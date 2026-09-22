@@ -2579,6 +2579,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "rusqlite",
+ "schemars",
  "serde",
  "serde_json",
  "tempfile",
@@ -3910,6 +3911,7 @@ version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2b42f36aa1cd011945615b92222f6bf73c599a102a300334cd7f8dbeec726cc"
 dependencies = [
+ "chrono",
  "dyn-clone",
  "ref-cast",
  "schemars_derive",
@@ -4150,12 +4152,14 @@ version = "0.1.0"
 dependencies = [
  "api-macros",
  "memory",
+ "merge-request",
  "protocol",
  "runtime-api",
  "schemars",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "ticket",
  "tokio",
  "ts-rs",
  "webauthn-rs-proto",

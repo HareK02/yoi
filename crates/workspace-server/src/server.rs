@@ -11,10 +11,10 @@ use axum::extract::{DefaultBodyLimit, Extension, Path as AxumPath, Query, Reques
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION, ORIGIN, SET_COOKIE,
 };
-use axum::http::{HeaderMap, Method, StatusCode, Uri};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use chrono::{Duration, SecondsFormat, Utc};
 use config_source::ConfigTreeSnapshot;
@@ -55,9 +55,9 @@ use server_api::{
     RuntimeRemovalOperationState as ApiRuntimeRemovalOperationState, RuntimeTrustAuditAction,
     RuntimeTrustAuditEntry, RuntimeTrustConflictKind, RuntimeTrustConflictResponse,
     RuntimeTrustKeyRevealResponse, RuntimeTrustKeyState, RuntimeTrustKeyStatus,
-    TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_PATH, UpdateRemoteRuntimeRequest,
-    UpdateWorkspaceMetadataRequest, WhoamiResponse, WorkerLaunchOptionsResponse,
-    WorkerLaunchProfileCandidate, WorkerLaunchRuntimeOption, WorkerLaunchWorkerSummary,
+    UpdateRemoteRuntimeRequest, UpdateWorkspaceMetadataRequest, WhoamiResponse,
+    WorkerLaunchOptionsResponse, WorkerLaunchProfileCandidate, WorkerLaunchRuntimeOption,
+    WorkerLaunchWorkerSummary,
     WorkingDirectoryCreateRequest as BrowserWorkingDirectoryCreateRequest,
     WorkingDirectoryCreateResponse as BrowserWorkingDirectoryCreateResponse,
     WorkingDirectoryDetailResponse as BrowserWorkingDirectoryDetailResponse,
@@ -75,6 +75,8 @@ use server_api::{
     WorkspaceSigningIdentityState, WorkspaceSummary, WorkspaceWorkerDiscoveryItem,
     WorkspaceWorkerDiscoveryPage, WorkspaceWorkerSubject,
 };
+#[cfg(test)]
+use server_api::{TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_PATH};
 use sha2::{Digest, Sha256};
 use ticket::{
     MarkdownText, NewTicketEvent, TicketBackend, TicketBodyReplacement, TicketEventKind,
@@ -3637,12 +3639,52 @@ fn build_server_auth_router(api: ServerAuthApi) -> Router {
         .with_state(api)
 }
 
+fn server_request_context(
+    actor: Option<RequestActor>,
+    origin: Option<String>,
+    headers: &HeaderMap,
+) -> server_api::ServerRequestContext {
+    server_api::ServerRequestContext {
+        actor,
+        origin,
+        transport_headers: headers
+            .iter()
+            .map(|(name, value)| (name.as_str().to_string(), value.as_bytes().to_vec()))
+            .collect(),
+    }
+}
+
+fn contract_request_headers(
+    context: &server_api::ServerRequestContext,
+) -> std::result::Result<HeaderMap, server_api::RepositoryApiError> {
+    let mut headers = HeaderMap::new();
+    for (name, value) in &context.transport_headers {
+        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+            server_api::RepositoryApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                "Internal Server Error",
+                format!("generated route retained an invalid request header name: {error}"),
+                Vec::new(),
+            )
+        })?;
+        let value = HeaderValue::from_bytes(value).map_err(|error| {
+            server_api::RepositoryApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                "Internal Server Error",
+                format!("generated route retained an invalid request header value: {error}"),
+                Vec::new(),
+            )
+        })?;
+        headers.append(name, value);
+    }
+    Ok(headers)
+}
+
 async fn attach_server_origin_context(mut request: Request, next: Next) -> Response {
     let actor = request.extensions().get::<RequestActor>().cloned();
     let origin = request_origin(request.headers());
-    request
-        .extensions_mut()
-        .insert(server_api::ServerRequestContext { actor, origin });
+    let context = server_request_context(actor, origin, request.headers());
+    request.extensions_mut().insert(context);
     next.run(request).await
 }
 
@@ -3667,9 +3709,8 @@ async fn attach_server_request_context(
         }
     };
     let origin = request_origin(request.headers());
-    request
-        .extensions_mut()
-        .insert(server_api::ServerRequestContext { actor, origin });
+    let context = server_request_context(actor, origin, request.headers());
+    request.extensions_mut().insert(context);
     next.run(request).await
 }
 
@@ -3824,6 +3865,149 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::repository_create(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::ticket_list_alias(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_list(service.clone()))
+        .merge(server_api::server_api_axum::ticket_create_record(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_query(service.clone()))
+        .merge(server_api::server_api_axum::ticket_get_alias(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_default_intake_ready_body(service.clone()))
+        .merge(server_api::server_api_axum::ticket_summary_search(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_doctor(service.clone()))
+        .merge(server_api::server_api_axum::ticket_relation_query(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_orchestration_plan_query(service.clone()))
+        .merge(server_api::server_api_axum::ticket_record_get(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_record_item_edit(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_dependency_check(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_thread_event_add(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_state_change_add(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_intake_summary_add(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_state_field_set(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_workflow_state_set(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_mark_ready_record(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_queue_record(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::merge_request_list(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::merge_request_show(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::merge_request_open(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::merge_request_readiness(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::merge_request_thread(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::merge_request_selector_repair(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::merge_request_reviewer_child_register(service.clone()))
+        .merge(
+            server_api::server_api_axum::merge_request_review_capability_register(service.clone()),
+        )
+        .merge(server_api::server_api_axum::merge_request_review_submit(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::merge_request_review_revoke(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::merge_request_complete(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_close_record(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_relation_view(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_relation_record(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_relation_remove(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_orchestration_plan_record(service.clone()))
+        .merge(server_api::server_api_axum::ticket_get(service.clone()))
+        .merge(server_api::server_api_axum::ticket_edit(service.clone()))
+        .merge(server_api::server_api_axum::ticket_show(service.clone()))
+        .merge(server_api::server_api_axum::ticket_assignment_list(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_assignment_set(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_assignment_clear(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_implementation_cancel(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_state_transition(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_ready(service.clone()))
+        .merge(server_api::server_api_axum::ticket_event_append(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_queue(service.clone()))
+        .merge(server_api::server_api_axum::ticket_close(service.clone()))
+        .merge(server_api::server_api_axum::objective_list_alias(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::objective_list(service.clone()))
+        .merge(server_api::server_api_axum::objective_create(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::objective_query(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::objective_get_alias(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::objective_get(service.clone()))
+        .merge(server_api::server_api_axum::objective_edit(service.clone()))
+        .merge(server_api::server_api_axum::objective_show(service.clone()))
+        .merge(server_api::server_api_axum::objective_state_set(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::objective_ticket_link(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::objective_ticket_unlink(
+            service.clone(),
+        ))
         .layer(middleware::from_fn_with_state(
             service.as_ref().clone(),
             attach_server_request_context,
@@ -3834,6 +4018,12 @@ fn project_server_dto<T: Serialize, U: DeserializeOwned>(value: &T) -> Result<U>
     let value = serde_json::to_value(value)
         .map_err(|error| Error::RegistryInconsistency(error.to_string()))?;
     serde_json::from_value(value).map_err(|error| Error::RegistryInconsistency(error.to_string()))
+}
+
+fn project_contract_dto<T: Serialize, U: DeserializeOwned>(
+    value: &T,
+) -> std::result::Result<U, server_api::RepositoryApiError> {
+    project_server_dto(value).map_err(|error| ApiError::from(error).into_repository_api_error())
 }
 
 impl server_api::ServerApi for ServerApiContractService {
@@ -4866,218 +5056,1060 @@ impl server_api::ServerApi for ServerApiContractService {
         .map(|(_status, Json(response))| response)
         .map_err(ApiError::into_repository_api_error)
     }
+
+    async fn ticket_list_alias(
+        &self,
+        query: server_api::TicketListHttpQuery,
+    ) -> std::result::Result<server_api::TicketListResponse, server_api::RepositoryApiError> {
+        let query = TicketListQuery {
+            states: query.states,
+            limit: query.limit,
+            cursor: query.cursor,
+        };
+        let Json(response) = list_tickets(State(self.workspace_api()?.clone()), Query(query))
+            .await
+            .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn ticket_list(
+        &self,
+        workspace_id: String,
+        query: server_api::TicketListHttpQuery,
+    ) -> std::result::Result<server_api::TicketListResponse, server_api::RepositoryApiError> {
+        let query = TicketListQuery {
+            states: query.states,
+            limit: query.limit,
+            cursor: query.cursor,
+        };
+        let Json(response) = scoped_list_tickets(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Query(query),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn ticket_create_record(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::CreateTicketRecordRequest,
+    ) -> std::result::Result<server_api::TicketRecordRef, server_api::RepositoryApiError> {
+        let Json(response) = scoped_create_ticket_record(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            contract_request_headers(&context)?,
+            Json(request.0),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::TicketRecordRef(response))
+    }
+
+    async fn ticket_query(
+        &self,
+        workspace_id: String,
+        request: server_api::TicketQueryRequest,
+    ) -> std::result::Result<server_api::TicketQueryResponse, server_api::RepositoryApiError> {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = scoped_query_tickets(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn ticket_get_alias(
+        &self,
+        id: String,
+    ) -> std::result::Result<server_api::TicketDetail, server_api::RepositoryApiError> {
+        let Json(response) = get_ticket(State(self.workspace_api()?.clone()), AxumPath(id))
+            .await
+            .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn ticket_default_intake_ready_body(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::DefaultIntakeReadyBodyRequest,
+    ) -> std::result::Result<server_api::TextResponse, server_api::RepositoryApiError> {
+        let Json(response) = scoped_default_intake_ready_body(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            contract_request_headers(&context)?,
+            Json(DefaultIntakeReadyBodyRequest { from: request.from }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::TextResponse(response))
+    }
+
+    async fn ticket_summary_search(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        query: server_api::TicketSummarySearchQuery,
+    ) -> std::result::Result<server_api::TicketRecordSummaryList, server_api::RepositoryApiError>
+    {
+        let Json(response) = scoped_list_ticket_summaries(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            contract_request_headers(&context)?,
+            Query(TicketSummarySearchQuery { state: query.state }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::TicketRecordSummaryList(response))
+    }
+
+    async fn ticket_doctor(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+    ) -> std::result::Result<server_api::TicketDoctorResponse, server_api::RepositoryApiError> {
+        let Json(response) = scoped_ticket_doctor(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            contract_request_headers(&context)?,
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::TicketDoctorResponse(response))
+    }
+
+    async fn ticket_relation_query(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::TicketRelationSearchRequest,
+    ) -> std::result::Result<server_api::TicketRelationRecordList, server_api::RepositoryApiError>
+    {
+        let Json(response) = scoped_query_ticket_relations(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            contract_request_headers(&context)?,
+            Json(TicketRelationSearchRequest {
+                ticket: request.ticket,
+                kind: request.kind,
+            }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::TicketRelationRecordList(response))
+    }
+
+    async fn ticket_orchestration_plan_query(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::TicketOrchestrationPlanSearchRequest,
+    ) -> std::result::Result<
+        server_api::TicketOrchestrationPlanRecordList,
+        server_api::RepositoryApiError,
+    > {
+        let Json(response) = scoped_query_ticket_orchestration_plans(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            contract_request_headers(&context)?,
+            Json(TicketOrchestrationPlanSearchRequest {
+                ticket: request.ticket,
+                kind: request.kind,
+            }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::TicketOrchestrationPlanRecordList(response))
+    }
+
+    async fn ticket_record_get(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+    ) -> std::result::Result<server_api::TicketRecord, server_api::RepositoryApiError> {
+        let Json(response) = scoped_get_ticket_record(
+            State(self.workspace_api()?.clone()),
+            AxumPath((workspace_id, id)),
+            contract_request_headers(&context)?,
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::TicketRecord(response))
+    }
+
+    async fn ticket_record_item_edit(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::EditTicketRecordItemRequest,
+    ) -> std::result::Result<server_api::TicketRecord, server_api::RepositoryApiError> {
+        let Json(response) = scoped_edit_ticket_record_item(
+            State(self.workspace_api()?.clone()),
+            AxumPath((workspace_id, id)),
+            contract_request_headers(&context)?,
+            Json(request.0),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::TicketRecord(response))
+    }
+
+    async fn ticket_dependency_check(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+    ) -> std::result::Result<
+        server_api::TicketDependencyCheckResponse,
+        server_api::RepositoryApiError,
+    > {
+        let Json(response) = scoped_ticket_dependency_check(
+            State(self.workspace_api()?.clone()),
+            AxumPath((workspace_id, id)),
+            contract_request_headers(&context)?,
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::TicketDependencyCheckResponse(response))
+    }
+
+    async fn ticket_thread_event_add(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::TicketThreadEventRequest,
+    ) -> std::result::Result<(), server_api::RepositoryApiError> {
+        scoped_add_ticket_thread_event(
+            State(self.workspace_api()?.clone()),
+            AxumPath((workspace_id, id)),
+            contract_request_headers(&context)?,
+            Json(request.0),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(())
+    }
+
+    async fn ticket_state_change_add(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::TicketStateChangeRequest,
+    ) -> std::result::Result<(), server_api::RepositoryApiError> {
+        scoped_add_ticket_state_change(
+            State(self.workspace_api()?.clone()),
+            AxumPath((workspace_id, id)),
+            contract_request_headers(&context)?,
+            Json(request.0),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(())
+    }
+
+    async fn ticket_intake_summary_add(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::TicketIntakeSummaryRequest,
+    ) -> std::result::Result<(), server_api::RepositoryApiError> {
+        scoped_add_ticket_intake_summary(
+            State(self.workspace_api()?.clone()),
+            AxumPath((workspace_id, id)),
+            contract_request_headers(&context)?,
+            Json(request.0),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(())
+    }
+
+    async fn ticket_state_field_set(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        field: String,
+        request: server_api::TicketStateChangeRequest,
+    ) -> std::result::Result<(), server_api::RepositoryApiError> {
+        scoped_set_ticket_state_field(
+            State(self.workspace_api()?.clone()),
+            AxumPath((workspace_id, id, field)),
+            contract_request_headers(&context)?,
+            Json(request.0),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(())
+    }
+
+    async fn ticket_workflow_state_set(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::TicketStateChangeRequest,
+    ) -> std::result::Result<(), server_api::RepositoryApiError> {
+        scoped_set_ticket_workflow_state(
+            State(self.workspace_api()?.clone()),
+            AxumPath((workspace_id, id)),
+            contract_request_headers(&context)?,
+            Json(request.0),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(())
+    }
+
+    async fn ticket_mark_ready_record(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::TicketMarkReadyRequest,
+    ) -> std::result::Result<server_api::TicketRecord, server_api::RepositoryApiError> {
+        let Json(response) = scoped_mark_ticket_ready(
+            State(self.workspace_api()?.clone()),
+            AxumPath((workspace_id, id)),
+            contract_request_headers(&context)?,
+            Json(TicketMarkReadyRequest {
+                operation_key: request.operation_key,
+                reason: request.reason,
+                intake_summary: request.intake_summary,
+            }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::TicketRecord(response))
+    }
+
+    async fn ticket_queue_record(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+    ) -> std::result::Result<server_api::TicketQueueResponse, server_api::RepositoryApiError> {
+        let Json(response) = scoped_queue_ticket_record(
+            State(self.workspace_api()?.clone()),
+            AxumPath((workspace_id, id)),
+            contract_request_headers(&context)?,
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::TicketQueueResponse(response))
+    }
+
+    async fn merge_request_list(
+        &self,
+        workspace_id: String,
+        query: server_api::MergeRequestListQuery,
+    ) -> std::result::Result<server_api::MergeRequestListResponse, server_api::RepositoryApiError>
+    {
+        let query = project_contract_dto(&query)?;
+        let Json(response) = scoped_list_merge_requests(
+            State(self.workspace_api()?.clone()),
+            AxumPath(workspace_id),
+            Query(query),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn merge_request_show(
+        &self,
+        workspace_id: String,
+        merge_request_id: String,
+        query: server_api::MergeRequestThreadQuery,
+    ) -> std::result::Result<server_api::MergeRequestDetailResponse, server_api::RepositoryApiError>
+    {
+        let query = project_contract_dto(&query)?;
+        let Json(response) = scoped_show_merge_request(
+            State(self.workspace_api()?.clone()),
+            AxumPath((workspace_id, merge_request_id)),
+            Query(query),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn merge_request_open(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::OpenMergeRequestRequest,
+    ) -> std::result::Result<server_api::PublicMergeRequest, server_api::RepositoryApiError> {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = scoped_open_merge_request(
+            State(self.workspace_api()?.clone()),
+            contract_request_headers(&context)?,
+            AxumPath((workspace_id, id)),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn merge_request_readiness(
+        &self,
+        workspace_id: String,
+        id: String,
+    ) -> std::result::Result<
+        server_api::MergeRequestReadinessResponse,
+        server_api::RepositoryApiError,
+    > {
+        let Json(response) = scoped_merge_request_readiness(
+            State(self.workspace_api()?.clone()),
+            AxumPath((workspace_id, id)),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn merge_request_thread(
+        &self,
+        workspace_id: String,
+        id: String,
+        query: server_api::MergeRequestThreadQuery,
+    ) -> std::result::Result<server_api::MergeRequestThreadResponse, server_api::RepositoryApiError>
+    {
+        let query = project_contract_dto(&query)?;
+        let Json(response) = scoped_merge_request_thread(
+            State(self.workspace_api()?.clone()),
+            AxumPath((workspace_id, id)),
+            Query(query),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response).map(server_api::MergeRequestThreadResponse)
+    }
+
+    async fn merge_request_selector_repair(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::RepairMergeRequestSelectorRequest,
+    ) -> std::result::Result<server_api::PublicMergeRequest, server_api::RepositoryApiError> {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = scoped_repair_merge_request_selector(
+            State(self.workspace_api()?.clone()),
+            contract_request_headers(&context)?,
+            AxumPath((workspace_id, id)),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn merge_request_reviewer_child_register(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::RegisterReviewerChildSessionRequest,
+    ) -> std::result::Result<(), server_api::RepositoryApiError> {
+        let request = project_contract_dto(&request)?;
+        scoped_register_reviewer_child_session(
+            State(self.workspace_api()?.clone()),
+            contract_request_headers(&context)?,
+            AxumPath(workspace_id),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(())
+    }
+
+    async fn merge_request_review_capability_register(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::RegisterMergeRequestReviewCapabilityRequest,
+    ) -> std::result::Result<(), server_api::RepositoryApiError> {
+        let request = project_contract_dto(&request)?;
+        scoped_register_merge_request_review_capability(
+            State(self.workspace_api()?.clone()),
+            contract_request_headers(&context)?,
+            AxumPath((workspace_id, id)),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(())
+    }
+
+    async fn merge_request_review_submit(
+        &self,
+        workspace_id: String,
+        id: String,
+        request: server_api::SubmitMergeRequestReviewRequest,
+    ) -> std::result::Result<server_api::ReviewEvent, server_api::RepositoryApiError> {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = scoped_submit_merge_request_review(
+            State(self.workspace_api()?.clone()),
+            AxumPath((workspace_id, id)),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn merge_request_review_revoke(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::RevokeMergeRequestReviewRequest,
+    ) -> std::result::Result<server_api::ReviewRevokedEvent, server_api::RepositoryApiError> {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = scoped_revoke_merge_request_review(
+            State(self.workspace_api()?.clone()),
+            contract_request_headers(&context)?,
+            AxumPath((workspace_id, id)),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn merge_request_complete(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::CompleteMergeRequestRequest,
+    ) -> std::result::Result<server_api::MergeEvent, server_api::RepositoryApiError> {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = scoped_complete_merge_request(
+            State(self.workspace_api()?.clone()),
+            contract_request_headers(&context)?,
+            AxumPath((workspace_id, id)),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn ticket_close_record(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::TicketCloseRecordRequest,
+    ) -> std::result::Result<(), server_api::RepositoryApiError> {
+        scoped_close_ticket_record(
+            State(self.workspace_api()?.clone()),
+            AxumPath((workspace_id, id)),
+            contract_request_headers(&context)?,
+            Json(request.0),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(())
+    }
+
+    async fn ticket_relation_view(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+    ) -> std::result::Result<server_api::TicketRelationRecordView, server_api::RepositoryApiError>
+    {
+        let Json(response) = scoped_ticket_relation_view(
+            State(self.workspace_api()?.clone()),
+            AxumPath((workspace_id, id)),
+            contract_request_headers(&context)?,
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::TicketRelationRecordView(response))
+    }
+
+    async fn ticket_relation_record(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::CreateTicketRelationRequest,
+    ) -> std::result::Result<server_api::TicketRelationRecord, server_api::RepositoryApiError> {
+        let Json(response) = scoped_record_ticket_relation(
+            State(self.workspace_api()?.clone()),
+            AxumPath((workspace_id, id)),
+            contract_request_headers(&context)?,
+            Json(request.0),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::TicketRelationRecord(response))
+    }
+
+    async fn ticket_relation_remove(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::TicketRelationRemoveRequest,
+    ) -> std::result::Result<server_api::TicketRelationRecord, server_api::RepositoryApiError> {
+        let Json(response) = scoped_remove_ticket_relation(
+            State(self.workspace_api()?.clone()),
+            AxumPath((workspace_id, id)),
+            contract_request_headers(&context)?,
+            Json(TicketRelationRemoveRequest {
+                kind: request.kind,
+                target: request.target,
+            }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::TicketRelationRecord(response))
+    }
+
+    async fn ticket_orchestration_plan_record(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::CreateTicketOrchestrationPlanRequest,
+    ) -> std::result::Result<
+        server_api::TicketOrchestrationPlanRecord,
+        server_api::RepositoryApiError,
+    > {
+        let Json(response) = scoped_record_ticket_orchestration_plan(
+            State(self.workspace_api()?.clone()),
+            AxumPath((workspace_id, id)),
+            contract_request_headers(&context)?,
+            Json(request.0),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::TicketOrchestrationPlanRecord(response))
+    }
+
+    async fn ticket_get(
+        &self,
+        workspace_id: String,
+        id: String,
+    ) -> std::result::Result<server_api::TicketDetail, server_api::RepositoryApiError> {
+        let Json(response) = scoped_get_ticket(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRecordPath { workspace_id, id }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn ticket_edit(
+        &self,
+        workspace_id: String,
+        id: String,
+        request: server_api::BrowserEditTicketRequest,
+    ) -> std::result::Result<server_api::TicketDetail, server_api::RepositoryApiError> {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = scoped_edit_ticket_item(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRecordPath { workspace_id, id }),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn ticket_show(
+        &self,
+        workspace_id: String,
+        id: String,
+        request: server_api::TicketShowRequest,
+    ) -> std::result::Result<server_api::TicketDetail, server_api::RepositoryApiError> {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = scoped_show_ticket(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRecordPath { workspace_id, id }),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn ticket_assignment_list(
+        &self,
+        workspace_id: String,
+        id: String,
+    ) -> std::result::Result<
+        server_api::TicketRoleAssignmentsResponse,
+        server_api::RepositoryApiError,
+    > {
+        let Json(response) = scoped_list_ticket_assignments(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRecordPath { workspace_id, id }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn ticket_assignment_set(
+        &self,
+        workspace_id: String,
+        id: String,
+        role: String,
+        request: server_api::SetTicketRoleAssignmentRequest,
+    ) -> std::result::Result<
+        server_api::TicketRoleAssignmentMutationResponse,
+        server_api::RepositoryApiError,
+    > {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = scoped_set_ticket_assignment(
+            State(self.workspace_api()?.clone()),
+            AxumPath((workspace_id, id, role)),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn ticket_assignment_clear(
+        &self,
+        workspace_id: String,
+        id: String,
+        role: String,
+        query: server_api::ClearTicketRoleAssignmentQuery,
+    ) -> std::result::Result<
+        server_api::TicketRoleAssignmentMutationResponse,
+        server_api::RepositoryApiError,
+    > {
+        let query = project_contract_dto(&query)?;
+        let Json(response) = scoped_clear_ticket_assignment(
+            State(self.workspace_api()?.clone()),
+            AxumPath((workspace_id, id, role)),
+            Query(query),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn ticket_implementation_cancel(
+        &self,
+        workspace_id: String,
+        id: String,
+        request: server_api::CancelTicketImplementationRequest,
+    ) -> std::result::Result<server_api::TicketDetail, server_api::RepositoryApiError> {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = scoped_cancel_ticket_implementation(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRecordPath { workspace_id, id }),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn ticket_state_transition(
+        &self,
+        workspace_id: String,
+        id: String,
+        request: server_api::BrowserTransitionTicketStateRequest,
+    ) -> std::result::Result<server_api::TicketDetail, server_api::RepositoryApiError> {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = scoped_transition_ticket_state(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRecordPath { workspace_id, id }),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn ticket_ready(
+        &self,
+        workspace_id: String,
+        id: String,
+        request: server_api::TicketMarkReadyRequest,
+    ) -> std::result::Result<server_api::TicketDetail, server_api::RepositoryApiError> {
+        let request = TicketMarkReadyRequest {
+            operation_key: request.operation_key,
+            reason: request.reason,
+            intake_summary: request.intake_summary,
+        };
+        let Json(response) = scoped_mark_ticket_ready_from_browser(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRecordPath { workspace_id, id }),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn ticket_event_append(
+        &self,
+        workspace_id: String,
+        id: String,
+        request: server_api::BrowserAppendTicketEventRequest,
+    ) -> std::result::Result<server_api::TicketDetail, server_api::RepositoryApiError> {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = scoped_append_ticket_event(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRecordPath { workspace_id, id }),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn ticket_queue(
+        &self,
+        workspace_id: String,
+        id: String,
+        request: server_api::BrowserQueueTicketRequest,
+    ) -> std::result::Result<server_api::TicketQueueResponse, server_api::RepositoryApiError> {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = scoped_queue_ticket(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRecordPath { workspace_id, id }),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::TicketQueueResponse(response))
+    }
+
+    async fn ticket_close(
+        &self,
+        workspace_id: String,
+        id: String,
+        request: server_api::BrowserCloseTicketRequest,
+    ) -> std::result::Result<server_api::TicketDetail, server_api::RepositoryApiError> {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = scoped_close_ticket(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRecordPath { workspace_id, id }),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn objective_list_alias(
+        &self,
+        query: server_api::ObjectiveListQuery,
+    ) -> std::result::Result<server_api::ObjectiveListResponse, server_api::RepositoryApiError>
+    {
+        let Json(response) = list_objectives(
+            State(self.workspace_api()?.clone()),
+            Query(ObjectiveListQuery { limit: query.limit }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn objective_list(
+        &self,
+        workspace_id: String,
+        query: server_api::ObjectiveListQuery,
+    ) -> std::result::Result<server_api::ObjectiveListResponse, server_api::RepositoryApiError>
+    {
+        let Json(response) = scoped_list_objectives(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Query(ObjectiveListQuery { limit: query.limit }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn objective_create(
+        &self,
+        workspace_id: String,
+        request: server_api::ObjectiveCreateRequest,
+    ) -> std::result::Result<server_api::ObjectiveDetail, server_api::RepositoryApiError> {
+        let Json(response) = scoped_create_objective(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn objective_query(
+        &self,
+        workspace_id: String,
+        request: server_api::ObjectiveQueryRequest,
+    ) -> std::result::Result<server_api::ObjectiveQueryResponse, server_api::RepositoryApiError>
+    {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = scoped_query_objectives(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn objective_get_alias(
+        &self,
+        id: String,
+    ) -> std::result::Result<server_api::ObjectiveDetail, server_api::RepositoryApiError> {
+        let Json(response) = get_objective(State(self.workspace_api()?.clone()), AxumPath(id))
+            .await
+            .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn objective_get(
+        &self,
+        workspace_id: String,
+        objective_id: String,
+    ) -> std::result::Result<server_api::ObjectiveDetail, server_api::RepositoryApiError> {
+        let Json(response) = scoped_get_objective(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedObjectivePath {
+                workspace_id,
+                objective_id,
+            }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn objective_edit(
+        &self,
+        workspace_id: String,
+        objective_id: String,
+        request: server_api::ObjectiveEditRequest,
+    ) -> std::result::Result<server_api::ObjectiveDetail, server_api::RepositoryApiError> {
+        let Json(response) = scoped_edit_objective(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedObjectivePath {
+                workspace_id,
+                objective_id,
+            }),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn objective_show(
+        &self,
+        workspace_id: String,
+        objective_id: String,
+        request: server_api::ObjectiveShowRequest,
+    ) -> std::result::Result<server_api::ObjectiveDetail, server_api::RepositoryApiError> {
+        let request = project_contract_dto(&request)?;
+        let Json(response) = scoped_show_objective(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedObjectivePath {
+                workspace_id,
+                objective_id,
+            }),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn objective_state_set(
+        &self,
+        workspace_id: String,
+        objective_id: String,
+        request: server_api::ObjectiveStateRequest,
+    ) -> std::result::Result<server_api::ObjectiveDetail, server_api::RepositoryApiError> {
+        let Json(response) = scoped_set_objective_state(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedObjectivePath {
+                workspace_id,
+                objective_id,
+            }),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn objective_ticket_link(
+        &self,
+        workspace_id: String,
+        objective_id: String,
+        request: server_api::ObjectiveLinkTicketRequest,
+    ) -> std::result::Result<server_api::ObjectiveDetail, server_api::RepositoryApiError> {
+        let Json(response) = scoped_link_objective_ticket(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedObjectivePath {
+                workspace_id,
+                objective_id,
+            }),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn objective_ticket_unlink(
+        &self,
+        workspace_id: String,
+        objective_id: String,
+        ticket_id: String,
+    ) -> std::result::Result<server_api::ObjectiveDetail, server_api::RepositoryApiError> {
+        let Json(response) = scoped_unlink_objective_ticket(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedObjectiveTicketPath {
+                workspace_id,
+                objective_id,
+                ticket_id,
+            }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
 }
 
 fn build_inner_router(api: WorkspaceApi) -> Router {
     let contract_service = ServerApiContractService::Workspace(api.clone());
     let auth = build_server_auth_router(ServerAuthApi::from(&api))
         .merge(generated_auth_contract_router(contract_service.clone()));
-    let scoped_ticket_relations_query_path =
-        format!("/api/w/{{workspace_id}}{TICKET_RELATIONS_QUERY_PATH}");
-    let scoped_ticket_orchestration_plans_query_path =
-        format!("/api/w/{{workspace_id}}{TICKET_ORCHESTRATION_PLANS_QUERY_PATH}");
     let workspace = Router::new()
-        .route("/api/tickets", get(list_tickets))
-        .route(
-            "/api/w/{workspace_id}/tickets",
-            get(scoped_list_tickets).post(scoped_create_ticket_record),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/query",
-            post(scoped_query_tickets),
-        )
-        .route("/api/tickets/{id}", get(get_ticket))
-        .route(
-            "/api/w/{workspace_id}/tickets/default-intake-ready-body",
-            post(scoped_default_intake_ready_body),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/search",
-            get(scoped_list_ticket_summaries),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/doctor",
-            get(scoped_ticket_doctor),
-        )
-        .route(
-            scoped_ticket_relations_query_path.as_str(),
-            post(scoped_query_ticket_relations),
-        )
-        .route(
-            scoped_ticket_orchestration_plans_query_path.as_str(),
-            post(scoped_query_ticket_orchestration_plans),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/record",
-            get(scoped_get_ticket_record),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/item",
-            patch(scoped_edit_ticket_record_item),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/dependency-check",
-            get(scoped_ticket_dependency_check),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/thread-events",
-            post(scoped_add_ticket_thread_event),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/state-changes",
-            post(scoped_add_ticket_state_change),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/intake-summaries",
-            post(scoped_add_ticket_intake_summary),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/state-fields/{field}",
-            post(scoped_set_ticket_state_field),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/workflow-state",
-            post(scoped_set_ticket_workflow_state),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/workflow/mark-ready",
-            post(scoped_mark_ticket_ready),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/workflow/queue",
-            post(scoped_queue_ticket_record),
-        )
-        .route(
-            "/api/w/{workspace_id}/merge-requests",
-            get(scoped_list_merge_requests),
-        )
-        .route(
-            "/api/w/{workspace_id}/merge-requests/{merge_request_id}",
-            get(scoped_show_merge_request),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/merge-request",
-            post(scoped_open_merge_request),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/merge-request/readiness",
-            get(scoped_merge_request_readiness),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/merge-request/thread",
-            get(scoped_merge_request_thread),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/merge-request/repair-source",
-            post(scoped_repair_merge_request_selector),
-        )
-        .route(
-            "/api/w/{workspace_id}/internal/reviewer-child-sessions",
-            post(scoped_register_reviewer_child_session),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/merge-request/review-capabilities",
-            post(scoped_register_merge_request_review_capability),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/merge-request/reviews",
-            post(scoped_submit_merge_request_review),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/merge-request/reviews/revoke",
-            post(scoped_revoke_merge_request_review),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/merge-request/complete",
-            post(scoped_complete_merge_request),
-        )
-
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/workflow/close",
-            post(scoped_close_ticket_record),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/relation-view",
-            get(scoped_ticket_relation_view),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/relations",
-            post(scoped_record_ticket_relation).delete(scoped_remove_ticket_relation),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/orchestration-plans",
-            post(scoped_record_ticket_orchestration_plan),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}",
-            get(scoped_get_ticket).patch(scoped_edit_ticket_item),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/show",
-            post(scoped_show_ticket),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/assignments",
-            get(scoped_list_ticket_assignments),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/assignments/{role}",
-            put(scoped_set_ticket_assignment).delete(scoped_clear_ticket_assignment),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/implementation-cancellations",
-            post(scoped_cancel_ticket_implementation),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/state",
-            post(scoped_transition_ticket_state),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/ready",
-            post(scoped_mark_ticket_ready_from_browser),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/events",
-            post(scoped_append_ticket_event),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/queue",
-            post(scoped_queue_ticket),
-        )
-        .route(
-            "/api/w/{workspace_id}/tickets/{id}/close",
-            post(scoped_close_ticket),
-        )
-        .route("/api/objectives", get(list_objectives))
-        .route(
-            "/api/w/{workspace_id}/objectives",
-            get(scoped_list_objectives).post(scoped_create_objective),
-        )
-        .route(
-            "/api/w/{workspace_id}/objectives/query",
-            post(scoped_query_objectives),
-        )
-        .route("/api/objectives/{id}", get(get_objective))
-        .route(
-            "/api/w/{workspace_id}/objectives/{objective_id}",
-            get(scoped_get_objective).patch(scoped_edit_objective),
-        )
-        .route(
-            "/api/w/{workspace_id}/objectives/{objective_id}/show",
-            post(scoped_show_objective),
-        )
-        .route(
-            "/api/w/{workspace_id}/objectives/{objective_id}/state",
-            post(scoped_set_objective_state),
-        )
-        .route(
-            "/api/w/{workspace_id}/objectives/{objective_id}/ticket-links",
-            post(scoped_link_objective_ticket),
-        )
-        .route(
-            "/api/w/{workspace_id}/objectives/{objective_id}/ticket-links/{ticket_id}",
-            delete(scoped_unlink_objective_ticket),
-        )
         .route(
             "/api/w/{workspace_id}/repositories/{repository_key}/ssh-connection-test",
             post(scoped_probe_repository_ssh_connection)

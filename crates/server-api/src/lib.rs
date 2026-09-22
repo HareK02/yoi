@@ -152,6 +152,75 @@ impl_openapi_schema!(
     SkillCatalogResponse,
     SkillDetailResponse,
     SkillActivationResponse,
+    BrowserAppendTicketEventRequest,
+    BrowserCloseTicketRequest,
+    BrowserEditTicketRequest,
+    BrowserQueueTicketRequest,
+    BrowserTransitionTicketStateRequest,
+    CancelTicketImplementationRequest,
+    ClearTicketRoleAssignmentQuery,
+    CompleteMergeRequestRequest,
+    CreateTicketOrchestrationPlanRequest,
+    CreateTicketRecordRequest,
+    CreateTicketRelationRequest,
+    DefaultIntakeReadyBodyRequest,
+    EditTicketRecordItemRequest,
+    MergeEvent,
+    MergeRequestDetailResponse,
+    MergeRequestListQuery,
+    MergeRequestListResponse,
+    MergeRequestReadinessResponse,
+    MergeRequestThreadQuery,
+    MergeRequestThreadResponse,
+    ObjectiveCreateRequest,
+    ObjectiveDetail,
+    ObjectiveEditRequest,
+    ObjectiveLinkTicketRequest,
+    ObjectiveListQuery,
+    ObjectiveListResponse,
+    ObjectiveQueryRequest,
+    ObjectiveQueryResponse,
+    ObjectiveShowRequest,
+    ObjectiveStateRequest,
+    OpenMergeRequestRequest,
+    PublicMergeRequest,
+    RegisterMergeRequestReviewCapabilityRequest,
+    RegisterReviewerChildSessionRequest,
+    RepairMergeRequestSelectorRequest,
+    ReviewEvent,
+    ReviewRevokedEvent,
+    RevokeMergeRequestReviewRequest,
+    SetTicketRoleAssignmentRequest,
+    SubmitMergeRequestReviewRequest,
+    TextResponse,
+    TicketCloseRecordRequest,
+    TicketDependencyCheckResponse,
+    TicketDetail,
+    TicketDoctorResponse,
+    TicketIntakeSummaryRequest,
+    TicketListHttpQuery,
+    TicketListResponse,
+    TicketMarkReadyRequest,
+    TicketOrchestrationPlanRecord,
+    TicketOrchestrationPlanRecordList,
+    TicketOrchestrationPlanSearchRequest,
+    TicketQueryRequest,
+    TicketQueryResponse,
+    TicketQueueResponse,
+    TicketRecord,
+    TicketRecordRef,
+    TicketRecordSummaryList,
+    TicketRelationRecord,
+    TicketRelationRecordList,
+    TicketRelationRecordView,
+    TicketRelationRemoveRequest,
+    TicketRelationSearchRequest,
+    TicketRoleAssignmentMutationResponse,
+    TicketRoleAssignmentsResponse,
+    TicketShowRequest,
+    TicketStateChangeRequest,
+    TicketSummarySearchQuery,
+    TicketThreadEventRequest,
 );
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -910,6 +979,478 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[body] request: CreateWorkspaceRepositoryRequest,
     ) -> Result<CreateWorkspaceRepositoryResponse, RepositoryApiError>;
+
+    #[get("/api/tickets", status = 200, error_status = 400, additional_error_statuses = [500])]
+    async fn ticket_list_alias(
+        &self,
+        #[query] query: TicketListHttpQuery,
+    ) -> Result<TicketListResponse, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/tickets", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_list(
+        &self,
+        #[path] workspace_id: String,
+        #[query] query: TicketListHttpQuery,
+    ) -> Result<TicketListResponse, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_create_record(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: CreateTicketRecordRequest,
+    ) -> Result<TicketRecordRef, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/query", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_query(
+        &self,
+        #[path] workspace_id: String,
+        #[body] request: TicketQueryRequest,
+    ) -> Result<TicketQueryResponse, RepositoryApiError>;
+
+    #[get("/api/tickets/{id}", status = 200, error_status = 404, additional_error_statuses = [400, 500])]
+    async fn ticket_get_alias(
+        &self,
+        #[path] id: String,
+    ) -> Result<TicketDetail, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/default-intake-ready-body", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500])]
+    async fn ticket_default_intake_ready_body(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: DefaultIntakeReadyBodyRequest,
+    ) -> Result<TextResponse, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/tickets/search", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500])]
+    async fn ticket_summary_search(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[query] query: TicketSummarySearchQuery,
+    ) -> Result<TicketRecordSummaryList, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/tickets/doctor", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500])]
+    async fn ticket_doctor(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+    ) -> Result<TicketDoctorResponse, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/relations/search", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500])]
+    async fn ticket_relation_query(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: TicketRelationSearchRequest,
+    ) -> Result<TicketRelationRecordList, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/orchestration-plans/search", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500])]
+    async fn ticket_orchestration_plan_query(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: TicketOrchestrationPlanSearchRequest,
+    ) -> Result<TicketOrchestrationPlanRecordList, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/tickets/{id}/record", status = 200, error_status = 404, additional_error_statuses = [400, 401, 403, 500])]
+    async fn ticket_record_get(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+    ) -> Result<TicketRecord, RepositoryApiError>;
+
+    #[patch("/api/w/{workspace_id}/tickets/{id}/item", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    async fn ticket_record_item_edit(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: EditTicketRecordItemRequest,
+    ) -> Result<TicketRecord, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/tickets/{id}/dependency-check", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500])]
+    async fn ticket_dependency_check(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+    ) -> Result<TicketDependencyCheckResponse, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{id}/thread-events", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    async fn ticket_thread_event_add(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: TicketThreadEventRequest,
+    ) -> Result<(), RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{id}/state-changes", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    async fn ticket_state_change_add(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: TicketStateChangeRequest,
+    ) -> Result<(), RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{id}/intake-summaries", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    async fn ticket_intake_summary_add(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: TicketIntakeSummaryRequest,
+    ) -> Result<(), RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{id}/state-fields/{field}", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    async fn ticket_state_field_set(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[path] field: String,
+        #[body] request: TicketStateChangeRequest,
+    ) -> Result<(), RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{id}/workflow-state", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    async fn ticket_workflow_state_set(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: TicketStateChangeRequest,
+    ) -> Result<(), RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{id}/workflow/mark-ready", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    async fn ticket_mark_ready_record(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: TicketMarkReadyRequest,
+    ) -> Result<TicketRecord, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{id}/workflow/queue", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    async fn ticket_queue_record(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+    ) -> Result<TicketQueueResponse, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/merge-requests", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn merge_request_list(
+        &self,
+        #[path] workspace_id: String,
+        #[query] query: MergeRequestListQuery,
+    ) -> Result<MergeRequestListResponse, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/merge-requests/{merge_request_id}", status = 200, error_status = 404, additional_error_statuses = [400, 401, 403, 500], bearer_auth = true, browser_auth = true)]
+    async fn merge_request_show(
+        &self,
+        #[path] workspace_id: String,
+        #[path] merge_request_id: String,
+        #[query] query: MergeRequestThreadQuery,
+    ) -> Result<MergeRequestDetailResponse, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    async fn merge_request_open(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: OpenMergeRequestRequest,
+    ) -> Result<PublicMergeRequest, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/tickets/{id}/merge-request/readiness", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    async fn merge_request_readiness(
+        &self,
+        #[path] workspace_id: String,
+        #[path] id: String,
+    ) -> Result<MergeRequestReadinessResponse, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/tickets/{id}/merge-request/thread", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500])]
+    async fn merge_request_thread(
+        &self,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[query] query: MergeRequestThreadQuery,
+    ) -> Result<MergeRequestThreadResponse, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/repair-source", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn merge_request_selector_repair(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: RepairMergeRequestSelectorRequest,
+    ) -> Result<PublicMergeRequest, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/internal/reviewer-child-sessions", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    async fn merge_request_reviewer_child_register(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: RegisterReviewerChildSessionRequest,
+    ) -> Result<(), RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/review-capabilities", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    async fn merge_request_review_capability_register(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: RegisterMergeRequestReviewCapabilityRequest,
+    ) -> Result<(), RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/reviews", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    async fn merge_request_review_submit(
+        &self,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: SubmitMergeRequestReviewRequest,
+    ) -> Result<ReviewEvent, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/reviews/revoke", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    async fn merge_request_review_revoke(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: RevokeMergeRequestReviewRequest,
+    ) -> Result<ReviewRevokedEvent, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/complete", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    async fn merge_request_complete(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: CompleteMergeRequestRequest,
+    ) -> Result<MergeEvent, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{id}/workflow/close", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    async fn ticket_close_record(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: TicketCloseRecordRequest,
+    ) -> Result<(), RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/tickets/{id}/relation-view", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500])]
+    async fn ticket_relation_view(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+    ) -> Result<TicketRelationRecordView, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{id}/relations", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    async fn ticket_relation_record(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: CreateTicketRelationRequest,
+    ) -> Result<TicketRelationRecord, RepositoryApiError>;
+
+    #[delete("/api/w/{workspace_id}/tickets/{id}/relations", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    async fn ticket_relation_remove(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: TicketRelationRemoveRequest,
+    ) -> Result<TicketRelationRecord, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{id}/orchestration-plans", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    async fn ticket_orchestration_plan_record(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: CreateTicketOrchestrationPlanRequest,
+    ) -> Result<TicketOrchestrationPlanRecord, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/tickets/{id}", status = 200, error_status = 404, additional_error_statuses = [400, 401, 403, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_get(
+        &self,
+        #[path] workspace_id: String,
+        #[path] id: String,
+    ) -> Result<TicketDetail, RepositoryApiError>;
+
+    #[patch("/api/w/{workspace_id}/tickets/{id}", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_edit(
+        &self,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: BrowserEditTicketRequest,
+    ) -> Result<TicketDetail, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{id}/show", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500])]
+    async fn ticket_show(
+        &self,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: TicketShowRequest,
+    ) -> Result<TicketDetail, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/tickets/{id}/assignments", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_assignment_list(
+        &self,
+        #[path] workspace_id: String,
+        #[path] id: String,
+    ) -> Result<TicketRoleAssignmentsResponse, RepositoryApiError>;
+
+    #[put("/api/w/{workspace_id}/tickets/{id}/assignments/{role}", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_assignment_set(
+        &self,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[path] role: String,
+        #[body] request: SetTicketRoleAssignmentRequest,
+    ) -> Result<TicketRoleAssignmentMutationResponse, RepositoryApiError>;
+
+    #[delete("/api/w/{workspace_id}/tickets/{id}/assignments/{role}", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_assignment_clear(
+        &self,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[path] role: String,
+        #[query] query: ClearTicketRoleAssignmentQuery,
+    ) -> Result<TicketRoleAssignmentMutationResponse, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{id}/implementation-cancellations", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_implementation_cancel(
+        &self,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: CancelTicketImplementationRequest,
+    ) -> Result<TicketDetail, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{id}/state", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_state_transition(
+        &self,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: BrowserTransitionTicketStateRequest,
+    ) -> Result<TicketDetail, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{id}/ready", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_ready(
+        &self,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: TicketMarkReadyRequest,
+    ) -> Result<TicketDetail, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{id}/events", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_event_append(
+        &self,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: BrowserAppendTicketEventRequest,
+    ) -> Result<TicketDetail, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{id}/queue", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_queue(
+        &self,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: BrowserQueueTicketRequest,
+    ) -> Result<TicketQueueResponse, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/tickets/{id}/close", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_close(
+        &self,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: BrowserCloseTicketRequest,
+    ) -> Result<TicketDetail, RepositoryApiError>;
+
+    #[get("/api/objectives", status = 200, error_status = 400, additional_error_statuses = [500])]
+    async fn objective_list_alias(
+        &self,
+        #[query] query: ObjectiveListQuery,
+    ) -> Result<ObjectiveListResponse, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/objectives", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn objective_list(
+        &self,
+        #[path] workspace_id: String,
+        #[query] query: ObjectiveListQuery,
+    ) -> Result<ObjectiveListResponse, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/objectives", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn objective_create(
+        &self,
+        #[path] workspace_id: String,
+        #[body] request: ObjectiveCreateRequest,
+    ) -> Result<ObjectiveDetail, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/objectives/query", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500])]
+    async fn objective_query(
+        &self,
+        #[path] workspace_id: String,
+        #[body] request: ObjectiveQueryRequest,
+    ) -> Result<ObjectiveQueryResponse, RepositoryApiError>;
+
+    #[get("/api/objectives/{id}", status = 200, error_status = 404, additional_error_statuses = [400, 500])]
+    async fn objective_get_alias(
+        &self,
+        #[path] id: String,
+    ) -> Result<ObjectiveDetail, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/objectives/{objective_id}", status = 200, error_status = 404, additional_error_statuses = [400, 401, 403, 500], bearer_auth = true, browser_auth = true)]
+    async fn objective_get(
+        &self,
+        #[path] workspace_id: String,
+        #[path] objective_id: String,
+    ) -> Result<ObjectiveDetail, RepositoryApiError>;
+
+    #[patch("/api/w/{workspace_id}/objectives/{objective_id}", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn objective_edit(
+        &self,
+        #[path] workspace_id: String,
+        #[path] objective_id: String,
+        #[body] request: ObjectiveEditRequest,
+    ) -> Result<ObjectiveDetail, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/objectives/{objective_id}/show", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500])]
+    async fn objective_show(
+        &self,
+        #[path] workspace_id: String,
+        #[path] objective_id: String,
+        #[body] request: ObjectiveShowRequest,
+    ) -> Result<ObjectiveDetail, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/objectives/{objective_id}/state", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn objective_state_set(
+        &self,
+        #[path] workspace_id: String,
+        #[path] objective_id: String,
+        #[body] request: ObjectiveStateRequest,
+    ) -> Result<ObjectiveDetail, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/objectives/{objective_id}/ticket-links", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn objective_ticket_link(
+        &self,
+        #[path] workspace_id: String,
+        #[path] objective_id: String,
+        #[body] request: ObjectiveLinkTicketRequest,
+    ) -> Result<ObjectiveDetail, RepositoryApiError>;
+
+    #[delete("/api/w/{workspace_id}/objectives/{objective_id}/ticket-links/{ticket_id}", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn objective_ticket_unlink(
+        &self,
+        #[path] workspace_id: String,
+        #[path] objective_id: String,
+        #[path] ticket_id: String,
+    ) -> Result<ObjectiveDetail, RepositoryApiError>;
 }
 
 /// Digest of the fully rendered canonical contract with its digest slot normalized.
@@ -947,10 +1488,27 @@ pub fn canonical_openapi_document()
 ///
 /// Generated clients and OpenAPI omit extension parameters; operation implementations use this
 /// value instead of re-parsing transport headers inside domain handlers.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ServerRequestContext {
     pub actor: Option<RequestActor>,
     pub origin: Option<String>,
+    /// Transport headers retained for Server-side authentication adapters.
+    ///
+    /// Generated clients and OpenAPI do not expose this extension. Values stay byte-exact so the
+    /// Workspace Server can reuse the existing Runtime source-proof and browser-session authority
+    /// while generated Axum routes replace only the handwritten route registration.
+    pub transport_headers: Vec<(String, Vec<u8>)>,
+}
+
+impl std::fmt::Debug for ServerRequestContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServerRequestContext")
+            .field("actor", &self.actor)
+            .field("origin", &self.origin)
+            .field("transport_header_count", &self.transport_headers.len())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -2933,9 +3491,10 @@ pub struct WorkingDirectoryCreateResponse {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct ListResponse<T> {
     pub workspace_id: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub limit: usize,
     pub items: Vec<T>,
     pub source: String,
@@ -2943,19 +3502,28 @@ pub struct ListResponse<T> {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct QueryPage {
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub limit: usize,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub returned: usize,
     pub has_more: bool,
     pub next_cursor: Option<String>,
     pub sort: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub source_limit: Option<usize>,
     pub source_truncated: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct ObjectiveEventDetail {
     pub event_ref: String,
     pub kind: String,
@@ -2963,7 +3531,9 @@ pub struct ObjectiveEventDetail {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct ObjectiveLinkedTicketSummary {
     pub id: String,
     pub resource_key: String,
@@ -2971,15 +3541,21 @@ pub struct ObjectiveLinkedTicketSummary {
     pub state: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct ObjectiveResourceSummary {
     pub path: String,
     pub media_type: Option<String>,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub bytes: usize,
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct ObjectiveSummary {
     pub id: String,
     pub resource_key: String,
@@ -2992,7 +3568,9 @@ pub struct ObjectiveSummary {
     pub record_source: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct ObjectiveDetail {
     pub id: String,
     pub resource_key: String,
@@ -3011,7 +3589,9 @@ pub struct ObjectiveDetail {
     pub record_source: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct ObjectiveCreateRequest {
     pub title: String,
     #[serde(default)]
@@ -3026,7 +3606,9 @@ fn default_objective_state() -> String {
     "active".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct ObjectiveEditRequest {
     pub title: Option<String>,
     pub old_string: Option<String>,
@@ -3035,17 +3617,1005 @@ pub struct ObjectiveEditRequest {
     pub replace_all: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct ObjectiveStateRequest {
     pub state: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct ObjectiveLinkTicketRequest {
     pub ticket_id: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// One malformed project record reported by a bounded list projection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct InvalidProjectRecord {
+    pub label: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketListItemSummary {
+    pub id: String,
+    pub resource_key: String,
+    pub title: String,
+    pub state: String,
+    pub priority: String,
+    pub updated_at: Option<String>,
+    pub queued_by: Option<String>,
+    pub queued_at: Option<String>,
+    pub workspace_action_priority: String,
+    pub record_source: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketListHttpQuery {
+    pub states: Option<String>,
+    #[schemars(range(min = 0, max = 1000))]
+    pub limit: Option<usize>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketListResponse {
+    pub workspace_id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 1000))]
+    pub limit: usize,
+    pub items: Vec<TicketListItemSummary>,
+    pub page: QueryPage,
+    pub invalid_records: Vec<InvalidProjectRecord>,
+    pub record_authority: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketEventDetail {
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub sequence: usize,
+    pub event_ref: String,
+    pub kind: String,
+    pub author: Option<String>,
+    pub at: Option<String>,
+    pub status: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub reason: Option<String>,
+    pub state_field: Option<String>,
+    pub heading: Option<String>,
+    pub body: Option<String>,
+    pub attributes: BTreeMap<String, String>,
+    pub references: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketDetailRelation {
+    pub ticket_id: String,
+    pub kind: String,
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub target_resource_key: Option<String>,
+    pub note: Option<String>,
+    pub author: String,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketDetailDerivedRelation {
+    pub source_ticket: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub source_resource_key: Option<String>,
+    pub inverse_kind: String,
+    pub forward_kind: String,
+    pub note: Option<String>,
+    pub author: String,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketDetailRelationBlocker {
+    pub blocking_ticket: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub blocking_resource_key: Option<String>,
+    pub reason_kind: String,
+    pub relation_kind: String,
+    pub note: Option<String>,
+    pub blocking_state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketDetailRelationNotice {
+    pub related_ticket: String,
+    pub kind: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketDetailRelationView {
+    pub outgoing: Vec<TicketDetailRelation>,
+    pub incoming: Vec<TicketDetailDerivedRelation>,
+    pub blockers: Vec<TicketDetailRelationBlocker>,
+    pub notices: Vec<TicketDetailRelationNotice>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct ObjectiveLinkSummary {
+    pub id: String,
+    pub resource_key: String,
+    pub title: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketEvidenceEvent {
+    pub event_ref: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub sequence: usize,
+    pub kind: String,
+    pub at: Option<String>,
+    pub author: Option<String>,
+    pub excerpt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketAssignmentSummary {
+    pub assignment_id: String,
+    pub runtime_id: String,
+    pub worker_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub worker_resource_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[cfg_attr(feature = "typescript", ts(tag = "kind", rename_all = "snake_case"))]
+pub enum TicketAssignmentPrincipal {
+    User {
+        account_id: String,
+    },
+    Worker {
+        runtime_id: String,
+        worker_id: String,
+    },
+    WorkspaceAgent {
+        agent_key: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum TicketAssignmentRole {
+    Orchestrator,
+    Coder,
+    Owner,
+    Contributor,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketRoleAssignmentRecord {
+    pub workspace_id: String,
+    pub ticket_id: String,
+    pub assignment_id: String,
+    pub role: TicketAssignmentRole,
+    pub principal: TicketAssignmentPrincipal,
+    pub assigned_by: String,
+    pub assigned_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketRoleAssignmentSummary {
+    pub assignment_id: String,
+    pub role: String,
+    pub principal: TicketAssignmentPrincipal,
+    pub assigned_by: String,
+    pub assigned_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketActionEligibility {
+    pub can_assign_orchestrator: bool,
+    pub can_unassign_orchestrator: bool,
+    pub can_queue: bool,
+    pub can_start_manual_coder: bool,
+    pub queue_tickets: Vec<String>,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketMergeRequestSummary {
+    pub merge_request_id: String,
+    pub repository_key: String,
+    pub state: String,
+    pub review_status: String,
+    pub selector_from: Option<String>,
+    pub selector_to: String,
+    pub updated_at: String,
+    pub current_subject_ref: Option<String>,
+    pub review_subject_ref: Option<String>,
+    pub review_requested_at: Option<String>,
+    pub review_submitted_at: Option<String>,
+    pub review_excerpt: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct MergeRequestRefDiagnostic {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct MergeRequestListItem {
+    pub summary: TicketMergeRequestSummary,
+    pub ticket_ids: Vec<String>,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub thread_event_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ref_diagnostics: Vec<MergeRequestRefDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct MergeRequestListResponse {
+    pub items: Vec<MergeRequestListItem>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketEvidenceSummary {
+    pub has_merge_request: bool,
+    pub has_current_subject_ref: bool,
+    pub has_review_request: bool,
+    pub has_commit: bool,
+    pub review_status: Option<String>,
+    pub approved_current_subject: bool,
+    pub review_after_rescope: bool,
+    pub unresolved_request_changes: bool,
+    pub complete_for_integration: bool,
+    pub missing: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketQueryRequest {
+    pub query: Option<String>,
+    #[serde(default)]
+    pub states: Vec<String>,
+    #[serde(default)]
+    pub event_kinds: Vec<String>,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    pub review_status: Option<String>,
+    #[serde(default)]
+    pub attention: Vec<String>,
+    pub related_ticket_id: Option<String>,
+    pub relation_kind: Option<String>,
+    pub linked_objective_id: Option<String>,
+    pub updated_after: Option<String>,
+    pub updated_before: Option<String>,
+    pub sort: Option<String>,
+    #[schemars(range(min = 0, max = 1000))]
+    pub limit: Option<usize>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketQueryItem {
+    pub id: String,
+    pub resource_key: String,
+    pub title: String,
+    pub state: String,
+    pub readiness: Option<String>,
+    pub priority: String,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub item_revision: String,
+    pub workspace_action_priority: String,
+    pub matched_fields: Vec<String>,
+    pub snippet: Option<String>,
+    pub matching_event: Option<TicketEvidenceEvent>,
+    pub linked_objective_ids: Vec<String>,
+    pub linked_objective_keys: Vec<String>,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub relation_count: usize,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub blocker_count: usize,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub unresolved_blocker_count: usize,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub unresolved_review_count: usize,
+    pub evidence: TicketEvidenceSummary,
+    pub merge_request: Option<TicketMergeRequestSummary>,
+    pub current_coder: Option<TicketAssignmentSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketQueryResponse {
+    pub items: Vec<TicketQueryItem>,
+    pub page: QueryPage,
+    pub record_authority: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketShowRequest {
+    #[schemars(range(min = 0, max = 1000))]
+    pub event_limit: Option<usize>,
+    pub event_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketDetail {
+    pub id: String,
+    pub resource_key: String,
+    pub title: String,
+    pub state: String,
+    pub readiness: Option<String>,
+    pub priority: String,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub item_revision: String,
+    pub queued_by: Option<String>,
+    pub queued_at: Option<String>,
+    pub repository_key: Option<String>,
+    pub ref_selector: Option<String>,
+    pub risk_flags: Vec<String>,
+    pub body: String,
+    pub body_truncated: bool,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub event_count: usize,
+    pub events: Vec<TicketEventDetail>,
+    pub event_page: QueryPage,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub artifact_count: usize,
+    pub artifacts: Vec<String>,
+    pub relations: TicketDetailRelationView,
+    pub linked_objectives: Vec<ObjectiveLinkSummary>,
+    pub implementation_reports: Vec<TicketEvidenceEvent>,
+    pub assignments: Vec<TicketRoleAssignmentSummary>,
+    pub current_coder: Option<TicketAssignmentSummary>,
+    pub assignment_diagnostics: Vec<String>,
+    pub action_eligibility: TicketActionEligibility,
+    pub merge_request: Option<TicketMergeRequestSummary>,
+    pub evidence: TicketEvidenceSummary,
+    pub resolution: Option<String>,
+    pub record_source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DefaultIntakeReadyBodyRequest {
+    pub from: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(transparent)]
+pub struct TextResponse(pub String);
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketSummarySearchQuery {
+    pub state: Option<String>,
+    #[schemars(range(min = 0, max = 1000))]
+    pub limit: Option<usize>,
+}
+
+macro_rules! transparent_ticket_dto {
+    ($name:ident, $inner:ty) => {
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+        #[serde(transparent)]
+        pub struct $name(pub $inner);
+    };
+}
+
+transparent_ticket_dto!(TicketRecord, ticket::Ticket);
+transparent_ticket_dto!(TicketRecordRef, ticket::TicketRef);
+transparent_ticket_dto!(TicketRecordSummaryList, Vec<ticket::TicketSummary>);
+transparent_ticket_dto!(TicketDependencyCheckResponse, ticket::TicketDependencyCheck);
+transparent_ticket_dto!(TicketQueueResponse, ticket::TicketQueueOutcome);
+transparent_ticket_dto!(TicketDoctorResponse, ticket::TicketDoctorReport);
+transparent_ticket_dto!(TicketRelationRecord, ticket::TicketRelation);
+transparent_ticket_dto!(TicketRelationRecordList, Vec<ticket::TicketRelation>);
+transparent_ticket_dto!(TicketRelationRecordView, ticket::TicketRelationView);
+transparent_ticket_dto!(
+    TicketOrchestrationPlanRecord,
+    ticket::OrchestrationPlanRecord
+);
+transparent_ticket_dto!(
+    TicketOrchestrationPlanRecordList,
+    Vec<ticket::OrchestrationPlanRecord>
+);
+transparent_ticket_dto!(CreateTicketRecordRequest, ticket::NewTicket);
+transparent_ticket_dto!(EditTicketRecordItemRequest, ticket::TicketItemEdit);
+transparent_ticket_dto!(TicketThreadEventRequest, ticket::NewTicketEvent);
+transparent_ticket_dto!(TicketStateChangeRequest, ticket::TicketStateChange);
+transparent_ticket_dto!(TicketIntakeSummaryRequest, ticket::TicketIntakeSummary);
+transparent_ticket_dto!(TicketCloseRecordRequest, ticket::MarkdownText);
+transparent_ticket_dto!(CreateTicketRelationRequest, ticket::NewTicketRelation);
+transparent_ticket_dto!(
+    CreateTicketOrchestrationPlanRequest,
+    ticket::NewOrchestrationPlanRecord
+);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketMarkReadyRequest {
+    pub operation_key: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub intake_summary: Option<ticket::TicketIntakeSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketRelationRemoveRequest {
+    pub kind: ticket::TicketRelationKind,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketRelationSearchRequest {
+    pub ticket: Option<ticket::TicketIdOrSlug>,
+    pub kind: Option<ticket::TicketRelationKind>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketOrchestrationPlanSearchRequest {
+    pub ticket: Option<ticket::TicketIdOrSlug>,
+    pub kind: Option<ticket::OrchestrationPlanKind>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct SetTicketRoleAssignmentRequest {
+    pub operation_id: String,
+    pub principal: TicketAssignmentPrincipal,
+    pub expected_assignment_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct ClearTicketRoleAssignmentQuery {
+    pub operation_id: Option<String>,
+    pub assignment_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct CancelTicketImplementationRequest {
+    pub operation_id: String,
+    pub assignment_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketRoleAssignmentsResponse {
+    pub workspace_id: String,
+    pub ticket_id: String,
+    pub assignments: Vec<TicketRoleAssignmentRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct TicketRoleAssignmentMutationResponse {
+    pub workspace_id: String,
+    pub ticket_id: String,
+    pub assignment: Option<TicketRoleAssignmentRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+#[cfg_attr(feature = "typescript", ts(tag = "action", rename_all = "snake_case"))]
+pub enum BrowserTicketTargetEdit {
+    Set {
+        repository_key: String,
+        ref_selector: Option<String>,
+    },
+    Clear,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserTicketWorkflowState {
+    Planning,
+    Ready,
+    Queued,
+    Inprogress,
+    Done,
+    Closed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct BrowserEditTicketRequest {
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub old_string: Option<String>,
+    pub new_string: Option<String>,
+    #[serde(default)]
+    pub replace_all: bool,
+    pub target: Option<BrowserTicketTargetEdit>,
+    pub author: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct BrowserTransitionTicketStateRequest {
+    pub state: BrowserTicketWorkflowState,
+    pub reason: Option<String>,
+    pub body: Option<String>,
+    pub author: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserTicketThreadRole {
+    Comment,
+    Plan,
+    Decision,
+    ImplementationReport,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct BrowserAppendTicketEventRequest {
+    pub role: BrowserTicketThreadRole,
+    pub body: String,
+    pub author: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct BrowserQueueTicketRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct BrowserCloseTicketRequest {
+    pub resolution: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectiveListQuery {
+    #[schemars(range(min = 0, max = 1000))]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct ObjectiveListResponse {
+    pub workspace_id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 1000))]
+    pub limit: usize,
+    pub items: Vec<ObjectiveSummary>,
+    pub invalid_records: Vec<InvalidProjectRecord>,
+    pub record_authority: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct ObjectiveQueryRequest {
+    pub query: Option<String>,
+    #[serde(default)]
+    pub states: Vec<String>,
+    pub linked_ticket_id: Option<String>,
+    pub updated_after: Option<String>,
+    pub updated_before: Option<String>,
+    pub sort: Option<String>,
+    #[schemars(range(min = 0, max = 1000))]
+    pub limit: Option<usize>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct ObjectiveQueryItem {
+    pub id: String,
+    pub resource_key: String,
+    pub title: String,
+    pub state: String,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub matched_fields: Vec<String>,
+    pub snippet: Option<String>,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub linked_ticket_count: usize,
+    pub linked_tickets: Vec<String>,
+    pub linked_ticket_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct ObjectiveQueryResponse {
+    pub items: Vec<ObjectiveQueryItem>,
+    pub page: QueryPage,
+    pub record_authority: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct ObjectiveShowRequest {
+    #[schemars(range(min = 0, max = 1000))]
+    pub event_limit: Option<usize>,
+    pub event_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum MergeRequestState {
+    Open,
+    Merged,
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewDecision {
+    Approve,
+    RequestChanges,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum FindingSeverity {
+    Blocker,
+    Major,
+    Minor,
+    Note,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct ReviewFinding {
+    pub severity: FindingSeverity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub line: Option<u32>,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct MergeRequestWorkerIdentity {
+    pub runtime_id: String,
+    pub worker_id: String,
+}
+
+macro_rules! merge_request_event {
+    ($name:ident { $($field:ident : $ty:ty),* $(,)? }) => {
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+        #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+        #[serde(deny_unknown_fields)]
+        pub struct $name {
+            pub event_id: String,
+            #[cfg_attr(feature = "typescript", ts(type = "number"))]
+            #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+            pub sequence: u64,
+            $(pub $field: $ty,)*
+            pub created_at: String,
+        }
+    };
+}
+
+merge_request_event!(ReviewRequestedEvent {
+    subject_ref: String,
+    requested_by: MergeRequestWorkerIdentity,
+    reviewer: MergeRequestWorkerIdentity,
+});
+merge_request_event!(ReviewEvent {
+    request_event_id: String,
+    subject_ref: String,
+    decision: ReviewDecision,
+    body: String,
+    findings: Vec<ReviewFinding>,
+    reviewer: MergeRequestWorkerIdentity,
+});
+merge_request_event!(ReviewRevokedEvent {
+    review_event_id: String,
+    subject_ref: String,
+    reason: String,
+    revoked_by: MergeRequestWorkerIdentity,
+});
+merge_request_event!(ReviewCancelledEvent {
+    request_event_id: String,
+    subject_ref: String,
+    reason: String,
+});
+merge_request_event!(MergeRequestCommentEvent {
+    body: String,
+    author: MergeRequestWorkerIdentity,
+});
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum MergeStrategy {
+    FastForward,
+    Merge,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictResolution {
+    None,
+    Clean,
+    ConflictsResolved,
+}
+
+merge_request_event!(MergeEvent {
+    operation_id: String,
+    approval_event_id: String,
+    approved_source_ref: String,
+    target_ref_before: String,
+    target_ref_after: String,
+    strategy: MergeStrategy,
+    resolution: ConflictResolution,
+    merged_by: MergeRequestWorkerIdentity,
+});
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MergeRequestThreadEvent {
+    ReviewRequested(ReviewRequestedEvent),
+    Review(ReviewEvent),
+    ReviewRevoked(ReviewRevokedEvent),
+    ReviewCancelled(ReviewCancelledEvent),
+    Comment(MergeRequestCommentEvent),
+    Merge(MergeEvent),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PublicMergeRequest {
+    pub workspace_id: String,
+    pub merge_request_id: String,
+    pub repository_key: String,
+    pub state: MergeRequestState,
+    pub selector_from: Option<String>,
+    pub selector_to: String,
+    pub ticket_ids: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub thread: Vec<MergeRequestThreadEvent>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MergeRequestListQuery {
+    pub state: Option<String>,
+    pub repository_key: Option<String>,
+    pub ticket_ref: Option<String>,
+    pub selector_from: Option<String>,
+    pub selector_to: Option<String>,
+    pub cursor: Option<String>,
+    #[schemars(range(min = 0, max = 1000))]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MergeRequestThreadQuery {
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub after: Option<u64>,
+    #[schemars(range(min = 0, max = 1000))]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct MergeRequestRefResponse {
+    pub status: String,
+    #[serde(rename = "ref")]
+    pub revision_ref: Option<String>,
+    pub observed_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub diagnostic: Option<MergeRequestRefDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct MergeRequestLinkedTicketResponse {
+    pub ticket_id: String,
+    pub key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct MergeRequestDetailResponse {
+    #[serde(flatten)]
+    pub merge_request: PublicMergeRequest,
+    pub source: MergeRequestRefResponse,
+    pub target: MergeRequestRefResponse,
+    pub linked_tickets: Vec<MergeRequestLinkedTicketResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct MergeRequestReadinessResponse {
+    pub ready: bool,
+    pub blockers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub subject_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub review: Option<ReviewEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(transparent)]
+pub struct MergeRequestThreadResponse(pub Vec<MergeRequestThreadEvent>);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OpenMergeRequestRequest {
+    pub repository_key: String,
+    pub selector_from: String,
+    pub selector_to: String,
+    #[serde(default)]
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RepairMergeRequestSelectorRequest {
+    pub selector_from: String,
+    pub reason: String,
+    pub explicit_confirmation: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RevokeMergeRequestReviewRequest {
+    pub review_event_id: String,
+    pub reason: String,
+    pub explicit_confirmation: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RegisterReviewerChildSessionRequest {
+    pub child_session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RegisterMergeRequestReviewCapabilityRequest {
+    pub child_session_id: String,
+    pub capability_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitMergeRequestReviewRequest {
+    pub capability_token: String,
+    pub decision: ReviewDecision,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub findings: Vec<ReviewFinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CompleteMergeRequestRequest {
+    pub operation_id: String,
+    pub approval_event_id: String,
+    pub target_ref_before: String,
+    pub target_ref_after: String,
+    pub strategy: MergeStrategy,
+    pub resolution: ConflictResolution,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeSourceKind {
@@ -5112,6 +6682,61 @@ mod tests {
                 "workspace_deletion_get",
                 HttpMethod::Get,
                 "/api/workspace-deletions/{operation_id}",
+            ),
+        ] {
+            let operation = operations
+                .iter()
+                .find(|operation| operation.operation_id == operation_id)
+                .unwrap_or_else(|| panic!("missing ServerApi operation {operation_id}"));
+            assert_eq!(operation.method, method, "{operation_id}");
+            assert_eq!(operation.path, path, "{operation_id}");
+        }
+    }
+
+    #[test]
+    fn ticket_objective_and_merge_request_operations_are_in_server_api_metadata() {
+        let operations = ServerApiMetadata::OPERATIONS;
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|operation| operation.operation_id.starts_with("ticket_"))
+                .count(),
+            37
+        );
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|operation| operation.operation_id.starts_with("objective_"))
+                .count(),
+            11
+        );
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|operation| operation.operation_id.starts_with("merge_request_"))
+                .count(),
+            11
+        );
+        for (operation_id, method, path) in [
+            (
+                "ticket_relation_query",
+                HttpMethod::Post,
+                "/api/w/{workspace_id}/tickets/relations/search",
+            ),
+            (
+                "ticket_orchestration_plan_query",
+                HttpMethod::Post,
+                "/api/w/{workspace_id}/tickets/orchestration-plans/search",
+            ),
+            (
+                "merge_request_complete",
+                HttpMethod::Post,
+                "/api/w/{workspace_id}/tickets/{id}/merge-request/complete",
+            ),
+            (
+                "objective_ticket_unlink",
+                HttpMethod::Delete,
+                "/api/w/{workspace_id}/objectives/{objective_id}/ticket-links/{ticket_id}",
             ),
         ] {
             let operation = operations

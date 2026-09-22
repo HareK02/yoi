@@ -18,7 +18,7 @@ const DOMAIN_TABLES: [&str; 5] = [
     "merge_request_reviewer_child_sessions",
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MergeRequestState {
     Open,
@@ -43,13 +43,13 @@ impl MergeRequestState {
         }
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewDecision {
     Approve,
     RequestChanges,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FindingSeverity {
     Blocker,
@@ -57,7 +57,7 @@ pub enum FindingSeverity {
     Minor,
     Note,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReviewFinding {
     pub severity: FindingSeverity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -68,7 +68,7 @@ pub struct ReviewFinding {
     pub line: Option<u32>,
     pub body: String,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkerIdentity {
     pub runtime_id: String,
     pub worker_id: String,
@@ -91,18 +91,20 @@ impl MergeRequestAuth {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReviewRequestedEvent {
     pub event_id: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub sequence: u64,
     pub subject_ref: String,
     pub requested_by: WorkerIdentity,
     pub reviewer: WorkerIdentity,
     pub created_at: DateTime<Utc>,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReviewEvent {
     pub event_id: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub sequence: u64,
     pub request_event_id: String,
     pub subject_ref: String,
@@ -112,9 +114,10 @@ pub struct ReviewEvent {
     pub reviewer: WorkerIdentity,
     pub created_at: DateTime<Utc>,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReviewRevokedEvent {
     pub event_id: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub sequence: u64,
     pub review_event_id: String,
     pub subject_ref: String,
@@ -122,39 +125,42 @@ pub struct ReviewRevokedEvent {
     pub revoked_by: WorkerIdentity,
     pub created_at: DateTime<Utc>,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReviewCancelledEvent {
     pub event_id: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub sequence: u64,
     pub request_event_id: String,
     pub subject_ref: String,
     pub reason: String,
     pub created_at: DateTime<Utc>,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CommentEvent {
     pub event_id: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub sequence: u64,
     pub body: String,
     pub author: WorkerIdentity,
     pub created_at: DateTime<Utc>,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MergeStrategy {
     FastForward,
     Merge,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ConflictResolution {
     None,
     Clean,
     ConflictsResolved,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MergeEvent {
     pub event_id: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub sequence: u64,
     pub operation_id: String,
     pub approval_event_id: String,
@@ -166,7 +172,7 @@ pub struct MergeEvent {
     pub merged_by: WorkerIdentity,
     pub created_at: DateTime<Utc>,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MergeRequestThreadEvent {
     ReviewRequested(ReviewRequestedEvent),
@@ -203,7 +209,7 @@ impl MergeRequestThreadEvent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MergeRequest {
     pub workspace_id: String,
     pub merge_request_id: String,
@@ -313,7 +319,7 @@ pub struct ReadinessCheck {
     pub current_subject_ref: Option<String>,
     pub auth: MergeRequestAuth,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReadinessReport {
     pub ready: bool,
     pub blockers: Vec<String>,

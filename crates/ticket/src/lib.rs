@@ -133,7 +133,19 @@ fn sqlite_err(error: impl std::fmt::Display) -> TicketError {
     TicketError::Sqlite(error.to_string())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 pub enum TicketStatus {
     Open,
     Closed,
@@ -162,7 +174,9 @@ impl fmt::Display for TicketStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
 pub enum ExtensibleTicketStatus {
     Open,
     Closed,
@@ -206,7 +220,19 @@ impl From<TicketStatus> for ExtensibleTicketStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TicketWorkflowState {
     Planning,
@@ -273,7 +299,7 @@ impl fmt::Display for TicketWorkflowState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MarkdownText(pub String);
 
 impl MarkdownText {
@@ -298,7 +324,7 @@ impl From<String> for MarkdownText {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum TicketIdOrSlug {
     Id(String),
     Slug(String),
@@ -325,7 +351,7 @@ impl From<String> for TicketIdOrSlug {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TicketEventKind {
     Create,
@@ -390,13 +416,13 @@ impl From<&str> for TicketEventKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketReference {
     pub kind: String,
     pub target: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct NewTicketEvent {
     pub kind: TicketEventKind,
     pub author: Option<String>,
@@ -415,7 +441,7 @@ impl NewTicketEvent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketStateChange {
     pub from: String,
     pub to: String,
@@ -443,7 +469,7 @@ impl TicketStateChange {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketIntakeSummary {
     pub author: Option<String>,
     pub body: MarkdownText,
@@ -460,7 +486,7 @@ impl TicketIntakeSummary {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct NewTicket {
     pub title: String,
     pub slug: Option<String>,
@@ -533,7 +559,7 @@ pub trait TicketTargetAuthority: Send + Sync {
     ) -> Result<ResolvedTicketTarget>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketMarkReady {
     pub operation_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -685,7 +711,7 @@ fn validate_generic_state_change(
     Ok(())
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketItemEdit {
     pub title: Option<String>,
     /// Whole-body replacement for legacy authoring surfaces. Prefer `body_replacement`
@@ -697,7 +723,7 @@ pub struct TicketItemEdit {
     pub author: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketBodyReplacement {
     pub old_string: String,
     pub new_string: String,
@@ -787,7 +813,7 @@ impl TicketBodyReplacement {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketDependencyCheck {
     pub ticket: TicketSummary,
     pub blockers: Vec<TicketRelationBlocker>,
@@ -796,7 +822,7 @@ pub struct TicketDependencyCheck {
     pub recommended_action: TicketWorkspaceNextAction,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketQueueOutcome {
     pub requested_ticket: String,
     pub queued_tickets: Vec<String>,
@@ -923,7 +949,7 @@ impl TicketListQuery {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketRef {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -932,7 +958,19 @@ pub struct TicketRef {
     pub status: TicketStatus,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TicketRelationKind {
     DependsOn,
@@ -971,7 +1009,7 @@ impl fmt::Display for TicketRelationKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct NewTicketRelation {
     pub kind: TicketRelationKind,
     pub target: String,
@@ -979,7 +1017,7 @@ pub struct NewTicketRelation {
     pub author: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TicketRelation {
     pub ticket_id: String,
@@ -991,7 +1029,7 @@ pub struct TicketRelation {
     pub at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DerivedTicketRelation {
     pub source_ticket: String,
     pub inverse_kind: String,
@@ -1001,7 +1039,7 @@ pub struct DerivedTicketRelation {
     pub at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketRelationBlocker {
     pub blocking_ticket: String,
     pub reason_kind: String,
@@ -1010,14 +1048,14 @@ pub struct TicketRelationBlocker {
     pub blocking_state: TicketWorkflowState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketRelationNotice {
     pub related_ticket: String,
     pub kind: TicketRelationKind,
     pub message: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketRelationView {
     pub outgoing: Vec<TicketRelation>,
     pub incoming: Vec<DerivedTicketRelation>,
@@ -1033,7 +1071,7 @@ pub enum TicketWorkspaceActionPriority {
     Background,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TicketWorkspaceNextAction {
     Clarify,
@@ -1057,7 +1095,7 @@ pub struct TicketWorkspaceStateOverlay {
     pub workflow_state: TicketWorkflowState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketQueueGuard {
     pub can_queue_for_orchestrator: bool,
     pub reason: Option<String>,
@@ -1473,7 +1511,19 @@ fn format_workspace_relation_blockers(blockers: &[&TicketRelationBlocker]) -> St
     formatted
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum OrchestrationPlanKind {
     Before,
@@ -1533,7 +1583,7 @@ impl fmt::Display for OrchestrationPlanKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AcceptedOrchestrationPlan {
     pub summary: String,
@@ -1545,7 +1595,7 @@ pub struct AcceptedOrchestrationPlan {
     pub role_plan: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct NewOrchestrationPlanRecord {
     pub kind: OrchestrationPlanKind,
     pub related_ticket: Option<String>,
@@ -1554,7 +1604,7 @@ pub struct NewOrchestrationPlanRecord {
     pub author: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OrchestrationPlanRecord {
     pub id: String,
@@ -1570,7 +1620,7 @@ pub struct OrchestrationPlanRecord {
     pub at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketMeta {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1596,7 +1646,7 @@ pub struct TicketMeta {
     pub raw: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketSummary {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1651,13 +1701,13 @@ pub struct SqliteTicketListPage {
     pub next: Option<SqliteTicketListCursor>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketDocument {
     pub body: MarkdownText,
     pub raw_frontmatter: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketEvent {
     pub kind: TicketEventKind,
     pub author: Option<String>,
@@ -1673,13 +1723,13 @@ pub struct TicketEvent {
     pub attributes: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketArtifactRef {
     /// Path relative to the ticket's `artifacts/` directory.
     pub relative_path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Ticket {
     pub meta: TicketMeta,
     pub document: TicketDocument,
@@ -1689,20 +1739,20 @@ pub struct Ticket {
     pub resolution: Option<MarkdownText>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum TicketDoctorSeverity {
     Error,
     Warning,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketDoctorDiagnostic {
     pub severity: TicketDoctorSeverity,
     pub message: String,
     pub path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketDoctorReport {
     pub diagnostics: Vec<TicketDoctorDiagnostic>,
 }

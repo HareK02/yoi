@@ -68,7 +68,7 @@ impl From<server_api::client_support::ClientError<server_api::RepositoryApiError
     }
 }
 
-fn server_client_error(
+pub(crate) fn server_client_error(
     backend: &BackendApiClient,
     error: server_api::client_support::ClientError<server_api::RepositoryApiError>,
 ) -> BackendWorkspaceClientError {
@@ -92,7 +92,7 @@ fn server_client_error(
 }
 
 #[derive(Clone, Debug)]
-struct ServerBearerAuthorizer {
+pub(crate) struct ServerBearerAuthorizer {
     authorization: String,
 }
 
@@ -114,7 +114,7 @@ impl server_api::client_support::RequestAuthorizer for ServerBearerAuthorizer {
 
 const SERVER_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
 
-fn server_api_client(
+pub(crate) fn server_api_client(
     backend: &BackendApiClient,
 ) -> Result<server_api::ServerApiClient<ServerBearerAuthorizer>, BackendWorkspaceClientError> {
     server_api::ServerApiClient::builder(backend.origin().as_str())
