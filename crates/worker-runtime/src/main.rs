@@ -75,6 +75,23 @@ fn init_serve_tracing() {
         .try_init();
 }
 
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 fn run() -> Result<(), ProcessError> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if matches!(args.first().map(String::as_str), Some("migrate")) {
@@ -104,11 +121,12 @@ fn run() -> Result<(), ProcessError> {
             "yoi-runtime listening on {local_addr}; intended client is a trusted backend/proxy, not a browser"
         );
         let server = if let Some(workspace_auth) = workspace_http_auth {
-            worker_runtime::http_server::serve_runtime_http_with_workspace_auth(
+            worker_runtime::http_server::serve_runtime_http_with_workspace_auth_shutdown(
                 worker_runtime,
                 listener,
                 config.http.local_token,
                 workspace_auth,
+                shutdown_signal(),
             )
             .await
         } else {
@@ -117,10 +135,11 @@ fn run() -> Result<(), ProcessError> {
                     "Runtime HTTP server requires Workspace issuer auth or --local-token".to_owned(),
                 )
             })?;
-            worker_runtime::http_server::serve_runtime_http(
+            worker_runtime::http_server::serve_runtime_http_with_shutdown(
                 worker_runtime,
                 listener,
                 Some(local_token),
+                shutdown_signal(),
             )
             .await
         };

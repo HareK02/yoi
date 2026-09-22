@@ -1267,6 +1267,65 @@ impl Drop for PanelHarness {
     }
 }
 
+mod worker_environment;
+
+pub use worker_environment::{
+    WorkerBinaryProviderInfo, WorkerE2eEnvironment, WorkerEnvironmentCleanupReport,
+    worker_binary_provider_info,
+};
+
+#[derive(Debug)]
+struct FixtureAllocation {
+    temp_root: TempDir,
+    root: PathBuf,
+    home: PathBuf,
+    xdg_data_home: PathBuf,
+    xdg_state_home: PathBuf,
+    xdg_config_home: PathBuf,
+    xdg_runtime_dir: PathBuf,
+    artifacts_dir: PathBuf,
+}
+
+fn allocate_fixture(kind: &str) -> Result<FixtureAllocation> {
+    let workspace_root = workspace_root()?;
+    let target_dir = workspace_root.join("target");
+    let temp_parent = target_dir.join("e2e-tmp");
+    let artifact_parent = target_dir.join("e2e-artifacts");
+    fs::create_dir_all(&temp_parent)?;
+    fs::create_dir_all(&artifact_parent)?;
+    let fixture_id = format!(
+        "{kind}-{}-{}-{}",
+        std::process::id(),
+        now_ms(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let temp_root = tempfile::Builder::new()
+        .prefix(&format!("yoi-e2e-{fixture_id}-"))
+        .tempdir_in(&temp_parent)?;
+    let root = temp_root.path().to_path_buf();
+    let allocation = FixtureAllocation {
+        temp_root,
+        home: root.join("home"),
+        xdg_data_home: root.join("data"),
+        xdg_state_home: root.join("state"),
+        xdg_config_home: root.join("config"),
+        xdg_runtime_dir: root.join("run"),
+        artifacts_dir: artifact_parent.join(fixture_id),
+        root,
+    };
+    for dir in [
+        &allocation.home,
+        &allocation.xdg_data_home,
+        &allocation.xdg_state_home,
+        &allocation.xdg_config_home,
+        &allocation.xdg_runtime_dir,
+        &allocation.artifacts_dir,
+    ] {
+        fs::create_dir_all(dir)?;
+    }
+    Ok(allocation)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FixtureCleanupReport {
     pub fixture_root: PathBuf,
@@ -1299,107 +1358,87 @@ pub struct FixtureWorkspace {
 
 impl FixtureWorkspace {
     pub fn new(binary: &Path) -> Result<Self> {
-        let workspace_root = workspace_root()?;
-        let target_dir = workspace_root.join("target");
-        let temp_parent = target_dir.join("e2e-tmp");
-        let artifact_parent = target_dir.join("e2e-artifacts");
-        fs::create_dir_all(&temp_parent)?;
-        fs::create_dir_all(&artifact_parent)?;
+        Self::new_inner(binary, true)
+    }
 
-        let fixture_id = format!(
-            "{}-{}-{}",
-            std::process::id(),
-            now_ms(),
-            FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
-        );
-        let temp_root = tempfile::Builder::new()
-            .prefix(&format!("yoi-e2e-{fixture_id}-"))
-            .tempdir_in(&temp_parent)?;
-        let root = temp_root.path().to_path_buf();
-        let artifacts_dir = artifact_parent.join(fixture_id);
+    pub fn new_rewind(binary: &Path) -> Result<Self> {
+        Self::new_inner(binary, false)
+    }
+
+    fn new_inner(binary: &Path, setup_dashboard: bool) -> Result<Self> {
+        let allocation = allocate_fixture("tui")?;
+        let root = allocation.root;
+        let artifacts_dir = allocation.artifacts_dir;
         let workspace = root.join("workspace");
-        let home = root.join("home");
-        let xdg_data_home = root.join("data");
-        let xdg_state_home = root.join("state");
-        let xdg_config_home = root.join("config");
-        let xdg_runtime_dir = root.join("runtime");
-        for dir in [
-            &workspace,
-            &home,
-            &xdg_data_home,
-            &xdg_state_home,
-            &xdg_config_home,
-            &xdg_runtime_dir,
-            &artifacts_dir,
-        ] {
-            fs::create_dir_all(dir)?;
-        }
+        fs::create_dir_all(&workspace)?;
 
         let mut fixture = Self {
-            temp_root: Some(temp_root),
+            temp_root: Some(allocation.temp_root),
             root,
             workspace,
-            home,
-            xdg_data_home,
-            xdg_state_home,
-            xdg_config_home,
-            xdg_runtime_dir,
+            home: allocation.home,
+            xdg_data_home: allocation.xdg_data_home,
+            xdg_state_home: allocation.xdg_state_home,
+            xdg_config_home: allocation.xdg_config_home,
+            xdg_runtime_dir: allocation.xdg_runtime_dir,
             artifacts_dir,
             ready_ticket_id: String::new(),
             planning_ticket_id: String::new(),
         };
         fixture.write_fixture_metadata("created", None)?;
 
-        let worker_metadata_root = active_worker_metadata_root(&fixture.home);
-        write_blocking_worker_metadata(&worker_metadata_root, "workspace")?;
-        write_blocking_worker_metadata(&worker_metadata_root, "workspace-orchestrator")?;
-        run_yoi(
-            binary,
-            &fixture.workspace,
-            &fixture.home,
-            &fixture.xdg_data_home,
-            &fixture.xdg_state_home,
-            &fixture.xdg_config_home,
-            &fixture.xdg_runtime_dir,
-            &fixture.artifacts_dir,
-            &["ticket", "init"],
-        )?;
-        let first = create_ticket(
-            binary,
-            &fixture.workspace,
-            &fixture.home,
-            &fixture.xdg_data_home,
-            &fixture.xdg_state_home,
-            &fixture.xdg_config_home,
-            &fixture.xdg_runtime_dir,
-            &fixture.artifacts_dir,
-            READY_FIXTURE_TICKET_TITLE,
-        )?;
-        run_yoi(
-            binary,
-            &fixture.workspace,
-            &fixture.home,
-            &fixture.xdg_data_home,
-            &fixture.xdg_state_home,
-            &fixture.xdg_config_home,
-            &fixture.xdg_runtime_dir,
-            &fixture.artifacts_dir,
-            &["ticket", "state", &first, "ready"],
-        )?;
-        let second = create_ticket(
-            binary,
-            &fixture.workspace,
-            &fixture.home,
-            &fixture.xdg_data_home,
-            &fixture.xdg_state_home,
-            &fixture.xdg_config_home,
-            &fixture.xdg_runtime_dir,
-            &fixture.artifacts_dir,
-            PLANNING_FIXTURE_TICKET_TITLE,
-        )?;
-        fixture.ready_ticket_id = first;
-        fixture.planning_ticket_id = second;
-        fixture.setup_orchestration_overlay(binary)?;
+        if setup_dashboard {
+            let worker_metadata_root = active_worker_metadata_root(&fixture.home);
+            write_blocking_worker_metadata(&worker_metadata_root, "workspace")?;
+            write_blocking_worker_metadata(&worker_metadata_root, "workspace-orchestrator")?;
+            run_yoi(
+                binary,
+                &fixture.workspace,
+                &fixture.home,
+                &fixture.xdg_data_home,
+                &fixture.xdg_state_home,
+                &fixture.xdg_config_home,
+                &fixture.xdg_runtime_dir,
+                &fixture.artifacts_dir,
+                &["ticket", "init"],
+            )?;
+            let first = create_ticket(
+                binary,
+                &fixture.workspace,
+                &fixture.home,
+                &fixture.xdg_data_home,
+                &fixture.xdg_state_home,
+                &fixture.xdg_config_home,
+                &fixture.xdg_runtime_dir,
+                &fixture.artifacts_dir,
+                READY_FIXTURE_TICKET_TITLE,
+            )?;
+            run_yoi(
+                binary,
+                &fixture.workspace,
+                &fixture.home,
+                &fixture.xdg_data_home,
+                &fixture.xdg_state_home,
+                &fixture.xdg_config_home,
+                &fixture.xdg_runtime_dir,
+                &fixture.artifacts_dir,
+                &["ticket", "state", &first, "ready"],
+            )?;
+            let second = create_ticket(
+                binary,
+                &fixture.workspace,
+                &fixture.home,
+                &fixture.xdg_data_home,
+                &fixture.xdg_state_home,
+                &fixture.xdg_config_home,
+                &fixture.xdg_runtime_dir,
+                &fixture.artifacts_dir,
+                PLANNING_FIXTURE_TICKET_TITLE,
+            )?;
+            fixture.ready_ticket_id = first;
+            fixture.planning_ticket_id = second;
+            fixture.setup_orchestration_overlay(binary)?;
+        }
         fixture.write_fixture_metadata("ready", None)?;
         Ok(fixture)
     }

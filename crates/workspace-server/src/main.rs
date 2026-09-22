@@ -9,18 +9,19 @@ use yoi_workspace_server::hosts::{
     EMBEDDED_RUNTIME_ID, RemoteRuntimeConfig, is_loopback_runtime_origin,
 };
 use yoi_workspace_server::store::{
-    SqliteWorkspaceStore, WorkspaceRuntimeAuthenticationMode, WorkspaceRuntimeBinding,
-    WorkspaceRuntimeBindingState,
+    AccountRecord, ApiTokenRecord, SqliteWorkspaceStore, UserRecord,
+    WorkspaceRuntimeAuthenticationMode, WorkspaceRuntimeBinding, WorkspaceRuntimeBindingState,
 };
 use yoi_workspace_server::{
     ControlPlaneStore, ResolvedWorkspaceBackendConfig, ServerConfig, ServerHostConfigFile,
-    WorkspaceRecord, serve_workspace_catalog,
+    WorkspaceRecord, serve_workspace_catalog_with_shutdown,
 };
 
 #[derive(Debug)]
 enum Command {
     Serve(ServeOptions),
     Migrate(MigrateOptions),
+    BootstrapAuth(BootstrapAuthOptions),
     Skills(SkillsCommand),
     Help,
 }
@@ -36,6 +37,13 @@ struct MigrateOptions {
     database: Option<PathBuf>,
     dry_run: bool,
     help: bool,
+}
+
+#[derive(Debug)]
+struct BootstrapAuthOptions {
+    handle: String,
+    display_name: Option<String>,
+    label: Option<String>,
 }
 
 #[derive(Debug)]
@@ -77,6 +85,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match parse_command(&args)? {
         Command::Serve(options) => run_serve(options).await,
         Command::Migrate(options) => run_migrate(options),
+        Command::BootstrapAuth(options) => run_bootstrap_auth(options),
         Command::Skills(command) => run_skills(command),
         Command::Help => Ok(()),
     }
@@ -90,6 +99,7 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
 
     match command.as_str() {
         "migrate" => parse_migrate_options(rest).map(Command::Migrate),
+        "bootstrap-auth" => parse_bootstrap_auth_options(rest).map(Command::BootstrapAuth),
         "skills" => parse_skills_command(rest),
         "serve" => {
             if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -103,7 +113,7 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
             Ok(Command::Help)
         }
         other => Err(CliError(format!(
-            "unknown command `{other}`; expected `migrate`, `skills`, or `serve`"
+            "unknown command `{other}`; expected `bootstrap-auth`, `migrate`, `skills`, or `serve`"
         ))),
     }
 }
@@ -214,6 +224,131 @@ fn run_migrate(options: MigrateOptions) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
+fn run_bootstrap_auth(options: BootstrapAuthOptions) -> Result<(), Box<dyn std::error::Error>> {
+    let database_path = ServerConfig::default_server_database_path();
+    if let Some(parent) = database_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let store = SqliteWorkspaceStore::open(&database_path)?;
+    if !store.list_workspaces()?.is_empty() {
+        return Err(Box::new(CliError(
+            "bootstrap-auth is available only before the first Workspace is created".to_string(),
+        )));
+    }
+
+    let handle = yoi_workspace_server::auth::normalize_handle(&options.handle)?;
+    let display_name = options
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&handle)
+        .to_string();
+    let now = yoi_workspace_server::auth::now_rfc3339();
+    let user = match store.any_user()? {
+        Some(user) if user.handle == handle => user,
+        Some(_) => {
+            return Err(Box::new(CliError(
+                "bootstrap-auth refuses to replace an existing bootstrap user".to_string(),
+            )));
+        }
+        None => {
+            let account_id = yoi_workspace_server::auth::new_id("acct-user");
+            store.upsert_account(&AccountRecord {
+                account_id: account_id.clone(),
+                kind: "user".to_string(),
+                handle: handle.clone(),
+                display_name: display_name.clone(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            })?;
+            let user = UserRecord {
+                user_id: yoi_workspace_server::auth::new_id("user"),
+                account_id,
+                handle,
+                display_name,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            };
+            store.upsert_user(&user)?;
+            user
+        }
+    };
+
+    let access_token = yoi_workspace_server::auth::mint_secret("yoi_api");
+    store.create_api_token(&ApiTokenRecord {
+        token_id: yoi_workspace_server::auth::new_id("api-token"),
+        token_hash: yoi_workspace_server::auth::token_hash(&access_token),
+        user_id: user.user_id.clone(),
+        label: options
+            .label
+            .unwrap_or_else(|| "initial host setup".to_string()),
+        created_at: now,
+        expires_at: None,
+        revoked_at: None,
+        last_used_at: None,
+    })?;
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "access_token": access_token,
+            "token_type": "bearer",
+            "user": {
+                "user_id": user.user_id,
+                "account_id": user.account_id,
+                "handle": user.handle,
+                "display_name": user.display_name,
+            }
+        }))?
+    );
+    Ok(())
+}
+
+fn parse_bootstrap_auth_options(args: &[String]) -> Result<BootstrapAuthOptions, CliError> {
+    let mut handle = None;
+    let mut display_name = None;
+    let mut label = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let (field, target) = match arg.as_str() {
+            "--handle" => ("--handle", &mut handle),
+            "--display-name" => ("--display-name", &mut display_name),
+            "--label" => ("--label", &mut label),
+            _ if arg.starts_with("--handle=") => {
+                handle = Some(value_after_equals(arg, "--handle")?.to_string());
+                index += 1;
+                continue;
+            }
+            _ if arg.starts_with("--display-name=") => {
+                display_name = Some(value_after_equals(arg, "--display-name")?.to_string());
+                index += 1;
+                continue;
+            }
+            _ if arg.starts_with("--label=") => {
+                label = Some(value_after_equals(arg, "--label")?.to_string());
+                index += 1;
+                continue;
+            }
+            other => return Err(CliError(format!("unknown bootstrap-auth option `{other}`"))),
+        };
+        index += 1;
+        let value = args
+            .get(index)
+            .ok_or_else(|| CliError(format!("{field} requires a value")))?;
+        if target.replace(value.clone()).is_some() {
+            return Err(CliError(format!("{field} must be provided only once")));
+        }
+        index += 1;
+    }
+    let handle = handle.ok_or_else(|| CliError("bootstrap-auth requires --handle".to_string()))?;
+    Ok(BootstrapAuthOptions {
+        handle,
+        display_name,
+        label,
+    })
+}
+
 fn init_serve_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -224,6 +359,23 @@ fn init_serve_tracing() {
         .json()
         .flatten_event(true)
         .try_init();
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Error>> {
@@ -284,7 +436,8 @@ async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Erro
         database_path.display(),
         local_addr
     );
-    serve_workspace_catalog(resolved.server, store, listener).await?;
+    serve_workspace_catalog_with_shutdown(resolved.server, store, listener, shutdown_signal())
+        .await?;
     Ok(())
 }
 
@@ -490,7 +643,7 @@ fn parse_listen(value: &str) -> Result<SocketAddr, CliError> {
 
 fn print_help() {
     println!(
-        "yoi-server\n\nUsage:\n  yoi-server migrate [--dry-run] [--database <PATH>]\n  yoi-server skills <COMMAND> [OPTIONS]\n  yoi-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
+        "yoi-server\n\nUsage:\n  yoi-server bootstrap-auth --handle <HANDLE> [--display-name <NAME>] [--label <LABEL>]\n  yoi-server migrate [--dry-run] [--database <PATH>]\n  yoi-server skills <COMMAND> [OPTIONS]\n  yoi-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
     );
 }
 
@@ -525,6 +678,28 @@ mod tests {
                 "unexpected error for {command}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn parse_bootstrap_auth_requires_handle_and_accepts_host_setup_fields() {
+        let command = parse_command(&[
+            "bootstrap-auth".to_string(),
+            "--handle=e2e-owner".to_string(),
+            "--display-name".to_string(),
+            "E2E Owner".to_string(),
+            "--label".to_string(),
+            "e2e setup".to_string(),
+        ])
+        .unwrap();
+        let Command::BootstrapAuth(options) = command else {
+            panic!("expected bootstrap-auth command");
+        };
+        assert_eq!(options.handle, "e2e-owner");
+        assert_eq!(options.display_name.as_deref(), Some("E2E Owner"));
+        assert_eq!(options.label.as_deref(), Some("e2e setup"));
+
+        let error = parse_bootstrap_auth_options(&[]).unwrap_err();
+        assert_eq!(error.to_string(), "bootstrap-auth requires --handle");
     }
 
     #[test]
@@ -662,7 +837,9 @@ mod tests {
             let error = parse_command(&[command.to_owned()]).unwrap_err();
             assert_eq!(
                 error.to_string(),
-                format!("unknown command `{command}`; expected `migrate`, `skills`, or `serve`")
+                format!(
+                    "unknown command `{command}`; expected `bootstrap-auth`, `migrate`, `skills`, or `serve`"
+                )
             );
         }
     }

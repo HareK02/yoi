@@ -123,8 +123,8 @@ impl FsRuntimeStore {
         })?;
         let owner_lock = acquire_runtime_store_owner_lock(&root)?;
         recover_runtime_store_migration(&root)?;
-        let existed = root.exists();
-        if existed && !root.is_dir() {
+        let root_existed = root.exists();
+        if root_existed && !root.is_dir() {
             return Err(RuntimeError::StoreCorrupt {
                 operation: "open runtime store",
                 path: root,
@@ -132,17 +132,36 @@ impl FsRuntimeStore {
             });
         }
 
-        if !existed {
+        if !root_existed {
             fs::create_dir_all(&root).map_err(|source| RuntimeError::StoreIo {
                 operation: "create runtime store root",
                 path: root.clone(),
                 source,
             })?;
         }
+        let snapshot_exists = root.join(RUNTIME_FILE).is_file();
+        let workers_dir = root.join(WORKERS_DIR);
+        if !snapshot_exists
+            && workers_dir.is_dir()
+            && fs::read_dir(&workers_dir)
+                .map_err(|source| RuntimeError::StoreIo {
+                    operation: "inspect uninitialized runtime store",
+                    path: workers_dir.clone(),
+                    source,
+                })?
+                .next()
+                .is_some()
+        {
+            return Err(RuntimeError::StoreCorrupt {
+                operation: "open runtime store",
+                path: root,
+                message: "Worker records exist without a Runtime snapshot".to_string(),
+            });
+        }
 
-        fs::create_dir_all(root.join(WORKERS_DIR)).map_err(|source| RuntimeError::StoreIo {
+        fs::create_dir_all(&workers_dir).map_err(|source| RuntimeError::StoreIo {
             operation: "create runtime store",
-            path: root.join(WORKERS_DIR),
+            path: workers_dir,
             source,
         })?;
         let legacy_events = root.join("events.jsonl");
@@ -158,14 +177,14 @@ impl FsRuntimeStore {
             }
         }
 
-        if existed {
+        if snapshot_exists {
             migrate_runtime_store(&root, runtime_id)?;
         }
         let store = Self {
             root,
             _owner_lock: Some(owner_lock),
         };
-        let state = if existed {
+        let state = if snapshot_exists {
             Some(store.load_runtime_state()?)
         } else {
             None
@@ -2135,6 +2154,37 @@ mod tests {
         let document: serde_json::Value =
             serde_json::from_slice(&fs::read(root.join(RUNTIME_FILE)).unwrap()).unwrap();
         document["schema_version"].as_u64().unwrap()
+    }
+
+    #[test]
+    fn auth_initialized_directory_without_snapshot_is_a_fresh_store() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("runtime");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("auth.toml"), b"fixture auth material").unwrap();
+
+        let opened = FsRuntimeStore::open_or_create(root.clone(), "runtime-test").unwrap();
+
+        assert!(opened.state.is_none());
+        assert!(root.join(WORKERS_DIR).is_dir());
+        assert_eq!(
+            fs::read(root.join("auth.toml")).unwrap(),
+            b"fixture auth material"
+        );
+    }
+
+    #[test]
+    fn worker_records_without_runtime_snapshot_are_rejected() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("runtime");
+        fs::create_dir_all(root.join(WORKERS_DIR).join("orphan")).unwrap();
+
+        let error = FsRuntimeStore::open_or_create(root.clone(), "runtime-test").unwrap_err();
+
+        assert!(matches!(
+            error,
+            RuntimeError::StoreCorrupt { path, .. } if path == root
+        ));
     }
 
     #[test]

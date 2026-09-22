@@ -1995,6 +1995,10 @@ struct WorkspaceListQuery {
     limit: Option<usize>,
 }
 
+async fn server_health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
 async fn list_server_workspaces(
     State(api): State<WorkspaceServerApi>,
     headers: HeaderMap,
@@ -2663,6 +2667,7 @@ pub async fn build_workspace_server_router(
     api.preload().await?;
     api.recover_workspace_deletions().await?;
     let catalog = Router::new()
+        .route("/health", get(server_health))
         .route(
             "/api/workspaces",
             get(list_server_workspaces).post(create_server_workspace),
@@ -4563,6 +4568,22 @@ struct ApiFailureLogEvent<'a> {
     message: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostics: Option<&'a [RuntimeDiagnostic]>,
+}
+
+pub async fn serve_workspace_catalog_with_shutdown<F>(
+    template: ServerConfig,
+    store: Arc<dyn ControlPlaneStore>,
+    listener: TcpListener,
+    shutdown: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let router = build_workspace_server_router(template, store).await?;
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown)
+        .await?;
+    Ok(())
 }
 
 pub async fn serve_workspace_catalog(
