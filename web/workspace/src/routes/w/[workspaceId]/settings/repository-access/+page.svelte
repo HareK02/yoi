@@ -293,7 +293,7 @@
     <div><p class="eyebrow">owner only</p><h2>Repository Access</h2></div>
     <span class="badge success">encrypted</span>
   </header>
-  <p>The Workspace default SSH key is generated separately from the Runtime authentication identity and is always offered during SSH clone. Without an explicit Repository binding, a unique pinned host trust matching the Repository URI is used with this default key. A binding can add one dedicated credential; OpenSSH receives both candidates and tries them through one operation-scoped agent. Private keys and passphrases remain write-only.</p>
+  <p>The Workspace default SSH key is generated separately from the Runtime authentication identity and is always offered during SSH clone. Without an explicit Repository binding, a unique pinned host trust matching the Repository URI is used with this default key and normal read/write Git access. An explicit binding can select read-only access or add one dedicated credential; OpenSSH receives both credential candidates and tries them through one operation-scoped agent. Private keys and passphrases remain write-only.</p>
   {#if message}<p class="status-message">{message}</p>{/if}
 
   <div class="settings-runtime-list">

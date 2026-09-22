@@ -77,6 +77,8 @@ test("Repository Access generates and copies selectable public keys", () => {
       "publicKeys[credential.credential_id]",
       "workspace-default",
       "always offered during SSH clone",
+      "normal read/write Git access",
+      "explicit binding can select read-only access",
     ]
   ) {
     assert(

@@ -1123,7 +1123,7 @@ impl RepositorySecretService {
             repository_key: repository_key.to_string(),
             credential_id: WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID.to_string(),
             host_trust_id: host_trust.host_trust_id.clone(),
-            access: RepositoryAccessMode::ReadOnly,
+            access: RepositoryAccessMode::ReadWrite,
         }))
     }
 
@@ -2377,7 +2377,7 @@ mod tests {
     }
 
     #[test]
-    fn default_binding_resolves_unique_host_trust_for_url_and_scp_ssh_sources() {
+    fn default_binding_is_read_write_for_unique_host_trust_and_ssh_sources() {
         let (_dir, _store, service) = test_service();
         assert!(
             service
@@ -2418,7 +2418,7 @@ mod tests {
                 WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID
             );
             assert_eq!(binding.host_trust_id, "example");
-            assert_eq!(binding.access, RepositoryAccessMode::ReadOnly);
+            assert_eq!(binding.access, RepositoryAccessMode::ReadWrite);
         }
         assert!(
             service
