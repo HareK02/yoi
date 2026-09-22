@@ -10,6 +10,7 @@
     type SidebarSnippet,
   } from '$lib/workspace/sidebar/context';
   import { createOverrideStack } from '$lib/workspace/sidebar/override-stack';
+  import { ownsRoutePath } from '$lib/workspace/sidebar/route-ownership';
   import WorkspaceSidebarFixture from './WorkspaceSidebarFixture.svelte';
   import { designLabBasePath } from './workspace-navigation';
   import './showroom.css';
@@ -26,7 +27,12 @@
     registerSidebar: sidebarContentOverrides.register,
   });
 
-  const inSettings = $derived(page.url.pathname.startsWith(`${designLabBasePath}/settings`));
+  const ownsCurrentRoute = $derived(
+    ownsRoutePath(designLabBasePath, page.url.pathname),
+  );
+  const inSettings = $derived(
+    ownsRoutePath(`${designLabBasePath}/settings`, page.url.pathname),
+  );
 </script>
 
 {#snippet designLabHeader()}
@@ -45,7 +51,11 @@
   <WorkspaceSidebarFixture currentPath={page.url.pathname} content={sidebarContent} />
 {/snippet}
 
-<HeaderOverride content={designLabHeader} />
-<SidebarOverride controller={parentSidebarController} sidebar={workspaceSidebar} />
+<HeaderOverride content={designLabHeader} active={ownsCurrentRoute} />
+<SidebarOverride
+  controller={parentSidebarController}
+  sidebar={workspaceSidebar}
+  active={ownsCurrentRoute}
+/>
 
 {@render children()}

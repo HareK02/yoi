@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
+  import { ownsRoutePath } from '$lib/workspace/sidebar/route-ownership';
   import { designLabBasePath, workspaceNavigation, workspaceWorkers } from './workspace-navigation';
 
   let {
@@ -32,7 +33,7 @@
       </a>
       <a
         class="workspace-sidebar-shortcut"
-        class:active={currentPath.startsWith(settingsPath)}
+        class:active={ownsRoutePath(settingsPath, currentPath)}
         href={settingsPath}
         aria-label="Workspace settings"
         title="Workspace settings"

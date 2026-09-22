@@ -8,10 +8,18 @@
   type Props = {
     sidebar: SidebarSnippet;
     controller?: SidebarController;
+    active?: boolean;
   };
 
   const inheritedController = getSidebarController();
-  const { sidebar, controller = inheritedController }: Props = $props();
+  const {
+    sidebar,
+    controller = inheritedController,
+    active = true,
+  }: Props = $props();
 
-  $effect(() => controller.registerSidebar(sidebar));
+  $effect(() => {
+    if (!active) return;
+    return controller.registerSidebar(sidebar);
+  });
 </script>

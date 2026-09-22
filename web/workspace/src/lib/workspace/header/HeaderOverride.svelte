@@ -2,13 +2,17 @@
   import type { Snippet } from 'svelte';
   import { getHeaderController } from './context';
 
-  let { content }: { content: Snippet<[]> } = $props();
+  let {
+    content,
+    active = true,
+  }: {
+    content: Snippet<[]>;
+    active?: boolean;
+  } = $props();
   const controller = getHeaderController();
 
   $effect(() => {
-    controller.content = content;
-    return () => {
-      if (controller.content === content) controller.content = null;
-    };
+    if (!active) return;
+    return controller.registerContent(content);
   });
 </script>

@@ -11,6 +11,8 @@
     type SidebarSnippet,
   } from '$lib/workspace/sidebar/context';
   import { createOverrideStack } from '$lib/workspace/sidebar/override-stack';
+  import { ownsRoutePath } from '$lib/workspace/sidebar/route-ownership';
+  import { workspaceRoute } from '$lib/workspace/api/http';
   import { disposeWorkspaceMultiplexer } from '$lib/workspace/multiplexer';
   import { disposeWorkspaceWorkersStore } from '$lib/workspace/sidebar/worker-subscription';
   import WorkspaceSidebar from '$lib/workspace/sidebar/WorkspaceSidebar.svelte';
@@ -29,6 +31,11 @@
   setContext<SidebarController>(SIDEBAR_CONTEXT, {
     registerSidebar: sidebarContentOverrides.register,
   });
+
+  const workspaceId = $derived(data.workspace?.workspace_id ?? page.params.workspaceId ?? '');
+  const ownsCurrentRoute = $derived(
+    workspaceId !== '' && ownsRoutePath(workspaceRoute(workspaceId), page.url.pathname),
+  );
 
   $effect(() => {
     const workspaceId = data.workspace?.workspace_id;
@@ -57,7 +64,11 @@
   />
 {/snippet}
 
-<HeaderOverride content={workspaceHeader} />
-<SidebarOverride controller={parentSidebarController} sidebar={workspaceSidebar} />
+<HeaderOverride content={workspaceHeader} active={ownsCurrentRoute} />
+<SidebarOverride
+  controller={parentSidebarController}
+  sidebar={workspaceSidebar}
+  active={ownsCurrentRoute}
+/>
 
 {@render children()}

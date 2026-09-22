@@ -180,6 +180,13 @@ Deno.test("design lab demonstrates nested sidebar slots without flattening level
     "Workspace design-lab layout must expose its child override slot",
   );
   assert(
+    workspaceLayout.includes(
+      "ownsRoutePath(designLabBasePath, page.url.pathname)",
+    ) &&
+      workspaceLayout.includes("active={ownsCurrentRoute}"),
+    "Workspace design-lab chrome must unregister outside its owned route",
+  );
+  assert(
     !workspaceLayout.includes("<GlobalNavSections"),
     "Workspace design-lab layout must not flatten Global navigation",
   );
@@ -199,6 +206,11 @@ Deno.test("design lab demonstrates nested sidebar slots without flattening level
   assert(
     settingsLayout.includes("controller={parentSidebarController}"),
     "Settings design-lab layout must register into its parent slot",
+  );
+  assert(
+    settingsLayout.includes("ownsRoutePath(`${designLabBasePath}/settings`") &&
+      settingsLayout.includes("active={ownsCurrentRoute}"),
+    "Settings design-lab chrome must unregister outside its owned route",
   );
   assert(
     !settingsLayout.includes("<WorkspaceSidebar"),
@@ -1011,6 +1023,9 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
   const sidebarOverride = await Deno.readTextFile(
     new URL("../sidebar/SidebarOverride.svelte", import.meta.url),
   );
+  const headerOverride = await Deno.readTextFile(
+    new URL("../header/HeaderOverride.svelte", import.meta.url),
+  );
   const sidebar = await Deno.readTextFile(
     new URL("../sidebar/WorkspaceSidebar.svelte", import.meta.url),
   );
@@ -1104,10 +1119,20 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
     "Sidebar styles should define their layer order before component rules so base link styles do not win by import order",
   );
   assert(
-    sidebarOverride.includes("controller.registerSidebar(sidebar)") &&
+    sidebarOverride.includes("if (!active) return") &&
+      sidebarOverride.includes("controller.registerSidebar(sidebar)") &&
+      workspaceLayout.includes("ownsRoutePath(workspaceRoute(workspaceId)") &&
+      workspaceLayout.includes("active={ownsCurrentRoute}") &&
       rootLayout.includes("createOverrideStack<SidebarSnippet>") &&
       rootLayout.includes("registerSidebar: sidebarOverrides.register"),
-    "SidebarOverride should register a nested sidebar whose cleanup restores the parent override",
+    "Sidebar overrides should register only while their route owns the shared chrome slot",
+  );
+  assert(
+    headerOverride.includes("if (!active) return") &&
+      headerOverride.includes("controller.registerContent(content)") &&
+      rootLayout.includes("createOverrideStack<HeaderSnippet>") &&
+      rootLayout.includes("registerContent: headerOverrides.register"),
+    "Header overrides should share the route-scoped LIFO registration contract",
   );
   assert(
     rootLayoutLoad.includes("export const load") &&

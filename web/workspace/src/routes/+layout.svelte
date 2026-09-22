@@ -3,7 +3,11 @@
   import { setContext } from 'svelte';
   import WorkspaceAlerts from '$lib/workspace/alerts/WorkspaceAlerts.svelte';
   import Bevel from '$lib/workspace/ui/Bevel.svelte';
-  import { provideHeaderController, type HeaderController } from '$lib/workspace/header/context';
+  import {
+    provideHeaderController,
+    type HeaderController,
+    type HeaderSnippet,
+  } from '$lib/workspace/header/context';
   import GlobalSidebar from '$lib/workspace/sidebar/GlobalSidebar.svelte';
   import SidebarFrame from '$lib/workspace/sidebar/SidebarFrame.svelte';
   import { SIDEBAR_CONTEXT, type SidebarController, type SidebarSnippet } from '$lib/workspace/sidebar/context';
@@ -16,14 +20,19 @@
   const sidebarOverrides = createOverrideStack<SidebarSnippet>((activeSidebar) => {
     sidebar = activeSidebar;
   });
-  const headerController = $state<HeaderController>({ content: null });
+  let header = $state<HeaderSnippet | null>(null);
+  const headerOverrides = createOverrideStack<HeaderSnippet>((activeHeader) => {
+    header = activeHeader;
+  });
   let sidebarFolded = $state(false);
 
   function toggleSidebar() {
     sidebarFolded = !sidebarFolded;
   }
 
-  provideHeaderController(headerController);
+  provideHeaderController({
+    registerContent: headerOverrides.register,
+  } satisfies HeaderController);
   setContext<SidebarController>(SIDEBAR_CONTEXT, {
     registerSidebar: sidebarOverrides.register,
   });
@@ -43,7 +52,7 @@
   <Bevel as="div" class="app-shell__topbar-bevel" top={false} right={false} left={false} fill>
     <header class="app-shell__topbar">
       <div class="app-shell__topbar-location">
-        {#if headerController.content}{@render headerController.content()}{/if}
+        {#if header}{@render header()}{/if}
       </div>
       <nav class="app-shell__topbar-actions" aria-label="Global navigation">
         <button

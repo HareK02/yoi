@@ -3,9 +3,9 @@ import type { Snippet } from "svelte";
 
 const HEADER_CONTEXT_KEY = Symbol("workspace-header");
 
-export type HeaderContent = Snippet<[]> | null;
+export type HeaderSnippet = Snippet<[]>;
 export type HeaderController = {
-  content: HeaderContent;
+  registerContent(content: HeaderSnippet): () => void;
 };
 
 export function provideHeaderController(controller: HeaderController): void {

@@ -9,7 +9,9 @@
     type SidebarSnippet,
   } from '$lib/workspace/sidebar/context';
   import { createOverrideStack } from '$lib/workspace/sidebar/override-stack';
+  import { ownsRoutePath } from '$lib/workspace/sidebar/route-ownership';
   import SettingsSidebarFixture from './SettingsSidebarFixture.svelte';
+  import { designLabBasePath } from '../workspace-navigation';
   import type { LayoutProps } from './$types';
 
   let { children }: LayoutProps = $props();
@@ -22,12 +24,20 @@
   setContext<SidebarController>(SIDEBAR_CONTEXT, {
     registerSidebar: sidebarContentOverrides.register,
   });
+
+  const ownsCurrentRoute = $derived(
+    ownsRoutePath(`${designLabBasePath}/settings`, page.url.pathname),
+  );
 </script>
 
 {#snippet settingsSidebar()}
   <SettingsSidebarFixture currentPath={page.url.pathname} content={sidebarContent} />
 {/snippet}
 
-<SidebarOverride controller={parentSidebarController} sidebar={settingsSidebar} />
+<SidebarOverride
+  controller={parentSidebarController}
+  sidebar={settingsSidebar}
+  active={ownsCurrentRoute}
+/>
 
 {@render children()}

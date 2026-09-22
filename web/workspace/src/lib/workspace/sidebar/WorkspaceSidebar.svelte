@@ -2,6 +2,7 @@
   import type { Snippet } from 'svelte';
   import './sidebar.css';
   import { workspaceRoute } from '$lib/workspace/api/http';
+  import { ownsRoutePath } from './route-ownership';
   import ObjectivesNavSection from './ObjectivesNavSection.svelte';
   import MemoryNavSection from './MemoryNavSection.svelte';
   import MergeRequestsNavSection from './MergeRequestsNavSection.svelte';
@@ -50,11 +51,11 @@
           </a>
           <a
             class="workspace-sidebar-shortcut"
-            class:active={currentPath.startsWith(workspaceSettingsHref)}
+            class:active={ownsRoutePath(workspaceSettingsHref, currentPath)}
             href={workspaceSettingsHref}
             aria-label="Workspace settings"
             title="Workspace settings"
-            aria-current={currentPath.startsWith(workspaceSettingsHref) ? 'page' : undefined}
+            aria-current={ownsRoutePath(workspaceSettingsHref, currentPath) ? 'page' : undefined}
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M4 5h16M4 12h16M4 19h16"></path>
