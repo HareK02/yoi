@@ -12,8 +12,10 @@ e2e = []
 
 [dependencies]
 libc.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 
 [[test]]
@@ -24,4 +26,9 @@ required-features = ["e2e"]
 [[test]]
 name = "rewind"
 path = "tests/rewind.rs"
+required-features = ["e2e"]
+
+[[test]]
+name = "worker_environment"
+path = "tests/worker_environment.rs"
 required-features = ["e2e"]

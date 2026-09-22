@@ -137,7 +137,51 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
     }
     let mut terminal_mode = TerminalModeGuard::new();
 
-    let result = match mode {
+    #[cfg(feature = "e2e-test")]
+    let result = if std::env::var_os("YOI_TUI_TEST_REWIND_FIXTURE").is_some() {
+        let worker_name = match &mode {
+            LaunchMode::Spawn { worker_name, .. } => worker_name
+                .clone()
+                .unwrap_or_else(|| "e2e-rewind".to_string()),
+            _ => "e2e-rewind".to_string(),
+        };
+        console::run_e2e_rewind(worker_name).await
+    } else {
+        launch_mode(target.as_ref(), mode, &workspace_root).await
+    };
+    #[cfg(not(feature = "e2e-test"))]
+    let result = launch_mode(target.as_ref(), mode, &workspace_root).await;
+
+    // Always restore the terminal first so any pending eprintln below
+    // shows up cleanly in scrollback rather than inside an active
+    // alternate-screen buffer.
+    #[cfg(feature = "e2e-test")]
+    e2e_observer::emit("tui", "terminal_cleanup_started", serde_json::json!({}));
+    let _ = terminal_mode.restore();
+    #[cfg(feature = "e2e-test")]
+    e2e_observer::emit("tui", "terminal_cleanup_finished", serde_json::json!({}));
+
+    match result {
+        Ok(()) => {
+            #[cfg(feature = "e2e-test")]
+            e2e_observer::emit("tui", "exit", serde_json::json!({ "status": "success" }));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("yoi: {e}");
+            #[cfg(feature = "e2e-test")]
+            e2e_observer::emit("tui", "exit", serde_json::json!({ "status": "failure" }));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn launch_mode(
+    target: &dyn Target,
+    mode: LaunchMode,
+    workspace_root: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match mode {
         LaunchMode::Spawn {
             worker_name,
             profile,
@@ -145,7 +189,7 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
             Ok(Some(selection)) => match target.spawn_worker() {
                 Ok(spawn) => {
                     console::run_standalone(
-                        workspace_root.clone(),
+                        workspace_root.to_path_buf(),
                         spawn.state_dir,
                         Some(selection.worker_name),
                         Some(selection.profile),
@@ -158,7 +202,7 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
             Err(error) => Err(Box::new(error) as Box<dyn std::error::Error>),
         },
         LaunchMode::StandaloneResume { include_all } => {
-            match standalone_picker::pick(target.as_ref(), include_all) {
+            match standalone_picker::pick(target, include_all) {
                 Ok(Some(intent)) => console::run_standalone_restore(intent).await,
                 Ok(None) => Ok(()),
                 Err(error) => Err(Box::new(error) as Box<dyn std::error::Error>),
@@ -195,28 +239,5 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
             }
             Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
         },
-    };
-
-    // Always restore the terminal first so any pending eprintln below
-    // shows up cleanly in scrollback rather than inside an active
-    // alternate-screen buffer.
-    #[cfg(feature = "e2e-test")]
-    e2e_observer::emit("tui", "terminal_cleanup_started", serde_json::json!({}));
-    let _ = terminal_mode.restore();
-    #[cfg(feature = "e2e-test")]
-    e2e_observer::emit("tui", "terminal_cleanup_finished", serde_json::json!({}));
-
-    match result {
-        Ok(()) => {
-            #[cfg(feature = "e2e-test")]
-            e2e_observer::emit("tui", "exit", serde_json::json!({ "status": "success" }));
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("yoi: {e}");
-            #[cfg(feature = "e2e-test")]
-            e2e_observer::emit("tui", "exit", serde_json::json!({ "status": "failure" }));
-            ExitCode::FAILURE
-        }
     }
 }

@@ -1,6 +1,6 @@
 use reqwest::Method;
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use server_api::{
     BrowserCreateWorkerResponse, BrowserWorkspaceOrchestratorResponse,
     CreateWorkspaceWorkerRequest, ListResponse, MemoryDocumentResponse, MemoryStagingListResponse,
@@ -21,6 +21,21 @@ use ticket::{
 use crate::{BackendApiClient, BackendWorkspaceClientError};
 
 const DEFAULT_PRODUCT_LIST_LIMIT: usize = 1_000;
+
+#[derive(Debug, Deserialize)]
+struct BackendObjectiveListResponse {
+    workspace_id: String,
+    limit: usize,
+    items: Vec<ObjectiveSummary>,
+    invalid_records: Vec<BackendInvalidProjectRecord>,
+    record_authority: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BackendInvalidProjectRecord {
+    label: String,
+    reason: String,
+}
 
 /// Workspace-scoped Backend client for Ticket and Objective product state.
 ///
@@ -177,7 +192,23 @@ impl BackendWorkspaceProductClient {
         &self,
         limit: usize,
     ) -> Result<ListResponse<ObjectiveSummary>, BackendWorkspaceClientError> {
-        self.get_json(&format!("/objectives?limit={limit}"))
+        let response: BackendObjectiveListResponse =
+            self.get_json(&format!("/objectives?limit={limit}"))?;
+        Ok(ListResponse {
+            workspace_id: response.workspace_id,
+            limit: response.limit,
+            items: response.items,
+            source: response.record_authority,
+            diagnostics: response
+                .invalid_records
+                .into_iter()
+                .map(|invalid| server_api::Diagnostic {
+                    code: "invalid_objective_record".to_string(),
+                    severity: server_api::DiagnosticSeverity::Warning,
+                    message: format!("{}: {}", invalid.label, invalid.reason),
+                })
+                .collect(),
+        })
     }
 
     pub fn show_objective(&self, id: &str) -> Result<ObjectiveDetail, BackendWorkspaceClientError> {
@@ -794,7 +825,7 @@ mod tests {
 
     #[test]
     fn objective_list_uses_workspace_scoped_backend_route() {
-        let body = r#"{"workspace_id":"workspace-a","limit":1000,"items":[],"source":"sqlite","diagnostics":[]}"#;
+        let body = r#"{"workspace_id":"workspace-a","limit":1000,"items":[],"invalid_records":[{"label":"broken.md","reason":"invalid frontmatter"}],"record_authority":"sqlite"}"#;
         let (base_url, request, handle) = one_response_server("200 OK", body);
         let client = BackendWorkspaceProductClient::new_with_access_token(
             base_url,
@@ -806,6 +837,13 @@ mod tests {
         let response = client.list_objectives(1_000).unwrap();
 
         assert!(response.items.is_empty());
+        assert_eq!(response.source, "sqlite");
+        assert_eq!(response.diagnostics.len(), 1);
+        assert_eq!(response.diagnostics[0].code, "invalid_objective_record");
+        assert_eq!(
+            response.diagnostics[0].message,
+            "broken.md: invalid frontmatter"
+        );
         let request = request.recv().unwrap();
         assert!(request.starts_with("GET /api/w/workspace-a/objectives?limit=1000 "));
         assert!(request.contains("authorization: Bearer test-backend-token\r\n"));

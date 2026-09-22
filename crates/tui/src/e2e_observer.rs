@@ -2,12 +2,11 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
 const EVENT_PATH_ENV: &str = "YOI_TUI_TEST_EVENTS";
-const HOLD_BACKGROUND_TASK_ENV: &str = "YOI_TUI_TEST_HOLD_BACKGROUND_TASK";
 
 static EVENT_WRITER: OnceLock<Option<Mutex<File>>> = OnceLock::new();
 
@@ -41,25 +40,6 @@ where
     if serde_json::to_writer(&mut *writer, &envelope).is_ok() {
         let _ = writer.write_all(b"\n");
         let _ = writer.flush();
-    }
-}
-
-pub(crate) async fn hold_background_task_if_requested(task: &'static str) {
-    let requested = std::env::var(HOLD_BACKGROUND_TASK_ENV).unwrap_or_default();
-    if !requested
-        .split(',')
-        .map(str::trim)
-        .any(|requested| requested == task)
-    {
-        return;
-    }
-    emit(
-        "panel",
-        "background_task_hold_started",
-        serde_json::json!({ "task": task }),
-    );
-    loop {
-        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 

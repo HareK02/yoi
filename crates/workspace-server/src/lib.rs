@@ -48,6 +48,7 @@ pub use repositories::{ConfiguredRepository, RepositoryLogRead, RepositoryRegist
 pub use server::{
     AuthConfig, ServerConfig, WorkspaceApi, WorkspaceServerApi, build_router,
     build_workspace_server_router, serve, serve_workspace_catalog,
+    serve_workspace_catalog_with_shutdown,
 };
 pub use server_api::{
     GitCommitSummary, GitRemoteSummary, GitRepositorySummary, RepositorySummary,

@@ -6,7 +6,7 @@ use yoi_e2e::{FixtureWorkspace, KeyPress, PanelHarness, yoi_binary};
 fn single_pod_rewind_picker_applies_without_escape_and_suppresses_duplicate_enter()
 -> yoi_e2e::Result<()> {
     let binary = yoi_binary()?;
-    let fixture = FixtureWorkspace::new(&binary)?;
+    let fixture = FixtureWorkspace::new_rewind(&binary)?;
     let mut tui = PanelHarness::spawn(fixture.rewind_fixture_config(binary))?;
 
     tui.expect_mouse_capture_enabled()?;

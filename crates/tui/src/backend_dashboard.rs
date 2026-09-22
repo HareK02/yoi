@@ -2,7 +2,7 @@ use std::io;
 use std::time::Duration;
 
 use client::{BackendWorkspaceProductClient, ObjectiveSummary};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -79,8 +79,26 @@ async fn run_loop(
     app: &mut BackendDashboard,
     client: BackendWorkspaceProductClient,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut first_frame = true;
+    let mut initial_snapshot_pending = false;
     loop {
         terminal.draw(|frame| draw(frame, app))?;
+        if first_frame {
+            first_frame = false;
+            #[cfg(feature = "e2e-test")]
+            {
+                crate::e2e_observer::emit(
+                    "backend_dashboard",
+                    "panel_ready",
+                    serde_json::json!({ "workspace_id": app.workspace_id }),
+                );
+                initial_snapshot_pending = true;
+            }
+        } else if initial_snapshot_pending {
+            #[cfg(feature = "e2e-test")]
+            emit_e2e_snapshot(app, "backend_dashboard_content_ready");
+            initial_snapshot_pending = false;
+        }
         if !event::poll(Duration::from_millis(100))? {
             continue;
         }
@@ -91,21 +109,50 @@ async fn run_loop(
             continue;
         }
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+            KeyCode::Char('q') | KeyCode::Esc => {
+                #[cfg(feature = "e2e-test")]
+                crate::e2e_observer::emit(
+                    "backend_dashboard",
+                    "quit_requested",
+                    serde_json::json!({}),
+                );
+                return Ok(());
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                #[cfg(feature = "e2e-test")]
+                crate::e2e_observer::emit(
+                    "backend_dashboard",
+                    "quit_requested",
+                    serde_json::json!({}),
+                );
+                return Ok(());
+            }
             KeyCode::Tab | KeyCode::BackTab => {
                 app.focus = match app.focus {
                     Focus::Tickets => Focus::Objectives,
                     Focus::Objectives => Focus::Tickets,
                 };
+                #[cfg(feature = "e2e-test")]
+                emit_e2e_snapshot(app, "backend_dashboard_selection_changed");
             }
-            KeyCode::Down | KeyCode::Char('j') => app.select_next(),
-            KeyCode::Up | KeyCode::Char('k') => app.select_previous(),
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.select_next();
+                #[cfg(feature = "e2e-test")]
+                emit_e2e_snapshot(app, "backend_dashboard_selection_changed");
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.select_previous();
+                #[cfg(feature = "e2e-test")]
+                emit_e2e_snapshot(app, "backend_dashboard_selection_changed");
+            }
             KeyCode::Char('r') => match load(&client).await {
                 Ok((tickets, objectives)) => {
                     app.tickets = tickets;
                     app.objectives = objectives;
                     app.clamp_selection();
                     app.status = "Reloaded from Backend authority".to_string();
+                    #[cfg(feature = "e2e-test")]
+                    emit_e2e_snapshot(app, "backend_dashboard_reloaded");
                 }
                 Err(error) => app.status = format!("Backend reload failed: {error}"),
             },
@@ -142,6 +189,51 @@ async fn run_loop(
             _ => {}
         }
     }
+}
+
+#[cfg(feature = "e2e-test")]
+fn emit_e2e_snapshot(app: &BackendDashboard, event: &'static str) {
+    let focus = match app.focus {
+        Focus::Tickets => "tickets",
+        Focus::Objectives => "objectives",
+    };
+    let tickets = app
+        .tickets
+        .iter()
+        .map(|ticket| {
+            serde_json::json!({
+                "id": ticket.id,
+                "resource_key": ticket.resource_key,
+                "title": ticket.title,
+                "workflow_state": ticket.workflow_state.as_str(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let objectives = app
+        .objectives
+        .iter()
+        .map(|objective| {
+            serde_json::json!({
+                "id": objective.id,
+                "resource_key": objective.resource_key,
+                "title": objective.title,
+                "state": objective.state,
+            })
+        })
+        .collect::<Vec<_>>();
+    crate::e2e_observer::emit(
+        "backend_dashboard",
+        event,
+        serde_json::json!({
+            "workspace_id": app.workspace_id,
+            "focus": focus,
+            "selected_ticket_id": app.selected_ticket_id(),
+            "selected_objective_id": app.objectives.get(app.selected_objective).map(|objective| &objective.id),
+            "tickets": tickets,
+            "objectives": objectives,
+            "status": app.status,
+        }),
+    );
 }
 
 impl BackendDashboard {

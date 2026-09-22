@@ -139,6 +139,22 @@ pub enum RuntimeHttpStoreSelection {
     },
 }
 
+pub async fn serve_runtime_http_with_shutdown<F>(
+    runtime: Runtime,
+    listener: TcpListener,
+    local_token: Option<String>,
+    shutdown: F,
+) -> Result<(), RuntimeHttpServerError>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let local_token = local_token.ok_or(RuntimeHttpServerError::AuthRequired)?;
+    axum::serve(listener, runtime_http_router(runtime, local_token))
+        .with_graceful_shutdown(shutdown)
+        .await?;
+    Ok(())
+}
+
 /// Serve an existing Runtime on a pre-bound listener.
 pub async fn serve_runtime_http(
     runtime: Runtime,
@@ -147,6 +163,25 @@ pub async fn serve_runtime_http(
 ) -> Result<(), RuntimeHttpServerError> {
     let local_token = local_token.ok_or(RuntimeHttpServerError::AuthRequired)?;
     axum::serve(listener, runtime_http_router(runtime, local_token)).await?;
+    Ok(())
+}
+
+pub async fn serve_runtime_http_with_workspace_auth_shutdown<F>(
+    runtime: Runtime,
+    listener: TcpListener,
+    local_token: Option<String>,
+    workspace_auth: WorkspaceRuntimeHttpAuth,
+    shutdown: F,
+) -> Result<(), RuntimeHttpServerError>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    axum::serve(
+        listener,
+        runtime_http_router_with_optional_auth(runtime, local_token, Some(workspace_auth)),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await?;
     Ok(())
 }
 
