@@ -35,6 +35,22 @@ T-629 owns conversion of the panel E2E setup to the Backend-owned dashboard fixt
 - Ticket tool mutation uses a direct SQLite backend and asserts `tickets.db` is written while `.yoi`/`tickets` are not.
 - Workspace Server authority seeds SQLite Ticket/Objectives directly, proves filesystem-only records are ignored, and proves legacy Memory staging cannot enter the Backend consolidation backlog.
 
+## Final-source validation
+
+The final candidate was validated after the normal merge of T-629-integrated `develop`. All commands below completed successfully:
+
+| Boundary | Command and result |
+| --- | --- |
+| Normal compile closure | `cargo check` — passed. |
+| Workspace/test targets | `cargo check --workspace --all-targets` — passed. |
+| Changed Rust crates | `cargo test -p memory`; `cargo test -p ticket`; `cargo test -p worker --lib`; `cargo test -p worker-runtime`; `cargo test -p yoi --bin yoi`; `cargo test -p yoi-workspace-server`; `cargo test -p tui` — passed, including 16 Memory, 74 Ticket, 582 Worker, 100 CLI, 421 Server-library, and 270 TUI library tests. |
+| Focused authority regressions | `cargo test` filters for `production_source_has_no_repository_local_memory_provider`, `production_source_has_no_repository_local_ticket_provider`, `production_source_has_no_local_ticket_feature_backend`, `workspace_only_ticket_feature_preserves_unrelated_stale_repository_trees`, `production_source_has_no_repository_derived_runtime_store`, `worker_spawn_receives_materialized_workspace_cwd_instead_of_source_repo`, `removed_memory_command_is_unknown_without_touching_legacy_trees`, and `sqlite_workspace_authority_reads_sqlite_records_without_filesystem_authority` — passed. |
+| T-629 Backend panel baseline | `cargo test -p yoi-e2e --features e2e --test panel -- --test-threads=2` — passed, 2/2. The fixture contains no `yoi ticket init` invocation. |
+| Rewind E2E | `cargo test -p yoi-e2e --features e2e --test rewind -- --test-threads=2` — passed, 1/1. |
+| Web | `cd web/workspace && deno task check && deno task test && deno task build` — passed. The build emitted only existing unused-import/chunk-size warnings. |
+| Formatting and patch integrity | `nix develop -c cargo fmt --all -- --check` and `git diff --check HEAD` — passed. The host toolchain does not directly provide `cargo fmt`, so the repository dev shell supplied the pinned rustfmt component. |
+| Reachability inventory | Exact-symbol and path-join source scans found removed provider names only inside source assertions, negative fixtures, or comments. Remaining executable `.yoi` path construction is limited to the preserved home-directory boundary; repository paths occur only in ignored-input/no-write tests. |
+
 ## Remaining `.yoi` classifications
 
 The post-change source inventory contains the following intentional classes:
