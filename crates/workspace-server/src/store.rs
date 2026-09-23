@@ -11646,16 +11646,21 @@ fn apply_ticket_targets_and_workdir_capabilities_schema(conn: &Connection) -> Re
             let legacy_event_targets = {
                 let mut statement = db.prepare(
                     "SELECT attribute.workspace_id, attribute.ticket_id, attribute.event_index,
-                            repository.repository_key, selector.value
+                            COALESCE(repository_by_id.repository_key,
+                                     repository_by_key.repository_key),
+                            selector.value
                        FROM typed_ticket_event_attributes AS attribute
                        LEFT JOIN typed_ticket_event_attributes AS selector
                          ON selector.workspace_id = attribute.workspace_id
                         AND selector.ticket_id = attribute.ticket_id
                         AND selector.event_index = attribute.event_index
                         AND selector.key = 'ref_selector'
-                       LEFT JOIN repositories AS repository
-                         ON repository.workspace_id = attribute.workspace_id
-                        AND repository.repository_id = attribute.value
+                       LEFT JOIN repositories AS repository_by_id
+                         ON repository_by_id.workspace_id = attribute.workspace_id
+                        AND repository_by_id.repository_id = attribute.value
+                       LEFT JOIN repositories AS repository_by_key
+                         ON repository_by_key.workspace_id = attribute.workspace_id
+                        AND repository_by_key.repository_key = attribute.value
                       WHERE attribute.key = 'repository_id'
                       ORDER BY attribute.workspace_id, attribute.ticket_id, attribute.event_index",
                 )?;
@@ -13642,15 +13647,18 @@ mod tests {
             INSERT INTO typed_ticket_events(
                 workspace_id, ticket_id, event_index, kind, author, at, status,
                 from_state, to_state, reason, state_field, heading, body
-            ) VALUES (
-                'workspace-a', 'ticket-a', 0, 'state_changed', 'user', '1', NULL,
-                'planning', 'ready', NULL, 'state', 'State changed', ''
-            );
+            ) VALUES
+                ('workspace-a', 'ticket-a', 0, 'state_changed', 'user', '1', NULL,
+                 'planning', 'ready', NULL, 'state', 'State changed', ''),
+                ('workspace-a', 'ticket-a', 1, 'state_changed', 'user', '2', NULL,
+                 'ready', 'planning', NULL, 'state', 'State changed', '');
             INSERT INTO typed_ticket_event_attributes(
                 workspace_id, ticket_id, event_index, key, value
             ) VALUES
                 ('workspace-a', 'ticket-a', 0, 'repository_id', 'repo-main'),
-                ('workspace-a', 'ticket-a', 0, 'ref_selector', 'develop');
+                ('workspace-a', 'ticket-a', 0, 'ref_selector', 'develop'),
+                ('workspace-a', 'ticket-a', 1, 'repository_id', 'main'),
+                ('workspace-a', 'ticket-a', 1, 'ref_selector', 'feature/key-evidence');
             INSERT INTO worker_registry(
                 workspace_id, worker_id, runtime_id, display_name, profile, retention_state,
                 transcript_ref, session_ref, summary_ref, diagnostics_ref, created_at, updated_at
@@ -13726,11 +13734,28 @@ mod tests {
                 "access": "read_write"
             }])
         );
+        let key_target_evidence: String = conn
+            .query_row(
+                "SELECT value FROM typed_ticket_event_attributes
+                  WHERE workspace_id = 'workspace-a' AND ticket_id = 'ticket-a'
+                    AND event_index = 1 AND key = 'targets'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&key_target_evidence).unwrap(),
+            serde_json::json!([{
+                "repository_key": "main",
+                "ref_selector": "feature/key-evidence",
+                "access": "read_write"
+            }])
+        );
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM typed_ticket_event_attributes
                   WHERE workspace_id = 'workspace-a' AND ticket_id = 'ticket-a'
-                    AND event_index = 0 AND key IN ('repository_id', 'ref_selector')",
+                    AND key IN ('repository_id', 'ref_selector')",
                 [],
                 |row| row.get::<_, i64>(0),
             )
