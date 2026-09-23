@@ -19,24 +19,25 @@ const loaderSource = await Deno.readTextFile(
     import.meta.url,
   ),
 );
+const settingsCss = await Deno.readTextFile(
+  new URL("../../src/lib/workspace/styles/settings.css", import.meta.url),
+);
 
-test("Repository Access Web code consumes server-api legacy generated DTOs", () => {
+test("Repository Access consumes generated contracts and validates every response boundary", () => {
   assert(
     source.includes("$lib/generated/repository-access-api"),
     "mutation code should import generated request and response contracts",
   );
-  assert(
-    loaderSource.includes("parseRepositorySshCredentials") &&
-      loaderSource.includes("parseRepositorySshHostTrusts") &&
-      loaderSource.includes("parseRepositorySshPublicKey") &&
-      loaderSource.includes("parseRepositoryAccessProjection"),
-    "loader should validate unknown JSON before exposing generated DTOs to Svelte",
-  );
-  assert(
-    loaderSource.indexOf('"/settings/repository-access"') <
-      loaderSource.indexOf("Promise.all"),
-    "loader should check Repository Access permission before starting list preloads",
-  );
+  for (
+    const parser of [
+      "parseRepositorySshCredentials",
+      "parseRepositorySshHostTrusts",
+      "parseRepositorySshPublicKey",
+      "parseRepositoryAccessProjection",
+    ]
+  ) {
+    assert(loaderSource.includes(parser), `loader should use ${parser}`);
+  }
   for (
     const duplicate of [
       "interface RepositorySshCredential",
@@ -51,94 +52,185 @@ test("Repository Access Web code consumes server-api legacy generated DTOs", () 
   }
 });
 
-test("Repository Access renders the shared access projection fields", () => {
+test("Repository Access authorizes first and preserves independently available sections", () => {
+  assert(
+    loaderSource.indexOf('"/settings/repository-access"') <
+      loaderSource.indexOf("Promise.all"),
+    "loader should check Repository Access permission before section preloads",
+  );
+  assert(
+    loaderSource.match(/loadRepositoryAccessSection/g)?.length === 4,
+    "credentials, host trusts, and the default public key should have independent failures",
+  );
   for (
     const field of [
+      "credentialsError",
+      "hostTrustsError",
+      "defaultPublicKeyError",
+    ]
+  ) {
+    assert(
+      source.includes(`data.${field}`),
+      `page should render scoped ${field}`,
+    );
+  }
+  assert(
+    loaderSource.includes("WORKSPACE_DEFAULT_CREDENTIAL_ID") &&
+      !loaderSource.includes("credentials.map("),
+    "loader should preload only the default public key instead of every public key",
+  );
+});
+
+test("Repository Access presents current state as tables with technical disclosure", () => {
+  for (
+    const token of [
+      "Repository bindings",
+      "SSH credentials",
+      "Pinned SSH host keys",
+      "repository-access-table-wrap",
+      "Technical details",
+      "Credential revisions",
+      "Host key revisions",
       "accessProjection.config_revision",
       "accessProjection.projection_digest",
-      "accessProjection.bindings",
       "binding.repository_key",
       "binding.credential_id",
       "binding.host_trust_id",
       "binding.access",
     ]
   ) {
-    assert(source.includes(field), `missing access projection field ${field}`);
+    assert(
+      source.includes(token),
+      `missing information structure token ${token}`,
+    );
   }
+  assert(
+    !source.includes('class="card'),
+    "Repository Access should not nest generic cards",
+  );
+  assert(
+    !source.includes("<h2>Repository Access</h2>"),
+    "the route title should remain owned by the Header",
+  );
+  assert(
+    !source.includes("<textarea readonly"),
+    "public keys should not occupy permanent textareas",
+  );
+  assert(
+    settingsCss.includes(".repository-access-table-wrap") &&
+      settingsCss.includes("overflow-x: auto") &&
+      settingsCss.includes(".repository-access-form-grid"),
+    "Settings CSS should own bounded table overflow and responsive forms",
+  );
 });
 
-test("Repository Access generates and copies selectable public keys", () => {
+test("Repository Access explains automatic application without inventing a binding", () => {
   for (
     const token of [
-      "/credentials/generate",
+      "No explicit bindings",
+      "Workspace default credential",
+      "unique pinned key that matches their host and port",
+      "Explicit binding",
+      "plus <code>{binding.credential_id}",
+    ]
+  ) {
+    assert(source.includes(token), `missing access authority copy ${token}`);
+  }
+  assert(
+    source.includes("A successful probe only observes a key") &&
+      source.includes("Git authentication succeeds only"),
+    "probe, trust persistence, and Git authentication must remain distinct",
+  );
+});
+
+test("Repository Access opens one scoped form with validation, cancellation, and pending fences", () => {
+  for (
+    const token of [
+      "credentialForm === 'generate'",
+      "credentialForm === 'import'",
+      "hostEditorOpen",
+      "selectedCredential",
+      "validateGeneratedCredential",
+      "validateImportedCredential",
+      "validateCredentialRotation",
+      "validateHostTrust",
+      'class="field-error"',
+      "aria-invalid",
+      "disabled={busy}",
+      ">Cancel</button>",
+      "Generating…",
+      "Importing…",
+      "Rotating…",
+      "Saving…",
+    ]
+  ) {
+    assert(source.includes(token), `missing scoped form behavior ${token}`);
+  }
+  const permanentFormStart = source.indexOf("<form");
+  const generateDisclosure = source.indexOf(
+    "{#if credentialForm === 'generate'}",
+  );
+  assert(
+    permanentFormStart > generateDisclosure,
+    "forms should render only after an explicit disclosure action",
+  );
+});
+
+test("Repository Access keeps public key copy easy without exposing key material", () => {
+  for (
+    const token of [
       "/public-key",
-      "Generate Repository SSH credential",
       "navigator.clipboard.writeText",
-      "publicKeys[credential.credential_id]",
+      "Copy public key",
       "workspace-default",
-      "always offered during SSH clone",
+      "publicKeys[credential.credential_id]",
+      "data-web-ux-redact",
     ]
   ) {
     assert(
       source.includes(token),
-      `missing generated public key flow ${token}`,
+      `missing safe public key or secret handling ${token}`,
     );
   }
   assert(
-    source.includes("binding.credential_id"),
-    "Repository bindings should identify the selected credential",
+    source.includes("publicKeys = { ...publicKeys") &&
+      source.includes("loadPublicKey(credential.credential_id)"),
+    "non-default public keys should load only on demand",
   );
 });
 
-test("Repository Access hides Rotate for the Workspace default credential", () => {
-  const credentialsStart = source.indexOf("<h3>SSH credentials</h3>");
-  const generateStart = source.indexOf(
-    "<h3>Generate Repository SSH credential</h3>",
-  );
-  assert(
-    credentialsStart >= 0 && generateStart > credentialsStart,
-    "credential list should appear before the generation form",
-  );
-
-  const credentialList = source.slice(credentialsStart, generateStart);
-  const additionalCredentialGuard = credentialList.indexOf(
+test("Repository Access protects default and referenced resources from destructive controls", () => {
+  const defaultGuard = source.indexOf(
     "{#if credential.credential_id !== workspaceDefaultCredentialId}",
   );
-  const rotateAction = credentialList.indexOf(
-    "rotateCredentialId = rotateCredentialId === credential.credential_id",
-    additionalCredentialGuard,
+  const rotateAction = source.indexOf(
+    "openCredentialRotation(credential)",
+    defaultGuard,
   );
-  const deleteAction = credentialList.indexOf(
-    "onclick={() => void deleteCredential(credential)}",
+  const unreferencedGuard = source.indexOf(
+    "{#if credential.referenced_repositories.length === 0}",
     rotateAction,
   );
-  const guardEnd = credentialList.indexOf("{/if}", deleteAction);
-
-  assert(
-    additionalCredentialGuard >= 0 &&
-      rotateAction > additionalCredentialGuard &&
-      deleteAction > rotateAction &&
-      guardEnd > deleteAction,
-    "Rotate and Delete should render only for additional credentials",
+  const deleteAction = source.indexOf(
+    "deleteCredential(credential)",
+    unreferencedGuard,
   );
   assert(
-    credentialList.indexOf(
-      "{#if rotateCredentialId === credential.credential_id}",
-      guardEnd,
-    ) > guardEnd,
-    "the existing rotation form should remain available after selecting an additional credential",
+    defaultGuard >= 0 && rotateAction > defaultGuard &&
+      unreferencedGuard > rotateAction && deleteAction > unreferencedGuard,
+    "default and referenced credentials should not render destructive actions",
+  );
+  assert(
+    source.includes("Remove Repository references before deletion") &&
+      source.includes("hostTrust.referenced_repositories.length === 0"),
+    "reference constraints should be visible beside affected rows",
   );
 });
 
-test("Repository credential submissions clear write-only fields in finally blocks", () => {
+test("Repository credential submissions clear write-only fields after attempts", () => {
   const createStart = source.indexOf("async function createCredential()");
   const rotateStart = source.indexOf("async function rotateCredential(");
   const deleteStart = source.indexOf("async function deleteCredential(");
-  assert(
-    createStart >= 0 && rotateStart > createStart && deleteStart > rotateStart,
-    "credential handlers should appear in source order",
-  );
-
   const createBody = source.slice(createStart, rotateStart);
   const rotateBody = source.slice(rotateStart, deleteStart);
   for (const token of ["finally", "privateKey = ''", "passphrase = ''"]) {

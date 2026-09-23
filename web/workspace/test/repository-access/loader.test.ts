@@ -1,4 +1,7 @@
-import { loadRepositoryAccessJson } from "../../src/lib/workspace/api/repository-access-loader.ts";
+import {
+  loadRepositoryAccessJson,
+  loadRepositoryAccessSection,
+} from "../../src/lib/workspace/api/repository-access-loader.ts";
 import { RepositoryAccessSchemaError } from "../../src/lib/workspace/api/repository-access.ts";
 
 type HttpFailure = { status?: number; body?: { message?: string } };
@@ -87,6 +90,21 @@ Deno.test("Repository Access loader maps schema mismatch to explicit bounded 502
   );
   if (!failure.body?.message?.includes("credentials")) {
     throw new Error("schema mismatch error omitted the failing response path");
+  }
+});
+
+Deno.test("Repository Access section loader contains one failed sibling", async () => {
+  const result = await loadRepositoryAccessSection(
+    () => Promise.resolve(new Response(null, { status: 503 })),
+    "/api/w/workspace-1/settings/repository-access/credentials",
+    (value) => value,
+    "SSH credentials",
+  );
+  if (result.data !== null) {
+    throw new Error("failed section must not expose data");
+  }
+  if (result.error !== "Repository Access request failed with status 503.") {
+    throw new Error(`unexpected scoped error: ${String(result.error)}`);
   }
 });
 
