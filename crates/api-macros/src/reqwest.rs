@@ -6,6 +6,7 @@
 
 use std::{fmt, time::Duration};
 
+use bytes::Bytes;
 use futures::StreamExt as _;
 use reqwest::{
     Client, Method, StatusCode, Url,
@@ -319,15 +320,50 @@ impl<A> ClientCore<A> {
     }
 }
 
+/// A prepared request body whose bytes are authorized and transmitted without further encoding.
+pub struct EncodedBody {
+    bytes: Bytes,
+    content_type: &'static str,
+}
+
+impl EncodedBody {
+    fn json(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: bytes.into(),
+            content_type: "application/json",
+        }
+    }
+
+    fn binary(body: crate::BinaryBody) -> Self {
+        Self {
+            bytes: body.into_bytes(),
+            content_type: "application/octet-stream",
+        }
+    }
+}
+
+impl fmt::Debug for EncodedBody {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EncodedBody")
+            .field("bytes", &"<redacted>")
+            .field("content_type", &self.content_type)
+            .finish()
+    }
+}
+
 impl<A: RequestAuthorizer> ClientCore<A> {
     pub async fn send(
         &self,
         method: Method,
         url: Url,
         mut headers: HeaderMap,
-        body: Option<Vec<u8>>,
+        body: Option<EncodedBody>,
     ) -> Result<ReceivedResponse, ClientFailure> {
-        let body_bytes = body.as_deref().unwrap_or_default();
+        let body_bytes = body
+            .as_ref()
+            .map(|body| body.bytes.as_ref())
+            .unwrap_or_default();
         let path_and_query = &url[url::Position::BeforePath..url::Position::AfterQuery];
         let authorization = self
             .authorizer
@@ -338,6 +374,12 @@ impl<A: RequestAuthorizer> ClientCore<A> {
             })
             .map_err(|_| ClientFailure::Authorization)?;
         headers.extend(authorization);
+        if let Some(body) = body.as_ref() {
+            headers.insert(
+                reqwest::header::CONTENT_TYPE,
+                HeaderValue::from_static(body.content_type),
+            );
+        }
 
         let mut request = self
             .client
@@ -345,9 +387,7 @@ impl<A: RequestAuthorizer> ClientCore<A> {
             .headers(headers)
             .timeout(self.request_timeout);
         if let Some(body) = body {
-            request = request
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body);
+            request = request.body(body.bytes);
         }
         let response = request.send().await.map_err(|error| {
             if error.is_timeout() {
@@ -413,9 +453,16 @@ pub fn insert_header<T: fmt::Display>(
     Ok(())
 }
 
-/// Serialize the request body once. These exact bytes are authorized and transmitted.
-pub fn encode_json<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, ClientFailure> {
-    serde_json::to_vec(value).map_err(|_| ClientFailure::RequestEncoding)
+/// Serialize a JSON request body once. These exact bytes are authorized and transmitted.
+pub fn encode_json<T: Serialize + ?Sized>(value: &T) -> Result<EncodedBody, ClientFailure> {
+    serde_json::to_vec(value)
+        .map(EncodedBody::json)
+        .map_err(|_| ClientFailure::RequestEncoding)
+}
+
+/// Move an explicit binary request body into the exact authorized/transmitted representation.
+pub fn encode_binary(value: crate::BinaryBody) -> EncodedBody {
+    EncodedBody::binary(value)
 }
 
 /// Response received under the configured byte limit. Its content is always redacted in Debug.

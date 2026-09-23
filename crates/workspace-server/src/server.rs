@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use async_trait::async_trait;
-use axum::body::Bytes;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Extension, Path as AxumPath, Query, Request, State};
 use axum::http::header::{
@@ -14,7 +13,7 @@ use axum::http::header::{
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{Duration, SecondsFormat, Utc};
 use config_source::ConfigTreeSnapshot;
@@ -4224,6 +4223,10 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         ))
         .merge(server_api::server_api_axum::runtime_worker_attachment_upload_grant(service.clone()))
         .merge(
+            server_api::server_api_axum::runtime_worker_attachment_upload(service.clone())
+                .layer(DefaultBodyLimit::max(MAX_WORKER_FILE_UPLOAD_BYTES)),
+        )
+        .merge(
             server_api::server_api_axum::runtime_worker_attachment_upload_cancel(service.clone()),
         )
         .merge(server_api::server_api_axum::runtime_worker_attachment_delete(service.clone()))
@@ -6536,6 +6539,30 @@ impl server_api::ServerApi for ServerApiContractService {
         Ok(response)
     }
 
+    async fn runtime_worker_attachment_upload(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        runtime_id: String,
+        worker_id: String,
+        upload_id: String,
+        body: server_api::BinaryBody,
+    ) -> std::result::Result<WorkerFileUploadResponse, server_api::RepositoryApiError> {
+        upload_runtime_worker_file_contract(
+            self.workspace_api()?.clone(),
+            actor,
+            ScopedAttachmentUploadPath {
+                workspace_id,
+                runtime_id,
+                worker_id,
+                upload_id,
+            },
+            body.as_ref(),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)
+    }
+
     async fn runtime_worker_attachment_upload_cancel(
         &self,
         actor: RequestActor,
@@ -8241,11 +8268,6 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/protocol/ws",
             get(scoped_workspace_protocol_ws),
-        )
-        .route(
-            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/attachment-uploads/{upload_id}",
-            put(scoped_upload_runtime_worker_file)
-                .layer(DefaultBodyLimit::max(MAX_WORKER_FILE_UPLOAD_BYTES)),
         )
         .route(
             "/api/runtimes/{runtime_id}/workers/{worker_id}/protocol/ws",
@@ -18658,14 +18680,14 @@ async fn scoped_create_attachment_upload_grant(
     }))
 }
 
-async fn scoped_upload_runtime_worker_file(
-    State(api): State<WorkspaceApi>,
-    Extension(actor): Extension<RequestActor>,
-    AxumPath(path): AxumPath<ScopedAttachmentUploadPath>,
-    body: Bytes,
-) -> ApiResult<Json<WorkerFileUploadResponse>> {
+async fn upload_runtime_worker_file_contract(
+    api: WorkspaceApi,
+    actor: RequestActor,
+    path: ScopedAttachmentUploadPath,
+    body: &[u8],
+) -> ApiResult<WorkerFileUploadResponse> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let body_sha256 = attachment_body_sha256(&body);
+    let body_sha256 = attachment_body_sha256(body);
     let grant = {
         let mut grants = api
             .attachment_upload_grants
@@ -18685,7 +18707,7 @@ async fn scoped_upload_runtime_worker_file(
             )
             .map_err(ApiError::from)?
         {
-            return Ok(Json(WorkerFileUploadResponse { file }));
+            return Ok(WorkerFileUploadResponse { file });
         }
         grant.clone()
     };
@@ -18702,7 +18724,7 @@ async fn scoped_upload_runtime_worker_file(
         &worker,
         &grant.file_name,
         &grant.media_type,
-        &body,
+        body,
         Some(&upload_context),
     );
     let mut grants = api
@@ -18726,7 +18748,7 @@ async fn scoped_upload_runtime_worker_file(
     match uploaded {
         Ok(file) => {
             current.state = AttachmentUploadGrantState::Completed(file.clone());
-            Ok(Json(WorkerFileUploadResponse { file }))
+            Ok(WorkerFileUploadResponse { file })
         }
         Err(error) => {
             current.state = AttachmentUploadGrantState::Pending;
@@ -26547,6 +26569,113 @@ mod tests {
             grant.claim("workspace-1", "runtime-1", "worker-1", "account-1", 1, "b"),
             Err(Error::RepositoryConflict(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn generated_attachment_upload_route_preserves_the_host_specific_body_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        let successful_body = vec![0, 255, 1, 2];
+        let successful_sha256 = attachment_body_sha256(&successful_body);
+        let successful_file = completed_upload_file(&successful_sha256);
+        api.attachment_upload_grants.lock().unwrap().insert(
+            "completed".to_string(),
+            AttachmentUploadGrant {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                runtime_id: "runtime-1".to_string(),
+                worker_id: "worker-1".to_string(),
+                account_id: format!("account-{TEST_WORKSPACE_ID}"),
+                file_name: successful_file.file_name.clone(),
+                media_type: successful_file.media_type.clone(),
+                expires_at_ms: attachment_upload_now_ms().unwrap() + 60_000,
+                state: AttachmentUploadGrantState::Completed(successful_file.clone()),
+            },
+        );
+        let router = generated_workspace_contract_router(ServerApiContractService::Workspace(api))
+            .layer(Extension(test_owner_actor()));
+        let uri = format!(
+            "/api/w/{TEST_WORKSPACE_ID}/runtimes/runtime-1/workers/worker-1/attachment-uploads/unknown"
+        );
+
+        for body in [
+            Vec::new(),
+            vec![0, 1, 2],
+            vec![0; MAX_WORKER_FILE_UPLOAD_BYTES],
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(&uri)
+                        .header(CONTENT_TYPE, "application/octet-stream")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "bodies through the exact route limit must reach upload grant validation"
+            );
+        }
+
+        let completed_uri = format!(
+            "/api/w/{TEST_WORKSPACE_ID}/runtimes/runtime-1/workers/worker-1/attachment-uploads/completed"
+        );
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(&completed_uri)
+                    .header(CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(successful_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let uploaded: WorkerFileUploadResponse =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(uploaded.file, successful_file);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(completed_uri)
+                    .header(CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(vec![9, 9, 9]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(uri)
+                    .header(CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(vec![0; MAX_WORKER_FILE_UPLOAD_BYTES + 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let error: server_api::RepositoryApiError =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(error.error, "Payload Too Large");
     }
 
     #[tokio::test]

@@ -1,0 +1,5 @@
+error: an API operation may declare only one JSON or binary request body
+  --> tests/ui/multiple_binary_bodies.rs:11:19
+   |
+11 |         #[binary] second: api_macros::BinaryBody,
+   |                   ^^^^^^

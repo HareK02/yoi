@@ -1,7 +1,5 @@
 use crate::transport::websocket::{Socket as WebSocket, SocketError as WebSocketError};
 use crate::{BackendApiClient, BackendApiClientError, Client};
-use reqwest::Method as HttpMethod;
-use serde::Deserialize;
 pub use server_api::{
     BrowserCreateWorkerResponse as BackendCreateWorkerResponse,
     CreateWorkspaceWorkerRequest as BackendCreateWorkerRequest, Diagnostic as BackendDiagnostic,
@@ -101,28 +99,17 @@ impl BackendRuntimeTarget {
                 },
             )
             .await?;
-        let worker_path = format!(
-            "/api/w/{}/runtimes/{}/workers/{}",
-            path_segment_encode(&self.workspace_id),
-            path_segment_encode(&self.runtime_id),
-            path_segment_encode(&self.worker_id),
-        );
-        let upload_path = format!(
-            "{worker_path}/attachment-uploads/{}",
-            path_segment_encode(&grant.upload_id),
-        );
-        let response = api
-            .request(HttpMethod::PUT, &upload_path)?
-            .body(content)
-            .send()
-            .await
-            .map_err(BackendRuntimeClientError::Http)?;
-        api.check_status(response.status())?;
-        response
-            .json::<UploadedFileResponse>()
+        client
+            .runtime_worker_attachment_upload(
+                self.workspace_id.clone(),
+                self.runtime_id.clone(),
+                self.worker_id.clone(),
+                grant.upload_id,
+                server_api::BinaryBody::from(content),
+            )
             .await
             .map(|response| response.file)
-            .map_err(BackendRuntimeClientError::Http)
+            .map_err(BackendRuntimeClientError::from)
     }
 
     pub async fn cancel_file_upload(
@@ -156,11 +143,6 @@ impl BackendRuntimeTarget {
             .await?;
         Ok(())
     }
-}
-
-#[derive(Deserialize)]
-struct UploadedFileResponse {
-    file: protocol::UploadedFileRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

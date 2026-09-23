@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use api_macros::api;
 pub use api_macros::axum as server_support;
 pub use api_macros::reqwest as client_support;
-pub use api_macros::{ApiContract, HttpMethod};
+pub use api_macros::{ApiContract, BinaryBody, HttpMethod};
 pub mod repository_openapi_typescript;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -320,6 +320,7 @@ impl_openapi_schema!(
     RuntimeCleanupExecutionResponse,
     WorkerRetentionResponse,
     WorkerFileUploadQuery,
+    WorkerFileUploadResponse,
     AttachmentUploadGrantResponse,
     AttachmentUploadCancelResponse,
     WorkerFileDeleteResponse,
@@ -1859,6 +1860,25 @@ pub trait ServerApi {
         #[path] worker_id: String,
         #[query] query: WorkerFileUploadQuery,
     ) -> Result<AttachmentUploadGrantResponse, RepositoryApiError>;
+
+    #[put(
+        "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/attachment-uploads/{upload_id}",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 413, 500, 502, 503],
+        bearer_auth = true,
+        browser_auth = true,
+        normalize_body_errors = true
+    )]
+    async fn runtime_worker_attachment_upload(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] runtime_id: String,
+        #[path] worker_id: String,
+        #[path] upload_id: String,
+        #[binary] body: BinaryBody,
+    ) -> Result<WorkerFileUploadResponse, RepositoryApiError>;
 
     #[delete(
         "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/attachment-uploads/{upload_id}",
@@ -6539,7 +6559,7 @@ pub struct WorkerFileUploadQuery {
     pub upload_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerFileUploadResponse {
     pub file: protocol::UploadedFileRef,
@@ -10524,6 +10544,39 @@ mod openapi_artifact_tests {
         assert_eq!(
             generated, checked_in,
             "regenerate with `cargo run -p server-api --example export_openapi -- openapi/server-api.json`",
+        );
+    }
+
+    #[test]
+    fn attachment_upload_openapi_uses_required_binary_body_and_json_response() {
+        let value = canonical_openapi_document()
+            .expect("canonical OpenAPI contract must build")
+            .as_value()
+            .clone();
+        let operation = &value["paths"]["/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/attachment-uploads/{upload_id}"]
+            ["put"];
+        assert_eq!(operation["operationId"], "runtime_worker_attachment_upload");
+        assert_eq!(
+            operation["requestBody"],
+            serde_json::json!({
+                "required": true,
+                "content": {
+                    "application/octet-stream": {
+                        "schema": { "type": "string", "format": "binary" }
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/WorkerFileUploadResponse"
+        );
+        assert!(
+            value["components"]["schemas"]
+                .as_object()
+                .expect("schema components")
+                .get("BinaryBody")
+                .is_none()
         );
     }
 

@@ -1,4 +1,7 @@
-import type { AttachmentUploadGrantResponse } from "$lib/generated/runtime-api.ts";
+import type {
+  AttachmentUploadGrantResponse,
+  WorkerFileUploadResponse,
+} from "$lib/generated/runtime-api.ts";
 import type { UploadedFileRef } from "$lib/generated/protocol.ts";
 
 export const MAX_UPLOADED_FILE_BYTES = 10 * 1024 * 1024;
@@ -151,7 +154,7 @@ function isUploadGrantResponse(
 
 function isUploadedFileResponse(
   value: unknown,
-): value is { file: UploadedFileRef } {
+): value is WorkerFileUploadResponse {
   if (!value || typeof value !== "object" || !("file" in value)) return false;
   const file = value.file;
   return !!file && typeof file === "object" &&

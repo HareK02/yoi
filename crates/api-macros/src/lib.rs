@@ -45,12 +45,13 @@
 //! security schemes. Body operations may opt into typed Axum rejection normalization with
 //! typed Axum rejection normalization with `normalize_body_errors = true` and [`HttpRequestError`].
 //!
-//! Arguments are classified with `#[body]`, `#[query]`, `#[header]`, `#[path]`, or `#[extension]`.
-//! Extension values are trusted server-local Axum context: generated clients and OpenAPI omit them.
-//! An unannotated argument whose Rust name occurs in the route template is inferred as a path
-//! argument. Header attributes may carry a wire name, as in `#[header("x-request-id")]`.
-//! Exactly one JSON body is allowed. JSON request, response, and error bodies must be named
-//! Rust types; tuples, references, arrays, and other anonymous structural types are rejected.
+//! Arguments are classified with `#[body]`, `#[binary]`, `#[query]`, `#[header]`, `#[path]`, or
+//! `#[extension]`. Extension values are trusted server-local Axum context: generated clients and
+//! OpenAPI omit them. An unannotated argument whose Rust name occurs in the route template is
+//! inferred as a path argument. Header attributes may carry a wire name, as in
+//! `#[header("x-request-id")]`. Exactly one JSON or binary body is allowed. JSON request, response,
+//! and error bodies must be named Rust types; tuples, references, arrays, and other anonymous
+//! structural types are rejected. Binary request bodies use [`BinaryBody`] and remain byte-exact.
 //! `openapi = false` explicitly excludes an operation whose wire body cannot yet satisfy the
 //! strict OpenAPI schema boundary; Reqwest and Axum adapters are still generated.
 //!
@@ -63,9 +64,9 @@
 //! deterministic `Operation<utf8-hex>` fallback. The `ApiContract::OPERATIONS` inventory is
 //! sorted by operation ID, so its ordering is independent of source method order.
 //!
-//! Only empty and JSON bodies are accepted by this first contract. [`WireKind`] reserves
-//! explicit variants for future transport work; accepting one requires a deliberate macro and
-//! adapter change rather than silently treating it as JSON.
+//! Empty, JSON, and bounded binary request bodies are supported. [`WireKind`] reserves explicit
+//! variants for other future transport work; accepting one requires a deliberate macro and adapter
+//! change rather than silently treating it as JSON.
 //!
 //! # OpenAPI 3.1 export
 //!
@@ -114,6 +115,70 @@ pub mod axum;
 pub mod openapi;
 #[cfg(feature = "reqwest")]
 pub mod reqwest;
+
+/// Framework-neutral owned bytes used by explicit `#[binary]` request bodies.
+///
+/// The wrapper preserves the exact byte sequence while keeping payload content out of `Debug`
+/// output. Its `bytes::Bytes` storage lets generated Axum adapters transfer an extracted body
+/// without reserialization and lets generated Reqwest clients authorize and send the same storage.
+#[derive(Clone, Default, Eq, Hash, PartialEq)]
+pub struct BinaryBody(bytes::Bytes);
+
+impl BinaryBody {
+    pub const fn new(bytes: bytes::Bytes) -> Self {
+        Self(bytes)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn into_bytes(self) -> bytes::Bytes {
+        self.0
+    }
+}
+
+impl AsRef<[u8]> for BinaryBody {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+
+impl std::ops::Deref for BinaryBody {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+impl From<bytes::Bytes> for BinaryBody {
+    fn from(value: bytes::Bytes) -> Self {
+        Self(value)
+    }
+}
+
+impl From<Vec<u8>> for BinaryBody {
+    fn from(value: Vec<u8>) -> Self {
+        Self(value.into())
+    }
+}
+
+impl From<&'static [u8]> for BinaryBody {
+    fn from(value: &'static [u8]) -> Self {
+        Self(bytes::Bytes::from_static(value))
+    }
+}
+
+impl std::fmt::Debug for BinaryBody {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BinaryBody(<redacted>)")
+    }
+}
 
 /// A transport-neutral HTTP method.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -189,7 +254,7 @@ pub trait ApiContract {
 pub trait Operation {
     /// Tuple of all non-receiver parameter types in declaration order.
     type Parameters;
-    /// JSON request body type, or [`NoBody`].
+    /// Typed JSON or binary request body, or [`NoBody`].
     type RequestBody;
     /// JSON success response body type, or [`NoBody`].
     type ResponseBody;

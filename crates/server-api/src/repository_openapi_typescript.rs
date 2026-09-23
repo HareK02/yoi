@@ -924,6 +924,12 @@ fn validate_runtime_operations(
             None,
             &[("200", "AttachmentUploadGrantResponse")],
         ),
+        binary_runtime_operation(
+            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/attachment-uploads/{upload_id}",
+            "put",
+            "runtime_worker_attachment_upload",
+            &[("200", "WorkerFileUploadResponse")],
+        ),
         runtime_operation(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/attachment-uploads/{upload_id}",
             "delete",
@@ -996,6 +1002,24 @@ const fn runtime_operation(
         method,
         operation_id,
         request,
+        binary_request: false,
+        successes,
+        error: "RepositoryApiError",
+    }
+}
+
+const fn binary_runtime_operation(
+    path: &'static str,
+    method: &'static str,
+    operation_id: &'static str,
+    successes: &'static [(&'static str, &'static str)],
+) -> RuntimeOperationContract {
+    RuntimeOperationContract {
+        path,
+        method,
+        operation_id,
+        request: None,
+        binary_request: true,
         successes,
         error: "RepositoryApiError",
     }
@@ -1015,23 +1039,28 @@ fn validate_runtime_operation_contracts(
                 operation.method, operation.path, operation.operation_id
             )));
         }
-        match operation.request {
-            Some(expected) => {
-                let request = object_field(value, "requestBody", operation.operation_id)?;
-                require_schema_ref(
-                    json_content_schema(request, operation.operation_id)?,
-                    expected,
-                    operation.operation_id,
-                )?;
-                roots.insert(expected.to_owned());
+        if operation.binary_request {
+            let request = object_field(value, "requestBody", operation.operation_id)?;
+            validate_binary_request_body(request, operation.operation_id)?;
+        } else {
+            match operation.request {
+                Some(expected) => {
+                    let request = object_field(value, "requestBody", operation.operation_id)?;
+                    require_schema_ref(
+                        json_content_schema(request, operation.operation_id)?,
+                        expected,
+                        operation.operation_id,
+                    )?;
+                    roots.insert(expected.to_owned());
+                }
+                None if value.contains_key("requestBody") => {
+                    return Err(GenerationError::invalid(format!(
+                        "{} unexpectedly gained a request body",
+                        operation.operation_id
+                    )));
+                }
+                None => {}
             }
-            None if value.contains_key("requestBody") => {
-                return Err(GenerationError::invalid(format!(
-                    "{} unexpectedly gained a request body",
-                    operation.operation_id
-                )));
-            }
-            None => {}
         }
         let responses = object_field(value, "responses", operation.operation_id)?;
         let successes = operation
@@ -1072,6 +1101,7 @@ struct RuntimeOperationContract {
     method: &'static str,
     operation_id: &'static str,
     request: Option<&'static str>,
+    binary_request: bool,
     successes: &'static [(&'static str, &'static str)],
     error: &'static str,
 }
@@ -1144,6 +1174,36 @@ struct OperationContract {
     operation_id: &'static str,
     request: Option<&'static str>,
     successes: &'static [(&'static str, &'static str)],
+}
+
+fn validate_binary_request_body(
+    request: &Map<String, Value>,
+    context: &str,
+) -> Result<(), GenerationError> {
+    if request.get("required").and_then(Value::as_bool) != Some(true) {
+        return Err(GenerationError::invalid(format!(
+            "{context} binary request body must be required"
+        )));
+    }
+    let content = object_field(request, "content", context)?;
+    if content.len() != 1 {
+        return Err(GenerationError::invalid(format!(
+            "{context} binary request body must expose only application/octet-stream"
+        )));
+    }
+    let media = object_field(content, "application/octet-stream", context)?;
+    let schema = media.get("schema").ok_or_else(|| {
+        GenerationError::invalid(format!("{context} is missing its binary schema"))
+    })?;
+    let schema = object(schema, context)?;
+    if schema.get("type").and_then(Value::as_str) != Some("string")
+        || schema.get("format").and_then(Value::as_str) != Some("binary")
+    {
+        return Err(GenerationError::invalid(format!(
+            "{context} binary request schema must be type string with format binary"
+        )));
+    }
+    Ok(())
 }
 
 fn json_content_schema<'a>(
@@ -1828,6 +1888,8 @@ mod tests {
         )));
         assert!(output.contains("export type RuntimeCleanupPlanResponse ="));
         assert!(output.contains("export type RuntimeWorkerLifecycleResult ="));
+        assert!(output.contains("export type WorkerFileUploadResponse ="));
+        assert!(output.contains("export type UploadedFileRef ="));
         assert!(output.contains(
             "export type RuntimeWorkerSpawnAcceptanceRequirement = { kind: \"socket_ready\"; } | { expected_segments: number; kind: \"run_accepted\"; };"
         ));
@@ -1838,6 +1900,13 @@ mod tests {
             serde_json::json!("manual_cleanup_plan");
         let error = generate_runtime_typescript(&document.to_string()).unwrap_err();
         assert!(error.to_string().contains("runtime_cleanup_plan"));
+
+        let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
+        document["paths"]["/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/attachment-uploads/{upload_id}"]
+            ["put"]["requestBody"]["content"]["application/octet-stream"]["schema"]["format"] =
+            serde_json::json!("byte");
+        let error = generate_runtime_typescript(&document.to_string()).unwrap_err();
+        assert!(error.to_string().contains("format binary"));
 
         let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
         document["components"]["schemas"]["RuntimeWorkerSpawnAcceptanceRequirement"]

@@ -38,6 +38,12 @@ impl api_macros::HttpError for PublicError {
     }
 }
 
+impl api_macros::HttpRequestError for PublicError {
+    fn from_request_rejection(status: u16, message: String) -> Self {
+        Self { message, status }
+    }
+}
+
 #[api(reqwest, axum)]
 pub trait WidgetApi {
     #[post(
@@ -84,6 +90,45 @@ impl WidgetApi for WidgetService {
     }
 
     async fn delete(&self, _widget_id: u64) {}
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BinaryReceipt {
+    bytes: Vec<u8>,
+    content_type: String,
+}
+
+#[api(reqwest, axum)]
+pub trait BinaryApi {
+    #[put(
+        "/binary",
+        operation_id = "binary.put",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [413],
+        normalize_body_errors = true
+    )]
+    async fn upload(
+        &self,
+        #[header("content-type")] content_type: String,
+        #[binary] body: api_macros::BinaryBody,
+    ) -> Result<BinaryReceipt, PublicError>;
+}
+
+#[derive(Clone)]
+pub struct BinaryService;
+
+impl BinaryApi for BinaryService {
+    async fn upload(
+        &self,
+        content_type: String,
+        body: api_macros::BinaryBody,
+    ) -> Result<BinaryReceipt, PublicError> {
+        Ok(BinaryReceipt {
+            bytes: body.as_ref().to_vec(),
+            content_type,
+        })
+    }
 }
 
 #[api(reqwest)]
@@ -273,6 +318,71 @@ async fn generated_client_and_router_follow_the_normalized_contract() {
     ));
 
     let _route_specific = widget_api_axum::create(Arc::new(WidgetService));
+    server.abort();
+}
+
+#[tokio::test]
+async fn binary_adapter_preserves_exact_bytes_content_type_and_route_limit() {
+    let app = binary_api_axum::upload(Arc::new(BinaryService))
+        .layer(api_macros::axum::framework::DefaultBodyLimit::max(4));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind binary fixture server");
+    let address = listener.local_addr().expect("binary fixture address");
+    let server = tokio::spawn(async move {
+        api_macros::axum::framework::serve(listener, app)
+            .await
+            .expect("serve binary fixture API");
+    });
+
+    let recorded = Arc::new(Mutex::new(None));
+    let client = BinaryApiClient::builder(format!("http://{address}/"))
+        .expect("validated base URL")
+        .authorizer(RecordingAuthorizer {
+            request: recorded.clone(),
+            credential: "Bearer binary-test".to_owned(),
+        })
+        .build()
+        .expect("binary client build");
+
+    for expected in [vec![], vec![0, 1], vec![0, 255, 1, 2]] {
+        let receipt = client
+            .upload(
+                "text/plain".to_owned(),
+                api_macros::BinaryBody::from(expected.clone()),
+            )
+            .await
+            .expect("binary body within the route limit");
+        assert_eq!(receipt.bytes, expected);
+        assert_eq!(receipt.content_type, "application/octet-stream");
+        assert_eq!(
+            recorded
+                .lock()
+                .expect("recording lock")
+                .as_ref()
+                .expect("authorized request")
+                .body,
+            expected
+        );
+    }
+
+    let oversized = client
+        .upload(
+            "text/plain".to_owned(),
+            api_macros::BinaryBody::from(vec![0, 1, 2, 3, 4]),
+        )
+        .await
+        .expect_err("one byte over the route limit must be rejected");
+    assert!(matches!(
+        oversized,
+        api_reqwest::ClientError::Public { status, .. }
+            if status == api_reqwest::framework::StatusCode::PAYLOAD_TOO_LARGE
+    ));
+    assert_eq!(
+        format!("{:?}", api_macros::BinaryBody::from(vec![1, 2, 3])),
+        "BinaryBody(<redacted>)"
+    );
+
     server.abort();
 }
 

@@ -118,6 +118,7 @@ yoi-workspace-server = { path = "crates/workspace-server" }
 async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22.1"
+bytes = "1"
 decodal = "0.4.0"
 decodal-language-service = "0.4.0"
 decodal-language-tools = "0.4.0"

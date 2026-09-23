@@ -1,6 +1,8 @@
 #![allow(async_fn_in_trait)]
 
-use api_macros::{ApiContract, HttpMethod, NoBody, Operation, ParameterLocation, WireKind, api};
+use api_macros::{
+    ApiContract, BinaryBody, HttpMethod, NoBody, Operation, ParameterLocation, WireKind, api,
+};
 
 pub struct CreateWidget;
 pub struct Widget;
@@ -33,6 +35,12 @@ pub trait WidgetApi {
 pub trait WrapperApi {
     #[get("/search", operation_id = "search")]
     async fn search(&self) -> SearchResult<Widget>;
+}
+
+#[api]
+pub trait BinaryApi {
+    #[put("/payload", operation_id = "payload.upload")]
+    async fn upload(&self, #[binary] payload: BinaryBody) -> Widget;
 }
 
 #[api]
@@ -96,6 +104,12 @@ fn expansion_exposes_deterministic_metadata_and_type_connections() {
     let lookup = <widget_api_operations::Lookup as Operation>::METADATA;
     assert_eq!(lookup.parameters[0].location, ParameterLocation::Path);
     assert_eq!(lookup.parameters[1].location, ParameterLocation::Query);
+
+    let upload = <binary_api_operations::Upload as Operation>::METADATA;
+    assert_eq!(upload.request_body.wire_kind, WireKind::Binary);
+    assert_eq!(upload.parameters[0].location, ParameterLocation::Body);
+    fn assert_binary_request<O: Operation<RequestBody = BinaryBody>>() {}
+    assert_binary_request::<binary_api_operations::Upload>();
 
     let delete = <widget_api_operations::Delete as Operation>::METADATA;
     assert_eq!(delete.response.status, 204);

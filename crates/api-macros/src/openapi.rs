@@ -385,6 +385,24 @@ impl OpenApiOperation<'_> {
         Ok(())
     }
 
+    pub fn binary_request_body(&mut self) -> Result<(), OpenApiError> {
+        if self.request_body.is_some() {
+            return Err(OpenApiError::InvalidContract(format!(
+                "multiple request bodies for `{}`",
+                self.operation_id
+            )));
+        }
+        self.request_body = Some(json!({
+            "required": true,
+            "content": {
+                "application/octet-stream": {
+                    "schema": { "type": "string", "format": "binary" }
+                }
+            },
+        }));
+        Ok(())
+    }
+
     pub fn response<T: OpenApiSchema>(
         &mut self,
         status: u16,

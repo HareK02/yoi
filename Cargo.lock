@@ -174,6 +174,7 @@ version = "0.1.0"
 dependencies = [
  "api-macros-impl",
  "axum",
+ "bytes",
  "futures",
  "oas3",
  "reqwest",

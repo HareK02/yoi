@@ -1,0 +1,5 @@
+error: binary request bodies must use api_macros::BinaryBody
+ --> tests/ui/invalid_binary_type.rs:8:44
+  |
+8 |     async fn upload(&self, #[binary] body: Vec<u8>) -> Response;
+  |                                            ^^^^^^^

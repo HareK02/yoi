@@ -2,7 +2,7 @@
 #![allow(async_fn_in_trait, dead_code)]
 
 use api_macros::{
-    api,
+    BinaryBody, api,
     openapi::{OpenApiInfo, OpenApiSchema},
 };
 use schemars::JsonSchema;
@@ -100,6 +100,9 @@ pub trait FixtureApi {
 
     #[delete("/widgets/{widget_id}", operation_id = "widgets.delete", status = 204)]
     async fn delete(&self, #[path] widget_id: u32) -> ();
+
+    #[put("/uploads", operation_id = "uploads.put", status = 200)]
+    async fn upload(&self, #[binary] body: BinaryBody) -> Widget;
 }
 
 fn document() -> api_macros::openapi::OpenApiDocument {
@@ -281,6 +284,24 @@ fn operations_and_components_preserve_the_wire_contract() {
                 .contains(&json!("null"))
         );
     }
+
+    let upload = &value["paths"]["/uploads"]["put"];
+    assert_eq!(upload["operationId"], "uploads.put");
+    assert_eq!(
+        upload["requestBody"],
+        json!({
+            "required": true,
+            "content": {
+                "application/octet-stream": {
+                    "schema": { "type": "string", "format": "binary" }
+                }
+            }
+        })
+    );
+    assert!(
+        !schemas.contains_key("BinaryBody"),
+        "binary payloads are not JSON Schema components"
+    );
 
     let delete = &value["paths"]["/widgets/{widget_id}"]["delete"];
     assert_eq!(delete["operationId"], "widgets.delete");

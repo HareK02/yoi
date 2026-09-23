@@ -225,6 +225,7 @@ enum Location {
     Query,
     Header,
     Body,
+    Binary,
     /// Trusted request-local context supplied by the server adapter. Extension
     /// parameters are not part of the wire contract or generated client signature.
     Extension,
@@ -236,7 +237,7 @@ impl Location {
             Self::Path => quote!(Path),
             Self::Query => quote!(Query),
             Self::Header => quote!(Header),
-            Self::Body => quote!(Body),
+            Self::Body | Self::Binary => quote!(Body),
             Self::Extension => unreachable!("extensions are not wire parameters"),
         };
         quote!(#api_crate::ParameterLocation::#variant)
@@ -251,6 +252,17 @@ struct Parameter {
     ty: Type,
 }
 
+#[derive(Clone, Copy)]
+enum RequestWireKind {
+    Json,
+    Binary,
+}
+
+struct RequestBody {
+    ty: Type,
+    wire_kind: RequestWireKind,
+}
+
 struct Operation {
     method_ident: Ident,
     marker_ident: Ident,
@@ -258,7 +270,7 @@ struct Operation {
     method: Method,
     path: String,
     parameters: Vec<Parameter>,
-    request_body: Option<Type>,
+    request_body: Option<RequestBody>,
     response_body: Option<Type>,
     error_body: Option<Type>,
     fallible: bool,
@@ -575,6 +587,15 @@ fn normalize_operation(method: &mut TraitItemFn) -> syn::Result<Operation> {
                 }
                 (Location::Body, rust_name.clone())
             }
+            Some((Location::Binary, wire_name)) => {
+                if wire_name.is_some() {
+                    return Err(syn::Error::new(
+                        ident.span(),
+                        "#[binary] does not accept a wire name",
+                    ));
+                }
+                (Location::Binary, rust_name.clone())
+            }
             Some((Location::Extension, wire_name)) => {
                 if wire_name.is_some() {
                     return Err(syn::Error::new(
@@ -588,7 +609,7 @@ fn normalize_operation(method: &mut TraitItemFn) -> syn::Result<Operation> {
             None => {
                 return Err(syn::Error::new(
                     ident.span(),
-                    "API arguments must use #[path], #[query], #[header], #[body], or #[extension]; path arguments may omit #[path] when their name matches a placeholder",
+                    "API arguments must use #[path], #[query], #[header], #[body], #[binary], or #[extension]; path arguments may omit #[path] when their name matches a placeholder",
                 ));
             }
         };
@@ -596,15 +617,28 @@ fn normalize_operation(method: &mut TraitItemFn) -> syn::Result<Operation> {
         if matches!(location, Location::Path) {
             path_parameters.insert(rust_name.clone());
         }
-        if matches!(location, Location::Body) {
+        if matches!(location, Location::Body | Location::Binary) {
             if body_type.is_some() {
                 return Err(syn::Error::new(
                     ident.span(),
-                    "an API operation may declare only one request body",
+                    "an API operation may declare only one JSON or binary request body",
                 ));
             }
-            validate_named_body_type(&input.ty, "request")?;
-            body_type = Some((*input.ty).clone());
+            let wire_kind = match location {
+                Location::Body => {
+                    validate_named_body_type(&input.ty, "request")?;
+                    RequestWireKind::Json
+                }
+                Location::Binary => {
+                    validate_binary_body_type(&input.ty)?;
+                    RequestWireKind::Binary
+                }
+                _ => unreachable!(),
+            };
+            body_type = Some(RequestBody {
+                ty: (*input.ty).clone(),
+                wire_kind,
+            });
         }
         parameters.push(Parameter {
             rust_ident: ident.clone(),
@@ -642,6 +676,20 @@ fn normalize_operation(method: &mut TraitItemFn) -> syn::Result<Operation> {
                 "{} operations cannot declare a request body",
                 method_name(http_method)
             ),
+        ));
+    }
+    if route
+        .normalize_body_errors
+        .as_ref()
+        .is_some_and(|value| value.value)
+        && (body_type.is_none() || error_body.is_none())
+    {
+        return Err(syn::Error::new_spanned(
+            route
+                .normalize_body_errors
+                .as_ref()
+                .expect("checked normalize_body_errors"),
+            "normalize_body_errors requires a request body and public error response type",
         ));
     }
 
@@ -717,8 +765,9 @@ fn take_location(attrs: &mut Vec<Attribute>) -> syn::Result<Option<(Location, Op
             Some("query") => Some(Location::Query),
             Some("header") => Some(Location::Header),
             Some("body") => Some(Location::Body),
+            Some("binary") => Some(Location::Binary),
             Some("extension") => Some(Location::Extension),
-            Some("stream") | Some("multipart") | Some("binary") => {
+            Some("stream") | Some("multipart") => {
                 return Err(syn::Error::new_spanned(
                     attr,
                     "this wire kind is explicitly unsupported by the initial API contract",
@@ -930,6 +979,31 @@ fn validate_named_body_type(ty: &Type, kind: &str) -> syn::Result<()> {
     Ok(())
 }
 
+fn validate_binary_body_type(ty: &Type) -> syn::Result<()> {
+    let Type::Path(path) = ty else {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "binary request bodies must use api_macros::BinaryBody",
+        ));
+    };
+    let Some(last) = path.path.segments.last() else {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "binary request bodies must use api_macros::BinaryBody",
+        ));
+    };
+    if path.qself.is_some()
+        || last.ident != "BinaryBody"
+        || !matches!(last.arguments, PathArguments::None)
+    {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "binary request bodies must use api_macros::BinaryBody",
+        ));
+    }
+    Ok(())
+}
+
 fn argument_ident(pat: &Pat) -> syn::Result<&Ident> {
     let Pat::Ident(ident) = pat else {
         return Err(syn::Error::new_spanned(
@@ -1048,14 +1122,20 @@ fn reqwest_adapter_tokens(
         let body = operation
             .parameters
             .iter()
-            .find(|parameter| matches!(parameter.location, Location::Body))
+            .find(|parameter| matches!(parameter.location, Location::Body | Location::Binary))
             .map(|parameter| {
                 let ident = &parameter.rust_ident;
-                quote! {
-                    ::core::option::Option::Some(
-                        #api_crate::reqwest::encode_json(&#ident)
-                            .map_err(#api_crate::reqwest::ClientError::from)?,
-                    )
+                match parameter.location {
+                    Location::Body => quote! {
+                        ::core::option::Option::Some(
+                            #api_crate::reqwest::encode_json(&#ident)
+                                .map_err(#api_crate::reqwest::ClientError::from)?,
+                        )
+                    },
+                    Location::Binary => quote! {
+                        ::core::option::Option::Some(#api_crate::reqwest::encode_binary(#ident))
+                    },
+                    _ => unreachable!(),
                 }
             })
             .unwrap_or_else(|| quote!(::core::option::Option::None));
@@ -1329,44 +1409,81 @@ fn axum_adapter_tokens(
         let (body_extractor, body_rejection) = operation
             .parameters
             .iter()
-            .find(|parameter| matches!(parameter.location, Location::Body))
+            .find(|parameter| matches!(parameter.location, Location::Body | Location::Binary))
             .map(|parameter| {
                 let ident = &parameter.rust_ident;
                 let ty = &parameter.ty;
-                if !operation.normalize_body_errors {
-                    return (
+                match parameter.location {
+                    Location::Body if !operation.normalize_body_errors => (
                         Some(quote!(#api_crate::axum::framework::Json(#ident): #api_crate::axum::framework::Json<#ty>,)),
                         None,
-                    );
+                    ),
+                    Location::Body => {
+                        let error = operation
+                            .error_body
+                            .as_ref()
+                            .expect("normalized body operations require an error type");
+                        (
+                            Some(quote!(
+                                __body: ::core::result::Result<
+                                    #api_crate::axum::framework::Json<#ty>,
+                                    #api_crate::axum::framework::JsonRejection,
+                                >,
+                            )),
+                            Some(quote! {
+                                let #ident = match __body {
+                                    ::core::result::Result::Ok(#api_crate::axum::framework::Json(value)) => value,
+                                    ::core::result::Result::Err(rejection) => {
+                                        let status = rejection.status().as_u16();
+                                        let error = <#error as #api_crate::HttpRequestError>::from_request_rejection(
+                                            status,
+                                            rejection.body_text(),
+                                        );
+                                        return #api_crate::axum::json_response(
+                                            #api_crate::axum::status(status),
+                                            error,
+                                        );
+                                    }
+                                };
+                            }),
+                        )
+                    }
+                    Location::Binary if !operation.normalize_body_errors => (
+                        Some(quote!(#api_crate::axum::framework::Bytes(__body): #api_crate::axum::framework::Bytes,)),
+                        Some(quote!(let #ident: #ty = __body.into();)),
+                    ),
+                    Location::Binary => {
+                        let error = operation
+                            .error_body
+                            .as_ref()
+                            .expect("normalized body operations require an error type");
+                        (
+                            Some(quote!(
+                                __body: ::core::result::Result<
+                                    #api_crate::axum::framework::Bytes,
+                                    #api_crate::axum::framework::BytesRejection,
+                                >,
+                            )),
+                            Some(quote! {
+                                let #ident: #ty = match __body {
+                                    ::core::result::Result::Ok(value) => value.into(),
+                                    ::core::result::Result::Err(rejection) => {
+                                        let status = rejection.status().as_u16();
+                                        let error = <#error as #api_crate::HttpRequestError>::from_request_rejection(
+                                            status,
+                                            rejection.body_text(),
+                                        );
+                                        return #api_crate::axum::json_response(
+                                            #api_crate::axum::status(status),
+                                            error,
+                                        );
+                                    }
+                                };
+                            }),
+                        )
+                    }
+                    _ => unreachable!(),
                 }
-                let error = operation
-                    .error_body
-                    .as_ref()
-                    .expect("body operations require an error type");
-                (
-                    Some(quote!(
-                        __body: ::core::result::Result<
-                            #api_crate::axum::framework::Json<#ty>,
-                            #api_crate::axum::framework::JsonRejection,
-                        >,
-                    )),
-                    Some(quote! {
-                        let #ident = match __body {
-                            ::core::result::Result::Ok(#api_crate::axum::framework::Json(value)) => value,
-                            ::core::result::Result::Err(rejection) => {
-                                let status = rejection.status().as_u16();
-                                let error = <#error as #api_crate::HttpRequestError>::from_request_rejection(
-                                    status,
-                                    rejection.body_text(),
-                                );
-                                return #api_crate::axum::json_response(
-                                    #api_crate::axum::status(status),
-                                    error,
-                                );
-                            }
-                        };
-                    }),
-                )
             })
             .unwrap_or((None, None));
         let call_arguments = operation.parameters.iter().map(|parameter| &parameter.rust_ident);
@@ -1485,7 +1602,7 @@ fn openapi_adapter_tokens(
         let path = &operation.path;
         let operation_id = &operation.operation_id;
         let parameters = operation.parameters.iter().filter_map(|parameter| {
-            if matches!(parameter.location, Location::Body | Location::Extension) {
+            if matches!(parameter.location, Location::Body | Location::Binary | Location::Extension) {
                 return None;
             }
             let ty = &parameter.ty;
@@ -1494,16 +1611,22 @@ fn openapi_adapter_tokens(
                 Location::Path => "path",
                 Location::Query => "query",
                 Location::Header => "header",
-                Location::Body | Location::Extension => unreachable!(),
+                Location::Body | Location::Binary | Location::Extension => unreachable!(),
             };
             Some(quote! {
                 operation.parameter::<#ty>(#name, #location)?;
             })
         });
-        let request = operation.request_body.as_ref().map(|ty| {
-            quote! {
-                operation.request_body::<#ty>("application/json")?;
+        let request = operation.request_body.as_ref().map(|body| match body.wire_kind {
+            RequestWireKind::Json => {
+                let ty = &body.ty;
+                quote! {
+                    operation.request_body::<#ty>("application/json")?;
+                }
             }
+            RequestWireKind::Binary => quote! {
+                operation.binary_request_body()?;
+            },
         });
         let status = operation.response_status;
         let response = match &operation.response_body {
@@ -1623,7 +1746,10 @@ fn expand_api(api: ApiDefinition) -> syn::Result<proc_macro2::TokenStream> {
             let request_type = operation
                 .request_body
                 .as_ref()
-                .map(|ty| quote!(#ty))
+                .map(|body| {
+                    let ty = &body.ty;
+                    quote!(#ty)
+                })
                 .unwrap_or_else(|| quote!(#api_crate::NoBody));
             let response_type = operation
                 .response_body
@@ -1686,10 +1812,10 @@ fn metadata_tokens(
     let operation_id = &operation.operation_id;
     let method = operation.method.tokens(api_crate);
     let path = &operation.path;
-    let request_kind = if operation.request_body.is_some() {
-        quote!(#api_crate::WireKind::Json)
-    } else {
-        quote!(#api_crate::WireKind::Empty)
+    let request_kind = match operation.request_body.as_ref().map(|body| body.wire_kind) {
+        Some(RequestWireKind::Json) => quote!(#api_crate::WireKind::Json),
+        Some(RequestWireKind::Binary) => quote!(#api_crate::WireKind::Binary),
+        None => quote!(#api_crate::WireKind::Empty),
     };
     let response_kind = if operation.response_body.is_some() {
         quote!(#api_crate::WireKind::Json)
