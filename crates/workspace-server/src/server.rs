@@ -115,7 +115,9 @@ use worker_runtime::http_server::{
     RUNTIME_HTTP_PROTOCOL_MAX_VERSION, RUNTIME_HTTP_PROTOCOL_MIN_VERSION,
     RUNTIME_HTTP_PROTOCOL_VERSION,
 };
-use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest};
+#[cfg(test)]
+use worker_runtime::resource::BackendResourceError;
+use worker_runtime::resource::BackendResourceFetchRequest;
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
 use worker_runtime::workspace_issuer::{
     WORKSPACE_VERIFICATION_ACK_PATH, WORKSPACE_VERIFICATION_CHALLENGE_PATH,

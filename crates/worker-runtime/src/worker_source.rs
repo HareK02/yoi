@@ -1070,9 +1070,12 @@ mod tests {
         server.join().unwrap();
 
         let request = received.lock().unwrap().clone();
-        assert!(request.contains(
-            "GET /api/w/workspace-a/worker-discovery/workers?limit=1&cursor=v1%3A0&query=coder%20two "
-        ));
+        assert!(
+            request.contains(
+                "GET /api/w/workspace-a/worker-discovery/workers?cursor=v1%3A0&limit=1&query=coder+two "
+            ),
+            "unexpected discovery request: {request}"
+        );
         let token = request
             .lines()
             .find_map(|line| {
@@ -1086,7 +1089,7 @@ mod tests {
         assert_eq!(claims.permission, WORKSPACE_WORKER_DISCOVERY_PERMISSION);
         assert_eq!(
             claims.path,
-            "/api/w/workspace-a/worker-discovery/workers?limit=1&cursor=v1%3A0&query=coder%20two"
+            "/api/w/workspace-a/worker-discovery/workers?cursor=v1%3A0&limit=1&query=coder+two"
         );
     }
 
@@ -1145,9 +1148,15 @@ mod tests {
             let count = stream.read(&mut bytes).unwrap();
             *received_for_server.lock().unwrap() =
                 String::from_utf8_lossy(&bytes[..count]).into_owned();
-            stream
-                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-                .unwrap();
+            let body =
+                r#"{"removed":true,"runtime_id":"runtime-target","worker_id":"worker-target"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
         });
 
         let identity = RuntimeIdentityMaterial::generate("runtime-a").unwrap();
@@ -1166,7 +1175,7 @@ mod tests {
         let response = forwarder
             .execute_worker_remove("runtime-target", "worker-target", "retire obsolete Worker")
             .unwrap();
-        assert_eq!(response.status, 204);
+        assert_eq!(response.status, 200);
         server.join().unwrap();
 
         let request = received.lock().unwrap().clone();

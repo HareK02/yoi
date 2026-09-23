@@ -448,16 +448,15 @@ mod tests {
         let base_url = format!("http://{address}");
         let identity = RuntimeIdentityMaterial::generate("runtime-test").unwrap();
         let handle = handle_for(b"archive-bytes");
-        let client = HttpBackendResourceClient::new(format!("{base_url}/fetch"), None)
-            .with_request_timeout(std::time::Duration::from_millis(25))
-            .with_workspace_request_client(
-                RuntimeWorkspaceRequestClient::new(
-                    "workspace-test",
-                    base_url.clone(),
-                    "runtime-test",
-                )
+        let client = HttpBackendResourceClient::new(
+            format!("{base_url}/api/runtime/v1/workspaces/workspace-test/resources/fetch"),
+            None,
+        )
+        .with_request_timeout(std::time::Duration::from_millis(25))
+        .with_workspace_request_client(
+            RuntimeWorkspaceRequestClient::new("workspace-test", base_url.clone(), "runtime-test")
                 .with_runtime_request_source(&identity, base_url),
-            );
+        );
 
         let error = client
             .fetch_resource(BackendResourceFetchRequest {

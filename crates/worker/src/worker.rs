@@ -583,10 +583,24 @@ fn workspace_server_json_request<T: serde::Serialize>(
     ))
 }
 
+fn encode_workspace_path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
 fn workspace_server_operation_request(
     workspace_id: &str,
     operation: WorkspaceServerOperation,
 ) -> Result<WorkspaceRequest, WorkspaceClientError> {
+    let workspace_id = encode_workspace_path_segment(workspace_id);
     let base = format!("/api/w/{workspace_id}");
     match operation {
         WorkspaceServerOperation::WorkerControlList => Ok(WorkspaceRequest::get(format!(
