@@ -103,6 +103,16 @@ pub trait FixtureApi {
 
     #[put("/uploads", operation_id = "uploads.put", status = 200)]
     async fn upload(&self, #[binary] body: BinaryBody) -> Widget;
+
+    #[get(
+        "/conditional",
+        operation_id = "conditional.get",
+        responses = [
+            (status = 200, body = Widget, headers = [("etag", String), ("cache-control", String)]),
+            (status = 304, headers = [("etag", String), ("cache-control", String)])
+        ]
+    )]
+    async fn conditional(&self) -> fixture_api_responses::Conditional;
 }
 
 fn document() -> api_macros::openapi::OpenApiDocument {
@@ -301,6 +311,26 @@ fn operations_and_components_preserve_the_wire_contract() {
     assert!(
         !schemas.contains_key("BinaryBody"),
         "binary payloads are not JSON Schema components"
+    );
+
+    let conditional = &value["paths"]["/conditional"]["get"];
+    assert_eq!(
+        conditional["responses"]["200"]["content"]["application/json"]["schema"],
+        json!({ "$ref": "#/components/schemas/Widget" })
+    );
+    assert_eq!(
+        conditional["responses"]["200"]["headers"]["etag"]["schema"],
+        json!({ "$ref": "#/components/schemas/string" })
+    );
+    assert_eq!(
+        conditional["responses"]["304"],
+        json!({
+            "description": "Alternate successful response",
+            "headers": {
+                "cache-control": { "schema": { "$ref": "#/components/schemas/string" } },
+                "etag": { "schema": { "$ref": "#/components/schemas/string" } }
+            }
+        })
     );
 
     let delete = &value["paths"]["/widgets/{widget_id}"]["delete"];

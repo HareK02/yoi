@@ -105,12 +105,93 @@ struct RouteArgs {
     operation_id: Option<LitStr>,
     status: Option<LitInt>,
     alternate_status: Option<LitInt>,
+    responses: Vec<DeclaredResponse>,
     error_status: Option<LitInt>,
     additional_error_statuses: Vec<LitInt>,
     bearer_auth: Option<syn::LitBool>,
     browser_auth: Option<syn::LitBool>,
     normalize_body_errors: Option<syn::LitBool>,
     openapi: Option<syn::LitBool>,
+}
+
+struct DeclaredResponseHeader {
+    name: LitStr,
+    field_ident: Ident,
+    ty: Type,
+}
+
+struct DeclaredResponse {
+    status: LitInt,
+    body: Option<Type>,
+    headers: Vec<DeclaredResponseHeader>,
+}
+
+impl Parse for DeclaredResponse {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let content;
+        syn::parenthesized!(content in input);
+        let mut status = None;
+        let mut body = None;
+        let mut headers = Vec::new();
+        while !content.is_empty() {
+            let key: Ident = content.parse()?;
+            content.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "status" => set_once(
+                    &mut status,
+                    content.parse::<LitInt>()?,
+                    &key,
+                    "response status",
+                )?,
+                "body" => set_once(&mut body, content.parse::<Type>()?, &key, "response body")?,
+                "headers" => {
+                    if !headers.is_empty() {
+                        return Err(syn::Error::new(
+                            key.span(),
+                            "duplicate `headers` response option",
+                        ));
+                    }
+                    let header_content;
+                    syn::bracketed!(header_content in content);
+                    while !header_content.is_empty() {
+                        let pair;
+                        syn::parenthesized!(pair in header_content);
+                        let name = pair.parse::<LitStr>()?;
+                        pair.parse::<Token![,]>()?;
+                        let ty = pair.parse::<Type>()?;
+                        if !pair.is_empty() {
+                            return Err(pair.error(
+                                "response header entries contain exactly a name and Rust type",
+                            ));
+                        }
+                        let field_ident = response_header_field_ident(&name)?;
+                        headers.push(DeclaredResponseHeader {
+                            name,
+                            field_ident,
+                            ty,
+                        });
+                        if !header_content.is_empty() {
+                            header_content.parse::<Token![,]>()?;
+                        }
+                    }
+                }
+                _ => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        "unsupported response option; expected status, body, or headers",
+                    ));
+                }
+            }
+            if !content.is_empty() {
+                content.parse::<Token![,]>()?;
+            }
+        }
+        Ok(Self {
+            status: status.ok_or_else(|| input.error("declared response requires `status`"))?,
+            body,
+            headers,
+        })
+    }
 }
 
 impl Parse for RouteArgs {
@@ -121,6 +202,7 @@ impl Parse for RouteArgs {
             operation_id: None,
             status: None,
             alternate_status: None,
+            responses: Vec::new(),
             error_status: None,
             additional_error_statuses: Vec::new(),
             bearer_auth: None,
@@ -150,6 +232,26 @@ impl Parse for RouteArgs {
                     &key,
                     "alternate_status",
                 )?,
+                "responses" => {
+                    if !result.responses.is_empty() {
+                        return Err(syn::Error::new(
+                            key.span(),
+                            "duplicate `responses` route option",
+                        ));
+                    }
+                    let content;
+                    syn::bracketed!(content in input);
+                    result.responses =
+                        Punctuated::<DeclaredResponse, Token![,]>::parse_terminated(&content)?
+                            .into_iter()
+                            .collect();
+                    if result.responses.is_empty() {
+                        return Err(syn::Error::new(
+                            key.span(),
+                            "`responses` must declare at least one successful response",
+                        ));
+                    }
+                }
                 "error_status" => set_once(
                     &mut result.error_status,
                     input.parse::<LitInt>()?,
@@ -199,7 +301,7 @@ impl Parse for RouteArgs {
                 _ => {
                     return Err(syn::Error::new(
                         key.span(),
-                        "unsupported route option; expected operation_id, status, or error_status",
+                        "unsupported route option; expected operation_id, status, alternate_status, responses, error_status, additional_error_statuses, bearer_auth, browser_auth, normalize_body_errors, or openapi",
                     ));
                 }
             }
@@ -263,6 +365,18 @@ struct RequestBody {
     wire_kind: RequestWireKind,
 }
 
+struct ResponseHeader {
+    wire_name: String,
+    field_ident: Ident,
+    ty: Type,
+}
+
+struct SuccessResponse {
+    status: u16,
+    body: Option<Type>,
+    headers: Vec<ResponseHeader>,
+}
+
 struct Operation {
     method_ident: Ident,
     marker_ident: Ident,
@@ -272,6 +386,8 @@ struct Operation {
     parameters: Vec<Parameter>,
     request_body: Option<RequestBody>,
     response_body: Option<Type>,
+    success_responses: Vec<SuccessResponse>,
+    declared_responses: bool,
     error_body: Option<Type>,
     fallible: bool,
     response_status: u16,
@@ -461,31 +577,130 @@ fn normalize_operation(method: &mut TraitItemFn) -> syn::Result<Operation> {
         validate_named_body_type(ty, "error response")?;
     }
 
+    let declared_responses = !route.responses.is_empty();
+    if declared_responses && (route.status.is_some() || route.alternate_status.is_some()) {
+        return Err(syn::Error::new_spanned(
+            &route.path,
+            "`responses` cannot be combined with `status` or `alternate_status`",
+        ));
+    }
+    if declared_responses && response_body.is_none() {
+        return Err(syn::Error::new_spanned(
+            &method.sig.output,
+            "declared responses require the generated success result type",
+        ));
+    }
+
+    let mut success_responses = Vec::new();
+    if declared_responses {
+        let mut statuses = BTreeSet::new();
+        for response in route.responses {
+            let status = response.status.base10_parse::<u16>().map_err(|_| {
+                syn::Error::new(
+                    response.status.span(),
+                    "HTTP status must be an unsigned 16-bit integer",
+                )
+            })?;
+            if !((200..=299).contains(&status) || status == 304) {
+                return Err(syn::Error::new(
+                    response.status.span(),
+                    "declared success response status must be between 200 and 299, or exactly 304",
+                ));
+            }
+            if !statuses.insert(status) {
+                return Err(syn::Error::new(
+                    response.status.span(),
+                    "declared success response statuses must be distinct",
+                ));
+            }
+            if response.body.is_some() && matches!(status, 204 | 205 | 304) {
+                return Err(syn::Error::new(
+                    response.status.span(),
+                    format!("status {status} cannot have a response body"),
+                ));
+            }
+            if http_method == Method::Head && response.body.is_some() {
+                return Err(syn::Error::new_spanned(
+                    response.body,
+                    "HEAD operations cannot declare a response body",
+                ));
+            }
+            if let Some(body) = response.body.as_ref() {
+                validate_named_body_type(body, "response")?;
+            }
+            let mut header_names = BTreeSet::new();
+            let mut field_names = BTreeSet::new();
+            let mut headers = Vec::new();
+            for header in response.headers {
+                let wire_name = header.name.value().to_ascii_lowercase();
+                validate_response_header_name(&wire_name, &header.name)?;
+                if !header_names.insert(wire_name.clone()) {
+                    return Err(syn::Error::new_spanned(
+                        header.name,
+                        "duplicate response header name within one response",
+                    ));
+                }
+                if !field_names.insert(header.field_ident.to_string()) {
+                    return Err(syn::Error::new_spanned(
+                        header.name,
+                        "response header names produce duplicate Rust field names",
+                    ));
+                }
+                headers.push(ResponseHeader {
+                    wire_name,
+                    field_ident: header.field_ident,
+                    ty: header.ty,
+                });
+            }
+            success_responses.push(SuccessResponse {
+                status,
+                body: response.body,
+                headers,
+            });
+        }
+    }
+
     let response_status = parse_status(route.status.as_ref(), "status")?
         .unwrap_or(if response_body.is_some() { 200 } else { 204 });
-    if !(200..=299).contains(&response_status) {
-        return Err(syn::Error::new(
-            route
-                .status
-                .as_ref()
-                .map_or(route.path.span(), Spanned::span),
-            "status must be a success status between 200 and 299",
-        ));
-    }
-    let alternate_status = parse_status(route.alternate_status.as_ref(), "alternate_status")?;
-    if let Some(status) = alternate_status
-        && (!(200..=299).contains(&status) || status == response_status)
-    {
-        return Err(syn::Error::new_spanned(
-            route.alternate_status,
-            "alternate_status must be a distinct success status between 200 and 299",
-        ));
-    }
-    if alternate_status.is_some() && response_body.is_none() {
-        return Err(syn::Error::new_spanned(
-            route.alternate_status,
-            "alternate_status requires a response body implementing HttpSuccess",
-        ));
+    let mut alternate_status = parse_status(route.alternate_status.as_ref(), "alternate_status")?;
+    if !declared_responses {
+        if !(200..=299).contains(&response_status) {
+            return Err(syn::Error::new(
+                route
+                    .status
+                    .as_ref()
+                    .map_or(route.path.span(), Spanned::span),
+                "status must be a success status between 200 and 299",
+            ));
+        }
+        if let Some(status) = alternate_status
+            && (!(200..=299).contains(&status) || status == response_status)
+        {
+            return Err(syn::Error::new_spanned(
+                route.alternate_status,
+                "alternate_status must be a distinct success status between 200 and 299",
+            ));
+        }
+        if alternate_status.is_some() && response_body.is_none() {
+            return Err(syn::Error::new_spanned(
+                route.alternate_status,
+                "alternate_status requires a response body implementing HttpSuccess",
+            ));
+        }
+        success_responses.push(SuccessResponse {
+            status: response_status,
+            body: response_body.clone(),
+            headers: Vec::new(),
+        });
+        if let Some(status) = alternate_status {
+            success_responses.push(SuccessResponse {
+                status,
+                body: response_body.clone(),
+                headers: Vec::new(),
+            });
+        }
+    } else {
+        alternate_status = None;
     }
     let error_status = parse_status(route.error_status.as_ref(), "error_status")?;
     if error_status.is_some() && error_body.is_none() {
@@ -532,13 +747,13 @@ fn normalize_operation(method: &mut TraitItemFn) -> syn::Result<Operation> {
         ));
     }
 
-    if http_method == Method::Head && response_body.is_some() {
+    if !declared_responses && http_method == Method::Head && response_body.is_some() {
         return Err(syn::Error::new_spanned(
             &method.sig.output,
             "HEAD operations cannot declare a response body",
         ));
     }
-    if matches!(response_status, 204 | 205) && response_body.is_some() {
+    if !declared_responses && matches!(response_status, 204 | 205) && response_body.is_some() {
         return Err(syn::Error::new_spanned(
             &method.sig.output,
             format!("status {response_status} cannot have a response body"),
@@ -702,6 +917,8 @@ fn normalize_operation(method: &mut TraitItemFn) -> syn::Result<Operation> {
         parameters,
         request_body: body_type,
         response_body,
+        success_responses,
+        declared_responses,
         error_body,
         fallible,
         response_status,
@@ -876,6 +1093,71 @@ fn validate_operation_id(operation_id: &str, source: &impl Spanned) -> syn::Resu
     Ok(())
 }
 
+fn response_header_field_ident(name: &LitStr) -> syn::Result<Ident> {
+    let value = name.value().to_ascii_lowercase();
+    validate_response_header_name(&value, name)?;
+    let field = value
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() {
+                byte as char
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    Ok(format_ident!("header_{}", field, span = name.span()))
+}
+
+fn validate_response_header_name(name: &str, source: &impl Spanned) -> syn::Result<()> {
+    let valid = !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        });
+    if !valid {
+        return Err(syn::Error::new(
+            source.span(),
+            "response header name must be a valid HTTP field name",
+        ));
+    }
+    if matches!(
+        name,
+        "connection"
+            | "content-length"
+            | "content-type"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    ) {
+        return Err(syn::Error::new(
+            source.span(),
+            "response header is transport-controlled and cannot be declared",
+        ));
+    }
+    Ok(())
+}
+
 fn parse_status(value: Option<&LitInt>, name: &str) -> syn::Result<Option<u16>> {
     let Some(value) = value else {
         return Ok(None);
@@ -930,6 +1212,15 @@ fn body_type(ty: &Type) -> Option<Type> {
 
 fn is_unit(ty: &Type) -> bool {
     matches!(ty, Type::Tuple(tuple) if tuple.elems.is_empty())
+}
+
+fn is_option_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Path(path)
+            if path.qself.is_none()
+                && path.path.segments.last().is_some_and(|segment| segment.ident == "Option")
+    )
 }
 
 fn validate_named_body_type(ty: &Type, kind: &str) -> syn::Result<()> {
@@ -1083,6 +1374,11 @@ fn reqwest_adapter_tokens(
     let visibility = &api.item.vis;
     let client_ident = format_ident!("{}Client", ident_text(trait_ident));
     let builder_ident = format_ident!("{}ClientBuilder", ident_text(trait_ident));
+    let responses_module_ident = format_ident!(
+        "{}_responses",
+        to_snake_case(trait_ident),
+        span = trait_ident.span()
+    );
     let methods = api.operations.iter().map(|operation| {
         let method_ident = &operation.method_ident;
         let arguments = operation.parameters.iter().filter_map(|parameter| {
@@ -1114,10 +1410,17 @@ fn reqwest_adapter_tokens(
             }
             let ident = &parameter.rust_ident;
             let name = &parameter.wire_name;
-            Some(quote! {
-                #api_crate::reqwest::insert_header(&mut __headers, #name, &#ident)
-                    .map_err(#api_crate::reqwest::ClientError::from)?;
-            })
+            if is_option_type(&parameter.ty) {
+                Some(quote! {
+                    #api_crate::reqwest::insert_optional_header(&mut __headers, #name, &#ident)
+                        .map_err(#api_crate::reqwest::ClientError::from)?;
+                })
+            } else {
+                Some(quote! {
+                    #api_crate::reqwest::insert_header(&mut __headers, #name, &#ident)
+                        .map_err(#api_crate::reqwest::ClientError::from)?;
+                })
+            }
         });
         let body = operation
             .parameters
@@ -1140,11 +1443,7 @@ fn reqwest_adapter_tokens(
             })
             .unwrap_or_else(|| quote!(::core::option::Option::None));
         let method = reqwest_method_tokens(operation.method, api_crate);
-        let response_status = operation.response_status;
-        let accepted_status = operation
-            .alternate_status
-            .map(|alternate| quote!(__actual == #response_status || __actual == #alternate))
-            .unwrap_or_else(|| quote!(__actual == #response_status));
+        let response_status = operation.success_responses[0].status;
         let response_type = operation
             .response_body
             .as_ref()
@@ -1155,17 +1454,76 @@ fn reqwest_adapter_tokens(
             .as_ref()
             .map(|ty| quote!(#ty))
             .unwrap_or_else(|| quote!(#api_crate::NoBody));
-        let success = if let Some(response) = operation.response_body.as_ref() {
+        let success_dispatch = if operation.declared_responses {
+            let response_ident = &operation.marker_ident;
+            let arms = operation.success_responses.iter().map(|response| {
+                let status = response.status;
+                let variant_ident = format_ident!("Status{}", status);
+                let header_parsers = response.headers.iter().map(|header| {
+                    let field = &header.field_ident;
+                    let ty = &header.ty;
+                    let name = &header.wire_name;
+                    quote! {
+                        let #field = __response
+                            .parse_header::<#ty>(#name)
+                            .map_err(#api_crate::reqwest::ClientError::from)?;
+                    }
+                });
+                let body_parser = match response.body.as_ref() {
+                    Some(ty) => quote! {
+                        let body = __response
+                            .decode_json::<#ty>(#api_crate::reqwest::DecodeKind::Success)
+                            .map_err(#api_crate::reqwest::ClientError::from)?;
+                    },
+                    None => quote! {
+                        __response
+                            .require_empty()
+                            .map_err(#api_crate::reqwest::ClientError::from)?;
+                    },
+                };
+                let body_field = response.body.as_ref().map(|_| quote!(body,));
+                let header_fields = response.headers.iter().map(|header| &header.field_ident);
+                quote! {
+                    #status => {
+                        #(#header_parsers)*
+                        #body_parser
+                        return ::core::result::Result::Ok(
+                            #responses_module_ident::#response_ident::#variant_ident {
+                                #body_field
+                                #(#header_fields),*
+                            },
+                        );
+                    }
+                }
+            });
             quote! {
-                return __response
-                    .decode_json::<#response>(#api_crate::reqwest::DecodeKind::Success)
-                    .map_err(#api_crate::reqwest::ClientError::from);
+                match __actual {
+                    #(#arms)*
+                    _ => {}
+                }
             }
         } else {
+            let accepted_status = operation
+                .alternate_status
+                .map(|alternate| quote!(__actual == #response_status || __actual == #alternate))
+                .unwrap_or_else(|| quote!(__actual == #response_status));
+            let success = if let Some(response) = operation.response_body.as_ref() {
+                quote! {
+                    return __response
+                        .decode_json::<#response>(#api_crate::reqwest::DecodeKind::Success)
+                        .map_err(#api_crate::reqwest::ClientError::from);
+                }
+            } else {
+                quote! {
+                    return __response
+                        .require_empty()
+                        .map_err(#api_crate::reqwest::ClientError::from);
+                }
+            };
             quote! {
-                return __response
-                    .require_empty()
-                    .map_err(#api_crate::reqwest::ClientError::from);
+                if #accepted_status {
+                    #success
+                }
             }
         };
         let public_error = match operation.error_body.as_ref() {
@@ -1202,9 +1560,7 @@ fn reqwest_adapter_tokens(
                     .await
                     .map_err(#api_crate::reqwest::ClientError::from)?;
                 let __actual = __response.status().as_u16();
-                if #accepted_status {
-                    #success
-                }
+                #success_dispatch
                 #public_error
                 ::core::result::Result::Err(#api_crate::reqwest::ClientError::from(
                     #api_crate::reqwest::ClientFailure::UnexpectedStatus {
@@ -1355,6 +1711,11 @@ fn axum_adapter_tokens(
     let visibility = &api.item.vis;
     let adapter_ident = format_ident!("{}Axum", ident_text(trait_ident));
     let module_ident = format_ident!("{}_axum", to_snake_case(trait_ident));
+    let responses_module_ident = format_ident!(
+        "{}_responses",
+        to_snake_case(trait_ident),
+        span = trait_ident.span()
+    );
     let route_functions: Vec<_> = api.operations.iter().map(|operation| {
         let method_ident = &operation.method_ident;
         let handler_ident = format_ident!("{}_handler", ident_text(method_ident));
@@ -1391,8 +1752,13 @@ fn axum_adapter_tokens(
             let ident = &parameter.rust_ident;
             let ty = &parameter.ty;
             let name = &parameter.wire_name;
+            let parser = if is_option_type(ty) {
+                quote!(#api_crate::axum::parse_optional_header)
+            } else {
+                quote!(#api_crate::axum::parse_header)
+            };
             Some(quote! {
-                let #ident: #ty = match #api_crate::axum::parse_header(&__headers, #name) {
+                let #ident: #ty = match #parser(&__headers, #name) {
                     Ok(value) => value,
                     Err(status) => return #api_crate::axum::rejection(status),
                 };
@@ -1488,7 +1854,50 @@ fn axum_adapter_tokens(
             .unwrap_or((None, None));
         let call_arguments = operation.parameters.iter().map(|parameter| &parameter.rust_ident);
         let response_status = operation.response_status;
-        let success = if let Some(alternate_status) = operation.alternate_status {
+        let success = if operation.declared_responses {
+            let response_ident = &operation.marker_ident;
+            let arms = operation.success_responses.iter().map(|response| {
+                let status = response.status;
+                let variant_ident = format_ident!("Status{}", status);
+                let body_pattern = response.body.as_ref().map(|_| quote!(body,));
+                let header_fields = response.headers.iter().map(|header| &header.field_ident);
+                let base_response = if response.body.is_some() {
+                    quote!(#api_crate::axum::json_response(#api_crate::axum::status(#status), body))
+                } else {
+                    quote!(#api_crate::axum::empty_response(#api_crate::axum::status(#status)))
+                };
+                let header_insertions = response.headers.iter().map(|header| {
+                    let field = &header.field_ident;
+                    let name = &header.wire_name;
+                    quote! {
+                        if #api_crate::axum::insert_response_header(
+                            __response.headers_mut(),
+                            #name,
+                            &#field,
+                        ).is_err() {
+                            return #api_crate::axum::empty_response(
+                                #api_crate::axum::framework::StatusCode::INTERNAL_SERVER_ERROR,
+                            );
+                        }
+                    }
+                });
+                quote! {
+                    #responses_module_ident::#response_ident::#variant_ident {
+                        #body_pattern
+                        #(#header_fields),*
+                    } => {
+                        let mut __response = #base_response;
+                        #(#header_insertions)*
+                        __response
+                    }
+                }
+            });
+            quote! {
+                match value {
+                    #(#arms),*
+                }
+            }
+        } else if let Some(alternate_status) = operation.alternate_status {
             quote!({
                 let status = #api_crate::HttpSuccess::status_code(&value);
                 if status == #response_status || status == #alternate_status {
@@ -1628,23 +2037,31 @@ fn openapi_adapter_tokens(
                 operation.binary_request_body()?;
             },
         });
-        let status = operation.response_status;
-        let response = match &operation.response_body {
-            Some(ty) => quote! {
-                operation.response::<#ty>(#status, "application/json", "Successful response")?;
-            },
-            None => quote! {
-                operation.empty_response(#status, "Successful response")?;
-            },
-        };
-        let alternate_response = operation.alternate_status.map(|status| {
-            match operation.response_body.as_ref() {
+        let success_responses = operation.success_responses.iter().enumerate().map(|(index, response)| {
+            let status = response.status;
+            let description = if index == 0 {
+                "Successful response"
+            } else {
+                "Alternate successful response"
+            };
+            let body = match response.body.as_ref() {
                 Some(ty) => quote! {
-                    operation.response::<#ty>(#status, "application/json", "Alternate successful response")?;
+                    operation.response::<#ty>(#status, "application/json", #description)?;
                 },
                 None => quote! {
-                    operation.empty_response(#status, "Alternate successful response")?;
+                    operation.empty_response(#status, #description)?;
                 },
+            };
+            let headers = response.headers.iter().map(|header| {
+                let ty = &header.ty;
+                let name = &header.wire_name;
+                quote! {
+                    operation.response_header::<#ty>(#status, #name)?;
+                }
+            });
+            quote! {
+                #body
+                #(#headers)*
             }
         });
         let error = operation
@@ -1684,8 +2101,7 @@ fn openapi_adapter_tokens(
                 #bearer_auth
                 #browser_auth
                 #request
-                #response
-                #alternate_response
+                #(#success_responses)*
                 #error
                 #(#additional_errors)*
                 operation.finish()?;
@@ -1713,6 +2129,56 @@ fn expand_api(api: ApiDefinition) -> syn::Result<proc_macro2::TokenStream> {
     let reqwest_adapter = reqwest_adapter_tokens(&api, &api_crate);
     let axum_adapter = axum_adapter_tokens(&api, &api_crate);
     let openapi_adapter = openapi_adapter_tokens(&api, &api_crate);
+    let responses_module_ident = format_ident!(
+        "{}_responses",
+        to_snake_case(&api.item.ident),
+        span = api.item.ident.span()
+    );
+    let response_items: Vec<_> = api
+        .operations
+        .iter()
+        .filter(|operation| operation.declared_responses)
+        .map(|operation| {
+            let response_ident = &operation.marker_ident;
+            let variants = operation.success_responses.iter().map(|response| {
+                let variant_ident = format_ident!("Status{}", response.status);
+                let body = response.body.as_ref().map(|ty| quote!(body: #ty,));
+                let headers = response.headers.iter().map(|header| {
+                    let field = &header.field_ident;
+                    let ty = &header.ty;
+                    quote!(#field: #ty,)
+                });
+                quote! {
+                    #variant_ident {
+                        #body
+                        #(#headers)*
+                    }
+                }
+            });
+            let debug_arms = operation.success_responses.iter().map(|response| {
+                let variant_ident = format_ident!("Status{}", response.status);
+                quote! {
+                    Self::#variant_ident { .. } => formatter
+                        .debug_struct(stringify!(#variant_ident))
+                        .finish_non_exhaustive()
+                }
+            });
+            quote! {
+                #[doc = "Typed status/body/header result for one declared-success operation."]
+                pub enum #response_ident {
+                    #(#variants),*
+                }
+
+                impl ::core::fmt::Debug for #response_ident {
+                    fn fmt(&self, formatter: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                        match self {
+                            #(#debug_arms),*
+                        }
+                    }
+                }
+            }
+        })
+        .collect();
     let item = api.item;
     let metadata_ident = api.metadata_ident;
     let module_ident = api.operations_module_ident;
@@ -1797,6 +2263,13 @@ fn expand_api(api: ApiDefinition) -> syn::Result<proc_macro2::TokenStream> {
             #(#marker_items)*
         }
 
+        #[doc = "Typed success results generated for operations with declared responses."]
+        pub mod #responses_module_ident {
+            #[allow(unused_imports)]
+            use super::*;
+            #(#response_items)*
+        }
+
         #(#operation_impls)*
 
         #reqwest_adapter
@@ -1817,23 +2290,44 @@ fn metadata_tokens(
         Some(RequestWireKind::Binary) => quote!(#api_crate::WireKind::Binary),
         None => quote!(#api_crate::WireKind::Empty),
     };
-    let response_kind = if operation.response_body.is_some() {
-        quote!(#api_crate::WireKind::Json)
-    } else {
-        quote!(#api_crate::WireKind::Empty)
-    };
-    let response_status = operation.response_status;
-    let error = match operation.error_status {
-        Some(status) => quote! {
-            ::core::option::Option::Some(#api_crate::ResponseMetadata {
+    let success_responses = operation.success_responses.iter().map(|response| {
+        let status = response.status;
+        let wire_kind = if response.body.is_some() {
+            quote!(#api_crate::WireKind::Json)
+        } else {
+            quote!(#api_crate::WireKind::Empty)
+        };
+        let headers = response.headers.iter().map(|header| {
+            let wire_name = &header.wire_name;
+            let ty = &header.ty;
+            quote! {
+                #api_crate::ResponseHeaderMetadata {
+                    wire_name: #wire_name,
+                    rust_type: stringify!(#ty),
+                }
+            }
+        });
+        quote! {
+            #api_crate::ResponseMetadata {
                 status: #status,
-                body: #api_crate::BodyMetadata {
-                    wire_kind: #api_crate::WireKind::Json,
-                },
-            })
-        },
-        None => quote!(::core::option::Option::None),
-    };
+                body: #api_crate::BodyMetadata { wire_kind: #wire_kind },
+                headers: &[#(#headers),*],
+            }
+        }
+    });
+    let error_statuses = operation
+        .error_status
+        .into_iter()
+        .chain(operation.additional_error_statuses.iter().copied());
+    let error_responses = error_statuses.map(|status| {
+        quote! {
+            #api_crate::ResponseMetadata {
+                status: #status,
+                body: #api_crate::BodyMetadata { wire_kind: #api_crate::WireKind::Json },
+                headers: &[],
+            }
+        }
+    });
     let parameters = operation.parameters.iter().filter_map(|parameter| {
         if matches!(parameter.location, Location::Extension) {
             return None;
@@ -1857,11 +2351,8 @@ fn metadata_tokens(
             path: #path,
             parameters: &[#(#parameters),*],
             request_body: #api_crate::BodyMetadata { wire_kind: #request_kind },
-            response: #api_crate::ResponseMetadata {
-                status: #response_status,
-                body: #api_crate::BodyMetadata { wire_kind: #response_kind },
-            },
-            error_response: #error,
+            success_responses: &[#(#success_responses),*],
+            error_responses: &[#(#error_responses),*],
         }
     }
 }

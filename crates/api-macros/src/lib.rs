@@ -39,7 +39,11 @@
 //! method name but should be set explicitly for contracts which must remain stable while Rust
 //! names evolve. Success status defaults to `200`, except an empty (`()`) response defaults to
 //! `204`. `alternate_status` opts a JSON response into [`HttpSuccess`] when two successful HTTP
-//! outcomes share one schema. A public error inferred from `Result<T, E>` defaults to status `400`;
+//! outcomes share one schema. Operations whose successful statuses have different body or header
+//! shapes use `responses = [(status = 200, body = Widget, headers = [("etag", String)]),
+//! (status = 304, headers = [("etag", String)])]`; the macro emits a typed result enum in the
+//! `<trait_name>_responses` module. Only explicit body-less `304` declarations extend success
+//! beyond 2xx. A public error inferred from `Result<T, E>` defaults to status `400`;
 //! `additional_error_statuses` publishes the same typed error schema for other declared outcomes.
 //! `bearer_auth = true` and `browser_auth = true` attach standard bearer and browser-session cookie
 //! security schemes. Body operations may opt into typed Axum rejection normalization with
@@ -226,11 +230,21 @@ pub struct BodyMetadata {
     pub wire_kind: WireKind,
 }
 
+/// Stable metadata for one explicitly declared response header.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ResponseHeaderMetadata {
+    /// Canonical wire name declared in the API contract.
+    pub wire_name: &'static str,
+    /// Rust type spelling declared alongside the wire name.
+    pub rust_type: &'static str,
+}
+
 /// Stable metadata for one HTTP response.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ResponseMetadata {
     pub status: u16,
     pub body: BodyMetadata,
+    pub headers: &'static [ResponseHeaderMetadata],
 }
 
 /// Complete transport metadata for one operation.
@@ -241,8 +255,10 @@ pub struct OperationMetadata {
     pub path: &'static str,
     pub parameters: &'static [ParameterMetadata],
     pub request_body: BodyMetadata,
-    pub response: ResponseMetadata,
-    pub error_response: Option<ResponseMetadata>,
+    /// Every declared successful response, including status-specific body and header shape.
+    pub success_responses: &'static [ResponseMetadata],
+    /// Every declared public-error status. Error responses currently have no declared headers.
+    pub error_responses: &'static [ResponseMetadata],
 }
 
 /// Deterministic operation inventory emitted for an `#[api]` trait.
@@ -256,7 +272,7 @@ pub trait Operation {
     type Parameters;
     /// Typed JSON or binary request body, or [`NoBody`].
     type RequestBody;
-    /// JSON success response body type, or [`NoBody`].
+    /// JSON success response body type, generated declared-response result, or [`NoBody`].
     type ResponseBody;
     /// JSON public error body type, or [`NoBody`].
     type ErrorBody;

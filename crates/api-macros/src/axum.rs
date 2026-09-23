@@ -5,7 +5,7 @@
 //! other application state remain explicit outer Axum layers. Each operation is also exposed as a
 //! separate router so route-specific layers can be applied before routers are merged.
 
-use std::str::FromStr;
+use std::{fmt, str::FromStr};
 
 use axum::{
     Json,
@@ -26,6 +26,48 @@ where
         .map_err(|_| StatusCode::BAD_REQUEST)?
         .parse()
         .map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+pub fn parse_optional_header<T>(
+    headers: &HeaderMap,
+    name: &'static str,
+) -> Result<Option<T>, StatusCode>
+where
+    T: FromStr,
+{
+    headers
+        .get(name)
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| StatusCode::BAD_REQUEST)?
+                .parse()
+                .map_err(|_| StatusCode::BAD_REQUEST)
+        })
+        .transpose()
+}
+
+/// Opaque failure to encode one declared response header.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResponseHeaderError;
+
+impl fmt::Display for ResponseHeaderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("declared response header encoding failed")
+    }
+}
+
+impl std::error::Error for ResponseHeaderError {}
+
+/// Insert one typed declared response header without retaining its value in an error.
+pub fn insert_response_header<T: fmt::Display>(
+    headers: &mut HeaderMap,
+    name: &'static str,
+    value: &T,
+) -> Result<(), ResponseHeaderError> {
+    let value = value.to_string().parse().map_err(|_| ResponseHeaderError)?;
+    headers.insert(name, value);
+    Ok(())
 }
 
 /// Serialize a typed JSON response with the contract status.
@@ -52,7 +94,7 @@ pub fn status(code: u16) -> StatusCode {
 pub mod framework {
     pub use axum::{
         Json, Router,
-        body::Bytes,
+        body::{Body, Bytes},
         extract::{
             DefaultBodyLimit, Extension, Path, Query, State,
             rejection::{BytesRejection, JsonRejection},
@@ -62,4 +104,22 @@ pub mod framework {
         routing::{delete, get, head, options, patch, post, put},
         serve,
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_header_encoding_failure_is_bounded_and_value_safe() {
+        let mut headers = HeaderMap::new();
+        let error = insert_response_header(&mut headers, "set-cookie", &"secret\ninvalid")
+            .expect_err("invalid header bytes must fail");
+        assert_eq!(
+            error.to_string(),
+            "declared response header encoding failed"
+        );
+        assert!(!format!("{error:?}").contains("secret"));
+        assert!(headers.is_empty());
+    }
 }

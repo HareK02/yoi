@@ -427,6 +427,42 @@ impl OpenApiOperation<'_> {
         self.insert_response(status, json!({ "description": description }))
     }
 
+    pub fn response_header<T: OpenApiSchema>(
+        &mut self,
+        status: u16,
+        name: &'static str,
+    ) -> Result<(), OpenApiError> {
+        let schema = self.parent.schema_ref::<T>()?;
+        let response = self
+            .responses
+            .get_mut(&status.to_string())
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                OpenApiError::InvalidContract(format!(
+                    "response header `{name}` precedes status `{status}` for `{}`",
+                    self.operation_id
+                ))
+            })?;
+        let headers = response
+            .entry("headers")
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .ok_or_else(|| {
+                OpenApiError::InvalidContract(format!(
+                    "response headers for status `{status}` are not an object for `{}`",
+                    self.operation_id
+                ))
+            })?;
+        if headers.contains_key(name) {
+            return Err(OpenApiError::InvalidContract(format!(
+                "duplicate response header `{name}` for status `{status}` on `{}`",
+                self.operation_id
+            )));
+        }
+        headers.insert(name.to_owned(), json!({ "schema": schema }));
+        Ok(())
+    }
+
     fn insert_response(&mut self, status: u16, response: Value) -> Result<(), OpenApiError> {
         if !(100..=599).contains(&status) {
             return Err(OpenApiError::InvalidContract(format!(

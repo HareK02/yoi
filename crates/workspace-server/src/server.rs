@@ -7,13 +7,15 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use async_trait::async_trait;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Extension, Path as AxumPath, Query, Request, State};
-use axum::http::header::{
-    CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION, ORIGIN, SET_COOKIE,
-};
+#[cfg(test)]
+use axum::http::header::{CACHE_CONTROL, ETAG, IF_NONE_MATCH};
+use axum::http::header::{CONTENT_TYPE, LOCATION, ORIGIN};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
+#[cfg(test)]
+use axum::routing::post;
 use axum::{Json, Router};
 use chrono::{Duration, SecondsFormat, Utc};
 use config_source::ConfigTreeSnapshot;
@@ -2550,10 +2552,6 @@ pub async fn build_workspace_server_router(
     template: ServerConfig,
     store: Arc<dyn ControlPlaneStore>,
 ) -> Result<Router> {
-    let auth = build_server_auth_router(ServerAuthApi {
-        config: template.clone(),
-        store: store.clone(),
-    });
     let api = WorkspaceServerApi::new(template, store);
     api.preload().await?;
     api.recover_workspace_deletions().await?;
@@ -2568,12 +2566,10 @@ pub async fn build_workspace_server_router(
         .merge(generated_workspace_catalog_contract_router(
             contract_service,
         ));
-    Ok(auth
-        .merge(catalog)
-        .layer(axum::middleware::from_fn_with_state(
-            api,
-            enforce_server_cookie_mutation_origin,
-        )))
+    Ok(catalog.layer(axum::middleware::from_fn_with_state(
+        api,
+        enforce_server_cookie_mutation_origin,
+    )))
 }
 
 #[cfg(test)]
@@ -3636,20 +3632,6 @@ fn configured_repository_from_record(record: RepositoryRecord) -> Result<Configu
     })
 }
 
-fn build_server_auth_router(api: ServerAuthApi) -> Router {
-    Router::new()
-        .route(
-            "/api/auth/passkeys/registration/complete",
-            post(post_passkey_registration_complete),
-        )
-        .route(
-            "/api/auth/passkeys/login/complete",
-            post(post_passkey_login_complete),
-        )
-        .route("/api/auth/logout", post(post_auth_logout))
-        .with_state(api)
-}
-
 fn server_request_context(
     actor: Option<RequestActor>,
     worker_source: Option<server_api::ServerWorkerSource>,
@@ -3771,6 +3753,11 @@ fn generated_auth_contract_router(service: ServerApiContractService) -> Router {
         .merge(server_api::server_api_axum::auth_bootstrap_user(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::auth_passkey_registration_complete(service.clone()))
+        .merge(server_api::server_api_axum::auth_passkey_login_complete(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::auth_logout(service.clone()))
         .merge(server_api::server_api_axum::auth_device_login_start(
             service.clone(),
         ))
@@ -3810,6 +3797,9 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
             service.clone(),
         ))
         .merge(server_api::server_api_axum::workspace_scoped(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_runtime_config(
             service.clone(),
         ))
         .merge(server_api::server_api_axum::workspace_metadata_settings(
@@ -4592,6 +4582,23 @@ impl server_api::ServerApi for ServerApiContractService {
             .map_err(ApiError::into_repository_api_error)
     }
 
+    async fn auth_passkey_registration_complete(
+        &self,
+        request: PasskeyRegistrationCompleteRequest,
+    ) -> std::result::Result<
+        server_api::server_api_responses::AuthPasskeyRegistrationComplete,
+        server_api::RepositoryApiError,
+    > {
+        let (body, header_set_cookie) = complete_passkey_registration(&self.auth_api(), request)
+            .map_err(ApiError::into_repository_api_error)?;
+        Ok(
+            server_api::server_api_responses::AuthPasskeyRegistrationComplete::Status200 {
+                body,
+                header_set_cookie,
+            },
+        )
+    }
+
     async fn auth_passkey_login_options(
         &self,
         context: server_api::ServerRequestContext,
@@ -4604,6 +4611,23 @@ impl server_api::ServerApi for ServerApiContractService {
             .await
             .map(|Json(response)| response)
             .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn auth_passkey_login_complete(
+        &self,
+        request: PasskeyLoginCompleteRequest,
+    ) -> std::result::Result<
+        server_api::server_api_responses::AuthPasskeyLoginComplete,
+        server_api::RepositoryApiError,
+    > {
+        let (body, header_set_cookie) = complete_passkey_login(&self.auth_api(), request)
+            .map_err(ApiError::into_repository_api_error)?;
+        Ok(
+            server_api::server_api_responses::AuthPasskeyLoginComplete::Status200 {
+                body,
+                header_set_cookie,
+            },
+        )
     }
 
     async fn auth_device_login_start(
@@ -4649,6 +4673,21 @@ impl server_api::ServerApi for ServerApiContractService {
     ) -> std::result::Result<WhoamiResponse, server_api::RepositoryApiError> {
         Ok(WhoamiResponse {
             actor: context.actor,
+        })
+    }
+
+    async fn auth_logout(
+        &self,
+        cookie: Option<String>,
+    ) -> std::result::Result<
+        server_api::server_api_responses::AuthLogout,
+        server_api::RepositoryApiError,
+    > {
+        let (body, header_set_cookie) = logout_browser_session(&self.auth_api(), cookie)
+            .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::server_api_responses::AuthLogout::Status200 {
+            body,
+            header_set_cookie,
         })
     }
 
@@ -4828,6 +4867,25 @@ impl server_api::ServerApi for ServerApiContractService {
         workspace_response(api, context.actor)
             .await
             .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn workspace_runtime_config(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        query: server_api::WorkspaceRuntimeConfigQuery,
+        if_none_match: Option<String>,
+    ) -> std::result::Result<
+        server_api::server_api_responses::WorkspaceRuntimeConfig,
+        server_api::RepositoryApiError,
+    > {
+        workspace_runtime_config_result(
+            self.workspace_api()?,
+            context,
+            &workspace_id,
+            query,
+            if_none_match,
+        )
     }
 
     async fn workspace_metadata_settings(
@@ -8252,18 +8310,13 @@ impl server_api::ServerApi for ServerApiContractService {
 
 fn build_inner_router(api: WorkspaceApi) -> Router {
     let contract_service = ServerApiContractService::Workspace(api.clone());
-    let auth = build_server_auth_router(ServerAuthApi::from(&api))
-        .merge(generated_auth_contract_router(contract_service.clone()));
+    let auth = generated_auth_contract_router(contract_service.clone());
     let workspace = Router::new()
         // WebSocket provider transport is intentionally outside the generated
         // JSON REST contract.
         .route(
             "/api/w/{workspace_id}/external-workdir-grants/{grant_id}/provider",
             get(scoped_external_workdir_provider_ws),
-        )
-        .route(
-            "/api/w/{workspace_id}/runtime-config",
-            get(get_latest_workspace_runtime_config),
         )
         .route(
             "/api/w/{workspace_id}/protocol/ws",
@@ -14720,99 +14773,104 @@ async fn scoped_list_hosts(
     list_hosts(State(api)).await
 }
 
-#[derive(Debug, Deserialize)]
-struct LatestWorkspaceRuntimeConfigQuery {
-    profile: String,
-}
-
-async fn get_latest_workspace_runtime_config(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedWorkspacePath>,
-    Query(query): Query<LatestWorkspaceRuntimeConfigQuery>,
-    headers: HeaderMap,
-    source: Option<Extension<crate::worker_source::VerifiedRuntimeRequestSource>>,
-) -> Response {
-    let Some(Extension(_source)) = source else {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "error": "runtime_config_source_required" })),
-        )
-            .into_response();
-    };
-    if let Err(error) = validate_workspace_scope(&api, &path.workspace_id) {
-        return error.into_response();
+fn workspace_runtime_config_result(
+    api: &WorkspaceApi,
+    context: server_api::ServerRequestContext,
+    workspace_id: &str,
+    query: server_api::WorkspaceRuntimeConfigQuery,
+    if_none_match: Option<String>,
+) -> std::result::Result<
+    server_api::server_api_responses::WorkspaceRuntimeConfig,
+    server_api::RepositoryApiError,
+> {
+    if context.runtime_source.is_none() {
+        return Err(server_api::RepositoryApiError::new(
+            StatusCode::FORBIDDEN.as_u16(),
+            "runtime_config_source_required",
+            "runtime config requires an authenticated Runtime source",
+            Vec::new(),
+        ));
     }
-    let config_state = match api.config_store.load_workspace_config(&path.workspace_id) {
-        Ok(Some(config)) => config,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "workspace_config_not_found" })),
+    validate_workspace_scope(api, workspace_id).map_err(ApiError::into_repository_api_error)?;
+    let config_state = api
+        .config_store
+        .load_workspace_config(workspace_id)
+        .map_err(|error| ApiError::from(error).into_repository_api_error())?
+        .ok_or_else(|| {
+            server_api::RepositoryApiError::new(
+                StatusCode::NOT_FOUND.as_u16(),
+                "workspace_config_not_found",
+                "Workspace Config was not found",
+                Vec::new(),
             )
-                .into_response();
-        }
-        Err(error) => return ApiError::from(error).into_response(),
-    };
-    let profile_projection = match crate::profile_settings::project_profiles_from_workspace_config(
-        &path.workspace_id,
+        })?;
+    let profile_projection = crate::profile_settings::project_profiles_from_workspace_config(
+        workspace_id,
         &config_state,
-    ) {
-        Ok(projection) => projection,
-        Err(error) => return ApiError::from(error).into_response(),
-    };
+    )
+    .map_err(|error| ApiError::from(error).into_repository_api_error())?;
     if crate::profile_settings::selector_for_workspace_candidate(
         &profile_projection,
         &query.profile,
     )
     .is_none()
     {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "runtime_config_profile_not_found" })),
-        )
-            .into_response();
-    };
-    let prompt_catalog = match api
+        return Err(server_api::RepositoryApiError::new(
+            StatusCode::NOT_FOUND.as_u16(),
+            "runtime_config_profile_not_found",
+            "Runtime Config profile was not found",
+            Vec::new(),
+        ));
+    }
+    let prompt_catalog = api
         .prompt_projection_cache
-        .resolve(&path.workspace_id, &config_state)
-    {
-        Ok(catalog) => catalog,
-        Err(error) => return ApiError::from(error).into_response(),
-    };
-    let Some(bundle) =
-        (match crate::profile_settings::build_virtual_profile_config_bundle_with_prompt_projection(
+        .resolve(workspace_id, &config_state)
+        .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+    let bundle =
+        crate::profile_settings::build_virtual_profile_config_bundle_with_prompt_projection(
             &profile_projection,
             &config_state,
-            &path.workspace_id,
+            workspace_id,
             &api.config.workspace_created_at,
             &query.profile,
             prompt_catalog.as_ref(),
-        ) {
-            Ok(bundle) => bundle,
-            Err(error) => return ApiError::from(error).into_response(),
-        })
-    else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "runtime_config_profile_not_found" })),
         )
-            .into_response();
-    };
+        .map_err(|error| ApiError::from(error).into_repository_api_error())?
+        .ok_or_else(|| {
+            server_api::RepositoryApiError::new(
+                StatusCode::NOT_FOUND.as_u16(),
+                "runtime_config_profile_not_found",
+                "Runtime Config profile was not found",
+                Vec::new(),
+            )
+        })?;
     let etag = worker_runtime::config_bundle::workspace_config_etag(&bundle.metadata.digest);
-    let mut response_headers = HeaderMap::new();
-    response_headers.insert(ETAG, etag.parse().expect("Workspace Config ETag is valid"));
-    response_headers.insert(
-        CACHE_CONTROL,
-        "no-cache".parse().expect("valid cache policy"),
-    );
-    if headers
-        .get(IF_NONE_MATCH)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.split(',').any(|candidate| candidate.trim() == etag))
+    let header_cache_control = "no-cache".to_owned();
+    if if_none_match.is_some_and(|value| value.split(',').any(|candidate| candidate.trim() == etag))
     {
-        return (StatusCode::NOT_MODIFIED, response_headers).into_response();
+        return Ok(
+            server_api::server_api_responses::WorkspaceRuntimeConfig::Status304 {
+                header_etag: etag,
+                header_cache_control,
+            },
+        );
     }
-    (StatusCode::OK, response_headers, Json(bundle)).into_response()
+    let body = serde_json::to_value(bundle)
+        .map(server_api::WorkspaceRuntimeConfigResponse)
+        .map_err(|error| {
+            ApiError::from(invalid_contract_value(
+                "Workspace Runtime Config response",
+                error,
+            ))
+            .into_repository_api_error()
+        })?;
+    Ok(
+        server_api::server_api_responses::WorkspaceRuntimeConfig::Status200 {
+            body,
+            header_etag: etag,
+            header_cache_control,
+        },
+    )
 }
 
 async fn scoped_list_runtimes(
@@ -18959,10 +19017,10 @@ async fn post_passkey_registration_options(
     }))
 }
 
-async fn post_passkey_registration_complete(
-    State(api): State<ServerAuthApi>,
-    Json(request): Json<PasskeyRegistrationCompleteRequest>,
-) -> ApiResult<Response> {
+fn complete_passkey_registration(
+    api: &ServerAuthApi,
+    request: PasskeyRegistrationCompleteRequest,
+) -> ApiResult<(AuthUserResponse, server_api::SetCookieHeader)> {
     let challenge = api
         .store
         .consume_auth_challenge_by_id(
@@ -19025,7 +19083,7 @@ async fn post_passkey_registration_complete(
             created_at: crate::auth::now_rfc3339(),
             last_used_at: None,
         })?;
-    issue_browser_session_response(&api, user)
+    issue_browser_session(&api, user)
 }
 
 async fn post_passkey_login_options(
@@ -19079,10 +19137,10 @@ async fn post_passkey_login_options(
     }))
 }
 
-async fn post_passkey_login_complete(
-    State(api): State<ServerAuthApi>,
-    Json(request): Json<PasskeyLoginCompleteRequest>,
-) -> ApiResult<Response> {
+fn complete_passkey_login(
+    api: &ServerAuthApi,
+    request: PasskeyLoginCompleteRequest,
+) -> ApiResult<(AuthUserResponse, server_api::SetCookieHeader)> {
     let challenge = api
         .store
         .consume_auth_challenge_by_id(
@@ -19160,10 +19218,13 @@ async fn post_passkey_login_complete(
             created_at: stored.created_at,
             last_used_at: Some(crate::auth::now_rfc3339()),
         })?;
-    issue_browser_session_response(&api, user)
+    issue_browser_session(&api, user)
 }
 
-fn issue_browser_session_response(api: &ServerAuthApi, user: UserRecord) -> ApiResult<Response> {
+fn issue_browser_session(
+    api: &ServerAuthApi,
+    user: UserRecord,
+) -> ApiResult<(AuthUserResponse, server_api::SetCookieHeader)> {
     let session_token = mint_secret("yoi_sess");
     api.store.create_browser_session(&BrowserSessionRecord {
         session_id: new_id("session"),
@@ -19174,29 +19235,17 @@ fn issue_browser_session_response(api: &ServerAuthApi, user: UserRecord) -> ApiR
         revoked_at: None,
     })?;
     let auth = auth_public_config(&api.config);
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        SET_COOKIE,
-        session_set_cookie(
-            session_cookie_policy(&auth),
-            &session_token,
-            14 * 24 * 60 * 60,
-        )
-        .parse()
-        .map_err(|error| {
-            auth_error(
-                "invalid_session_cookie",
-                &format!("failed to build session cookie: {error}"),
-            )
-        })?,
+    let cookie = session_set_cookie(
+        session_cookie_policy(&auth),
+        &session_token,
+        14 * 24 * 60 * 60,
     );
     Ok((
-        headers,
-        Json(AuthUserResponse {
+        AuthUserResponse {
             user: user_response(user),
-        }),
-    )
-        .into_response())
+        },
+        server_api::SetCookieHeader::new(cookie),
+    ))
 }
 
 async fn post_device_login_start(
@@ -19347,35 +19396,32 @@ async fn post_device_login_poll(
     }))
 }
 
-async fn post_auth_logout(
-    State(api): State<ServerAuthApi>,
-    headers: HeaderMap,
-) -> ApiResult<Response> {
+fn logout_browser_session(
+    api: &ServerAuthApi,
+    cookie: Option<String>,
+) -> ApiResult<(LogoutResponse, server_api::SetCookieHeader)> {
     let auth = auth_public_config(&api.config);
+    let mut headers = HeaderMap::new();
+    if let Some(cookie) = cookie {
+        let value = cookie.parse::<HeaderValue>().map_err(|_| {
+            auth_error(
+                "invalid_session_cookie",
+                "request cookie header could not be represented",
+            )
+        })?;
+        headers.insert(axum::http::header::COOKIE, value);
+    }
     if let Some(session_token) = parse_cookie(&headers, &auth.cookie_name) {
         let _ = api
             .store
             .revoke_browser_session(&token_hash(&session_token), &crate::auth::now_rfc3339())?;
     }
-    let mut response_headers = HeaderMap::new();
-    response_headers.insert(
-        SET_COOKIE,
-        session_set_cookie(session_cookie_policy(&auth), "", 0)
-            .parse()
-            .map_err(|error| {
-                auth_error(
-                    "invalid_session_cookie",
-                    &format!("failed to build logout cookie: {error}"),
-                )
-            })?,
-    );
     Ok((
-        response_headers,
-        Json(LogoutResponse {
+        LogoutResponse {
             status: LogoutStatus::LoggedOut,
-        }),
-    )
-        .into_response())
+        },
+        server_api::SetCookieHeader::new(session_set_cookie(session_cookie_policy(&auth), "", 0)),
+    ))
 }
 
 fn request_origin(headers: &HeaderMap) -> Option<String> {
@@ -31586,15 +31632,30 @@ mod tests {
                 .unwrap();
             let auth_api = ServerAuthApi::from(&api);
 
-            let login = issue_browser_session_response(&auth_api, user).unwrap();
-            let login_cookie = login.headers().get(SET_COOKIE).unwrap().to_str().unwrap();
+            let (_, login) = issue_browser_session(&auth_api, user).unwrap();
+            let login_cookie = login.expose();
             assert_eq!(login_cookie.contains("; Secure"), secure, "{scheme}");
             assert!(login_cookie.contains("; HttpOnly; SameSite=Lax"));
 
-            let logout = post_auth_logout(State(auth_api), HeaderMap::new())
+            let app = generated_auth_contract_router(ServerApiContractService::Workspace(api));
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/auth/logout")
+                        .header(axum::http::header::COOKIE, login_cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
                 .await
                 .unwrap();
-            let logout_cookie = logout.headers().get(SET_COOKIE).unwrap().to_str().unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let logout_cookie = response
+                .headers()
+                .get(axum::http::header::SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap();
             assert_eq!(logout_cookie.contains("; Secure"), secure, "{scheme}");
             assert!(logout_cookie.contains("Max-Age=0"));
             assert!(logout_cookie.contains("; HttpOnly; SameSite=Lax"));

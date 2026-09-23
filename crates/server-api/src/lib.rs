@@ -154,8 +154,14 @@ impl_openapi_schema!(
     HealthResponse,
     PasskeyLoginOptionsRequest,
     PasskeyLoginOptionsResponse,
+    PasskeyLoginCompleteRequest,
     PasskeyRegistrationOptionsRequest,
     PasskeyRegistrationOptionsResponse,
+    PasskeyRegistrationCompleteRequest,
+    LogoutResponse,
+    SetCookieHeader,
+    WorkspaceRuntimeConfigQuery,
+    WorkspaceRuntimeConfigResponse,
     WhoamiResponse,
     WorkspaceCreateRequest,
     WorkspaceCreateResponse,
@@ -413,6 +419,19 @@ pub trait ServerApi {
     ) -> Result<PasskeyRegistrationOptionsResponse, RepositoryApiError>;
 
     #[post(
+        "/api/auth/passkeys/registration/complete",
+        responses = [
+            (status = 200, body = AuthUserResponse, headers = [("set-cookie", SetCookieHeader)])
+        ],
+        error_status = 400,
+        additional_error_statuses = [500]
+    )]
+    async fn auth_passkey_registration_complete(
+        &self,
+        #[body] request: PasskeyRegistrationCompleteRequest,
+    ) -> Result<server_api_responses::AuthPasskeyRegistrationComplete, RepositoryApiError>;
+
+    #[post(
         "/api/auth/passkeys/login/options",
         status = 200,
         error_status = 400,
@@ -423,6 +442,19 @@ pub trait ServerApi {
         #[extension] context: ServerRequestContext,
         #[body] request: PasskeyLoginOptionsRequest,
     ) -> Result<PasskeyLoginOptionsResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/auth/passkeys/login/complete",
+        responses = [
+            (status = 200, body = AuthUserResponse, headers = [("set-cookie", SetCookieHeader)])
+        ],
+        error_status = 400,
+        additional_error_statuses = [500]
+    )]
+    async fn auth_passkey_login_complete(
+        &self,
+        #[body] request: PasskeyLoginCompleteRequest,
+    ) -> Result<server_api_responses::AuthPasskeyLoginComplete, RepositoryApiError>;
 
     #[post(
         "/api/auth/device-login/start",
@@ -465,6 +497,19 @@ pub trait ServerApi {
         &self,
         #[extension] context: ServerRequestContext,
     ) -> Result<WhoamiResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/auth/logout",
+        responses = [
+            (status = 200, body = LogoutResponse, headers = [("set-cookie", SetCookieHeader)])
+        ],
+        error_status = 400,
+        additional_error_statuses = [500]
+    )]
+    async fn auth_logout(
+        &self,
+        #[header("cookie")] cookie: Option<String>,
+    ) -> Result<server_api_responses::AuthLogout, RepositoryApiError>;
 
     #[get(
         "/api/workspaces",
@@ -563,6 +608,23 @@ pub trait ServerApi {
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
     ) -> Result<WorkspaceResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/runtime-config",
+        responses = [
+            (status = 200, body = WorkspaceRuntimeConfigResponse, headers = [("etag", String), ("cache-control", String)]),
+            (status = 304, headers = [("etag", String), ("cache-control", String)])
+        ],
+        error_status = 400,
+        additional_error_statuses = [403, 404, 500]
+    )]
+    async fn workspace_runtime_config(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[query] query: WorkspaceRuntimeConfigQuery,
+        #[header("if-none-match")] if_none_match: Option<String>,
+    ) -> Result<server_api_responses::WorkspaceRuntimeConfig, RepositoryApiError>;
 
     #[get(
         "/api/w/{workspace_id}/settings",
@@ -3010,12 +3072,13 @@ pub struct PasskeyRegistrationOptionsResponse {
     pub public_key: CreationChallengeResponse,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct PasskeyRegistrationCompleteRequest {
     pub challenge_id: String,
     #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
+    #[schemars(with = "serde_json::Value")]
     pub credential: RegisterPublicKeyCredential,
 }
 
@@ -3041,14 +3104,63 @@ pub struct PasskeyLoginOptionsResponse {
     pub public_key: RequestChallengeResponse,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct PasskeyLoginCompleteRequest {
     pub challenge_id: String,
     #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
+    #[schemars(with = "serde_json::Value")]
     pub credential: PublicKeyCredential,
 }
+
+/// Sensitive `Set-Cookie` response header value.
+///
+/// Formatting is available only for transport encoding; `Debug` always redacts the value.
+#[derive(Clone, Eq, JsonSchema, PartialEq)]
+#[schemars(transparent)]
+pub struct SetCookieHeader(String);
+
+impl SetCookieHeader {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SetCookieHeader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SetCookieHeader(<redacted>)")
+    }
+}
+
+impl std::fmt::Display for SetCookieHeader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::str::FromStr for SetCookieHeader {
+    type Err = std::convert::Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(value.to_owned()))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRuntimeConfigQuery {
+    pub profile: String,
+}
+
+/// Transparent JSON body for the Runtime-owned config bundle wire format.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[serde(transparent)]
+pub struct WorkspaceRuntimeConfigResponse(pub serde_json::Value);
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -3203,14 +3315,14 @@ impl std::fmt::Debug for DeviceLoginPollResponse {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum LogoutStatus {
     LoggedOut,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct LogoutResponse {
@@ -10587,9 +10699,12 @@ mod openapi_artifact_tests {
             "auth_config",
             "auth_bootstrap_user",
             "auth_passkey_registration_options",
+            "auth_passkey_registration_complete",
             "auth_passkey_login_options",
+            "auth_passkey_login_complete",
             "auth_device_login_start",
             "auth_device_login_poll",
+            "auth_logout",
             "auth_whoami",
         ];
         // These operations are authenticated by Runtime request-source proof, Worker source
@@ -10620,6 +10735,7 @@ mod openapi_artifact_tests {
         // Session observation retains its existing explicit non-OpenAPI boundary independently of
         // the Runtime/Worker-source signed operation inventory above.
         const OTHER_OPENAPI_EXCLUDED: &[&str] = &["worker_session"];
+        const DOCUMENTED_SIGNED_INTERNAL: &[&str] = &["workspace_runtime_config"];
         const BROWSER_ONLY: &[&str] = &["merge_request_selector_repair"];
 
         let document = canonical_openapi_document().expect("canonical OpenAPI contract must build");
@@ -10667,7 +10783,9 @@ mod openapi_artifact_tests {
             let documented_operation = documented
                 .get(operation_id)
                 .unwrap_or_else(|| panic!("missing public OpenAPI operation {operation_id}"));
-            let expected = if PUBLIC_UNAUTHENTICATED.contains(&operation_id) {
+            let expected = if PUBLIC_UNAUTHENTICATED.contains(&operation_id)
+                || DOCUMENTED_SIGNED_INTERNAL.contains(&operation_id)
+            {
                 &[][..]
             } else if BROWSER_ONLY.contains(&operation_id) {
                 &["browserSession"][..]
@@ -10705,7 +10823,7 @@ mod openapi_artifact_tests {
     }
 
     #[test]
-    fn auth_and_workspace_catalog_contract_is_strict_and_excludes_cookie_routes() {
+    fn auth_workspace_catalog_and_typed_header_contract_is_strict() {
         let document = canonical_openapi_document().expect("canonical OpenAPI contract must build");
         let value: serde_json::Value =
             serde_json::from_str(&document.to_json().expect("document must serialize"))
@@ -10716,7 +10834,10 @@ mod openapi_artifact_tests {
             ("/api/auth/config", "get"),
             ("/api/auth/bootstrap-user", "post"),
             ("/api/auth/passkeys/registration/options", "post"),
+            ("/api/auth/passkeys/registration/complete", "post"),
             ("/api/auth/passkeys/login/options", "post"),
+            ("/api/auth/passkeys/login/complete", "post"),
+            ("/api/auth/logout", "post"),
             ("/api/auth/device-login/start", "post"),
             ("/api/auth/device-login/approve", "post"),
             ("/api/auth/device-login/poll", "post"),
@@ -10755,10 +10876,30 @@ mod openapi_artifact_tests {
             "/api/auth/passkeys/login/complete",
             "/api/auth/logout",
         ] {
-            assert!(
-                value["paths"].get(path).is_none(),
-                "cookie response route {path} must remain outside ServerApi"
+            let response = &value["paths"][path]["post"]["responses"]["200"];
+            assert_eq!(
+                response["headers"]["set-cookie"]["schema"]["$ref"],
+                "#/components/schemas/SetCookieHeader",
+                "cookie response route {path} must declare Set-Cookie"
             );
+            assert_eq!(
+                response["content"]["application/json"]["schema"]["$ref"],
+                if path == "/api/auth/logout" {
+                    "#/components/schemas/LogoutResponse"
+                } else {
+                    "#/components/schemas/AuthUserResponse"
+                }
+            );
+        }
+        let runtime_config = &value["paths"]["/api/w/{workspace_id}/runtime-config"]["get"];
+        assert_eq!(
+            runtime_config["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/WorkspaceRuntimeConfigResponse"
+        );
+        assert!(runtime_config["responses"]["304"].get("content").is_none());
+        for status in ["200", "304"] {
+            assert!(runtime_config["responses"][status]["headers"]["etag"].is_object());
+            assert!(runtime_config["responses"][status]["headers"]["cache-control"].is_object());
         }
         for schema in [
             "RepositoryApiError",

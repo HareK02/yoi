@@ -131,6 +131,84 @@ impl BinaryApi for BinaryService {
     }
 }
 
+#[api(reqwest, axum)]
+pub trait ResponseApi {
+    #[get(
+        "/conditional",
+        operation_id = "responses.conditional",
+        responses = [
+            (status = 200, body = Widget, headers = [("etag", String), ("cache-control", String)]),
+            (status = 304, headers = [("etag", String), ("cache-control", String)])
+        ]
+    )]
+    async fn conditional(&self, #[query] lookup: Lookup) -> response_api_responses::Conditional;
+
+    #[post(
+        "/cookie",
+        operation_id = "responses.cookie",
+        responses = [
+            (status = 200, body = Widget, headers = [("set-cookie", String)])
+        ]
+    )]
+    async fn cookie(&self) -> response_api_responses::Cookie;
+}
+
+#[derive(Clone)]
+pub struct ResponseService;
+
+impl ResponseApi for ResponseService {
+    async fn conditional(&self, lookup: Lookup) -> response_api_responses::Conditional {
+        if lookup.mode == "cached" {
+            response_api_responses::Conditional::Status304 {
+                header_etag: "\"widget-v1\"".to_owned(),
+                header_cache_control: "no-cache".to_owned(),
+            }
+        } else {
+            response_api_responses::Conditional::Status200 {
+                body: Widget {
+                    id: 42,
+                    name: "conditional".to_owned(),
+                    mode: lookup.mode,
+                },
+                header_etag: "\"widget-v1\"".to_owned(),
+                header_cache_control: "no-cache".to_owned(),
+            }
+        }
+    }
+
+    async fn cookie(&self) -> response_api_responses::Cookie {
+        response_api_responses::Cookie::Status200 {
+            body: Widget {
+                id: 7,
+                name: "cookie".to_owned(),
+                mode: "session".to_owned(),
+            },
+            header_set_cookie: "session=top-secret; HttpOnly; SameSite=Lax".to_owned(),
+        }
+    }
+}
+
+#[api(reqwest)]
+pub trait ResponseFailureApi {
+    #[get(
+        "/missing-header",
+        responses = [(status = 200, headers = [("x-count", u32)])]
+    )]
+    async fn missing_header(&self) -> response_failure_api_responses::MissingHeader;
+
+    #[get(
+        "/invalid-header",
+        responses = [(status = 200, headers = [("x-count", u32)])]
+    )]
+    async fn invalid_header(&self) -> response_failure_api_responses::InvalidHeader;
+
+    #[get(
+        "/duplicate-header",
+        responses = [(status = 200, headers = [("x-count", u32)])]
+    )]
+    async fn duplicate_header(&self) -> response_failure_api_responses::DuplicateHeader;
+}
+
 #[api(reqwest)]
 pub trait FailureApi {
     #[get("/malformed", operation_id = "failure.malformed", status = 200)]
@@ -173,6 +251,27 @@ impl api_reqwest::RequestAuthorizer for RecordingAuthorizer {
         );
         Ok(headers)
     }
+}
+
+async fn missing_header() -> api_macros::axum::framework::StatusCode {
+    api_macros::axum::framework::StatusCode::OK
+}
+
+async fn invalid_header() -> api_macros::axum::framework::Response {
+    api_macros::axum::framework::Response::builder()
+        .status(api_macros::axum::framework::StatusCode::OK)
+        .header("x-count", "not-a-number")
+        .body(api_macros::axum::framework::Body::empty())
+        .expect("valid fixture response")
+}
+
+async fn duplicate_header() -> api_macros::axum::framework::Response {
+    api_macros::axum::framework::Response::builder()
+        .status(api_macros::axum::framework::StatusCode::OK)
+        .header("x-count", "1")
+        .header("x-count", "2")
+        .body(api_macros::axum::framework::Body::empty())
+        .expect("valid fixture response")
 }
 
 async fn malformed() -> &'static str {
@@ -318,6 +417,119 @@ async fn generated_client_and_router_follow_the_normalized_contract() {
     ));
 
     let _route_specific = widget_api_axum::create(Arc::new(WidgetService));
+    server.abort();
+}
+
+#[tokio::test]
+async fn declared_response_status_bodies_and_headers_round_trip_without_secret_diagnostics() {
+    let app = ResponseApiAxum::router(ResponseService).merge(
+        api_macros::axum::framework::Router::new()
+            .route(
+                "/missing-header",
+                api_macros::axum::framework::get(missing_header),
+            )
+            .route(
+                "/invalid-header",
+                api_macros::axum::framework::get(invalid_header),
+            )
+            .route(
+                "/duplicate-header",
+                api_macros::axum::framework::get(duplicate_header),
+            ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind declared-response fixture server");
+    let address = listener.local_addr().expect("fixture address");
+    let server = tokio::spawn(async move {
+        api_macros::axum::framework::serve(listener, app)
+            .await
+            .expect("serve declared-response fixture API");
+    });
+    let base_url = format!("http://{address}/");
+    let client = ResponseApiClient::try_new(&base_url).expect("response client");
+
+    let fresh = client
+        .conditional(Lookup {
+            mode: "fresh".to_owned(),
+        })
+        .await
+        .expect("200 declared response");
+    match fresh {
+        response_api_responses::Conditional::Status200 {
+            body,
+            header_etag,
+            header_cache_control,
+        } => {
+            assert_eq!(body.id, 42);
+            assert_eq!(header_etag, "\"widget-v1\"");
+            assert_eq!(header_cache_control, "no-cache");
+        }
+        other => panic!("unexpected fresh variant: {other:?}"),
+    }
+
+    let cached = client
+        .conditional(Lookup {
+            mode: "cached".to_owned(),
+        })
+        .await
+        .expect("304 declared response");
+    assert!(matches!(
+        cached,
+        response_api_responses::Conditional::Status304 {
+            ref header_etag,
+            ref header_cache_control,
+        } if header_etag == "\"widget-v1\"" && header_cache_control == "no-cache"
+    ));
+
+    let cookie = client.cookie().await.expect("cookie response");
+    let cookie_debug = format!("{cookie:?}");
+    assert!(!cookie_debug.contains("top-secret"));
+    match cookie {
+        response_api_responses::Cookie::Status200 {
+            body,
+            header_set_cookie,
+        } => {
+            assert_eq!(body.name, "cookie");
+            assert_eq!(
+                header_set_cookie,
+                "session=top-secret; HttpOnly; SameSite=Lax"
+            );
+        }
+    }
+
+    let failures = ResponseFailureApiClient::try_new(&base_url).expect("failure client");
+    let missing = failures
+        .missing_header()
+        .await
+        .expect_err("missing header must fail");
+    assert!(matches!(
+        missing,
+        api_reqwest::ClientError::Failure(api_reqwest::ClientFailure::MissingResponseHeader {
+            name: "x-count"
+        })
+    ));
+    let invalid = failures
+        .invalid_header()
+        .await
+        .expect_err("invalid header must fail");
+    assert!(matches!(
+        invalid,
+        api_reqwest::ClientError::Failure(api_reqwest::ClientFailure::InvalidResponseHeader {
+            name: "x-count"
+        })
+    ));
+    let duplicate = failures
+        .duplicate_header()
+        .await
+        .expect_err("duplicate header must fail");
+    assert!(matches!(
+        duplicate,
+        api_reqwest::ClientError::Failure(api_reqwest::ClientFailure::DuplicateResponseHeader {
+            name: "x-count"
+        })
+    ));
+
     server.abort();
 }
 

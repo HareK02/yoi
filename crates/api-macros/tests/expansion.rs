@@ -44,6 +44,19 @@ pub trait BinaryApi {
 }
 
 #[api]
+pub trait ConditionalApi {
+    #[get(
+        "/conditional",
+        operation_id = "conditional.get",
+        responses = [
+            (status = 200, body = Widget, headers = [("etag", String), ("cache-control", String)]),
+            (status = 304, headers = [("etag", String), ("cache-control", String)])
+        ]
+    )]
+    async fn fetch(&self) -> conditional_api_responses::Fetch;
+}
+
+#[api]
 pub trait RawIdentifierApi {
     #[get("/type", operation_id = "raw.type")]
     async fn r#type(&self) -> Widget;
@@ -94,9 +107,9 @@ fn expansion_exposes_deterministic_metadata_and_type_connections() {
     assert_eq!(create.method, HttpMethod::Post);
     assert_eq!(create.path, "/widgets");
     assert_eq!(create.request_body.wire_kind, WireKind::Json);
-    assert_eq!(create.response.status, 201);
-    assert_eq!(create.response.body.wire_kind, WireKind::Json);
-    assert_eq!(create.error_response.unwrap().status, 422);
+    assert_eq!(create.success_responses[0].status, 201);
+    assert_eq!(create.success_responses[0].body.wire_kind, WireKind::Json);
+    assert_eq!(create.error_responses[0].status, 422);
     assert_eq!(create.parameters[0].location, ParameterLocation::Body);
     assert_eq!(create.parameters[1].location, ParameterLocation::Header);
     assert_eq!(create.parameters[1].wire_name, "x-request-id");
@@ -111,10 +124,37 @@ fn expansion_exposes_deterministic_metadata_and_type_connections() {
     fn assert_binary_request<O: Operation<RequestBody = BinaryBody>>() {}
     assert_binary_request::<binary_api_operations::Upload>();
 
+    let conditional = <conditional_api_operations::Fetch as Operation>::METADATA;
+    assert_eq!(conditional.success_responses.len(), 2);
+    assert_eq!(conditional.success_responses[0].status, 200);
+    assert_eq!(
+        conditional.success_responses[0].body.wire_kind,
+        WireKind::Json
+    );
+    assert_eq!(conditional.success_responses[0].headers.len(), 2);
+    assert_eq!(
+        conditional.success_responses[0].headers[0].wire_name,
+        "etag"
+    );
+    assert_eq!(
+        conditional.success_responses[0].headers[0].rust_type,
+        "String"
+    );
+    assert_eq!(conditional.success_responses[1].status, 304);
+    assert_eq!(
+        conditional.success_responses[1].body.wire_kind,
+        WireKind::Empty
+    );
+    fn assert_conditional_response<
+        O: Operation<ResponseBody = conditional_api_responses::Fetch>,
+    >() {
+    }
+    assert_conditional_response::<conditional_api_operations::Fetch>();
+
     let delete = <widget_api_operations::Delete as Operation>::METADATA;
-    assert_eq!(delete.response.status, 204);
-    assert_eq!(delete.response.body.wire_kind, WireKind::Empty);
-    assert_eq!(delete.error_response, None);
+    assert_eq!(delete.success_responses[0].status, 204);
+    assert_eq!(delete.success_responses[0].body.wire_kind, WireKind::Empty);
+    assert!(delete.error_responses.is_empty());
 
     fn assert_empty_request<O: Operation<RequestBody = NoBody>>() {}
     fn assert_empty_response<O: Operation<ResponseBody = NoBody, ErrorBody = NoBody>>() {}
