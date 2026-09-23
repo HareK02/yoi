@@ -114,7 +114,6 @@
       const repository = repositoryFor(target.repository_key);
       if (
         !target.repository_key || repository === null ||
-        (repository.diagnostics ?? []).length > 0 ||
         !effectiveRefSelector(target) ||
         repositoryKeys.has(target.repository_key)
       ) return false;
@@ -651,7 +650,7 @@
             {busy === "ready" ? "Marking ready…" : "Mark ready"}
           </button>
           {#if !targetCandidateValid}
-            <p class="workspace-empty-copy">Add unique healthy repository targets with effective ref selectors and exactly one read-write target before marking ready.</p>
+            <p class="workspace-empty-copy">Add unique registered repository targets with effective ref selectors and exactly one read-write target before marking ready.</p>
           {/if}
         {:else if ticket.state === "ready"}
           <button class="workspace-primary-button ticket-queue-button" type="button" disabled={busy === "queue" || !ticket.action_eligibility.can_queue} onclick={() => void queueTicket()}>

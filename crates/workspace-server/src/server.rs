@@ -3707,14 +3707,6 @@ fn validated_ticket_implementation_targets(
                         repository.repository_key
                     )))
                 })?;
-            api.live_repository_reader()?
-                .observe_merge_target(&repository_id, Some(&ref_selector))
-                .map_err(|error| {
-                    ApiError::from(Error::InvalidInput(format!(
-                        "Ticket `{ticket_id}` target Repository `{}` selector `{ref_selector}` is not resolvable: {error:?}",
-                        repository.repository_key
-                    )))
-                })?;
             let capabilities = match target.access {
                 TicketTargetAccess::ReadOnly => {
                     workdir::WorkdirSessionCapabilities::READ_ONLY
@@ -10931,15 +10923,6 @@ impl ticket::TicketTargetAuthority for WorkspaceTicketTargetAuthority {
             .or(repository.default_ref.as_deref())
             .ok_or_else(|| {
                 ticket::TicketError::MissingTargetSelector(repository.repository_key.clone())
-            })?;
-        self.api
-            .live_repository_reader()
-            .map_err(|error| ticket::TicketError::Conflict(error.to_string()))?
-            .observe_merge_target(&repository.repository_id, Some(selector))
-            .map_err(|error| ticket::TicketError::InvalidTargetSelector {
-                repository_key: repository.repository_key.clone(),
-                selector: selector.to_owned(),
-                reason: format!("{error:?}"),
             })?;
         Ok(ticket::ResolvedTicketTarget {
             repository_key: repository.repository_key,
@@ -33123,10 +33106,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_ready_resolves_workspace_target_and_closes_lifecycle_bypasses() {
+    async fn mark_ready_accepts_registered_remote_target_and_closes_lifecycle_bypasses() {
         let dir = tempfile::tempdir().unwrap();
-        init_clean_git_workspace(dir.path());
-        let api = test_api(dir.path()).await;
+        let api = test_api_with_remote_repository(dir.path()).await;
         let backend = browser_ticket_backend(&api).unwrap();
 
         let repository_key = "test-repository";
@@ -33150,6 +33132,15 @@ mod tests {
                 "develop",
                 TicketTargetAccess::ReadWrite,
             )]
+        );
+        let implementation_targets =
+            validated_ticket_implementation_targets(&api, &ticket_ref.id).unwrap();
+        assert_eq!(implementation_targets.len(), 1);
+        assert_eq!(implementation_targets[0].repository_key, repository_key);
+        assert_eq!(implementation_targets[0].ref_selector, "develop");
+        assert_eq!(
+            implementation_targets[0].access,
+            TicketTargetAccess::ReadWrite
         );
         assert_eq!(
             backend
@@ -34596,14 +34587,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_queue_eligibility_uses_authoritative_dependency_targets() {
+    async fn browser_queue_eligibility_accepts_registered_remote_dependency_targets() {
         let dir = tempfile::tempdir().unwrap();
-        init_clean_git_workspace(dir.path());
-        let api = test_api(dir.path()).await;
+        let api = test_api_with_remote_repository(dir.path()).await;
         let backend = browser_ticket_backend(&api).unwrap();
-        let mut dependency_input = ticket::NewTicket::new("Invalid target dependency");
+        let mut dependency_input = ticket::NewTicket::new("Remote target dependency");
         dependency_input.workflow_state = Some(TicketWorkflowState::Ready);
-        set_test_ticket_target(&mut dependency_input, "test-repository", "missing-ref");
+        set_test_ticket_target(&mut dependency_input, "test-repository", "remote-feature");
         let dependency = backend.create(dependency_input).unwrap();
         let mut root_input = ticket::NewTicket::new("Queue root");
         root_input.workflow_state = Some(TicketWorkflowState::Ready);
@@ -34624,25 +34614,23 @@ mod tests {
         assign_test_orchestrator(&api, &dependency.id);
 
         let Json(detail) = browser_ticket_detail(&api, &root.id).unwrap();
-        assert!(!detail.action_eligibility.can_queue);
-        assert!(
-            detail
-                .action_eligibility
-                .blockers
-                .iter()
-                .any(|blocker| blocker.contains("missing-ref"))
-        );
-        let result = scoped_queue_ticket_record(
+        assert!(detail.action_eligibility.can_queue);
+        assert!(detail.action_eligibility.blockers.is_empty());
+        let Json(outcome) = scoped_queue_ticket_record(
             State(api.clone()),
             AxumPath((TEST_WORKSPACE_ID.to_string(), root.id.clone())),
             HeaderMap::new(),
         )
-        .await;
-        assert!(result.is_err());
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome.queued_tickets,
+            vec![dependency.id.clone(), root.id.clone()]
+        );
         for ticket_id in [dependency.id, root.id] {
             assert_eq!(
                 backend.show(ticket_id.into()).unwrap().meta.workflow_state,
-                TicketWorkflowState::Ready
+                TicketWorkflowState::Queued
             );
         }
     }
@@ -35710,6 +35698,27 @@ mod tests {
 
     async fn test_api(workspace_root: impl Into<PathBuf>) -> WorkspaceApi {
         test_api_with_recording_backend(workspace_root).await.0
+    }
+
+    async fn test_api_with_remote_repository(workspace_root: impl Into<PathBuf>) -> WorkspaceApi {
+        let mut config = test_server_config(workspace_root);
+        let source = server_api::RepositorySource {
+            kind: server_api::RepositorySourceKind::Ssh,
+            uri: "git@example.invalid:owner/repository.git".to_string(),
+        };
+        config.repositories[0].source_fingerprint =
+            crate::repository_source::repository_source_fingerprint(&source);
+        config.repositories[0].source = source;
+        config.repositories[0].path = None;
+        config.repositories[0].default_selector = Some("develop".to_string());
+        let store = SqliteWorkspaceStore::open(config.database_path.clone()).unwrap();
+        WorkspaceApi::new_with_execution_backend(
+            config,
+            Arc::new(store),
+            Arc::new(DeterministicExecutionBackend::default()),
+        )
+        .await
+        .unwrap()
     }
 
     async fn test_api_with_docs_repository(workspace_root: impl Into<PathBuf>) -> WorkspaceApi {

@@ -184,6 +184,14 @@ Deno.test("ticket detail uses server-derived role assignment actions", async () 
   assertEquals(source.includes("updatedTicket.targets"), true);
   assertEquals(source.includes("ticket.repository_key"), false);
   assertEquals(source.includes("ticket.ref_selector"), false);
+  assertEquals(
+    source.includes("(repository.diagnostics ?? []).length > 0"),
+    false,
+  );
+  assertEquals(
+    source.includes("unique registered repository targets"),
+    true,
+  );
 });
 
 Deno.test("Ticket authoring creates the target collection without singular authority", async () => {
