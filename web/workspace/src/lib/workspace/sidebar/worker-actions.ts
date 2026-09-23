@@ -24,11 +24,18 @@ function workerPath(workspaceId: string, worker: WorkerActionTarget): string {
 async function responseError(response: Response): Promise<string> {
   const fallback = `${response.status} ${response.statusText}`.trim();
   try {
-    const payload = await response.json() as {
-      message?: string;
-      error?: { message?: string };
-    };
-    return payload.error?.message ?? payload.message ?? fallback;
+    const payload: unknown = await response.json();
+    if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+      return fallback;
+    }
+    const record = payload as Record<string, unknown>;
+    if (typeof record.message === "string") return record.message.slice(0, 512);
+    const nested = record.error;
+    if (typeof nested === "object" && nested !== null && !Array.isArray(nested)) {
+      const message = (nested as Record<string, unknown>).message;
+      if (typeof message === "string") return message.slice(0, 512);
+    }
+    return fallback;
   } catch {
     return fallback;
   }

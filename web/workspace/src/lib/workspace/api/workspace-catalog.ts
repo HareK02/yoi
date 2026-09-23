@@ -138,15 +138,18 @@ async function fetchJson(
   if (!response.ok) {
     let detail = `${response.status} ${response.statusText}`.trim();
     try {
-      const body = await response.json();
-      if (typeof body?.message === "string") detail = body.message;
-      else if (typeof body?.error === "string") detail = body.error;
+      const body: unknown = await response.json();
+      if (typeof body === "object" && body !== null && !Array.isArray(body)) {
+        const record = body as Record<string, unknown>;
+        if (typeof record.message === "string") detail = record.message.slice(0, 512);
+        else if (typeof record.error === "string") detail = record.error.slice(0, 512);
+      }
     } catch {
       // Preserve the bounded status text when the Backend did not return JSON.
     }
     throw new WorkspaceCatalogError(response.status, detail);
   }
-  return await response.json() as unknown;
+  return await response.json();
 }
 
 function errorMessage(error: unknown): string {
