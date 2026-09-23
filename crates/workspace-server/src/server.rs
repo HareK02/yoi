@@ -3790,6 +3790,167 @@ fn ticket_target_capabilities_for_workdir(
     Ok(target.capabilities.intersection(source_capabilities))
 }
 
+#[derive(Clone, Debug)]
+struct ManualTicketCoderWorkdirBinding {
+    original_links: Vec<WorkerWorkdirLinkRecord>,
+    effective_links: Vec<WorkerWorkdirLinkRecord>,
+    runtime_attachments: Vec<LogicalWorkdirAttachment>,
+}
+
+fn validate_manual_ticket_coder_workdir_binding(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    ticket_id: &str,
+) -> ApiResult<ManualTicketCoderWorkdirBinding> {
+    let targets = validated_ticket_implementation_targets(api, ticket_id)?;
+    let original_links = api
+        .store
+        .list_worker_workdir_links(&api.config.workspace_id, worker)?
+        .into_iter()
+        .filter(|link| link.unlinked_at.is_none())
+        .collect::<Vec<_>>();
+    let mut aliases = HashSet::new();
+    let mut workdir_ids = HashSet::new();
+    let mut covered_repositories = HashSet::new();
+    let mut effective_links = Vec::with_capacity(original_links.len());
+    let mut runtime_attachments = Vec::with_capacity(original_links.len());
+
+    for link in &original_links {
+        if !aliases.insert(link.alias.clone()) {
+            return Err(Error::InvalidInput(format!(
+                "Ticket `{ticket_id}` Worker attachment alias `{}` appears more than once",
+                link.alias
+            ))
+            .into());
+        }
+        if !workdir_ids.insert(link.workdir_id.clone()) {
+            return Err(Error::InvalidInput(format!(
+                "Ticket `{ticket_id}` Workdir `{}` appears more than once",
+                link.workdir_id
+            ))
+            .into());
+        }
+        let workdir = api
+            .store
+            .get_workdir_registry(&api.config.workspace_id, &link.workdir_id)?
+            .ok_or_else(|| {
+                ApiError::from(Error::Config(format!(
+                    "unknown working directory `{}` in this Workspace",
+                    link.workdir_id
+                )))
+            })?;
+        if workdir.materialization_status != "present" {
+            return Err(Error::InvalidInput(format!(
+                "Ticket `{ticket_id}` attachment `{}` Workdir `{}` is not present",
+                link.alias, link.workdir_id
+            ))
+            .into());
+        }
+        let (workdir_runtime_id, repository_id) = match &workdir.source {
+            WorkdirRegistrySource::Repository {
+                runtime_id,
+                repository_id,
+            } => (runtime_id, repository_id),
+            WorkdirRegistrySource::ExternalGrant { .. } => {
+                return Err(Error::InvalidInput(format!(
+                    "Ticket `{ticket_id}` attachment `{}` is an ExternalGrant and cannot satisfy a persisted Repository target",
+                    link.alias
+                ))
+                .into());
+            }
+        };
+        if workdir_runtime_id != &worker.runtime_id {
+            return Err(Error::InvalidInput(format!(
+                "Ticket `{ticket_id}` attachment `{}` belongs to Runtime `{workdir_runtime_id}`, not Worker Runtime `{}`",
+                link.alias, worker.runtime_id
+            ))
+            .into());
+        }
+        let target = targets
+            .iter()
+            .find(|target| target.repository_id == *repository_id)
+            .ok_or_else(|| {
+                ApiError::from(Error::InvalidInput(format!(
+                    "Ticket `{ticket_id}` attachment `{}` resolves undeclared Repository `{repository_id}`",
+                    link.alias
+                )))
+            })?;
+        if workdir.creation_selector.as_deref() != Some(target.ref_selector.as_str()) {
+            return Err(Error::InvalidInput(format!(
+                "Ticket `{ticket_id}` target selector `{}` does not match attachment `{}` selector `{}`",
+                target.ref_selector,
+                link.alias,
+                workdir.creation_selector.as_deref().unwrap_or("none")
+            ))
+            .into());
+        }
+        if !covered_repositories.insert(repository_id.clone()) {
+            return Err(Error::InvalidInput(format!(
+                "Ticket `{ticket_id}` target Repository `{}` has more than one Worker attachment",
+                target.repository_key
+            ))
+            .into());
+        }
+        let capabilities = link
+            .capabilities
+            .intersection(workdir_source_capabilities(&workdir))
+            .intersection(target.capabilities);
+        effective_links.push(WorkerWorkdirLinkRecord {
+            capabilities,
+            ..link.clone()
+        });
+        runtime_attachments.push(LogicalWorkdirAttachment {
+            alias: workdir::WorkdirAttachmentAlias::new(link.alias.clone())
+                .map_err(|error| Error::InvalidInput(error.to_string()))?,
+            working_directory_id: link.workdir_id.clone(),
+            capabilities,
+        });
+    }
+
+    let missing = targets
+        .iter()
+        .filter(|target| !covered_repositories.contains(&target.repository_id))
+        .map(|target| target.repository_key.as_str())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(Error::InvalidInput(format!(
+            "Ticket `{ticket_id}` is missing one-to-one Workdir attachment coverage for target(s): {}",
+            missing.join(", ")
+        ))
+        .into());
+    }
+    if original_links.len() != targets.len() {
+        return Err(Error::InvalidInput(format!(
+            "Ticket `{ticket_id}` requires exactly {} Workdir attachment(s), found {}",
+            targets.len(),
+            original_links.len()
+        ))
+        .into());
+    }
+
+    Ok(ManualTicketCoderWorkdirBinding {
+        original_links,
+        effective_links,
+        runtime_attachments,
+    })
+}
+
+fn logical_attachments_from_links(
+    links: &[WorkerWorkdirLinkRecord],
+) -> Result<Vec<LogicalWorkdirAttachment>> {
+    links
+        .iter()
+        .map(|link| {
+            Ok(LogicalWorkdirAttachment {
+                alias: workdir::WorkdirAttachmentAlias::new(link.alias.clone())
+                    .map_err(|error| Error::InvalidInput(error.to_string()))?,
+                working_directory_id: link.workdir_id.clone(),
+                capabilities: link.capabilities,
+            })
+        })
+        .collect()
+}
+
 fn import_configured_repositories(
     store: &dyn ControlPlaneStore,
     config: &ServerConfig,
@@ -9955,6 +10116,255 @@ async fn scoped_list_ticket_assignments(
     }))
 }
 
+async fn compensate_manual_ticket_coder_binding(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    binding: &ManualTicketCoderWorkdirBinding,
+    worker_may_be_live: bool,
+) -> Vec<RuntimeDiagnostic> {
+    let mut diagnostics = Vec::new();
+    if worker_may_be_live {
+        match api.runtime.stop_worker(
+            worker,
+            WorkerLifecycleRequest {
+                reason: Some(
+                    "roll back failed manual Coder assignment capability binding".to_string(),
+                ),
+                ticket_assignment: None,
+            },
+        ) {
+            Ok(result) if result.state == InternalWorkerOperationState::Accepted => {}
+            Ok(result) => {
+                diagnostics.push(spawn_compensation_diagnostic(
+                    "manual_coder_worker_stop_rollback_failed",
+                    runtime_diagnostics_message(&result.diagnostics),
+                ));
+                return diagnostics;
+            }
+            Err(error) => {
+                diagnostics.push(spawn_compensation_diagnostic(
+                    "manual_coder_worker_stop_rollback_failed",
+                    sanitize_backend_error(&error.message()),
+                ));
+                return diagnostics;
+            }
+        }
+        if let Err(error) = close_current_worker_session_locked(api, worker).await {
+            diagnostics.push(spawn_compensation_diagnostic(
+                "manual_coder_session_close_rollback_failed",
+                sanitize_backend_error(&error.to_string()),
+            ));
+            return diagnostics;
+        }
+    }
+    if let Err(error) = api.store.replace_worker_workdir_link_capabilities(
+        &api.config.workspace_id,
+        worker,
+        &binding.original_links,
+    ) {
+        diagnostics.push(spawn_compensation_diagnostic(
+            "manual_coder_workdir_capability_rollback_failed",
+            format!(
+                "Failed to restore Workdir capabilities for Worker {}:{}: {}",
+                worker.runtime_id,
+                worker.worker_id,
+                sanitize_backend_error(&error.to_string())
+            ),
+        ));
+        return diagnostics;
+    }
+    let original_attachments = match logical_attachments_from_links(&binding.original_links) {
+        Ok(attachments) => attachments,
+        Err(error) => {
+            diagnostics.push(spawn_compensation_diagnostic(
+                "manual_coder_runtime_attachment_rollback_failed",
+                sanitize_backend_error(&error.to_string()),
+            ));
+            return diagnostics;
+        }
+    };
+    match api
+        .runtime
+        .replace_worker_workdir_attachments(worker, original_attachments)
+    {
+        Ok(result) if result.state == InternalWorkerOperationState::Accepted => {}
+        Ok(result) => {
+            diagnostics.push(spawn_compensation_diagnostic(
+                "manual_coder_runtime_attachment_rollback_failed",
+                runtime_diagnostics_message(&result.diagnostics),
+            ));
+            return diagnostics;
+        }
+        Err(error) => {
+            diagnostics.push(spawn_compensation_diagnostic(
+                "manual_coder_runtime_attachment_rollback_failed",
+                sanitize_backend_error(&error.message()),
+            ));
+            return diagnostics;
+        }
+    }
+    match api.restore_workspace_worker(worker) {
+        Ok(result) if result.state == server_api::WorkerRestoreState::Accepted => {}
+        Ok(result) => diagnostics.push(spawn_compensation_diagnostic(
+            "manual_coder_worker_restore_failed",
+            runtime_diagnostics_message(&result.diagnostics),
+        )),
+        Err(error) => diagnostics.push(spawn_compensation_diagnostic(
+            "manual_coder_worker_restore_failed",
+            sanitize_backend_error(&error.error.to_string()),
+        )),
+    }
+    diagnostics
+}
+
+async fn start_manual_ticket_coder_assignment(
+    api: &WorkspaceApi,
+    record: &TicketRoleAssignmentRecord,
+    operation_id: &str,
+) -> ApiResult<TicketRoleAssignmentRecord> {
+    let TicketAssignmentPrincipal::Worker {
+        runtime_id,
+        worker_id,
+    } = &record.principal
+    else {
+        return Err(Error::TicketAssignmentConflict(
+            "Workspace agent principal cannot occupy the Coder role".to_string(),
+        )
+        .into());
+    };
+    let worker = RuntimeWorkerRef::new(runtime_id.clone(), worker_id.clone());
+
+    if api
+        .store
+        .get_ticket_assignment_operation(&api.config.workspace_id, operation_id)?
+        .is_some()
+    {
+        return api
+            .store
+            .start_ready_ticket_with_coder_assignment(record, &new_id("tasev"), operation_id)
+            .map_err(ApiError::from);
+    }
+
+    let observed = api
+        .runtime
+        .worker(&worker)
+        .map_err(|error| error.into_error())?;
+    if observed.state != "idle" {
+        return Err(Error::TicketAssignmentConflict(format!(
+            "manual Coder assignment requires an idle Worker; Worker {}:{} is {}",
+            worker.runtime_id, worker.worker_id, observed.state
+        ))
+        .into());
+    }
+    let session_lock = current_worker_session_lock(api, &worker);
+    let _session_guard = session_lock.lock().await;
+    let binding = validate_manual_ticket_coder_workdir_binding(api, &worker, &record.ticket_id)?;
+    let stopped = api
+        .runtime
+        .stop_worker(
+            &worker,
+            WorkerLifecycleRequest {
+                reason: Some(format!(
+                    "bind authoritative Workdir capabilities for Ticket {} manual Coder assignment",
+                    record.ticket_id
+                )),
+                ticket_assignment: None,
+            },
+        )
+        .map_err(|error| error.into_error())?;
+    if stopped.state != InternalWorkerOperationState::Accepted {
+        return Err(Error::RuntimeOperationFailed {
+            runtime_id: worker.runtime_id.clone(),
+            code: "manual_coder_worker_stop_rejected".to_string(),
+            message: runtime_diagnostics_message(&stopped.diagnostics),
+        }
+        .into());
+    }
+    if let Err(error) = close_current_worker_session_locked(api, &worker).await {
+        let diagnostics = match api.restore_workspace_worker(&worker) {
+            Ok(result) if result.state == server_api::WorkerRestoreState::Accepted => Vec::new(),
+            Ok(result) => vec![spawn_compensation_diagnostic(
+                "manual_coder_worker_restore_failed",
+                runtime_diagnostics_message(&result.diagnostics),
+            )],
+            Err(restore_error) => vec![spawn_compensation_diagnostic(
+                "manual_coder_worker_restore_failed",
+                sanitize_backend_error(&restore_error.error.to_string()),
+            )],
+        };
+        return Err(ApiError::with_diagnostics(error, diagnostics));
+    }
+
+    let replacement = api
+        .runtime
+        .replace_worker_workdir_attachments(&worker, binding.runtime_attachments.clone())
+        .map_err(|error| error.into_error());
+    match replacement {
+        Ok(result) if result.state == InternalWorkerOperationState::Accepted => {}
+        Ok(result) => {
+            let diagnostics =
+                compensate_manual_ticket_coder_binding(api, &worker, &binding, false).await;
+            return Err(ApiError::with_diagnostics(
+                Error::RuntimeOperationFailed {
+                    runtime_id: worker.runtime_id.clone(),
+                    code: "manual_coder_workdir_binding_rejected".to_string(),
+                    message: runtime_diagnostics_message(&result.diagnostics),
+                },
+                diagnostics,
+            ));
+        }
+        Err(error) => {
+            let diagnostics =
+                compensate_manual_ticket_coder_binding(api, &worker, &binding, false).await;
+            return Err(ApiError::with_diagnostics(error, diagnostics));
+        }
+    }
+
+    if let Err(error) = api.store.replace_worker_workdir_link_capabilities(
+        &api.config.workspace_id,
+        &worker,
+        &binding.effective_links,
+    ) {
+        let diagnostics =
+            compensate_manual_ticket_coder_binding(api, &worker, &binding, false).await;
+        return Err(ApiError::with_diagnostics(error, diagnostics));
+    }
+
+    match api.restore_workspace_worker(&worker) {
+        Ok(result) if result.state == server_api::WorkerRestoreState::Accepted => {}
+        Ok(result) => {
+            let diagnostics =
+                compensate_manual_ticket_coder_binding(api, &worker, &binding, false).await;
+            return Err(ApiError::with_diagnostics(
+                Error::RuntimeOperationFailed {
+                    runtime_id: worker.runtime_id.clone(),
+                    code: "manual_coder_worker_restore_rejected".to_string(),
+                    message: runtime_diagnostics_message(&result.diagnostics),
+                },
+                diagnostics,
+            ));
+        }
+        Err(error) => {
+            let diagnostics =
+                compensate_manual_ticket_coder_binding(api, &worker, &binding, false).await;
+            return Err(ApiError::with_diagnostics(error.error, diagnostics));
+        }
+    }
+
+    match api.store.start_ready_ticket_with_coder_assignment(
+        record,
+        &new_id("tasev"),
+        operation_id,
+    ) {
+        Ok(assignment) => Ok(assignment),
+        Err(error) => {
+            let diagnostics =
+                compensate_manual_ticket_coder_binding(api, &worker, &binding, true).await;
+            Err(ApiError::with_diagnostics(error, diagnostics))
+        }
+    }
+}
+
 async fn scoped_set_ticket_assignment(
     State(api): State<WorkspaceApi>,
     AxumPath((workspace_id, id, role)): AxumPath<(String, String, String)>,
@@ -10022,23 +10432,7 @@ async fn scoped_set_ticket_assignment(
                 )
                 .into());
             }
-            if let TicketAssignmentPrincipal::Worker {
-                runtime_id,
-                worker_id,
-            } = &record.principal
-            {
-                api.runtime
-                    .worker(&RuntimeWorkerRef::new(
-                        runtime_id.clone(),
-                        worker_id.clone(),
-                    ))
-                    .map_err(|error| error.into_error())?;
-            }
-            api.store.start_ready_ticket_with_coder_assignment(
-                &record,
-                &new_id("tasev"),
-                &operation_id,
-            )?
+            start_manual_ticket_coder_assignment(&api, &record, &operation_id).await?
         }
         TicketAssignmentRole::Owner | TicketAssignmentRole::Contributor => {
             return Err(Error::TicketAssignmentConflict(
@@ -26236,6 +26630,7 @@ mod tests {
         spawn_requests: Arc<Mutex<Vec<WorkerSpawnRequest>>>,
         reject_next_spawn: Arc<Mutex<bool>>,
         workdir_repositories: Arc<Mutex<HashMap<String, String>>>,
+        logical_attachments: Arc<Mutex<HashMap<String, Vec<LogicalWorkdirAttachment>>>>,
     }
 
     impl WorkdirlessFixtureRuntime {
@@ -26260,6 +26655,15 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(working_directory_id.to_string(), repository_id.to_string());
+        }
+
+        fn logical_attachments(&self, worker_id: &str) -> Vec<LogicalWorkdirAttachment> {
+            self.logical_attachments
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(worker_id)
+                .cloned()
+                .unwrap_or_default()
         }
 
         fn configured_workdir_status(
@@ -26515,11 +26919,40 @@ mod tests {
             }
         }
 
+        fn restore_worker(&self, worker_id: &str) -> InternalWorkerRestoreResult {
+            let worker = self.worker(worker_id).worker;
+            InternalWorkerRestoreResult {
+                state: if worker.is_some() {
+                    server_api::WorkerRestoreState::Accepted
+                } else {
+                    server_api::WorkerRestoreState::Rejected
+                },
+                worker,
+                diagnostics: Vec::new(),
+            }
+        }
+
         fn replace_worker_workspace_api(
             &self,
             worker_id: &str,
             _workspace_api: WorkspaceApiRef,
         ) -> crate::hosts::WorkerWorkspaceApiResult {
+            crate::hosts::WorkerWorkspaceApiResult {
+                state: InternalWorkerOperationState::Accepted,
+                worker: self.worker(worker_id).worker,
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn replace_worker_workdir_attachments(
+            &self,
+            worker_id: &str,
+            attachments: Vec<LogicalWorkdirAttachment>,
+        ) -> crate::hosts::WorkerWorkspaceApiResult {
+            self.logical_attachments
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(worker_id.to_string(), attachments);
             crate::hosts::WorkerWorkspaceApiResult {
                 state: InternalWorkerOperationState::Accepted,
                 worker: self.worker(worker_id).worker,
@@ -33006,6 +33439,393 @@ mod tests {
                 )
             );
         }
+    }
+
+    struct ManualCoderAssignmentFixture {
+        _workspace: tempfile::TempDir,
+        api: WorkspaceApi,
+        runtime: WorkdirlessFixtureRuntime,
+        ticket_id: String,
+        worker: RuntimeWorkerRef,
+        main_workdir_id: String,
+        docs_workdir_id: String,
+    }
+
+    async fn manual_coder_assignment_fixture() -> ManualCoderAssignmentFixture {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api_with_docs_repository(workspace.path()).await;
+        register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
+        let runtime = WorkdirlessFixtureRuntime::default();
+        api.runtime.register_or_replace(runtime.clone());
+        let Json(created) = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(CreateWorkspaceWorkerRequest {
+                runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.to_string(),
+                display_name: "Manual Coder candidate".to_string(),
+                profile: Some("builtin:coder".to_string()),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachments: Vec::new(),
+                control_operation_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let worker = RuntimeWorkerRef::new(created.runtime_id, created.worker_id);
+        let main_workdir_id = "manual-main-workdir".to_string();
+        let docs_workdir_id = "manual-docs-workdir".to_string();
+        let now = now_registry_timestamp();
+        for (workdir_id, repository_id, alias) in [
+            (
+                &main_workdir_id,
+                test_repository_id(&api),
+                "checkout".to_string(),
+            ),
+            (
+                &docs_workdir_id,
+                test_repository_id_by_key(&api, "docs"),
+                "docs".to_string(),
+            ),
+        ] {
+            api.store
+                .upsert_workdir_registry(&WorkdirRegistryRecord {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    workdir_id: workdir_id.clone(),
+                    display_name: None,
+                    source: WorkdirRegistrySource::Repository {
+                        runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.to_string(),
+                        repository_id,
+                    },
+                    creation_selector: Some("develop".to_string()),
+                    creation_ref: None,
+                    creation_tree: None,
+                    current_selector: Some("develop".to_string()),
+                    current_ref: None,
+                    current_tree: None,
+                    observed_at_epoch_seconds: None,
+                    materialization_status: "present".to_string(),
+                    cleanliness: "clean".to_string(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                })
+                .unwrap();
+            api.store
+                .attach_worker_workdir(&WorkerWorkdirLinkRecord {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    worker: worker.clone(),
+                    workdir_id: workdir_id.clone(),
+                    alias,
+                    capabilities: workdir::WorkdirSessionCapabilities::ALL,
+                    linked_at: now.clone(),
+                    unlinked_at: None,
+                })
+                .unwrap();
+        }
+        sync_runtime_worker_workdir_attachments(&api, &worker).unwrap();
+        let mut input = ticket::NewTicket::new("Manual multi-target Coder");
+        input.workflow_state = Some(TicketWorkflowState::Ready);
+        input.targets = vec![
+            test_ticket_target("test-repository", "develop", TicketTargetAccess::ReadWrite),
+            test_ticket_target("docs", "develop", TicketTargetAccess::ReadOnly),
+        ];
+        let ticket_id = browser_ticket_backend(&api)
+            .unwrap()
+            .create(input)
+            .unwrap()
+            .id;
+        ManualCoderAssignmentFixture {
+            _workspace: workspace,
+            api,
+            runtime,
+            ticket_id,
+            worker,
+            main_workdir_id,
+            docs_workdir_id,
+        }
+    }
+
+    fn manual_coder_assignment_request(
+        fixture: &ManualCoderAssignmentFixture,
+        operation_id: &str,
+    ) -> server_api::SetTicketRoleAssignmentRequest {
+        server_api::SetTicketRoleAssignmentRequest {
+            operation_id: operation_id.to_string(),
+            principal: server_api::TicketAssignmentPrincipal::Worker {
+                runtime_id: fixture.worker.runtime_id.clone(),
+                worker_id: fixture.worker.worker_id.clone(),
+            },
+            expected_assignment_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_coder_assignment_validates_and_rebinds_all_ticket_targets() {
+        let fixture = manual_coder_assignment_fixture().await;
+        let Json(response) = scoped_set_ticket_assignment(
+            State(fixture.api.clone()),
+            AxumPath((
+                TEST_WORKSPACE_ID.to_string(),
+                fixture.ticket_id.clone(),
+                "coder".to_string(),
+            )),
+            Json(manual_coder_assignment_request(
+                &fixture,
+                "manual-multi-target-success",
+            )),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            response.assignment.unwrap().principal,
+            server_api::TicketAssignmentPrincipal::Worker {
+                runtime_id: fixture.worker.runtime_id.clone(),
+                worker_id: fixture.worker.worker_id.clone(),
+            }
+        );
+        assert_eq!(
+            fixture
+                .api
+                .authority
+                .ticket(&fixture.ticket_id)
+                .unwrap()
+                .state,
+            TicketWorkflowState::InProgress.as_str()
+        );
+        let links = fixture
+            .api
+            .store
+            .list_worker_workdir_links(TEST_WORKSPACE_ID, &fixture.worker)
+            .unwrap();
+        assert_eq!(links.len(), 2);
+        assert_eq!(
+            links
+                .iter()
+                .find(|link| link.workdir_id == fixture.main_workdir_id)
+                .unwrap()
+                .capabilities,
+            workdir::WorkdirSessionCapabilities::ALL
+        );
+        assert_eq!(
+            links
+                .iter()
+                .find(|link| link.workdir_id == fixture.docs_workdir_id)
+                .unwrap()
+                .capabilities,
+            workdir::WorkdirSessionCapabilities::READ_ONLY
+        );
+        assert_eq!(
+            fixture.api.runtime.worker(&fixture.worker).unwrap().state,
+            "idle",
+            "manual assignment must restore the live Worker after capability binding"
+        );
+        let runtime_attachments = fixture.runtime.logical_attachments(&fixture.worker.worker_id);
+        assert_eq!(runtime_attachments.len(), 2);
+        assert_eq!(
+            runtime_attachments
+                .iter()
+                .find(|attachment| attachment.alias.as_str() == "docs")
+                .unwrap()
+                .capabilities,
+            workdir::WorkdirSessionCapabilities::READ_ONLY,
+            "the restored live Worker must not retain its pre-assignment ALL capability"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_coder_assignment_rejects_incomplete_or_mismatched_workdirs_before_state_change() {
+        for case in ["missing", "undeclared", "selector"] {
+            let fixture = manual_coder_assignment_fixture().await;
+            match case {
+                "missing" => {
+                    fixture
+                        .api
+                        .store
+                        .detach_worker_workdir(
+                            TEST_WORKSPACE_ID,
+                            &fixture.worker,
+                            Some(&fixture.docs_workdir_id),
+                            TEST_CREATED_AT,
+                        )
+                        .unwrap();
+                }
+                "undeclared" => {
+                    fixture
+                        .api
+                        .store
+                        .upsert_repository(&RepositoryRecord {
+                            workspace_id: TEST_WORKSPACE_ID.to_string(),
+                            repository_id: "undeclared-repository".to_string(),
+                            repository_key: "undeclared".to_string(),
+                            kind: "git".to_string(),
+                            provider: Some("git".to_string()),
+                            source: server_api::RepositorySource {
+                                kind: server_api::RepositorySourceKind::LocalPath,
+                                uri: fixture
+                                    .api
+                                    .config
+                                    .workspace_execution_root
+                                    .display()
+                                    .to_string(),
+                            },
+                            default_ref: Some("develop".to_string()),
+                            source_revision: 1,
+                            source_fingerprint: "sha256:undeclared".to_string(),
+                            observed_status: server_api::RepositoryObservedStatus::Unverified,
+                            observed_at: None,
+                            created_at: TEST_CREATED_AT.to_string(),
+                            updated_at: TEST_CREATED_AT.to_string(),
+                        })
+                        .unwrap();
+                    let mut docs = fixture
+                        .api
+                        .store
+                        .get_workdir_registry(TEST_WORKSPACE_ID, &fixture.docs_workdir_id)
+                        .unwrap()
+                        .unwrap();
+                    docs.source = WorkdirRegistrySource::Repository {
+                        runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.to_string(),
+                        repository_id: "undeclared-repository".to_string(),
+                    };
+                    fixture.api.store.upsert_workdir_registry(&docs).unwrap();
+                }
+                "selector" => {
+                    let mut docs = fixture
+                        .api
+                        .store
+                        .get_workdir_registry(TEST_WORKSPACE_ID, &fixture.docs_workdir_id)
+                        .unwrap()
+                        .unwrap();
+                    docs.creation_selector = Some("other".to_string());
+                    fixture.api.store.upsert_workdir_registry(&docs).unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let error = scoped_set_ticket_assignment(
+                State(fixture.api.clone()),
+                AxumPath((
+                    TEST_WORKSPACE_ID.to_string(),
+                    fixture.ticket_id.clone(),
+                    "coder".to_string(),
+                )),
+                Json(manual_coder_assignment_request(
+                    &fixture,
+                    &format!("manual-invalid-{case}"),
+                )),
+            )
+            .await
+            .unwrap_err()
+            .into_response();
+            assert_eq!(error.status(), StatusCode::BAD_REQUEST, "case={case}");
+            assert_eq!(
+                fixture
+                    .api
+                    .authority
+                    .ticket(&fixture.ticket_id)
+                    .unwrap()
+                    .state,
+                TicketWorkflowState::Ready.as_str(),
+                "case={case}"
+            );
+            assert!(
+                fixture
+                    .api
+                    .store
+                    .get_current_ticket_role_assignment(
+                        TEST_WORKSPACE_ID,
+                        &fixture.ticket_id,
+                        TicketAssignmentRole::Coder,
+                    )
+                    .unwrap()
+                    .is_none(),
+                "case={case}"
+            );
+            assert!(
+                fixture
+                    .api
+                    .store
+                    .get_ticket_assignment_operation(
+                        TEST_WORKSPACE_ID,
+                        &format!("manual-invalid-{case}"),
+                    )
+                    .unwrap()
+                    .is_none(),
+                "case={case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_coder_assignment_failure_restores_worker_and_attachment_capabilities() {
+        let fixture = manual_coder_assignment_fixture().await;
+        rusqlite::Connection::open(&fixture.api.config.database_path)
+            .unwrap()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_manual_coder_assignment
+                BEFORE INSERT ON ticket_current_worker_assignments
+                WHEN NEW.role = 'coder'
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected manual Coder assignment failure');
+                END;
+                "#,
+            )
+            .unwrap();
+
+        assert!(
+            scoped_set_ticket_assignment(
+                State(fixture.api.clone()),
+                AxumPath((
+                    TEST_WORKSPACE_ID.to_string(),
+                    fixture.ticket_id.clone(),
+                    "coder".to_string(),
+                )),
+                Json(manual_coder_assignment_request(
+                    &fixture,
+                    "manual-assignment-failure",
+                )),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            fixture
+                .api
+                .authority
+                .ticket(&fixture.ticket_id)
+                .unwrap()
+                .state,
+            TicketWorkflowState::Ready.as_str()
+        );
+        assert!(
+            fixture
+                .api
+                .store
+                .get_current_ticket_role_assignment(
+                    TEST_WORKSPACE_ID,
+                    &fixture.ticket_id,
+                    TicketAssignmentRole::Coder,
+                )
+                .unwrap()
+                .is_none()
+        );
+        let links = fixture
+            .api
+            .store
+            .list_worker_workdir_links(TEST_WORKSPACE_ID, &fixture.worker)
+            .unwrap();
+        assert!(links.iter().all(|link| {
+            link.capabilities == workdir::WorkdirSessionCapabilities::ALL
+        }));
+        let runtime_attachments = fixture.runtime.logical_attachments(&fixture.worker.worker_id);
+        assert_eq!(runtime_attachments.len(), 2);
+        assert!(runtime_attachments.iter().all(|attachment| {
+            attachment.capabilities == workdir::WorkdirSessionCapabilities::ALL
+        }));
+        assert_eq!(fixture.api.runtime.worker(&fixture.worker).unwrap().state, "idle");
     }
 
     #[tokio::test]

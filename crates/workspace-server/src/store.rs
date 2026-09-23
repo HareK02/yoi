@@ -1731,6 +1731,12 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         &self,
         record: &WorkerWorkdirLinkRecord,
     ) -> Result<WorkerWorkdirLinkRecord>;
+    fn replace_worker_workdir_link_capabilities(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        active_links: &[WorkerWorkdirLinkRecord],
+    ) -> Result<()>;
     fn detach_worker_workdir(
         &self,
         workspace_id: &str,
@@ -8221,6 +8227,92 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             }
             tx.commit()?;
             Ok(record.clone())
+        })
+    }
+
+    fn replace_worker_workdir_link_capabilities(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        active_links: &[WorkerWorkdirLinkRecord],
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let mut stmt = tx.prepare(
+                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
+                   FROM worker_workdir_links
+                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
+                     AND unlinked_at IS NULL"#,
+            )?;
+            let persisted = stmt
+                .query_map(
+                    params![workspace_id, worker.runtime_id, worker.worker_id],
+                    read_worker_workdir_link_record,
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(stmt);
+
+            let mut persisted_identity = persisted
+                .iter()
+                .map(|link| (link.alias.as_str(), link.workdir_id.as_str()))
+                .collect::<Vec<_>>();
+            persisted_identity.sort_unstable();
+            let mut requested_identity = active_links
+                .iter()
+                .map(|link| {
+                    if link.workspace_id != workspace_id
+                        || link.worker != *worker
+                        || link.unlinked_at.is_some()
+                    {
+                        return Err(Error::WorkdirAttachmentConflict(
+                            "Workdir capability replacement contains a foreign or inactive attachment"
+                                .to_string(),
+                        ));
+                    }
+                    workdir::WorkdirAttachmentAlias::new(link.alias.clone()).map_err(|error| {
+                        Error::WorkdirAttachmentConflict(format!(
+                            "invalid Workdir attachment alias `{}`: {error}",
+                            link.alias
+                        ))
+                    })?;
+                    Ok((link.alias.as_str(), link.workdir_id.as_str()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            requested_identity.sort_unstable();
+            if persisted_identity != requested_identity {
+                return Err(Error::WorkdirAttachmentConflict(format!(
+                    "Worker {}:{} attachments changed during capability replacement",
+                    worker.runtime_id, worker.worker_id
+                )));
+            }
+
+            for link in active_links {
+                let changed = tx.execute(
+                    r#"UPDATE worker_workdir_links
+                       SET capabilities = ?1
+                       WHERE workspace_id = ?2 AND runtime_id = ?3 AND worker_id = ?4
+                         AND workdir_id = ?5 AND alias = ?6 AND unlinked_at IS NULL"#,
+                    params![
+                        encode_workdir_link_capabilities(link.capabilities)?,
+                        workspace_id,
+                        worker.runtime_id,
+                        worker.worker_id,
+                        link.workdir_id,
+                        link.alias,
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(Error::WorkdirAttachmentConflict(format!(
+                        "Worker {}:{} attachment `{}` changed during capability replacement",
+                        worker.runtime_id, worker.worker_id, link.alias
+                    )));
+                }
+            }
+            tx.commit()?;
+            Ok(())
         })
     }
 
