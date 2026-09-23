@@ -537,8 +537,13 @@ pub trait ServerApi {
         #[extension] context: ServerRequestContext,
         #[path] operation_id: String,
     ) -> Result<WorkspaceDeletionOperationResponse, RepositoryApiError>;
-
-    #[get("/api/workspace", status = 200, error_status = 400)]
+    #[get(
+        "/api/workspace",
+        status = 200,
+        error_status = 400,
+        bearer_auth = true,
+        browser_auth = true
+    )]
     async fn workspace_current(
         &self,
         #[extension] context: ServerRequestContext,
@@ -833,12 +838,13 @@ pub trait ServerApi {
         &self,
         #[path] workspace_id: String,
     ) -> Result<WorkspaceConfigTreeResponse, RepositoryApiError>;
-
     #[get(
         "/api/w/{workspace_id}/config/projections/prompts",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500]
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true,
     )]
     async fn workspace_prompt_projection(
         &self,
@@ -899,47 +905,51 @@ pub trait ServerApi {
         &self,
         #[path] workspace_id: String,
     ) -> Result<ProfileSettingsResponse, RepositoryApiError>;
-
     #[get(
         "/api/w/{workspace_id}/flows",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500]
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true,
     )]
     async fn flow_list(
         &self,
         #[path] workspace_id: String,
     ) -> Result<FlowSourceListResponse, RepositoryApiError>;
-
     #[put(
         "/api/w/{workspace_id}/flows",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500]
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        bearer_auth = true,
+        browser_auth = true,
     )]
     async fn flow_put(
         &self,
         #[path] workspace_id: String,
         #[body] request: PutFlowRequest,
     ) -> Result<FlowSourceRecord, RepositoryApiError>;
-
     #[post(
         "/api/w/{workspace_id}/flows/resolve",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500]
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true,
     )]
     async fn flow_resolve(
         &self,
         #[path] workspace_id: String,
         #[body] request: FlowSourceResolveRequest,
     ) -> Result<ResolvedFlowSource, RepositoryApiError>;
-
     #[get(
         "/api/w/{workspace_id}/flows/{flow_id}",
         status = 200,
         error_status = 404,
-        additional_error_statuses = [400, 401, 403, 500]
+        additional_error_statuses = [400, 401, 403, 500],
+        bearer_auth = true,
+        browser_auth = true,
     )]
     async fn flow_get(
         &self,
@@ -973,24 +983,26 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[query] query: MemoryStagingQuery,
     ) -> Result<MemoryStagingListResponse, RepositoryApiError>;
-
     #[post(
         "/api/w/{workspace_id}/memory/backend",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500]
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true,
     )]
     async fn memory_backend(
         &self,
         #[path] workspace_id: String,
         #[body] request: MemoryBackendRequest,
     ) -> Result<MemoryBackendResponse, RepositoryApiError>;
-
     #[post(
         "/api/w/{workspace_id}/memory/consolidation",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503]
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        bearer_auth = true,
+        browser_auth = true,
     )]
     async fn memory_consolidation(
         &self,
@@ -1037,12 +1049,13 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] name: String,
     ) -> Result<SkillDetailResponse, RepositoryApiError>;
-
     #[get(
         "/api/w/{workspace_id}/skills/{name}/activate",
         status = 200,
         error_status = 404,
-        additional_error_statuses = [400, 401, 403, 409, 500]
+        additional_error_statuses = [400, 401, 403, 409, 500],
+        bearer_auth = true,
+        browser_auth = true,
     )]
     async fn skill_activate(
         &self,
@@ -1112,24 +1125,24 @@ pub trait ServerApi {
         &self,
         #[path] workspace_id: String,
     ) -> Result<BrowserWorkspaceOrchestratorResponse, RepositoryApiError>;
-
     #[get(
         "/api/w/{workspace_id}/worker-control/workers",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500]
+        additional_error_statuses = [401, 403, 404, 500],
+        openapi = false,
     )]
     async fn worker_control_list(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
     ) -> Result<WorkerControlListResponse, RepositoryApiError>;
-
     #[post(
         "/api/w/{workspace_id}/worker-control/workers",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503]
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        openapi = false,
     )]
     async fn worker_control_spawn(
         &self,
@@ -1137,12 +1150,12 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[body] request: CreateWorkspaceWorkerRequest,
     ) -> Result<BrowserCreateWorkerResponse, RepositoryApiError>;
-
     #[post(
         "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/input",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503]
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        openapi = false,
     )]
     async fn worker_control_input(
         &self,
@@ -1152,12 +1165,12 @@ pub trait ServerApi {
         #[path] worker_id: String,
         #[body] request: RuntimeWorkerInputRequest,
     ) -> Result<RuntimeWorkerInputResult, RepositoryApiError>;
-
     #[post(
         "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/cancel",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503]
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        openapi = false,
     )]
     async fn worker_control_cancel(
         &self,
@@ -1167,12 +1180,12 @@ pub trait ServerApi {
         #[path] worker_id: String,
         #[body] request: RuntimeWorkerLifecycleRequest,
     ) -> Result<RuntimeWorkerLifecycleResult, RepositoryApiError>;
-
     #[post(
         "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/stop",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504]
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
+        openapi = false,
     )]
     async fn worker_control_stop(
         &self,
@@ -1182,12 +1195,12 @@ pub trait ServerApi {
         #[path] worker_id: String,
         #[body] request: RuntimeWorkerLifecycleRequest,
     ) -> Result<RuntimeWorkerLifecycleResult, RepositoryApiError>;
-
     #[post(
         "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/restore",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504]
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
+        openapi = false,
     )]
     async fn worker_control_restore(
         &self,
@@ -1196,26 +1209,24 @@ pub trait ServerApi {
         #[path] runtime_id: String,
         #[path] worker_id: String,
     ) -> Result<WorkerRestoreResponse, RepositoryApiError>;
-
     #[get(
         "/api/w/{workspace_id}/worker-observation/sessions",
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 500],
-        openapi = false
+        openapi = false,
     )]
     async fn worker_observation_sessions(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
     ) -> Result<WorkerObservationSessionsResponse, RepositoryApiError>;
-
     #[post(
         "/api/w/{workspace_id}/worker-observation/session",
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 500, 502, 504],
-        openapi = false
+        openapi = false,
     )]
     async fn worker_observation_capture(
         &self,
@@ -1223,12 +1234,12 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[body] request: WorkerObservationSubjectRef,
     ) -> Result<WorkerObservationCaptureResponse, RepositoryApiError>;
-
     #[get(
         "/api/w/{workspace_id}/worker-discovery/workers",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500]
+        additional_error_statuses = [401, 403, 404, 500],
+        openapi = false,
     )]
     async fn workspace_worker_discovery(
         &self,
@@ -1303,12 +1314,12 @@ pub trait ServerApi {
         &self,
         #[path] workspace_id: String,
     ) -> Result<WorkerLaunchOptionsResponse, RepositoryApiError>;
-
     #[post(
         "/api/runtime/v1/workspaces/{workspace_id}/resources/fetch",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 404, 410, 502, 504]
+        additional_error_statuses = [401, 404, 410, 502, 504],
+        openapi = false,
     )]
     async fn runtime_resource_fetch(
         &self,
@@ -1420,12 +1431,12 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[body] request: CompanionCancelRequest,
     ) -> Result<CompanionMessageResponse, RepositoryApiError>;
-
     #[post(
         "/api/w/{workspace_id}/workers/remove",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 503]
+        additional_error_statuses = [401, 403, 404, 409, 500, 503],
+        openapi = false,
     )]
     async fn workspace_worker_remove(
         &self,
@@ -2214,13 +2225,12 @@ pub trait ServerApi {
         #[path] working_directory_id: String,
         #[body] request: WorkingDirectoryRemovalRequest,
     ) -> Result<WorkingDirectoryRemovalResponse, RepositoryApiError>;
-
     #[post(
         "/api/w/{workspace_id}/workers/self/workdir-attachments",
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
-        bearer_auth = true
+        openapi = false,
     )]
     async fn current_worker_workdir_attach(
         &self,
@@ -2228,13 +2238,12 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[body] request: CurrentWorkerWorkdirAttachRequest,
     ) -> Result<CurrentWorkerWorkdirAttachmentResponse, RepositoryApiError>;
-
     #[delete(
         "/api/w/{workspace_id}/workers/self/workdir-attachments/{alias}",
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
-        bearer_auth = true
+        openapi = false,
     )]
     async fn current_worker_workdir_detach(
         &self,
@@ -2242,13 +2251,12 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] alias: String,
     ) -> Result<CurrentWorkerWorkdirAttachmentResponse, RepositoryApiError>;
-
     #[post(
         "/api/w/{workspace_id}/workers/self/workdir-session/operations",
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
-        bearer_auth = true
+        openapi = false,
     )]
     async fn current_worker_workdir_operation(
         &self,
@@ -2359,8 +2367,7 @@ pub trait ServerApi {
         #[path] working_directory_id: String,
         #[body] request: WorkingDirectoryRemovalRequest,
     ) -> Result<WorkingDirectoryRemovalResponse, RepositoryApiError>;
-
-    #[get("/api/tickets", status = 200, error_status = 400, additional_error_statuses = [500])]
+    #[get("/api/tickets", status = 200, error_status = 400, additional_error_statuses = [500], bearer_auth = true, browser_auth = true)]
     async fn ticket_list_alias(
         &self,
         #[query] query: TicketListHttpQuery,
@@ -2387,61 +2394,53 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[body] request: TicketQueryRequest,
     ) -> Result<TicketQueryResponse, RepositoryApiError>;
-
-    #[get("/api/tickets/{id}", status = 200, error_status = 404, additional_error_statuses = [400, 500])]
+    #[get("/api/tickets/{id}", status = 200, error_status = 404, additional_error_statuses = [400, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_get_alias(
         &self,
         #[path] id: String,
     ) -> Result<TicketDetail, RepositoryApiError>;
-
-    #[post("/api/w/{workspace_id}/tickets/default-intake-ready-body", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500])]
+    #[post("/api/w/{workspace_id}/tickets/default-intake-ready-body", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_default_intake_ready_body(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: DefaultIntakeReadyBodyRequest,
     ) -> Result<TextResponse, RepositoryApiError>;
-
-    #[get("/api/w/{workspace_id}/tickets/search", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500])]
+    #[get("/api/w/{workspace_id}/tickets/search", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_summary_search(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[query] query: TicketSummarySearchQuery,
     ) -> Result<TicketRecordSummaryList, RepositoryApiError>;
-
-    #[get("/api/w/{workspace_id}/tickets/doctor", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500])]
+    #[get("/api/w/{workspace_id}/tickets/doctor", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_doctor(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
     ) -> Result<TicketDoctorResponse, RepositoryApiError>;
-
-    #[post("/api/w/{workspace_id}/tickets/relations/search", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500])]
+    #[post("/api/w/{workspace_id}/tickets/relations/search", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_relation_query(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: TicketRelationSearchRequest,
     ) -> Result<TicketRelationRecordList, RepositoryApiError>;
-
-    #[post("/api/w/{workspace_id}/tickets/orchestration-plans/search", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500])]
+    #[post("/api/w/{workspace_id}/tickets/orchestration-plans/search", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_orchestration_plan_query(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: TicketOrchestrationPlanSearchRequest,
     ) -> Result<TicketOrchestrationPlanRecordList, RepositoryApiError>;
-
-    #[get("/api/w/{workspace_id}/tickets/{id}/record", status = 200, error_status = 404, additional_error_statuses = [400, 401, 403, 500])]
+    #[get("/api/w/{workspace_id}/tickets/{id}/record", status = 200, error_status = 404, additional_error_statuses = [400, 401, 403, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_record_get(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] id: String,
     ) -> Result<TicketRecord, RepositoryApiError>;
-
-    #[patch("/api/w/{workspace_id}/tickets/{id}/item", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    #[patch("/api/w/{workspace_id}/tickets/{id}/item", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_record_item_edit(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2449,16 +2448,14 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: EditTicketRecordItemRequest,
     ) -> Result<TicketRecord, RepositoryApiError>;
-
-    #[get("/api/w/{workspace_id}/tickets/{id}/dependency-check", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500])]
+    #[get("/api/w/{workspace_id}/tickets/{id}/dependency-check", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_dependency_check(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] id: String,
     ) -> Result<TicketDependencyCheckResponse, RepositoryApiError>;
-
-    #[post("/api/w/{workspace_id}/tickets/{id}/thread-events", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    #[post("/api/w/{workspace_id}/tickets/{id}/thread-events", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_thread_event_add(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2466,8 +2463,7 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: TicketThreadEventRequest,
     ) -> Result<(), RepositoryApiError>;
-
-    #[post("/api/w/{workspace_id}/tickets/{id}/state-changes", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    #[post("/api/w/{workspace_id}/tickets/{id}/state-changes", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_state_change_add(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2475,8 +2471,7 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: TicketStateChangeRequest,
     ) -> Result<(), RepositoryApiError>;
-
-    #[post("/api/w/{workspace_id}/tickets/{id}/intake-summaries", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    #[post("/api/w/{workspace_id}/tickets/{id}/intake-summaries", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_intake_summary_add(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2484,8 +2479,7 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: TicketIntakeSummaryRequest,
     ) -> Result<(), RepositoryApiError>;
-
-    #[post("/api/w/{workspace_id}/tickets/{id}/state-fields/{field}", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    #[post("/api/w/{workspace_id}/tickets/{id}/state-fields/{field}", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_state_field_set(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2494,8 +2488,7 @@ pub trait ServerApi {
         #[path] field: String,
         #[body] request: TicketStateChangeRequest,
     ) -> Result<(), RepositoryApiError>;
-
-    #[post("/api/w/{workspace_id}/tickets/{id}/workflow-state", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    #[post("/api/w/{workspace_id}/tickets/{id}/workflow-state", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_workflow_state_set(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2503,8 +2496,7 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: TicketStateChangeRequest,
     ) -> Result<(), RepositoryApiError>;
-
-    #[post("/api/w/{workspace_id}/tickets/{id}/workflow/mark-ready", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    #[post("/api/w/{workspace_id}/tickets/{id}/workflow/mark-ready", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_mark_ready_record(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2512,8 +2504,7 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: TicketMarkReadyRequest,
     ) -> Result<TicketRecord, RepositoryApiError>;
-
-    #[post("/api/w/{workspace_id}/tickets/{id}/workflow/queue", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    #[post("/api/w/{workspace_id}/tickets/{id}/workflow/queue", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_queue_record(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2535,8 +2526,7 @@ pub trait ServerApi {
         #[path] merge_request_id: String,
         #[query] query: MergeRequestThreadQuery,
     ) -> Result<MergeRequestDetailResponse, RepositoryApiError>;
-
-    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
     async fn merge_request_open(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2544,23 +2534,20 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: OpenMergeRequestRequest,
     ) -> Result<PublicMergeRequest, RepositoryApiError>;
-
-    #[get("/api/w/{workspace_id}/tickets/{id}/merge-request/readiness", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    #[get("/api/w/{workspace_id}/tickets/{id}/merge-request/readiness", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn merge_request_readiness(
         &self,
         #[path] workspace_id: String,
         #[path] id: String,
     ) -> Result<MergeRequestReadinessResponse, RepositoryApiError>;
-
-    #[get("/api/w/{workspace_id}/tickets/{id}/merge-request/thread", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500])]
+    #[get("/api/w/{workspace_id}/tickets/{id}/merge-request/thread", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn merge_request_thread(
         &self,
         #[path] workspace_id: String,
         #[path] id: String,
         #[query] query: MergeRequestThreadQuery,
     ) -> Result<MergeRequestThreadResponse, RepositoryApiError>;
-
-    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/repair-source", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/repair-source", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], browser_auth = true)]
     async fn merge_request_selector_repair(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2568,16 +2555,14 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: RepairMergeRequestSelectorRequest,
     ) -> Result<PublicMergeRequest, RepositoryApiError>;
-
-    #[post("/api/w/{workspace_id}/internal/reviewer-child-sessions", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    #[post("/api/w/{workspace_id}/internal/reviewer-child-sessions", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
     async fn merge_request_reviewer_child_register(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: RegisterReviewerChildSessionRequest,
     ) -> Result<(), RepositoryApiError>;
-
-    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/review-capabilities", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/review-capabilities", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
     async fn merge_request_review_capability_register(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2585,16 +2570,14 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: RegisterMergeRequestReviewCapabilityRequest,
     ) -> Result<(), RepositoryApiError>;
-
-    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/reviews", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/reviews", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
     async fn merge_request_review_submit(
         &self,
         #[path] workspace_id: String,
         #[path] id: String,
         #[body] request: SubmitMergeRequestReviewRequest,
     ) -> Result<ReviewEvent, RepositoryApiError>;
-
-    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/reviews/revoke", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/reviews/revoke", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
     async fn merge_request_review_revoke(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2602,8 +2585,7 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: RevokeMergeRequestReviewRequest,
     ) -> Result<ReviewRevokedEvent, RepositoryApiError>;
-
-    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/complete", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/complete", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
     async fn merge_request_complete(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2611,8 +2593,7 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: CompleteMergeRequestRequest,
     ) -> Result<MergeEvent, RepositoryApiError>;
-
-    #[post("/api/w/{workspace_id}/tickets/{id}/workflow/close", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    #[post("/api/w/{workspace_id}/tickets/{id}/workflow/close", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_close_record(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2620,16 +2601,14 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: TicketCloseRecordRequest,
     ) -> Result<(), RepositoryApiError>;
-
-    #[get("/api/w/{workspace_id}/tickets/{id}/relation-view", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500])]
+    #[get("/api/w/{workspace_id}/tickets/{id}/relation-view", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_relation_view(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] id: String,
     ) -> Result<TicketRelationRecordView, RepositoryApiError>;
-
-    #[post("/api/w/{workspace_id}/tickets/{id}/relations", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    #[post("/api/w/{workspace_id}/tickets/{id}/relations", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_relation_record(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2637,8 +2616,7 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: CreateTicketRelationRequest,
     ) -> Result<TicketRelationRecord, RepositoryApiError>;
-
-    #[delete("/api/w/{workspace_id}/tickets/{id}/relations", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    #[delete("/api/w/{workspace_id}/tickets/{id}/relations", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_relation_remove(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2646,8 +2624,7 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: TicketRelationRemoveRequest,
     ) -> Result<TicketRelationRecord, RepositoryApiError>;
-
-    #[post("/api/w/{workspace_id}/tickets/{id}/orchestration-plans", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500])]
+    #[post("/api/w/{workspace_id}/tickets/{id}/orchestration-plans", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_orchestration_plan_record(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2670,8 +2647,7 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: BrowserEditTicketRequest,
     ) -> Result<TicketDetail, RepositoryApiError>;
-
-    #[post("/api/w/{workspace_id}/tickets/{id}/show", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500])]
+    #[post("/api/w/{workspace_id}/tickets/{id}/show", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_show(
         &self,
         #[path] workspace_id: String,
@@ -2751,8 +2727,7 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: BrowserCloseTicketRequest,
     ) -> Result<TicketDetail, RepositoryApiError>;
-
-    #[get("/api/objectives", status = 200, error_status = 400, additional_error_statuses = [500])]
+    #[get("/api/objectives", status = 200, error_status = 400, additional_error_statuses = [500], bearer_auth = true, browser_auth = true)]
     async fn objective_list_alias(
         &self,
         #[query] query: ObjectiveListQuery,
@@ -2771,15 +2746,13 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[body] request: ObjectiveCreateRequest,
     ) -> Result<ObjectiveDetail, RepositoryApiError>;
-
-    #[post("/api/w/{workspace_id}/objectives/query", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500])]
+    #[post("/api/w/{workspace_id}/objectives/query", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn objective_query(
         &self,
         #[path] workspace_id: String,
         #[body] request: ObjectiveQueryRequest,
     ) -> Result<ObjectiveQueryResponse, RepositoryApiError>;
-
-    #[get("/api/objectives/{id}", status = 200, error_status = 404, additional_error_statuses = [400, 500])]
+    #[get("/api/objectives/{id}", status = 200, error_status = 404, additional_error_statuses = [400, 500], bearer_auth = true, browser_auth = true)]
     async fn objective_get_alias(
         &self,
         #[path] id: String,
@@ -2799,8 +2772,7 @@ pub trait ServerApi {
         #[path] objective_id: String,
         #[body] request: ObjectiveEditRequest,
     ) -> Result<ObjectiveDetail, RepositoryApiError>;
-
-    #[post("/api/w/{workspace_id}/objectives/{objective_id}/show", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500])]
+    #[post("/api/w/{workspace_id}/objectives/{objective_id}/show", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn objective_show(
         &self,
         #[path] workspace_id: String,
@@ -10553,6 +10525,130 @@ mod openapi_artifact_tests {
             generated, checked_in,
             "regenerate with `cargo run -p server-api --example export_openapi -- openapi/server-api.json`",
         );
+    }
+
+    #[test]
+    fn server_api_openapi_security_matches_workspace_server_auth_semantics() {
+        const PUBLIC_UNAUTHENTICATED: &[&str] = &[
+            "health",
+            "auth_config",
+            "auth_bootstrap_user",
+            "auth_passkey_registration_options",
+            "auth_passkey_login_options",
+            "auth_device_login_start",
+            "auth_device_login_poll",
+            "auth_whoami",
+        ];
+        // These operations are authenticated by Runtime request-source proof, Worker source
+        // identity, or a one-use Reviewer capability. They remain generated Rust client/Axum
+        // operations, but must not appear as unauthenticated operations in the public OpenAPI.
+        const SIGNED_INTERNAL: &[&str] = &[
+            "current_worker_workdir_attach",
+            "current_worker_workdir_detach",
+            "current_worker_workdir_operation",
+            "merge_request_complete",
+            "merge_request_open",
+            "merge_request_review_capability_register",
+            "merge_request_review_revoke",
+            "merge_request_review_submit",
+            "merge_request_reviewer_child_register",
+            "runtime_resource_fetch",
+            "worker_control_cancel",
+            "worker_control_input",
+            "worker_control_list",
+            "worker_control_restore",
+            "worker_control_spawn",
+            "worker_control_stop",
+            "worker_observation_capture",
+            "worker_observation_sessions",
+            "workspace_worker_discovery",
+            "workspace_worker_remove",
+        ];
+        // Session observation retains its existing explicit non-OpenAPI boundary independently of
+        // the Runtime/Worker-source signed operation inventory above.
+        const OTHER_OPENAPI_EXCLUDED: &[&str] = &["worker_session"];
+        const BROWSER_ONLY: &[&str] = &["merge_request_selector_repair"];
+
+        let document = canonical_openapi_document().expect("canonical OpenAPI contract must build");
+        let value: serde_json::Value =
+            serde_json::from_str(&document.to_json().expect("document must serialize"))
+                .expect("document must be JSON");
+        let paths = value["paths"]
+            .as_object()
+            .expect("OpenAPI paths must exist");
+        let mut documented = std::collections::BTreeMap::new();
+        for path in paths.values() {
+            for operation in path
+                .as_object()
+                .expect("OpenAPI path item must be an object")
+                .values()
+            {
+                let operation_id = operation["operationId"]
+                    .as_str()
+                    .expect("OpenAPI operationId must be a string");
+                assert!(
+                    documented.insert(operation_id, operation).is_none(),
+                    "duplicate OpenAPI operationId {operation_id}"
+                );
+            }
+        }
+
+        let operations = ServerApiMetadata::OPERATIONS;
+        assert_eq!(
+            documented.len() + SIGNED_INTERNAL.len() + OTHER_OPENAPI_EXCLUDED.len(),
+            operations.len(),
+            "every ServerApi operation must have one bounded OpenAPI auth disposition"
+        );
+        for operation in operations {
+            let operation_id = operation.operation_id;
+            if SIGNED_INTERNAL.contains(&operation_id)
+                || OTHER_OPENAPI_EXCLUDED.contains(&operation_id)
+            {
+                assert!(
+                    !documented.contains_key(operation_id),
+                    "internal/excluded operation {operation_id} must not appear public in OpenAPI"
+                );
+                continue;
+            }
+
+            let documented_operation = documented
+                .get(operation_id)
+                .unwrap_or_else(|| panic!("missing public OpenAPI operation {operation_id}"));
+            let expected = if PUBLIC_UNAUTHENTICATED.contains(&operation_id) {
+                &[][..]
+            } else if BROWSER_ONLY.contains(&operation_id) {
+                &["browserSession"][..]
+            } else {
+                &["bearerAuth", "browserSession"][..]
+            };
+            let security = documented_operation.get("security");
+            if expected.is_empty() {
+                assert!(
+                    security.is_none(),
+                    "public unauthenticated operation {operation_id} must not require security"
+                );
+                continue;
+            }
+            let security = security
+                .and_then(serde_json::Value::as_array)
+                .unwrap_or_else(|| panic!("authenticated operation {operation_id} lacks security"));
+            let mut actual = security
+                .iter()
+                .map(|requirement| {
+                    let requirement = requirement.as_object().unwrap_or_else(|| {
+                        panic!("security requirement for {operation_id} must be an object")
+                    });
+                    assert_eq!(
+                        requirement.len(),
+                        1,
+                        "security alternatives for {operation_id} must remain independent OR choices"
+                    );
+                    requirement.keys().next().expect("one security scheme").as_str()
+                })
+                .collect::<Vec<_>>();
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "security mismatch for {operation_id}");
+        }
     }
 
     #[test]

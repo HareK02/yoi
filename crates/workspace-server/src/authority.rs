@@ -19,10 +19,10 @@ use crate::records::{
     ObjectiveQueryItem, ObjectiveQueryRequest, ObjectiveQueryResponse, ObjectiveResourceSummary,
     ObjectiveShowRequest, ObjectiveSummary, ProjectRecordList, QueryPage, TicketActionEligibility,
     TicketAssignmentPrincipalSummary, TicketAssignmentSummary, TicketDetail, TicketEventDetail,
-    TicketEvidenceEvent, TicketEvidenceSummary, TicketListPageRequest, TicketMergeRequestSummary,
-    TicketQueryItem, TicketQueryRequest, TicketQueryResponse, TicketRelationView,
+    TicketEvidenceEvent, TicketEvidenceSummary, TicketListProjectionRequest,
+    TicketMergeRequestSummary, TicketQueryItem, TicketQueryRequest, TicketQueryResponse,
     TicketRoleAssignmentSummary, TicketShowRequest, TicketSummary, TicketSummaryPage,
-    summarize_body, truncate_body,
+    summarize_body, ticket_relation_view_from_domain, truncate_body,
 };
 use crate::store::{
     ControlPlaneStore, MemoryDocumentRecord, MemoryStagingRecord, MemoryStagingResolutionRecord,
@@ -48,7 +48,7 @@ impl<T> WorkspaceAuthority for T where T: ObjectiveAuthority + TicketAuthority +
 
 pub trait TicketAuthority {
     fn list_tickets(&self, limit: usize) -> Result<ProjectRecordList<TicketSummary>>;
-    fn list_ticket_page(&self, request: TicketListPageRequest) -> Result<TicketSummaryPage>;
+    fn list_ticket_page(&self, request: TicketListProjectionRequest) -> Result<TicketSummaryPage>;
     fn query_tickets(&self, query: TicketQueryRequest) -> Result<TicketQueryResponse>;
     fn ticket(&self, id: &str) -> Result<TicketDetail>;
     fn show_ticket(&self, id: &str, query: TicketShowRequest) -> Result<TicketDetail>;
@@ -86,14 +86,14 @@ pub trait MemoryAuthority {
     fn ensure_memory_document(&self) -> Result<MemoryDocument>;
     fn memory_document(&self) -> Result<MemoryDocument>;
     fn update_memory_document(&self, body_md: &str) -> Result<MemoryDocument>;
-    fn list_memory_staging_records(&self, limit: usize) -> Result<Vec<MemoryStagingEntry>>;
-    fn memory_staging_record(&self, candidate_id: &str) -> Result<MemoryStagingEntry>;
+    fn list_memory_staging_records(&self, limit: usize) -> Result<Vec<InternalMemoryStagingEntry>>;
+    fn memory_staging_record(&self, candidate_id: &str) -> Result<InternalMemoryStagingEntry>;
     fn upsert_memory_staging_record(
         &self,
         candidate_id: &str,
         raw_json: &str,
         source_path: Option<&str>,
-    ) -> Result<MemoryStagingEntry>;
+    ) -> Result<InternalMemoryStagingEntry>;
     fn close_memory_staging_record(
         &self,
         candidate_id: &str,
@@ -114,7 +114,7 @@ pub struct MemoryDocument {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemoryStagingEntry {
+pub struct InternalMemoryStagingEntry {
     pub candidate_id: String,
     pub raw_json: String,
     pub source_path: Option<String>,
@@ -966,7 +966,7 @@ impl SqliteWorkspaceAuthority {
                 &ticket.meta.id,
             )?)
             .ok_or_else(|| Error::Store(format!("missing resource key for {}", ticket.meta.id)))?;
-        let mut relations: TicketRelationView = ticket.relations.into();
+        let mut relations = ticket_relation_view_from_domain(ticket.relations);
         for relation in &mut relations.outgoing {
             relation.target_resource_key = self.store.resource_key(
                 &self.workspace_id,
@@ -1073,7 +1073,7 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
         })
     }
 
-    fn list_ticket_page(&self, request: TicketListPageRequest) -> Result<TicketSummaryPage> {
+    fn list_ticket_page(&self, request: TicketListProjectionRequest) -> Result<TicketSummaryPage> {
         let limit = request.limit.unwrap_or(30).clamp(1, 100);
         let mut states = request.states;
         states.sort();
@@ -1587,7 +1587,7 @@ impl MemoryAuthority for SqliteWorkspaceAuthority {
         Ok(memory_document_from_record(record))
     }
 
-    fn list_memory_staging_records(&self, limit: usize) -> Result<Vec<MemoryStagingEntry>> {
+    fn list_memory_staging_records(&self, limit: usize) -> Result<Vec<InternalMemoryStagingEntry>> {
         self.store
             .list_memory_staging_records(&self.workspace_id, limit)
             .map(|records| {
@@ -1598,7 +1598,7 @@ impl MemoryAuthority for SqliteWorkspaceAuthority {
             })
     }
 
-    fn memory_staging_record(&self, candidate_id: &str) -> Result<MemoryStagingEntry> {
+    fn memory_staging_record(&self, candidate_id: &str) -> Result<InternalMemoryStagingEntry> {
         validate_memory_candidate_id(candidate_id)?;
         self.store
             .get_memory_staging_record(&self.workspace_id, candidate_id)?
@@ -1613,7 +1613,7 @@ impl MemoryAuthority for SqliteWorkspaceAuthority {
         candidate_id: &str,
         raw_json: &str,
         source_path: Option<&str>,
-    ) -> Result<MemoryStagingEntry> {
+    ) -> Result<InternalMemoryStagingEntry> {
         validate_memory_candidate_id(candidate_id)?;
         validate_json_object(raw_json, "raw_json")?;
         let imported_at = now_rfc3339();
@@ -2634,8 +2634,8 @@ fn memory_document_from_record(record: MemoryDocumentRecord) -> MemoryDocument {
     }
 }
 
-fn memory_staging_from_record(record: MemoryStagingRecord) -> MemoryStagingEntry {
-    MemoryStagingEntry {
+fn memory_staging_from_record(record: MemoryStagingRecord) -> InternalMemoryStagingEntry {
+    InternalMemoryStagingEntry {
         candidate_id: record.candidate_id,
         raw_json: record.raw_json,
         source_path: record.source_path,
@@ -3330,7 +3330,7 @@ VALUES ('workspace-test', 'ticket', 4);
         assert_eq!(incoming_relation.items.len(), 1);
         assert_eq!(incoming_relation.items[0].id, "00000000001J5");
         let summary_page = authority
-            .list_ticket_page(TicketListPageRequest {
+            .list_ticket_page(TicketListProjectionRequest {
                 states: vec!["planning".to_string(), "ready".to_string()],
                 limit: Some(1),
                 cursor: None,
@@ -3338,7 +3338,7 @@ VALUES ('workspace-test', 'ticket', 4);
             .unwrap();
         assert_eq!(summary_page.items.len(), 1);
         assert!(summary_page.page.has_more);
-        let mismatched_summary_cursor = authority.list_ticket_page(TicketListPageRequest {
+        let mismatched_summary_cursor = authority.list_ticket_page(TicketListProjectionRequest {
             states: vec!["done".to_string()],
             limit: Some(1),
             cursor: summary_page.page.next_cursor,

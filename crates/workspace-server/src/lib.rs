@@ -36,7 +36,7 @@ pub mod workspace_signing_identity;
 mod workspace_subscription;
 
 pub use authority::{
-    MemoryAuthority, MemoryDocument, MemoryStagingEntry, MemoryStagingResolution,
+    InternalMemoryStagingEntry, MemoryAuthority, MemoryDocument, MemoryStagingResolution,
     ObjectiveAuthority, SqliteWorkspaceAuthority, TicketAuthority, TicketMergeRevisionSource,
     WorkspaceAuthority,
 };

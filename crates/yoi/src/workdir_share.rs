@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use client::BackendApiClient;
 use futures::{SinkExt, StreamExt};
-use server_api::{ExternalWorkdirGrantCreateRequest, ExternalWorkdirGrantResponse};
+use server_api::{
+    ExternalWorkdirGrantCreateRequest, ExternalWorkdirGrantResponse, ServerApiClient,
+};
 use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
 use workdir::external::{
@@ -95,40 +97,57 @@ fn pin_selected_root_from(
     ExternalWorkdirRoot::pin(absolute).map_err(|error| error.to_string())
 }
 
+fn authenticated_server_api_client(
+    backend_client: &BackendApiClient,
+    backend_url: &str,
+) -> Result<ServerApiClient, String> {
+    // BackendApiClient remains the stored-credential authority used by the
+    // manual provider WebSocket. Reuse that transport's Authorization header
+    // for the generated JSON client instead of loading or interpreting the
+    // credential a second time here.
+    let authenticated_request = backend_client
+        .websocket_request("/")
+        .map_err(|error| error.to_string())?;
+    let authorization = authenticated_request
+        .headers()
+        .get(reqwest::header::AUTHORIZATION)
+        .cloned()
+        .ok_or_else(|| "stored Backend credential did not provide Authorization".to_string())?;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::AUTHORIZATION, authorization);
+    let http_client = reqwest::Client::builder()
+        .default_headers(headers)
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|error| format!("failed to configure Backend client: {error}"))?;
+    let base_url = backend_url
+        .try_into()
+        .map_err(|error| format!("invalid Backend URL: {error}"))?;
+    Ok(ServerApiClient::with_client(base_url, http_client))
+}
+
 pub(crate) async fn run(options: WorkdirShareOptions) -> Result<(), String> {
     // Pin before creating remote authority: the Backend grant can never outlive
     // a failed local approval/open race, and subsequent path replacement cannot
     // redirect the provider.
     let pinned_root = pin_selected_root(&options.path)?;
 
-    let client = BackendApiClient::from_stored_token(&options.backend_url)
+    let backend_client = BackendApiClient::from_stored_token(&options.backend_url)
         .map_err(|error| error.to_string())?;
+    let server_api_client = authenticated_server_api_client(&backend_client, &options.backend_url)?;
     let provider_instance_id = format!("cli-{}", uuid::Uuid::now_v7());
-    let create_path = format!(
-        "/api/w/{}/external-workdir-grants",
-        encode_path_segment(&options.workspace_id)
-    );
-    let response = client
-        .request(reqwest::Method::POST, &create_path)
-        .map_err(|error| error.to_string())?
-        .timeout(Duration::from_secs(10))
-        .json(&ExternalWorkdirGrantCreateRequest {
-            provider_instance_id: provider_instance_id.clone(),
-            display_name: options.display_name.clone(),
-            ttl_seconds: options.ttl.as_secs(),
-            read_only: true,
-        })
-        .send()
+    let grant = server_api_client
+        .external_workdir_grant_create(
+            options.workspace_id.clone(),
+            ExternalWorkdirGrantCreateRequest {
+                provider_instance_id: provider_instance_id.clone(),
+                display_name: options.display_name.clone(),
+                ttl_seconds: options.ttl.as_secs(),
+                read_only: true,
+            },
+        )
         .await
         .map_err(|error| format!("External Workdir grant request failed: {error}"))?;
-    let response = client
-        .require_success(response)
-        .await
-        .map_err(|error| error.to_string())?;
-    let grant = response
-        .json::<ExternalWorkdirGrantResponse>()
-        .await
-        .map_err(|error| format!("Backend returned an invalid External Workdir grant: {error}"))?;
 
     let limits = BoundedReadLimits::EXTERNAL_DEFAULT;
     let session = LocalWorkdirSession::external_read_only_pinned(
@@ -150,7 +169,8 @@ pub(crate) async fn run(options: WorkdirShareOptions) -> Result<(), String> {
     let mut generation = grant.generation;
     loop {
         let outcome = serve_provider_connection(
-            &client,
+            &backend_client,
+            &server_api_client,
             &options,
             &grant,
             &provider_instance_id,
@@ -166,11 +186,12 @@ pub(crate) async fn run(options: WorkdirShareOptions) -> Result<(), String> {
                         "External Workdir grant expired after provider connection failure: {connection_error}"
                     ));
                 }
-                let refresh = fetch_grant(&client, &options.workspace_id, &grant.grant_id);
+                let refresh =
+                    fetch_grant(&server_api_client, &options.workspace_id, &grant.grant_id);
                 let refreshed = tokio::select! {
                     signal = tokio::signal::ctrl_c() => {
                         signal.map_err(|error| format!("failed to wait for Ctrl-C: {error}"))?;
-                        revoke(&client, &options.workspace_id, &grant.grant_id).await?;
+                        revoke(&server_api_client, &options.workspace_id, &grant.grant_id).await?;
                         println!("External Workdir grant revoked.");
                         return Ok(());
                     }
@@ -182,8 +203,12 @@ pub(crate) async fn run(options: WorkdirShareOptions) -> Result<(), String> {
                         eprintln!(
                             "Connection refresh failed; retrying: {connection_error}; {refresh_error}"
                         );
-                        if wait_to_reconnect(&client, &options.workspace_id, &grant.grant_id)
-                            .await?
+                        if wait_to_reconnect(
+                            &server_api_client,
+                            &options.workspace_id,
+                            &grant.grant_id,
+                        )
+                        .await?
                         {
                             println!("External Workdir grant revoked.");
                             return Ok(());
@@ -213,7 +238,9 @@ pub(crate) async fn run(options: WorkdirShareOptions) -> Result<(), String> {
                     }
                 }
                 println!("Connection: reconnecting");
-                if wait_to_reconnect(&client, &options.workspace_id, &grant.grant_id).await? {
+                if wait_to_reconnect(&server_api_client, &options.workspace_id, &grant.grant_id)
+                    .await?
+                {
                     println!("External Workdir grant revoked.");
                     return Ok(());
                 }
@@ -237,7 +264,9 @@ pub(crate) async fn run(options: WorkdirShareOptions) -> Result<(), String> {
                     .checked_add(1)
                     .ok_or_else(|| "External Workdir provider generation overflow".to_string())?;
                 println!("Connection: reconnecting");
-                if wait_to_reconnect(&client, &options.workspace_id, &grant.grant_id).await? {
+                if wait_to_reconnect(&server_api_client, &options.workspace_id, &grant.grant_id)
+                    .await?
+                {
                     println!("External Workdir grant revoked.");
                     return Ok(());
                 }
@@ -247,7 +276,8 @@ pub(crate) async fn run(options: WorkdirShareOptions) -> Result<(), String> {
 }
 
 async fn serve_provider_connection(
-    client: &BackendApiClient,
+    backend_client: &BackendApiClient,
+    server_api_client: &ServerApiClient,
     options: &WorkdirShareOptions,
     grant: &ExternalWorkdirGrantResponse,
     provider_instance_id: &str,
@@ -259,7 +289,7 @@ async fn serve_provider_connection(
         encode_path_segment(&options.workspace_id),
         encode_path_segment(&grant.grant_id)
     );
-    let request = client
+    let request = backend_client
         .websocket_request(&provider_path)
         .map_err(|error| error.to_string())?;
     let websocket_config = WebSocketConfig::default()
@@ -269,7 +299,7 @@ async fn serve_provider_connection(
     let (mut socket, _) = tokio::select! {
         signal = tokio::signal::ctrl_c() => {
             signal.map_err(|error| format!("failed to wait for Ctrl-C: {error}"))?;
-            revoke(client, &options.workspace_id, &grant.grant_id).await?;
+            revoke(server_api_client, &options.workspace_id, &grant.grant_id).await?;
             return Ok(ProviderEnd::Interrupted);
         }
         connection = connection => connection
@@ -292,7 +322,7 @@ async fn serve_provider_connection(
     let registered = tokio::select! {
         signal = tokio::signal::ctrl_c() => {
             signal.map_err(|error| format!("failed to wait for Ctrl-C: {error}"))?;
-            revoke(client, &options.workspace_id, &grant.grant_id).await?;
+            revoke(server_api_client, &options.workspace_id, &grant.grant_id).await?;
             return Ok(ProviderEnd::Interrupted);
         }
         registered = tokio::time::timeout(Duration::from_secs(10), socket.next()) => {
@@ -324,7 +354,7 @@ async fn serve_provider_connection(
             signal = tokio::signal::ctrl_c() => {
                 signal.map_err(|error| format!("failed to wait for Ctrl-C: {error}"))?;
                 stop_operations(&mut operations, &mut completions).await?;
-                revoke(client, &options.workspace_id, &grant.grant_id).await?;
+                revoke(server_api_client, &options.workspace_id, &grant.grant_id).await?;
                 return Ok(ProviderEnd::Interrupted);
             }
             completion = completions.recv() => {
@@ -558,7 +588,7 @@ where
 }
 
 async fn wait_to_reconnect(
-    client: &BackendApiClient,
+    client: &ServerApiClient,
     workspace_id: &str,
     grant_id: &str,
 ) -> Result<bool, String> {
@@ -573,51 +603,27 @@ async fn wait_to_reconnect(
 }
 
 async fn fetch_grant(
-    client: &BackendApiClient,
+    client: &ServerApiClient,
     workspace_id: &str,
     grant_id: &str,
 ) -> Result<ExternalWorkdirGrantResponse, String> {
-    let path = format!(
-        "/api/w/{}/external-workdir-grants/{}",
-        encode_path_segment(workspace_id),
-        encode_path_segment(grant_id)
-    );
-    let response = client
-        .request(reqwest::Method::GET, &path)
-        .map_err(|error| error.to_string())?
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|error| format!("External Workdir grant refresh failed: {error}"))?;
     client
-        .require_success(response)
+        .external_workdir_grant_get(workspace_id.to_string(), grant_id.to_string())
         .await
-        .map_err(|error| error.to_string())?
-        .json::<ExternalWorkdirGrantResponse>()
-        .await
-        .map_err(|error| format!("Backend returned an invalid External Workdir grant: {error}"))
+        .map_err(|error| format!("External Workdir grant refresh failed: {error}"))
 }
 
 async fn revoke(
-    client: &BackendApiClient,
+    client: &ServerApiClient,
     workspace_id: &str,
     grant_id: &str,
 ) -> Result<(), String> {
-    let path = format!(
-        "/api/w/{}/external-workdir-grants/{}",
-        encode_path_segment(workspace_id),
-        encode_path_segment(grant_id)
-    );
-    let response = client
-        .request(reqwest::Method::DELETE, &path)
-        .map_err(|error| error.to_string())?
-        .timeout(Duration::from_secs(10))
-        .send()
+    client
+        .external_workdir_grant_revoke(workspace_id.to_string(), grant_id.to_string())
         .await
-        .map_err(|error| format!("External Workdir revoke request failed: {error}"))?;
-    client.require_success(response).await.map_err(|error| {
-        format!("External Workdir revoke was not confirmed by the Backend: {error}")
-    })?;
+        .map_err(|error| {
+            format!("External Workdir revoke was not confirmed by the Backend: {error}")
+        })?;
     Ok(())
 }
 
@@ -636,6 +642,169 @@ fn encode_path_segment(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+
+    fn test_server_api_client(base_url: &str) -> ServerApiClient {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_static("Bearer test-token"),
+        );
+        let http_client = reqwest::Client::builder()
+            .default_headers(headers)
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        ServerApiClient::with_client(base_url.try_into().unwrap(), http_client)
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let mut expected_length = None;
+        loop {
+            let read = stream.read(&mut buffer).unwrap();
+            assert!(read > 0, "HTTP client closed before completing request");
+            request.extend_from_slice(&buffer[..read]);
+            if expected_length.is_none()
+                && let Some(header_end) =
+                    request.windows(4).position(|window| window == b"\r\n\r\n")
+            {
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                });
+                expected_length = Some(header_end + 4 + content_length.unwrap_or(0));
+            }
+            if expected_length.is_some_and(|length| request.len() >= length) {
+                break;
+            }
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    fn spawn_json_server(
+        response_body: String,
+        response_count: usize,
+    ) -> (String, mpsc::Receiver<String>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            for _ in 0..response_count {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                let status = if request.starts_with("POST ") {
+                    "201 Created"
+                } else {
+                    "200 OK"
+                };
+                sender.send(request).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                )
+                .unwrap();
+            }
+        });
+        (format!("http://{address}"), receiver, thread)
+    }
+
+    fn grant_response_json() -> String {
+        serde_json::json!({
+            "grant_id": "grant/a b",
+            "workspace_id": "workspace/a b",
+            "working_directory_id": "workdir-a",
+            "provider_instance_id": "provider-a",
+            "display_name": "Shared files",
+            "permissions": "read_only",
+            "expires_at": "2026-09-23T03:00:00Z",
+            "generation": 7,
+            "status": "pending"
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn generated_grant_operations_preserve_auth_and_encode_contract_paths() {
+        let (base_url, requests, server) = spawn_json_server(grant_response_json(), 3);
+        let client = test_server_api_client(&base_url);
+
+        let created = client
+            .external_workdir_grant_create(
+                "workspace/a b".to_string(),
+                ExternalWorkdirGrantCreateRequest {
+                    provider_instance_id: "provider-a".to_string(),
+                    display_name: "Shared files".to_string(),
+                    ttl_seconds: 600,
+                    read_only: true,
+                },
+            )
+            .await
+            .unwrap();
+        let fetched = fetch_grant(&client, "workspace/a b", "grant/a b")
+            .await
+            .unwrap();
+        revoke(&client, "workspace/a b", "grant/a b").await.unwrap();
+
+        assert_eq!(created.grant_id, "grant/a b");
+        assert_eq!(fetched.generation, 7);
+        let requests = (0..3)
+            .map(|_| requests.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect::<Vec<_>>();
+        server.join().unwrap();
+        assert!(
+            requests[0]
+                .starts_with("POST /api/w/workspace%2Fa%20b/external-workdir-grants HTTP/1.1\r\n")
+        );
+        assert!(requests[1].starts_with(
+            "GET /api/w/workspace%2Fa%20b/external-workdir-grants/grant%2Fa%20b HTTP/1.1\r\n"
+        ));
+        assert!(requests[2].starts_with(
+            "DELETE /api/w/workspace%2Fa%20b/external-workdir-grants/grant%2Fa%20b HTTP/1.1\r\n"
+        ));
+        for request in &requests {
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("\r\nauthorization: bearer test-token\r\n")
+            );
+        }
+        assert!(requests[0].contains("\"provider_instance_id\":\"provider-a\""));
+        assert!(requests[0].contains("\"ttl_seconds\":600"));
+    }
+
+    #[tokio::test]
+    async fn generated_grant_response_is_bounded() {
+        let oversized_body = format!("{{\"padding\":\"{}\"}}", "x".repeat(1_048_576));
+        let (base_url, requests, server) = spawn_json_server(oversized_body, 1);
+        let client = test_server_api_client(&base_url);
+
+        let error = fetch_grant(&client, "workspace-a", "grant-a")
+            .await
+            .unwrap_err();
+
+        let request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        server.join().unwrap();
+        assert!(
+            request
+                .starts_with("GET /api/w/workspace-a/external-workdir-grants/grant-a HTTP/1.1\r\n")
+        );
+        assert!(error.contains("External Workdir grant refresh failed"));
+        assert!(
+            error.contains("response body exceeded 1048576 bytes"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn relative_share_path_is_resolved_and_pinned_before_backend_access() {

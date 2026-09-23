@@ -663,27 +663,6 @@ fn validate_workdir_operations(
             successes: &[("200", "WorkingDirectoryRemovalResponse")],
         },
         OperationContract {
-            path: "/api/w/{workspace_id}/workers/self/workdir-attachments",
-            method: "post",
-            operation_id: "current_worker_workdir_attach",
-            request: Some("CurrentWorkerWorkdirAttachRequest"),
-            successes: &[("200", "CurrentWorkerWorkdirAttachmentResponse")],
-        },
-        OperationContract {
-            path: "/api/w/{workspace_id}/workers/self/workdir-attachments/{alias}",
-            method: "delete",
-            operation_id: "current_worker_workdir_detach",
-            request: None,
-            successes: &[("200", "CurrentWorkerWorkdirAttachmentResponse")],
-        },
-        OperationContract {
-            path: "/api/w/{workspace_id}/workers/self/workdir-session/operations",
-            method: "post",
-            operation_id: "current_worker_workdir_operation",
-            request: Some("CurrentWorkerWorkdirOperationRequest"),
-            successes: &[("200", "WorkdirSessionOperationResult")],
-        },
-        OperationContract {
             path: "/api/w/{workspace_id}/external-workdir-grants",
             method: "post",
             operation_id: "external_workdir_grant_create",
@@ -1140,13 +1119,10 @@ fn validate_operation_contracts(
                 &format!("{} response {status}", operation.operation_id),
             )?;
             let schema = json_content_schema(response, operation.operation_id)?;
-            let expected = successes.get(status.as_str()).copied().unwrap_or_else(|| {
-                if operation.operation_id == "current_worker_workdir_operation" {
-                    "WorkdirOperationApiError"
-                } else {
-                    "RepositoryApiError"
-                }
-            });
+            let expected = successes
+                .get(status.as_str())
+                .copied()
+                .unwrap_or("RepositoryApiError");
             require_schema_ref(schema, expected, operation.operation_id)?;
             roots.insert(expected.to_owned());
         }
