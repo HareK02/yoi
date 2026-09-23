@@ -14855,15 +14855,7 @@ fn workspace_runtime_config_result(
             },
         );
     }
-    let body = serde_json::to_value(bundle)
-        .map(server_api::WorkspaceRuntimeConfigResponse)
-        .map_err(|error| {
-            ApiError::from(invalid_contract_value(
-                "Workspace Runtime Config response",
-                error,
-            ))
-            .into_repository_api_error()
-        })?;
+    let body = server_api::WorkspaceRuntimeConfigResponse::from(bundle);
     Ok(
         server_api::server_api_responses::WorkspaceRuntimeConfig::Status200 {
             body,
@@ -31613,6 +31605,255 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generated_passkey_routes_complete_registration_login_and_logout_cookie_lifecycle() {
+        use webauthn_authenticator_rs::{WebauthnAuthenticator, softpasskey::SoftPasskey};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mut api = test_api(workspace.path()).await;
+        let AuthConfig::Passkey {
+            rp_id,
+            origin,
+            public_base_url,
+            cookie_name,
+        } = &mut api.config.auth;
+        *rp_id = "workspace.test".to_string();
+        *origin = "https://workspace.test".to_string();
+        *public_base_url = origin.clone();
+        let origin = origin.clone();
+        let cookie_name = cookie_name.clone();
+        let app = generated_auth_contract_router(ServerApiContractService::Workspace(api));
+        let mut authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let authenticator_origin = url::Url::parse(&origin).unwrap();
+
+        let registration_options_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/passkeys/registration/options")
+                    .header(ORIGIN, &origin)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&PasskeyRegistrationOptionsRequest {
+                            handle: "generated-passkey-user".to_string(),
+                            display_name: Some("Generated Passkey User".to_string()),
+                            browser_origin: None,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registration_options_response.status(), StatusCode::OK);
+        let registration_options: PasskeyRegistrationOptionsResponse = serde_json::from_slice(
+            &to_bytes(registration_options_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let registration_credential = authenticator
+            .do_registration(
+                authenticator_origin.clone(),
+                registration_options.public_key,
+            )
+            .unwrap();
+
+        let registration_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/passkeys/registration/complete")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&PasskeyRegistrationCompleteRequest {
+                            challenge_id: registration_options.challenge_id,
+                            credential: registration_credential,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registration_response.status(), StatusCode::OK);
+        let registration_cookie = registration_response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(registration_cookie.starts_with(&format!("{cookie_name}=")));
+        assert!(registration_cookie.contains("; Secure"));
+        assert!(registration_cookie.contains("; HttpOnly; SameSite=Lax"));
+        let registration_body: AuthUserResponse = serde_json::from_slice(
+            &to_bytes(registration_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(registration_body.user.handle, "generated-passkey-user");
+        let registration_cookie_pair = registration_cookie.split(';').next().unwrap().to_string();
+
+        let registered_whoami = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/whoami")
+                    .header(axum::http::header::COOKIE, &registration_cookie_pair)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registered_whoami.status(), StatusCode::OK);
+        let registered_whoami: Value = serde_json::from_slice(
+            &to_bytes(registered_whoami.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            registered_whoami["actor"]["handle"],
+            "generated-passkey-user"
+        );
+
+        let login_options_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/passkeys/login/options")
+                    .header(ORIGIN, &origin)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&PasskeyLoginOptionsRequest {
+                            handle: Some("generated-passkey-user".to_string()),
+                            browser_origin: None,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login_options_response.status(), StatusCode::OK);
+        let login_options: PasskeyLoginOptionsResponse = serde_json::from_slice(
+            &to_bytes(login_options_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let login_credential = authenticator
+            .do_authentication(authenticator_origin, login_options.public_key)
+            .unwrap();
+
+        let login_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/passkeys/login/complete")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&PasskeyLoginCompleteRequest {
+                            challenge_id: login_options.challenge_id,
+                            credential: login_credential,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login_response.status(), StatusCode::OK);
+        let login_cookie = login_response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(login_cookie.starts_with(&format!("{cookie_name}=")));
+        assert!(login_cookie.contains("; Secure"));
+        assert!(login_cookie.contains("; HttpOnly; SameSite=Lax"));
+        let login_body: AuthUserResponse = serde_json::from_slice(
+            &to_bytes(login_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(login_body.user, registration_body.user);
+        let login_cookie_pair = login_cookie.split(';').next().unwrap().to_string();
+
+        let logged_in_whoami = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/whoami")
+                    .header(axum::http::header::COOKIE, &login_cookie_pair)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logged_in_whoami.status(), StatusCode::OK);
+        let logged_in_whoami: Value = serde_json::from_slice(
+            &to_bytes(logged_in_whoami.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            logged_in_whoami["actor"]["handle"],
+            "generated-passkey-user"
+        );
+
+        let logout_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/logout")
+                    .header(axum::http::header::COOKIE, &login_cookie_pair)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout_response.status(), StatusCode::OK);
+        let logout_cookie = logout_response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(logout_cookie.starts_with(&format!("{cookie_name}=")));
+        assert!(logout_cookie.contains("Max-Age=0"));
+
+        let logged_out_whoami = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/whoami")
+                    .header(axum::http::header::COOKIE, login_cookie_pair)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logged_out_whoami.status(), StatusCode::OK);
+        let logged_out_whoami: Value = serde_json::from_slice(
+            &to_bytes(logged_out_whoami.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(logged_out_whoami["actor"].is_null());
+    }
+
+    #[tokio::test]
     async fn browser_session_set_and_clear_cookies_follow_public_https_scheme() {
         for (scheme, secure) in [("http", false), ("https", true)] {
             let workspace = tempfile::tempdir().unwrap();
@@ -37723,9 +37964,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let etag = response.headers().get(ETAG).unwrap().clone();
         assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-cache");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let contract_bundle: server_api::WorkspaceRuntimeConfigResponse =
+            serde_json::from_slice(&body).unwrap();
         let bundle: worker_runtime::config_bundle::ConfigBundle =
-            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
+            serde_json::from_value(serde_json::to_value(contract_bundle).unwrap()).unwrap();
         assert!(bundle.profile_source_archive.is_some());
         assert_eq!(
             etag.to_str().unwrap(),

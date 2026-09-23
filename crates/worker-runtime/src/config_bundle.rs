@@ -1,10 +1,13 @@
 use crate::catalog::{ConfigBundleRef, ProfileSelector};
 use crate::error::RuntimeError;
 use crate::profile_archive::{
-    ProfileArchiveError, ProfileSourceArchive, ProfileSourceArchiveRef,
+    ProfileArchiveError, ProfileSourceArchive, ProfileSourceArchiveRef, ProfileSourceGraphSummary,
     VerifiedProfileSourceArchive,
 };
-use crate::resource::{BackendResourceHandle, validate_resource_handle_text};
+use crate::resource::{
+    BackendResourceHandle, BackendResourceKind, BackendResourceOperation, ResourceRedactionPolicy,
+    validate_resource_handle_text,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -159,6 +162,181 @@ impl ConfigBundle {
         self.profiles
             .iter()
             .any(|profile| profile.selector == *selector)
+    }
+}
+
+impl From<ConfigBundle> for server_api::WorkspaceRuntimeConfigResponse {
+    fn from(bundle: ConfigBundle) -> Self {
+        let ConfigBundle {
+            metadata,
+            profiles,
+            declarations,
+            prompt_catalog,
+            profile_source_archive,
+            profile_source_archive_handle,
+        } = bundle;
+        Self {
+            metadata: metadata.into(),
+            profiles: profiles.into_iter().map(Into::into).collect(),
+            declarations: declarations.into_iter().map(Into::into).collect(),
+            prompt_catalog: prompt_catalog.map(|catalog| {
+                server_api::WorkspaceRuntimePromptCatalog {
+                    templates: catalog.templates,
+                    config_revision: catalog.config_revision,
+                    source_digest: catalog.source_digest,
+                    schema_fingerprint: catalog.schema_fingerprint,
+                    toolchain_fingerprint: catalog.toolchain_fingerprint,
+                    catalog_digest: catalog.catalog_digest,
+                }
+            }),
+            profile_source_archive: profile_source_archive.map(Into::into),
+            profile_source_archive_handle: profile_source_archive_handle.map(Into::into),
+        }
+    }
+}
+
+impl From<ConfigBundleMetadata> for server_api::WorkspaceRuntimeConfigMetadata {
+    fn from(metadata: ConfigBundleMetadata) -> Self {
+        Self {
+            id: metadata.id,
+            digest: metadata.digest,
+            revision: metadata.revision,
+            workspace_id: metadata.workspace_id,
+            created_at: metadata.created_at,
+            provenance: metadata.provenance.into(),
+        }
+    }
+}
+
+impl From<ConfigBundleProvenance> for server_api::WorkspaceRuntimeConfigProvenance {
+    fn from(provenance: ConfigBundleProvenance) -> Self {
+        Self {
+            source: provenance.source,
+            detail: provenance.detail,
+        }
+    }
+}
+
+impl From<ConfigProfileDescriptor> for server_api::WorkspaceRuntimeConfigProfile {
+    fn from(profile: ConfigProfileDescriptor) -> Self {
+        Self {
+            selector: profile.selector.into(),
+            label: profile.label,
+        }
+    }
+}
+
+impl From<ProfileSelector> for server_api::WorkspaceRuntimeProfileSelector {
+    fn from(selector: ProfileSelector) -> Self {
+        match selector {
+            ProfileSelector::Builtin(value) => Self::Builtin(value),
+            ProfileSelector::Named(value) => Self::Named(value),
+        }
+    }
+}
+
+impl From<ConfigDeclaration> for server_api::WorkspaceRuntimeConfigDeclaration {
+    fn from(declaration: ConfigDeclaration) -> Self {
+        Self {
+            kind: declaration.kind.into(),
+            name: declaration.name,
+            reference: declaration.reference,
+        }
+    }
+}
+
+impl From<ConfigDeclarationKind> for server_api::WorkspaceRuntimeConfigDeclarationKind {
+    fn from(kind: ConfigDeclarationKind) -> Self {
+        match kind {
+            ConfigDeclarationKind::SecretRef => Self::SecretRef,
+            ConfigDeclarationKind::MountGrant => Self::MountGrant,
+            ConfigDeclarationKind::NetworkPolicy => Self::NetworkPolicy,
+            ConfigDeclarationKind::ShellPolicy => Self::ShellPolicy,
+            ConfigDeclarationKind::GitPolicy => Self::GitPolicy,
+            ConfigDeclarationKind::CapabilityGrant => Self::CapabilityGrant,
+            ConfigDeclarationKind::Unsupported => Self::Unsupported,
+        }
+    }
+}
+
+impl From<ProfileSourceArchive> for server_api::WorkspaceRuntimeProfileSourceArchive {
+    fn from(archive: ProfileSourceArchive) -> Self {
+        Self {
+            reference: archive.reference.into(),
+            content: archive.content,
+        }
+    }
+}
+
+impl From<ProfileSourceArchiveRef> for server_api::WorkspaceRuntimeProfileSourceArchiveRef {
+    fn from(reference: ProfileSourceArchiveRef) -> Self {
+        Self {
+            id: reference.id,
+            digest: reference.digest,
+            size_bytes: reference.size_bytes,
+            source_graph: reference.source_graph.into(),
+        }
+    }
+}
+
+impl From<ProfileSourceGraphSummary> for server_api::WorkspaceRuntimeProfileSourceGraph {
+    fn from(summary: ProfileSourceGraphSummary) -> Self {
+        Self {
+            source_count: summary.source_count,
+            total_source_bytes: summary.total_source_bytes,
+            entrypoints: summary.entrypoints,
+            import_count: summary.import_count,
+        }
+    }
+}
+
+impl From<BackendResourceHandle> for server_api::WorkspaceRuntimeResourceHandle {
+    fn from(handle: BackendResourceHandle) -> Self {
+        Self {
+            kind: handle.kind.into(),
+            workspace_id: handle.workspace_id,
+            scope_id: handle.scope_id,
+            runtime_id: handle.runtime_id,
+            worker_id: handle.worker_id,
+            resource_id: handle.resource_id,
+            digest: handle.digest,
+            operation: handle.operation.into(),
+            expires_at_unix_seconds: handle.expires_at_unix_seconds,
+            nonce: handle.nonce,
+            revision: handle.revision,
+            generation: handle.generation,
+            max_bytes: handle.max_bytes,
+            content_type: handle.content_type,
+            redaction: handle.redaction.into(),
+            audit_correlation_id: handle.audit_correlation_id,
+            profile_source_graph: handle.profile_source_graph.map(Into::into),
+        }
+    }
+}
+
+impl From<BackendResourceKind> for server_api::WorkspaceRuntimeResourceKind {
+    fn from(kind: BackendResourceKind) -> Self {
+        match kind {
+            BackendResourceKind::ProfileSourceArchive => Self::ProfileSourceArchive,
+            BackendResourceKind::RepositorySshAccess => Self::RepositorySshAccess,
+        }
+    }
+}
+
+impl From<BackendResourceOperation> for server_api::WorkspaceRuntimeResourceOperation {
+    fn from(operation: BackendResourceOperation) -> Self {
+        match operation {
+            BackendResourceOperation::FetchArchive => Self::FetchArchive,
+            BackendResourceOperation::FetchOnce => Self::FetchOnce,
+        }
+    }
+}
+
+impl From<ResourceRedactionPolicy> for server_api::WorkspaceRuntimeResourceRedactionPolicy {
+    fn from(policy: ResourceRedactionPolicy) -> Self {
+        match policy {
+            ResourceRedactionPolicy::RuntimeInternalOnly => Self::RuntimeInternalOnly,
+        }
     }
 }
 

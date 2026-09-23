@@ -13128,6 +13128,106 @@
         ],
         "type": "object"
       },
+      "WorkspaceRuntimeConfigDeclaration": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/WorkspaceRuntimeConfigDeclarationKind"
+          },
+          "name": {
+            "type": "string"
+          },
+          "reference": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "name",
+          "reference"
+        ],
+        "type": "object"
+      },
+      "WorkspaceRuntimeConfigDeclarationKind": {
+        "enum": [
+          "secret_ref",
+          "mount_grant",
+          "network_policy",
+          "shell_policy",
+          "git_policy",
+          "capability_grant",
+          "unsupported"
+        ],
+        "type": "string"
+      },
+      "WorkspaceRuntimeConfigMetadata": {
+        "additionalProperties": false,
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "digest": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "provenance": {
+            "$ref": "#/components/schemas/WorkspaceRuntimeConfigProvenance"
+          },
+          "revision": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "digest",
+          "revision",
+          "workspace_id",
+          "created_at",
+          "provenance"
+        ],
+        "type": "object"
+      },
+      "WorkspaceRuntimeConfigProfile": {
+        "additionalProperties": false,
+        "properties": {
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "selector": {
+            "$ref": "#/components/schemas/WorkspaceRuntimeProfileSelector"
+          }
+        },
+        "required": [
+          "selector"
+        ],
+        "type": "object"
+      },
+      "WorkspaceRuntimeConfigProvenance": {
+        "additionalProperties": false,
+        "properties": {
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "type": "object"
+      },
       "WorkspaceRuntimeConfigQuery": {
         "additionalProperties": false,
         "properties": {
@@ -13141,7 +13241,59 @@
         "type": "object"
       },
       "WorkspaceRuntimeConfigResponse": {
-        "description": "Transparent JSON body for the Runtime-owned config bundle wire format."
+        "additionalProperties": false,
+        "description": "Canonical Runtime config-bundle response projected by Workspace authority.\n\nThis is intentionally a concrete transport DTO rather than an opaque JSON value so generated\nclients and OpenAPI consumers receive the same complete wire contract as the Runtime.",
+        "properties": {
+          "declarations": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceRuntimeConfigDeclaration"
+            },
+            "type": "array"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/WorkspaceRuntimeConfigMetadata"
+          },
+          "profile_source_archive": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkspaceRuntimeProfileSourceArchive"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "profile_source_archive_handle": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkspaceRuntimeResourceHandle"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "profiles": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceRuntimeConfigProfile"
+            },
+            "type": "array"
+          },
+          "prompt_catalog": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkspaceRuntimePromptCatalog"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "metadata"
+        ],
+        "type": "object"
       },
       "WorkspaceRuntimeDetail": {
         "additionalProperties": false,
@@ -13213,6 +13365,164 @@
         ],
         "type": "object"
       },
+      "WorkspaceRuntimeProfileSelector": {
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "builtin",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "named",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WorkspaceRuntimeProfileSourceArchive": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "items": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "reference": {
+            "$ref": "#/components/schemas/WorkspaceRuntimeProfileSourceArchiveRef"
+          }
+        },
+        "required": [
+          "reference",
+          "content"
+        ],
+        "type": "object"
+      },
+      "WorkspaceRuntimeProfileSourceArchiveRef": {
+        "additionalProperties": false,
+        "properties": {
+          "digest": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source_graph": {
+            "$ref": "#/components/schemas/WorkspaceRuntimeProfileSourceGraph"
+          }
+        },
+        "required": [
+          "id",
+          "digest",
+          "size_bytes",
+          "source_graph"
+        ],
+        "type": "object"
+      },
+      "WorkspaceRuntimeProfileSourceGraph": {
+        "additionalProperties": false,
+        "properties": {
+          "entrypoints": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "import_count": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source_count": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_source_bytes": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "source_count",
+          "total_source_bytes",
+          "entrypoints",
+          "import_count"
+        ],
+        "type": "object"
+      },
+      "WorkspaceRuntimePromptCatalog": {
+        "additionalProperties": false,
+        "properties": {
+          "catalog_digest": {
+            "type": "string"
+          },
+          "config_revision": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "schema_fingerprint": {
+            "type": "string"
+          },
+          "source_digest": {
+            "type": "string"
+          },
+          "templates": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "toolchain_fingerprint": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "templates",
+          "config_revision",
+          "schema_fingerprint",
+          "toolchain_fingerprint",
+          "catalog_digest"
+        ],
+        "type": "object"
+      },
       "WorkspaceRuntimeResource": {
         "properties": {
           "arch": {
@@ -13269,6 +13579,125 @@
           "management"
         ],
         "type": "object"
+      },
+      "WorkspaceRuntimeResourceHandle": {
+        "additionalProperties": false,
+        "properties": {
+          "audit_correlation_id": {
+            "type": "string"
+          },
+          "content_type": {
+            "type": "string"
+          },
+          "digest": {
+            "type": "string"
+          },
+          "expires_at_unix_seconds": {
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "generation": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/WorkspaceRuntimeResourceKind"
+          },
+          "max_bytes": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "nonce": {
+            "type": "string"
+          },
+          "operation": {
+            "$ref": "#/components/schemas/WorkspaceRuntimeResourceOperation"
+          },
+          "profile_source_graph": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkspaceRuntimeProfileSourceGraph"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "redaction": {
+            "$ref": "#/components/schemas/WorkspaceRuntimeResourceRedactionPolicy"
+          },
+          "resource_id": {
+            "type": "string"
+          },
+          "revision": {
+            "type": "string"
+          },
+          "runtime_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scope_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "worker_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "workspace_id",
+          "resource_id",
+          "digest",
+          "operation",
+          "expires_at_unix_seconds",
+          "nonce",
+          "revision",
+          "max_bytes",
+          "content_type",
+          "redaction",
+          "audit_correlation_id"
+        ],
+        "type": "object"
+      },
+      "WorkspaceRuntimeResourceKind": {
+        "enum": [
+          "profile_source_archive",
+          "repository_ssh_access"
+        ],
+        "type": "string"
+      },
+      "WorkspaceRuntimeResourceOperation": {
+        "enum": [
+          "fetch_archive",
+          "fetch_once"
+        ],
+        "type": "string"
+      },
+      "WorkspaceRuntimeResourceRedactionPolicy": {
+        "enum": [
+          "runtime_internal_only"
+        ],
+        "type": "string"
       },
       "WorkspaceSigningIdentityPublic": {
         "additionalProperties": false,
@@ -13464,7 +13893,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:c76b20e52333efb49a28f9db63d711561bfdc2871e98fd3cbf00d364f2992c21"
+    "x-yoi-source-digest": "sha256:2463eb461342aceb84c87e7aa6bdcf73e28e3866349a555bd4a0d795db671a3f"
   },
   "openapi": "3.1.0",
   "paths": {

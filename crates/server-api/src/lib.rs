@@ -3157,10 +3157,171 @@ pub struct WorkspaceRuntimeConfigQuery {
     pub profile: String,
 }
 
-/// Transparent JSON body for the Runtime-owned config bundle wire format.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
-#[serde(transparent)]
-pub struct WorkspaceRuntimeConfigResponse(pub serde_json::Value);
+/// Canonical Runtime config-bundle response projected by Workspace authority.
+///
+/// This is intentionally a concrete transport DTO rather than an opaque JSON value so generated
+/// clients and OpenAPI consumers receive the same complete wire contract as the Runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRuntimeConfigResponse {
+    pub metadata: WorkspaceRuntimeConfigMetadata,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<WorkspaceRuntimeConfigProfile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declarations: Vec<WorkspaceRuntimeConfigDeclaration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_catalog: Option<WorkspaceRuntimePromptCatalog>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_source_archive: Option<WorkspaceRuntimeProfileSourceArchive>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_source_archive_handle: Option<WorkspaceRuntimeResourceHandle>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRuntimeConfigMetadata {
+    pub id: String,
+    pub digest: String,
+    pub revision: String,
+    pub workspace_id: String,
+    pub created_at: String,
+    pub provenance: WorkspaceRuntimeConfigProvenance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRuntimeConfigProvenance {
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRuntimeConfigProfile {
+    pub selector: WorkspaceRuntimeProfileSelector,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum WorkspaceRuntimeProfileSelector {
+    Builtin(String),
+    Named(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRuntimeConfigDeclaration {
+    pub kind: WorkspaceRuntimeConfigDeclarationKind,
+    pub name: String,
+    pub reference: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceRuntimeConfigDeclarationKind {
+    SecretRef,
+    MountGrant,
+    NetworkPolicy,
+    ShellPolicy,
+    GitPolicy,
+    CapabilityGrant,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRuntimePromptCatalog {
+    pub templates: BTreeMap<String, String>,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub config_revision: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_digest: String,
+    pub schema_fingerprint: String,
+    pub toolchain_fingerprint: String,
+    pub catalog_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRuntimeProfileSourceArchive {
+    pub reference: WorkspaceRuntimeProfileSourceArchiveRef,
+    pub content: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRuntimeProfileSourceArchiveRef {
+    pub id: String,
+    pub digest: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub size_bytes: u64,
+    pub source_graph: WorkspaceRuntimeProfileSourceGraph,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRuntimeProfileSourceGraph {
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub source_count: usize,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub total_source_bytes: u64,
+    pub entrypoints: BTreeMap<String, String>,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub import_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRuntimeResourceHandle {
+    pub kind: WorkspaceRuntimeResourceKind,
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    pub resource_id: String,
+    pub digest: String,
+    pub operation: WorkspaceRuntimeResourceOperation,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_i64))]
+    pub expires_at_unix_seconds: i64,
+    pub nonce: String,
+    pub revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub generation: Option<u64>,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub max_bytes: u64,
+    pub content_type: String,
+    pub redaction: WorkspaceRuntimeResourceRedactionPolicy,
+    pub audit_correlation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_source_graph: Option<WorkspaceRuntimeProfileSourceGraph>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceRuntimeResourceKind {
+    ProfileSourceArchive,
+    RepositorySshAccess,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceRuntimeResourceOperation {
+    FetchArchive,
+    FetchOnce,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceRuntimeResourceRedactionPolicy {
+    RuntimeInternalOnly,
+}
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -8962,6 +9123,89 @@ mod skill_typescript_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_config_response_round_trips_the_complete_config_bundle_shape() {
+        let fixture = serde_json::json!({
+            "metadata": {
+                "id": "bundle-a",
+                "digest": "0123456789abcdef",
+                "revision": "revision-a",
+                "workspace_id": "workspace-a",
+                "created_at": "2026-01-01T00:00:00Z",
+                "provenance": {
+                    "source": "workspace_config",
+                    "detail": "projected"
+                }
+            },
+            "profiles": [{
+                "selector": { "kind": "builtin", "value": "builtin:companion" },
+                "label": "Companion"
+            }],
+            "declarations": [{
+                "kind": "secret_ref",
+                "name": "github-token",
+                "reference": "secret:github-token"
+            }],
+            "prompt_catalog": {
+                "templates": { "default": "Prompt" },
+                "config_revision": 7,
+                "source_digest": "source-digest",
+                "schema_fingerprint": "schema-a",
+                "toolchain_fingerprint": "toolchain-a",
+                "catalog_digest": "catalog-a"
+            },
+            "profile_source_archive": {
+                "reference": {
+                    "id": "archive-a",
+                    "digest": "archive-digest",
+                    "size_bytes": 3,
+                    "source_graph": {
+                        "source_count": 1,
+                        "total_source_bytes": 3,
+                        "entrypoints": { "builtin:companion": "companion.dcdl" },
+                        "import_count": 0
+                    }
+                },
+                "content": [1, 2, 3]
+            },
+            "profile_source_archive_handle": {
+                "kind": "profile_source_archive",
+                "workspace_id": "workspace-a",
+                "scope_id": "scope-a",
+                "runtime_id": "runtime-a",
+                "worker_id": "worker-a",
+                "resource_id": "resource-a",
+                "digest": "resource-digest",
+                "operation": "fetch_archive",
+                "expires_at_unix_seconds": 1_800_000_000,
+                "nonce": "nonce-a",
+                "revision": "revision-a",
+                "generation": 2,
+                "max_bytes": 1_048_576,
+                "content_type": "application/vnd.yoi.profile-source-archive+tar",
+                "redaction": "runtime_internal_only",
+                "audit_correlation_id": "audit-a",
+                "profile_source_graph": {
+                    "source_count": 1,
+                    "total_source_bytes": 3,
+                    "entrypoints": { "builtin:companion": "companion.dcdl" },
+                    "import_count": 0
+                }
+            }
+        });
+        let response: WorkspaceRuntimeConfigResponse =
+            serde_json::from_value(fixture.clone()).unwrap();
+        assert_eq!(serde_json::to_value(response).unwrap(), fixture);
+
+        let mut unknown_nested_field = fixture;
+        unknown_nested_field["metadata"]["runtime_local_path"] =
+            serde_json::Value::String("/private/path".to_string());
+        assert!(
+            serde_json::from_value::<WorkspaceRuntimeConfigResponse>(unknown_nested_field).is_err()
+        );
+    }
+
     #[test]
     fn worker_session_contract_and_flattened_availability_are_stable() {
         let operations = ServerApiMetadata::OPERATIONS;
@@ -10895,6 +11139,18 @@ mod openapi_artifact_tests {
         assert_eq!(
             runtime_config["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/WorkspaceRuntimeConfigResponse"
+        );
+        let runtime_config_schema =
+            &value["components"]["schemas"]["WorkspaceRuntimeConfigResponse"];
+        assert_eq!(runtime_config_schema["type"], "object");
+        assert_eq!(runtime_config_schema["additionalProperties"], false);
+        assert!(runtime_config_schema["properties"]["metadata"].is_object());
+        assert!(runtime_config_schema["properties"]["profiles"].is_object());
+        assert!(runtime_config_schema["properties"]["declarations"].is_object());
+        assert!(
+            value["components"]["schemas"]["WorkspaceRuntimeConfigMetadata"]["properties"]
+                ["digest"]
+                .is_object()
         );
         assert!(runtime_config["responses"]["304"].get("content").is_none());
         for status in ["200", "304"] {
