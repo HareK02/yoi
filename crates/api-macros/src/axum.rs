@@ -8,9 +8,11 @@
 use std::{fmt, str::FromStr};
 
 use axum::{
-    Json,
+    Json, Router,
+    handler::Handler,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
+    routing::get,
 };
 use serde::Serialize;
 
@@ -88,6 +90,26 @@ pub fn rejection(status: StatusCode) -> Response {
 /// Convert a status constant from generated metadata.
 pub fn status(code: u16) -> StatusCode {
     StatusCode::from_u16(code).expect("#[api] validates HTTP status constants")
+}
+
+/// Mount a manual Axum upgrade handler at a contract-declared WebSocket route.
+///
+/// The operation marker supplies the only path and method authority. Requiring
+/// [`crate::WebSocketOperation`] prevents HTTP operation markers from being registered through this
+/// helper while Axum retains its normal route composition and collision behavior.
+pub fn websocket_route<O, H, T, S>(router: Router<S>, handler: H) -> Router<S>
+where
+    O: crate::WebSocketOperation,
+    H: Handler<T, S>,
+    T: 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    debug_assert_eq!(O::METADATA.method, crate::HttpMethod::Get);
+    debug_assert!(matches!(
+        O::METADATA.transport,
+        crate::TransportMetadata::WebSocket { .. }
+    ));
+    router.route(O::METADATA.path, get(handler))
 }
 
 /// Reexports used by generated router code.

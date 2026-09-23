@@ -1,0 +1,5 @@
+error: path parameter(s) have no matching placeholder: unused
+ --> tests/ui/websocket_unused_path_parameter.rs:8:9
+  |
+8 |         "/events",
+  |         ^^^^^^^^^

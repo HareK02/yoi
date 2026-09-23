@@ -59,6 +59,34 @@
 //! `openapi = false` explicitly excludes an operation whose wire body cannot yet satisfy the
 //! strict OpenAPI schema boundary; Reqwest and Axum adapters are still generated.
 //!
+//! WebSocket routes use a declaration-only associated type rather than a dummy unary method:
+//!
+//! ```
+//! # mod websocket_example {
+//! # use api_macros::api;
+//! # pub struct ClientFrame;
+//! # pub struct ServerFrame;
+//! #[api]
+//! pub trait EventApi {
+//!     #[websocket(
+//!         "/events/{stream_id}",
+//!         operation_id = "events.stream",
+//!         method = GET,
+//!         client_to_server = ClientFrame,
+//!         server_to_client = ServerFrame,
+//!         path_parameters = [stream_id: u64]
+//!     )]
+//!     type EventStream;
+//! }
+//! # }
+//! ```
+//!
+//! The declaration is removed from the emitted service trait and becomes a typed marker implementing
+//! [`WebSocketOperation`]. It participates in the same operation/route inventory and path validation,
+//! but never generates a Reqwest method, unary Axum adapter, or OpenAPI path. Under the `axum`
+//! feature, [`axum::websocket_route`] mounts an existing manual upgrade handler at its declared GET
+//! path without exposing framework WebSocket types to the contract.
+//!
 //! # Generated names
 //!
 //! For `WidgetApi`, the macro emits `WidgetApiMetadata`, which implements [`ApiContract`],
@@ -216,12 +244,25 @@ pub enum WireKind {
     Binary,
 }
 
-/// Stable metadata for one Rust method argument.
+/// Stable metadata for one operation argument.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ParameterMetadata {
     pub rust_name: &'static str,
+    pub rust_type: &'static str,
     pub wire_name: &'static str,
     pub location: ParameterLocation,
+}
+
+/// Transport semantics declared by one operation.
+///
+/// WebSocket frame directions remain distinct even when both directions use the same Rust type.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TransportMetadata {
+    Http,
+    WebSocket {
+        client_to_server_frame: &'static str,
+        server_to_client_frame: &'static str,
+    },
 }
 
 /// Stable metadata for a request or response body.
@@ -253,6 +294,7 @@ pub struct OperationMetadata {
     pub operation_id: &'static str,
     pub method: HttpMethod,
     pub path: &'static str,
+    pub transport: TransportMetadata,
     pub parameters: &'static [ParameterMetadata],
     pub request_body: BodyMetadata,
     /// Every declared successful response, including status-specific body and header shape.
@@ -276,6 +318,21 @@ pub trait Operation {
     type ResponseBody;
     /// JSON public error body type, or [`NoBody`].
     type ErrorBody;
+
+    const METADATA: OperationMetadata;
+}
+
+/// Compile-time connection between a WebSocket route and its directional frame authorities.
+///
+/// This is intentionally separate from [`Operation`]: WebSocket routes do not have unary request,
+/// response, or error bodies and therefore cannot be passed to HTTP adapter surfaces.
+pub trait WebSocketOperation {
+    /// Tuple of path parameter types in path-template order.
+    type PathParameters;
+    /// Frame received by the server from the connected client.
+    type ClientToServerFrame;
+    /// Frame sent by the server to the connected client.
+    type ServerToClientFrame;
 
     const METADATA: OperationMetadata;
 }

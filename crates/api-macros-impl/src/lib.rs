@@ -27,6 +27,12 @@ pub fn api(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Transport {
+    Http,
+    WebSocket,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Method {
     Get,
     Post,
@@ -112,6 +118,98 @@ struct RouteArgs {
     browser_auth: Option<syn::LitBool>,
     normalize_body_errors: Option<syn::LitBool>,
     openapi: Option<syn::LitBool>,
+}
+
+struct WebSocketArgs {
+    path: LitStr,
+    operation_id: Option<LitStr>,
+    method: Option<Ident>,
+    client_to_server: Option<Type>,
+    server_to_client: Option<Type>,
+    path_parameters: Vec<(Ident, Type)>,
+}
+
+impl Parse for WebSocketArgs {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let path = input.parse()?;
+        let mut result = Self {
+            path,
+            operation_id: None,
+            method: None,
+            client_to_server: None,
+            server_to_client: None,
+            path_parameters: Vec::new(),
+        };
+        let mut saw_path_parameters = false;
+        while !input.is_empty() {
+            input.parse::<Token![,]>()?;
+            if input.is_empty() {
+                break;
+            }
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "operation_id" => set_once(
+                    &mut result.operation_id,
+                    input.parse::<LitStr>()?,
+                    &key,
+                    "operation_id",
+                )?,
+                "method" => set_once(&mut result.method, input.parse::<Ident>()?, &key, "method")?,
+                "client_to_server" => set_once(
+                    &mut result.client_to_server,
+                    input.parse::<Type>()?,
+                    &key,
+                    "client_to_server",
+                )?,
+                "server_to_client" => set_once(
+                    &mut result.server_to_client,
+                    input.parse::<Type>()?,
+                    &key,
+                    "server_to_client",
+                )?,
+                "path_parameters" => {
+                    if saw_path_parameters {
+                        return Err(syn::Error::new(
+                            key.span(),
+                            "duplicate `path_parameters` WebSocket option",
+                        ));
+                    }
+                    saw_path_parameters = true;
+                    let content;
+                    syn::bracketed!(content in input);
+                    while !content.is_empty() {
+                        let name = content.parse::<Ident>()?;
+                        content.parse::<Token![:]>()?;
+                        let ty = content.parse::<Type>()?;
+                        result.path_parameters.push((name, ty));
+                        if !content.is_empty() {
+                            content.parse::<Token![,]>()?;
+                        }
+                    }
+                }
+                "body" | "binary" => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        "WebSocket operations cannot declare JSON or binary request bodies",
+                    ));
+                }
+                "status" | "alternate_status" | "responses" | "response" => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        "WebSocket operations cannot declare unary success responses or statuses",
+                    ));
+                }
+                _ => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        "unsupported WebSocket option; expected operation_id, method, client_to_server, server_to_client, or path_parameters",
+                    ));
+                }
+            }
+        }
+        Ok(result)
+    }
 }
 
 struct DeclaredResponseHeader {
@@ -381,9 +479,12 @@ struct Operation {
     method_ident: Ident,
     marker_ident: Ident,
     operation_id: String,
+    transport: Transport,
     method: Method,
     path: String,
     parameters: Vec<Parameter>,
+    client_to_server_frame: Option<Type>,
+    server_to_client_frame: Option<Type>,
     request_body: Option<RequestBody>,
     response_body: Option<Type>,
     success_responses: Vec<SuccessResponse>,
@@ -434,24 +535,36 @@ fn normalize_api(
     let mut routes = BTreeMap::<(Method, String), Span>::new();
     let mut marker_names = BTreeMap::<String, (String, Span)>::new();
 
-    for trait_item in &mut item.items {
-        let TraitItem::Fn(method) = trait_item else {
-            return Err(syn::Error::new_spanned(
-                trait_item,
-                "an #[api] trait may contain methods only",
-            ));
+    let mut retained_items = Vec::new();
+    for mut trait_item in std::mem::take(&mut item.items) {
+        let operation = match &mut trait_item {
+            TraitItem::Fn(method) => {
+                let operation = normalize_operation(method)?;
+                retained_items.push(trait_item);
+                operation
+            }
+            TraitItem::Type(declaration) if has_websocket_attribute(&declaration.attrs) => {
+                normalize_websocket_operation(declaration)?
+            }
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    trait_item,
+                    "an #[api] trait may contain HTTP methods and #[websocket] operation declarations only",
+                ));
+            }
         };
-        let operation = normalize_operation(method)?;
+        let source_ident = operation.method_ident.clone();
+        let source_name = ident_text(&source_ident);
+        let source_span = source_ident.span();
 
         let marker_name = operation.marker_ident.to_string();
-        if let Some((first_method, first_span)) = marker_names.insert(
-            marker_name.clone(),
-            (ident_text(&method.sig.ident), method.sig.ident.span()),
-        ) {
+        if let Some((first_operation, first_span)) =
+            marker_names.insert(marker_name.clone(), (source_name, source_span))
+        {
             let mut error = syn::Error::new(
-                method.sig.ident.span(),
+                source_span,
                 format!(
-                    "generated operation marker `{marker_name}` collides with method `{first_method}`"
+                    "generated operation marker `{marker_name}` collides with method `{first_operation}`"
                 ),
             );
             error.combine(syn::Error::new(
@@ -462,23 +575,20 @@ fn normalize_api(
         }
 
         if operation_ids
-            .insert(operation.operation_id.clone(), method.sig.ident.span())
+            .insert(operation.operation_id.clone(), source_span)
             .is_some()
         {
             return Err(syn::Error::new(
-                method.sig.ident.span(),
+                source_span,
                 format!("duplicate operation ID `{}`", operation.operation_id),
             ));
         }
         if routes
-            .insert(
-                (operation.method, operation.path.clone()),
-                method.sig.ident.span(),
-            )
+            .insert((operation.method, operation.path.clone()), source_span)
             .is_some()
         {
             return Err(syn::Error::new(
-                method.sig.ident.span(),
+                source_span,
                 format!(
                     "duplicate route for {} `{}`",
                     method_name(operation.method),
@@ -488,6 +598,7 @@ fn normalize_api(
         }
         operations.push(operation);
     }
+    item.items = retained_items;
 
     if operations.is_empty() {
         return Err(syn::Error::new_spanned(
@@ -526,6 +637,156 @@ fn make_service_futures_send(item: &mut ItemTrait) -> syn::Result<()> {
         ))?;
     }
     Ok(())
+}
+
+fn has_websocket_attribute(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|attr| attr.path().is_ident("websocket"))
+}
+
+fn normalize_websocket_operation(declaration: &mut syn::TraitItemType) -> syn::Result<Operation> {
+    if !declaration.generics.params.is_empty()
+        || declaration.generics.where_clause.is_some()
+        || !declaration.bounds.is_empty()
+        || declaration.default.is_some()
+    {
+        return Err(syn::Error::new_spanned(
+            declaration,
+            "a #[websocket] declaration cannot have generics, bounds, or a default type",
+        ));
+    }
+
+    let mut route = None;
+    for attr in &declaration.attrs {
+        if attr.path().is_ident("websocket") {
+            if route.is_some() {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "a WebSocket operation must have exactly one #[websocket] attribute",
+                ));
+            }
+            route = Some(attr.parse_args::<WebSocketArgs>()?);
+        } else if !attr.path().is_ident("doc") {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "a #[websocket] declaration supports only documentation attributes",
+            ));
+        }
+    }
+    let route = route.expect("caller checked for a WebSocket attribute");
+    let method = route.method.ok_or_else(|| {
+        syn::Error::new_spanned(
+            &route.path,
+            "WebSocket operations require explicit `method = GET`",
+        )
+    })?;
+    if method != "GET" {
+        return Err(syn::Error::new_spanned(
+            method,
+            "WebSocket operations require `method = GET`",
+        ));
+    }
+    let client_to_server_frame = route.client_to_server.ok_or_else(|| {
+        syn::Error::new_spanned(
+            &route.path,
+            "WebSocket operations require `client_to_server = FrameType`",
+        )
+    })?;
+    let server_to_client_frame = route.server_to_client.ok_or_else(|| {
+        syn::Error::new_spanned(
+            &route.path,
+            "WebSocket operations require `server_to_client = FrameType`",
+        )
+    })?;
+    validate_frame_type(&client_to_server_frame)?;
+    validate_frame_type(&server_to_client_frame)?;
+
+    let path = route.path.value();
+    let placeholders = parse_path_template(&route.path)?;
+    let mut path_parameters = BTreeSet::new();
+    let mut parameters = Vec::new();
+    for (ident, ty) in route.path_parameters {
+        let rust_name = ident_text(&ident);
+        if !path_parameters.insert(rust_name.clone()) {
+            return Err(syn::Error::new(
+                ident.span(),
+                format!("duplicate path parameter `{rust_name}`"),
+            ));
+        }
+        parameters.push(Parameter {
+            rust_ident: ident,
+            rust_name: rust_name.clone(),
+            wire_name: rust_name,
+            location: Location::Path,
+            ty,
+        });
+    }
+    let missing: Vec<_> = placeholders.difference(&path_parameters).cloned().collect();
+    if !missing.is_empty() {
+        return Err(syn::Error::new(
+            route.path.span(),
+            format!(
+                "path placeholder(s) have no matching path parameter: {}",
+                missing.join(", ")
+            ),
+        ));
+    }
+    let extra: Vec<_> = path_parameters.difference(&placeholders).cloned().collect();
+    if !extra.is_empty() {
+        return Err(syn::Error::new(
+            route.path.span(),
+            format!(
+                "path parameter(s) have no matching placeholder: {}",
+                extra.join(", ")
+            ),
+        ));
+    }
+
+    let operation_id = route
+        .operation_id
+        .as_ref()
+        .map(LitStr::value)
+        .unwrap_or_else(|| to_snake_case(&declaration.ident));
+    validate_operation_id(
+        &operation_id,
+        route.operation_id.as_ref().unwrap_or(&route.path),
+    )?;
+
+    Ok(Operation {
+        method_ident: declaration.ident.clone(),
+        marker_ident: declaration.ident.clone(),
+        operation_id,
+        transport: Transport::WebSocket,
+        method: Method::Get,
+        path,
+        parameters,
+        client_to_server_frame: Some(client_to_server_frame),
+        server_to_client_frame: Some(server_to_client_frame),
+        request_body: None,
+        response_body: None,
+        success_responses: Vec::new(),
+        declared_responses: false,
+        error_body: None,
+        fallible: false,
+        response_status: 101,
+        alternate_status: None,
+        error_status: None,
+        additional_error_statuses: Vec::new(),
+        bearer_auth: false,
+        browser_auth: false,
+        normalize_body_errors: false,
+        openapi_skip: true,
+    })
+}
+
+fn validate_frame_type(ty: &Type) -> syn::Result<()> {
+    if matches!(ty, Type::Path(path) if path.qself.is_none()) {
+        Ok(())
+    } else {
+        Err(syn::Error::new_spanned(
+            ty,
+            "WebSocket frame authorities must use direct named Rust types",
+        ))
+    }
 }
 
 fn normalize_operation(method: &mut TraitItemFn) -> syn::Result<Operation> {
@@ -912,9 +1173,12 @@ fn normalize_operation(method: &mut TraitItemFn) -> syn::Result<Operation> {
         marker_ident: operation_marker_ident(&method.sig.ident),
         method_ident: method.sig.ident.clone(),
         operation_id,
+        transport: Transport::Http,
         method: http_method,
         path,
         parameters,
+        client_to_server_frame: None,
+        server_to_client_frame: None,
         request_body: body_type,
         response_body,
         success_responses,
@@ -1379,7 +1643,11 @@ fn reqwest_adapter_tokens(
         to_snake_case(trait_ident),
         span = trait_ident.span()
     );
-    let methods = api.operations.iter().map(|operation| {
+    let methods = api
+        .operations
+        .iter()
+        .filter(|operation| matches!(operation.transport, Transport::Http))
+        .map(|operation| {
         let method_ident = &operation.method_ident;
         let arguments = operation.parameters.iter().filter_map(|parameter| {
             if matches!(parameter.location, Location::Extension) {
@@ -1716,7 +1984,11 @@ fn axum_adapter_tokens(
         to_snake_case(trait_ident),
         span = trait_ident.span()
     );
-    let route_functions: Vec<_> = api.operations.iter().map(|operation| {
+    let route_functions: Vec<_> = api
+        .operations
+        .iter()
+        .filter(|operation| matches!(operation.transport, Transport::Http))
+        .map(|operation| {
         let method_ident = &operation.method_ident;
         let handler_ident = format_ident!("{}_handler", ident_text(method_ident));
         let route_path = &operation.path;
@@ -1959,10 +2231,14 @@ fn axum_adapter_tokens(
             }
         }
     }).collect();
-    let operation_merges = api.operations.iter().map(|operation| {
-        let method_ident = &operation.method_ident;
-        quote!(__router = __router.merge(#module_ident::#method_ident(__service.clone()));)
-    });
+    let operation_merges = api
+        .operations
+        .iter()
+        .filter(|operation| matches!(operation.transport, Transport::Http))
+        .map(|operation| {
+            let method_ident = &operation.method_ident;
+            quote!(__router = __router.merge(#module_ident::#method_ident(__service.clone()));)
+        });
 
     quote! {
         #[doc = concat!("Per-operation Axum routers for [`", stringify!(#trait_ident), "`].")]
@@ -2005,7 +2281,9 @@ fn openapi_adapter_tokens(
     let operations = api
         .operations
         .iter()
-        .filter(|operation| !operation.openapi_skip)
+        .filter(|operation| {
+            matches!(operation.transport, Transport::Http) && !operation.openapi_skip
+        })
         .map(|operation| {
         let method = method_name(operation.method);
         let path = &operation.path;
@@ -2188,9 +2466,9 @@ fn expand_api(api: ApiDefinition) -> syn::Result<proc_macro2::TokenStream> {
         .iter()
         .map(|operation| {
             let marker_ident = &operation.marker_ident;
-            let method_ident = &operation.method_ident;
+            let declaration_ident = &operation.method_ident;
             quote! {
-                #[doc = concat!("Typed operation marker for Rust method `", stringify!(#method_ident), "`.")]
+                #[doc = concat!("Typed operation marker for contract declaration `", stringify!(#declaration_ident), "`.")]
                 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
                 pub struct #marker_ident;
             }
@@ -2199,6 +2477,7 @@ fn expand_api(api: ApiDefinition) -> syn::Result<proc_macro2::TokenStream> {
     let operation_impls: Vec<_> = api
         .operations
         .iter()
+        .filter(|operation| matches!(operation.transport, Transport::Http))
         .map(|operation| {
             let marker_ident = &operation.marker_ident;
             let metadata = metadata_tokens(operation, &api_crate);
@@ -2239,6 +2518,35 @@ fn expand_api(api: ApiDefinition) -> syn::Result<proc_macro2::TokenStream> {
             }
         })
         .collect();
+    let websocket_operation_impls: Vec<_> = api
+        .operations
+        .iter()
+        .filter(|operation| matches!(operation.transport, Transport::WebSocket))
+        .map(|operation| {
+            let marker_ident = &operation.marker_ident;
+            let metadata = metadata_tokens(operation, &api_crate);
+            let path_types = ordered_path_parameters(operation)
+                .into_iter()
+                .map(|parameter| &parameter.ty);
+            let client_to_server = operation
+                .client_to_server_frame
+                .as_ref()
+                .expect("WebSocket operation has a client frame");
+            let server_to_client = operation
+                .server_to_client_frame
+                .as_ref()
+                .expect("WebSocket operation has a server frame");
+            quote! {
+                impl #api_crate::WebSocketOperation for #module_ident::#marker_ident {
+                    type PathParameters = (#(#path_types,)*);
+                    type ClientToServerFrame = #client_to_server;
+                    type ServerToClientFrame = #server_to_client;
+
+                    const METADATA: #api_crate::OperationMetadata = #metadata;
+                }
+            }
+        })
+        .collect();
     let inventory: Vec<_> = api
         .operations
         .iter()
@@ -2271,6 +2579,7 @@ fn expand_api(api: ApiDefinition) -> syn::Result<proc_macro2::TokenStream> {
         }
 
         #(#operation_impls)*
+        #(#websocket_operation_impls)*
 
         #reqwest_adapter
         #axum_adapter
@@ -2285,6 +2594,25 @@ fn metadata_tokens(
     let operation_id = &operation.operation_id;
     let method = operation.method.tokens(api_crate);
     let path = &operation.path;
+    let transport = match operation.transport {
+        Transport::Http => quote!(#api_crate::TransportMetadata::Http),
+        Transport::WebSocket => {
+            let client_to_server = operation
+                .client_to_server_frame
+                .as_ref()
+                .expect("WebSocket operation has a client frame");
+            let server_to_client = operation
+                .server_to_client_frame
+                .as_ref()
+                .expect("WebSocket operation has a server frame");
+            quote! {
+                #api_crate::TransportMetadata::WebSocket {
+                    client_to_server_frame: stringify!(#client_to_server),
+                    server_to_client_frame: stringify!(#server_to_client),
+                }
+            }
+        }
+    };
     let request_kind = match operation.request_body.as_ref().map(|body| body.wire_kind) {
         Some(RequestWireKind::Json) => quote!(#api_crate::WireKind::Json),
         Some(RequestWireKind::Binary) => quote!(#api_crate::WireKind::Binary),
@@ -2333,11 +2661,13 @@ fn metadata_tokens(
             return None;
         }
         let rust_name = &parameter.rust_name;
+        let ty = &parameter.ty;
         let wire_name = &parameter.wire_name;
         let location = parameter.location.tokens(api_crate);
         Some(quote! {
             #api_crate::ParameterMetadata {
                 rust_name: #rust_name,
+                rust_type: stringify!(#ty),
                 wire_name: #wire_name,
                 location: #location,
             }
@@ -2349,6 +2679,7 @@ fn metadata_tokens(
             operation_id: #operation_id,
             method: #method,
             path: #path,
+            transport: #transport,
             parameters: &[#(#parameters),*],
             request_body: #api_crate::BodyMetadata { wire_kind: #request_kind },
             success_responses: &[#(#success_responses),*],

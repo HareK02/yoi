@@ -8,6 +8,26 @@ use std::{
 use api_macros::{api, reqwest as api_reqwest};
 use serde::{Deserialize, Serialize};
 
+pub struct NonSerdeClientFrame;
+pub struct NonSerdeServerFrame;
+
+#[api(reqwest, axum)]
+pub trait WebSocketOnlyApi {
+    #[websocket(
+        "/events/{stream_id}",
+        operation_id = "events.websocket",
+        method = GET,
+        client_to_server = NonSerdeClientFrame,
+        server_to_client = NonSerdeServerFrame,
+        path_parameters = [stream_id: u64]
+    )]
+    type Events;
+}
+
+#[derive(Clone)]
+pub struct WebSocketOnlyService;
+impl WebSocketOnlyApi for WebSocketOnlyService {}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CreateWidget {
     name: String,
@@ -285,6 +305,40 @@ async fn oversized() -> String {
 async fn slow() -> &'static str {
     tokio::time::sleep(Duration::from_millis(100)).await;
     "{}"
+}
+
+async fn manual_websocket_route(
+    api_macros::axum::framework::Path(stream_id): api_macros::axum::framework::Path<u64>,
+) -> String {
+    format!("stream:{stream_id}")
+}
+
+#[tokio::test]
+async fn websocket_declarations_skip_unary_adapters_and_mount_manual_handlers() {
+    let _client = WebSocketOnlyApiClient::try_new("http://127.0.0.1:1")
+        .expect("WebSocket-only contracts still provide a client with no unary methods");
+    let app = api_macros::axum::websocket_route::<web_socket_only_api_operations::Events, _, _, _>(
+        api_macros::axum::framework::Router::new(),
+        manual_websocket_route,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fixture server");
+    let address = listener.local_addr().expect("fixture address");
+    let server = tokio::spawn(async move {
+        api_macros::axum::framework::serve(listener, app)
+            .await
+            .expect("serve fixture WebSocket route");
+    });
+
+    let body = reqwest::get(format!("http://{address}/events/42"))
+        .await
+        .expect("manual route response")
+        .text()
+        .await
+        .expect("manual route body");
+    assert_eq!(body, "stream:42");
+    server.abort();
 }
 
 #[tokio::test]

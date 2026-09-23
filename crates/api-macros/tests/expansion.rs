@@ -1,7 +1,8 @@
 #![allow(async_fn_in_trait)]
 
 use api_macros::{
-    ApiContract, BinaryBody, HttpMethod, NoBody, Operation, ParameterLocation, WireKind, api,
+    ApiContract, BinaryBody, HttpMethod, NoBody, Operation, ParameterLocation, TransportMetadata,
+    WebSocketOperation, WireKind, api,
 };
 
 pub struct CreateWidget;
@@ -9,6 +10,24 @@ pub struct Widget;
 pub struct Lookup;
 pub struct PublicError;
 pub struct SearchResult<T>(std::marker::PhantomData<T>);
+pub struct ClientFrame;
+pub struct ServerFrame;
+
+#[api]
+pub trait MixedTransportApi {
+    #[get("/status")]
+    async fn status(&self) -> Widget;
+
+    #[websocket(
+        "/widgets/{widget_id}/events",
+        operation_id = "widgets.events",
+        method = GET,
+        client_to_server = ClientFrame,
+        server_to_client = ServerFrame,
+        path_parameters = [widget_id: u64]
+    )]
+    type WidgetEvents;
+}
 
 #[api]
 pub trait WidgetApi {
@@ -106,11 +125,13 @@ fn expansion_exposes_deterministic_metadata_and_type_connections() {
     assert_eq!(operations[0], create);
     assert_eq!(create.method, HttpMethod::Post);
     assert_eq!(create.path, "/widgets");
+    assert_eq!(create.transport, TransportMetadata::Http);
     assert_eq!(create.request_body.wire_kind, WireKind::Json);
     assert_eq!(create.success_responses[0].status, 201);
     assert_eq!(create.success_responses[0].body.wire_kind, WireKind::Json);
     assert_eq!(create.error_responses[0].status, 422);
     assert_eq!(create.parameters[0].location, ParameterLocation::Body);
+    assert_eq!(create.parameters[0].rust_type, "CreateWidget");
     assert_eq!(create.parameters[1].location, ParameterLocation::Header);
     assert_eq!(create.parameters[1].wire_name, "x-request-id");
 
@@ -160,4 +181,28 @@ fn expansion_exposes_deterministic_metadata_and_type_connections() {
     fn assert_empty_response<O: Operation<ResponseBody = NoBody, ErrorBody = NoBody>>() {}
     assert_empty_request::<widget_api_operations::Lookup>();
     assert_empty_response::<widget_api_operations::Delete>();
+
+    fn assert_websocket_types<
+        O: WebSocketOperation<
+                PathParameters = (u64,),
+                ClientToServerFrame = ClientFrame,
+                ServerToClientFrame = ServerFrame,
+            >,
+    >() {
+    }
+    assert_websocket_types::<mixed_transport_api_operations::WidgetEvents>();
+    let websocket = <mixed_transport_api_operations::WidgetEvents as WebSocketOperation>::METADATA;
+    assert_eq!(websocket.method, HttpMethod::Get);
+    assert_eq!(websocket.path, "/widgets/{widget_id}/events");
+    assert_eq!(websocket.parameters[0].rust_name, "widget_id");
+    assert_eq!(websocket.parameters[0].rust_type, "u64");
+    assert!(websocket.success_responses.is_empty());
+    assert!(websocket.error_responses.is_empty());
+    assert_eq!(
+        websocket.transport,
+        TransportMetadata::WebSocket {
+            client_to_server_frame: "ClientFrame",
+            server_to_client_frame: "ServerFrame",
+        }
+    );
 }

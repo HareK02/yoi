@@ -8311,28 +8311,34 @@ impl server_api::ServerApi for ServerApiContractService {
 fn build_inner_router(api: WorkspaceApi) -> Router {
     let contract_service = ServerApiContractService::Workspace(api.clone());
     let auth = generated_auth_contract_router(contract_service.clone());
-    let workspace = Router::new()
-        // WebSocket provider transport is intentionally outside the generated
-        // JSON REST contract.
-        .route(
-            "/api/w/{workspace_id}/external-workdir-grants/{grant_id}/provider",
-            get(scoped_external_workdir_provider_ws),
-        )
-        .route(
-            "/api/w/{workspace_id}/protocol/ws",
-            get(scoped_workspace_protocol_ws),
-        )
-        .route(
-            "/api/runtimes/{runtime_id}/workers/{worker_id}/protocol/ws",
-            get(worker_protocol_ws),
-        )
-        .route(
-            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/protocol/ws",
-            get(scoped_worker_protocol_ws),
-        )
-        .fallback(get(static_or_spa_fallback))
-        .with_state(api)
-        .merge(generated_workspace_contract_router(contract_service));
+    let workspace = Router::new();
+    let workspace = server_api::server_support::websocket_route::<
+        server_api::server_api_operations::ExternalWorkdirProviderWebSocket,
+        _,
+        _,
+        _,
+    >(workspace, scoped_external_workdir_provider_ws);
+    let workspace = server_api::server_support::websocket_route::<
+        server_api::server_api_operations::WorkspaceProtocolWebSocket,
+        _,
+        _,
+        _,
+    >(workspace, scoped_workspace_protocol_ws);
+    let workspace = server_api::server_support::websocket_route::<
+        server_api::server_api_operations::WorkerProtocolWebSocketAlias,
+        _,
+        _,
+        _,
+    >(workspace, worker_protocol_ws);
+    let workspace = server_api::server_support::websocket_route::<
+        server_api::server_api_operations::WorkspaceWorkerProtocolWebSocket,
+        _,
+        _,
+        _,
+    >(workspace, scoped_worker_protocol_ws)
+    .fallback(get(static_or_spa_fallback))
+    .with_state(api)
+    .merge(generated_workspace_contract_router(contract_service));
     auth.merge(workspace)
         .layer(middleware::from_fn(log_failed_api_response))
 }

@@ -1,0 +1,5 @@
+error: WebSocket operations cannot declare JSON or binary request bodies
+  --> tests/ui/invalid_websocket_body.rs:14:9
+   |
+14 |         body = Body
+   |         ^^^^

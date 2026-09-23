@@ -1,0 +1,5 @@
+error: path placeholder(s) have no matching path parameter: widget_id
+ --> tests/ui/websocket_path_mismatch.rs:8:9
+  |
+8 |         "/widgets/{widget_id}/events",
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

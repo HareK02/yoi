@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use api_macros::api;
 pub use api_macros::axum as server_support;
 pub use api_macros::reqwest as client_support;
-pub use api_macros::{ApiContract, BinaryBody, HttpMethod};
+pub use api_macros::{ApiContract, BinaryBody, HttpMethod, TransportMetadata, WebSocketOperation};
 pub mod repository_openapi_typescript;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -2885,10 +2885,147 @@ pub trait ServerApi {
         #[path] objective_id: String,
         #[path] ticket_id: String,
     ) -> Result<ObjectiveDetail, RepositoryApiError>;
+
+    #[websocket(
+        "/api/w/{workspace_id}/protocol/ws",
+        operation_id = "workspace_protocol_websocket",
+        method = GET,
+        client_to_server = protocol::subscription::SubscriptionFrame,
+        server_to_client = protocol::subscription::SubscriptionFrame,
+        path_parameters = [workspace_id: String]
+    )]
+    type WorkspaceProtocolWebSocket;
+
+    #[websocket(
+        "/api/w/{workspace_id}/external-workdir-grants/{grant_id}/provider",
+        operation_id = "external_workdir_provider_websocket",
+        method = GET,
+        client_to_server = workdir::external::ExternalWorkdirProviderFrame,
+        server_to_client = workdir::external::ExternalWorkdirServerFrame,
+        path_parameters = [workspace_id: String, grant_id: String]
+    )]
+    type ExternalWorkdirProviderWebSocket;
+
+    #[websocket(
+        "/api/runtimes/{runtime_id}/workers/{worker_id}/protocol/ws",
+        operation_id = "worker_protocol_websocket_alias",
+        method = GET,
+        client_to_server = protocol::Method,
+        server_to_client = protocol::Event,
+        path_parameters = [runtime_id: String, worker_id: String]
+    )]
+    type WorkerProtocolWebSocketAlias;
+
+    #[websocket(
+        "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/protocol/ws",
+        operation_id = "workspace_worker_protocol_websocket",
+        method = GET,
+        client_to_server = protocol::Method,
+        server_to_client = protocol::Event,
+        path_parameters = [workspace_id: String, runtime_id: String, worker_id: String]
+    )]
+    type WorkspaceWorkerProtocolWebSocket;
 }
 
-/// Digest of the fully rendered canonical contract with its digest slot normalized.
-pub fn canonical_openapi_source_digest() -> Result<String, api_macros::openapi::OpenApiError> {
+/// Stable fingerprint for one complete operation declaration.
+///
+/// The fingerprint includes transport kind, directional WebSocket frame authorities, path
+/// parameter names and types, and every unary body/response shape. Length-prefixing keeps the
+/// representation unambiguous without introducing a second schema format.
+pub fn operation_fingerprint(operation: &api_macros::OperationMetadata) -> String {
+    fn field(hasher: &mut Sha256, value: &str) {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+
+    let mut hasher = Sha256::new();
+    field(&mut hasher, operation.operation_id);
+    field(&mut hasher, http_method_name(operation.method));
+    field(&mut hasher, operation.path);
+    match operation.transport {
+        api_macros::TransportMetadata::Http => field(&mut hasher, "http"),
+        api_macros::TransportMetadata::WebSocket {
+            client_to_server_frame,
+            server_to_client_frame,
+        } => {
+            field(&mut hasher, "websocket");
+            field(&mut hasher, client_to_server_frame);
+            field(&mut hasher, server_to_client_frame);
+        }
+    }
+    field(&mut hasher, "parameters");
+    field(&mut hasher, &operation.parameters.len().to_string());
+    for parameter in operation.parameters {
+        field(&mut hasher, parameter.rust_name);
+        field(&mut hasher, parameter.rust_type);
+        field(&mut hasher, parameter.wire_name);
+        field(&mut hasher, parameter_location_name(parameter.location));
+    }
+    field(
+        &mut hasher,
+        wire_kind_name(operation.request_body.wire_kind),
+    );
+    field(&mut hasher, "successes");
+    field(&mut hasher, &operation.success_responses.len().to_string());
+    for response in operation.success_responses {
+        field(&mut hasher, &response.status.to_string());
+        field(&mut hasher, wire_kind_name(response.body.wire_kind));
+        field(&mut hasher, &response.headers.len().to_string());
+        for header in response.headers {
+            field(&mut hasher, header.wire_name);
+            field(&mut hasher, header.rust_type);
+        }
+    }
+    field(&mut hasher, "errors");
+    field(&mut hasher, &operation.error_responses.len().to_string());
+    for response in operation.error_responses {
+        field(&mut hasher, &response.status.to_string());
+        field(&mut hasher, wire_kind_name(response.body.wire_kind));
+    }
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity("sha256:".len() + digest.len() * 2);
+    encoded.push_str("sha256:");
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
+fn http_method_name(method: HttpMethod) -> &'static str {
+    match method {
+        HttpMethod::Get => "GET",
+        HttpMethod::Post => "POST",
+        HttpMethod::Put => "PUT",
+        HttpMethod::Patch => "PATCH",
+        HttpMethod::Delete => "DELETE",
+        HttpMethod::Head => "HEAD",
+        HttpMethod::Options => "OPTIONS",
+    }
+}
+
+fn parameter_location_name(location: api_macros::ParameterLocation) -> &'static str {
+    match location {
+        api_macros::ParameterLocation::Path => "path",
+        api_macros::ParameterLocation::Query => "query",
+        api_macros::ParameterLocation::Header => "header",
+        api_macros::ParameterLocation::Body => "body",
+    }
+}
+
+fn wire_kind_name(kind: api_macros::WireKind) -> &'static str {
+    match kind {
+        api_macros::WireKind::Empty => "empty",
+        api_macros::WireKind::Json => "json",
+        api_macros::WireKind::Streaming => "streaming",
+        api_macros::WireKind::Multipart => "multipart",
+        api_macros::WireKind::Binary => "binary",
+        _ => "reserved",
+    }
+}
+
+/// Digest of the complete canonical contract with the OpenAPI digest slot normalized.
+pub fn canonical_contract_source_digest() -> Result<String, api_macros::openapi::OpenApiError> {
     const NORMALIZED_DIGEST: &str =
         "sha256:0000000000000000000000000000000000000000000000000000000000000000";
     let normalized = server_api_openapi(api_macros::openapi::OpenApiInfo {
@@ -2897,7 +3034,15 @@ pub fn canonical_openapi_source_digest() -> Result<String, api_macros::openapi::
         source_digest: NORMALIZED_DIGEST,
     })?
     .to_json()?;
-    let digest = Sha256::digest(normalized.as_bytes());
+    let mut hasher = Sha256::new();
+    hasher.update((normalized.len() as u64).to_be_bytes());
+    hasher.update(normalized.as_bytes());
+    for operation in ServerApiMetadata::OPERATIONS {
+        let fingerprint = operation_fingerprint(operation);
+        hasher.update((fingerprint.len() as u64).to_be_bytes());
+        hasher.update(fingerprint.as_bytes());
+    }
+    let digest = hasher.finalize();
     let mut encoded = String::with_capacity("sha256:".len() + digest.len() * 2);
     encoded.push_str("sha256:");
     for byte in digest {
@@ -2910,7 +3055,7 @@ pub fn canonical_openapi_source_digest() -> Result<String, api_macros::openapi::
 /// Build the deployment-independent canonical ServerApi OpenAPI document.
 pub fn canonical_openapi_document()
 -> Result<api_macros::openapi::OpenApiDocument, api_macros::openapi::OpenApiError> {
-    let source_digest = canonical_openapi_source_digest()?;
+    let source_digest = canonical_contract_source_digest()?;
     server_api_openapi(api_macros::openapi::OpenApiInfo {
         title: "Yoi Server API",
         version: env!("CARGO_PKG_VERSION"),
@@ -9125,6 +9270,128 @@ mod tests {
     use super::*;
 
     #[test]
+    fn websocket_operations_preserve_routes_and_directional_frame_authorities() {
+        use api_macros::{TransportMetadata, WebSocketOperation};
+
+        fn workspace_protocol<O>()
+        where
+            O: WebSocketOperation<
+                    PathParameters = (String,),
+                    ClientToServerFrame = protocol::subscription::SubscriptionFrame,
+                    ServerToClientFrame = protocol::subscription::SubscriptionFrame,
+                >,
+        {
+        }
+        fn external_provider<O>()
+        where
+            O: WebSocketOperation<
+                    PathParameters = (String, String),
+                    ClientToServerFrame = workdir::external::ExternalWorkdirProviderFrame,
+                    ServerToClientFrame = workdir::external::ExternalWorkdirServerFrame,
+                >,
+        {
+        }
+        fn direct_worker<O, P>()
+        where
+            O: WebSocketOperation<
+                    PathParameters = P,
+                    ClientToServerFrame = protocol::Method,
+                    ServerToClientFrame = protocol::Event,
+                >,
+        {
+        }
+
+        workspace_protocol::<server_api_operations::WorkspaceProtocolWebSocket>();
+        external_provider::<server_api_operations::ExternalWorkdirProviderWebSocket>();
+        direct_worker::<server_api_operations::WorkerProtocolWebSocketAlias, (String, String)>();
+        direct_worker::<
+            server_api_operations::WorkspaceWorkerProtocolWebSocket,
+            (String, String, String),
+        >();
+
+        for (operation_id, path, client, server) in [
+            (
+                "workspace_protocol_websocket",
+                "/api/w/{workspace_id}/protocol/ws",
+                "protocol :: subscription :: SubscriptionFrame",
+                "protocol :: subscription :: SubscriptionFrame",
+            ),
+            (
+                "external_workdir_provider_websocket",
+                "/api/w/{workspace_id}/external-workdir-grants/{grant_id}/provider",
+                "workdir :: external :: ExternalWorkdirProviderFrame",
+                "workdir :: external :: ExternalWorkdirServerFrame",
+            ),
+            (
+                "worker_protocol_websocket_alias",
+                "/api/runtimes/{runtime_id}/workers/{worker_id}/protocol/ws",
+                "protocol :: Method",
+                "protocol :: Event",
+            ),
+            (
+                "workspace_worker_protocol_websocket",
+                "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/protocol/ws",
+                "protocol :: Method",
+                "protocol :: Event",
+            ),
+        ] {
+            let operation = ServerApiMetadata::OPERATIONS
+                .iter()
+                .find(|operation| operation.operation_id == operation_id)
+                .unwrap_or_else(|| panic!("missing WebSocket operation {operation_id}"));
+            assert_eq!(operation.method, HttpMethod::Get);
+            assert_eq!(operation.path, path);
+            assert!(operation.success_responses.is_empty());
+            assert!(operation.error_responses.is_empty());
+            assert_eq!(
+                operation.request_body.wire_kind,
+                api_macros::WireKind::Empty
+            );
+            assert_eq!(
+                operation.transport,
+                TransportMetadata::WebSocket {
+                    client_to_server_frame: client,
+                    server_to_client_frame: server,
+                }
+            );
+            assert!(operation_fingerprint(operation).starts_with("sha256:"));
+        }
+
+        let external = *ServerApiMetadata::OPERATIONS
+            .iter()
+            .find(|operation| operation.operation_id == "external_workdir_provider_websocket")
+            .expect("external provider WebSocket operation");
+        let swapped = api_macros::OperationMetadata {
+            transport: TransportMetadata::WebSocket {
+                client_to_server_frame: "workdir :: external :: ExternalWorkdirServerFrame",
+                server_to_client_frame: "workdir :: external :: ExternalWorkdirProviderFrame",
+            },
+            ..external
+        };
+        assert_ne!(
+            operation_fingerprint(&external),
+            operation_fingerprint(&swapped),
+            "directional frame authority must participate in the operation fingerprint"
+        );
+
+        let openapi = canonical_openapi_document()
+            .expect("canonical OpenAPI contract must build")
+            .as_value()
+            .clone();
+        for path in [
+            "/api/w/{workspace_id}/protocol/ws",
+            "/api/w/{workspace_id}/external-workdir-grants/{grant_id}/provider",
+            "/api/runtimes/{runtime_id}/workers/{worker_id}/protocol/ws",
+            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/protocol/ws",
+        ] {
+            assert!(
+                openapi["paths"][path].is_null(),
+                "WebSocket route {path} must not be projected into OpenAPI"
+            );
+        }
+    }
+
+    #[test]
     fn runtime_config_response_round_trips_the_complete_config_bundle_shape() {
         let fixture = serde_json::json!({
             "metadata": {
@@ -11006,7 +11273,10 @@ mod openapi_artifact_tests {
             }
         }
 
-        let operations = ServerApiMetadata::OPERATIONS;
+        let operations = ServerApiMetadata::OPERATIONS
+            .iter()
+            .filter(|operation| matches!(operation.transport, api_macros::TransportMetadata::Http))
+            .collect::<Vec<_>>();
         assert_eq!(
             documented.len() + SIGNED_INTERNAL.len() + OTHER_OPENAPI_EXCLUDED.len(),
             operations.len(),

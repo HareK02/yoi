@@ -81,6 +81,9 @@ impl OpenApiSchema for PublicError {}
 
 type OptionalRequestId = Option<String>;
 
+pub struct ClientFrame;
+pub struct ServerFrame;
+
 #[api(openapi)]
 pub trait FixtureApi {
     #[post(
@@ -113,6 +116,16 @@ pub trait FixtureApi {
         ]
     )]
     async fn conditional(&self) -> fixture_api_responses::Conditional;
+
+    #[websocket(
+        "/widgets/{widget_id}/events",
+        operation_id = "widgets.events",
+        method = GET,
+        client_to_server = ClientFrame,
+        server_to_client = ServerFrame,
+        path_parameters = [widget_id: u32]
+    )]
+    type WidgetEvents;
 }
 
 fn document() -> api_macros::openapi::OpenApiDocument {
@@ -188,6 +201,10 @@ fn collect_schema_references<'a>(value: &'a Value, references: &mut Vec<&'a str>
 #[test]
 fn operations_and_components_preserve_the_wire_contract() {
     let value = document().as_value().clone();
+    assert!(
+        value["paths"]["/widgets/{widget_id}/events"].is_null(),
+        "WebSocket transports must not be projected as unary OpenAPI operations"
+    );
     let create = &value["paths"]["/widgets/{widget_id}"]["post"];
     assert_eq!(create["operationId"], "widgets.create");
     assert_eq!(create["security"], json!([{ "bearerAuth": [] }]));

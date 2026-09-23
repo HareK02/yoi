@@ -1,0 +1,5 @@
+error: WebSocket operations require `method = GET`
+ --> tests/ui/invalid_websocket_method.rs:9:18
+  |
+9 |         method = POST,
+  |                  ^^^^
