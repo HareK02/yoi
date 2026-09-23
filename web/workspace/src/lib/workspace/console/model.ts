@@ -516,15 +516,34 @@ function upsertCommandSnapshot(
   projection: ConsoleProjection,
   eventId: string,
   command: CommandSnapshot,
+  source: "snapshot" | CommandEvent["kind"] = "snapshot",
 ): void {
-  const toolCallId = command.tool_call_id ?? `command:${command.command_id}`;
+  const toolCallId = command.tool_call_id;
+  if (toolCallId === null) {
+    reportCommandCorrelationError(
+      projection,
+      eventId,
+      command.command_id,
+      source,
+      toolCallId,
+    );
+    return;
+  }
   const existingIndex = findToolCallLineIndex(projection, toolCallId);
-  const existing = existingIndex >= 0
-    ? projection.lines[existingIndex].toolCall
-    : undefined;
+  if (existingIndex < 0) {
+    reportCommandCorrelationError(
+      projection,
+      eventId,
+      command.command_id,
+      source,
+      toolCallId,
+    );
+    return;
+  }
+  const existing = projection.lines[existingIndex].toolCall!;
   upsertToolCall(projection, eventId, toolCallId, {
-    name: existing?.name ?? "Bash",
-    state: existing?.state ?? "running",
+    name: existing.name,
+    state: existing.state,
     command,
   });
 }
@@ -545,7 +564,7 @@ function applyCommandEvent(
       stdout: emptyCommandStream(),
       stderr: emptyCommandStream(),
       exit_code: null,
-    });
+    }, "started");
     return;
   }
 
@@ -553,20 +572,12 @@ function applyCommandEvent(
     line.toolCall?.command?.command_id === event.command_id
   );
   if (index < 0) {
-    if (event.kind === "output") {
-      const stream = commandStreamFromEvent(event);
-      upsertCommandSnapshot(projection, eventId, {
-        command_id: event.command_id,
-        tool_call_id: null,
-        status: "running",
-        started_at_ms: event.observed_at_ms,
-        observed_at_ms: event.observed_at_ms,
-        last_output_at_ms: event.observed_at_ms,
-        stdout: event.stream === "stdout" ? stream : emptyCommandStream(),
-        stderr: event.stream === "stderr" ? stream : emptyCommandStream(),
-        exit_code: null,
-      });
-    }
+    reportCommandCorrelationError(
+      projection,
+      eventId,
+      event.command_id,
+      event.kind,
+    );
     return;
   }
 
@@ -577,7 +588,7 @@ function applyCommandEvent(
       status: event.status,
       exit_code: event.exit_code,
       observed_at_ms: event.observed_at_ms,
-    });
+    }, "terminal");
     return;
   }
   const updatedStream = appendCommandStream(
@@ -592,22 +603,35 @@ function applyCommandEvent(
     last_output_at_ms: event.observed_at_ms,
     stdout: event.stream === "stdout" ? updatedStream : existing.stdout,
     stderr: event.stream === "stderr" ? updatedStream : existing.stderr,
+  }, "output");
+}
+
+function reportCommandCorrelationError(
+  projection: ConsoleProjection,
+  eventId: string,
+  commandId: string,
+  source: "snapshot" | CommandEvent["kind"],
+  toolCallId?: string | null,
+): void {
+  const id = `command-correlation-error-${commandId}`;
+  if (projection.lines.some((item) => item.id === id)) return;
+  const target = toolCallId ? `tool call \`${toolCallId}\`` : "a tool call";
+  projection.lines.push({
+    ...line(
+      eventId,
+      "error",
+      "Command telemetry error",
+      `Command ${source} telemetry for \`${commandId}\` could not be correlated with ${target}.`,
+      undefined,
+      false,
+      true,
+    ),
+    id,
   });
 }
 
 function emptyCommandStream(): CommandStreamSlice {
   return { start_offset: 0, end_offset: 0, content: "", truncated: false };
-}
-
-function commandStreamFromEvent(
-  event: Extract<CommandEvent, { kind: "output" }>,
-): CommandStreamSlice {
-  return appendCommandStream(
-    emptyCommandStream(),
-    event.start_offset,
-    event.end_offset,
-    event.content,
-  );
 }
 
 function appendCommandStream(

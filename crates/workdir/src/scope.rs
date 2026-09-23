@@ -103,10 +103,20 @@ impl WorkdirToolBroker {
             #[cfg(test)]
             command_start_gate: Mutex::new(None),
         });
+        let event_forwarder = forward_owned_command_events(
+            authority.source.subscribe_command_events(),
+            authority.owned_commands.clone(),
+            authority.pending_command_events.clone(),
+            authority.starting_tool_calls.clone(),
+            authority.forwarded_starts.clone(),
+            authority.forwarded_terminals.clone(),
+            authority.command_events.clone(),
+        )
+        .map(|handle| Arc::new(Mutex::new(Some(handle))));
         Self {
             session: authority.clone(),
             authority,
-            event_forwarder: None,
+            event_forwarder,
         }
     }
 
@@ -1179,11 +1189,7 @@ impl WorkdirSession for ScopedWorkdirSession {
         {
             return None;
         }
-        if self.scope.is_none() {
-            self.source.subscribe_command_events()
-        } else {
-            Some(self.command_events.subscribe())
-        }
+        Some(self.command_events.subscribe())
     }
 
     fn command_snapshot(&self) -> Vec<CommandSnapshot> {
@@ -1192,9 +1198,6 @@ impl WorkdirSession for ScopedWorkdirSession {
             .supports(WorkdirSessionCapability::Command)
         {
             return Vec::new();
-        }
-        if self.scope.is_none() {
-            return self.source.command_snapshot();
         }
         let owned = self
             .owned_commands
@@ -1768,11 +1771,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scoped_commands_use_child_cwd_and_do_not_leak_between_siblings() {
+    async fn scoped_commands_use_child_cwd_and_do_not_leak_to_parent_or_siblings() {
         let root = TempDir::new().unwrap();
         fs::create_dir_all(root.path().join("one")).unwrap();
         fs::create_dir_all(root.path().join("two")).unwrap();
         let parent = session(root.path());
+        let mut parent_events = parent.subscribe_command_events().unwrap();
         let first = parent
             .scope(request("one", WorkdirToolScopePermission::Write))
             .await
@@ -1799,6 +1803,11 @@ mod tests {
             first_events.recv().await.unwrap(),
             CommandEvent::Started { .. }
         ));
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), parent_events.recv()).await,
+            Err(_)
+        ));
+        assert!(parent.command_snapshot().is_empty());
         assert!(matches!(
             tokio::time::timeout(std::time::Duration::from_millis(50), second_events.recv()).await,
             Err(_)

@@ -740,6 +740,121 @@ Deno.test("projectConsole streams distinct Bash stdout and stderr through termin
   assertEquals(line.error, true);
 });
 
+Deno.test("projectConsole reports command telemetry without its tool call", () => {
+  const projection = projectConsole([
+    {
+      eventId: "command-only-started",
+      event: {
+        event: "command",
+        data: {
+          event: {
+            kind: "started",
+            command_id: "command-only-1",
+            tool_call_id: "command-only-call",
+            observed_at_ms: 1000,
+          },
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "command-only-output",
+      event: {
+        event: "command",
+        data: {
+          event: {
+            kind: "output",
+            command_id: "command-only-1",
+            stream: "stdout",
+            start_offset: 0,
+            end_offset: 6,
+            content: "ready\n",
+            observed_at_ms: 1100,
+          },
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "command-only-terminal",
+      event: {
+        event: "command",
+        data: {
+          event: {
+            kind: "terminal",
+            command_id: "command-only-1",
+            status: "completed",
+            exit_code: 0,
+            stdout_end_offset: 6,
+            stderr_end_offset: 0,
+            observed_at_ms: 1200,
+          },
+        },
+      } satisfies Event,
+    },
+  ]);
+
+  const toolLines = projection.lines.filter((line) => line.kind === "tool");
+  assertEquals(toolLines.length, 0);
+  const errorLines = projection.lines.filter((line) => line.kind === "error");
+  assertEquals(errorLines.length, 1);
+  assertEquals(
+    errorLines[0].id,
+    "command-correlation-error-command-only-1",
+  );
+  assertEquals(errorLines[0].title, "Command telemetry error");
+  assertEquals(
+    errorLines[0].body,
+    "Command started telemetry for `command-only-1` could not be correlated with tool call `command-only-call`.",
+  );
+  assertEquals(errorLines[0].error, true);
+});
+
+Deno.test("snapshot reports command telemetry without a tool call id", () => {
+  const snapshot = snapshotEvent("/repo");
+  if (snapshot.event !== "snapshot") {
+    throw new Error("snapshot fixture expected");
+  }
+  snapshot.data.in_flight = {
+    blocks: [],
+    commands: [{
+      command_id: "command-without-call",
+      tool_call_id: null,
+      status: "running",
+      started_at_ms: 1000,
+      observed_at_ms: 1000,
+      last_output_at_ms: null,
+      stdout: {
+        start_offset: 0,
+        end_offset: 0,
+        content: "",
+        truncated: false,
+      },
+      stderr: {
+        start_offset: 0,
+        end_offset: 0,
+        content: "",
+        truncated: false,
+      },
+      exit_code: null,
+    }],
+  };
+
+  const projection = projectConsole([{
+    eventId: "snapshot-command-error",
+    event: snapshot,
+  }]);
+
+  assertEquals(
+    projection.lines.filter((line) => line.kind === "tool").length,
+    0,
+  );
+  const errorLines = projection.lines.filter((line) => line.kind === "error");
+  assertEquals(errorLines.length, 1);
+  assertEquals(
+    errorLines[0].body,
+    "Command snapshot telemetry for `command-without-call` could not be correlated with a tool call.",
+  );
+});
+
 Deno.test("snapshot restores bounded in-flight Bash command output", () => {
   const snapshot = snapshotEvent("/repo");
   if (snapshot.event !== "snapshot") {
