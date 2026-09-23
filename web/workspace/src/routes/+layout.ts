@@ -1,6 +1,8 @@
 import { listWorkspaces } from "$lib/workspace/api/workspace-catalog";
 import type { LayoutLoad } from "./$types";
 
+export const ssr = false;
+
 export const load: LayoutLoad = async ({ fetch }) => {
   try {
     return {
