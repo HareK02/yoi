@@ -6,6 +6,12 @@
     workspaceApiJsonWithBody,
     workspaceApiPath,
   } from "$lib/workspace/api/http";
+  import {
+    TICKET_BROWSER_API_MAX_RESPONSE_BYTES,
+    parseTicketDetail,
+    parseTicketQueueOutcome,
+    parseTicketRoleAssignmentMutationResponse,
+  } from "$lib/workspace/api/ticket-browser";
   import { mergeRequestPagePath } from "$lib/workspace/api/merge-requests";
   import {
     relationLabel,
@@ -37,11 +43,6 @@
   const loadedTicket = initialData.ticket.data;
   if (!loadedTicket) throw new Error(initialData.ticket.error ?? "ticket load failed");
   const loadedRepositories = $derived(data.repositories.data);
-
-  type QueueOutcome = {
-    requested_ticket: string;
-    queued_tickets: string[];
-  };
 
   let ticket = $state<TicketDetail>(loadedTicket);
   const mergeRequest = $derived(ticket.merge_request);
@@ -146,10 +147,10 @@
     busy = action;
     errorMessage = null;
     try {
-      const response = await workspaceApiJsonWithBody<TicketDetail>(path, {
+      const response = await workspaceApiJsonWithBody(path, {
         method,
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      });
+      }, parseTicketDetail, TICKET_BROWSER_API_MAX_RESPONSE_BYTES);
       if (generation !== routeGeneration) return false;
       applyTicket(response);
       return true;
@@ -171,12 +172,18 @@
     errorMessage = null;
     queueMessage = null;
     try {
-      const outcome = await workspaceApiJsonWithBody<QueueOutcome>(
+      const outcome = await workspaceApiJsonWithBody(
         `${path}/queue`,
         { method: "POST", body: JSON.stringify({}) },
+        parseTicketQueueOutcome,
+        TICKET_BROWSER_API_MAX_RESPONSE_BYTES,
       );
       if (generation !== routeGeneration) return;
-      const updatedTicket = await workspaceApiJson<TicketDetail>(path);
+      const updatedTicket = await workspaceApiJson(
+        path,
+        parseTicketDetail,
+        TICKET_BROWSER_API_MAX_RESPONSE_BYTES,
+      );
       if (generation !== routeGeneration) return;
       queueMessage = `Queued ${outcome.queued_tickets.length} Ticket(s): ${outcome.queued_tickets.join(", ")}`;
       applyTicket(updatedTicket);
@@ -210,9 +217,15 @@
             expected_assignment_id: null,
           }),
         },
+        parseTicketRoleAssignmentMutationResponse,
+        TICKET_BROWSER_API_MAX_RESPONSE_BYTES,
       );
       if (generation !== routeGeneration) return;
-      const updatedTicket = await workspaceApiJson<TicketDetail>(path);
+      const updatedTicket = await workspaceApiJson(
+        path,
+        parseTicketDetail,
+        TICKET_BROWSER_API_MAX_RESPONSE_BYTES,
+      );
       if (generation !== routeGeneration) return;
       applyTicket(updatedTicket);
     } catch (error) {
@@ -317,7 +330,7 @@
     event.preventDefault();
     if (!threadBody.trim()) return;
     if (
-      await mutate("thread", "/thread", {
+      await mutate("thread", "/events", {
         role: threadRole,
         body: threadBody.trim(),
       })

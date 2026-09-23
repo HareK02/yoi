@@ -1,5 +1,8 @@
 import type { BrowserWorkspaceOrchestratorResponse } from "$lib/generated/worker-launch-api";
-import type { TicketDetail, TicketSummary } from "$lib/generated/ticket-api";
+import type {
+  TicketDetail,
+  TicketListItemSummary,
+} from "$lib/generated/ticket-api";
 
 export const TICKET_STATES = [
   "planning",
@@ -38,7 +41,7 @@ export const TICKET_LANE_PAGE_SIZE = 30;
 export type TicketLaneDefinition = (typeof LANE_DEFINITIONS)[number];
 export type TicketLaneId = TicketLaneDefinition["id"];
 export type TicketCardSummary = Pick<
-  TicketSummary,
+  TicketListItemSummary,
   "id" | "resource_key" | "title" | "state" | "priority" | "updated_at"
 >;
 

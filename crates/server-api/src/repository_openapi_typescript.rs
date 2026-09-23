@@ -28,6 +28,10 @@ pub const COMPANION_GENERATOR_VERSION: &str = "1";
 pub const COMPANION_GENERATOR_OPTIONS: &str =
     "companion-operation-schema-closure,openapi-3.1,strict-integer-ranges,sorted-output";
 pub const COMPANION_OUTPUT_PATH: &str = "web/workspace/src/lib/generated/companion-api.ts";
+pub const TICKET_BROWSER_GENERATOR_NAME: &str = "yoi-ticket-browser-openapi-typescript";
+pub const TICKET_BROWSER_GENERATOR_VERSION: &str = "1";
+pub const TICKET_BROWSER_GENERATOR_OPTIONS: &str = "ticket-objective-merge-request-browser-operation-schema-closure,openapi-3.1,strict-integer-ranges,sorted-output";
+pub const TICKET_BROWSER_OUTPUT_PATH: &str = "web/workspace/src/lib/generated/ticket-api.ts";
 
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 const MIN_SAFE_INTEGER: f64 = -9_007_199_254_740_991.0;
@@ -200,6 +204,19 @@ pub fn generate_companion_typescript(input: &str) -> Result<String, GenerationEr
         COMPANION_GENERATOR_OPTIONS,
         COMPANION_OUTPUT_PATH,
         "generate_companion_api_types",
+    )
+}
+
+pub fn generate_ticket_browser_typescript(input: &str) -> Result<String, GenerationError> {
+    generate_domain_typescript(
+        input,
+        "Ticket Browser",
+        validate_ticket_browser_operations,
+        TICKET_BROWSER_GENERATOR_NAME,
+        TICKET_BROWSER_GENERATOR_VERSION,
+        TICKET_BROWSER_GENERATOR_OPTIONS,
+        TICKET_BROWSER_OUTPUT_PATH,
+        "generate_ticket_api_types",
     )
 }
 
@@ -397,6 +414,112 @@ fn validate_companion_operations(
             operation_id: "companion_cancel",
             request: Some("CompanionCancelRequest"),
             successes: &[("200", "CompanionMessageResponse")],
+        },
+    ];
+    validate_operation_contracts(paths, &operations)
+}
+
+fn validate_ticket_browser_operations(
+    paths: &Map<String, Value>,
+) -> Result<BTreeSet<String>, GenerationError> {
+    let operations = [
+        OperationContract {
+            path: "/api/w/{workspace_id}/tickets",
+            method: "get",
+            operation_id: "ticket_list",
+            request: None,
+            successes: &[("200", "TicketListResponse")],
+        },
+        OperationContract {
+            path: "/api/w/{workspace_id}/tickets/{id}",
+            method: "get",
+            operation_id: "ticket_get",
+            request: None,
+            successes: &[("200", "TicketDetail")],
+        },
+        OperationContract {
+            path: "/api/w/{workspace_id}/tickets/{id}",
+            method: "patch",
+            operation_id: "ticket_edit",
+            request: Some("BrowserEditTicketRequest"),
+            successes: &[("200", "TicketDetail")],
+        },
+        OperationContract {
+            path: "/api/w/{workspace_id}/tickets/{id}/assignments/{role}",
+            method: "put",
+            operation_id: "ticket_assignment_set",
+            request: Some("SetTicketRoleAssignmentRequest"),
+            successes: &[("200", "TicketRoleAssignmentMutationResponse")],
+        },
+        OperationContract {
+            path: "/api/w/{workspace_id}/tickets/{id}/implementation-cancellations",
+            method: "post",
+            operation_id: "ticket_implementation_cancel",
+            request: Some("CancelTicketImplementationRequest"),
+            successes: &[("200", "TicketDetail")],
+        },
+        OperationContract {
+            path: "/api/w/{workspace_id}/tickets/{id}/state",
+            method: "post",
+            operation_id: "ticket_state_transition",
+            request: Some("BrowserTransitionTicketStateRequest"),
+            successes: &[("200", "TicketDetail")],
+        },
+        OperationContract {
+            path: "/api/w/{workspace_id}/tickets/{id}/ready",
+            method: "post",
+            operation_id: "ticket_ready",
+            request: Some("TicketMarkReadyRequest"),
+            successes: &[("200", "TicketDetail")],
+        },
+        OperationContract {
+            path: "/api/w/{workspace_id}/tickets/{id}/events",
+            method: "post",
+            operation_id: "ticket_event_append",
+            request: Some("BrowserAppendTicketEventRequest"),
+            successes: &[("200", "TicketDetail")],
+        },
+        OperationContract {
+            path: "/api/w/{workspace_id}/tickets/{id}/queue",
+            method: "post",
+            operation_id: "ticket_queue",
+            request: Some("BrowserQueueTicketRequest"),
+            successes: &[("200", "TicketQueueOutcome")],
+        },
+        OperationContract {
+            path: "/api/w/{workspace_id}/tickets/{id}/close",
+            method: "post",
+            operation_id: "ticket_close",
+            request: Some("BrowserCloseTicketRequest"),
+            successes: &[("200", "TicketDetail")],
+        },
+        OperationContract {
+            path: "/api/w/{workspace_id}/objectives",
+            method: "get",
+            operation_id: "objective_list",
+            request: None,
+            successes: &[("200", "ObjectiveListResponse")],
+        },
+        OperationContract {
+            path: "/api/w/{workspace_id}/objectives/{objective_id}",
+            method: "get",
+            operation_id: "objective_get",
+            request: None,
+            successes: &[("200", "ObjectiveDetail")],
+        },
+        OperationContract {
+            path: "/api/w/{workspace_id}/merge-requests",
+            method: "get",
+            operation_id: "merge_request_list",
+            request: None,
+            successes: &[("200", "MergeRequestListResponse")],
+        },
+        OperationContract {
+            path: "/api/w/{workspace_id}/merge-requests/{merge_request_id}",
+            method: "get",
+            operation_id: "merge_request_show",
+            request: None,
+            successes: &[("200", "MergeRequestDetailResponse")],
         },
     ];
     validate_operation_contracts(paths, &operations)
@@ -1484,12 +1607,25 @@ fn render_typed_schema(
                 None => (MIN_SAFE_INTEGER, MAX_SAFE_INTEGER),
                 Some(_) => unreachable!("integer format validated above"),
             };
-            if minimum != Some(expected_minimum) || maximum != Some(expected_maximum) {
+            let minimum = minimum.unwrap_or(expected_minimum);
+            let maximum = maximum.unwrap_or(expected_maximum);
+            if minimum.fract() != 0.0
+                || maximum.fract() != 0.0
+                || minimum < expected_minimum
+                || maximum > expected_maximum
+                || minimum > maximum
+            {
                 return Err(GenerationError::invalid(format!(
                     "{context} integer range does not match its JavaScript safe-number mapping"
                 )));
             }
-            Ok("number".to_owned())
+            if minimum == expected_minimum && maximum == expected_maximum {
+                Ok("number".to_owned())
+            } else {
+                Ok(format!(
+                    "number & {{ readonly \"__yoiIntegerRange\": \"{minimum:.0}..{maximum:.0}\"; }}"
+                ))
+            }
         }
         "array" => {
             ensure_schema_keywords(schema, &["items", "maxItems", "minItems", "type"], context)?;
@@ -1537,10 +1673,13 @@ fn render_typed_schema(
 }
 
 fn render_object(schema: &Map<String, Value>, context: &str) -> Result<String, GenerationError> {
-    let properties = schema
-        .get("properties")
-        .and_then(Value::as_object)
-        .ok_or_else(|| GenerationError::invalid(format!("{context} object has no properties")))?;
+    let empty_properties = Map::new();
+    let properties = match schema.get("properties") {
+        Some(value) => value.as_object().ok_or_else(|| {
+            GenerationError::invalid(format!("{context} object properties must be an object"))
+        })?,
+        None => &empty_properties,
+    };
     let required = match schema.get("required") {
         Some(Value::Array(required)) => required
             .iter()
@@ -1564,13 +1703,23 @@ fn render_object(schema: &Map<String, Value>, context: &str) -> Result<String, G
             "{context} requires missing property `{missing}`"
         )));
     }
-    if schema
-        .get("additionalProperties")
-        .is_some_and(|value| value != &Value::Bool(false))
-    {
-        return Err(GenerationError::invalid(format!(
-            "{context} contains unsupported additionalProperties"
-        )));
+    match schema.get("additionalProperties") {
+        Some(Value::Bool(false)) | None => {}
+        Some(additional) if properties.is_empty() && required.is_empty() => {
+            return Ok(format!(
+                "{{ [key: string]: {}; }}",
+                render_schema(additional, context)?
+            ));
+        }
+        Some(_) => {
+            return Err(GenerationError::invalid(format!(
+                "{context} contains unsupported additionalProperties"
+            )));
+        }
+    }
+
+    if properties.is_empty() {
+        return Ok("{ [key: string]: never; }".to_owned());
     }
 
     let mut fields = Vec::with_capacity(properties.len());
@@ -1649,6 +1798,42 @@ mod tests {
         include_str!("../../../web/workspace/src/lib/generated/repository-api.ts");
     const RUNTIME_TYPESCRIPT: &str =
         include_str!("../../../web/workspace/src/lib/generated/runtime-api.ts");
+    const TICKET_BROWSER_TYPESCRIPT: &str =
+        include_str!("../../../web/workspace/src/lib/generated/ticket-api.ts");
+
+    #[test]
+    fn checked_in_ticket_browser_typescript_is_current() {
+        assert_eq!(
+            generate_ticket_browser_typescript(OPENAPI).unwrap(),
+            TICKET_BROWSER_TYPESCRIPT,
+            "regenerate with `cargo run -q -p server-api --example generate_ticket_api_types`",
+        );
+    }
+
+    #[test]
+    fn ticket_browser_generator_validates_operation_ownership_and_schema_closure() {
+        let output = generate_ticket_browser_typescript(OPENAPI).unwrap();
+        assert!(output.contains(&format!(
+            "@generated by {TICKET_BROWSER_GENERATOR_NAME}@{TICKET_BROWSER_GENERATOR_VERSION}"
+        )));
+        assert!(output.contains("export type TicketListResponse ="));
+        assert!(
+            output.contains("limit: number & { readonly \"__yoiIntegerRange\": \"0..1000\"; }")
+        );
+        assert!(
+            output.contains("export type BrowserQueueTicketRequest = { [key: string]: never; };")
+        );
+        assert!(output.contains("attributes: { [key: string]: string; }"));
+        assert!(output.contains("export type ObjectiveDetail ="));
+        assert!(output.contains("export type MergeRequestDetailResponse ="));
+        assert!(!output.contains("export type RuntimeListResponse ="));
+
+        let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
+        document["paths"]["/api/w/{workspace_id}/tickets"]["get"]["operationId"] =
+            serde_json::json!("manual_ticket_list");
+        let error = generate_ticket_browser_typescript(&document.to_string()).unwrap_err();
+        assert!(error.to_string().contains("ticket_list"));
+    }
 
     #[test]
     fn checked_in_runtime_typescript_is_current() {
@@ -1711,7 +1896,7 @@ mod tests {
     }
 
     #[test]
-    fn generator_rejects_lossy_safe_integer_and_union_changes() {
+    fn generator_rejects_lossy_safe_integers_and_preserves_bounded_ranges() {
         let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
         document["components"]["schemas"]["RepositorySummary"]["properties"]["source_revision"]["maximum"] =
             serde_json::json!(9_007_199_254_740_992_u64);
@@ -1727,8 +1912,10 @@ mod tests {
         let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
         document["components"]["schemas"]["RepositorySummary"]["properties"]["source_revision"]["maximum"] =
             serde_json::json!(9_007_199_254_740_990_u64);
-        let error = generate_repository_typescript(&document.to_string()).unwrap_err();
-        assert!(error.to_string().contains("safe-number"));
+        let output = generate_repository_typescript(&document.to_string()).unwrap();
+        assert!(output.contains(
+            "source_revision: number & { readonly \"__yoiIntegerRange\": \"0..9007199254740990\"; }"
+        ));
 
         let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
         document["components"]["schemas"]["RepositorySummary"]["properties"]["source_revision"]["format"] =

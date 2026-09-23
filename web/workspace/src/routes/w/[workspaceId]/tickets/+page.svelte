@@ -3,10 +3,13 @@
   import type { ApiResult } from "$lib/workspace/api/http";
   import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
   import { parseBrowserWorkspaceOrchestratorResponse } from "$lib/workspace/api/workers";
+  import {
+    TICKET_BROWSER_API_LOAD_POLICY,
+    parseTicketListResponse,
+  } from "$lib/workspace/api/ticket-browser";
   import type {
     QueryPage,
-    TicketListResponse,
-    TicketSummary,
+    TicketListItemSummary as TicketSummary,
   } from "$lib/generated/ticket-api";
   import { ticketHref } from "$lib/workspace/resource-links";
   import {
@@ -70,15 +73,18 @@
         states: lane.states.join(","),
         cursor: lane.page.next_cursor,
       });
-      const response = await fetch(
+      const result = await loadJson(
+        fetch,
         `/api/w/${encodeURIComponent(data.workspaceId)}/tickets?${search}`,
+        undefined,
+        parseTicketListResponse,
+        TICKET_BROWSER_API_LOAD_POLICY,
       );
-      if (!response.ok) {
-        throw new Error(`追加読み込みに失敗しました (${response.status})`);
+      if (!result.data) {
+        throw new Error(result.error ?? "追加読み込みに失敗しました");
       }
-      const page = (await response.json()) as TicketListResponse;
-      lane.tickets = mergeTickets(lane.tickets, page.items);
-      lane.page = page.page;
+      lane.tickets = mergeTickets(lane.tickets, result.data.items);
+      lane.page = result.data.page;
     } catch (error) {
       lane.error = error instanceof Error ? error.message : String(error);
     } finally {

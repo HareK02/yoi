@@ -177,23 +177,41 @@ export async function readBoundedJson(
   return JSON.parse(text) as unknown;
 }
 
-async function requireJson<T>(response: Response, path: string): Promise<T> {
+async function requireJson<T>(
+  response: Response,
+  path: string,
+  parse: (value: unknown) => T,
+  maxResponseBytes?: number,
+): Promise<T> {
   if (!response.ok) {
+    if (maxResponseBytes !== undefined) {
+      await response.body?.cancel();
+      throw new Error(`${path} request failed (${response.status})`);
+    }
     const text = await response.text();
     throw new Error(text || `${path} request failed (${response.status})`);
   }
-  return (await response.json()) as T;
+  const value: unknown = maxResponseBytes === undefined
+    ? await response.json()
+    : await readBoundedJson(response, maxResponseBytes);
+  return parse(value);
 }
 
-export async function workspaceApiJson<T>(path: string): Promise<T> {
-  return requireJson<T>(await fetch(path), path);
+export async function workspaceApiJson<T>(
+  path: string,
+  parse: (value: unknown) => T = (value) => value as T,
+  maxResponseBytes?: number,
+): Promise<T> {
+  return requireJson(await fetch(path), path, parse, maxResponseBytes);
 }
 
 export async function workspaceApiJsonWithBody<T>(
   path: string,
   init: RequestInit,
+  parse: (value: unknown) => T = (value) => value as T,
+  maxResponseBytes?: number,
 ): Promise<T> {
-  return requireJson<T>(
+  return requireJson(
     await fetch(path, {
       headers: {
         "content-type": "application/json",
@@ -202,6 +220,8 @@ export async function workspaceApiJsonWithBody<T>(
       ...init,
     }),
     path,
+    parse,
+    maxResponseBytes,
   );
 }
 

@@ -22,14 +22,12 @@ pub struct TicketSummaryPage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct InvalidProjectRecord {
     pub label: String,
     pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketSummary {
     pub id: String,
     pub resource_key: String,
@@ -54,7 +52,6 @@ pub struct TicketListPageRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketListResponse {
     pub workspace_id: String,
     pub limit: usize,
@@ -65,7 +62,6 @@ pub struct TicketListResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketDetail {
     pub id: String,
     pub resource_key: String,
@@ -102,7 +98,6 @@ pub struct TicketDetail {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketEventDetail {
     pub sequence: usize,
     pub event_ref: String,
@@ -121,7 +116,6 @@ pub struct TicketEventDetail {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketRelation {
     pub ticket_id: String,
     pub kind: String,
@@ -134,7 +128,6 @@ pub struct TicketRelation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct DerivedTicketRelation {
     pub source_ticket: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,7 +140,6 @@ pub struct DerivedTicketRelation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketRelationBlocker {
     pub blocking_ticket: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -159,7 +151,6 @@ pub struct TicketRelationBlocker {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketRelationNotice {
     pub related_ticket: String,
     pub kind: String,
@@ -167,7 +158,6 @@ pub struct TicketRelationNotice {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketRelationView {
     pub outgoing: Vec<TicketRelation>,
     pub incoming: Vec<DerivedTicketRelation>,
@@ -230,7 +220,6 @@ impl From<ticket::TicketRelationView> for TicketRelationView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct ObjectiveLinkSummary {
     pub id: String,
     pub resource_key: String,
@@ -239,7 +228,6 @@ pub struct ObjectiveLinkSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketEvidenceEvent {
     pub event_ref: String,
     pub sequence: usize,
@@ -250,7 +238,6 @@ pub struct TicketEvidenceEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketAssignmentSummary {
     pub assignment_id: String,
     pub runtime_id: String,
@@ -260,7 +247,6 @@ pub struct TicketAssignmentSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketRoleAssignmentSummary {
     pub assignment_id: String,
     pub role: String,
@@ -271,8 +257,6 @@ pub struct TicketRoleAssignmentSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[cfg_attr(feature = "typescript", ts(tag = "kind", rename_all = "snake_case"))]
 pub enum TicketAssignmentPrincipalSummary {
     User {
         account_id: String,
@@ -287,7 +271,6 @@ pub enum TicketAssignmentPrincipalSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketActionEligibility {
     pub can_assign_orchestrator: bool,
     pub can_unassign_orchestrator: bool,
@@ -298,7 +281,6 @@ pub struct TicketActionEligibility {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketMergeRequestSummary {
     pub merge_request_id: String,
     pub repository_key: String,
@@ -315,14 +297,12 @@ pub struct TicketMergeRequestSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct MergeRequestRefDiagnostic {
     pub code: String,
     pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct MergeRequestListItem {
     pub summary: TicketMergeRequestSummary,
     pub ticket_ids: Vec<String>,
@@ -332,14 +312,12 @@ pub struct MergeRequestListItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct MergeRequestListResponse {
     pub items: Vec<MergeRequestListItem>,
     pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketEvidenceSummary {
     pub has_merge_request: bool,
     pub has_current_subject_ref: bool,
@@ -354,7 +332,6 @@ pub struct TicketEvidenceSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketQueryRequest {
     pub query: Option<String>,
     #[serde(default)]
@@ -377,7 +354,6 @@ pub struct TicketQueryRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketQueryItem {
     pub id: String,
     pub resource_key: String,
@@ -393,7 +369,6 @@ pub struct TicketQueryItem {
     pub snippet: Option<String>,
     pub matching_event: Option<TicketEvidenceEvent>,
     pub linked_objective_ids: Vec<String>,
-    #[ts(skip)]
     pub linked_objective_keys: Vec<String>,
     pub relation_count: usize,
     pub blocker_count: usize,
@@ -401,12 +376,10 @@ pub struct TicketQueryItem {
     pub unresolved_review_count: usize,
     pub evidence: TicketEvidenceSummary,
     pub merge_request: Option<TicketMergeRequestSummary>,
-    #[ts(skip)]
     pub current_coder: Option<TicketAssignmentSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketQueryResponse {
     pub items: Vec<TicketQueryItem>,
     pub page: QueryPage,
@@ -414,7 +387,6 @@ pub struct TicketQueryResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TicketShowRequest {
     pub event_limit: Option<usize>,
     pub event_cursor: Option<String>,
@@ -459,78 +431,6 @@ pub struct ObjectiveQueryResponse {
 pub struct ObjectiveShowRequest {
     pub event_limit: Option<usize>,
     pub event_cursor: Option<String>,
-}
-
-#[cfg(feature = "typescript")]
-pub fn ticket_api_typescript() -> String {
-    use ts_rs::TS;
-
-    let config = ts_rs::Config::default();
-    let declarations = [
-        InvalidProjectRecord::decl(&config),
-        TicketSummary::decl(&config),
-        TicketListResponse::decl(&config),
-        QueryPage::decl(&config),
-        TicketEventDetail::decl(&config),
-        ObjectiveLinkSummary::decl(&config),
-        TicketEvidenceEvent::decl(&config),
-        TicketAssignmentSummary::decl(&config),
-        TicketRoleAssignmentSummary::decl(&config),
-        TicketAssignmentPrincipalSummary::decl(&config),
-        TicketActionEligibility::decl(&config),
-        TicketMergeRequestSummary::decl(&config),
-        MergeRequestRefDiagnostic::decl(&config),
-        MergeRequestListItem::decl(&config),
-        MergeRequestListResponse::decl(&config),
-        TicketEvidenceSummary::decl(&config),
-        TicketQueryRequest::decl(&config),
-        TicketQueryItem::decl(&config),
-        TicketQueryResponse::decl(&config),
-        TicketShowRequest::decl(&config),
-        TicketRelation::decl(&config),
-        DerivedTicketRelation::decl(&config),
-        TicketRelationBlocker::decl(&config),
-        TicketRelationNotice::decl(&config),
-        TicketRelationView::decl(&config),
-        TicketDetail::decl(&config),
-    ];
-    format!(
-        "// Generated from yoi-workspace-server. Do not edit by hand.\n// Regenerate: cargo run -q -p yoi-workspace-server --features typescript --example generate_ticket_api_types > web/workspace/src/lib/generated/ticket-api.ts\n\n{}\n",
-        declarations
-            .into_iter()
-            .map(|declaration| format!("export {declaration}"))
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    )
-}
-
-#[cfg(all(test, feature = "typescript"))]
-mod typescript_tests {
-    #[test]
-    fn generated_ticket_api_contract_is_current() {
-        let expected = super::ticket_api_typescript();
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../web/workspace/src/lib/generated/ticket-api.ts");
-        let actual = std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-        assert_eq!(
-            normalize(&actual),
-            normalize(&expected),
-            "regenerate Ticket API TypeScript types with `cargo run -q -p yoi-workspace-server --features typescript --example generate_ticket_api_types > web/workspace/src/lib/generated/ticket-api.ts` and format the generated file",
-        );
-    }
-
-    fn normalize(value: &str) -> String {
-        value
-            .chars()
-            .filter_map(|character| match character {
-                character if character.is_whitespace() => None,
-                ',' => Some(';'),
-                character => Some(character),
-            })
-            .collect::<String>()
-            .replace(";}", "}")
-    }
 }
 
 pub(crate) fn summarize_body(body: &str) -> String {

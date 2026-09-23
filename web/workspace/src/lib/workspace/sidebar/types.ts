@@ -82,15 +82,17 @@ export type WorkerCapabilities = SharedWorkerCapabilitySummary;
 
 export type WorkerWorkdirAttachment = SharedWorkerWorkdirAttachmentSummary;
 
-export type Worker = Omit<
-  SharedWorkerSummary,
-  "display_name" | "tags" | "worker_state" | "diagnostics"
-> & {
-  display_name: string;
-  tags: string[];
-  worker_state?: WorkerStateSnapshot | null;
-  diagnostics: Diagnostic[];
-};
+export type Worker =
+  & Omit<
+    SharedWorkerSummary,
+    "display_name" | "tags" | "worker_state" | "diagnostics"
+  >
+  & {
+    display_name: string;
+    tags: string[];
+    worker_state?: WorkerStateSnapshot | null;
+    diagnostics: Diagnostic[];
+  };
 
 export type WorkerOperationState = "accepted" | "unsupported" | "rejected";
 
@@ -149,61 +151,22 @@ export type RepositoryDetailResponse = SharedRepositoryDetailResponse;
 export type RepositoryLogResponse = SharedRepositoryLogResponse;
 
 export type {
-  DerivedTicketRelation,
+  ObjectiveDetail,
+  ObjectiveLinkedTicketSummary,
+  ObjectiveListResponse,
+  ObjectiveSummary,
   TicketDetail,
   TicketEventDetail,
   TicketListResponse,
-  TicketRelation,
-  TicketRelationBlocker,
-  TicketRelationNotice,
-  TicketRelationView,
-  TicketSummary,
 } from "$lib/generated/ticket-api";
-
-export type ObjectiveSummary = {
-  id: string;
-  resource_key: string;
-  title: string;
-  state: string;
-  updated_at?: string | null;
-  summary: string;
-  linked_tickets?: string[];
-  record_source?: string;
-};
-
-export type ObjectiveLinkedTicketSummary = {
-  id: string;
-  resource_key: string;
-  title: string;
-  state: string;
-};
-
-export type ObjectiveDetail = {
-  id: string;
-  resource_key: string;
-  title: string;
-  state: string;
-  created_at?: string | null;
-  updated_at?: string | null;
-  linked_tickets: string[];
-  linked_ticket_summaries: ObjectiveLinkedTicketSummary[];
-  body: string;
-  body_truncated: boolean;
-  record_source: string;
-};
-
-export type InvalidProjectRecord = {
-  label: string;
-  reason: string;
-};
-
-export type ObjectiveListResponse = {
-  workspace_id: string;
-  limit: number;
-  items: ObjectiveSummary[];
-  invalid_records: InvalidProjectRecord[];
-  record_authority: string;
-};
+export type {
+  TicketDetailDerivedRelation as DerivedTicketRelation,
+  TicketDetailRelation as TicketRelation,
+  TicketDetailRelationBlocker as TicketRelationBlocker,
+  TicketDetailRelationNotice as TicketRelationNotice,
+  TicketDetailRelationView as TicketRelationView,
+  TicketListItemSummary as TicketSummary,
+} from "$lib/generated/ticket-api";
 
 export type {
   CompanionCancelRequest,
