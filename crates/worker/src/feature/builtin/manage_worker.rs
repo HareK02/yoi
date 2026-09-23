@@ -458,11 +458,21 @@ pub trait WorkerLifecycleService: Send + Sync {
     ) -> Result<WorkspaceResponse, WorkspaceClientError>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerLifecycleWorkdirAttachment {
+    /// Stable Worker-local routing alias preserved into the canonical create request.
+    pub alias: String,
+    /// Workspace-authoritative Workdir id preserved into the canonical create request.
+    pub working_directory_id: String,
+    /// Optional normalized initial cwd relative to this Workdir.
+    pub relative_cwd: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkerLifecycleSpawnRequest {
     pub runtime_id: String,
-    pub working_directory_id: String,
-    pub relative_cwd: Option<String>,
+    /// Ordered alias-keyed selections forwarded as canonical Workdir attachments.
+    pub workdir_attachments: Vec<WorkerLifecycleWorkdirAttachment>,
     pub profile: String,
     pub ticket_id: Option<String>,
     pub operation_id: Option<String>,
@@ -501,11 +511,15 @@ fn workspace_worker_create_request(
         profile: Some(request.profile),
         ticket_assignment,
         initial_submit: request.initial_submit,
-        workdir_attachments: vec![BrowserWorkerWorkingDirectorySelection {
-            alias: INITIAL_WORKDIR_ALIAS.to_string(),
-            working_directory_id: request.working_directory_id,
-            relative_cwd: request.relative_cwd,
-        }],
+        workdir_attachments: request
+            .workdir_attachments
+            .into_iter()
+            .map(|attachment| BrowserWorkerWorkingDirectorySelection {
+                alias: attachment.alias,
+                working_directory_id: attachment.working_directory_id,
+                relative_cwd: attachment.relative_cwd,
+            })
+            .collect(),
         control_operation_id: Some(control_operation_id),
     })
 }
@@ -698,6 +712,8 @@ struct WorkerListInput {}
 #[serde(deny_unknown_fields)]
 struct WorkerSpawnInput {
     runtime_id: String,
+    /// Singular Workdir selection wrapped into the shared attachment collection
+    /// under the stable `workdir` alias.
     working_directory_id: String,
     profile: String,
     /// Optional inprogress Ticket already accepted by the Orchestrator. Set
@@ -831,7 +847,7 @@ impl WorkerOperation {
                 "List only known Runtime Workers and direct SubWorkers granted to the current Worker."
             }
             Self::Spawn => {
-                "Spawn a Backend/Runtime Worker session in an existing Workspace Workdir. The Workdir id is authority; filesystem paths and Runtime URLs are not accepted. `initial_submit` carries the normal typed user submission. After the Orchestrator has committed a Ticket to `inprogress`, set `ticket_id` with a Flow segment in `initial_submit` to atomically assign the new Coder Worker; the operation id is derived from the durable tool call rather than model input."
+                "Spawn a Backend/Runtime Worker session in one existing Workspace Workdir. The model-facing input remains singular and the shared lifecycle wraps it as the canonical attachment collection under the stable `workdir` alias. The Workdir id is authority; filesystem paths and Runtime URLs are not accepted. `initial_submit` carries the normal typed user submission. After the Orchestrator has committed a Ticket to `inprogress`, set `ticket_id` with a Flow segment in `initial_submit` to atomically assign the new Coder Worker; the operation id is derived from the durable tool call rather than model input."
             }
             Self::SendInput => "Send user input to a known Runtime Worker when allowed.",
             Self::Notify => "Send an advisory notification to a known Runtime Worker when allowed.",
@@ -878,14 +894,17 @@ impl Tool for WorkspaceWorkerTool {
                 self.control
                     .spawn_worker(WorkerLifecycleSpawnRequest {
                         runtime_id: authority_id(&input.runtime_id, "runtime_id")?,
-                        working_directory_id: authority_id(
-                            &input.working_directory_id,
-                            "working_directory_id",
-                        )?,
-                        relative_cwd: input
-                            .relative_cwd
-                            .map(|value| validate_relative_cwd(&value))
-                            .transpose()?,
+                        workdir_attachments: vec![WorkerLifecycleWorkdirAttachment {
+                            alias: INITIAL_WORKDIR_ALIAS.to_string(),
+                            working_directory_id: authority_id(
+                                &input.working_directory_id,
+                                "working_directory_id",
+                            )?,
+                            relative_cwd: input
+                                .relative_cwd
+                                .map(|value| validate_relative_cwd(&value))
+                                .transpose()?,
+                        }],
                         profile: non_empty(input.profile, "profile")?,
                         ticket_id,
                         operation_id,
@@ -1390,6 +1409,7 @@ mod tests {
             &serde_json::json!({
                 "runtime_id": "runtime-1",
                 "working_directory_id": "workdir-1",
+                "relative_cwd": "crates/worker",
                 "profile": "builtin:coder",
                 "ticket_id": "00001KZ9E0DBS",
                 "initial_submit": [
@@ -1435,7 +1455,7 @@ mod tests {
         );
         assert_eq!(
             body["workdir_attachments"][0]["relative_cwd"],
-            serde_json::Value::Null
+            "crates/worker"
         );
         assert!(body.get("working_directory").is_none());
         assert!(body.get("initial_text").is_none());
@@ -1709,11 +1729,21 @@ mod tests {
     }
 
     #[test]
-    fn worker_spawn_request_uses_canonical_initial_attachment_contract() {
+    fn worker_lifecycle_spawn_request_preserves_canonical_attachment_collection() {
         let request = workspace_worker_create_request(WorkerLifecycleSpawnRequest {
             runtime_id: "runtime-1".to_string(),
-            working_directory_id: "wd-1".to_string(),
-            relative_cwd: Some("repo".to_string()),
+            workdir_attachments: vec![
+                WorkerLifecycleWorkdirAttachment {
+                    alias: "checkout".to_string(),
+                    working_directory_id: "wd-1".to_string(),
+                    relative_cwd: Some("repo".to_string()),
+                },
+                WorkerLifecycleWorkdirAttachment {
+                    alias: "docs".to_string(),
+                    working_directory_id: "wd-2".to_string(),
+                    relative_cwd: None,
+                },
+            ],
             profile: "builtin:coder".to_string(),
             ticket_id: None,
             operation_id: None,
@@ -1728,16 +1758,22 @@ mod tests {
         .unwrap();
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["runtime_id"], "runtime-1");
-        assert_eq!(value["workdir_attachments"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            value["workdir_attachments"][0]["alias"],
-            INITIAL_WORKDIR_ALIAS
-        );
+        assert_eq!(value["workdir_attachments"].as_array().unwrap().len(), 2);
+        assert_eq!(value["workdir_attachments"][0]["alias"], "checkout");
         assert_eq!(
             value["workdir_attachments"][0]["working_directory_id"],
             "wd-1"
         );
         assert_eq!(value["workdir_attachments"][0]["relative_cwd"], "repo");
+        assert_eq!(value["workdir_attachments"][1]["alias"], "docs");
+        assert_eq!(
+            value["workdir_attachments"][1]["working_directory_id"],
+            "wd-2"
+        );
+        assert_eq!(
+            value["workdir_attachments"][1]["relative_cwd"],
+            serde_json::Value::Null
+        );
         assert!(value.get("working_directory").is_none());
         assert!(value.get("cwd").is_none());
         assert!(value.get("runtime_url").is_none());

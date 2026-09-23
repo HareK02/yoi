@@ -134,11 +134,11 @@ const DECISION_DESCRIPTION: &str = "Append a typed Ticket decision event. `body`
 const IMPLEMENTATION_REPORT_DESCRIPTION: &str =
     "Append a typed Ticket implementation_report event. `body` is Markdown.";
 const MARK_READY_DESCRIPTION: &str = "Mark a planning Ticket ready through the typed Ticket backend. \
-The backend atomically validates and normalizes the persisted repository/ref target, records one typed \
-state_changed event, and transitions planning -> ready. `reason` is optional.";
+The backend atomically validates and normalizes every persisted repository target, requires exactly one \
+read_write target, records one typed state_changed event, and transitions planning -> ready. `reason` is optional.";
 const INTAKE_READY_DESCRIPTION: &str = "Record a bounded intake summary and mark a planning Ticket ready. \
-The backend applies the same target validation and lock as TicketMarkReady and commits the summary, \
-state_changed event, effective target, and planning -> ready transition atomically.";
+The backend applies the same targets validation and lock as TicketMarkReady and commits the summary, \
+state_changed event, effective targets, and planning -> ready transition atomically.";
 const QUEUE_DESCRIPTION: &str = "Queue a ready Ticket for Orchestrator routing through the typed \
 Ticket backend. The backend rejects transitive planning dependencies and cycles, atomically queues the \
 requested Ticket plus every transitive ready dependency, and leaves queued or in-progress dependencies unchanged.";
@@ -397,12 +397,9 @@ struct TicketCreateParams {
     /// Optional queued_at frontmatter value.
     #[serde(default)]
     queued_at: Option<String>,
-    /// Optional target Workspace repository id.
+    /// Ordered implementation targets. Selectors may be omitted while planning.
     #[serde(default)]
-    repository_key: Option<String>,
-    /// Optional target Git ref selector. Requires `repository_key`.
-    #[serde(default)]
-    ref_selector: Option<String>,
+    targets: Vec<crate::TicketTarget>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -424,9 +421,9 @@ struct TicketEditItemParams {
     /// Replace every occurrence of `old_string`; by default exactly one occurrence is required.
     #[serde(default)]
     replace_all: bool,
-    /// Optional target repository/ref update.
+    /// Optional ordered targets replacement or clear operation.
     #[serde(default)]
-    target: Option<crate::TicketTargetEdit>,
+    targets: Option<crate::TicketTargetsEdit>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
@@ -941,8 +938,7 @@ impl Tool for TicketCreateTool {
         input.workflow_state = params.state.map(TicketWorkflowStateParam::into_state);
         input.queued_by = None;
         input.queued_at = params.queued_at;
-        input.repository_id = params.repository_key;
-        input.ref_selector = params.ref_selector;
+        input.targets = params.targets;
 
         let created = self
             .backend
@@ -986,7 +982,7 @@ impl Tool for TicketEditItemTool {
             title: params.title,
             body: params.body.map(MarkdownText::new),
             body_replacement,
-            target: params.target,
+            targets: params.targets,
             author: None,
         };
         let ticket = self
@@ -1170,8 +1166,7 @@ impl Tool for TicketMarkReadyTool {
             json!({
                 "ticket": ticket.meta.id,
                 "state": ticket.meta.workflow_state.as_str(),
-                "repository_key": ticket.meta.repository_id,
-                "ref_selector": ticket.meta.ref_selector,
+                "targets": ticket.meta.targets,
                 "ok": true
             }),
         ))
@@ -1203,8 +1198,7 @@ impl Tool for TicketIntakeReadyTool {
             json!({
                 "ticket": ticket.meta.id,
                 "state": ticket.meta.workflow_state.as_str(),
-                "repository_key": ticket.meta.repository_id,
-                "ref_selector": ticket.meta.ref_selector,
+                "targets": ticket.meta.targets,
                 "ok": true
             }),
         ))
@@ -1719,6 +1713,7 @@ fn ticket_json(
             "risk_flags": ticket.meta.risk_flags,
             "queued_by": ticket.meta.queued_by,
             "queued_at": ticket.meta.queued_at,
+            "targets": ticket.meta.targets,
         },
         "body": truncate_text(ticket.document.body.as_str(), body_max_bytes),
         "events": {
@@ -1937,13 +1932,22 @@ mod tests {
         fn resolve_target(
             &self,
             _workspace_id: &str,
-            repository_key: Option<&str>,
+            repository_key: &str,
             ref_selector: Option<&str>,
         ) -> crate::Result<crate::ResolvedTicketTarget> {
             Ok(crate::ResolvedTicketTarget {
-                repository_id: repository_key.unwrap_or("main").to_owned(),
+                repository_key: repository_key.to_owned(),
                 ref_selector: ref_selector.unwrap_or("develop").to_owned(),
+                access: crate::TicketTargetAccess::ReadOnly,
             })
+        }
+    }
+
+    fn write_target(repository_key: &str) -> crate::TicketTarget {
+        crate::TicketTarget {
+            repository_key: repository_key.to_owned(),
+            ref_selector: None,
+            access: crate::TicketTargetAccess::ReadWrite,
         }
     }
 
@@ -2076,7 +2080,18 @@ mod tests {
             .execute(
                 &json!({
                     "title": "Tool Created",
-                    "body": "## Background\n\nCreated by tool.\n"
+                    "body": "## Background\n\nCreated by tool.\n",
+                    "targets": [
+                        {
+                            "repository_key": "main",
+                            "ref_selector": "develop",
+                            "access": "read_write"
+                        },
+                        {
+                            "repository_key": "docs",
+                            "access": "read_only"
+                        }
+                    ]
                 })
                 .to_string(),
                 Default::default(),
@@ -2114,6 +2129,11 @@ mod tests {
             .unwrap();
         assert!(shown.summary.contains(&id));
         let shown_content = shown.content.unwrap();
+        let shown_json: Value = serde_json::from_str(&shown_content).unwrap();
+        assert_eq!(shown_json["meta"]["targets"][0]["repository_key"], "main");
+        assert_eq!(shown_json["meta"]["targets"][0]["access"], "read_write");
+        assert_eq!(shown_json["meta"]["targets"][1]["repository_key"], "docs");
+        assert_eq!(shown_json["meta"]["targets"][1]["access"], "read_only");
         assert!(shown_content.contains("Created by tool"));
         assert!(!shown_content.contains("legacy_ticket"));
         assert!(!shown_content.contains("needs_preflight"));
@@ -2574,10 +2594,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let inner = sqlite_backend(&temp);
         let mut dependency_input = NewTicket::new("Dependency");
-        dependency_input.repository_id = Some("main".to_string());
+        dependency_input.targets = vec![write_target("main")];
         let dependency = inner.create(dependency_input).unwrap();
         let mut target_input = NewTicket::new("Target");
-        target_input.repository_id = Some("main".to_string());
+        target_input.targets = vec![write_target("main")];
         let target = inner.create(target_input).unwrap();
         inner
             .add_ticket_relation(
@@ -2669,7 +2689,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let backend = backend(&temp);
         let mut input = NewTicket::new("Workflow Tool");
-        input.repository_id = Some("main".to_owned());
+        input.targets = vec![write_target("main")];
         let created = backend.create(input).unwrap();
         let intake_ready = tool_by_name(backend.clone(), "TicketMarkReady");
         let workflow = tool_by_name(backend.clone(), "TicketWorkflowState");
@@ -2752,7 +2772,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let backend = backend(&temp);
         let mut input = NewTicket::new("Intake Workflow");
-        input.repository_id = Some("main".to_owned());
+        input.targets = vec![write_target("main")];
         let created = backend.create(input).unwrap();
         tool_by_name(backend.clone(), "TicketIntakeReady")
             .execute(
@@ -2768,7 +2788,10 @@ mod tests {
             .unwrap();
         let record = backend.show(TicketIdOrSlug::Id(created.id)).unwrap();
         assert_eq!(record.meta.workflow_state, TicketWorkflowState::Ready);
-        assert_eq!(record.meta.ref_selector.as_deref(), Some("develop"));
+        assert_eq!(
+            record.meta.targets[0].ref_selector.as_deref(),
+            Some("develop")
+        );
         assert_eq!(
             record
                 .events
@@ -3088,6 +3111,15 @@ mod tests {
         assert!(!create_schema.contains("needs_preflight"));
         assert!(!create_schema.contains("action_required"));
         assert!(!create_schema.contains("attention_required"));
+        let create_properties = input_schema("TicketCreate")["properties"]
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(create_properties.contains_key("targets"));
+        assert!(!create_properties.contains_key("repository_key"));
+        assert!(!create_properties.contains_key("ref_selector"));
+        assert!(create_schema.contains("read_only"));
+        assert!(create_schema.contains("read_write"));
         let plan_record_schema = tools
             .iter()
             .map(|definition| definition().0)
@@ -3115,6 +3147,13 @@ mod tests {
         assert!(edit_schema.contains("old_string"));
         assert!(edit_schema.contains("new_string"));
         assert!(edit_schema.contains("replace_all"));
+        assert!(edit_schema.contains("targets"));
+        assert!(
+            !input_schema("TicketEditItem")["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("target")
+        );
         for name in [
             "TicketCreate",
             "TicketEditItem",

@@ -6857,6 +6857,7 @@ mod tests {
             alias: workdir::WorkdirAttachmentAlias::new("workdir").unwrap(),
             working_directory_id: "workdir-1".to_string(),
             relative_cwd: Some("crates/yoi".to_string()),
+            capabilities: workdir::WorkdirSessionCapabilities::ALL,
         }];
         let profile_source =
             profile_source_archive_source(&request, &request.profile).expect("profile source");

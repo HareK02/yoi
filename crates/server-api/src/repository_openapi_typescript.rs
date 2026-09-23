@@ -431,6 +431,13 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketListResponse")],
         },
         OperationContract {
+            path: "/api/w/{workspace_id}/tickets",
+            method: "post",
+            operation_id: "ticket_create_record",
+            request: Some("NewTicket"),
+            successes: &[("200", "TicketRef")],
+        },
+        OperationContract {
             path: "/api/w/{workspace_id}/tickets/{id}",
             method: "get",
             operation_id: "ticket_get",
@@ -1836,6 +1843,45 @@ mod tests {
         include_str!("../../../web/workspace/src/lib/generated/runtime-api.ts");
     const TICKET_BROWSER_TYPESCRIPT: &str =
         include_str!("../../../web/workspace/src/lib/generated/ticket-api.ts");
+
+    #[test]
+    fn ticket_browser_generator_projects_target_collections_without_singular_authority() {
+        let openapi = crate::canonical_openapi_document()
+            .expect("canonical OpenAPI contract must build")
+            .to_json()
+            .expect("canonical OpenAPI contract must serialize");
+        let output = generate_ticket_browser_typescript(&openapi).unwrap();
+        assert!(output.contains(
+            "export type TicketTarget = { access: TicketTargetAccess; ref_selector?: string | null; repository_key: string; };"
+        ));
+        assert!(
+            output.contains("export type TicketTargetAccess = \"read_only\" | \"read_write\";")
+        );
+        assert!(output.contains(
+            "export type BrowserTicketTargetEdit = { action: \"set\"; targets: Array<TicketTarget>; } | { action: \"clear\"; };"
+        ));
+        let edit = output
+            .lines()
+            .find(|line| line.starts_with("export type BrowserEditTicketRequest ="))
+            .expect("BrowserEditTicketRequest declaration");
+        assert!(edit.contains("target?: BrowserTicketTargetEdit | null;"));
+        let create = output
+            .lines()
+            .find(|line| line.starts_with("export type NewTicket ="))
+            .expect("NewTicket declaration");
+        assert!(create.contains("targets?: Array<TicketTarget>;"));
+        assert!(!create.contains("repository_key"));
+        assert!(!create.contains("ref_selector"));
+        assert!(!create.contains(" target?:"));
+        let detail = output
+            .lines()
+            .find(|line| line.starts_with("export type TicketDetail ="))
+            .expect("TicketDetail declaration");
+        assert!(detail.contains("targets: Array<TicketTarget>;"));
+        assert!(!detail.contains("repository_key"));
+        assert!(!detail.contains("ref_selector"));
+        assert!(!detail.contains(" target:"));
+    }
 
     #[test]
     fn checked_in_ticket_browser_typescript_is_current() {

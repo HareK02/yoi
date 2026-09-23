@@ -755,11 +755,25 @@ async fn fetch_workspace_config_http<T>(
     Err("Workspace Config fetch requires the worker-runtime http-server feature".to_string())
 }
 
+fn initial_workdir_session_capabilities(
+    alias: &WorkdirAttachmentAlias,
+    claims: &[crate::catalog::WorkingDirectoryAttachmentClaim],
+) -> WorkdirSessionCapabilities {
+    claims
+        .iter()
+        .find(|claim| &claim.alias == alias)
+        .map(|claim| claim.capabilities)
+        // New Runtime materialization requests have no claim and retain their
+        // established full local-session behavior.
+        .unwrap_or(WorkdirSessionCapabilities::ALL)
+}
+
 fn runtime_local_workdir_session(
     workdir_id: &str,
     root: &Path,
     cwd: &Path,
     scope: manifest::SharedScope,
+    capabilities: WorkdirSessionCapabilities,
     command_environment: std::collections::BTreeMap<String, String>,
     resources: Vec<Arc<dyn workdir::WorkdirSessionResource>>,
 ) -> WorkdirSessionHandle {
@@ -768,7 +782,7 @@ fn runtime_local_workdir_session(
         root.to_path_buf(),
         cwd.to_path_buf(),
         scope,
-        WorkdirSessionCapabilities::ALL,
+        capabilities,
         command_environment,
         resources,
     ))
@@ -776,6 +790,7 @@ fn runtime_local_workdir_session(
 
 fn runtime_local_workdir_router(
     attachments: &BTreeMap<WorkdirAttachmentAlias, WorkingDirectoryBinding>,
+    capabilities: &BTreeMap<WorkdirAttachmentAlias, WorkdirSessionCapabilities>,
     scope: manifest::SharedScope,
 ) -> Result<Arc<WorkdirSessionRouter>, String> {
     let router = Arc::new(WorkdirSessionRouter::new());
@@ -788,6 +803,10 @@ fn runtime_local_workdir_router(
                     binding.root(),
                     binding.cwd(),
                     scope.clone(),
+                    capabilities
+                        .get(alias)
+                        .copied()
+                        .unwrap_or(WorkdirSessionCapabilities::READ_ONLY),
                     binding.command_environment(),
                     binding.session_resources(),
                 ),
@@ -800,10 +819,25 @@ fn runtime_local_workdir_router(
 fn restored_workdir_router(
     local_attachments: &BTreeMap<WorkdirAttachmentAlias, WorkingDirectoryBinding>,
     logical_attachments: &[crate::catalog::LogicalWorkdirAttachment],
+    claims: &[crate::catalog::WorkingDirectoryAttachmentClaim],
     scope: manifest::SharedScope,
     workspace_client: Arc<dyn WorkspaceClient>,
 ) -> Result<Arc<WorkdirSessionRouter>, String> {
-    let router = runtime_local_workdir_router(local_attachments, scope)?;
+    let mut local_capabilities = local_attachments
+        .keys()
+        .map(|alias| {
+            (
+                alias.clone(),
+                initial_workdir_session_capabilities(alias, claims),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for attachment in logical_attachments {
+        if local_attachments.contains_key(&attachment.alias) {
+            local_capabilities.insert(attachment.alias.clone(), attachment.capabilities);
+        }
+    }
+    let router = runtime_local_workdir_router(local_attachments, &local_capabilities, scope)?;
     for attachment in logical_attachments {
         if let Some(local) = local_attachments.get(&attachment.alias) {
             if local.working_directory.id != attachment.working_directory_id {
@@ -1068,8 +1102,22 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         })?;
         let worker = prepared.worker_mut();
         validate_worker_memory_settings(worker.manifest(), &request.request)?;
+        let workdir_capabilities = request
+            .workdir_attachments
+            .keys()
+            .map(|alias| {
+                (
+                    alias.clone(),
+                    initial_workdir_session_capabilities(
+                        alias,
+                        &request.request.workdir_attachments,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         worker.bind_workdir_sessions(runtime_local_workdir_router(
             &request.workdir_attachments,
+            &workdir_capabilities,
             worker.scope().clone(),
         )?);
         if let (Some(runtime_id), Some(workspace_id)) =
@@ -1300,6 +1348,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         let workdir_sessions = restored_workdir_router(
             &request.workdir_attachments,
             &request.logical_workdir_attachments,
+            &request.request.workdir_attachments,
             worker.scope().clone(),
             worker.workspace_client_handle(),
         )?;
@@ -2177,6 +2226,7 @@ where
             binding.root(),
             binding.cwd(),
             manifest::SharedScope::new(scope),
+            WorkdirSessionCapabilities::ALL,
             binding.command_environment(),
             binding.session_resources(),
         ))
@@ -2979,6 +3029,7 @@ mod tests {
                 working_directory_id: "remote-workdir".to_string(),
                 capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
             }],
+            &[],
             scope,
             client,
         )
@@ -2989,6 +3040,37 @@ mod tests {
         assert_eq!(
             session.capabilities(),
             workdir::WorkdirSessionCapabilities::READ_ONLY
+        );
+    }
+
+    #[test]
+    fn restored_router_preserves_read_only_capabilities_for_local_attachment() {
+        let runtime_base = tempfile::tempdir().unwrap();
+        let repo = create_clean_repo();
+        let materializer = RuntimeGitMaterializer::new(runtime_base.path());
+        let worker_ref = WorkerRef::new(crate::identity::WorkerId::now_v7());
+        let binding = materializer
+            .materialize(&worker_ref, &working_directory_request(repo.path()))
+            .unwrap();
+        let alias = WorkdirAttachmentAlias::new("docs").unwrap();
+        let workdir_id = binding.working_directory.id.clone();
+        let scope = manifest::SharedScope::new(manifest::Scope::writable(binding.root()).unwrap());
+        let attachments = BTreeMap::from([(alias.clone(), binding)]);
+        let logical = [LogicalWorkdirAttachment {
+            alias: alias.clone(),
+            working_directory_id: workdir_id,
+            capabilities: WorkdirSessionCapabilities::READ_ONLY,
+        }];
+        let client = WorkerWorkspaceContext::local_filesystem(Some(
+            WorkspaceId::new("workspace-a").unwrap(),
+        ))
+        .client_handle();
+
+        let router = restored_workdir_router(&attachments, &logical, &[], scope, client).unwrap();
+
+        assert_eq!(
+            router.session(&alias).unwrap().capabilities(),
+            WorkdirSessionCapabilities::READ_ONLY
         );
     }
 
@@ -3949,13 +4031,35 @@ mod tests {
     }
 
     #[test]
-    fn restore_opens_a_fresh_session_for_the_same_workdir_identity() {
+    fn initial_claim_capabilities_override_full_materialization_default() {
+        let checkout = WorkdirAttachmentAlias::new("checkout").unwrap();
+        let docs = WorkdirAttachmentAlias::new("docs").unwrap();
+        let claims = [WorkingDirectoryAttachmentClaim {
+            alias: docs.clone(),
+            working_directory_id: "workdir-docs".to_string(),
+            relative_cwd: None,
+            capabilities: WorkdirSessionCapabilities::READ_ONLY,
+        }];
+
+        assert_eq!(
+            initial_workdir_session_capabilities(&docs, &claims),
+            WorkdirSessionCapabilities::READ_ONLY
+        );
+        assert_eq!(
+            initial_workdir_session_capabilities(&checkout, &claims),
+            WorkdirSessionCapabilities::ALL
+        );
+    }
+
+    #[test]
+    fn restore_opens_a_fresh_session_with_the_same_read_only_capabilities() {
         let root = tempfile::tempdir().unwrap();
         let spawned = runtime_local_workdir_session(
             "working-directory-42",
             root.path(),
             root.path(),
             manifest::SharedScope::new(Scope::writable(root.path()).unwrap()),
+            WorkdirSessionCapabilities::READ_ONLY,
             Default::default(),
             Vec::new(),
         );
@@ -3964,12 +4068,21 @@ mod tests {
             root.path(),
             root.path(),
             manifest::SharedScope::new(Scope::writable(root.path()).unwrap()),
+            WorkdirSessionCapabilities::READ_ONLY,
             Default::default(),
             Vec::new(),
         );
 
         assert_eq!(spawned.workdir().id().as_str(), "working-directory-42");
         assert_eq!(restored.workdir().id().as_str(), "working-directory-42");
+        assert_eq!(
+            spawned.capabilities(),
+            WorkdirSessionCapabilities::READ_ONLY
+        );
+        assert_eq!(
+            restored.capabilities(),
+            WorkdirSessionCapabilities::READ_ONLY
+        );
         assert!(!Arc::ptr_eq(&spawned, &restored));
     }
 
@@ -4924,6 +5037,7 @@ mod tests {
             alias: workdir::WorkdirAttachmentAlias::new("workdir").unwrap(),
             working_directory_id: workdir_id.clone(),
             relative_cwd: None,
+            capabilities: workdir::WorkdirSessionCapabilities::ALL,
         }];
 
         let error = runtime.create_worker(request).unwrap_err();

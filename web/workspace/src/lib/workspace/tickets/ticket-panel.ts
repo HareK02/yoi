@@ -107,23 +107,26 @@ export function ticketWorkerMessage(
 
 export function ticketWorkerLaunchHref(
   workspaceId: string,
-  ticket: Pick<
-    TicketDetail,
-    "id" | "title" | "repository_key" | "ref_selector"
-  >,
+  ticket: Pick<TicketDetail, "id" | "title" | "targets">,
   role: TicketWorkerRole,
 ): string {
+  const implementationTargets = ticket.targets.filter((target) =>
+    target.access === "read_write"
+  );
+  const implementationTarget = implementationTargets.length === 1
+    ? implementationTargets[0]
+    : null;
   const params = new URLSearchParams({
     ticketId: ticket.id,
     ticketTitle: ticket.title,
     ticketRole: role,
     initialInput: ticketWorkerMessage(ticket.id, role),
   });
-  if (ticket.repository_key) {
-    params.set("repositoryKey", ticket.repository_key);
-  }
-  if (ticket.ref_selector) {
-    params.set("refSelector", ticket.ref_selector);
+  if (implementationTarget) {
+    params.set("repositoryKey", implementationTarget.repository_key);
+    if (implementationTarget.ref_selector) {
+      params.set("refSelector", implementationTarget.ref_selector);
+    }
   }
   return `/w/${
     encodeURIComponent(workspaceId)

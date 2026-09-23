@@ -5,7 +5,9 @@ declare const Deno: {
 import {
   parseMergeRequestDetailResponse,
   parseObjectiveListResponse,
+  parseTicketDetail,
   parseTicketListResponse,
+  parseTicketRecordRef,
 } from "./ticket-browser.ts";
 
 function assertEquals(actual: unknown, expected: unknown): void {
@@ -75,6 +77,107 @@ Deno.test("Ticket Browser parser rejects unknown fields and out-of-range limits"
   assertThrows(
     () => parseTicketListResponse({ ...fixture, limit: 1001 }),
     "0 through 1000",
+  );
+});
+
+Deno.test("Ticket Browser parser accepts target collections and rejects singular target authority", () => {
+  const fixture = {
+    action_eligibility: {
+      blockers: [],
+      can_assign_orchestrator: false,
+      can_queue: false,
+      can_start_manual_coder: false,
+      can_unassign_orchestrator: false,
+      queue_tickets: [],
+    },
+    artifact_count: 0,
+    artifacts: [],
+    assignment_diagnostics: [],
+    assignments: [],
+    body: "Body",
+    body_truncated: false,
+    current_coder: null,
+    event_count: 0,
+    event_page: { ...page, returned: 0 },
+    events: [],
+    evidence: {
+      approved_current_subject: false,
+      complete_for_integration: false,
+      has_commit: false,
+      has_current_subject_ref: false,
+      has_merge_request: false,
+      has_review_request: false,
+      missing: [],
+      review_after_rescope: false,
+      review_status: null,
+      unresolved_request_changes: false,
+    },
+    id: "ticket-id",
+    implementation_reports: [],
+    item_revision: "revision-1",
+    linked_objectives: [],
+    merge_request: null,
+    priority: "P2",
+    queued_at: null,
+    queued_by: null,
+    readiness: null,
+    record_source: "sqlite",
+    relations: { blockers: [], incoming: [], notices: [], outgoing: [] },
+    resolution: null,
+    resource_key: "T-1",
+    risk_flags: [],
+    state: "planning",
+    targets: [
+      {
+        repository_key: "docs",
+        ref_selector: "main",
+        access: "read_only",
+      },
+      {
+        repository_key: "main",
+        ref_selector: "develop",
+        access: "read_write",
+      },
+    ],
+    title: "Ticket",
+  };
+
+  const parsed = parseTicketDetail(fixture);
+  assertEquals(parsed.targets.length, 2);
+  assertEquals(parsed.targets[0]?.repository_key, "docs");
+  assertEquals(parsed.targets[0]?.access, "read_only");
+  assertEquals(parsed.targets[1]?.repository_key, "main");
+  assertEquals(parsed.targets[1]?.access, "read_write");
+  assertThrows(
+    () =>
+      parseTicketDetail({
+        ...fixture,
+        targets: [{ ...fixture.targets[0], access: "write" }],
+      }),
+    "targets[0].access is invalid",
+  );
+  assertThrows(
+    () =>
+      parseTicketDetail({
+        ...fixture,
+        repository_key: "main",
+        ref_selector: "develop",
+      }),
+    "unknown field repository_key",
+  );
+});
+
+Deno.test("Ticket Browser parser validates Ticket create responses", () => {
+  const parsed = parseTicketRecordRef({
+    id: "ticket-id",
+    resource_key: "T-1",
+    slug: "ticket",
+    status: "Open",
+  });
+  assertEquals(parsed.resource_key, "T-1");
+  assertThrows(
+    () => parseTicketRecordRef({ ...parsed, status: "open" }),
+    "status is invalid",
   );
 });
 

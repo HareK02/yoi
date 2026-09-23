@@ -1,4 +1,5 @@
 import { parseBrowserWorkspaceOrchestratorResponse } from "$lib/workspace/api/workers";
+import { loadWorkspaceRepositoryList } from "$lib/workspace/api/repositories";
 import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
 import {
   parseTicketListResponse,
@@ -46,18 +47,24 @@ async function loadLane(
 
 export const load: PageLoad = async ({ fetch, params }) => {
   const workspaceId = params.workspaceId;
-  const [readyPlanning, inprogressQueued, doneClosed, orchestrator] =
-    await Promise.all([
-      loadLane(fetch, workspaceId, "ready-planning"),
-      loadLane(fetch, workspaceId, "inprogress-queued"),
-      loadLane(fetch, workspaceId, "done-closed"),
-      loadJson<WorkspaceOrchestratorStatus>(
-        fetch,
-        workspaceApiPath(workspaceId, "/orchestrator"),
-        undefined,
-        parseBrowserWorkspaceOrchestratorResponse,
-      ),
-    ]);
+  const [
+    readyPlanning,
+    inprogressQueued,
+    doneClosed,
+    orchestrator,
+    repositories,
+  ] = await Promise.all([
+    loadLane(fetch, workspaceId, "ready-planning"),
+    loadLane(fetch, workspaceId, "inprogress-queued"),
+    loadLane(fetch, workspaceId, "done-closed"),
+    loadJson<WorkspaceOrchestratorStatus>(
+      fetch,
+      workspaceApiPath(workspaceId, "/orchestrator"),
+      undefined,
+      parseBrowserWorkspaceOrchestratorResponse,
+    ),
+    loadWorkspaceRepositoryList(fetch, workspaceId),
+  ]);
 
   return {
     workspaceId,
@@ -67,5 +74,6 @@ export const load: PageLoad = async ({ fetch, params }) => {
       "done-closed": doneClosed,
     },
     orchestrator,
+    repositories,
   };
 };

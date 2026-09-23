@@ -87,7 +87,8 @@ use server_api::{TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_P
 use sha2::{Digest, Sha256};
 use ticket::{
     MarkdownText, NewTicketEvent, TicketBackend, TicketBodyReplacement, TicketEventKind,
-    TicketIdOrSlug, TicketItemEdit, TicketStateChange, TicketTargetEdit, TicketWorkflowState,
+    TicketIdOrSlug, TicketItemEdit, TicketStateChange, TicketTargetAccess, TicketTargetsEdit,
+    TicketWorkflowState,
 };
 use ticket::{
     SqliteTicketBackend, TicketBackendOperation, TicketBackendOperationResult,
@@ -3037,7 +3038,7 @@ impl WorkspaceApi {
         runtime_id: &str,
         mut request: WorkerSpawnRequest,
     ) -> ApiResult<WorkerSpawnResult> {
-        self.validate_worker_spawn_repository_scope(&request)?;
+        self.validate_worker_spawn_repository_scope(runtime_id, &mut request)?;
         let workspace_api = self.workspace_api_ref(runtime_id);
         request.resolved_workspace_api = Some(workspace_api.clone());
         for access in take_new_workdir_repository_access(&mut request)? {
@@ -3070,6 +3071,7 @@ impl WorkspaceApi {
                     attachment.alias.to_string(),
                     attachment.working_directory_id.clone(),
                     Uuid::new_v4().to_string(),
+                    attachment.capabilities,
                 )
             })
             .collect::<Vec<_>>();
@@ -3114,8 +3116,13 @@ impl WorkspaceApi {
             assignment: None,
             spawned_workdir_ids: &spawned_workdir_ids,
         };
-        let mut reserved_attachments: Vec<(String, String, String)> = Vec::new();
-        for (alias, workdir_id, reservation_id) in &attachment_reservations {
+        let mut reserved_attachments: Vec<(
+            String,
+            String,
+            String,
+            workdir::WorkdirSessionCapabilities,
+        )> = Vec::new();
+        for (alias, workdir_id, reservation_id, capabilities) in &attachment_reservations {
             if let Err(error) = self.store.reserve_worker_workdir_attachment(
                 &self.config.workspace_id,
                 workdir_id,
@@ -3147,7 +3154,12 @@ impl WorkspaceApi {
                 );
                 return Err(ApiError::with_diagnostics(error, diagnostics));
             }
-            reserved_attachments.push((alias.clone(), workdir_id.clone(), reservation_id.clone()));
+            reserved_attachments.push((
+                alias.clone(),
+                workdir_id.clone(),
+                reservation_id.clone(),
+                *capabilities,
+            ));
         }
         let mut result = match self
             .runtime
@@ -3307,12 +3319,13 @@ impl WorkspaceApi {
             return Err(api_error_with_additional_diagnostics(error, diagnostics));
         }
 
-        for (alias, workdir_id, reservation_id) in &reserved_attachments {
+        for (alias, workdir_id, reservation_id, capabilities) in &reserved_attachments {
             let attachment = WorkerWorkdirLinkRecord {
                 workspace_id: self.config.workspace_id.clone(),
                 worker: worker_ref.clone(),
                 workdir_id: workdir_id.clone(),
                 alias: alias.clone(),
+                capabilities: *capabilities,
                 linked_at: now_registry_timestamp(),
                 unlinked_at: None,
             };
@@ -3467,13 +3480,8 @@ impl WorkspaceApi {
         &self,
         repository_id: &str,
     ) -> ApiResult<ConfiguredRepository> {
-        self.require_workspace_repository(repository_id)?;
-        self.config
-            .repositories
-            .iter()
-            .find(|repository| repository.id == repository_id)
-            .cloned()
-            .ok_or_else(|| ApiError::from(Error::UnknownRepository(repository_id.to_string())))
+        configured_repository_from_record(self.require_workspace_repository(repository_id)?)
+            .map_err(ApiError::from)
     }
 
     fn require_configured_workspace_repository_by_key(
@@ -3494,23 +3502,55 @@ impl WorkspaceApi {
 
     fn validate_worker_spawn_repository_scope(
         &self,
-        request: &WorkerSpawnRequest,
+        runtime_id: &str,
+        request: &mut WorkerSpawnRequest,
     ) -> ApiResult<()> {
-        let mut selected_repositories = Vec::new();
         for attachment in &request.resolved_workdir_attachment_requests {
-            let working_directory = &attachment.working_directory;
-            let repository_id = working_directory.repository.id.as_str();
-            self.require_workspace_repository(repository_id)?;
-            selected_repositories.push((
-                repository_id.to_string(),
-                working_directory
-                    .repository
-                    .selector
-                    .as_deref()
-                    .map(str::to_owned),
-            ));
+            self.require_workspace_repository(&attachment.working_directory.repository.id)?;
         }
-        for claim in &request.resolved_workdir_attachments {
+        let WorkerSpawnIntent::TicketRole { ticket_id, .. } = &request.intent else {
+            for claim in &mut request.resolved_workdir_attachments {
+                let workdir = self
+                    .store
+                    .get_workdir_registry(&self.config.workspace_id, &claim.working_directory_id)?
+                    .ok_or_else(|| {
+                        ApiError::from(Error::Config(format!(
+                            "unknown working directory `{}` in this Workspace",
+                            claim.working_directory_id
+                        )))
+                    })?;
+                claim.capabilities = workdir_source_capabilities(&workdir);
+            }
+            return Ok(());
+        };
+
+        if !request.resolved_workdir_attachment_requests.is_empty() {
+            return Err(Error::InvalidInput(
+                "Ticket-role spawn requires existing Workspace Workdir attachments so Backend authority can bind each persisted target capability before Runtime side effects"
+                    .to_string(),
+            )
+            .into());
+        }
+
+        let targets = validated_ticket_implementation_targets(self, ticket_id)?;
+        let mut aliases = HashSet::new();
+        let mut workdir_ids = HashSet::new();
+        let mut covered_repositories = HashSet::new();
+        for claim in &mut request.resolved_workdir_attachments {
+            if !aliases.insert(claim.alias.as_str().to_string()) {
+                return Err(Error::InvalidInput(format!(
+                    "Ticket `{ticket_id}` Worker attachment alias `{}` appears more than once",
+                    claim.alias
+                ))
+                .into());
+            }
+            if !workdir_ids.insert(claim.working_directory_id.clone()) {
+                return Err(Error::InvalidInput(format!(
+                    "Ticket `{ticket_id}` Workdir `{}` appears more than once",
+                    claim.working_directory_id
+                ))
+                .into());
+            }
             let workdir = self
                 .store
                 .get_workdir_registry(&self.config.workspace_id, &claim.working_directory_id)?
@@ -3520,56 +3560,234 @@ impl WorkspaceApi {
                         claim.working_directory_id
                     )))
                 })?;
-            if let WorkdirRegistrySource::Repository { repository_id, .. } = workdir.source {
-                self.require_workspace_repository(&repository_id)?;
-                selected_repositories.push((repository_id, workdir.creation_selector));
-            }
-        }
-
-        if let WorkerSpawnIntent::TicketRole { ticket_id, .. } = &request.intent {
-            let ticket = self.authority.ticket(ticket_id)?;
-            // Workdir-less Ticket Workers cannot execute repository implementation.
-            // Preserve that control-plane launch while still validating any persisted
-            // target (including its Workspace ownership) when one exists.
-            if selected_repositories.is_empty() && ticket.repository_key.is_none() {
-                return Ok(());
-            }
-            let repository_key = ticket.repository_key.as_deref().ok_or_else(|| {
-                ApiError::from(Error::Config(
-                    "Ticket implementation target must be validated and persisted before spawning a Ticket Worker".to_owned(),
+            let (workdir_runtime_id, repository_id) = match &workdir.source {
+                WorkdirRegistrySource::Repository {
+                    runtime_id,
+                    repository_id,
+                } => (runtime_id, repository_id),
+                WorkdirRegistrySource::ExternalGrant { .. } => {
+                    return Err(Error::InvalidInput(format!(
+                        "Ticket `{ticket_id}` attachment `{}` is an ExternalGrant and cannot satisfy a persisted Repository target",
+                        claim.alias
+                    ))
+                    .into());
+                }
+            };
+            if workdir_runtime_id != runtime_id {
+                return Err(Error::InvalidInput(format!(
+                    "Ticket `{ticket_id}` attachment `{}` belongs to Runtime `{workdir_runtime_id}`, not requested Runtime `{runtime_id}`",
+                    claim.alias
                 ))
-            })?;
-            let repository = self.require_configured_workspace_repository_by_key(repository_key)?;
-            let repository_id = repository.id.as_str();
-            let ref_selector = ticket.ref_selector.as_deref().ok_or_else(|| {
-                ApiError::from(Error::Config(
-                    "Ticket implementation target selector must be validated and persisted before spawning a Ticket Worker".to_owned(),
-                ))
-            })?;
-            self.require_workspace_repository(repository_id)?;
-            self.repository_reader()
-                .observe_merge_target(repository_id, Some(ref_selector))
-                .map_err(|error| {
-                    ApiError::from(Error::Config(format!(
-                        "Ticket implementation target is no longer resolvable: {error:?}"
+                .into());
+            }
+            let target = targets
+                .iter()
+                .find(|target| target.repository_id == *repository_id)
+                .ok_or_else(|| {
+                    ApiError::from(Error::InvalidInput(format!(
+                        "Ticket `{ticket_id}` attachment `{}` resolves undeclared Repository `{repository_id}`",
+                        claim.alias
                     )))
                 })?;
-            for (selected_repository_id, selected_ref_selector) in &selected_repositories {
-                if selected_repository_id != repository_id {
-                    return Err(ApiError::from(Error::Config(format!(
-                        "Ticket `{ticket_id}` targets Repository `{repository_key}`, but a Worker attachment resolves a different Repository"
-                    ))));
-                }
-                if selected_ref_selector.as_deref() != Some(ref_selector) {
-                    return Err(ApiError::from(Error::Config(format!(
-                        "Ticket `{ticket_id}` targets selector `{ref_selector}`, but a Worker attachment resolves `{}`",
-                        selected_ref_selector.as_deref().unwrap_or("none")
-                    ))));
-                }
+            if workdir.creation_selector.as_deref() != Some(target.ref_selector.as_str()) {
+                return Err(Error::InvalidInput(format!(
+                    "Ticket `{ticket_id}` target selector `{}` does not match attachment `{}` selector `{}`",
+                    target.ref_selector,
+                    claim.alias,
+                    workdir.creation_selector.as_deref().unwrap_or("none")
+                ))
+                .into());
             }
+            if !covered_repositories.insert(repository_id.clone()) {
+                return Err(Error::InvalidInput(format!(
+                    "Ticket `{ticket_id}` target Repository `{}` has more than one Worker attachment",
+                    target.repository_key
+                ))
+                .into());
+            }
+            claim.capabilities = target
+                .capabilities
+                .intersection(workdir_source_capabilities(&workdir));
+        }
+
+        let missing = targets
+            .iter()
+            .filter(|target| !covered_repositories.contains(&target.repository_id))
+            .map(|target| target.repository_key.as_str())
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(Error::InvalidInput(format!(
+                "Ticket `{ticket_id}` is missing one-to-one Workdir attachment coverage for target(s): {}",
+                missing.join(", ")
+            ))
+            .into());
+        }
+        if request.resolved_workdir_attachments.len() != targets.len() {
+            return Err(Error::InvalidInput(format!(
+                "Ticket `{ticket_id}` requires exactly {} Workdir attachment(s), found {}",
+                targets.len(),
+                request.resolved_workdir_attachments.len()
+            ))
+            .into());
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ValidatedTicketImplementationTarget {
+    repository_id: String,
+    repository_key: String,
+    ref_selector: String,
+    access: TicketTargetAccess,
+    capabilities: workdir::WorkdirSessionCapabilities,
+}
+
+fn workdir_source_capabilities(
+    workdir: &WorkdirRegistryRecord,
+) -> workdir::WorkdirSessionCapabilities {
+    match &workdir.source {
+        WorkdirRegistrySource::Repository { .. } => workdir::WorkdirSessionCapabilities::ALL,
+        WorkdirRegistrySource::ExternalGrant { .. } => {
+            workdir::WorkdirSessionCapabilities::READ_ONLY
+        }
+    }
+}
+
+fn validated_ticket_implementation_targets(
+    api: &WorkspaceApi,
+    ticket_id: &str,
+) -> ApiResult<Vec<ValidatedTicketImplementationTarget>> {
+    let ticket = browser_ticket_backend(api)?
+        .show(TicketIdOrSlug::Id(ticket_id.to_string()))
+        .map_err(Error::from)?;
+    if ticket.meta.targets.is_empty() {
+        return Err(Error::InvalidInput(format!(
+            "Ticket `{ticket_id}` has no persisted implementation targets"
+        ))
+        .into());
+    }
+    let read_write_count = ticket
+        .meta
+        .targets
+        .iter()
+        .filter(|target| target.access == TicketTargetAccess::ReadWrite)
+        .count();
+    if read_write_count != 1 {
+        return Err(Error::InvalidInput(format!(
+            "Ticket `{ticket_id}` requires exactly one read_write target, found {read_write_count}"
+        ))
+        .into());
+    }
+
+    let mut repository_ids = HashSet::new();
+    ticket
+        .meta
+        .targets
+        .into_iter()
+        .map(|target| {
+            let repository_key = target.repository_key;
+            let repository = api
+                .store
+                .get_repository_by_key(&api.config.workspace_id, &repository_key)?
+                .ok_or_else(|| ApiError::from(Error::UnknownRepository(repository_key.clone())))?;
+            let repository_id = repository.repository_id.clone();
+            if !repository_ids.insert(repository_id.clone()) {
+                return Err(Error::InvalidInput(format!(
+                    "Ticket `{ticket_id}` target Repository `{repository_key}` appears more than once"
+                ))
+                .into());
+            }
+            let ref_selector = target
+                .ref_selector
+                .filter(|selector| !selector.trim().is_empty())
+                .ok_or_else(|| {
+                    ApiError::from(Error::InvalidInput(format!(
+                        "Ticket `{ticket_id}` target Repository `{}` has no persisted selector",
+                        repository.repository_key
+                    )))
+                })?;
+            api.live_repository_reader()?
+                .observe_merge_target(&repository_id, Some(&ref_selector))
+                .map_err(|error| {
+                    ApiError::from(Error::InvalidInput(format!(
+                        "Ticket `{ticket_id}` target Repository `{}` selector `{ref_selector}` is not resolvable: {error:?}",
+                        repository.repository_key
+                    )))
+                })?;
+            let capabilities = match target.access {
+                TicketTargetAccess::ReadOnly => {
+                    workdir::WorkdirSessionCapabilities::READ_ONLY
+                }
+                TicketTargetAccess::ReadWrite => workdir::WorkdirSessionCapabilities::ALL,
+            };
+            Ok(ValidatedTicketImplementationTarget {
+                repository_id,
+                repository_key: repository.repository_key,
+                ref_selector,
+                access: target.access,
+                capabilities,
+            })
+        })
+        .collect()
+}
+
+fn require_ticket_read_write_target(
+    api: &WorkspaceApi,
+    ticket_id: &str,
+    repository_id: &str,
+    selector: &str,
+) -> ApiResult<ValidatedTicketImplementationTarget> {
+    let write_target = validated_ticket_implementation_targets(api, ticket_id)?
+        .into_iter()
+        .find(|target| target.access == TicketTargetAccess::ReadWrite)
+        .expect("validated Ticket target collection has exactly one read_write target");
+    if write_target.repository_id != repository_id || write_target.ref_selector != selector {
+        return Err(Error::InvalidInput(
+            "selectors must match the authoritative Ticket read_write repository target".into(),
+        )
+        .into());
+    }
+    Ok(write_target)
+}
+
+fn ticket_target_capabilities_for_workdir(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    workdir: &WorkdirRegistryRecord,
+) -> Result<workdir::WorkdirSessionCapabilities> {
+    let source_capabilities = workdir_source_capabilities(workdir);
+    let Some(assignment) = api
+        .store
+        .get_current_ticket_role_assignment_for_worker(&api.config.workspace_id, worker)?
+        .filter(|assignment| assignment.role == TicketAssignmentRole::Coder)
+    else {
+        return Ok(source_capabilities);
+    };
+    let WorkdirRegistrySource::Repository { repository_id, .. } = &workdir.source else {
+        return Err(Error::InvalidInput(format!(
+            "assigned Ticket Coder Workdir `{}` is not a Repository target",
+            workdir.workdir_id
+        )));
+    };
+    let targets = validated_ticket_implementation_targets(api, &assignment.ticket_id)
+        .map_err(|error| error.error)?;
+    let target = targets
+        .into_iter()
+        .find(|target| target.repository_id == *repository_id)
+        .ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "Workdir `{}` Repository is not declared by assigned Ticket `{}`",
+                workdir.workdir_id, assignment.ticket_id
+            ))
+        })?;
+    if workdir.creation_selector.as_deref() != Some(target.ref_selector.as_str()) {
+        return Err(Error::InvalidInput(format!(
+            "Workdir `{}` selector does not match assigned Ticket `{}` target selector",
+            workdir.workdir_id, assignment.ticket_id
+        )));
+    }
+    Ok(target.capabilities.intersection(source_capabilities))
 }
 
 fn import_configured_repositories(
@@ -10080,6 +10298,16 @@ fn validate_ticket_assignment_spawn(
             "Ticket-assigned Coder spawn requires one Flow segment in initial_submit".to_string(),
         ));
     }
+    if !request.workdir_attachment_requests.is_empty()
+        || !request.resolved_workdir_attachment_requests.is_empty()
+    {
+        return Err(Error::TicketAssignmentConflict(
+            "Ticket-assigned Coder spawn requires existing Workspace Workdir attachments; new materialization requests cannot carry persisted Ticket target capabilities"
+                .to_string(),
+        ));
+    }
+    validated_ticket_implementation_targets(api, &assignment.ticket_id)
+        .map_err(|error| Error::TicketAssignmentConflict(error.error.to_string()))?;
     validate_ticket_assignment_state(api, assignment)?;
 
     if let Some(current) = api
@@ -10284,42 +10512,46 @@ impl ticket::TicketTargetAuthority for WorkspaceTicketTargetAuthority {
     fn resolve_target(
         &self,
         workspace_id: &str,
-        repository_id: Option<&str>,
+        repository_key: &str,
         ref_selector: Option<&str>,
     ) -> ticket::Result<ticket::ResolvedTicketTarget> {
         if workspace_id != self.api.config.workspace_id {
             return Err(ticket::TicketError::UnknownTargetRepository(
-                repository_id.unwrap_or_default().to_owned(),
+                repository_key.to_owned(),
             ));
         }
-        let repository_id = repository_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or(ticket::TicketError::MissingTargetRepository)?;
+        let repository_key = repository_key.trim();
+        if repository_key.is_empty() {
+            return Err(ticket::TicketError::MissingTargetRepository);
+        }
         let repository = self
             .api
             .store
-            .get_repository(workspace_id, repository_id)
+            .get_repository_by_key(workspace_id, repository_key)
             .map_err(|error| ticket::TicketError::Conflict(error.to_string()))?
             .ok_or_else(|| {
-                ticket::TicketError::UnknownTargetRepository(repository_id.to_owned())
+                ticket::TicketError::UnknownTargetRepository(repository_key.to_owned())
             })?;
         let selector = ref_selector
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .or(repository.default_ref.as_deref())
-            .ok_or_else(|| ticket::TicketError::MissingTargetSelector(repository_id.to_owned()))?;
+            .ok_or_else(|| {
+                ticket::TicketError::MissingTargetSelector(repository.repository_key.clone())
+            })?;
         self.api
-            .repository_reader()
-            .observe_merge_target(repository_id, Some(selector))
+            .live_repository_reader()
+            .map_err(|error| ticket::TicketError::Conflict(error.to_string()))?
+            .observe_merge_target(&repository.repository_id, Some(selector))
             .map_err(|error| ticket::TicketError::InvalidTargetSelector {
-                repository_id: repository_id.to_owned(),
+                repository_key: repository.repository_key.clone(),
                 selector: selector.to_owned(),
                 reason: format!("{error:?}"),
             })?;
         Ok(ticket::ResolvedTicketTarget {
-            repository_id: repository_id.to_owned(),
+            repository_key: repository.repository_key,
             ref_selector: selector.to_owned(),
+            access: TicketTargetAccess::ReadOnly,
         })
     }
 }
@@ -10349,33 +10581,21 @@ async fn scoped_edit_ticket_item(
     Json(request): Json<server_api::BrowserEditTicketRequest>,
 ) -> ApiResult<Json<TicketDetail>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let mut target = request.target.map(|target| match target {
-        server_api::BrowserTicketTargetEdit::Set {
-            repository_key,
-            ref_selector,
-        } => TicketTargetEdit::Set {
-            repository_id: repository_key,
-            ref_selector,
+    let mut targets = request.target.map(|target| match target {
+        server_api::BrowserTicketTargetEdit::Set { targets } => TicketTargetsEdit::Set {
+            targets: targets
+                .into_iter()
+                .map(|target| ticket::TicketTarget {
+                    repository_key: target.repository_key,
+                    ref_selector: target.ref_selector,
+                    access: target.access,
+                })
+                .collect(),
         },
-        server_api::BrowserTicketTargetEdit::Clear => TicketTargetEdit::Clear,
+        server_api::BrowserTicketTargetEdit::Clear => TicketTargetsEdit::Clear,
     });
-    if let Some(TicketTargetEdit::Set { repository_id, .. }) = target.as_mut() {
-        server_api::validate_repository_key(repository_id).map_err(|_| {
-            settings_bad_request(
-                "repository_key_invalid",
-                "Repository key must contain 1-64 lowercase ASCII letters, digits, or hyphens without a leading or trailing hyphen",
-            )
-        })?;
-        *repository_id = api
-            .store
-            .get_repository_by_key(&api.config.workspace_id, repository_id)?
-            .map(|repository| repository.repository_id)
-            .ok_or_else(|| {
-                settings_bad_request(
-                    "unknown_ticket_repository",
-                    "repository_key must identify a Repository registered in this Workspace",
-                )
-            })?;
+    if let Some(TicketTargetsEdit::Set { targets }) = targets.as_mut() {
+        validate_ticket_target_repository_keys(&api, &path.workspace_id, targets)?;
     }
     browser_ticket_backend(&api)?
         .edit_item(
@@ -10397,7 +10617,7 @@ async fn scoped_edit_ticket_item(
                         ));
                     }
                 },
-                target,
+                targets,
                 author: request.author,
             },
         )
@@ -10559,34 +10779,52 @@ fn reject_unguarded_ticket_completion(operation: &TicketBackendOperation) -> Res
     Ok(())
 }
 
-fn resolve_ticket_operation_repository_keys(
+fn validate_ticket_target_repository_keys(
     api: &WorkspaceApi,
     workspace_id: &str,
-    operation: &mut TicketBackendOperation,
+    targets: &[ticket::TicketTarget],
 ) -> ApiResult<()> {
-    let submitted_key = match operation {
-        TicketBackendOperation::Create { input } => input.repository_id.as_mut(),
-        TicketBackendOperation::EditItem { edit, .. } => match edit.target.as_mut() {
-            Some(ticket::TicketTargetEdit::Set { repository_id, .. }) => Some(repository_id),
-            _ => None,
-        },
-        _ => None,
-    };
-    let Some(repository_key) = submitted_key else {
-        return Ok(());
-    };
-    server_api::validate_repository_key(repository_key).map_err(|error| {
-        ApiError::from(Error::InvalidInput(format!(
-            "invalid Repository key: {error}"
-        )))
-    })?;
-    let repository_id = api
-        .store
-        .get_repository_by_key(workspace_id, repository_key)?
-        .map(|repository| repository.repository_id)
-        .ok_or_else(|| ApiError::from(Error::UnknownRepository(repository_key.clone())))?;
-    *repository_key = repository_id;
+    let mut repositories = HashSet::new();
+    for target in targets {
+        server_api::validate_repository_key(&target.repository_key).map_err(|error| {
+            ApiError::from(Error::InvalidInput(format!(
+                "invalid Repository key: {error}"
+            )))
+        })?;
+        let repository = api
+            .store
+            .get_repository_by_key(workspace_id, &target.repository_key)?
+            .ok_or_else(|| {
+                ApiError::from(Error::UnknownRepository(target.repository_key.clone()))
+            })?;
+        if !repositories.insert(repository.repository_id) {
+            return Err(Error::InvalidInput(format!(
+                "Ticket target Repository `{}` appears more than once",
+                target.repository_key
+            ))
+            .into());
+        }
+    }
     Ok(())
+}
+
+fn validate_ticket_operation_repository_keys(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    operation: &TicketBackendOperation,
+) -> ApiResult<()> {
+    match operation {
+        TicketBackendOperation::Create { input } => {
+            validate_ticket_target_repository_keys(api, workspace_id, &input.targets)
+        }
+        TicketBackendOperation::EditItem { edit, .. } => match edit.targets.as_ref() {
+            Some(TicketTargetsEdit::Set { targets }) => {
+                validate_ticket_target_repository_keys(api, workspace_id, targets)
+            }
+            Some(TicketTargetsEdit::Clear) | None => Ok(()),
+        },
+        _ => Ok(()),
+    }
 }
 
 async fn execute_ticket_rest_operation(
@@ -10596,7 +10834,7 @@ async fn execute_ticket_rest_operation(
     mut operation: TicketBackendOperation,
 ) -> ApiResult<TicketBackendOperationResult> {
     validate_workspace_scope(api, workspace_id)?;
-    resolve_ticket_operation_repository_keys(api, workspace_id, &mut operation)?;
+    validate_ticket_operation_repository_keys(api, workspace_id, &operation)?;
     let mut backend = SqliteTicketBackend::open_verified(
         api.config.database_path.clone(),
         api.config.workspace_id.clone(),
@@ -10698,7 +10936,7 @@ async fn execute_ticket_rest_operation(
         backend = backend.with_event_attributes(event_attributes);
     }
 
-    let mut result = execute_ticket_backend_operation(&backend, operation).map_err(Error::from)?;
+    let result = execute_ticket_backend_operation(&backend, operation).map_err(Error::from)?;
     if is_mutation {
         if let TicketBackendOperationResult::QueueOutcome(outcome) = &result {
             for ticket_id in &outcome.queued_tickets {
@@ -10723,16 +10961,6 @@ async fn execute_ticket_rest_operation(
                 source,
             );
         }
-    }
-    if let TicketBackendOperationResult::Ticket(ticket) = &mut result
-        && let Some(repository_id) = ticket.meta.repository_id.as_deref()
-    {
-        let repository_key = api
-            .store
-            .get_repository(workspace_id, repository_id)?
-            .map(|repository| repository.repository_key)
-            .ok_or_else(|| Error::UnknownRepository(repository_id.to_string()))?;
-        ticket.meta.repository_id = Some(repository_key);
     }
     Ok(result)
 }
@@ -12002,19 +12230,9 @@ async fn scoped_open_merge_request(
         )
         .into());
     }
-    let ticket = browser_ticket_backend(&api)?
-        .show(TicketIdOrSlug::Id(ticket_id.clone().into()))
-        .map_err(Error::from)?;
     let repository = api.require_configured_workspace_repository_by_key(&input.repository_key)?;
     let repository_id = repository.id;
-    if ticket.meta.repository_id.as_deref() != Some(repository_id.as_str())
-        || ticket.meta.ref_selector.as_deref() != Some(input.selector_to.as_str())
-    {
-        return Err(Error::InvalidInput(
-            "selectors must match the authoritative Ticket repository target".into(),
-        )
-        .into());
-    }
+    require_ticket_read_write_target(&api, &ticket_id, &repository_id, &input.selector_to)?;
     let source_observation = observe_published_source_ref(
         &api,
         &workspace_id,
@@ -12604,16 +12822,16 @@ fn validate_ticket_repository_operation(
     api: &WorkspaceApi,
     operation: &TicketBackendOperation,
 ) -> ApiResult<()> {
-    let repository_id = match operation {
-        TicketBackendOperation::Create { input } => input.repository_id.as_deref(),
-        TicketBackendOperation::EditItem { edit, .. } => match edit.target.as_ref() {
-            Some(TicketTargetEdit::Set { repository_id, .. }) => Some(repository_id.as_str()),
-            _ => None,
+    let targets: &[ticket::TicketTarget] = match operation {
+        TicketBackendOperation::Create { input } => &input.targets,
+        TicketBackendOperation::EditItem { edit, .. } => match edit.targets.as_ref() {
+            Some(TicketTargetsEdit::Set { targets }) => targets,
+            Some(TicketTargetsEdit::Clear) | None => &[],
         },
-        _ => None,
+        _ => &[],
     };
-    if let Some(repository_id) = repository_id {
-        api.require_workspace_repository(repository_id)?;
+    for target in targets {
+        api.require_configured_workspace_repository_by_key(&target.repository_key)?;
     }
     Ok(())
 }
@@ -13026,6 +13244,12 @@ async fn open_current_worker_workdir_session_locked(
                 link.workdir_id
             ),
         })?;
+    let effective_capabilities = link
+        .capabilities
+        .intersection(workdir_source_capabilities(&workdir))
+        .intersection(ticket_target_capabilities_for_workdir(
+            api, worker, &workdir,
+        )?);
     if let WorkdirRegistrySource::ExternalGrant { grant_id } = &workdir.source {
         close_current_worker_attachment_session_locked(api, worker).await?;
         let mut grant = api
@@ -13072,7 +13296,7 @@ async fn open_current_worker_workdir_session_locked(
                 code: "external_workdir_provider_offline".to_string(),
                 message: "External Workdir provider connection is unavailable".to_string(),
             })?;
-        let session: WorkdirSessionHandle = Arc::new(ExternalProviderWorkdirSession::new(
+        let source: WorkdirSessionHandle = Arc::new(ExternalProviderWorkdirSession::new(
             connection,
             Some(ExternalProviderAuditContext {
                 store: api.store.clone(),
@@ -13081,6 +13305,8 @@ async fn open_current_worker_workdir_session_locked(
                 attachment_alias: link.alias.clone(),
             }),
         ));
+        let session = workdir::WorkdirToolBroker::with_capabilities(source, effective_capabilities)
+            .tool_session();
         let replaced = api
             .workdir_sessions
             .lock()
@@ -13143,11 +13369,13 @@ async fn open_current_worker_workdir_session_locked(
         close_current_worker_attachment_session_locked(api, worker).await?;
     }
     let owner_worker_id = runtime_local_owner_worker_id(worker, runtime_id);
-    let session = api
+    let source = api
         .runtime
         .open_workdir_session(runtime_id, &workdir.workdir_id, owner_worker_id)
         .await
         .map_err(|error| error.into_error())?;
+    let session = workdir::WorkdirToolBroker::with_capabilities(source, effective_capabilities)
+        .tool_session();
     let replaced = api
         .workdir_sessions
         .lock()
@@ -13227,7 +13455,7 @@ fn sync_runtime_worker_workdir_attachments(
         .list_worker_workdir_links(&api.config.workspace_id, worker)?
         .into_iter()
         .filter(|link| link.unlinked_at.is_none())
-        .map(|link| {
+        .map(|mut link| {
             let workdir = api
                 .store
                 .get_workdir_registry(&api.config.workspace_id, &link.workdir_id)?
@@ -13237,14 +13465,16 @@ fn sync_runtime_worker_workdir_attachments(
                         link.workdir_id
                     ))
                 })?;
-            let capabilities = match workdir.source {
-                WorkdirRegistrySource::Repository { .. } => {
-                    workdir::WorkdirSessionCapabilities::ALL
-                }
-                WorkdirRegistrySource::ExternalGrant { .. } => {
-                    workdir::WorkdirSessionCapabilities::READ_ONLY
-                }
-            };
+            let capabilities = link
+                .capabilities
+                .intersection(workdir_source_capabilities(&workdir))
+                .intersection(ticket_target_capabilities_for_workdir(
+                    api, worker, &workdir,
+                )?);
+            if capabilities != link.capabilities {
+                link.capabilities = capabilities;
+                api.store.attach_worker_workdir(&link)?;
+            }
             Ok(LogicalWorkdirAttachment {
                 alias: workdir::WorkdirAttachmentAlias::new(link.alias)
                     .map_err(|error| Error::InvalidInput(error.to_string()))?,
@@ -13320,8 +13550,8 @@ async fn scoped_attach_current_worker_workdir(
         ))
         .into());
     }
-    let capabilities = match &workdir.source {
-        WorkdirRegistrySource::Repository { .. } => workdir::WorkdirSessionCapabilities::ALL,
+    match &workdir.source {
+        WorkdirRegistrySource::Repository { .. } => {}
         WorkdirRegistrySource::ExternalGrant { grant_id } => {
             let grant = api
                 .store
@@ -13353,9 +13583,9 @@ async fn scoped_attach_current_worker_workdir(
                 }
                 .into());
             }
-            workdir::WorkdirSessionCapabilities::READ_ONLY
         }
-    };
+    }
+    let capabilities = ticket_target_capabilities_for_workdir(&api, &worker, &workdir)?;
     let session_lock = current_worker_session_lock(&api, &worker);
     let _session_guard = session_lock.lock().await;
     if !api
@@ -13383,6 +13613,12 @@ async fn scoped_attach_current_worker_workdir(
             ))
             .into());
         }
+        let effective_capabilities = existing.capabilities.intersection(capabilities);
+        if effective_capabilities != existing.capabilities {
+            let mut attenuated = existing.clone();
+            attenuated.capabilities = effective_capabilities;
+            api.store.attach_worker_workdir(&attenuated)?;
+        }
         sync_runtime_worker_workdir_attachments(&api, &worker)?;
         api.worker_projection
             .refresh(&worker)
@@ -13391,7 +13627,7 @@ async fn scoped_attach_current_worker_workdir(
             workspace_id: api.config.workspace_id.clone(),
             alias: alias.to_string(),
             working_directory_id: workdir_id.to_string(),
-            capabilities,
+            capabilities: effective_capabilities,
             attached: true,
         }));
     }
@@ -13401,6 +13637,7 @@ async fn scoped_attach_current_worker_workdir(
         worker: worker.clone(),
         workdir_id: workdir_id.to_string(),
         alias: alias.to_string(),
+        capabilities,
         linked_at: Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
         unlinked_at: None,
     })?;
@@ -20796,6 +21033,7 @@ async fn create_workspace_worker_inner(
                 alias,
                 working_directory_id: selection.working_directory_id,
                 relative_cwd: selection.relative_cwd,
+                capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
             })
         })
         .collect::<ApiResult<Vec<_>>>()?;
@@ -21049,6 +21287,7 @@ fn finalize_spawned_worker_workdir_attachments(
                     worker_record,
                     attachment.alias.as_str(),
                     &summary.working_directory_id,
+                    workdir_source_capabilities(&workdir_record),
                     None,
                 ),
             )?;
@@ -21536,10 +21775,10 @@ fn api_error_with_additional_diagnostics(
 
 fn release_worker_workdir_attachment_reservations(
     api: &WorkspaceApi,
-    reservations: &[(String, String, String)],
+    reservations: &[(String, String, String, workdir::WorkdirSessionCapabilities)],
 ) -> Vec<RuntimeDiagnostic> {
     let mut diagnostics = Vec::new();
-    for (_, workdir_id, reservation_id) in reservations {
+    for (_, workdir_id, reservation_id, _) in reservations {
         if let Err(error) = api.store.release_worker_workdir_attachment_reservation(
             &api.config.workspace_id,
             workdir_id,
@@ -21565,7 +21804,7 @@ fn compensate_failed_workspace_worker_create(
     failure_phase: &str,
     worker: Option<&InternalWorkerSummary>,
     context: &WorkerSpawnCompensationContext<'_>,
-    attachment_reservations: &[(String, String, String)],
+    attachment_reservations: &[(String, String, String, workdir::WorkdirSessionCapabilities)],
 ) -> Vec<RuntimeDiagnostic> {
     let mut diagnostics = Vec::new();
     let reserved_worker_ref =
@@ -23563,11 +23802,14 @@ fn sync_worker_observation(
                 && link.alias == attachment.alias.as_str()
                 && link.workdir_id == working_directory.working_directory_id
         }) {
+            let capabilities =
+                ticket_target_capabilities_for_workdir(api, &record.worker, &workdir_record)?;
             link_worker_to_workdir(
                 api,
                 &record,
                 attachment.alias.as_str(),
                 &working_directory.working_directory_id,
+                capabilities,
                 None,
             )?;
         }
@@ -24001,6 +24243,7 @@ fn link_worker_to_workdir(
     worker_record: &WorkerRegistryRecord,
     alias: &str,
     workdir_id: &str,
+    capabilities: workdir::WorkdirSessionCapabilities,
     reservation_id: Option<&str>,
 ) -> ApiResult<()> {
     let timestamp = now_registry_timestamp();
@@ -24009,6 +24252,7 @@ fn link_worker_to_workdir(
         worker: worker_record.worker.clone(),
         workdir_id: workdir_id.to_string(),
         alias: alias.to_string(),
+        capabilities,
         linked_at: timestamp,
         unlinked_at: None,
     };
@@ -24953,6 +25197,12 @@ impl From<Error> for ApiError {
                     ticket::TicketError::InvalidTargetSelector { .. } => {
                         "ticket_target_selector_invalid"
                     }
+                    ticket::TicketError::DuplicateTargetRepository(_) => {
+                        "ticket_target_repository_duplicate"
+                    }
+                    ticket::TicketError::InvalidReadWriteTargetCount(_) => {
+                        "ticket_target_read_write_count_invalid"
+                    }
                     ticket::TicketError::TargetAuthorityUnavailable => {
                         "ticket_target_authority_unavailable"
                     }
@@ -25390,6 +25640,7 @@ mod tests {
             worker: worker.clone(),
             workdir_id: grant.workdir_id.clone(),
             alias: "expired-external".to_string(),
+            capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
             linked_at: created_at,
             unlinked_at: None,
         };
@@ -25803,6 +26054,7 @@ mod tests {
             worker: worker.clone(),
             workdir_id: "analysis-repository".to_string(),
             alias: "repository".to_string(),
+            capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
             linked_at: TEST_CREATED_AT.to_string(),
             unlinked_at: None,
         };
@@ -25811,13 +26063,23 @@ mod tests {
             worker: worker.clone(),
             workdir_id: grant.working_directory_id.clone(),
             alias: "session-logs".to_string(),
+            capabilities: workdir::WorkdirSessionCapabilities::ALL,
             linked_at: TEST_CREATED_AT.to_string(),
             unlinked_at: None,
         };
         api.store.attach_worker_workdir(&repository_link).unwrap();
         api.store.attach_worker_workdir(&external_link).unwrap();
         sync_runtime_worker_workdir_attachments(&api, &worker).unwrap();
-
+        let links = api
+            .store
+            .list_worker_workdir_links(TEST_WORKSPACE_ID, &worker)
+            .unwrap();
+        assert_eq!(links.len(), 2);
+        assert!(
+            links.iter().all(|link| {
+                link.capabilities == workdir::WorkdirSessionCapabilities::READ_ONLY
+            })
+        );
         let provider_root = tempfile::tempdir().unwrap();
         fs::write(provider_root.path().join("events.jsonl"), b"one\ntwo\n").unwrap();
         let local_session = workdir::LocalWorkdirSession::external_read_only(
@@ -27363,6 +27625,7 @@ mod tests {
             worker: worker.worker.clone(),
             workdir_id: workdir.workdir_id.clone(),
             alias: "attachment".to_string(),
+            capabilities: workdir::WorkdirSessionCapabilities::ALL,
             linked_at: "4".to_string(),
             unlinked_at: None,
         };
@@ -27729,7 +27992,7 @@ mod tests {
             .unwrap();
 
         let mut create_input = ticket::NewTicket::new("Foreign repository target");
-        create_input.repository_id = Some("foreign".to_string());
+        set_test_ticket_target(&mut create_input, "foreign", "HEAD");
         assert!(
             validate_ticket_repository_operation(
                 &api,
@@ -27764,7 +28027,7 @@ mod tests {
 
         let mut foreign_repository = api.config.repositories[0].clone();
         foreign_repository.id = "foreign".to_string();
-        let workdir_flow_launch = WorkerSpawnRequest {
+        let mut workdir_flow_launch = WorkerSpawnRequest {
             requested_worker_name: Some("cross-workspace-workdir".to_string()),
             intent: WorkerSpawnIntent::WorkspaceCoding,
             acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
@@ -27792,7 +28055,7 @@ mod tests {
             resolved_control_operation: None,
         };
         assert!(
-            api.validate_worker_spawn_repository_scope(&workdir_flow_launch)
+            api.validate_worker_spawn_repository_scope("runtime-1", &mut workdir_flow_launch)
                 .is_err()
         );
 
@@ -28067,53 +28330,41 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_worker_endpoint_finalizes_ticket_assignment() {
-        let workspace = tempfile::tempdir().unwrap();
-        init_clean_git_workspace(workspace.path());
-        let api = test_api(workspace.path()).await;
-        let backend = browser_ticket_backend(&api).unwrap();
-        let mut input = ticket::NewTicket::new("Assigned Ticket");
-        input.workflow_state = Some(TicketWorkflowState::Queued);
-        let ticket = backend.create(input).unwrap();
-        assign_test_orchestrator(&api, &ticket.id);
-        let response = create_workspace_worker(
-            State(api.clone()),
-            HeaderMap::new(),
-            Json(CreateWorkspaceWorkerRequest {
-                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
-                display_name: "Assigned Coder".to_string(),
-                profile: Some("builtin:coder".to_string()),
-                ticket_assignment: Some(CreateWorkspaceWorkerTicketAssignmentRequest {
-                    ticket_id: ticket.id.clone(),
-                    operation_id: "workspace-endpoint-assignment".to_string(),
-                }),
-                initial_submit: vec![Segment::Flow {
-                    selector: "builtin:coder-review".to_string(),
-                }],
-                workdir_attachments: Vec::new(),
-                control_operation_id: None,
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
+        let fixture = guarded_spawn_fixture().await;
+        let operation_id = "workspace-endpoint-assignment";
+        let response =
+            post_guarded_spawn(&fixture, guarded_spawn_payload(&fixture, operation_id)).await;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "unexpected guarded spawn response: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let response: BrowserCreateWorkerResponse = serde_json::from_slice(&bytes).unwrap();
 
         assert_eq!(
-            api.authority.ticket(&ticket.id).unwrap().state,
+            fixture
+                .api
+                .authority
+                .ticket(&fixture.ticket_id)
+                .unwrap()
+                .state,
             TicketWorkflowState::InProgress.as_str()
         );
-        let current = api
+        let current = fixture
+            .api
             .store
-            .get_current_ticket_coder_assignment(&api.config.workspace_id, &ticket.id)
+            .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
             .unwrap()
             .unwrap();
         let response_ref = RuntimeWorkerRef::new(&response.runtime_id, &response.worker_id);
         assert_eq!(current.worker, response_ref);
-        let operation = api
+        let operation = fixture
+            .api
             .store
-            .get_ticket_assignment_operation(
-                &api.config.workspace_id,
-                "workspace-endpoint-assignment",
-            )
+            .get_ticket_assignment_operation(TEST_WORKSPACE_ID, operation_id)
             .unwrap()
             .unwrap();
         assert_eq!(operation.assignment_id, Some(current.assignment_id));
@@ -28248,6 +28499,7 @@ mod tests {
                 worker: worker.clone(),
                 workdir_id: workdir_id.to_string(),
                 alias: "checkout".to_string(),
+                capabilities: workdir::WorkdirSessionCapabilities::ALL,
                 linked_at: TEST_CREATED_AT.to_string(),
                 unlinked_at: None,
             })
@@ -28502,41 +28754,51 @@ mod tests {
         controller: RuntimeWorkerRef,
         ticket_id: String,
         workdir_id: String,
+        read_only_workdir_id: String,
     }
 
     async fn guarded_spawn_fixture() -> GuardedSpawnFixture {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
-        let api = test_api(workspace.path()).await;
+        let api = test_api_with_docs_repository(workspace.path()).await;
         register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
         let runtime = WorkdirlessFixtureRuntime::default();
         let workdir_id = "guarded-existing-workdir".to_string();
+        let read_only_workdir_id = "guarded-docs-workdir".to_string();
         let repository_id = test_repository_id(&api);
+        let docs_repository_id = test_repository_id_by_key(&api, "docs");
+        assert_ne!(repository_id, docs_repository_id);
         runtime.set_workdir_repository(&workdir_id, &repository_id);
+        runtime.set_workdir_repository(&read_only_workdir_id, &docs_repository_id);
         api.runtime.register_or_replace(runtime.clone());
         let now = now_registry_timestamp();
-        api.store
-            .upsert_workdir_registry(&WorkdirRegistryRecord {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                workdir_id: workdir_id.clone(),
-                display_name: None,
-                source: WorkdirRegistrySource::Repository {
-                    runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.to_string(),
-                    repository_id: repository_id.clone(),
-                },
-                creation_selector: Some("develop".to_string()),
-                creation_ref: None,
-                creation_tree: None,
-                current_selector: Some("develop".to_string()),
-                current_ref: None,
-                current_tree: None,
-                observed_at_epoch_seconds: None,
-                materialization_status: "present".to_string(),
-                cleanliness: "clean".to_string(),
-                created_at: now.clone(),
-                updated_at: now,
-            })
-            .unwrap();
+        for (workdir_id, repository_id) in [
+            (&workdir_id, &repository_id),
+            (&read_only_workdir_id, &docs_repository_id),
+        ] {
+            api.store
+                .upsert_workdir_registry(&WorkdirRegistryRecord {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    workdir_id: workdir_id.clone(),
+                    display_name: None,
+                    source: WorkdirRegistrySource::Repository {
+                        runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.to_string(),
+                        repository_id: repository_id.clone(),
+                    },
+                    creation_selector: Some("develop".to_string()),
+                    creation_ref: None,
+                    creation_tree: None,
+                    current_selector: Some("develop".to_string()),
+                    current_ref: None,
+                    current_tree: None,
+                    observed_at_epoch_seconds: None,
+                    materialization_status: "present".to_string(),
+                    cleanliness: "clean".to_string(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                })
+                .unwrap();
+        }
         let Json(controller) = create_workspace_worker(
             State(api.clone()),
             HeaderMap::new(),
@@ -28555,13 +28817,21 @@ mod tests {
         let controller = RuntimeWorkerRef::new(controller.runtime_id, controller.worker_id);
         let mut input = ticket::NewTicket::new("Guarded attachment spawn");
         input.workflow_state = Some(TicketWorkflowState::Queued);
-        input.repository_id = Some(repository_id);
-        input.ref_selector = Some("develop".to_string());
+        input.targets = vec![
+            test_ticket_target("test-repository", "develop", TicketTargetAccess::ReadWrite),
+            test_ticket_target("docs", "develop", TicketTargetAccess::ReadOnly),
+        ];
         let ticket_id = browser_ticket_backend(&api)
             .unwrap()
             .create(input)
             .unwrap()
             .id;
+        assert_eq!(
+            validated_ticket_implementation_targets(&api, &ticket_id)
+                .unwrap()
+                .len(),
+            2
+        );
         assign_test_orchestrator(&api, &ticket_id);
         GuardedSpawnFixture {
             _workspace: workspace,
@@ -28570,6 +28840,7 @@ mod tests {
             controller,
             ticket_id,
             workdir_id,
+            read_only_workdir_id,
         }
     }
 
@@ -28586,11 +28857,17 @@ mod tests {
                 { "kind": "flow", "selector": "builtin:coder-review" },
                 { "kind": "text", "content": "Implement guarded attachment Ticket." },
             ],
-            "workdir_attachments": [{
-                "alias": "workdir",
-                "working_directory_id": fixture.workdir_id,
-                "relative_cwd": "crates/yoi",
-            }],
+            "workdir_attachments": [
+                {
+                    "alias": "workdir",
+                    "working_directory_id": fixture.workdir_id,
+                    "relative_cwd": "crates/yoi",
+                },
+                {
+                    "alias": "docs",
+                    "working_directory_id": fixture.read_only_workdir_id,
+                }
+            ],
             "control_operation_id": operation_id,
         })
     }
@@ -28599,7 +28876,7 @@ mod tests {
 
     #[derive(Clone)]
     struct StrictRemoteSpawnState {
-        workdir_status: worker_runtime::catalog::WorkingDirectoryStatus,
+        workdir_statuses: Arc<Vec<worker_runtime::catalog::WorkingDirectoryStatus>>,
         create_requests: Arc<Mutex<Vec<Value>>>,
     }
 
@@ -28624,18 +28901,36 @@ mod tests {
         AxumPath(working_directory_id): AxumPath<String>,
     ) -> Json<Value> {
         assert_strict_remote_request_headers(&headers);
-        assert_eq!(
-            state.workdir_status.summary.working_directory_id,
-            working_directory_id
-        );
-        Json(json!({ "working_directory": state.workdir_status }))
+        let workdir_status = state
+            .workdir_statuses
+            .iter()
+            .find(|status| status.summary.working_directory_id == working_directory_id)
+            .cloned()
+            .expect("strict Runtime received an unknown Workdir request");
+        Json(json!({ "working_directory": workdir_status }))
     }
 
     fn strict_remote_worker_response(
         state: &StrictRemoteSpawnState,
         request: &runtime_api::CreateWorkerRequest,
     ) -> Value {
-        let attachment = &request.workdir_attachments[0];
+        let workdir_attachments = request
+            .workdir_attachments
+            .iter()
+            .map(|attachment| {
+                let workdir_status = state
+                    .workdir_statuses
+                    .iter()
+                    .find(|status| {
+                        status.summary.working_directory_id == attachment.working_directory_id
+                    })
+                    .expect("strict Runtime response requires a registered Workdir");
+                json!({
+                    "alias": attachment.alias,
+                    "working_directory": workdir_status,
+                })
+            })
+            .collect::<Vec<_>>();
         let profile_source = match &request.profile_source {
             runtime_api::ProfileSourceArchiveSource::Embedded { archive } => {
                 archive.reference.clone()
@@ -28649,10 +28944,7 @@ mod tests {
                 "status": "idle",
                 "execution_metadata_available": true,
                 "workspace_id": TEST_WORKSPACE_ID,
-                "workdir_attachments": [{
-                    "alias": attachment.alias,
-                    "working_directory": state.workdir_status,
-                }],
+                "workdir_attachments": workdir_attachments,
                 "profile": request.profile,
                 "display_name": request.display_name,
                 "profile_source": profile_source,
@@ -28675,14 +28967,32 @@ mod tests {
         let request: runtime_api::CreateWorkerRequest =
             serde_json::from_value(raw.clone()).unwrap();
         assert!(request.workdir_attachment_requests.is_empty());
-        assert_eq!(request.workdir_attachments.len(), 1);
-        let attachment = &request.workdir_attachments[0];
-        assert_eq!(attachment.alias.as_str(), "workdir");
+        assert_eq!(request.workdir_attachments.len(), 2);
+        let writable = request
+            .workdir_attachments
+            .iter()
+            .find(|attachment| attachment.alias.as_str() == "workdir")
+            .unwrap();
+        assert_eq!(writable.relative_cwd.as_deref(), Some("crates/yoi"));
         assert_eq!(
-            attachment.working_directory_id,
-            state.workdir_status.summary.working_directory_id
+            writable.capabilities,
+            workdir::WorkdirSessionCapabilities::ALL
         );
-        assert_eq!(attachment.relative_cwd.as_deref(), Some("crates/yoi"));
+        let read_only = request
+            .workdir_attachments
+            .iter()
+            .find(|attachment| attachment.alias.as_str() == "docs")
+            .unwrap();
+        assert_eq!(read_only.relative_cwd, None);
+        assert_eq!(
+            read_only.capabilities,
+            workdir::WorkdirSessionCapabilities::READ_ONLY
+        );
+        for attachment in &request.workdir_attachments {
+            assert!(state.workdir_statuses.iter().any(|status| {
+                status.summary.working_directory_id == attachment.working_directory_id
+            }));
+        }
         state
             .create_requests
             .lock()
@@ -28757,14 +29067,20 @@ mod tests {
             guarded_spawn_artifact_counts(&fixture.api, &fixture.workdir_id),
             (0, 0, 0)
         );
-        assert!(
-            fixture
-                .api
-                .store
-                .list_workdir_worker_links(TEST_WORKSPACE_ID, &fixture.workdir_id)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            guarded_spawn_artifact_counts(&fixture.api, &fixture.read_only_workdir_id),
+            (0, 0, 0)
         );
+        for workdir_id in [&fixture.workdir_id, &fixture.read_only_workdir_id] {
+            assert!(
+                fixture
+                    .api
+                    .store
+                    .list_workdir_worker_links(TEST_WORKSPACE_ID, workdir_id)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
         assert!(
             fixture
                 .api
@@ -28793,7 +29109,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guarded_spawn_http_boundary_preserves_canonical_initial_attachment() {
+    async fn guarded_spawn_http_boundary_preserves_multi_target_capabilities() {
         let fixture = guarded_spawn_fixture().await;
         let payload = guarded_spawn_payload(&fixture, "guarded-success");
         assert!(payload.get("working_directory").is_none());
@@ -28808,53 +29124,96 @@ mod tests {
             String::from_utf8_lossy(&bytes)
         );
         let body: BrowserCreateWorkerResponse = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body.worker.workdir_attachments.len(), 1);
-        assert_eq!(body.worker.workdir_attachments[0].alias, "workdir");
-        assert_eq!(
-            body.worker.workdir_attachments[0]
-                .working_directory
-                .working_directory_id,
-            fixture.workdir_id
-        );
+        assert_eq!(body.worker.workdir_attachments.len(), 2);
+        assert!(body.worker.workdir_attachments.iter().any(|attachment| {
+            attachment.alias == "workdir"
+                && attachment.working_directory.working_directory_id == fixture.workdir_id
+        }));
+        assert!(body.worker.workdir_attachments.iter().any(|attachment| {
+            attachment.alias == "docs"
+                && attachment.working_directory.working_directory_id == fixture.read_only_workdir_id
+        }));
         let requests = fixture.runtime.spawn_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].resolved_workdir_attachments.len(), 1);
-        let attachment = &requests[0].resolved_workdir_attachments[0];
-        assert_eq!(attachment.alias.as_str(), "workdir");
-        assert_eq!(attachment.working_directory_id, fixture.workdir_id);
-        assert_eq!(attachment.relative_cwd.as_deref(), Some("crates/yoi"));
-        assert!(
-            fixture
-                .api
-                .store
-                .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
-                .unwrap()
-                .is_some()
-        );
+        assert_eq!(requests[0].resolved_workdir_attachments.len(), 2);
+        let writable = requests[0]
+            .resolved_workdir_attachments
+            .iter()
+            .find(|attachment| attachment.alias.as_str() == "workdir")
+            .unwrap();
+        assert_eq!(writable.working_directory_id, fixture.workdir_id);
+        assert_eq!(writable.relative_cwd.as_deref(), Some("crates/yoi"));
         assert_eq!(
-            fixture
-                .api
-                .store
-                .list_workdir_worker_links(TEST_WORKSPACE_ID, &fixture.workdir_id)
-                .unwrap()
-                .len(),
-            1
+            writable.capabilities,
+            workdir::WorkdirSessionCapabilities::ALL
         );
+        let read_only = requests[0]
+            .resolved_workdir_attachments
+            .iter()
+            .find(|attachment| attachment.alias.as_str() == "docs")
+            .unwrap();
+        assert_eq!(read_only.working_directory_id, fixture.read_only_workdir_id);
+        assert_eq!(
+            read_only.capabilities,
+            workdir::WorkdirSessionCapabilities::READ_ONLY
+        );
+        let worker = fixture
+            .api
+            .store
+            .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id)
+            .unwrap()
+            .unwrap()
+            .worker;
+        let links = fixture
+            .api
+            .store
+            .list_worker_workdir_links(TEST_WORKSPACE_ID, &worker)
+            .unwrap();
+        assert_eq!(links.len(), 2);
+        assert!(links.iter().any(|link| {
+            link.workdir_id == fixture.workdir_id
+                && link.capabilities == workdir::WorkdirSessionCapabilities::ALL
+        }));
+        assert!(links.iter().any(|link| {
+            link.workdir_id == fixture.read_only_workdir_id
+                && link.capabilities == workdir::WorkdirSessionCapabilities::READ_ONLY
+        }));
+    }
+
+    #[tokio::test]
+    async fn guarded_spawn_rejects_missing_target_before_runtime_side_effects() {
+        let fixture = guarded_spawn_fixture().await;
+        let mut payload = guarded_spawn_payload(&fixture, "guarded-missing-target");
+        payload["workdir_attachments"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|attachment| attachment["alias"] != "docs");
+
+        let response = post_guarded_spawn(&fixture, payload).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(fixture.runtime.spawn_requests().is_empty());
+        assert_guarded_spawn_rolled_back(&fixture);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn guarded_spawn_crosses_strict_remote_runtime_http_boundary() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
-        let api = test_api(workspace.path()).await;
+        let api = test_api_with_docs_repository(workspace.path()).await;
         register_test_runtime(&api, STRICT_REMOTE_RUNTIME_ID).await;
 
         let workdir_id = "guarded-strict-remote-workdir".to_string();
+        let read_only_workdir_id = "guarded-strict-remote-docs-workdir".to_string();
         let repository_id = test_repository_id(&api);
+        let docs_repository_id = test_repository_id_by_key(&api, "docs");
+        assert_ne!(repository_id, docs_repository_id);
         let mut workdir_status = WorkdirlessFixtureRuntime::workdir_status(&workdir_id);
         workdir_status.summary.repository_id = repository_id.clone();
+        let mut read_only_workdir_status =
+            WorkdirlessFixtureRuntime::workdir_status(&read_only_workdir_id);
+        read_only_workdir_status.summary.repository_id = docs_repository_id.clone();
         let strict_state = StrictRemoteSpawnState {
-            workdir_status,
+            workdir_statuses: Arc::new(vec![workdir_status, read_only_workdir_status]),
             create_requests: Arc::new(Mutex::new(Vec::new())),
         };
         let runtime_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -28894,28 +29253,33 @@ mod tests {
             .unwrap(),
         );
         let now = now_registry_timestamp();
-        api.store
-            .upsert_workdir_registry(&WorkdirRegistryRecord {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                workdir_id: workdir_id.clone(),
-                display_name: None,
-                source: WorkdirRegistrySource::Repository {
-                    runtime_id: STRICT_REMOTE_RUNTIME_ID.to_string(),
-                    repository_id: repository_id.clone(),
-                },
-                creation_selector: Some("develop".to_string()),
-                creation_ref: None,
-                creation_tree: None,
-                current_selector: Some("develop".to_string()),
-                current_ref: None,
-                current_tree: None,
-                observed_at_epoch_seconds: None,
-                materialization_status: "present".to_string(),
-                cleanliness: "clean".to_string(),
-                created_at: now.clone(),
-                updated_at: now,
-            })
-            .unwrap();
+        for (workdir_id, repository_id) in [
+            (&workdir_id, &repository_id),
+            (&read_only_workdir_id, &docs_repository_id),
+        ] {
+            api.store
+                .upsert_workdir_registry(&WorkdirRegistryRecord {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    workdir_id: workdir_id.clone(),
+                    display_name: None,
+                    source: WorkdirRegistrySource::Repository {
+                        runtime_id: STRICT_REMOTE_RUNTIME_ID.to_string(),
+                        repository_id: repository_id.clone(),
+                    },
+                    creation_selector: Some("develop".to_string()),
+                    creation_ref: None,
+                    creation_tree: None,
+                    current_selector: Some("develop".to_string()),
+                    current_ref: None,
+                    current_tree: None,
+                    observed_at_epoch_seconds: None,
+                    materialization_status: "present".to_string(),
+                    cleanliness: "clean".to_string(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                })
+                .unwrap();
+        }
         let Json(controller) = create_workspace_worker(
             State(api.clone()),
             HeaderMap::new(),
@@ -28934,8 +29298,10 @@ mod tests {
         let controller = RuntimeWorkerRef::new(controller.runtime_id, controller.worker_id);
         let mut ticket = ticket::NewTicket::new("Strict remote guarded attachment spawn");
         ticket.workflow_state = Some(TicketWorkflowState::Queued);
-        ticket.repository_id = Some(repository_id);
-        ticket.ref_selector = Some("develop".to_string());
+        ticket.targets = vec![
+            test_ticket_target("test-repository", "develop", TicketTargetAccess::ReadWrite),
+            test_ticket_target("docs", "develop", TicketTargetAccess::ReadOnly),
+        ];
         let ticket_id = browser_ticket_backend(&api)
             .unwrap()
             .create(ticket)
@@ -28954,11 +29320,17 @@ mod tests {
                 { "kind": "flow", "selector": "builtin:coder-review" },
                 { "kind": "text", "content": "Implement strict remote attachment Ticket." },
             ],
-            "workdir_attachments": [{
-                "alias": "workdir",
-                "working_directory_id": workdir_id,
-                "relative_cwd": "crates/yoi",
-            }],
+            "workdir_attachments": [
+                {
+                    "alias": "workdir",
+                    "working_directory_id": workdir_id,
+                    "relative_cwd": "crates/yoi",
+                },
+                {
+                    "alias": "docs",
+                    "working_directory_id": read_only_workdir_id,
+                }
+            ],
             "control_operation_id": "guarded-strict-remote-success",
         });
         assert!(payload.get("working_directory").is_none());
@@ -28986,14 +29358,15 @@ mod tests {
         );
         let body: BrowserCreateWorkerResponse = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body.worker.runtime_id, STRICT_REMOTE_RUNTIME_ID);
-        assert_eq!(body.worker.workdir_attachments.len(), 1);
-        assert_eq!(body.worker.workdir_attachments[0].alias.as_str(), "workdir");
-        assert_eq!(
-            body.worker.workdir_attachments[0]
-                .working_directory
-                .working_directory_id,
-            workdir_id
-        );
+        assert_eq!(body.worker.workdir_attachments.len(), 2);
+        assert!(body.worker.workdir_attachments.iter().any(|attachment| {
+            attachment.alias.as_str() == "workdir"
+                && attachment.working_directory.working_directory_id == workdir_id
+        }));
+        assert!(body.worker.workdir_attachments.iter().any(|attachment| {
+            attachment.alias.as_str() == "docs"
+                && attachment.working_directory.working_directory_id == read_only_workdir_id
+        }));
         let requests = strict_state
             .create_requests
             .lock()
@@ -29002,22 +29375,28 @@ mod tests {
         assert!(requests[0].get("working_directory").is_none());
         assert_eq!(
             requests[0]["workdir_attachments"].as_array().unwrap().len(),
-            1
+            2
         );
         drop(requests);
-        assert!(
-            api.store
-                .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &ticket_id)
-                .unwrap()
-                .is_some()
-        );
-        assert_eq!(
-            api.store
-                .list_workdir_worker_links(TEST_WORKSPACE_ID, &workdir_id)
-                .unwrap()
-                .len(),
-            1
-        );
+        let worker = api
+            .store
+            .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &ticket_id)
+            .unwrap()
+            .unwrap()
+            .worker;
+        let links = api
+            .store
+            .list_worker_workdir_links(TEST_WORKSPACE_ID, &worker)
+            .unwrap();
+        assert_eq!(links.len(), 2);
+        assert!(links.iter().any(|link| {
+            link.workdir_id == workdir_id
+                && link.capabilities == workdir::WorkdirSessionCapabilities::ALL
+        }));
+        assert!(links.iter().any(|link| {
+            link.workdir_id == read_only_workdir_id
+                && link.capabilities == workdir::WorkdirSessionCapabilities::READ_ONLY
+        }));
         runtime_server.abort();
     }
 
@@ -29493,6 +29872,7 @@ mod tests {
                 worker: RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, "7"),
                 workdir_id: "managed".to_string(),
                 alias: "attachment".to_string(),
+                capabilities: workdir::WorkdirSessionCapabilities::ALL,
                 linked_at: "3".to_string(),
                 unlinked_at: None,
             })
@@ -32317,10 +32697,9 @@ mod tests {
         let api = test_api(dir.path()).await;
         let backend = browser_ticket_backend(&api).unwrap();
 
-        let repository_id = test_repository_id(&api);
+        let repository_key = "test-repository";
         let mut input = ticket::NewTicket::new("Validated target");
-        input.repository_id = Some(repository_id.clone());
-        input.ref_selector = Some("develop".to_owned());
+        set_test_ticket_target(&mut input, repository_key, "develop");
         let ticket_ref = backend.create(input).unwrap();
         let request = ticket::TicketMarkReady {
             operation_key: "ready-server-test".to_owned(),
@@ -32333,10 +32712,13 @@ mod tests {
             .unwrap();
         assert_eq!(ready.meta.workflow_state, TicketWorkflowState::Ready);
         assert_eq!(
-            ready.meta.repository_id.as_deref(),
-            Some(repository_id.as_str())
+            ready.meta.targets,
+            vec![test_ticket_target(
+                repository_key,
+                "develop",
+                TicketTargetAccess::ReadWrite,
+            )]
         );
-        assert_eq!(ready.meta.ref_selector.as_deref(), Some("develop"));
         assert_eq!(
             backend
                 .mark_ready(TicketIdOrSlug::Id(ticket_ref.id.clone()), request)
@@ -32351,9 +32733,12 @@ mod tests {
             backend.edit_item(
                 TicketIdOrSlug::Id(ticket_ref.id.clone()),
                 ticket::TicketItemEdit {
-                    target: Some(ticket::TicketTargetEdit::Set {
-                        repository_id: TEST_REPOSITORY_ID.to_owned(),
-                        ref_selector: Some("other".to_owned()),
+                    targets: Some(ticket::TicketTargetsEdit::Set {
+                        targets: vec![test_ticket_target(
+                            "test-repository",
+                            "other",
+                            TicketTargetAccess::ReadWrite,
+                        )],
                     }),
                     ..Default::default()
                 },
@@ -32362,7 +32747,7 @@ mod tests {
         ));
 
         let mut missing = ticket::NewTicket::new("Missing target");
-        missing.repository_id = Some("unknown".to_owned());
+        set_test_ticket_target(&mut missing, "unknown", "develop");
         assert!(backend.create(missing).is_err());
         assert!(matches!(
             backend.set_workflow_state(
@@ -32371,6 +32756,29 @@ mod tests {
             ),
             Err(ticket::TicketError::InvalidWorkflowTransition { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn merge_request_target_rejects_read_only_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let api = test_api_with_docs_repository(dir.path()).await;
+        let writable_repository_id = test_repository_id(&api);
+        let docs_repository_id = test_repository_id_by_key(&api, "docs");
+        let mut input = ticket::NewTicket::new("Read-only MR target");
+        input.workflow_state = Some(TicketWorkflowState::Queued);
+        input.targets = vec![
+            test_ticket_target("test-repository", "develop", TicketTargetAccess::ReadWrite),
+            test_ticket_target("docs", "develop", TicketTargetAccess::ReadOnly),
+        ];
+        let ticket = browser_ticket_backend(&api).unwrap().create(input).unwrap();
+
+        require_ticket_read_write_target(&api, &ticket.id, &writable_repository_id, "develop")
+            .unwrap();
+        let error =
+            require_ticket_read_write_target(&api, &ticket.id, &docs_repository_id, "develop")
+                .unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -32504,8 +32912,7 @@ mod tests {
         execution.take_inputs();
 
         let mut input = ticket::NewTicket::new("Bounded notification");
-        input.repository_id = Some(test_repository_id(&api));
-        input.ref_selector = Some("develop".to_owned());
+        set_test_ticket_target(&mut input, "test-repository", "develop");
         let ticket = browser_ticket_backend(&api).unwrap().create(input).unwrap();
         assign_test_orchestrator(&api, &ticket.id);
         let ticket_id = TicketIdOrSlug::Id(ticket.id.clone());
@@ -33254,8 +33661,7 @@ mod tests {
         let backend = browser_ticket_backend(&api).unwrap();
         let mut input = ticket::NewTicket::new("Queue role gate");
         input.workflow_state = Some(TicketWorkflowState::Ready);
-        input.repository_id = Some(test_repository_id(&api));
-        input.ref_selector = Some("develop".to_string());
+        set_test_ticket_target(&mut input, "test-repository", "develop");
         let ticket = backend.create(input).unwrap();
         let path = (TEST_WORKSPACE_ID.to_string(), ticket.id.clone());
 
@@ -33317,13 +33723,11 @@ mod tests {
         let backend = browser_ticket_backend(&api).unwrap();
         let mut first_input = ticket::NewTicket::new("First cycle Ticket");
         first_input.workflow_state = Some(TicketWorkflowState::Ready);
-        first_input.repository_id = Some(test_repository_id(&api));
-        first_input.ref_selector = Some("develop".to_string());
+        set_test_ticket_target(&mut first_input, "test-repository", "develop");
         let first = backend.create(first_input).unwrap();
         let mut second_input = ticket::NewTicket::new("Second cycle Ticket");
         second_input.workflow_state = Some(TicketWorkflowState::Ready);
-        second_input.repository_id = Some(test_repository_id(&api));
-        second_input.ref_selector = Some("develop".to_string());
+        set_test_ticket_target(&mut second_input, "test-repository", "develop");
         let second = backend.create(second_input).unwrap();
         for (ticket_id, target) in [
             (first.id.clone(), second.id.clone()),
@@ -33370,13 +33774,11 @@ mod tests {
         let backend = browser_ticket_backend(&api).unwrap();
         let mut dependency_input = ticket::NewTicket::new("Invalid target dependency");
         dependency_input.workflow_state = Some(TicketWorkflowState::Ready);
-        dependency_input.repository_id = Some(test_repository_id(&api));
-        dependency_input.ref_selector = Some("missing-ref".to_string());
+        set_test_ticket_target(&mut dependency_input, "test-repository", "missing-ref");
         let dependency = backend.create(dependency_input).unwrap();
         let mut root_input = ticket::NewTicket::new("Queue root");
         root_input.workflow_state = Some(TicketWorkflowState::Ready);
-        root_input.repository_id = Some(test_repository_id(&api));
-        root_input.ref_selector = Some("develop".to_string());
+        set_test_ticket_target(&mut root_input, "test-repository", "develop");
         let root = backend.create(root_input).unwrap();
         backend
             .add_ticket_relation(
@@ -33424,13 +33826,11 @@ mod tests {
         let backend = browser_ticket_backend(&api).unwrap();
         let mut dependency_input = ticket::NewTicket::new("Ready dependency");
         dependency_input.workflow_state = Some(TicketWorkflowState::Ready);
-        dependency_input.repository_id = Some(test_repository_id(&api));
-        dependency_input.ref_selector = Some("develop".to_string());
+        set_test_ticket_target(&mut dependency_input, "test-repository", "develop");
         let dependency = backend.create(dependency_input).unwrap();
         let mut root_input = ticket::NewTicket::new("Queue root");
         root_input.workflow_state = Some(TicketWorkflowState::Ready);
-        root_input.repository_id = Some(test_repository_id(&api));
-        root_input.ref_selector = Some("develop".to_string());
+        set_test_ticket_target(&mut root_input, "test-repository", "develop");
         let root = backend.create(root_input).unwrap();
         backend
             .add_ticket_relation(
@@ -33783,8 +34183,7 @@ mod tests {
         let backend = browser_ticket_backend(&api).unwrap();
         let mut input = ticket::NewTicket::new("Recover queued work");
         input.workflow_state = Some(TicketWorkflowState::Queued);
-        input.repository_id = Some(test_repository_id(&api));
-        input.ref_selector = Some("HEAD".to_owned());
+        set_test_ticket_target(&mut input, "test-repository", "HEAD");
         let ticket_ref = backend.create(input).unwrap();
         assign_test_orchestrator(&api, &ticket_ref.id);
         *api.orchestrator_attention_fingerprint.lock().unwrap() = Some(ticket_ref.id.clone());
@@ -33908,18 +34307,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_spawn_and_restore_assignment_operations_are_idempotent() {
+    async fn runtime_worker_ticket_assignment_rejects_missing_target_attachments() {
         let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
         let api = test_api(dir.path()).await;
         let backend = browser_ticket_backend(&api).unwrap();
-        let mut first_ticket_input = ticket::NewTicket::new("Spawn assignment");
-        first_ticket_input.workflow_state = Some(TicketWorkflowState::Queued);
-        let first_ticket = backend.create(first_ticket_input).unwrap();
-        assign_test_orchestrator(&api, &first_ticket.id);
+        let mut input = ticket::NewTicket::new("Unsafe direct Runtime assignment");
+        input.workflow_state = Some(TicketWorkflowState::Queued);
+        set_test_ticket_target(&mut input, "test-repository", "develop");
+        let ticket = backend.create(input).unwrap();
+        assign_test_orchestrator(&api, &ticket.id);
         let request = server_api::RuntimeWorkerSpawnRequest {
             requested_worker_name: Some("assigned-spawn".to_string()),
             intent: server_api::RuntimeWorkerSpawnIntent::TicketRole {
-                ticket_id: first_ticket.id.clone(),
+                ticket_id: ticket.id.clone(),
                 role: server_api::RuntimeTicketWorkerRole::Coder,
             },
             acceptance: server_api::RuntimeWorkerSpawnAcceptanceRequirement::RunAccepted {
@@ -33927,8 +34328,8 @@ mod tests {
             },
             profile: server_api::RuntimeProfileSelector::Builtin("builtin:coder".to_string()),
             ticket_assignment: Some(server_api::RuntimeWorkerTicketAssignmentRequest {
-                ticket_id: first_ticket.id.clone(),
-                operation_id: "spawn-assignment-operation".to_string(),
+                ticket_id: ticket.id.clone(),
+                operation_id: "unsafe-runtime-assignment".to_string(),
             }),
             initial_submit: vec![
                 serde_json::to_value(Segment::Flow {
@@ -33938,495 +34339,28 @@ mod tests {
             ],
             workdir_attachment_requests: Vec::new(),
         };
-        let Json(first) = scoped_create_runtime_worker(
+
+        let error = scoped_create_runtime_worker(
             State(api.clone()),
             AxumPath(ScopedRuntimePath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
-            }),
-            Json(request.clone()),
-        )
-        .await
-        .unwrap();
-        let first_worker = first.worker.unwrap();
-        let first_worker_ref =
-            RuntimeWorkerRef::new(&first_worker.runtime_id, &first_worker.worker_id);
-        let Json(projected) = scoped_list_ticket_assignments(
-            State(api.clone()),
-            AxumPath(ScopedRecordPath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                id: first_ticket.id.clone(),
-            }),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            &projected.assignments[0].principal,
-            server_api::TicketAssignmentPrincipal::Worker { worker_id, .. }
-                if worker_id == &first_worker.worker_id
-        ));
-        assert_eq!(
-            backend
-                .show(first_ticket.id.clone().into())
-                .unwrap()
-                .meta
-                .workflow_state,
-            TicketWorkflowState::InProgress
-        );
-        let Json(retried) = scoped_create_runtime_worker(
-            State(api.clone()),
-            AxumPath(ScopedRuntimePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
-            }),
-            Json(request.clone()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(retried.worker.unwrap().worker_id, first_worker.worker_id);
-        assert_eq!(
-            api.store
-                .list_ticket_coder_assignment_events(TEST_WORKSPACE_ID, &first_ticket.id, 10,)
-                .unwrap()
-                .len(),
-            1
-        );
-
-        let current = api
-            .store
-            .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &first_ticket.id)
-            .unwrap()
-            .unwrap();
-        api.store
-            .clear_current_ticket_worker_assignment(
-                TEST_WORKSPACE_ID,
-                &first_ticket.id,
-                Some(&current.assignment_id),
-                "spawn-unassign-operation",
-                "spawn-unassign-event",
-                "test-user",
-                TEST_CREATED_AT,
-            )
-            .unwrap();
-        api.runtime
-            .stop_worker(
-                &first_worker_ref,
-                WorkerLifecycleRequest {
-                    reason: Some("restore assignment test".to_string()),
-                    ticket_assignment: None,
-                },
-            )
-            .unwrap();
-        let mut second_ticket_input = ticket::NewTicket::new("Restore assignment");
-        second_ticket_input.workflow_state = Some(TicketWorkflowState::Queued);
-        let second_ticket = backend.create(second_ticket_input).unwrap();
-        assign_test_orchestrator(&api, &second_ticket.id);
-        let _ = scoped_restore_runtime_worker(
-            State(api.clone()),
-            AxumPath(ScopedRuntimeWorkerPath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                worker: RuntimeWorkerRef::new(
-                    EMBEDDED_WORKER_RUNTIME_ID,
-                    first_worker.worker_id.clone(),
-                ),
-            }),
-            Query(RestoreTicketAssignmentQuery {
-                ticket_id: Some(second_ticket.id.clone()),
-                assignment_operation_id: Some("restore-assignment-operation".to_string()),
-            }),
-        )
-        .await
-        .unwrap();
-        let Json(retried_restore) = scoped_restore_runtime_worker(
-            State(api.clone()),
-            AxumPath(ScopedRuntimeWorkerPath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                worker: RuntimeWorkerRef::new(
-                    EMBEDDED_WORKER_RUNTIME_ID,
-                    first_worker.worker_id.clone(),
-                ),
-            }),
-            Query(RestoreTicketAssignmentQuery {
-                ticket_id: Some(second_ticket.id.clone()),
-                assignment_operation_id: Some("restore-assignment-operation".to_string()),
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(retried_restore.worker_id, first_worker.worker_id);
-        assert_eq!(
-            retried_restore.result.state,
-            server_api::WorkerRestoreState::Accepted
-        );
-        let restored_assignment = api
-            .store
-            .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &second_ticket.id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(restored_assignment.worker.worker_id, first_worker.worker_id);
-        assert_eq!(
-            backend
-                .show(second_ticket.id.clone().into())
-                .unwrap()
-                .meta
-                .workflow_state,
-            TicketWorkflowState::InProgress
-        );
-
-        api.store
-            .clear_current_ticket_worker_assignment(
-                TEST_WORKSPACE_ID,
-                &second_ticket.id,
-                Some(&restored_assignment.assignment_id),
-                "restore-clear-operation",
-                "restore-clear-event",
-                "test",
-                TEST_CREATED_AT,
-            )
-            .unwrap();
-        let pending_api_request = server_api::RuntimeWorkerSpawnRequest {
-            intent: server_api::RuntimeWorkerSpawnIntent::TicketRole {
-                ticket_id: second_ticket.id.clone(),
-                role: server_api::RuntimeTicketWorkerRole::Coder,
-            },
-            ticket_assignment: Some(server_api::RuntimeWorkerTicketAssignmentRequest {
-                ticket_id: second_ticket.id.clone(),
-                operation_id: "pending-spawn-operation".to_string(),
-            }),
-            ..request
-        };
-        let mut pending_request =
-            worker_spawn_request_from_api(pending_api_request.clone()).unwrap();
-        pending_request.resolved_workspace_api =
-            Some(test_worker_workspace_api(EMBEDDED_WORKER_RUNTIME_ID));
-        let (_, pending_fingerprint) = crate::hosts::worker_spawn_idempotency(&pending_request)
-            .unwrap()
-            .unwrap();
-        api.store
-            .reserve_ticket_assignment_operation(
-                TEST_WORKSPACE_ID,
-                "pending-spawn-operation",
-                &second_ticket.id,
-                EMBEDDED_WORKER_RUNTIME_ID,
-                None,
-                &pending_fingerprint,
-                TEST_CREATED_AT,
-            )
-            .unwrap();
-        let current_memory_settings = api
-            .config_store
-            .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-            .unwrap();
-        let reservation = api
-            .config_store
-            .reserve_worker_create(
-                TEST_WORKSPACE_ID,
-                EMBEDDED_WORKER_RUNTIME_ID,
-                "pending-spawn-operation",
-                &pending_fingerprint,
-                &current_memory_settings,
-            )
-            .unwrap();
-        pending_request.resolved_memory_settings = Some(reservation.memory_settings.clone());
-        let spawned_before_backend_failure = api
-            .runtime
-            .spawn_worker(
-                EMBEDDED_WORKER_RUNTIME_ID,
-                WorkerCreateBinding {
-                    worker_id: reservation.worker_id,
-                    create_fingerprint: reservation.create_fingerprint,
-                },
-                pending_request.clone(),
-            )
-            .unwrap()
-            .worker
-            .unwrap();
-        assert!(
-            api.store
-                .get_ticket_assignment_operation(TEST_WORKSPACE_ID, "pending-spawn-operation")
-                .unwrap()
-                .is_some_and(|operation| operation.worker.is_none())
-        );
-        let worker_count_before_retry = api.runtime.list_workers(100).items.len();
-        let Json(reconciled) = scoped_create_runtime_worker(
-            State(api.clone()),
-            AxumPath(ScopedRuntimePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
-            }),
-            Json(pending_api_request),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            reconciled.worker.unwrap().worker_id,
-            spawned_before_backend_failure.worker.worker_id
-        );
-        assert_eq!(
-            api.runtime.list_workers(100).items.len(),
-            worker_count_before_retry,
-            "retrying a reserved lifecycle operation must not spawn another Worker"
-        );
-        assert!(
-            api.store
-                .get_ticket_assignment_operation(TEST_WORKSPACE_ID, "pending-spawn-operation")
-                .unwrap()
-                .and_then(|operation| operation.assignment_id)
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn worker_spawn_finalize_failure_reports_stage_and_compensation_outcomes() {
-        let dir = tempfile::tempdir().unwrap();
-        let api = test_api(dir.path()).await;
-        register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
-        api.runtime
-            .register_or_replace(WorkdirlessFixtureRuntime::default());
-        let mut ticket_input = ticket::NewTicket::new("Compensation test Ticket");
-        ticket_input.workflow_state = Some(TicketWorkflowState::InProgress);
-        let ticket_id = browser_ticket_backend(&api)
-            .unwrap()
-            .create(ticket_input)
-            .unwrap()
-            .id;
-        assign_test_orchestrator(&api, &ticket_id);
-        let assignment = crate::hosts::WorkerTicketAssignmentRequest {
-            ticket_id: ticket_id.clone(),
-            operation_id: "compensation-test-operation".to_string(),
-        };
-        let request = server_api::RuntimeWorkerSpawnRequest {
-            intent: server_api::RuntimeWorkerSpawnIntent::TicketRole {
-                ticket_id: ticket_id.clone(),
-                role: server_api::RuntimeTicketWorkerRole::Coder,
-            },
-            requested_worker_name: Some("Compensation test Worker".to_string()),
-            acceptance: server_api::RuntimeWorkerSpawnAcceptanceRequirement::RunAccepted {
-                expected_segments: 1,
-            },
-            profile: server_api::RuntimeProfileSelector::Builtin("builtin:coder".to_string()),
-            ticket_assignment: Some(server_api::RuntimeWorkerTicketAssignmentRequest {
-                ticket_id: assignment.ticket_id.clone(),
-                operation_id: assignment.operation_id.clone(),
-            }),
-            initial_submit: vec![
-                serde_json::to_value(Segment::Flow {
-                    selector: "builtin:coder-review".to_string(),
-                })
-                .unwrap(),
-            ],
-            workdir_attachment_requests: Vec::new(),
-        };
-        let Json(created) = scoped_create_runtime_worker(
-            State(api.clone()),
-            AxumPath(ScopedRuntimePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.to_string(),
             }),
             Json(request),
         )
         .await
-        .unwrap();
-        let created_worker = created.worker.unwrap();
-        let worker_ref =
-            RuntimeWorkerRef::new(&created_worker.runtime_id, &created_worker.worker_id);
-        let mut worker = api.runtime.worker(&worker_ref).unwrap();
-        assert!(
-            api.store
-                .get_worker_registry(TEST_WORKSPACE_ID, &worker.worker)
-                .unwrap()
-                .is_some()
-        );
-
-        let spawned_workdir_ids = vec![
-            "spawned-workdir-left".to_string(),
-            "spawned-workdir-right".to_string(),
-        ];
-        for workdir_id in &spawned_workdir_ids {
-            seed_cleanup_workdir_for_runtime(
-                &api,
-                workdir_id,
-                WorkdirlessFixtureRuntime::RUNTIME_ID,
-                "present",
-                "clean",
-            );
-        }
-        worker.workdir_attachments = spawned_workdir_ids
-            .iter()
-            .enumerate()
-            .map(|(index, workdir_id)| {
-                let mut working_directory = WorkdirlessFixtureRuntime::workdir_status(workdir_id);
-                if index == 1 {
-                    working_directory.summary.display_name =
-                        Some("inject-registry-upsert-failure".to_string());
-                }
-                WorkingDirectoryAttachmentStatus {
-                    alias: workdir::WorkdirAttachmentAlias::new(if index == 0 {
-                        "left"
-                    } else {
-                        "right"
-                    })
-                    .unwrap(),
-                    working_directory,
-                }
-            })
-            .collect();
-        let worker_record = api
-            .store
-            .get_worker_registry(TEST_WORKSPACE_ID, &worker.worker)
-            .unwrap()
-            .unwrap();
-        rusqlite::Connection::open(&api.config.database_path)
-            .unwrap()
-            .execute_batch(
-                r#"
-                CREATE TABLE spawn_finalize_attachment_audit(alias TEXT NOT NULL);
-                CREATE TRIGGER audit_spawn_finalize_attachment
-                AFTER INSERT ON worker_workdir_links
-                BEGIN
-                    INSERT INTO spawn_finalize_attachment_audit(alias) VALUES (NEW.alias);
-                END;
-                CREATE TRIGGER fail_second_spawn_workdir_upsert
-                BEFORE UPDATE ON workdir_registry
-                WHEN NEW.display_name = 'inject-registry-upsert-failure'
-                BEGIN
-                    SELECT RAISE(ABORT, 'injected second Workdir registry failure');
-                END;
-                "#,
-            )
-            .unwrap();
-
-        let context = WorkerSpawnCompensationContext {
-            assignment: Some(&assignment),
-            spawned_workdir_ids: &spawned_workdir_ids,
-        };
-        let error =
-            finalize_spawned_worker_workdir_attachments(&api, &worker, &worker_record, &context)
-                .unwrap_err();
-        assert!(matches!(
-            error.error,
-            Error::RuntimeOperationFailed { ref code, .. }
-                if code == "worker_spawn_finalize_workdir_registry_failed"
-        ));
-        assert!(error.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "worker_spawn_finalize_workdir_registry_failed"
-                && diagnostic.message.contains(&worker.worker.runtime_id)
-                && diagnostic.message.contains(&worker.worker.worker_id)
-        }));
-        let audit_connection = rusqlite::Connection::open(&api.config.database_path).unwrap();
-        let mut audit_statement = audit_connection
-            .prepare("SELECT alias FROM spawn_finalize_attachment_audit ORDER BY rowid")
-            .unwrap();
-        let finalized_aliases = audit_statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(finalized_aliases, ["left"]);
-        assert!(
-            error
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "worker_spawn_compensated"),
-            "{:?}",
-            error.diagnostics
-        );
-        assert!(matches!(
-            api.runtime.worker(&worker.worker),
-            Err(RuntimeRegistryError::UnknownWorker { .. })
-        ));
-        assert!(
-            api.store
-                .get_worker_registry(TEST_WORKSPACE_ID, &worker.worker)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            api.store
-                .get_ticket_assignment_operation(TEST_WORKSPACE_ID, &assignment.operation_id)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            api.store
-                .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &ticket_id)
-                .unwrap()
-                .is_none()
-        );
-
-        for workdir_id in &spawned_workdir_ids {
-            assert!(
-                api.store
-                    .get_workdir_registry(TEST_WORKSPACE_ID, workdir_id)
-                    .unwrap()
-                    .is_none(),
-                "spawn compensation must clean every created Workdir: {workdir_id}"
-            );
-        }
-
-        let missing_summary_workdir_ids = vec![
-            "missing-summary-workdir-left".to_string(),
-            "missing-summary-workdir-right".to_string(),
-        ];
-        for workdir_id in &missing_summary_workdir_ids {
-            seed_cleanup_workdir_for_runtime(
-                &api,
-                workdir_id,
-                WorkdirlessFixtureRuntime::RUNTIME_ID,
-                "present",
-                "clean",
-            );
-        }
-        let missing_summary_context = WorkerSpawnCompensationContext {
-            assignment: None,
-            spawned_workdir_ids: &missing_summary_workdir_ids,
-        };
-        let reservation_worker_id = WorkerId::now_v7();
-        let _ = compensate_failed_workspace_worker_create(
-            &api,
-            EMBEDDED_WORKER_RUNTIME_ID,
-            reservation_worker_id,
-            "missing-summary-fingerprint",
-            "runtime_spawn_missing_summary",
-            None,
-            &missing_summary_context,
-            &[],
-        );
-        for workdir_id in &missing_summary_workdir_ids {
-            assert!(
-                api.store
-                    .get_workdir_registry(TEST_WORKSPACE_ID, workdir_id)
-                    .unwrap()
-                    .is_none(),
-                "missing-summary compensation must clean every created Workdir: {workdir_id}"
-            );
-        }
-
-        let mut residual_worker = worker.clone();
-        residual_worker.worker.runtime_id = "missing-runtime".to_string();
-        let residual_context = WorkerSpawnCompensationContext {
-            assignment: None,
-            spawned_workdir_ids: &[],
-        };
-        let residual_error = finalize_worker_spawn_stage::<()>(
-            &api,
-            &residual_worker,
-            &residual_context,
-            WorkerSpawnFinalizeStage::WorkerRegistry,
-            Err(Error::RegistryInconsistency("injected registry failure".to_string()).into()),
-        )
         .unwrap_err();
-        assert!(residual_error.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "worker_spawn_compensation_runtime_delete_failed"
-                && diagnostic.message.contains("missing-runtime")
-        }));
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
         assert!(
-            !residual_error
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "worker_spawn_compensated")
+            api.store
+                .get_current_ticket_coder_assignment(TEST_WORKSPACE_ID, &ticket.id)
+                .unwrap()
+                .is_none()
         );
-        assert!(residual_error.error.to_string().contains("residual state"));
+        assert_eq!(
+            backend.show(ticket.id.into()).unwrap().meta.workflow_state,
+            TicketWorkflowState::Queued
+        );
     }
 
     #[tokio::test]
@@ -34476,8 +34410,7 @@ mod tests {
         };
         let mut related_input = ticket::NewTicket::new("Related Browser Ticket");
         related_input.workflow_state = Some(TicketWorkflowState::Ready);
-        related_input.repository_id = Some(test_repository_id(&api));
-        related_input.ref_selector = Some("develop".to_string());
+        set_test_ticket_target(&mut related_input, "test-repository", "develop");
         let related_ticket_id = browser_ticket_backend(&api)
             .unwrap()
             .create(related_input)
@@ -34506,8 +34439,11 @@ mod tests {
                 new_string: None,
                 replace_all: false,
                 target: Some(server_api::BrowserTicketTargetEdit::Set {
-                    repository_key: "test-repository".to_string(),
-                    ref_selector: Some("develop".to_string()),
+                    targets: vec![test_ticket_target(
+                        "test-repository",
+                        "develop",
+                        TicketTargetAccess::ReadWrite,
+                    )],
                 }),
                 author: Some("browser-user".to_string()),
             }),
@@ -34516,8 +34452,14 @@ mod tests {
         .unwrap();
         assert_eq!(edited.title, "Browser Ticket API edited");
         assert_eq!(edited.body, "Updated from the Browser API.");
-        assert_eq!(edited.repository_key.as_deref(), Some("test-repository"));
-        assert_eq!(edited.ref_selector.as_deref(), Some("develop"));
+        assert_eq!(
+            edited.targets,
+            vec![test_ticket_target(
+                "test-repository",
+                "develop",
+                TicketTargetAccess::ReadWrite,
+            )]
+        );
         assert!(edited.assignments.is_empty());
         assert!(edited.assignment_diagnostics.is_empty());
         assert_eq!(edited.relations.outgoing.len(), 1);
@@ -34941,6 +34883,35 @@ mod tests {
         test_api_with_recording_backend(workspace_root).await.0
     }
 
+    async fn test_api_with_docs_repository(workspace_root: impl Into<PathBuf>) -> WorkspaceApi {
+        let workspace_root = workspace_root.into();
+        let docs_root = workspace_root.join("docs-repository");
+        fs::create_dir_all(&docs_root).unwrap();
+        init_clean_git_workspace(&docs_root);
+        let mut config = test_server_config(&workspace_root);
+        let mut docs = config.repositories[0].clone();
+        let docs_source = server_api::RepositorySource {
+            kind: server_api::RepositorySourceKind::LocalPath,
+            uri: docs_root.display().to_string(),
+        };
+        docs.id = "docs".to_string();
+        docs.repository_key = "docs".to_string();
+        docs.source_fingerprint =
+            crate::repository_source::repository_source_fingerprint(&docs_source);
+        docs.source = docs_source;
+        docs.path = Some(docs_root);
+        docs.default_selector = Some("develop".to_string());
+        config.repositories.push(docs);
+        let store = SqliteWorkspaceStore::open(config.database_path.clone()).unwrap();
+        WorkspaceApi::new_with_execution_backend(
+            config,
+            Arc::new(store),
+            Arc::new(DeterministicExecutionBackend::default()),
+        )
+        .await
+        .unwrap()
+    }
+
     fn test_owner_actor() -> RequestActor {
         RequestActor {
             user_id: "owner-user".to_string(),
@@ -34952,11 +34923,39 @@ mod tests {
     }
 
     fn test_repository_id(api: &WorkspaceApi) -> String {
+        test_repository_id_by_key(api, "test-repository")
+    }
+
+    fn test_repository_id_by_key(api: &WorkspaceApi, repository_key: &str) -> String {
         api.store
-            .get_repository_by_key(TEST_WORKSPACE_ID, "test-repository")
+            .get_repository_by_key(TEST_WORKSPACE_ID, repository_key)
             .unwrap()
             .expect("test Repository exists")
             .repository_id
+    }
+
+    fn test_ticket_target(
+        repository_key: impl Into<String>,
+        ref_selector: impl Into<String>,
+        access: TicketTargetAccess,
+    ) -> ticket::TicketTarget {
+        ticket::TicketTarget {
+            repository_key: repository_key.into(),
+            ref_selector: Some(ref_selector.into()),
+            access,
+        }
+    }
+
+    fn set_test_ticket_target(
+        input: &mut ticket::NewTicket,
+        repository_key: impl Into<String>,
+        ref_selector: impl Into<String>,
+    ) {
+        input.targets = vec![test_ticket_target(
+            repository_key,
+            ref_selector,
+            TicketTargetAccess::ReadWrite,
+        )];
     }
 
     fn set_test_default_runtime(api: &WorkspaceApi, runtime_id: &str) {
@@ -36119,6 +36118,7 @@ mod tests {
                 worker: RuntimeWorkerRef::new("runtime-test", runtime_worker_id.to_string()),
                 workdir_id: workdir_id.to_string(),
                 alias: "attachment".to_string(),
+                capabilities: workdir::WorkdirSessionCapabilities::ALL,
                 linked_at: now_registry_timestamp(),
                 unlinked_at: None,
             })
@@ -40394,6 +40394,7 @@ mod tests {
                 worker: RuntimeWorkerRef::new("embedded-worker-runtime", &worker_id),
                 workdir_id: workdir_id.to_string(),
                 alias: "attachment".to_string(),
+                capabilities: workdir::WorkdirSessionCapabilities::ALL,
                 linked_at: "2".to_string(),
                 unlinked_at: None,
             })
@@ -40790,6 +40791,7 @@ mod tests {
                 worker: RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, &worker_id),
                 workdir_id: workdir_id.to_string(),
                 alias: "attachment".to_string(),
+                capabilities: workdir::WorkdirSessionCapabilities::ALL,
                 linked_at: "1".to_string(),
                 unlinked_at: None,
             })

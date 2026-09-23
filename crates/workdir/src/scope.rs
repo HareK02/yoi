@@ -84,6 +84,16 @@ impl WorkdirToolBroker {
     /// Own the parent Worker's active session and mediate every scoped child operation.
     pub fn new(source: WorkdirSessionHandle) -> Self {
         let capabilities = source.capabilities();
+        Self::with_capabilities(source, capabilities)
+    }
+
+    /// Own a session behind an additional Backend-authored capability ceiling.
+    /// The ceiling can only attenuate provider capabilities; it can never add one.
+    pub fn with_capabilities(
+        source: WorkdirSessionHandle,
+        capabilities: WorkdirSessionCapabilities,
+    ) -> Self {
+        let capabilities = source.capabilities().intersection(capabilities);
         let (command_events, _) = broadcast::channel(64);
         let authority = Arc::new(ScopedWorkdirSession {
             source,
