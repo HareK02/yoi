@@ -125,17 +125,16 @@ impl WorkerObservationProvider for WorkspaceClientWorkerObservationProvider {
     async fn list_worker_sessions(
         &self,
     ) -> Result<Vec<WorkerObservationSubject>, WorkerObservationError> {
-        let workspace_id = self.client.workspace_id().ok_or_else(|| {
+        let _workspace_id = self.client.workspace_id().ok_or_else(|| {
             WorkerObservationError::Unavailable(
                 "Workspace observation requires a scoped Workspace client".to_string(),
             )
         })?;
         let response = self
             .client
-            .execute(crate::worker::WorkspaceRequest::get(format!(
-                "/api/w/{}/worker-observation/sessions",
-                workspace_id
-            )))
+            .execute_server_operation(
+                crate::worker::WorkspaceServerOperation::WorkerObservationSessions,
+            )
             .map_err(workspace_client_error)?;
         let body = workspace_response_body(response)?;
         serde_json::from_str::<WorkspaceWorkerObservationListResponse>(&body)
@@ -147,20 +146,28 @@ impl WorkerObservationProvider for WorkspaceClientWorkerObservationProvider {
         &self,
         subject: &WorkerObservationSubjectRef,
     ) -> Result<WorkerSessionCapture, WorkerObservationError> {
-        let body = serde_json::to_string(subject)
-            .map_err(|error| WorkerObservationError::Unavailable(error.to_string()))?;
-        let workspace_id = self.client.workspace_id().ok_or_else(|| {
+        let request = match subject {
+            WorkerObservationSubjectRef::RuntimeWorker {
+                runtime_id,
+                worker_id,
+            } => server_api::WorkerObservationSubjectRef::RuntimeWorker {
+                runtime_id: runtime_id.clone(),
+                worker_id: worker_id.clone(),
+            },
+            WorkerObservationSubjectRef::SubWorker { name } => {
+                server_api::WorkerObservationSubjectRef::SubWorker { name: name.clone() }
+            }
+        };
+        let _workspace_id = self.client.workspace_id().ok_or_else(|| {
             WorkerObservationError::Unavailable(
                 "Workspace observation requires a scoped Workspace client".to_string(),
             )
         })?;
         let response = self
             .client
-            .execute(crate::worker::WorkspaceRequest::json(
-                crate::worker::WorkspaceRequestMethod::Post,
-                format!("/api/w/{}/worker-observation/session", workspace_id),
-                body,
-            ))
+            .execute_server_operation(
+                crate::worker::WorkspaceServerOperation::WorkerObservationCapture(request),
+            )
             .map_err(workspace_client_error)?;
         let body = workspace_response_body(response)?;
         let response = serde_json::from_str::<WorkspaceWorkerObservationCaptureResponse>(&body)

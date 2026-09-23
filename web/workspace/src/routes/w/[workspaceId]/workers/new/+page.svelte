@@ -1,13 +1,14 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { untrack } from 'svelte';
-  import { workspaceApiPath } from '$lib/workspace/api/http';
+  import { readBoundedJson, workspaceApiPath } from '$lib/workspace/api/http';
   import {
     parseWorkingDirectoryCreateResponse,
     validateWorkingDirectoryCreateRequest,
   } from '$lib/workspace/api/workdirs';
   import {
     parseBrowserCreateWorkerResponse,
+    parseWorkerApiError,
     parseWorkerLaunchOptionsResponse,
   } from '$lib/workspace/api/workers';
   import { formatCurrentWorkdirRevision } from '$lib/workspace/settings/workdir-revision';
@@ -27,12 +28,6 @@
   type DisplayError = {
     message: string;
     diagnostics: Diagnostic[];
-  };
-
-  type ErrorPayload = {
-    error?: { message?: string; code?: string } | string;
-    message?: string;
-    diagnostics?: Diagnostic[];
   };
 
   function workdirOptionLabel(directory: WorkingDirectorySummary): string {
@@ -171,7 +166,9 @@
       if (!response.ok) {
         throw new Error(`worker launch options failed (${response.status})`);
       }
-      const payload = parseWorkerLaunchOptionsResponse(await response.json());
+      const payload = parseWorkerLaunchOptionsResponse(
+        await readBoundedJson(response, 8 * 1024 * 1024),
+      );
       options = payload;
       const form = defaultWorkerLaunchForm(payload, {
         runtime_id: runtimeId,
@@ -313,7 +310,9 @@
         submitError = await responseDisplayError(response, 'worker create failed');
         return;
       }
-      const payload = parseBrowserCreateWorkerResponse(await response.json());
+      const payload = parseBrowserCreateWorkerResponse(
+        await readBoundedJson(response, 8 * 1024 * 1024),
+      );
       await goto(payload.console_href);
     } catch (err) {
       submitError = exceptionDisplayError(err, 'worker create failed');
@@ -324,18 +323,13 @@
 
   async function responseDisplayError(response: Response, fallback: string): Promise<DisplayError> {
     try {
-      const payload = (await response.json()) as ErrorPayload;
-      const diagnostics = Array.isArray(payload.diagnostics) ? payload.diagnostics : [];
-      if (typeof payload.error === 'object' && payload.error?.message) {
-        return {
-          message: `${payload.error.code ?? 'request_failed'}: ${payload.error.message}`,
-          diagnostics,
-        };
-      }
-      if (payload.message) {
-        const code = typeof payload.error === 'string' ? payload.error : 'request_failed';
-        return { message: `${code}: ${payload.message}`, diagnostics };
-      }
+      const payload = parseWorkerApiError(
+        await readBoundedJson(response, 1024 * 1024),
+      );
+      return {
+        message: `${payload.error}: ${payload.message}`,
+        diagnostics: payload.diagnostics ?? [],
+      };
     } catch {
       // fall through
     }

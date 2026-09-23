@@ -310,6 +310,41 @@
         ],
         "type": "object"
       },
+      "BrowserCreateWorkerResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "console_href": {
+            "type": "string"
+          },
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array"
+          },
+          "runtime_id": {
+            "type": "string"
+          },
+          "worker": {
+            "$ref": "#/components/schemas/WorkerLaunchWorkerSummary"
+          },
+          "worker_id": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "runtime_id",
+          "worker_id",
+          "console_href",
+          "worker",
+          "diagnostics"
+        ],
+        "type": "object"
+      },
       "BrowserEditTicketRequest": {
         "additionalProperties": false,
         "properties": {
@@ -451,6 +486,67 @@
         },
         "required": [
           "state"
+        ],
+        "type": "object"
+      },
+      "BrowserWorkerWorkingDirectorySelection": {
+        "additionalProperties": false,
+        "properties": {
+          "alias": {
+            "description": "Stable Worker-local routing alias.",
+            "type": "string"
+          },
+          "relative_cwd": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "working_directory_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "alias",
+          "working_directory_id"
+        ],
+        "type": "object"
+      },
+      "BrowserWorkspaceOrchestratorResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array"
+          },
+          "disposition": {
+            "type": "string"
+          },
+          "online": {
+            "type": "boolean"
+          },
+          "worker": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkerLaunchWorkerSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "online",
+          "disposition",
+          "diagnostics"
         ],
         "type": "object"
       },
@@ -813,6 +909,227 @@
           "cancelled"
         ],
         "type": "string"
+      },
+      "CompanionCancelRequest": {
+        "additionalProperties": false,
+        "description": "Public Workspace Companion cancellation request.",
+        "properties": {
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "CompanionLifecycleState": {
+        "description": "Public lifecycle projection for the Workspace Companion endpoint.",
+        "enum": [
+          "idle",
+          "running",
+          "stopped"
+        ],
+        "type": "string"
+      },
+      "CompanionMessageDisposition": {
+        "description": "Public outcome of a Companion message submission.",
+        "enum": [
+          "accepted",
+          "rejected"
+        ],
+        "type": "string"
+      },
+      "CompanionMessageRequest": {
+        "additionalProperties": false,
+        "description": "Public Workspace Companion message request.",
+        "properties": {
+          "content": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "type": "object"
+      },
+      "CompanionMessageResponse": {
+        "additionalProperties": false,
+        "description": "Public Workspace Companion message response.",
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/CompanionMessageDisposition"
+          }
+        },
+        "required": [
+          "state",
+          "message"
+        ],
+        "type": "object"
+      },
+      "CompanionStatusResponse": {
+        "additionalProperties": false,
+        "description": "Public Workspace Companion status response.",
+        "properties": {
+          "diagnostics": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array"
+          },
+          "state": {
+            "$ref": "#/components/schemas/CompanionLifecycleState"
+          },
+          "transport": {
+            "$ref": "#/components/schemas/CompanionTransportSummary"
+          },
+          "worker": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkspaceWorkerDiscoveryItem"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "state",
+          "transport"
+        ],
+        "type": "object"
+      },
+      "CompanionTranscriptItem": {
+        "additionalProperties": false,
+        "description": "One allowlisted, user-visible Companion transcript item.",
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "role": {
+            "$ref": "#/components/schemas/CompanionTranscriptRole"
+          },
+          "sequence": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sequence",
+          "role",
+          "content",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "CompanionTranscriptProjection": {
+        "additionalProperties": false,
+        "description": "Bounded public Companion transcript projection.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/CompanionTranscriptItem"
+            },
+            "type": "array"
+          },
+          "limit": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "next": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "start": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state": {
+            "$ref": "#/components/schemas/CompanionLifecycleState"
+          },
+          "total": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "state",
+          "start",
+          "limit",
+          "total",
+          "items"
+        ],
+        "type": "object"
+      },
+      "CompanionTranscriptQuery": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "start": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "CompanionTranscriptRole": {
+        "description": "User-visible role accepted in the public Companion transcript.",
+        "enum": [
+          "user",
+          "assistant"
+        ],
+        "type": "string"
+      },
+      "CompanionTransportSummary": {
+        "additionalProperties": false,
+        "description": "Public, bounded transport metadata for Companion status.",
+        "properties": {
+          "available": {
+            "type": "boolean"
+          },
+          "mode": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode",
+          "available"
+        ],
+        "type": "object"
       },
       "CompiledFlowDefinition": {
         "additionalProperties": false,
@@ -1366,6 +1683,78 @@
           "workspace_id",
           "repository_key",
           "replayed"
+        ],
+        "type": "object"
+      },
+      "CreateWorkspaceWorkerRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "control_operation_id": {
+            "default": null,
+            "description": "Backend idempotency key used only for authenticated Worker-owned spawn/control.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "initial_submit": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/Segment"
+            },
+            "type": "array"
+          },
+          "profile": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "runtime_id": {
+            "type": "string"
+          },
+          "ticket_assignment": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CreateWorkspaceWorkerTicketAssignmentRequest"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "workdir_attachments": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/BrowserWorkerWorkingDirectorySelection"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "runtime_id",
+          "display_name"
+        ],
+        "type": "object"
+      },
+      "CreateWorkspaceWorkerTicketAssignmentRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "operation_id": {
+            "type": "string"
+          },
+          "ticket_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ticket_id",
+          "operation_id"
         ],
         "type": "object"
       },
@@ -5286,6 +5675,78 @@
         ],
         "type": "object"
       },
+      "PasteArtifactAvailability": {
+        "enum": [
+          "available",
+          "unavailable",
+          "integrity_failed"
+        ],
+        "type": "string"
+      },
+      "PasteArtifactMediaType": {
+        "description": "One typed piece of a user submission.\n\n`Method::Submit` and `Event::UserMessage` carry `Vec<Segment>`. Dumb\nclients (CLI piping, scripts) only need to produce a single\n`Segment::Text`; richer clients (TUI / GUI) construct typed atoms\n(paste chips, file refs) and\nsend them through directly so the Worker side never has to re-parse a\nflattened string.\n\nForward compat: payloads with unknown `kind` deserialize to\n`Segment::Unknown`. Worker treats this the same as known-but-unresolved\nvariants — emits an alert and inserts a `[unknown input segment]`\nplaceholder into the LLM context so neither user nor LLM is blind to\nthe dropped intent.",
+        "enum": [
+          "text_plain_utf8"
+        ],
+        "type": "string"
+      },
+      "PasteArtifactRef": {
+        "description": "Session-owned reference to a large pasted-input artifact.\n\nThe reference contains only bounded integrity and provenance metadata. The\nartifact body remains in session storage and is available to the model only\nthrough the scoped paste-artifact tools installed by Worker.",
+        "properties": {
+          "artifact_id": {
+            "type": "string"
+          },
+          "availability": {
+            "$ref": "#/components/schemas/PasteArtifactAvailability",
+            "description": "Availability observed when this immutable reference was committed.\nReads revalidate storage and integrity rather than trusting this field."
+          },
+          "byte_len": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "char_count": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "created_at_ms": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "line_count": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "media_type": {
+            "$ref": "#/components/schemas/PasteArtifactMediaType"
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "source_entry_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "artifact_id",
+          "created_at_ms",
+          "media_type",
+          "availability",
+          "byte_len",
+          "char_count",
+          "line_count",
+          "sha256",
+          "source_entry_id"
+        ],
+        "type": "object"
+      },
       "ProfileSettingsResponse": {
         "additionalProperties": false,
         "description": "Read-only Profile catalog projected from one active Workspace config revision.",
@@ -7099,6 +7560,42 @@
           }
         ]
       },
+      "RuntimeProfileSourceGraphSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "entrypoints": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "import_count": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source_count": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_source_bytes": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "source_count",
+          "total_source_bytes",
+          "entrypoints",
+          "import_count"
+        ],
+        "type": "object"
+      },
       "RuntimePublicIdentityBundle": {
         "additionalProperties": false,
         "properties": {
@@ -7175,6 +7672,355 @@
           "cleanup_pending",
           "succeeded",
           "failed"
+        ],
+        "type": "string"
+      },
+      "RuntimeResourceFetchApiError": {
+        "oneOf": [
+          {
+            "properties": {
+              "code": {
+                "const": "expired",
+                "type": "string"
+              }
+            },
+            "required": [
+              "code"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "code": {
+                "const": "unauthorized",
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "code": {
+                "const": "unsupported_kind",
+                "type": "string"
+              }
+            },
+            "required": [
+              "code"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "code": {
+                "const": "missing_resource",
+                "type": "string"
+              }
+            },
+            "required": [
+              "code"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "actual": {
+                "type": "string"
+              },
+              "code": {
+                "const": "digest_mismatch",
+                "type": "string"
+              },
+              "expected": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "expected",
+              "actual"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "actual_bytes": {
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "code": {
+                "const": "oversized",
+                "type": "string"
+              },
+              "max_bytes": {
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "code",
+              "max_bytes",
+              "actual_bytes"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "actual": {
+                "type": "string"
+              },
+              "code": {
+                "const": "content_type_mismatch",
+                "type": "string"
+              },
+              "expected": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "expected",
+              "actual"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "code": {
+                "const": "timeout",
+                "type": "string"
+              }
+            },
+            "required": [
+              "code"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "code": {
+                "const": "transport",
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "code": {
+                "const": "invalid_response",
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "RuntimeResourceFetchRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "audit_correlation_id": {
+            "type": "string"
+          },
+          "handle": {
+            "$ref": "#/components/schemas/RuntimeResourceHandle"
+          },
+          "runtime_id": {
+            "type": "string"
+          },
+          "worker_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "handle",
+          "runtime_id",
+          "audit_correlation_id"
+        ],
+        "type": "object"
+      },
+      "RuntimeResourceFetchResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "audit_correlation_id": {
+            "type": "string"
+          },
+          "bytes": {
+            "items": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "content_type": {
+            "type": "string"
+          },
+          "digest": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/RuntimeResourceKind"
+          },
+          "resource_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "resource_id",
+          "digest",
+          "content_type",
+          "bytes",
+          "audit_correlation_id"
+        ],
+        "type": "object"
+      },
+      "RuntimeResourceHandle": {
+        "additionalProperties": false,
+        "properties": {
+          "audit_correlation_id": {
+            "type": "string"
+          },
+          "content_type": {
+            "type": "string"
+          },
+          "digest": {
+            "type": "string"
+          },
+          "expires_at_unix_seconds": {
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": -9007199254740991,
+            "type": "integer"
+          },
+          "generation": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/RuntimeResourceKind"
+          },
+          "max_bytes": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "nonce": {
+            "type": "string"
+          },
+          "operation": {
+            "$ref": "#/components/schemas/RuntimeResourceOperation"
+          },
+          "profile_source_graph": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RuntimeProfileSourceGraphSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "redaction": {
+            "$ref": "#/components/schemas/RuntimeResourceRedactionPolicy"
+          },
+          "resource_id": {
+            "type": "string"
+          },
+          "revision": {
+            "type": "string"
+          },
+          "runtime_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scope_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "worker_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "workspace_id",
+          "resource_id",
+          "digest",
+          "operation",
+          "expires_at_unix_seconds",
+          "nonce",
+          "revision",
+          "max_bytes",
+          "content_type",
+          "redaction",
+          "audit_correlation_id"
+        ],
+        "type": "object"
+      },
+      "RuntimeResourceKind": {
+        "enum": [
+          "profile_source_archive",
+          "repository_ssh_access"
+        ],
+        "type": "string"
+      },
+      "RuntimeResourceOperation": {
+        "enum": [
+          "fetch_archive",
+          "fetch_once"
+        ],
+        "type": "string"
+      },
+      "RuntimeResourceRedactionPolicy": {
+        "enum": [
+          "runtime_internal_only"
         ],
         "type": "string"
       },
@@ -7727,7 +8573,16 @@
           "worker_id": {
             "type": "string"
           },
-          "worker_state": true,
+          "worker_state": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkerStateSnapshot"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "workspace": {
             "$ref": "#/components/schemas/WorkerWorkspaceSummary"
           }
@@ -7765,31 +8620,35 @@
       "RuntimeWorkerSpawnAcceptanceRequirement": {
         "oneOf": [
           {
-            "enum": [
-              "socket_ready"
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "socket_ready",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
             ],
-            "type": "string"
+            "type": "object"
           },
           {
             "additionalProperties": false,
             "properties": {
-              "run_accepted": {
-                "properties": {
-                  "expected_segments": {
-                    "format": "uint",
-                    "maximum": 9007199254740991,
-                    "minimum": 0,
-                    "type": "integer"
-                  }
-                },
-                "required": [
-                  "expected_segments"
-                ],
-                "type": "object"
+              "expected_segments": {
+                "format": "uint",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "run_accepted",
+                "type": "string"
               }
             },
             "required": [
-              "run_accepted"
+              "kind",
+              "expected_segments"
             ],
             "type": "object"
           }
@@ -8080,6 +8939,22 @@
         ],
         "type": "object"
       },
+      "RuntimeWorkerWorkdirAttachmentSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "alias": {
+            "type": "string"
+          },
+          "working_directory": {
+            "$ref": "#/components/schemas/RuntimeWorkingDirectorySummary"
+          }
+        },
+        "required": [
+          "alias",
+          "working_directory"
+        ],
+        "type": "object"
+      },
       "RuntimeWorkersQuery": {
         "additionalProperties": false,
         "properties": {
@@ -8101,6 +8976,270 @@
           "stopped"
         ],
         "type": "string"
+      },
+      "RuntimeWorkingDirectoryCleanupTarget": {
+        "additionalProperties": false,
+        "description": "Runtime-internal Workdir cleanup authority. This transport intentionally\nretains the Backend-generated Repository id and is never a Workspace public\nprojection.",
+        "properties": {
+          "kind": {
+            "type": "string"
+          },
+          "repository_id": {
+            "type": "string"
+          },
+          "working_directory_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "working_directory_id",
+          "repository_id"
+        ],
+        "type": "object"
+      },
+      "RuntimeWorkingDirectorySummary": {
+        "additionalProperties": false,
+        "description": "Runtime-internal Workdir inventory transport. Workspace REST and model-facing\nsurfaces must project this through [`WorkingDirectorySummary`] so the UUID is\nreplaced with `repository_key`.",
+        "properties": {
+          "cleanliness": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cleanup_target": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RuntimeWorkingDirectoryCleanupTarget"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "creation_ref": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "creation_selector": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "creation_tree": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "current_ref": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "current_selector": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "current_tree": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "description": "Optional human-facing label, never a routing key.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "materializer_kind": {
+            "$ref": "#/components/schemas/WorkingDirectoryMaterializerKind"
+          },
+          "observed_at_epoch_seconds": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "occupied_by": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkingDirectoryOccupancy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "repository_id": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/WorkingDirectoryStatusKind"
+          },
+          "working_directory_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "working_directory_id",
+          "repository_id",
+          "materializer_kind",
+          "status"
+        ],
+        "type": "object"
+      },
+      "Segment": {
+        "oneOf": [
+          {
+            "description": "Free-form text. The fallback every client can produce.",
+            "properties": {
+              "content": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "text",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "content"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Bracketed-paste capture from a TUI-style client. `id`, `chars`\nand `lines` carry the metadata needed to re-render a\n`[Clipboard #N | X chars, Y lines]` chip in `Event::UserMessage`\nre-broadcast.",
+            "properties": {
+              "chars": {
+                "format": "uint32",
+                "maximum": 4294967295,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "content": {
+                "type": "string"
+              },
+              "id": {
+                "format": "uint32",
+                "maximum": 4294967295,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "paste",
+                "type": "string"
+              },
+              "lines": {
+                "format": "uint32",
+                "maximum": 4294967295,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "id",
+              "chars",
+              "lines",
+              "content"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Internal reference produced when Worker stores a large `Paste` before\ncommitting input. Clients may receive this in history/event projections;\nthe body is intentionally absent.",
+            "properties": {
+              "artifact": {
+                "$ref": "#/components/schemas/PasteArtifactRef"
+              },
+              "kind": {
+                "const": "paste_artifact",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "artifact"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Client-local file uploaded into the owning Worker session before submit.\nThe Session Log stores only this immutable reference, never file bytes or\nthe client's local path.",
+            "properties": {
+              "file": {
+                "$ref": "#/components/schemas/UploadedFileRef"
+              },
+              "kind": {
+                "const": "uploaded_file",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "file"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "`@<path>` file-system reference. Worker resolves readable files to\n`[File: <path>]` attachments and readable normal directories to shallow\n`[Dir: <path>]` listings; the flattened user text keeps the literal\n`@<path>` placeholder either way.",
+            "properties": {
+              "kind": {
+                "const": "file_ref",
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "path"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Source-qualified request for the host to start a Flow before committing\nthis user input. Runtime resolves it through Workspace authority and\nreplaces it with the entered state's instructions before Worker-side\ninput resolution.",
+            "properties": {
+              "kind": {
+                "const": "flow",
+                "type": "string"
+              },
+              "selector": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "selector"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Unknown variant from a newer client. Worker treats this as an\nunresolved input — surfaces an alert and inserts a placeholder.\nRound-trip is lossy: re-serializing yields `{\"kind\":\"unknown\"}`.",
+            "properties": {
+              "kind": {
+                "const": "unknown",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "ServerJsonSafeU64": {
         "format": "uint64",
@@ -11022,6 +12161,63 @@
         ],
         "type": "object"
       },
+      "UploadedFileAvailability": {
+        "description": "Availability recorded for an uploaded client-local file.",
+        "enum": [
+          "available",
+          "unavailable",
+          "integrity_failed"
+        ],
+        "type": "string"
+      },
+      "UploadedFileRef": {
+        "description": "Session-owned immutable reference to a client-local uploaded file.\n\nUpload transports return an unbound reference. Worker fills\n`source_entry_id` immediately before the containing user input is committed;\ncommitted Session Log and public snapshot records therefore always retain\nthe durable source-entry identity without storing the file body.",
+        "properties": {
+          "artifact_id": {
+            "type": "string"
+          },
+          "availability": {
+            "$ref": "#/components/schemas/UploadedFileAvailability"
+          },
+          "byte_len": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "created_at_ms": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "file_name": {
+            "type": "string"
+          },
+          "media_type": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "source_entry_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "artifact_id",
+          "file_name",
+          "media_type",
+          "created_at_ms",
+          "availability",
+          "byte_len",
+          "sha256"
+        ],
+        "type": "object"
+      },
       "UsageAudit": {
         "properties": {
           "cache_creation_input_tokens": {
@@ -11688,6 +12884,42 @@
         ],
         "type": "string"
       },
+      "WorkerBusyState": {
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "run",
+                "type": "string"
+              },
+              "state": {
+                "$ref": "#/components/schemas/WorkerRunState"
+              }
+            },
+            "required": [
+              "kind",
+              "state"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "maintenance",
+                "type": "string"
+              },
+              "state": {
+                "$ref": "#/components/schemas/WorkerMaintenanceState"
+              }
+            },
+            "required": [
+              "kind",
+              "state"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "WorkerCapabilitySummary": {
         "properties": {
           "can_spawn_followup": {
@@ -11700,6 +12932,76 @@
         "required": [
           "can_stop",
           "can_spawn_followup"
+        ],
+        "type": "object"
+      },
+      "WorkerControlListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/WorkerControlRecord"
+            },
+            "type": "array"
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "items",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "WorkerControlRecord": {
+        "additionalProperties": false,
+        "properties": {
+          "origin": {
+            "type": "string"
+          },
+          "permissions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "relation": {
+            "type": "string"
+          },
+          "subject": {
+            "$ref": "#/components/schemas/WorkerControlSubject"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/WorkerLaunchWorkerSummary"
+          }
+        },
+        "required": [
+          "subject",
+          "relation",
+          "origin",
+          "permissions",
+          "summary"
+        ],
+        "type": "object"
+      },
+      "WorkerControlSubject": {
+        "additionalProperties": false,
+        "properties": {
+          "runtime_id": {
+            "type": "string"
+          },
+          "worker_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "runtime_id",
+          "worker_id"
         ],
         "type": "object"
       },
@@ -11750,6 +13052,209 @@
         "required": [
           "kind",
           "display_hint"
+        ],
+        "type": "object"
+      },
+      "WorkerLaunchOptionsResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "default_profile": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array"
+          },
+          "profiles": {
+            "items": {
+              "$ref": "#/components/schemas/WorkerLaunchProfileCandidate"
+            },
+            "type": "array"
+          },
+          "repositories": {
+            "items": {
+              "$ref": "#/components/schemas/WorkingDirectoryRepositoryOption"
+            },
+            "type": "array"
+          },
+          "runtimes": {
+            "items": {
+              "$ref": "#/components/schemas/WorkerLaunchRuntimeOption"
+            },
+            "type": "array"
+          },
+          "working_directories": {
+            "items": {
+              "$ref": "#/components/schemas/WorkingDirectorySummary"
+            },
+            "type": "array"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "runtimes",
+          "profiles",
+          "repositories",
+          "working_directories",
+          "diagnostics"
+        ],
+        "type": "object"
+      },
+      "WorkerLaunchProfileCandidate": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "description"
+        ],
+        "type": "object"
+      },
+      "WorkerLaunchRuntimeOption": {
+        "additionalProperties": false,
+        "properties": {
+          "built_in": {
+            "type": "boolean"
+          },
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "runtime_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "worker_creation_available": {
+            "type": "boolean"
+          },
+          "working_directory_required": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "runtime_id",
+          "display_name",
+          "built_in",
+          "worker_creation_available",
+          "working_directory_required",
+          "status",
+          "diagnostics"
+        ],
+        "type": "object"
+      },
+      "WorkerLaunchWorkerSummary": {
+        "additionalProperties": false,
+        "description": "Runtime-owned Worker summary embedded in Worker launch responses.\n\nThis preserves the existing launch wire shape. Workspace-owned Worker list\nand detail responses use [`WorkerSummary`] instead.",
+        "properties": {
+          "capabilities": {
+            "$ref": "#/components/schemas/WorkerCapabilitySummary"
+          },
+          "diagnostics": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "implementation": {
+            "$ref": "#/components/schemas/WorkerImplementationSummary"
+          },
+          "label": {
+            "type": "string"
+          },
+          "last_seen_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pinned": {
+            "type": "boolean"
+          },
+          "profile": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "retention_state": {
+            "type": "string"
+          },
+          "runtime_id": {
+            "type": "string"
+          },
+          "singleton_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "type": "string"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "workdir_attachments": {
+            "items": {
+              "$ref": "#/components/schemas/RuntimeWorkerWorkdirAttachmentSummary"
+            },
+            "type": "array"
+          },
+          "worker_id": {
+            "type": "string"
+          },
+          "workspace": {
+            "$ref": "#/components/schemas/WorkerWorkspaceSummary"
+          }
+        },
+        "required": [
+          "runtime_id",
+          "worker_id",
+          "host_id",
+          "display_name",
+          "label",
+          "tags",
+          "workspace",
+          "state",
+          "pinned",
+          "retention_state",
+          "implementation",
+          "capabilities"
         ],
         "type": "object"
       },
@@ -11840,6 +13345,49 @@
         ],
         "type": "string"
       },
+      "WorkerListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "diagnostics": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/WorkerSummary"
+            },
+            "type": "array"
+          },
+          "limit": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "limit",
+          "items",
+          "source"
+        ],
+        "type": "object"
+      },
+      "WorkerMaintenanceState": {
+        "enum": [
+          "compacting"
+        ],
+        "type": "string"
+      },
       "WorkerOperationState": {
         "enum": [
           "accepted",
@@ -11847,6 +13395,79 @@
           "rejected"
         ],
         "type": "string"
+      },
+      "WorkerRemoveApiError": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "WorkerRemoveRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "type": "string"
+          },
+          "target_runtime_id": {
+            "type": "string"
+          },
+          "target_worker_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_runtime_id",
+          "target_worker_id",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "WorkerRemoveResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "removed": {
+            "type": "boolean"
+          },
+          "runtime_id": {
+            "type": "string"
+          },
+          "worker_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "removed",
+          "runtime_id",
+          "worker_id"
+        ],
+        "type": "object"
       },
       "WorkerRestoreResponse": {
         "additionalProperties": false,
@@ -11939,6 +13560,66 @@
         ],
         "type": "object"
       },
+      "WorkerRunState": {
+        "enum": [
+          "running",
+          "pausing",
+          "paused",
+          "cancelling"
+        ],
+        "type": "string"
+      },
+      "WorkerState": {
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "idle",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "busy",
+                "type": "string"
+              },
+              "state": {
+                "$ref": "#/components/schemas/WorkerBusyState"
+              }
+            },
+            "required": [
+              "kind",
+              "state"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WorkerStateSnapshot": {
+        "properties": {
+          "last_command_id": {
+            "description": "Highest lifecycle command id observed by this controller instance.",
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state": {
+            "$ref": "#/components/schemas/WorkerState"
+          }
+        },
+        "required": [
+          "last_command_id",
+          "state"
+        ],
+        "type": "object"
+      },
       "WorkerSummary": {
         "description": "Workspace-authoritative Worker projection.\n\n`resource_key` is required here even though Runtime-internal Worker summaries\ndo not carry one. The Workspace Server must resolve it from Workspace\nauthority before constructing this response.",
         "properties": {
@@ -12017,7 +13698,16 @@
           "worker_id": {
             "type": "string"
           },
-          "worker_state": true,
+          "worker_state": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkerStateSnapshot"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "workspace": {
             "$ref": "#/components/schemas/WorkerWorkspaceSummary"
           }
@@ -12053,6 +13743,7 @@
         "type": "object"
       },
       "WorkerWorkspaceSummary": {
+        "additionalProperties": false,
         "properties": {
           "identity": {
             "type": "string"
@@ -12289,6 +13980,24 @@
           "working_directory_id",
           "disposition",
           "retryable"
+        ],
+        "type": "object"
+      },
+      "WorkingDirectoryRepositoryOption": {
+        "additionalProperties": false,
+        "properties": {
+          "default_selector": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repository_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository_key"
         ],
         "type": "object"
       },
@@ -13572,6 +15281,111 @@
         ],
         "type": "object"
       },
+      "WorkspaceWorkerDiscoveryItem": {
+        "additionalProperties": false,
+        "description": "Bounded, model-safe projection used by privileged Workspace Worker discovery.\nRuntime placement appears only in the typed subject required by Worker\ncontrol operations; provider and launch internals are intentionally omitted.",
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "profile": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resource_key": {
+            "type": "string"
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "subject": {
+            "$ref": "#/components/schemas/WorkspaceWorkerSubject"
+          }
+        },
+        "required": [
+          "subject",
+          "resource_key",
+          "display_name"
+        ],
+        "type": "object"
+      },
+      "WorkspaceWorkerDiscoveryPage": {
+        "properties": {
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workers": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceWorkerDiscoveryItem"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "workers"
+        ],
+        "type": "object"
+      },
+      "WorkspaceWorkerDiscoveryQuery": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "query": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "WorkspaceWorkerSubject": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "runtime_worker",
+                "type": "string"
+              },
+              "runtime_id": {
+                "type": "string"
+              },
+              "worker_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "runtime_id",
+              "worker_id"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "WriteRequest": {
         "additionalProperties": false,
         "properties": {
@@ -13645,7 +15459,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:67e56d1ffd3b27bc8653ef791bd68b5150ac7d507ccbe4e65b2e00320834d718"
+    "x-yoi-source-digest": "sha256:550383b600fe2a2e55630849c7de7a6a24463ad41d0c18dc5d254a3d14328f07"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -14061,6 +15875,298 @@
             "description": "Error response"
           }
         }
+      }
+    },
+    "/api/companion/cancel": {
+      "post": {
+        "operationId": "companion_cancel_alias",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompanionCancelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompanionMessageResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/companion/messages": {
+      "post": {
+        "operationId": "companion_message_alias",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompanionMessageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompanionMessageResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/companion/status": {
+      "get": {
+        "operationId": "companion_status_alias",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompanionStatusResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/companion/transcript": {
+      "get": {
+        "operationId": "companion_transcript_alias",
+        "parameters": [
+          {
+            "explode": true,
+            "in": "query",
+            "name": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/CompanionTranscriptQuery"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompanionTranscriptProjection"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
       }
     },
     "/api/hosts": {
@@ -14610,6 +16716,105 @@
             "browserSession": []
           }
         ]
+      }
+    },
+    "/api/runtime/v1/workspaces/{workspace_id}/resources/fetch": {
+      "post": {
+        "operationId": "runtime_resource_fetch",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RuntimeResourceFetchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeResourceFetchResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeResourceFetchApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeResourceFetchApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeResourceFetchApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeResourceFetchApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeResourceFetchApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeResourceFetchApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
       }
     },
     "/api/runtimes": {
@@ -16111,6 +18316,384 @@
             "description": "Error response"
           }
         }
+      }
+    },
+    "/api/w/{workspace_id}/companion/cancel": {
+      "post": {
+        "operationId": "companion_cancel",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompanionCancelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompanionMessageResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/companion/messages": {
+      "post": {
+        "operationId": "companion_message",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompanionMessageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompanionMessageResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/companion/status": {
+      "get": {
+        "operationId": "companion_status",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompanionStatusResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/companion/transcript": {
+      "get": {
+        "operationId": "companion_transcript",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": true,
+            "in": "query",
+            "name": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/CompanionTranscriptQuery"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompanionTranscriptProjection"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
       }
     },
     "/api/w/{workspace_id}/config/projections/prompts": {
@@ -19068,6 +21651,228 @@
             "description": "Error response"
           },
           "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/orchestrator": {
+      "get": {
+        "operationId": "workspace_orchestrator_status",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrowserWorkspaceOrchestratorResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      },
+      "post": {
+        "operationId": "workspace_orchestrator_start",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrowserWorkspaceOrchestratorResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
             "content": {
               "application/json": {
                 "schema": {
@@ -30380,6 +33185,1305 @@
         }
       }
     },
+    "/api/w/{workspace_id}/worker-control/workers": {
+      "get": {
+        "operationId": "worker_control_list",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerControlListResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      },
+      "post": {
+        "operationId": "worker_control_spawn",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateWorkspaceWorkerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrowserCreateWorkerResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      }
+    },
+    "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/cancel": {
+      "post": {
+        "operationId": "worker_control_cancel",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "runtime_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "worker_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RuntimeWorkerLifecycleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeWorkerLifecycleResult"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      }
+    },
+    "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/input": {
+      "post": {
+        "operationId": "worker_control_input",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "runtime_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "worker_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RuntimeWorkerInputRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeWorkerInputResult"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      }
+    },
+    "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/restore": {
+      "post": {
+        "operationId": "worker_control_restore",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "runtime_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "worker_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerRestoreResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      }
+    },
+    "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/stop": {
+      "post": {
+        "operationId": "worker_control_stop",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "runtime_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "worker_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RuntimeWorkerLifecycleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeWorkerLifecycleResult"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      }
+    },
+    "/api/w/{workspace_id}/worker-discovery/workers": {
+      "get": {
+        "operationId": "workspace_worker_discovery",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": true,
+            "in": "query",
+            "name": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/WorkspaceWorkerDiscoveryQuery"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceWorkerDiscoveryPage"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      }
+    },
+    "/api/w/{workspace_id}/workers": {
+      "get": {
+        "operationId": "workspace_worker_list",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerListResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      },
+      "post": {
+        "operationId": "workspace_worker_create",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateWorkspaceWorkerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrowserCreateWorkerResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/workers/launch-options": {
+      "get": {
+        "operationId": "workspace_worker_launch_options",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerLaunchOptionsResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/workers/remove": {
+      "post": {
+        "operationId": "workspace_worker_remove",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkerRemoveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerRemoveResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerRemoveApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerRemoveApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerRemoveApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerRemoveApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerRemoveApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerRemoveApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerRemoveApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
+      }
+    },
     "/api/w/{workspace_id}/workers/self/workdir-attachments": {
       "post": {
         "operationId": "current_worker_workdir_attach",
@@ -30748,6 +34852,123 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/workers/{worker_ref}": {
+      "get": {
+        "operationId": "workspace_worker_detail",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "worker_ref",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerSummary"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
           }
         ]
       }
@@ -31313,6 +35534,289 @@
             "description": "Error response"
           },
           "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/workers": {
+      "get": {
+        "operationId": "workspace_worker_list_alias",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerListResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      },
+      "post": {
+        "operationId": "workspace_worker_create_alias",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateWorkspaceWorkerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrowserCreateWorkerResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/workers/launch-options": {
+      "get": {
+        "operationId": "workspace_worker_launch_options_alias",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerLaunchOptionsResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
             "content": {
               "application/json": {
                 "schema": {

@@ -5,6 +5,7 @@ use crate::workspace_request::{RuntimeWorkspaceRequest, RuntimeWorkspaceRequestC
 use worker::{
     WorkspaceClient, WorkspaceClientError, WorkspacePromptCatalogResolution,
     WorkspacePromptProjection, WorkspaceRequest, WorkspaceRequestMethod, WorkspaceResponse,
+    WorkspaceServerOperation,
 };
 
 use crate::auth::{
@@ -254,45 +255,53 @@ fn execute_remote_worker_remove_http(
 fn execute_remote_worker_remove_http_blocking(
     request: RemoteWorkerRemoveHttpRequest,
 ) -> Result<WorkspaceResponse, RuntimeWorkerMutationForwardError> {
-    let path = format!(
-        "/api/w/{}/workers/remove",
-        request.request_client.workspace_id()
-    );
-    let body = serde_json::to_vec(&serde_json::json!({
-        "target_runtime_id": request.target_runtime_id,
-        "target_worker_id": request.target_worker_id,
-        "reason": request.reason,
-    }))
-    .map_err(|error| RuntimeWorkerMutationForwardError::Transport(error.to_string()))?;
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         crate::auth::WORKER_MUTATION_SOURCE_PROOF_HEADER,
         reqwest::header::HeaderValue::from_str(&request.token)
             .map_err(|error| RuntimeWorkerMutationForwardError::Transport(error.to_string()))?,
     );
-    headers.insert(
-        reqwest::header::CONTENT_TYPE,
-        reqwest::header::HeaderValue::from_static("application/json"),
-    );
-    let response = request
+    let client = request
         .request_client
-        .execute_blocking(RuntimeWorkspaceRequest {
-            method: reqwest::Method::POST,
-            path_and_query: path,
-            body,
+        .server_api_client(
+            WORKSPACE_REQUEST_PERMISSION,
+            Some(request.source_worker_id),
             headers,
-            permission: WORKSPACE_REQUEST_PERMISSION.to_string(),
-            worker_id: Some(request.source_worker_id),
-            timeout: Some(Duration::from_secs(5)),
-            max_response_bytes: 8 * 1024 * 1024,
-        })
+            Duration::from_secs(5),
+            8 * 1024 * 1024,
+        )
         .map_err(|error| RuntimeWorkerMutationForwardError::Transport(error.to_string()))?;
-    let body = String::from_utf8(response.body)
+    let workspace_id = request.request_client.workspace_id().to_string();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
         .map_err(|error| RuntimeWorkerMutationForwardError::Transport(error.to_string()))?;
-    Ok(WorkspaceResponse {
-        status: response.status.as_u16(),
-        body,
-    })
+    let result = runtime.block_on(client.workspace_worker_remove(
+        workspace_id,
+        server_api::WorkerRemoveRequest {
+            target_runtime_id: request.target_runtime_id,
+            target_worker_id: request.target_worker_id,
+            reason: request.reason,
+        },
+    ));
+    match result {
+        Ok(response) => Ok(WorkspaceResponse {
+            status: 200,
+            body: serde_json::to_string(&response)
+                .map_err(|error| RuntimeWorkerMutationForwardError::Transport(error.to_string()))?,
+        }),
+        Err(server_api::client_support::ClientError::Public { status, error }) => {
+            Ok(WorkspaceResponse {
+                status: status.as_u16(),
+                body: serde_json::to_string(&error).map_err(|error| {
+                    RuntimeWorkerMutationForwardError::Transport(error.to_string())
+                })?,
+            })
+        }
+        Err(error) => Err(RuntimeWorkerMutationForwardError::Transport(
+            error.to_string(),
+        )),
+    }
 }
 
 #[derive(Clone)]
@@ -432,6 +441,26 @@ impl std::fmt::Debug for RuntimeOwnedWorkspaceClient {
     }
 }
 
+fn generated_workspace_response<T: serde::Serialize>(
+    response: Result<T, server_api::client_support::ClientError<server_api::RepositoryApiError>>,
+) -> Result<WorkspaceResponse, WorkspaceClientError> {
+    match response {
+        Ok(response) => Ok(WorkspaceResponse {
+            status: 200,
+            body: serde_json::to_string(&response)
+                .map_err(|error| WorkspaceClientError::Request(error.to_string()))?,
+        }),
+        Err(server_api::client_support::ClientError::Public { status, error }) => {
+            Ok(WorkspaceResponse {
+                status: status.as_u16(),
+                body: serde_json::to_string(&error)
+                    .map_err(|error| WorkspaceClientError::Request(error.to_string()))?,
+            })
+        }
+        Err(error) => Err(WorkspaceClientError::Request(error.to_string())),
+    }
+}
+
 impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
     fn workspace_id(&self) -> Option<&str> {
         Some(self.request_client.workspace_id())
@@ -452,36 +481,143 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
         self.execute_with_permission(request, WORKSPACE_REQUEST_PERMISSION)
     }
 
+    fn execute_server_operation(
+        &self,
+        operation: WorkspaceServerOperation,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        let request_client = self.request_client.clone();
+        let workspace_id = self.workspace_id.clone();
+        let worker_id = self.worker_id.clone();
+        let timeout = self.request_timeout.unwrap_or(Duration::from_secs(5));
+        std::thread::Builder::new()
+            .name("yoi-workspace-server-api".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
+                let client = request_client
+                    .server_api_client(
+                        WORKSPACE_REQUEST_PERMISSION,
+                        Some(worker_id),
+                        reqwest::header::HeaderMap::new(),
+                        timeout,
+                        8 * 1024 * 1024,
+                    )
+                    .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
+                runtime.block_on(async move {
+                    match operation {
+                        WorkspaceServerOperation::WorkerControlList => {
+                            generated_workspace_response(
+                                client.worker_control_list(workspace_id).await,
+                            )
+                        }
+                        WorkspaceServerOperation::WorkerControlSpawn(request) => {
+                            generated_workspace_response(
+                                client.worker_control_spawn(workspace_id, request).await,
+                            )
+                        }
+                        WorkspaceServerOperation::WorkerControlInput {
+                            runtime_id,
+                            worker_id,
+                            request,
+                        } => generated_workspace_response(
+                            client
+                                .worker_control_input(workspace_id, runtime_id, worker_id, request)
+                                .await,
+                        ),
+                        WorkspaceServerOperation::WorkerControlCancel {
+                            runtime_id,
+                            worker_id,
+                            request,
+                        } => generated_workspace_response(
+                            client
+                                .worker_control_cancel(workspace_id, runtime_id, worker_id, request)
+                                .await,
+                        ),
+                        WorkspaceServerOperation::WorkerControlStop {
+                            runtime_id,
+                            worker_id,
+                            request,
+                        } => generated_workspace_response(
+                            client
+                                .worker_control_stop(workspace_id, runtime_id, worker_id, request)
+                                .await,
+                        ),
+                        WorkspaceServerOperation::WorkerControlRestore {
+                            runtime_id,
+                            worker_id,
+                        } => generated_workspace_response(
+                            client
+                                .worker_control_restore(workspace_id, runtime_id, worker_id)
+                                .await,
+                        ),
+                        WorkspaceServerOperation::WorkerObservationSessions => {
+                            generated_workspace_response(
+                                client.worker_observation_sessions(workspace_id).await,
+                            )
+                        }
+                        WorkspaceServerOperation::WorkerObservationCapture(request) => {
+                            generated_workspace_response(
+                                client
+                                    .worker_observation_capture(workspace_id, request)
+                                    .await,
+                            )
+                        }
+                    }
+                })
+            })
+            .map_err(|error| WorkspaceClientError::Request(error.to_string()))?
+            .join()
+            .map_err(|_| {
+                WorkspaceClientError::Request(
+                    "Workspace Server API request thread panicked".to_string(),
+                )
+            })?
+    }
+
     fn list_workspace_workers(
         &self,
         request: worker::WorkspaceWorkerDiscoveryRequest,
     ) -> Result<server_api::WorkspaceWorkerDiscoveryPage, WorkspaceClientError> {
-        let mut path = format!(
-            "/api/w/{}/worker-discovery/workers?limit={}",
-            self.workspace_id, request.limit
-        );
-        if let Some(cursor) = request.cursor.as_deref() {
-            path.push_str("&cursor=");
-            path.push_str(&percent_encode_query(cursor));
-        }
-        if let Some(query) = request.query.as_deref() {
-            path.push_str("&query=");
-            path.push_str(&percent_encode_query(query));
-        }
-        let response = self.execute_with_permission(
-            WorkspaceRequest::get(path),
-            WORKSPACE_WORKER_DISCOVERY_PERMISSION,
-        )?;
-        if !(200..300).contains(&response.status) {
-            return Err(WorkspaceClientError::Request(format!(
-                "Workspace Worker discovery failed with HTTP {}: {}",
-                response.status, response.body
-            )));
-        }
-        serde_json::from_str(&response.body).map_err(|error| {
-            WorkspaceClientError::Request(format!(
-                "invalid Workspace Worker discovery response: {error}"
-            ))
+        let request_client = self.request_client.clone();
+        let workspace_id = self.workspace_id.clone();
+        let worker_id = self.worker_id.clone();
+        let timeout = self.request_timeout.unwrap_or(Duration::from_secs(5));
+        let query = server_api::WorkspaceWorkerDiscoveryQuery {
+            cursor: request.cursor,
+            limit: Some(request.limit),
+            query: request.query,
+        };
+        let result = std::thread::Builder::new()
+            .name("yoi-worker-discovery-http".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                let client = request_client
+                    .server_api_client(
+                        WORKSPACE_WORKER_DISCOVERY_PERMISSION,
+                        Some(worker_id),
+                        reqwest::header::HeaderMap::new(),
+                        timeout,
+                        8 * 1024 * 1024,
+                    )
+                    .map_err(|error| error.to_string())?;
+                runtime
+                    .block_on(client.workspace_worker_discovery(workspace_id, query))
+                    .map_err(|error| error.to_string())
+            })
+            .map_err(|error| WorkspaceClientError::Request(error.to_string()))?
+            .join()
+            .map_err(|_| {
+                WorkspaceClientError::Request(
+                    "Workspace Worker discovery HTTP thread panicked".to_string(),
+                )
+            })?;
+        result.map_err(|error| {
+            WorkspaceClientError::Request(format!("Workspace Worker discovery failed: {error}"))
         })
     }
 
@@ -585,19 +721,6 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
             .execute_worker_remove(target_runtime_id, target_worker_id, reason)
             .map_err(|error| WorkspaceClientError::Request(error.to_string()))
     }
-}
-
-fn percent_encode_query(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            use std::fmt::Write as _;
-            let _ = write!(encoded, "%{byte:02X}");
-        }
-    }
-    encoded
 }
 
 #[derive(Debug, thiserror::Error)]

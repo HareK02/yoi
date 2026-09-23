@@ -13,7 +13,7 @@ typescript = ["dep:ts-rs", "protocol/typescript"]
 api-macros = { workspace = true, features = ["reqwest", "axum", "openapi"] }
 memory.workspace = true
 merge-request.workspace = true
-protocol.workspace = true
+protocol = { workspace = true, features = ["json-schema"] }
 runtime-api.workspace = true
 schemars.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -36,11 +36,9 @@ name = "generate_workdir_api_types"
 
 [[example]]
 name = "generate_worker_launch_api_types"
-required-features = ["typescript"]
 
 [[example]]
 name = "generate_companion_api_types"
-required-features = ["typescript"]
 
 [[example]]
 name = "generate_memory_api_types"

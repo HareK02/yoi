@@ -126,6 +126,7 @@ pub struct WorkerCommandAcknowledgement {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", content = "state", rename_all = "snake_case")]
 pub enum WorkerState {
     Idle,
@@ -134,6 +135,7 @@ pub enum WorkerState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", content = "state", rename_all = "snake_case")]
 pub enum WorkerBusyState {
     Run(WorkerRunState),
@@ -142,6 +144,7 @@ pub enum WorkerBusyState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerRunState {
     Running,
@@ -152,6 +155,7 @@ pub enum WorkerRunState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerMaintenanceState {
     Compacting,
@@ -159,8 +163,13 @@ pub enum WorkerMaintenanceState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct WorkerStateSnapshot {
     /// Highest lifecycle command id observed by this controller instance.
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(range(min = 0, max = 9_007_199_254_740_991_u64))
+    )]
     pub last_command_id: u64,
     pub state: WorkerState,
 }
@@ -453,13 +462,29 @@ impl PasteArtifactAvailability {
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct PasteArtifactRef {
     pub artifact_id: String,
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(range(min = 0, max = 9_007_199_254_740_991_u64))
+    )]
     pub created_at_ms: u64,
     pub media_type: PasteArtifactMediaType,
     /// Availability observed when this immutable reference was committed.
     /// Reads revalidate storage and integrity rather than trusting this field.
     pub availability: PasteArtifactAvailability,
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(range(min = 0, max = 9_007_199_254_740_991_u64))
+    )]
     pub byte_len: u64,
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(range(min = 0, max = 9_007_199_254_740_991_u64))
+    )]
     pub char_count: u64,
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(range(min = 0, max = 9_007_199_254_740_991_u64))
+    )]
     pub line_count: u64,
     pub sha256: String,
     pub source_entry_id: String,
@@ -499,8 +524,16 @@ pub struct UploadedFileRef {
     pub artifact_id: String,
     pub file_name: String,
     pub media_type: String,
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(range(min = 0, max = 9_007_199_254_740_991_u64))
+    )]
     pub created_at_ms: u64,
     pub availability: UploadedFileAvailability,
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(range(min = 0, max = 9_007_199_254_740_991_u64))
+    )]
     pub byte_len: u64,
     pub sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -519,8 +552,20 @@ pub enum Segment {
     /// `[Clipboard #N | X chars, Y lines]` chip in `Event::UserMessage`
     /// re-broadcast.
     Paste {
+        #[cfg_attr(
+            feature = "json-schema",
+            schemars(range(min = 0, max = 4_294_967_295_u32))
+        )]
         id: u32,
+        #[cfg_attr(
+            feature = "json-schema",
+            schemars(range(min = 0, max = 4_294_967_295_u32))
+        )]
         chars: u32,
+        #[cfg_attr(
+            feature = "json-schema",
+            schemars(range(min = 0, max = 4_294_967_295_u32))
+        )]
         lines: u32,
         content: String,
     },

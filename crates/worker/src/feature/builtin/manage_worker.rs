@@ -19,10 +19,7 @@ use crate::feature::{
     ServiceDeclaration, ServiceId, ToolContribution, ToolDeclaration,
 };
 use crate::spawn::registry::{SpawnedWorkerRegistry, SubWorkerStopSummary};
-use crate::worker::{
-    WorkspaceClient, WorkspaceClientError, WorkspaceRequest, WorkspaceRequestMethod,
-    WorkspaceResponse,
-};
+use crate::worker::{WorkspaceClient, WorkspaceClientError, WorkspaceResponse};
 
 const FEATURE_ID: &str = "worker";
 const FEATURE_NAME: &str = "Worker";
@@ -76,15 +73,21 @@ pub trait WorkerControlService: Send + Sync {
         &self,
         request: WorkerLifecycleSpawnRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError>;
+    async fn restore_worker(
+        &self,
+        runtime_id: String,
+        worker_id: String,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        let _ = (runtime_id, worker_id);
+        Err(WorkspaceClientError::Unavailable(
+            "Runtime Worker restore is unavailable".to_string(),
+        ))
+    }
     fn remove_runtime_worker(
         &self,
         runtime_id: &str,
         worker_id: &str,
         reason: &str,
-    ) -> Result<WorkspaceResponse, WorkspaceClientError>;
-    async fn execute_runtime(
-        &self,
-        request: WorkspaceRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError>;
     async fn ensure_permission(
         &self,
@@ -144,11 +147,9 @@ impl WorkerControlService for WorkspaceWorkerControlService {
 
     async fn list_workers(&self) -> Result<WorkspaceResponse, WorkspaceClientError> {
         let response = if self.runtime_worker_control {
-            self.execute_runtime(WorkspaceRequest::get(format!(
-                "/api/w/{}/worker-control/workers",
-                self.workspace_id
-            )))
-            .await?
+            self.client.execute_server_operation(
+                crate::worker::WorkspaceServerOperation::WorkerControlList,
+            )?
         } else {
             WorkspaceResponse {
                 status: 200,
@@ -210,19 +211,17 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                     WorkerControlInputKind::User => "user",
                     WorkerControlInputKind::Notify => "notify",
                 };
-                self.execute_runtime(WorkspaceRequest::json(
-                    WorkspaceRequestMethod::Post,
-                    format!(
-                        "/api/w/{}/worker-control/workers/{runtime_id}/{worker_id}/input",
-                        self.workspace_id
-                    ),
-                    serde_json::json!({
-                        "kind": kind,
-                        "content": content,
-                    })
-                    .to_string(),
-                ))
-                .await
+                self.client.execute_server_operation(
+                    crate::worker::WorkspaceServerOperation::WorkerControlInput {
+                        runtime_id,
+                        worker_id,
+                        request: server_api::RuntimeWorkerInputRequest {
+                            kind: Some(kind.to_string()),
+                            content,
+                            segments: None,
+                        },
+                    },
+                )
             }
             WorkerControlSubject::SubWorker { name } => {
                 if kind != WorkerControlInputKind::User {
@@ -273,19 +272,29 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                 runtime_id,
                 worker_id,
             } => {
-                let action = match kind {
-                    WorkerControlStopKind::Cancel => "cancel",
-                    WorkerControlStopKind::Stop => "stop",
+                let operation = match kind {
+                    WorkerControlStopKind::Cancel => {
+                        crate::worker::WorkspaceServerOperation::WorkerControlCancel {
+                            runtime_id,
+                            worker_id,
+                            request: server_api::RuntimeWorkerLifecycleRequest {
+                                reason,
+                                ticket_assignment: None,
+                            },
+                        }
+                    }
+                    WorkerControlStopKind::Stop => {
+                        crate::worker::WorkspaceServerOperation::WorkerControlStop {
+                            runtime_id,
+                            worker_id,
+                            request: server_api::RuntimeWorkerLifecycleRequest {
+                                reason,
+                                ticket_assignment: None,
+                            },
+                        }
+                    }
                 };
-                self.execute_runtime(WorkspaceRequest::json(
-                    WorkspaceRequestMethod::Post,
-                    format!(
-                        "/api/w/{}/worker-control/workers/{runtime_id}/{worker_id}/{action}",
-                        self.workspace_id
-                    ),
-                    serde_json::json!({ "reason": reason }).to_string(),
-                ))
-                .await
+                self.client.execute_server_operation(operation)
             }
             WorkerControlSubject::SubWorker { name } => {
                 if kind != WorkerControlStopKind::Stop {
@@ -329,10 +338,27 @@ impl WorkerControlService for WorkspaceWorkerControlService {
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         WorkspaceWorkerLifecycleService {
             client: self.client.clone(),
-            workspace_id: self.workspace_id.clone(),
         }
         .spawn(request)
         .await
+    }
+
+    async fn restore_worker(
+        &self,
+        runtime_id: String,
+        worker_id: String,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        if !self.runtime_worker_control {
+            return Err(WorkspaceClientError::Unavailable(
+                "Runtime Worker control is not enabled for this Worker".to_string(),
+            ));
+        }
+        self.client.execute_server_operation(
+            crate::worker::WorkspaceServerOperation::WorkerControlRestore {
+                runtime_id,
+                worker_id,
+            },
+        )
     }
 
     fn remove_runtime_worker(
@@ -348,18 +374,6 @@ impl WorkerControlService for WorkspaceWorkerControlService {
         }
         self.client
             .execute_worker_remove(runtime_id, worker_id, reason)
-    }
-
-    async fn execute_runtime(
-        &self,
-        request: WorkspaceRequest,
-    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
-        if !self.runtime_worker_control {
-            return Err(WorkspaceClientError::Request(
-                "Runtime Worker control is not enabled for this Worker".to_string(),
-            ));
-        }
-        self.client.execute(request)
     }
 
     async fn ensure_permission(
@@ -391,10 +405,9 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                         "Runtime Worker control is not enabled for this Worker".to_string(),
                     ));
                 }
-                let response = self.client.execute(WorkspaceRequest::get(format!(
-                    "/api/w/{}/worker-control/workers",
-                    self.workspace_id
-                )))?;
+                let response = self.client.execute_server_operation(
+                    crate::worker::WorkspaceServerOperation::WorkerControlList,
+                )?;
                 if !response.is_success() {
                     return Err(WorkspaceClientError::Request(format!(
                         "Workspace control request returned {}: {}",
@@ -459,7 +472,6 @@ pub struct WorkerLifecycleSpawnRequest {
 
 struct WorkspaceWorkerLifecycleService {
     client: Arc<dyn WorkspaceClient>,
-    workspace_id: String,
 }
 
 fn workspace_worker_create_request(
@@ -505,12 +517,9 @@ impl WorkerLifecycleService for WorkspaceWorkerLifecycleService {
         request: WorkerLifecycleSpawnRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         let body = workspace_worker_create_request(request)?;
-        self.client.execute(WorkspaceRequest::json(
-            WorkspaceRequestMethod::Post,
-            format!("/api/w/{}/worker-control/workers", self.workspace_id),
-            serde_json::to_string(&body)
-                .map_err(|error| WorkspaceClientError::Request(error.to_string()))?,
-        ))
+        self.client.execute_server_operation(
+            crate::worker::WorkspaceServerOperation::WorkerControlSpawn(body),
+        )
     }
 }
 
@@ -639,20 +648,17 @@ impl FeatureModule for ManageWorkerFeature {
     }
 
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
-        let workspace_id = self
-            .client
+        self.client
             .workspace_id()
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| {
                 FeatureInstallError::InvalidDescriptor(
                     "worker feature requires a Workspace id".to_string(),
                 )
-            })?
-            .to_string();
+            })?;
         let lifecycle: Arc<dyn WorkerLifecycleService> =
             Arc::new(WorkspaceWorkerLifecycleService {
                 client: self.client.clone(),
-                workspace_id: workspace_id.clone(),
             });
         context.services().provide(
             ServiceDeclaration::new(
@@ -948,14 +954,7 @@ impl Tool for WorkspaceWorkerTool {
                 let input = parse::<WorkerTargetInput>(input_json, "WorkerRestore")?;
                 let (runtime_id, worker_id) = runtime_subject_ids(&input.subject, self.operation)?;
                 self.control
-                    .execute_runtime(WorkspaceRequest::json(
-                        WorkspaceRequestMethod::Post,
-                        format!(
-                            "/api/w/{}/worker-control/workers/{runtime_id}/{worker_id}/restore",
-                            self.control.workspace_id()
-                        ),
-                        "{}",
-                    ))
+                    .restore_worker(runtime_id, worker_id)
                     .await
                     .map_err(control_tool_error)?
             }
@@ -1191,7 +1190,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::worker::{WorkspaceClientError, WorkspaceResponse};
+    use crate::worker::{WorkspaceClientError, WorkspaceRequest, WorkspaceResponse};
 
     #[derive(Debug, Default)]
     struct RecordingWorkspaceClient {
@@ -1355,15 +1354,6 @@ mod tests {
             _runtime_id: &str,
             _worker_id: &str,
             _reason: &str,
-        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
-            Err(WorkspaceClientError::Unavailable(
-                "Runtime Worker control is disabled in this test".to_string(),
-            ))
-        }
-
-        async fn execute_runtime(
-            &self,
-            _request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
             Err(WorkspaceClientError::Unavailable(
                 "Runtime Worker control is disabled in this test".to_string(),

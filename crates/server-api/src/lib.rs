@@ -336,6 +336,41 @@ impl_openapi_schema!(
     WorkspaceRuntimeListResponse,
     RuntimeWorkerListResponse,
     WorkerRestoreResponse,
+    WorkerControlSubject,
+    WorkerControlRecord,
+    WorkerControlListResponse,
+    WorkspaceWorkerDiscoveryQuery,
+    WorkspaceWorkerSubject,
+    WorkspaceWorkerDiscoveryItem,
+    WorkspaceWorkerDiscoveryPage,
+    CompanionTranscriptQuery,
+    CompanionLifecycleState,
+    CompanionMessageDisposition,
+    CompanionTransportSummary,
+    CompanionStatusResponse,
+    CompanionMessageRequest,
+    CompanionCancelRequest,
+    CompanionMessageResponse,
+    CompanionTranscriptRole,
+    CompanionTranscriptItem,
+    CompanionTranscriptProjection,
+    WorkerRemoveRequest,
+    WorkerRemoveResponse,
+    WorkerRemoveApiError,
+    RuntimeResourceKind,
+    RuntimeResourceOperation,
+    RuntimeResourceRedactionPolicy,
+    RuntimeProfileSourceGraphSummary,
+    RuntimeResourceHandle,
+    RuntimeResourceFetchRequest,
+    RuntimeResourceFetchResponse,
+    RuntimeResourceFetchApiError,
+    WorkerListResponse,
+    WorkerSummary,
+    WorkerLaunchOptionsResponse,
+    CreateWorkspaceWorkerRequest,
+    BrowserCreateWorkerResponse,
+    BrowserWorkspaceOrchestratorResponse,
 );
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1027,6 +1062,377 @@ pub trait ServerApi {
         #[path] runtime_id: String,
         #[path] worker_id: String,
     ) -> Result<WorkspaceWorkerSessionResponse, ServerApiError>;
+
+    #[get(
+        "/api/workers",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 500, 502, 503],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_worker_list_alias(&self) -> Result<WorkerListResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/workers",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_worker_create_alias(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[body] request: CreateWorkspaceWorkerRequest,
+    ) -> Result<BrowserCreateWorkerResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/orchestrator",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500, 502, 503],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_orchestrator_status(
+        &self,
+        #[path] workspace_id: String,
+    ) -> Result<BrowserWorkspaceOrchestratorResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/orchestrator",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_orchestrator_start(
+        &self,
+        #[path] workspace_id: String,
+    ) -> Result<BrowserWorkspaceOrchestratorResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/worker-control/workers",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500]
+    )]
+    async fn worker_control_list(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+    ) -> Result<WorkerControlListResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/worker-control/workers",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503]
+    )]
+    async fn worker_control_spawn(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: CreateWorkspaceWorkerRequest,
+    ) -> Result<BrowserCreateWorkerResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/input",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503]
+    )]
+    async fn worker_control_input(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] runtime_id: String,
+        #[path] worker_id: String,
+        #[body] request: RuntimeWorkerInputRequest,
+    ) -> Result<RuntimeWorkerInputResult, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/cancel",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503]
+    )]
+    async fn worker_control_cancel(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] runtime_id: String,
+        #[path] worker_id: String,
+        #[body] request: RuntimeWorkerLifecycleRequest,
+    ) -> Result<RuntimeWorkerLifecycleResult, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/stop",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504]
+    )]
+    async fn worker_control_stop(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] runtime_id: String,
+        #[path] worker_id: String,
+        #[body] request: RuntimeWorkerLifecycleRequest,
+    ) -> Result<RuntimeWorkerLifecycleResult, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/restore",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504]
+    )]
+    async fn worker_control_restore(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] runtime_id: String,
+        #[path] worker_id: String,
+    ) -> Result<WorkerRestoreResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/worker-observation/sessions",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        openapi = false
+    )]
+    async fn worker_observation_sessions(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+    ) -> Result<WorkerObservationSessionsResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/worker-observation/session",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500, 502, 504],
+        openapi = false
+    )]
+    async fn worker_observation_capture(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: WorkerObservationSubjectRef,
+    ) -> Result<WorkerObservationCaptureResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/worker-discovery/workers",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500]
+    )]
+    async fn workspace_worker_discovery(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[query] query: WorkspaceWorkerDiscoveryQuery,
+    ) -> Result<WorkspaceWorkerDiscoveryPage, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/workers",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500, 502, 503],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_worker_list(
+        &self,
+        #[path] workspace_id: String,
+    ) -> Result<WorkerListResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/workers",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_worker_create(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: CreateWorkspaceWorkerRequest,
+    ) -> Result<BrowserCreateWorkerResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/workers/{worker_ref}",
+        status = 200,
+        error_status = 404,
+        additional_error_statuses = [400, 401, 403, 500, 502, 503],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_worker_detail(
+        &self,
+        #[path] workspace_id: String,
+        #[path] worker_ref: String,
+    ) -> Result<WorkerSummary, RepositoryApiError>;
+
+    #[get(
+        "/api/workers/launch-options",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 500, 502, 503],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_worker_launch_options_alias(
+        &self,
+    ) -> Result<WorkerLaunchOptionsResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/workers/launch-options",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500, 502, 503],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_worker_launch_options(
+        &self,
+        #[path] workspace_id: String,
+    ) -> Result<WorkerLaunchOptionsResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/runtime/v1/workspaces/{workspace_id}/resources/fetch",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 404, 410, 502, 504]
+    )]
+    async fn runtime_resource_fetch(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: RuntimeResourceFetchRequest,
+    ) -> Result<RuntimeResourceFetchResponse, RuntimeResourceFetchApiError>;
+
+    #[get(
+        "/api/companion/status",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn companion_status_alias(&self) -> Result<CompanionStatusResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/companion/status",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn companion_status(
+        &self,
+        #[path] workspace_id: String,
+    ) -> Result<CompanionStatusResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/companion/transcript",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn companion_transcript_alias(
+        &self,
+        #[query] query: CompanionTranscriptQuery,
+    ) -> Result<CompanionTranscriptProjection, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/companion/transcript",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn companion_transcript(
+        &self,
+        #[path] workspace_id: String,
+        #[query] query: CompanionTranscriptQuery,
+    ) -> Result<CompanionTranscriptProjection, RepositoryApiError>;
+
+    #[post(
+        "/api/companion/messages",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn companion_message_alias(
+        &self,
+        #[body] request: CompanionMessageRequest,
+    ) -> Result<CompanionMessageResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/companion/messages",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn companion_message(
+        &self,
+        #[path] workspace_id: String,
+        #[body] request: CompanionMessageRequest,
+    ) -> Result<CompanionMessageResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/companion/cancel",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn companion_cancel_alias(
+        &self,
+        #[body] request: CompanionCancelRequest,
+    ) -> Result<CompanionMessageResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/companion/cancel",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn companion_cancel(
+        &self,
+        #[path] workspace_id: String,
+        #[body] request: CompanionCancelRequest,
+    ) -> Result<CompanionMessageResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/workers/remove",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 503]
+    )]
+    async fn workspace_worker_remove(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: WorkerRemoveRequest,
+    ) -> Result<WorkerRemoveResponse, WorkerRemoveApiError>;
 
     #[get(
         "/api/runtimes",
@@ -2468,10 +2874,17 @@ pub struct ServerWorkerSource {
     pub worker_id: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerRuntimeSource {
+    pub runtime_id: String,
+    pub worker_id: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct ServerRequestContext {
     pub actor: Option<RequestActor>,
     pub worker_source: Option<ServerWorkerSource>,
+    pub runtime_source: Option<ServerRuntimeSource>,
     pub origin: Option<String>,
     /// Transport headers retained for Server-side authentication adapters.
     ///
@@ -5829,7 +6242,7 @@ pub enum RuntimeTicketWorkerRole {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RuntimeWorkerSpawnAcceptanceRequirement {
     SocketReady,
     RunAccepted {
@@ -6557,7 +6970,330 @@ pub struct RuntimeConnectionTestResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerControlSubject {
+    pub runtime_id: String,
+    pub worker_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerControlRecord {
+    pub subject: WorkerControlSubject,
+    pub relation: String,
+    pub origin: String,
+    pub permissions: Vec<String>,
+    pub summary: WorkerLaunchWorkerSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerControlListResponse {
+    pub workspace_id: String,
+    pub items: Vec<WorkerControlRecord>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceWorkerDiscoveryQuery {
+    pub cursor: Option<String>,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub limit: Option<usize>,
+    pub query: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkerObservationSubjectRef {
+    RuntimeWorker {
+        runtime_id: String,
+        worker_id: String,
+    },
+    SubWorker {
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerObservationSubject {
+    pub subject: WorkerObservationSubjectRef,
+    pub display_name: String,
+    pub relation: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerObservationSessionsResponse {
+    pub sessions: Vec<WorkerObservationSubject>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerObservationCaptureResponse {
+    pub segment_id: String,
+    pub session: protocol::SessionSnapshot,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CompanionTranscriptQuery {
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub start: Option<usize>,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRemoveRequest {
+    pub target_runtime_id: String,
+    pub target_worker_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRemoveResponse {
+    pub removed: bool,
+    pub runtime_id: String,
+    pub worker_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRemoveApiError {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<Vec<Diagnostic>>,
+    #[serde(skip, default = "default_repository_error_status")]
+    #[schemars(skip)]
+    status: u16,
+}
+
+impl WorkerRemoveApiError {
+    pub fn new(
+        status: u16,
+        error: Option<String>,
+        code: Option<String>,
+        message: Option<String>,
+        diagnostics: Option<Vec<Diagnostic>>,
+    ) -> Self {
+        Self {
+            error,
+            code,
+            message,
+            diagnostics,
+            status,
+        }
+    }
+}
+
+impl std::fmt::Display for WorkerRemoveApiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            self.message
+                .as_deref()
+                .or(self.error.as_deref())
+                .or(self.code.as_deref())
+                .unwrap_or("Worker removal failed"),
+        )
+    }
+}
+
+impl std::error::Error for WorkerRemoveApiError {}
+impl api_macros::HttpError for WorkerRemoveApiError {
+    fn status_code(&self) -> u16 {
+        self.status
+    }
+}
+impl api_macros::HttpRequestError for WorkerRemoveApiError {
+    fn from_request_rejection(status: u16, message: String) -> Self {
+        Self::new(
+            status,
+            Some("invalid_worker_remove".to_string()),
+            None,
+            Some(message),
+            None,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeResourceKind {
+    ProfileSourceArchive,
+    RepositorySshAccess,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeResourceOperation {
+    FetchArchive,
+    FetchOnce,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeResourceRedactionPolicy {
+    RuntimeInternalOnly,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeProfileSourceGraphSummary {
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub source_count: usize,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub total_source_bytes: u64,
+    pub entrypoints: BTreeMap<String, String>,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub import_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeResourceHandle {
+    pub kind: RuntimeResourceKind,
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    pub resource_id: String,
+    pub digest: String,
+    pub operation: RuntimeResourceOperation,
+    #[schemars(range(min = -9_007_199_254_740_991_i64, max = 9_007_199_254_740_991_i64))]
+    pub expires_at_unix_seconds: i64,
+    pub nonce: String,
+    pub revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub generation: Option<u64>,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub max_bytes: u64,
+    pub content_type: String,
+    pub redaction: RuntimeResourceRedactionPolicy,
+    pub audit_correlation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_source_graph: Option<RuntimeProfileSourceGraphSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeResourceFetchRequest {
+    pub handle: RuntimeResourceHandle,
+    pub runtime_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    pub audit_correlation_id: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeResourceFetchResponse {
+    pub kind: RuntimeResourceKind,
+    pub resource_id: String,
+    pub digest: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+    pub audit_correlation_id: String,
+}
+
+impl std::fmt::Debug for RuntimeResourceFetchResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeResourceFetchResponse")
+            .field("kind", &self.kind)
+            .field("resource_id", &self.resource_id)
+            .field("digest", &self.digest)
+            .field("content_type", &self.content_type)
+            .field(
+                "bytes",
+                &format_args!("[REDACTED; {} bytes]", self.bytes.len()),
+            )
+            .field("audit_correlation_id", &self.audit_correlation_id)
+            .finish()
+    }
+}
+impl Drop for RuntimeResourceFetchResponse {
+    fn drop(&mut self) {
+        self.bytes.fill(0);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum RuntimeResourceFetchApiError {
+    Expired,
+    Unauthorized {
+        message: String,
+    },
+    UnsupportedKind,
+    MissingResource,
+    DigestMismatch {
+        expected: String,
+        actual: String,
+    },
+    Oversized {
+        #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+        max_bytes: u64,
+        #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+        actual_bytes: u64,
+    },
+    ContentTypeMismatch {
+        expected: String,
+        actual: String,
+    },
+    Timeout,
+    Transport {
+        message: String,
+    },
+    InvalidResponse {
+        message: String,
+    },
+}
+
+impl std::fmt::Display for RuntimeResourceFetchApiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Runtime resource fetch failed: {self:?}")
+    }
+}
+impl std::error::Error for RuntimeResourceFetchApiError {}
+impl api_macros::HttpError for RuntimeResourceFetchApiError {
+    fn status_code(&self) -> u16 {
+        match self {
+            Self::Expired => 410,
+            Self::Unauthorized { .. } => 401,
+            Self::MissingResource => 404,
+            Self::Timeout => 504,
+            Self::Transport { .. } => 502,
+            Self::UnsupportedKind
+            | Self::DigestMismatch { .. }
+            | Self::Oversized { .. }
+            | Self::ContentTypeMismatch { .. }
+            | Self::InvalidResponse { .. } => 400,
+        }
+    }
+}
+impl api_macros::HttpRequestError for RuntimeResourceFetchApiError {
+    fn from_request_rejection(_status: u16, message: String) -> Self {
+        Self::InvalidResponse { message }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct WorkerWorkspaceSummary {
     pub visibility: String,
     pub identity: String,
@@ -6579,9 +7315,9 @@ pub struct WorkerCapabilitySummary {
     pub can_spawn_followup: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkspaceWorkerSubject {
     RuntimeWorker {
         runtime_id: String,
@@ -6592,8 +7328,9 @@ pub enum WorkspaceWorkerSubject {
 /// Bounded, model-safe projection used by privileged Workspace Worker discovery.
 /// Runtime placement appears only in the typed subject required by Worker
 /// control operations; provider and launch internals are intentionally omitted.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceWorkerDiscoveryItem {
     pub subject: WorkspaceWorkerSubject,
     pub resource_key: String,
@@ -6604,7 +7341,7 @@ pub struct WorkspaceWorkerDiscoveryItem {
 }
 
 /// Public lifecycle projection for the Workspace Companion endpoint.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum CompanionLifecycleState {
@@ -6614,7 +7351,7 @@ pub enum CompanionLifecycleState {
 }
 
 /// Public outcome of a Companion message submission.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum CompanionMessageDisposition {
@@ -6623,7 +7360,7 @@ pub enum CompanionMessageDisposition {
 }
 
 /// Public, bounded transport metadata for Companion status.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct CompanionTransportSummary {
@@ -6632,7 +7369,7 @@ pub struct CompanionTransportSummary {
 }
 
 /// Public Workspace Companion status response.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct CompanionStatusResponse {
@@ -6644,7 +7381,7 @@ pub struct CompanionStatusResponse {
 }
 
 /// Public Workspace Companion message request.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct CompanionMessageRequest {
@@ -6652,7 +7389,7 @@ pub struct CompanionMessageRequest {
 }
 
 /// Public Workspace Companion cancellation request.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct CompanionCancelRequest {
@@ -6661,7 +7398,7 @@ pub struct CompanionCancelRequest {
 }
 
 /// Public Workspace Companion message response.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct CompanionMessageResponse {
@@ -6670,7 +7407,7 @@ pub struct CompanionMessageResponse {
 }
 
 /// User-visible role accepted in the public Companion transcript.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum CompanionTranscriptRole {
@@ -6679,10 +7416,11 @@ pub enum CompanionTranscriptRole {
 }
 
 /// One allowlisted, user-visible Companion transcript item.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct CompanionTranscriptItem {
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub sequence: usize,
     pub role: CompanionTranscriptRole,
     pub content: String,
@@ -6690,14 +7428,18 @@ pub struct CompanionTranscriptItem {
 }
 
 /// Bounded public Companion transcript projection.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct CompanionTranscriptProjection {
     pub state: CompanionLifecycleState,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub start: usize,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub limit: usize,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub total: usize,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub next: Option<usize>,
     pub items: Vec<CompanionTranscriptItem>,
 }
@@ -6734,7 +7476,7 @@ pub fn companion_api_typescript() -> String {
     )
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct WorkspaceWorkerDiscoveryPage {
     pub workers: Vec<WorkspaceWorkerDiscoveryItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6751,7 +7493,7 @@ pub struct WorkerWorkdirAttachmentSummary {
     pub working_directory: WorkingDirectorySummary,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeWorkerWorkdirAttachmentSummary {
@@ -6784,7 +7526,6 @@ pub struct WorkerSummary {
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
-    #[schemars(with = "Option<serde_json::Value>")]
     pub worker_state: Option<protocol::WorkerStateSnapshot>,
     pub last_seen_at: Option<String>,
     #[serde(default)]
@@ -6799,11 +7540,25 @@ pub struct WorkerSummary {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkerListResponse {
+    pub workspace_id: String,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub limit: usize,
+    pub items: Vec<WorkerSummary>,
+    pub source: String,
+    #[serde(default)]
+    pub diagnostics: Vec<Diagnostic>,
+}
+
 /// Runtime-owned Worker summary embedded in Worker launch responses.
 ///
 /// This preserves the existing launch wire shape. Workspace-owned Worker list
 /// and detail responses use [`WorkerSummary`] instead.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkerLaunchWorkerSummary {
@@ -6828,7 +7583,7 @@ pub struct WorkerLaunchWorkerSummary {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkerLaunchOptionsResponse {
@@ -6841,7 +7596,7 @@ pub struct WorkerLaunchOptionsResponse {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkerLaunchRuntimeOption {
@@ -6854,7 +7609,7 @@ pub struct WorkerLaunchRuntimeOption {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkerLaunchProfileCandidate {
@@ -6863,7 +7618,7 @@ pub struct WorkerLaunchProfileCandidate {
     pub description: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkingDirectoryRepositoryOption {
@@ -6873,7 +7628,7 @@ pub struct WorkingDirectoryRepositoryOption {
     pub default_selector: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct BrowserWorkerWorkingDirectorySelection {
@@ -6884,7 +7639,7 @@ pub struct BrowserWorkerWorkingDirectorySelection {
     pub relative_cwd: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct CreateWorkspaceWorkerTicketAssignmentRequest {
@@ -6892,7 +7647,7 @@ pub struct CreateWorkspaceWorkerTicketAssignmentRequest {
     pub operation_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct CreateWorkspaceWorkerRequest {
@@ -6911,7 +7666,7 @@ pub struct CreateWorkspaceWorkerRequest {
     pub control_operation_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct BrowserCreateWorkerResponse {
@@ -6923,7 +7678,7 @@ pub struct BrowserCreateWorkerResponse {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct BrowserWorkspaceOrchestratorResponse {
@@ -8020,32 +8775,23 @@ pub fn worker_launch_api_typescript() -> String {
     )
 }
 
-#[cfg(all(test, feature = "typescript"))]
+#[cfg(test)]
 mod worker_launch_typescript_tests {
     #[test]
     fn generated_worker_launch_api_contract_is_current() {
-        let expected = super::worker_launch_api_typescript();
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../web/workspace/src/lib/generated/worker-launch-api.ts");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let input =
+            std::fs::read_to_string(root.join(crate::repository_openapi_typescript::INPUT_PATH))
+                .expect("read Server API OpenAPI artifact");
+        let expected = crate::repository_openapi_typescript::generate_worker_typescript(&input)
+            .expect("generate Worker API TypeScript");
+        let path = root.join(crate::repository_openapi_typescript::WORKER_OUTPUT_PATH);
         let actual = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
         assert_eq!(
-            normalize(&actual),
-            normalize(&expected),
-            "regenerate Worker launch API TypeScript types with `cargo run -q -p server-api --features typescript --example generate_worker_launch_api_types > web/workspace/src/lib/generated/worker-launch-api.ts` and format the generated file",
+            actual, expected,
+            "regenerate Worker API TypeScript types with `cargo run -q -p server-api --example generate_worker_launch_api_types`",
         );
-    }
-
-    fn normalize(value: &str) -> String {
-        value
-            .chars()
-            .filter_map(|character| match character {
-                character if character.is_whitespace() => None,
-                ',' => Some(';'),
-                character => Some(character),
-            })
-            .collect::<String>()
-            .replace("=|", "=")
     }
 }
 
@@ -9606,8 +10352,8 @@ mod tests {
         let actual = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
         assert_eq!(
-            normalize_typescript(&actual),
-            normalize_typescript(&expected),
+            normalized_typescript(actual),
+            normalized_typescript(expected),
             "regenerate auth API TypeScript types with `cargo run -q -p server-api --features typescript --example generate_auth_api_types > web/workspace/src/lib/generated/auth-api.ts` and format the generated file",
         );
     }
@@ -9680,33 +10426,21 @@ mod tests {
         assert!(serde_json::from_value::<CompanionTranscriptItem>(private_item).is_err());
     }
 
-    #[cfg(feature = "typescript")]
     #[test]
     fn generated_companion_api_contract_is_current() {
-        let expected = companion_api_typescript();
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../web/workspace/src/lib/generated/companion-api.ts");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let input =
+            std::fs::read_to_string(root.join(crate::repository_openapi_typescript::INPUT_PATH))
+                .expect("read Server API OpenAPI artifact");
+        let expected = crate::repository_openapi_typescript::generate_companion_typescript(&input)
+            .expect("generate Companion API TypeScript");
+        let path = root.join(crate::repository_openapi_typescript::COMPANION_OUTPUT_PATH);
         let actual = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
         assert_eq!(
-            normalize_typescript(&actual),
-            normalize_typescript(&expected),
-            "regenerate Companion API TypeScript types with `cargo run -q -p server-api --features typescript --example generate_companion_api_types > web/workspace/src/lib/generated/companion-api.ts` and format the generated file",
+            actual, expected,
+            "regenerate Companion API TypeScript types with `cargo run -q -p server-api --example generate_companion_api_types`",
         );
-    }
-
-    #[cfg(feature = "typescript")]
-    fn normalize_typescript(value: &str) -> String {
-        value
-            .chars()
-            .filter_map(|character| match character {
-                character if character.is_whitespace() => None,
-                ',' => Some(';'),
-                character => Some(character),
-            })
-            .collect::<String>()
-            .replace(";}", "}")
-            .replace("=|", "=")
     }
 
     #[test]

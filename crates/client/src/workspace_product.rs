@@ -1,6 +1,3 @@
-use reqwest::Method;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use server_api::{
     BrowserCreateWorkerResponse, BrowserWorkspaceOrchestratorResponse,
     CreateWorkspaceWorkerRequest, ListResponse, MemoryDocumentResponse, MemoryStagingListResponse,
@@ -417,7 +414,10 @@ impl BackendWorkspaceProductClient {
         &self,
         ticket_id: &str,
     ) -> Result<String, BackendWorkspaceClientError> {
-        let options: WorkerLaunchOptionsResponse = self.get_json("/workers/launch-options")?;
+        let workspace_id = self.workspace_id.clone();
+        let options: WorkerLaunchOptionsResponse = self.generated(move |client| async move {
+            client.workspace_worker_launch_options(workspace_id).await
+        })?;
         let runtime = options
             .runtimes
             .iter()
@@ -439,8 +439,10 @@ impl BackendWorkspaceProductClient {
             workdir_attachments: Vec::new(),
             control_operation_id: None,
         };
-        let response: BrowserCreateWorkerResponse =
-            self.send_json(Method::POST, "/workers", Some(&request))?;
+        let workspace_id = self.workspace_id.clone();
+        let response: BrowserCreateWorkerResponse = self.generated(move |client| async move {
+            client.workspace_worker_create(workspace_id, request).await
+        })?;
         Ok(format!(
             "Started Intake Worker {}/{} for Ticket {ticket_id}",
             response.runtime_id, response.worker_id
@@ -448,8 +450,11 @@ impl BackendWorkspaceProductClient {
     }
 
     pub fn start_workspace_orchestrator(&self) -> Result<String, BackendWorkspaceClientError> {
+        let workspace_id = self.workspace_id.clone();
         let response: BrowserWorkspaceOrchestratorResponse =
-            self.send_json::<(), _>(Method::POST, "/orchestrator", None)?;
+            self.generated(move |client| async move {
+                client.workspace_orchestrator_start(workspace_id).await
+            })?;
         let worker = response.worker.ok_or_else(|| {
             BackendWorkspaceClientError::InvalidTarget(
                 "Backend accepted the Orchestrator request without returning a Worker".to_string(),
@@ -463,39 +468,6 @@ impl BackendWorkspaceProductClient {
 
     pub fn default_product_list_limit() -> usize {
         DEFAULT_PRODUCT_LIST_LIMIT
-    }
-
-    fn get_json<R: DeserializeOwned>(&self, path: &str) -> Result<R, BackendWorkspaceClientError> {
-        self.send_json::<(), R>(Method::GET, path, None)
-    }
-
-    fn send_json<B: Serialize + ?Sized, R: DeserializeOwned>(
-        &self,
-        method: Method,
-        path: &str,
-        body: Option<&B>,
-    ) -> Result<R, BackendWorkspaceClientError> {
-        let response = self.request(method, path, body)?.send()?;
-        self.api.check_status(response.status())?;
-        response.json().map_err(BackendWorkspaceClientError::Http)
-    }
-
-    fn request<B: Serialize + ?Sized>(
-        &self,
-        method: Method,
-        path: &str,
-        body: Option<&B>,
-    ) -> Result<reqwest::blocking::RequestBuilder, BackendWorkspaceClientError> {
-        let path = format!(
-            "/api/w/{}/{}",
-            encode_path_segment(&self.workspace_id),
-            path.trim_start_matches('/')
-        );
-        let request = self.api.blocking_request(method, &path)?;
-        Ok(match body {
-            Some(body) => request.json(body),
-            None => request,
-        })
     }
 }
 
@@ -785,6 +757,7 @@ fn ticket_list_state_query(query: &TicketListQuery) -> String {
     }
 }
 
+#[cfg(test)]
 fn encode_path_segment(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {

@@ -62,9 +62,57 @@ impl RuntimeWorkspaceRequestError {
             timeout,
         }
     }
+}
 
-    pub(crate) fn is_timeout(&self) -> bool {
-        matches!(self, Self::Transport { timeout: true, .. })
+#[derive(Clone)]
+pub(crate) struct RuntimeWorkspaceRequestAuthorizer {
+    workspace_id: String,
+    runtime_id: String,
+    request_source: Option<(RuntimeRequestSourceSigner, String)>,
+    permission: String,
+    worker_id: Option<String>,
+    extra_headers: HeaderMap,
+}
+
+impl server_api::client_support::RequestAuthorizer for RuntimeWorkspaceRequestAuthorizer {
+    fn authorize(
+        &self,
+        request: server_api::client_support::AuthorizerRequest<'_>,
+    ) -> Result<HeaderMap, server_api::client_support::AuthorizationError> {
+        let mut headers = self.extra_headers.clone();
+        headers.insert(
+            RUNTIME_ID_HEADER,
+            reqwest::header::HeaderValue::from_str(&self.runtime_id)
+                .map_err(|_| server_api::client_support::AuthorizationError::new())?,
+        );
+        if let Some(worker_id) = self.worker_id.as_deref() {
+            headers.insert(
+                WORKER_ID_HEADER,
+                reqwest::header::HeaderValue::from_str(worker_id)
+                    .map_err(|_| server_api::client_support::AuthorizationError::new())?,
+            );
+        }
+        if let Some((signer, audience)) = self.request_source.as_ref() {
+            let proof = signer
+                .issue(
+                    audience,
+                    &self.workspace_id,
+                    self.worker_id.as_deref(),
+                    &self.permission,
+                    request.method.as_str(),
+                    request.path_and_query,
+                    request.body,
+                    unix_now_seconds(),
+                    DEFAULT_REQUEST_PROOF_TTL_SECONDS,
+                )
+                .map_err(|_| server_api::client_support::AuthorizationError::new())?;
+            headers.insert(
+                RUNTIME_REQUEST_SOURCE_PROOF_HEADER,
+                reqwest::header::HeaderValue::from_str(&proof)
+                    .map_err(|_| server_api::client_support::AuthorizationError::new())?,
+            );
+        }
+        Ok(headers)
     }
 }
 
@@ -115,6 +163,34 @@ impl RuntimeWorkspaceRequestClient {
     pub fn matches_workspace(&self, workspace_id: &str, base_url: &str) -> bool {
         self.workspace_id == workspace_id
             && self.base_url.trim_end_matches('/') == base_url.trim_end_matches('/')
+    }
+
+    pub(crate) fn server_api_client(
+        &self,
+        permission: impl Into<String>,
+        worker_id: Option<String>,
+        extra_headers: HeaderMap,
+        timeout: Duration,
+        response_body_limit: usize,
+    ) -> Result<
+        server_api::ServerApiClient<RuntimeWorkspaceRequestAuthorizer>,
+        RuntimeWorkspaceRequestError,
+    > {
+        let authorizer = RuntimeWorkspaceRequestAuthorizer {
+            workspace_id: self.workspace_id.clone(),
+            runtime_id: self.runtime_id.clone(),
+            request_source: self.request_source.clone(),
+            permission: permission.into(),
+            worker_id,
+            extra_headers,
+        };
+        server_api::ServerApiClient::builder(&self.base_url)
+            .map_err(|error| RuntimeWorkspaceRequestError::InvalidRequest(error.to_string()))?
+            .authorizer(authorizer)
+            .request_timeout(timeout)
+            .response_body_limit(response_body_limit)
+            .build()
+            .map_err(|error| RuntimeWorkspaceRequestError::InvalidRequest(error.to_string()))
     }
 
     pub(crate) async fn execute(

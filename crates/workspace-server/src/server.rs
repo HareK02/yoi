@@ -3641,12 +3641,14 @@ fn build_server_auth_router(api: ServerAuthApi) -> Router {
 fn server_request_context(
     actor: Option<RequestActor>,
     worker_source: Option<server_api::ServerWorkerSource>,
+    runtime_source: Option<server_api::ServerRuntimeSource>,
     origin: Option<String>,
     headers: &HeaderMap,
 ) -> server_api::ServerRequestContext {
     server_api::ServerRequestContext {
         actor,
         worker_source,
+        runtime_source,
         origin,
         transport_headers: headers
             .iter()
@@ -3684,7 +3686,7 @@ fn contract_request_headers(
 async fn attach_server_origin_context(mut request: Request, next: Next) -> Response {
     let actor = request.extensions().get::<RequestActor>().cloned();
     let origin = request_origin(request.headers());
-    let context = server_request_context(actor, None, origin, request.headers());
+    let context = server_request_context(actor, None, None, origin, request.headers());
     request.extensions_mut().insert(context);
     next.run(request).await
 }
@@ -3716,8 +3718,21 @@ async fn attach_server_request_context(
             runtime_id: source.runtime_id.clone(),
             worker_id: source.worker_id.clone(),
         });
+    let runtime_source = request
+        .extensions()
+        .get::<crate::worker_source::VerifiedRuntimeRequestSource>()
+        .map(|source| server_api::ServerRuntimeSource {
+            runtime_id: source.runtime_id.clone(),
+            worker_id: source.worker_id.clone(),
+        });
     let origin = request_origin(request.headers());
-    let context = server_request_context(actor, worker_source, origin, request.headers());
+    let context = server_request_context(
+        actor,
+        worker_source,
+        runtime_source,
+        origin,
+        request.headers(),
+    );
     request.extensions_mut().insert(context);
     next.run(request).await
 }
@@ -4047,6 +4062,174 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         ))
         .merge(server_api::server_api_axum::ticket_queue(service.clone()))
         .merge(server_api::server_api_axum::ticket_close(service.clone()))
+        .merge(server_api::server_api_axum::workspace_worker_list_alias(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_worker_create_alias(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_orchestrator_status(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_orchestrator_start(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::worker_control_list(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::worker_control_spawn(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::worker_control_input(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::worker_control_cancel(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::worker_control_stop(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::worker_control_restore(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::worker_observation_sessions(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::worker_observation_capture(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_worker_discovery(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_worker_list(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_worker_create(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_worker_detail(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_worker_launch_options_alias(service.clone()))
+        .merge(server_api::server_api_axum::workspace_worker_launch_options(service.clone()))
+        .merge(server_api::server_api_axum::runtime_resource_fetch(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::companion_status_alias(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::companion_status(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::companion_transcript_alias(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::companion_transcript(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::companion_message_alias(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::companion_message(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::companion_cancel_alias(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::companion_cancel(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_worker_remove(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_list_alias(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_list(service.clone()))
+        .merge(server_api::server_api_axum::runtime_create(service.clone()))
+        .merge(server_api::server_api_axum::runtime_detail(service.clone()))
+        .merge(server_api::server_api_axum::runtime_update(service.clone()))
+        .merge(server_api::server_api_axum::runtime_remove(service.clone()))
+        .merge(server_api::server_api_axum::runtime_trust_key_reveal(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_trust_key_revoke(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_connection_test(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_worker_list_alias(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_worker_create_alias(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_worker_list(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_worker_create(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_config_bundle_sync_alias(service.clone()))
+        .merge(server_api::server_api_axum::runtime_config_bundle_sync(
+            service.clone(),
+        ))
+        .merge(
+            server_api::server_api_axum::runtime_config_bundle_availability_alias(service.clone()),
+        )
+        .merge(server_api::server_api_axum::runtime_config_bundle_availability(service.clone()))
+        .merge(server_api::server_api_axum::runtime_worker_detail_alias(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_worker_detail(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_worker_restore_alias(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_worker_restore(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_worker_pin(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_worker_unpin(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_cleanup_plan(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_cleanup_execute(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_worker_input_alias(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_worker_input(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_worker_attachment_upload_grant(service.clone()))
+        .merge(
+            server_api::server_api_axum::runtime_worker_attachment_upload_cancel(service.clone()),
+        )
+        .merge(server_api::server_api_axum::runtime_worker_attachment_delete(service.clone()))
+        .merge(server_api::server_api_axum::runtime_worker_completions_alias(service.clone()))
+        .merge(server_api::server_api_axum::runtime_worker_completions(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_worker_stop_alias(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_worker_stop(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_worker_cancel_alias(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::runtime_worker_cancel(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::objective_list_alias(
             service.clone(),
         ))
@@ -5046,6 +5229,480 @@ impl server_api::ServerApi for ServerApiContractService {
             },
             observation,
         })
+    }
+
+    async fn workspace_worker_list_alias(
+        &self,
+    ) -> std::result::Result<server_api::WorkerListResponse, server_api::RepositoryApiError> {
+        let Json(response) = list_workers(State(self.workspace_api()?.clone()))
+            .await
+            .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn workspace_worker_create_alias(
+        &self,
+        context: server_api::ServerRequestContext,
+        request: server_api::CreateWorkspaceWorkerRequest,
+    ) -> std::result::Result<server_api::BrowserCreateWorkerResponse, server_api::RepositoryApiError>
+    {
+        create_workspace_worker(
+            State(self.workspace_api()?.clone()),
+            contract_request_headers(&context)?,
+            Json(request),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn workspace_orchestrator_status(
+        &self,
+        workspace_id: String,
+    ) -> std::result::Result<
+        server_api::BrowserWorkspaceOrchestratorResponse,
+        server_api::RepositoryApiError,
+    > {
+        scoped_workspace_orchestrator_status(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn workspace_orchestrator_start(
+        &self,
+        workspace_id: String,
+    ) -> std::result::Result<
+        server_api::BrowserWorkspaceOrchestratorResponse,
+        server_api::RepositoryApiError,
+    > {
+        scoped_start_workspace_orchestrator(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn worker_control_list(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+    ) -> std::result::Result<server_api::WorkerControlListResponse, server_api::RepositoryApiError>
+    {
+        let Json(response) = list_known_workers(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            contract_request_headers(&context)?,
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn worker_control_spawn(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::CreateWorkspaceWorkerRequest,
+    ) -> std::result::Result<server_api::BrowserCreateWorkerResponse, server_api::RepositoryApiError>
+    {
+        spawn_known_worker(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            contract_request_headers(&context)?,
+            Json(request),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn worker_control_input(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        runtime_id: String,
+        worker_id: String,
+        request: server_api::RuntimeWorkerInputRequest,
+    ) -> std::result::Result<server_api::RuntimeWorkerInputResult, server_api::RepositoryApiError>
+    {
+        let request = project_server_dto(&request)
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+        let Json(response) = send_known_worker_input(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimeWorkerPath {
+                workspace_id,
+                worker: RuntimeWorkerRef::new(runtime_id, worker_id),
+            }),
+            contract_request_headers(&context)?,
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn worker_control_cancel(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        runtime_id: String,
+        worker_id: String,
+        request: server_api::RuntimeWorkerLifecycleRequest,
+    ) -> std::result::Result<server_api::RuntimeWorkerLifecycleResult, server_api::RepositoryApiError>
+    {
+        let request = project_server_dto(&request)
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+        let Json(response) = cancel_known_worker(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimeWorkerPath {
+                workspace_id,
+                worker: RuntimeWorkerRef::new(runtime_id, worker_id),
+            }),
+            contract_request_headers(&context)?,
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn worker_control_stop(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        runtime_id: String,
+        worker_id: String,
+        request: server_api::RuntimeWorkerLifecycleRequest,
+    ) -> std::result::Result<server_api::RuntimeWorkerLifecycleResult, server_api::RepositoryApiError>
+    {
+        let request = project_server_dto(&request)
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+        let Json(response) = stop_known_worker(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimeWorkerPath {
+                workspace_id,
+                worker: RuntimeWorkerRef::new(runtime_id, worker_id),
+            }),
+            contract_request_headers(&context)?,
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn worker_control_restore(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        runtime_id: String,
+        worker_id: String,
+    ) -> std::result::Result<server_api::WorkerRestoreResponse, server_api::RepositoryApiError>
+    {
+        restore_known_worker(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedRuntimeWorkerPath {
+                workspace_id,
+                worker: RuntimeWorkerRef::new(runtime_id, worker_id),
+            }),
+            contract_request_headers(&context)?,
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn worker_observation_sessions(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+    ) -> std::result::Result<
+        server_api::WorkerObservationSessionsResponse,
+        server_api::RepositoryApiError,
+    > {
+        let Json(response) = scoped_list_worker_observation_sessions(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            contract_request_headers(&context)?,
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        serde_json::from_value(response)
+            .map_err(|error| Error::RegistryInconsistency(error.to_string()))
+            .map_err(|error| ApiError::from(error).into_repository_api_error())
+    }
+
+    async fn worker_observation_capture(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::WorkerObservationSubjectRef,
+    ) -> std::result::Result<
+        server_api::WorkerObservationCaptureResponse,
+        server_api::RepositoryApiError,
+    > {
+        let request = project_server_dto(&request)
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+        let Json(response) = scoped_capture_worker_observation_session(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            contract_request_headers(&context)?,
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        serde_json::from_value(response)
+            .map_err(|error| Error::RegistryInconsistency(error.to_string()))
+            .map_err(|error| ApiError::from(error).into_repository_api_error())
+    }
+
+    async fn workspace_worker_discovery(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        query: server_api::WorkspaceWorkerDiscoveryQuery,
+    ) -> std::result::Result<server_api::WorkspaceWorkerDiscoveryPage, server_api::RepositoryApiError>
+    {
+        discover_workspace_workers(
+            self.workspace_api()?.clone(),
+            workspace_id,
+            query,
+            context.runtime_source.is_some(),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn workspace_worker_list(
+        &self,
+        workspace_id: String,
+    ) -> std::result::Result<server_api::WorkerListResponse, server_api::RepositoryApiError> {
+        let Json(response) = scoped_list_workers(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_contract_dto(&response)
+    }
+
+    async fn workspace_worker_create(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::CreateWorkspaceWorkerRequest,
+    ) -> std::result::Result<server_api::BrowserCreateWorkerResponse, server_api::RepositoryApiError>
+    {
+        scoped_create_workspace_worker(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            contract_request_headers(&context)?,
+            Json(request),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn workspace_worker_detail(
+        &self,
+        workspace_id: String,
+        worker_ref: String,
+    ) -> std::result::Result<server_api::WorkerSummary, server_api::RepositoryApiError> {
+        scoped_get_workspace_worker(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspaceWorkerReferencePath {
+                workspace_id,
+                worker_ref,
+            }),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn workspace_worker_launch_options_alias(
+        &self,
+    ) -> std::result::Result<server_api::WorkerLaunchOptionsResponse, server_api::RepositoryApiError>
+    {
+        get_worker_launch_options(State(self.workspace_api()?.clone()))
+            .await
+            .map(|Json(response)| response)
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn workspace_worker_launch_options(
+        &self,
+        workspace_id: String,
+    ) -> std::result::Result<server_api::WorkerLaunchOptionsResponse, server_api::RepositoryApiError>
+    {
+        scoped_get_worker_launch_options(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn runtime_resource_fetch(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::RuntimeResourceFetchRequest,
+    ) -> std::result::Result<
+        server_api::RuntimeResourceFetchResponse,
+        server_api::RuntimeResourceFetchApiError,
+    > {
+        runtime_resource_fetch_contract(
+            self.workspace_api()
+                .map_err(|_| server_api::RuntimeResourceFetchApiError::MissingResource)?,
+            context,
+            workspace_id,
+            request,
+        )
+        .await
+    }
+
+    async fn companion_status_alias(
+        &self,
+    ) -> std::result::Result<server_api::CompanionStatusResponse, server_api::RepositoryApiError>
+    {
+        get_companion_status(State(self.workspace_api()?.clone()))
+            .await
+            .map(|Json(response)| response)
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn companion_status(
+        &self,
+        workspace_id: String,
+    ) -> std::result::Result<server_api::CompanionStatusResponse, server_api::RepositoryApiError>
+    {
+        scoped_get_companion_status(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn companion_transcript_alias(
+        &self,
+        query: server_api::CompanionTranscriptQuery,
+    ) -> std::result::Result<
+        server_api::CompanionTranscriptProjection,
+        server_api::RepositoryApiError,
+    > {
+        get_companion_transcript(
+            State(self.workspace_api()?.clone()),
+            Query(TranscriptQuery {
+                start: query.start,
+                limit: query.limit,
+            }),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn companion_transcript(
+        &self,
+        workspace_id: String,
+        query: server_api::CompanionTranscriptQuery,
+    ) -> std::result::Result<
+        server_api::CompanionTranscriptProjection,
+        server_api::RepositoryApiError,
+    > {
+        scoped_get_companion_transcript(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Query(TranscriptQuery {
+                start: query.start,
+                limit: query.limit,
+            }),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn companion_message_alias(
+        &self,
+        request: server_api::CompanionMessageRequest,
+    ) -> std::result::Result<server_api::CompanionMessageResponse, server_api::RepositoryApiError>
+    {
+        post_companion_message(State(self.workspace_api()?.clone()), Json(request))
+            .await
+            .map(|Json(response)| response)
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn companion_message(
+        &self,
+        workspace_id: String,
+        request: server_api::CompanionMessageRequest,
+    ) -> std::result::Result<server_api::CompanionMessageResponse, server_api::RepositoryApiError>
+    {
+        scoped_post_companion_message(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Json(request),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn companion_cancel_alias(
+        &self,
+        request: server_api::CompanionCancelRequest,
+    ) -> std::result::Result<server_api::CompanionMessageResponse, server_api::RepositoryApiError>
+    {
+        post_companion_cancel(State(self.workspace_api()?.clone()), Json(request))
+            .await
+            .map(|Json(response)| response)
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn companion_cancel(
+        &self,
+        workspace_id: String,
+        request: server_api::CompanionCancelRequest,
+    ) -> std::result::Result<server_api::CompanionMessageResponse, server_api::RepositoryApiError>
+    {
+        scoped_post_companion_cancel(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Json(request),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn workspace_worker_remove(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::WorkerRemoveRequest,
+    ) -> std::result::Result<server_api::WorkerRemoveResponse, server_api::WorkerRemoveApiError>
+    {
+        worker_remove_contract(
+            self.workspace_api()
+                .map_err(|error| worker_remove_repository_error(error))?,
+            context,
+            workspace_id,
+            request,
+        )
+        .await
     }
 
     async fn runtime_list_alias(
@@ -7415,93 +8072,8 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
             get(get_latest_workspace_runtime_config),
         )
         .route(
-            "/api/workers",
-            get(list_workers).post(create_workspace_worker),
-        )
-        .route(
-            "/api/w/{workspace_id}/orchestrator",
-            get(scoped_workspace_orchestrator_status)
-                .post(scoped_start_workspace_orchestrator),
-        )
-        .route(
-            "/api/w/{workspace_id}/worker-control/workers",
-            get(list_known_workers).post(spawn_known_worker),
-        )
-        .route(
-            "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/input",
-            post(send_known_worker_input),
-        )
-        .route(
-            "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/cancel",
-            post(cancel_known_worker),
-        )
-        .route(
-            "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/stop",
-            post(stop_known_worker),
-        )
-        .route(
-            "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/restore",
-            post(restore_known_worker),
-        )
-        .route(
-            "/api/w/{workspace_id}/worker-observation/sessions",
-            get(scoped_list_worker_observation_sessions),
-        )
-        .route(
-            "/api/w/{workspace_id}/worker-observation/session",
-            post(scoped_capture_worker_observation_session),
-        )
-        .route(
-            "/api/w/{workspace_id}/worker-discovery/workers",
-            get(scoped_discover_workspace_workers),
-        )
-        .route(
-            "/api/w/{workspace_id}/workers",
-            get(scoped_list_workers).post(scoped_create_workspace_worker),
-        )
-        .route(
-            "/api/w/{workspace_id}/workers/{worker_ref}",
-            get(scoped_get_workspace_worker),
-        )
-        .route(
             "/api/w/{workspace_id}/protocol/ws",
             get(scoped_workspace_protocol_ws),
-        )
-        .route(
-            "/api/workers/launch-options",
-            get(get_worker_launch_options),
-        )
-        .route(
-            "/api/w/{workspace_id}/workers/launch-options",
-            get(scoped_get_worker_launch_options),
-        )
-        .route(
-            "/api/runtime/v1/workspaces/{workspace_id}/resources/fetch",
-            post(scoped_post_internal_runtime_resource_fetch),
-        )
-        .route("/api/companion/status", get(get_companion_status))
-        .route(
-            "/api/w/{workspace_id}/companion/status",
-            get(scoped_get_companion_status),
-        )
-        .route("/api/companion/transcript", get(get_companion_transcript))
-        .route(
-            "/api/w/{workspace_id}/companion/transcript",
-            get(scoped_get_companion_transcript),
-        )
-        .route("/api/companion/messages", post(post_companion_message))
-        .route(
-            "/api/w/{workspace_id}/companion/messages",
-            post(scoped_post_companion_message),
-        )
-        .route("/api/companion/cancel", post(post_companion_cancel))
-        .route(
-            "/api/w/{workspace_id}/companion/cancel",
-            post(scoped_post_companion_cancel),
-        )
-        .route(
-            "/api/w/{workspace_id}/workers/remove",
-            post(scoped_worker_remove_source_boundary),
         )
         .route(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/attachment-uploads/{upload_id}",
@@ -13952,92 +14524,109 @@ fn worker_retention_error_response(
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WorkerRemoveBoundaryRequest {
-    target_runtime_id: String,
-    target_worker_id: String,
-    reason: String,
+fn worker_remove_repository_error(
+    error: server_api::RepositoryApiError,
+) -> server_api::WorkerRemoveApiError {
+    server_api::WorkerRemoveApiError::new(
+        StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+        Some(error.error),
+        None,
+        Some(error.message),
+        Some(error.diagnostics),
+    )
 }
 
-async fn scoped_worker_remove_source_boundary(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedWorkspacePath>,
-    headers: HeaderMap,
-    Json(request): Json<WorkerRemoveBoundaryRequest>,
-) -> Response {
-    if let Err(error) = validate_workspace_scope(&api, &path.workspace_id) {
-        return error.into_response();
+async fn worker_remove_contract(
+    api: &WorkspaceApi,
+    context: server_api::ServerRequestContext,
+    workspace_id: String,
+    request: server_api::WorkerRemoveRequest,
+) -> std::result::Result<server_api::WorkerRemoveResponse, server_api::WorkerRemoveApiError> {
+    if workspace_id != api.config.workspace_id {
+        return Err(server_api::WorkerRemoveApiError::new(
+            StatusCode::NOT_FOUND.as_u16(),
+            Some("workspace_not_found".to_owned()),
+            None,
+            Some("Workspace was not found".to_owned()),
+            None,
+        ));
     }
-    let proof = match crate::worker_source::presented_worker_remove_source(&headers, None) {
-        Ok(proof) => proof,
-        Err(error) => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({ "error": error.to_string() })),
+    let headers = contract_request_headers(&context).map_err(worker_remove_repository_error)?;
+    let proof =
+        crate::worker_source::presented_worker_remove_source(&headers, None).map_err(|error| {
+            server_api::WorkerRemoveApiError::new(
+                StatusCode::UNAUTHORIZED.as_u16(),
+                Some(error.to_string()),
+                None,
+                None,
+                None,
             )
-                .into_response();
-        }
-    };
-    match crate::worker_source::verify_worker_remove_source(
-        &api,
+        })?;
+    let source = crate::worker_source::verify_worker_remove_source(
+        api,
         proof,
         &request.target_runtime_id,
         &request.target_worker_id,
     )
     .await
-    {
-        Ok(source) => {
-            let executor = WorkerRemovalService::new(&api);
-            match executor
-                .execute_async(
-                    source,
-                    &request.target_runtime_id,
-                    &request.target_worker_id,
-                    &request.reason,
-                )
-                .await
-            {
-                Ok(response) => (
-                    StatusCode::from_u16(response.status)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    [(CONTENT_TYPE, "application/json")],
-                    response.body,
-                )
-                    .into_response(),
-                Err(_) => {
-                    let response = worker_remove_error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "worker_remove_failed",
-                        "Worker removal failed before lifecycle execution",
-                    );
-                    (
-                        StatusCode::from_u16(response.status)
-                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                        [(CONTENT_TYPE, "application/json")],
-                        response.body,
-                    )
-                        .into_response()
-                }
+    .map_err(|error| {
+        let status = match error {
+            crate::worker_source::WorkerMutationSourceProofError::Replay => StatusCode::CONFLICT,
+            crate::worker_source::WorkerMutationSourceProofError::Authority(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
             }
-        }
-        Err(error) => {
-            let status = match error {
-                crate::worker_source::WorkerMutationSourceProofError::Replay => {
-                    StatusCode::CONFLICT
-                }
-                crate::worker_source::WorkerMutationSourceProofError::Authority(_) => {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                }
-                _ => StatusCode::FORBIDDEN,
-            };
-            (
-                status,
-                Json(serde_json::json!({ "error": error.to_string() })),
+            _ => StatusCode::FORBIDDEN,
+        };
+        server_api::WorkerRemoveApiError::new(
+            status.as_u16(),
+            Some(error.to_string()),
+            None,
+            None,
+            None,
+        )
+    })?;
+    let response = WorkerRemovalService::new(api)
+        .execute_async(
+            source,
+            &request.target_runtime_id,
+            &request.target_worker_id,
+            &request.reason,
+        )
+        .await
+        .unwrap_or_else(|_| {
+            worker_remove_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "worker_remove_failed",
+                "Worker removal failed before lifecycle execution",
             )
-                .into_response()
-        }
+        });
+    if (200..300).contains(&response.status) {
+        return serde_json::from_str(&response.body).map_err(|error| {
+            server_api::WorkerRemoveApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                Some("worker_remove_invalid_response".to_owned()),
+                None,
+                Some(error.to_string()),
+                None,
+            )
+        });
     }
+    let body: serde_json::Value = serde_json::from_str(&response.body).unwrap_or_default();
+    Err(server_api::WorkerRemoveApiError::new(
+        response.status,
+        body.get("error")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        body.get("code")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        body.get("message")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        body.get("diagnostics")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok()),
+    ))
 }
 
 async fn scoped_get_workspace_worker(
@@ -14069,73 +14658,43 @@ async fn scoped_get_workspace_worker(
         })
 }
 
-#[derive(Debug, Deserialize)]
-struct WorkspaceWorkerDiscoveryQuery {
-    cursor: Option<String>,
-    limit: Option<usize>,
-    query: Option<String>,
-}
-
-async fn scoped_discover_workspace_workers(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedWorkspacePath>,
-    Query(query): Query<WorkspaceWorkerDiscoveryQuery>,
-    source: Option<Extension<crate::worker_source::VerifiedRuntimeRequestSource>>,
-) -> Response {
-    let Some(Extension(_source)) = source else {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "workspace_worker_discovery_source_required"
-            })),
-        )
-            .into_response();
-    };
-
-    if let Err(error) = validate_workspace_scope(&api, &path.workspace_id) {
-        return error.into_response();
+async fn discover_workspace_workers(
+    api: WorkspaceApi,
+    workspace_id: String,
+    query: server_api::WorkspaceWorkerDiscoveryQuery,
+    verified_runtime_source: bool,
+) -> std::result::Result<WorkspaceWorkerDiscoveryPage, ApiError> {
+    if !verified_runtime_source {
+        return Err(ApiError::from(Error::WorkspacePermissionDenied(
+            "workspace_worker_discovery_source_required".to_string(),
+        )));
     }
+    validate_workspace_scope(&api, &workspace_id)?;
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
-    let cursor = query.cursor.as_deref();
+    let cursor = query.cursor.clone();
     let query = match query.query.as_deref().map(str::trim) {
         Some("") | None => None,
         Some(query) if query.len() <= 128 => Some(query),
         Some(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "invalid_workspace_worker_discovery_query"
-                })),
-            )
-                .into_response();
+            return Err(ApiError::from(Error::InvalidInput(
+                "invalid_workspace_worker_discovery_query".to_string(),
+            )));
         }
     };
     let filter_fingerprint = workspace_worker_discovery_filter_fingerprint(query);
-    let offset = match query_cursor_offset(cursor, filter_fingerprint) {
-        Ok(offset) => offset,
-        Err(()) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "invalid_workspace_worker_discovery_cursor"
-                })),
-            )
-                .into_response();
-        }
-    };
-
-    let workers = match workers_response(api) {
-        Ok(workers) => workers,
-        Err(error) => return error.into_response(),
-    };
-    Json(workspace_worker_discovery_page(
+    let offset = query_cursor_offset(cursor.as_deref(), filter_fingerprint).map_err(|()| {
+        ApiError::from(Error::InvalidInput(
+            "invalid_workspace_worker_discovery_cursor".to_string(),
+        ))
+    })?;
+    let workers = workers_response(api)?;
+    Ok(workspace_worker_discovery_page(
         workers.items,
         query,
         offset,
         limit,
         filter_fingerprint,
     ))
-    .into_response()
 }
 
 fn workspace_worker_discovery_page(
@@ -20094,101 +20653,89 @@ fn finalize_spawned_worker_workdir_attachments(
     Ok(())
 }
 
-async fn scoped_post_internal_runtime_resource_fetch(
-    State(api): State<WorkspaceApi>,
-    AxumPath(workspace_id): AxumPath<String>,
-    headers: HeaderMap,
-    request: Request,
+async fn runtime_resource_fetch_contract(
+    api: &WorkspaceApi,
+    context: server_api::ServerRequestContext,
+    workspace_id: String,
+    request: server_api::RuntimeResourceFetchRequest,
 ) -> std::result::Result<
-    Json<worker_runtime::resource::BackendResourceFetchResponse>,
-    (StatusCode, Json<BackendResourceError>),
+    server_api::RuntimeResourceFetchResponse,
+    server_api::RuntimeResourceFetchApiError,
 > {
     if workspace_id != api.workspace_id() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(BackendResourceError::MissingResource),
-        ));
+        return Err(server_api::RuntimeResourceFetchApiError::MissingResource);
     }
-    let proof = headers
-        .get(worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(BackendResourceError::Unauthorized {
-                    message: "Runtime request proof is required".to_owned(),
-                }),
-            )
-        })?;
-    let verified_source = request
-        .extensions()
-        .get::<crate::worker_source::VerifiedRuntimeRequestSource>()
-        .cloned();
-    let method = request.method().as_str().to_owned();
-    let path = signed_request_target(request.uri()).to_owned();
-    let body = axum::body::to_bytes(request.into_body(), 16 * 1024 * 1024)
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(BackendResourceError::InvalidResponse {
-                    message: error.to_string(),
-                }),
-            )
-        })?;
-    let source = if let Some(source) = verified_source {
+    let source = if let Some(source) = context.runtime_source {
         source
     } else {
-        crate::worker_source::verify_runtime_request_source_proof(
-            &api,
+        let proof = context
+            .transport_headers
+            .iter()
+            .find(|(name, _)| {
+                name.eq_ignore_ascii_case(worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER)
+            })
+            .and_then(|(_, value)| std::str::from_utf8(value).ok())
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| server_api::RuntimeResourceFetchApiError::Unauthorized {
+                message: "Runtime request proof is required".to_owned(),
+            })?;
+        let body = serde_json::to_vec(&request).map_err(|error| {
+            server_api::RuntimeResourceFetchApiError::InvalidResponse {
+                message: error.to_string(),
+            }
+        })?;
+        let path = format!("/api/runtime/v1/workspaces/{workspace_id}/resources/fetch");
+        let source = crate::worker_source::verify_runtime_request_source_proof(
+            api,
             proof,
             &workspace_id,
             worker_runtime::auth::BACKEND_RESOURCE_FETCH_PERMISSION,
-            &method,
+            "POST",
             &path,
             &worker_runtime::auth::request_body_digest(&body),
         )
         .await
-        .map_err(|_| {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(BackendResourceError::Unauthorized {
-                    message: "Runtime request proof is invalid".to_owned(),
-                }),
-            )
-        })?
+        .map_err(|_| server_api::RuntimeResourceFetchApiError::Unauthorized {
+            message: "Runtime request proof is invalid".to_owned(),
+        })?;
+        server_api::ServerRuntimeSource {
+            runtime_id: source.runtime_id,
+            worker_id: source.worker_id,
+        }
     };
     if source.worker_id.is_some() {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(BackendResourceError::Unauthorized {
-                message: "Worker-scoped proof cannot fetch Runtime resources".to_owned(),
-            }),
-        ));
+        return Err(server_api::RuntimeResourceFetchApiError::Unauthorized {
+            message: "Worker-scoped proof cannot fetch Runtime resources".to_owned(),
+        });
     }
-    let request: BackendResourceFetchRequest = serde_json::from_slice(&body).map_err(|error| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(BackendResourceError::InvalidResponse {
-                message: error.to_string(),
-            }),
-        )
-    })?;
     if request.runtime_id != source.runtime_id {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(BackendResourceError::Unauthorized {
-                message: "Runtime request proof subject does not match the request".to_owned(),
-            }),
-        ));
+        return Err(server_api::RuntimeResourceFetchApiError::Unauthorized {
+            message: "Runtime request proof subject does not match the request".to_owned(),
+        });
     }
-    api.resource_broker
+    let request: BackendResourceFetchRequest = project_server_dto(&request).map_err(|error| {
+        server_api::RuntimeResourceFetchApiError::InvalidResponse {
+            message: error.to_string(),
+        }
+    })?;
+    let response = api
+        .resource_broker
         .fetch_resource(request)
-        .map(Json)
-        .map_err(|error| (backend_resource_error_status(&error), Json(error)))
+        .map_err(|error| {
+            project_contract_dto(&error).unwrap_or_else(|projection_error| {
+                server_api::RuntimeResourceFetchApiError::InvalidResponse {
+                    message: projection_error.message,
+                }
+            })
+        })?;
+    project_contract_dto(&response).map_err(|error| {
+        server_api::RuntimeResourceFetchApiError::InvalidResponse {
+            message: error.message,
+        }
+    })
 }
 
+#[cfg(test)]
 fn backend_resource_error_status(error: &BackendResourceError) -> StatusCode {
     match error {
         BackendResourceError::Expired => StatusCode::GONE,

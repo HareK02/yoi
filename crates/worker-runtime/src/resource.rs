@@ -1,7 +1,7 @@
 use crate::auth::BACKEND_RESOURCE_FETCH_PERMISSION;
 use crate::identity::WorkerId;
 use crate::profile_archive::{ProfileSourceArchive, ProfileSourceArchiveRef, sha256_hex};
-use crate::workspace_request::{RuntimeWorkspaceRequest, RuntimeWorkspaceRequestClient};
+use crate::workspace_request::RuntimeWorkspaceRequestClient;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -219,11 +219,6 @@ impl BackendResourceClient for HttpBackendResourceClient {
         &self,
         request: BackendResourceFetchRequest,
     ) -> Result<BackendResourceFetchResponse, BackendResourceError> {
-        let body = serde_json::to_vec(&request).map_err(|error| {
-            BackendResourceError::InvalidResponse {
-                message: error.to_string(),
-            }
-        })?;
         let endpoint = reqwest::Url::parse(&self.endpoint).map_err(|error| {
             BackendResourceError::Transport {
                 message: error.to_string(),
@@ -248,17 +243,17 @@ impl BackendResourceClient for HttpBackendResourceClient {
                     .to_string(),
             }
         })?;
-        if !endpoint_suffix.starts_with('/') {
+        let expected_path = format!(
+            "/api/runtime/v1/workspaces/{}/resources/fetch",
+            client.workspace_id()
+        );
+        if endpoint_suffix != expected_path {
             return Err(BackendResourceError::Unauthorized {
                 message: "Workspace resource endpoint does not match its request client"
                     .to_string(),
             });
         }
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            reqwest::header::CONTENT_TYPE,
-            reqwest::header::HeaderValue::from_static("application/json"),
-        );
         if let Some(token) = self.bearer_token.as_deref() {
             let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
                 .map_err(|error| BackendResourceError::Transport {
@@ -266,41 +261,57 @@ impl BackendResourceClient for HttpBackendResourceClient {
                 })?;
             headers.insert(reqwest::header::AUTHORIZATION, value);
         }
-        let response = client
-            .execute(RuntimeWorkspaceRequest {
-                method: reqwest::Method::POST,
-                path_and_query: endpoint_suffix.to_string(),
-                body,
+        let request: server_api::RuntimeResourceFetchRequest =
+            serde_json::from_value(serde_json::to_value(&request).map_err(|error| {
+                BackendResourceError::InvalidResponse {
+                    message: error.to_string(),
+                }
+            })?)
+            .map_err(|error| BackendResourceError::InvalidResponse {
+                message: error.to_string(),
+            })?;
+        let generated = client
+            .server_api_client(
+                BACKEND_RESOURCE_FETCH_PERMISSION,
+                None,
                 headers,
-                permission: BACKEND_RESOURCE_FETCH_PERMISSION.to_string(),
-                worker_id: None,
-                timeout: Some(self.request_timeout),
-                max_response_bytes: 8 * 1024 * 1024,
-            })
+                self.request_timeout,
+                8 * 1024 * 1024,
+            )
+            .map_err(|error| BackendResourceError::Transport {
+                message: error.to_string(),
+            })?;
+        match generated
+            .runtime_resource_fetch(client.workspace_id().to_string(), request)
             .await
-            .map_err(|error| {
-                if error.is_timeout() {
-                    BackendResourceError::Timeout
-                } else {
-                    BackendResourceError::Transport {
+        {
+            Ok(response) => {
+                serde_json::from_value(serde_json::to_value(&response).map_err(|error| {
+                    BackendResourceError::InvalidResponse {
                         message: error.to_string(),
                     }
-                }
-            })?;
-        if response.status.is_success() {
-            serde_json::from_slice::<BackendResourceFetchResponse>(&response.body).map_err(|err| {
-                BackendResourceError::InvalidResponse {
-                    message: err.to_string(),
-                }
-            })
-        } else {
-            let status = response.status;
-            match serde_json::from_slice::<BackendResourceError>(&response.body) {
-                Ok(error) => Err(error),
-                Err(err) => Err(BackendResourceError::Transport {
-                    message: format!("backend resource fetch failed with HTTP {status}: {err}"),
-                }),
+                })?)
+                .map_err(|error| BackendResourceError::InvalidResponse {
+                    message: error.to_string(),
+                })
             }
+            Err(server_api::client_support::ClientError::Public { error, .. }) => {
+                serde_json::from_value(serde_json::to_value(error).map_err(|error| {
+                    BackendResourceError::InvalidResponse {
+                        message: error.to_string(),
+                    }
+                })?)
+                .map_err(|error| BackendResourceError::InvalidResponse {
+                    message: error.to_string(),
+                })
+                .and_then(Err)
+            }
+            Err(server_api::client_support::ClientError::Failure(
+                server_api::client_support::ClientFailure::Timeout,
+            )) => Err(BackendResourceError::Timeout),
+            Err(error) => Err(BackendResourceError::Transport {
+                message: error.to_string(),
+            }),
         }
     }
 }

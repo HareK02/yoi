@@ -9,10 +9,14 @@ import type {
   BrowserCreateWorkerResponse as SharedBrowserCreateWorkerResponse,
   BrowserWorkerWorkingDirectorySelection
     as SharedBrowserWorkerWorkingDirectorySelection,
+  Diagnostic as SharedDiagnostic,
+  WorkerCapabilitySummary as SharedWorkerCapabilitySummary,
   WorkerLaunchOptionsResponse as SharedWorkerLaunchOptionsResponse,
   WorkerLaunchProfileCandidate as SharedWorkerLaunchProfileCandidate,
   WorkerLaunchRuntimeOption as SharedWorkerLaunchRuntimeOption,
-  WorkerLaunchWorkerSummary as WorkerSummary,
+  WorkerLaunchWorkerSummary,
+  WorkerSummary as SharedWorkerSummary,
+  WorkerWorkdirAttachmentSummary as SharedWorkerWorkdirAttachmentSummary,
   WorkingDirectoryRepositoryOption as SharedWorkingDirectoryRepositoryOption,
 } from "$lib/generated/worker-launch-api";
 import type {
@@ -53,11 +57,7 @@ export type {
 };
 export type WorkspaceResponse = SharedWorkspaceResponse;
 
-export type Diagnostic = {
-  code: string;
-  severity: string;
-  message: string;
-};
+export type Diagnostic = SharedDiagnostic;
 
 export type Runtime = {
   runtime_id: string;
@@ -78,35 +78,17 @@ export type Runtime = {
   };
 };
 
-export type WorkerCapabilities = {
-  can_stop: boolean;
-  can_spawn_followup: boolean;
-};
+export type WorkerCapabilities = SharedWorkerCapabilitySummary;
 
-export type WorkerWorkdirAttachment = {
-  alias: string;
-  working_directory: WorkingDirectorySummary;
-};
+export type WorkerWorkdirAttachment = SharedWorkerWorkdirAttachmentSummary;
 
-export type Worker = {
-  runtime_id: string;
-  worker_id: string;
-  resource_key: string;
-  host_id: string;
+export type Worker = Omit<
+  SharedWorkerSummary,
+  "display_name" | "tags" | "worker_state" | "diagnostics"
+> & {
   display_name: string;
-  label: string;
-  profile?: string | null;
-  singleton_key?: string | null;
   tags: string[];
-  workspace: { visibility: string; identity: string };
-  state: string;
   worker_state?: WorkerStateSnapshot | null;
-  pinned?: boolean;
-  retention_state?: string;
-  last_seen_at?: string | null;
-  implementation: { kind: string; display_hint: string };
-  capabilities: WorkerCapabilities;
-  workdir_attachments?: WorkerWorkdirAttachment[];
   diagnostics: Diagnostic[];
 };
 
@@ -121,7 +103,7 @@ export type WorkerRestoreState =
 
 export type WorkerRestoreResult = {
   state: WorkerRestoreState;
-  worker?: WorkerSummary | null;
+  worker?: WorkerLaunchWorkerSummary | null;
   diagnostics: Diagnostic[];
 };
 

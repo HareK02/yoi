@@ -393,15 +393,16 @@ async fn get_backend_worker_launch_options_with_client(
     target: &BackendWorkerLaunchTarget,
     api: &BackendApiClient,
 ) -> Result<BackendWorkerLaunchOptions, BackendRuntimeClientError> {
-    let path = backend_workspace_workers_launch_options_path(
-        target
-            .workspace_id
-            .as_deref()
-            .expect("validated Backend Workspace scope"),
-    );
-    let response = api.request(HttpMethod::GET, &path)?.send().await?;
-    let response = api.require_success(response).await?;
-    Ok(response.json::<BackendWorkerLaunchOptions>().await?)
+    runtime_server_api_client(&target.base_url, api)?
+        .workspace_worker_launch_options(
+            target
+                .workspace_id
+                .as_deref()
+                .expect("validated Backend Workspace scope")
+                .to_string(),
+        )
+        .await
+        .map_err(Into::into)
 }
 
 pub async fn create_backend_worker(
@@ -418,19 +419,17 @@ async fn create_backend_worker_with_client(
     request: &BackendCreateWorkerRequest,
     api: &BackendApiClient,
 ) -> Result<BackendCreateWorkerResponse, BackendRuntimeClientError> {
-    let path = backend_workspace_workers_path(
-        target
-            .workspace_id
-            .as_deref()
-            .expect("validated Backend Workspace scope"),
-    );
-    let response = api
-        .request(HttpMethod::POST, &path)?
-        .json(request)
-        .send()
-        .await?;
-    let response = api.require_success(response).await?;
-    Ok(response.json::<BackendCreateWorkerResponse>().await?)
+    runtime_server_api_client(&target.base_url, api)?
+        .workspace_worker_create(
+            target
+                .workspace_id
+                .as_deref()
+                .expect("validated Backend Workspace scope")
+                .to_string(),
+            request.clone(),
+        )
+        .await
+        .map_err(Into::into)
 }
 
 pub async fn list_backend_workers(
@@ -678,17 +677,6 @@ fn validate_list_target(
         ));
     }
     Ok(())
-}
-
-fn backend_workspace_workers_path(workspace_id: &str) -> String {
-    format!("/api/w/{}/workers", path_segment_encode(workspace_id))
-}
-
-fn backend_workspace_workers_launch_options_path(workspace_id: &str) -> String {
-    format!(
-        "{}/launch-options",
-        backend_workspace_workers_path(workspace_id)
-    )
 }
 
 fn protocol_ws_request(

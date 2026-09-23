@@ -6,15 +6,20 @@ import type {
   CreateWorkspaceWorkerTicketAssignmentRequest,
   Diagnostic,
   DiagnosticSeverity,
+  RepositoryApiError,
+  RuntimeWorkerWorkdirAttachmentSummary,
   RuntimeWorkingDirectoryCleanupTarget,
   RuntimeWorkingDirectorySummary,
-  RuntimeWorkerWorkdirAttachmentSummary,
   WorkerCapabilitySummary,
   WorkerImplementationSummary,
   WorkerLaunchOptionsResponse,
   WorkerLaunchProfileCandidate,
   WorkerLaunchRuntimeOption,
   WorkerLaunchWorkerSummary,
+  WorkerListResponse,
+  WorkerStateSnapshot,
+  WorkerSummary,
+  WorkerWorkdirAttachmentSummary,
   WorkerWorkspaceSummary,
   WorkingDirectoryRepositoryOption,
 } from "$lib/generated/worker-launch-api";
@@ -45,8 +50,14 @@ function exact(
   }
 }
 
+const MAX_STRING_LENGTH = 65_536;
+const MAX_COLLECTION_LENGTH = 4_096;
+
 function string(value: unknown, label: string): string {
   if (typeof value !== "string") throw new Error(`${label} must be a string`);
+  if (value.length > MAX_STRING_LENGTH) {
+    throw new Error(`${label} exceeds its length limit`);
+  }
   return value;
 }
 
@@ -56,8 +67,8 @@ function boolean(value: unknown, label: string): boolean {
 }
 
 function number(value: unknown, label: string): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw new Error(`${label} must be a finite number`);
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+    throw new Error(`${label} must be a safe integer`);
   }
   return value;
 }
@@ -72,6 +83,9 @@ function array<T>(
   parse: (item: unknown, label: string) => T,
 ): T[] {
   if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+  if (value.length > MAX_COLLECTION_LENGTH) {
+    throw new Error(`${label} exceeds its item limit`);
+  }
   return value.map((item, index) => parse(item, `${label}[${index}]`));
 }
 
@@ -165,6 +179,18 @@ function repositoryOption(
   };
 }
 
+export function parseWorkerApiError(value: unknown): RepositoryApiError {
+  const item = record(value, "Worker API error");
+  exact(item, ["error", "message", "diagnostics"], "Worker API error");
+  return {
+    error: string(item.error, "error"),
+    message: string(item.message, "message"),
+    diagnostics: item.diagnostics === undefined
+      ? []
+      : array(item.diagnostics, "diagnostics", diagnostic),
+  };
+}
+
 export function parseWorkerLaunchOptionsResponse(
   value: unknown,
 ): WorkerLaunchOptionsResponse {
@@ -234,6 +260,181 @@ function capabilitySummary(
       item.can_spawn_followup,
       `${label}.can_spawn_followup`,
     ),
+  };
+}
+
+function workerStateSnapshot(
+  value: unknown,
+  label: string,
+): WorkerStateSnapshot {
+  const snapshot = record(value, label);
+  exact(snapshot, ["last_command_id", "state"], label);
+  const state = record(snapshot.state, `${label}.state`);
+  const kind = string(state.kind, `${label}.state.kind`);
+  if (kind === "idle") {
+    exact(state, ["kind"], `${label}.state`);
+    return {
+      last_command_id: unsignedInteger(
+        snapshot.last_command_id,
+        `${label}.last_command_id`,
+      ),
+      state: { kind: "idle" },
+    };
+  }
+  if (kind !== "busy") throw new Error(`${label}.state.kind is invalid`);
+  exact(state, ["kind", "state"], `${label}.state`);
+  const busy = record(state.state, `${label}.state.state`);
+  exact(busy, ["kind", "state"], `${label}.state.state`);
+  const busyKind = string(busy.kind, `${label}.state.state.kind`);
+  const busyState = string(busy.state, `${label}.state.state.state`);
+  if (
+    (busyKind === "run" &&
+      ["running", "pausing", "paused", "cancelling"].includes(busyState)) ||
+    (busyKind === "maintenance" && busyState === "compacting")
+  ) {
+    return {
+      last_command_id: unsignedInteger(
+        snapshot.last_command_id,
+        `${label}.last_command_id`,
+      ),
+      state: {
+        kind: "busy",
+        state: busyKind === "run"
+          ? {
+            kind: "run",
+            state: busyState as "running" | "pausing" | "paused" | "cancelling",
+          }
+          : { kind: "maintenance", state: "compacting" },
+      },
+    };
+  }
+  throw new Error(`${label}.state.state is invalid`);
+}
+
+function workerWorkdirAttachment(
+  value: unknown,
+  label: string,
+): WorkerWorkdirAttachmentSummary {
+  const item = record(value, label);
+  exact(item, ["alias", "working_directory"], label);
+  return {
+    alias: string(item.alias, `${label}.alias`),
+    working_directory: parseWorkingDirectorySummary(item.working_directory),
+  };
+}
+
+export type ParsedWorkerSummary =
+  & Omit<
+    WorkerSummary,
+    "display_name" | "tags" | "diagnostics"
+  >
+  & {
+    display_name: string;
+    tags: string[];
+    diagnostics: Diagnostic[];
+  };
+
+export type ParsedWorkerListResponse = Omit<WorkerListResponse, "items"> & {
+  items: ParsedWorkerSummary[];
+};
+
+export function parseWorkerSummary(
+  value: unknown,
+  label = "Worker summary",
+): ParsedWorkerSummary {
+  const item = record(value, label);
+  exact(
+    item,
+    [
+      "runtime_id",
+      "worker_id",
+      "resource_key",
+      "host_id",
+      "display_name",
+      "label",
+      "profile",
+      "singleton_key",
+      "tags",
+      "workspace",
+      "state",
+      "worker_state",
+      "last_seen_at",
+      "pinned",
+      "retention_state",
+      "implementation",
+      "capabilities",
+      "workdir_attachments",
+      "diagnostics",
+    ],
+    label,
+  );
+  return {
+    runtime_id: string(item.runtime_id, `${label}.runtime_id`),
+    worker_id: string(item.worker_id, `${label}.worker_id`),
+    resource_key: string(item.resource_key, `${label}.resource_key`),
+    host_id: string(item.host_id, `${label}.host_id`),
+    display_name: item.display_name === undefined
+      ? ""
+      : string(item.display_name, `${label}.display_name`),
+    label: string(item.label, `${label}.label`),
+    profile: optional(item.profile, `${label}.profile`, string),
+    singleton_key: optional(
+      item.singleton_key,
+      `${label}.singleton_key`,
+      string,
+    ),
+    tags: item.tags === undefined
+      ? []
+      : array(item.tags, `${label}.tags`, string),
+    workspace: workspaceSummary(item.workspace, `${label}.workspace`),
+    state: string(item.state, `${label}.state`),
+    worker_state: optional(
+      item.worker_state,
+      `${label}.worker_state`,
+      workerStateSnapshot,
+    ),
+    last_seen_at: optional(item.last_seen_at, `${label}.last_seen_at`, string),
+    pinned: item.pinned === undefined
+      ? false
+      : boolean(item.pinned, `${label}.pinned`),
+    retention_state: item.retention_state === undefined
+      ? ""
+      : string(item.retention_state, `${label}.retention_state`),
+    implementation: implementationSummary(
+      item.implementation,
+      `${label}.implementation`,
+    ),
+    capabilities: capabilitySummary(item.capabilities, `${label}.capabilities`),
+    workdir_attachments: item.workdir_attachments === undefined
+      ? undefined
+      : array(
+        item.workdir_attachments,
+        `${label}.workdir_attachments`,
+        workerWorkdirAttachment,
+      ),
+    diagnostics: item.diagnostics === undefined
+      ? []
+      : array(item.diagnostics, `${label}.diagnostics`, diagnostic),
+  };
+}
+
+export function parseWorkerListResponse(
+  value: unknown,
+): ParsedWorkerListResponse {
+  const item = record(value, "Worker list response");
+  exact(
+    item,
+    ["workspace_id", "limit", "items", "source", "diagnostics"],
+    "Worker list response",
+  );
+  return {
+    workspace_id: string(item.workspace_id, "workspace_id"),
+    limit: unsignedInteger(item.limit, "limit"),
+    items: array(item.items, "items", parseWorkerSummary),
+    source: string(item.source, "source"),
+    diagnostics: item.diagnostics === undefined
+      ? []
+      : array(item.diagnostics, "diagnostics", diagnostic),
   };
 }
 
