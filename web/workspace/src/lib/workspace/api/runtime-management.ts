@@ -5,6 +5,7 @@ import type {
   RevokeRuntimeTrustKeyRequest,
   RuntimeConnectionDisplayState,
   RuntimeIdentityAuthority,
+  RuntimeManagementApiError,
   RuntimeManagementSummary,
   RuntimeRemovalOperationResponse,
   RuntimeRemovalOperationState,
@@ -13,8 +14,6 @@ import type {
   RuntimeSourceSummary,
   RuntimeTrustAuditAction,
   RuntimeTrustAuditEntry,
-  RuntimeTrustConflictKind,
-  RuntimeTrustConflictResponse,
   RuntimeTrustKeyRevealResponse,
   RuntimeTrustKeyState,
   RuntimeTrustKeyStatus,
@@ -23,12 +22,24 @@ import type {
   WorkspaceRuntimeBindingState,
   WorkspaceRuntimeBindingSummary,
   WorkspaceRuntimeDetail,
+  WorkspaceRuntimeListResponse,
   WorkspaceRuntimeResource,
-} from "$lib/generated/legacy-server-api.ts";
-import type { ListResponse } from "$lib/workspace/sidebar/types";
+} from "$lib/generated/runtime-api.ts";
 import { workspaceApiPath } from "./http.ts";
 
-export type WorkspaceRuntimeList = ListResponse<WorkspaceRuntimeResource>;
+export type WorkspaceRuntimeList = Omit<WorkspaceRuntimeListResponse, "diagnostics"> & {
+  diagnostics: Diagnostic[];
+};
+export type ValidatedWorkspaceRuntimeDetail = Omit<
+  WorkspaceRuntimeDetail,
+  "recent_audit"
+> & {
+  recent_audit: RuntimeTrustAuditEntry[];
+};
+export type RuntimeTrustConflictKind = "stale_revision" | "fingerprint_in_use";
+export type RuntimeTrustConflictResponse = RuntimeManagementApiError & {
+  error: RuntimeTrustConflictKind;
+};
 
 const LIMITS = {
   runtimeItems: 200,
@@ -690,7 +701,7 @@ export function parseWorkspaceRuntimeList(
 
 export function parseWorkspaceRuntimeDetail(
   value: unknown,
-): WorkspaceRuntimeDetail {
+): ValidatedWorkspaceRuntimeDetail {
   const response = object(value, "Runtime detail response");
   exactKeys(
     response,

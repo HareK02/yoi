@@ -1,7 +1,5 @@
 use crate::transport::websocket::{Socket as WebSocket, SocketError as WebSocketError};
 use crate::{BackendApiClient, BackendApiClientError, Client};
-use reqwest::Method as HttpMethod;
-use serde::Deserialize;
 pub use server_api::{
     BrowserCreateWorkerResponse as BackendCreateWorkerResponse,
     CreateWorkspaceWorkerRequest as BackendCreateWorkerRequest, Diagnostic as BackendDiagnostic,
@@ -88,44 +86,30 @@ impl BackendRuntimeTarget {
         content: Vec<u8>,
     ) -> Result<protocol::UploadedFileRef, BackendRuntimeClientError> {
         let api = BackendApiClient::from_stored_token(&self.base_url)?;
-        let worker_path = format!(
-            "/api/w/{}/runtimes/{}/workers/{}",
-            path_segment_encode(&self.workspace_id),
-            path_segment_encode(&self.runtime_id),
-            path_segment_encode(&self.worker_id),
-        );
-        let grant_path = format!(
-            "{worker_path}/attachment-upload-grants?file_name={}&media_type={}&upload_id={}",
-            path_segment_encode(file_name),
-            path_segment_encode(media_type),
-            path_segment_encode(&upload_id),
-        );
-        let grant_response = api
-            .request(HttpMethod::POST, &grant_path)?
-            .send()
-            .await
-            .map_err(BackendRuntimeClientError::Http)?;
-        api.check_status(grant_response.status())?;
-        let grant = grant_response
-            .json::<AttachmentUploadGrantResponse>()
-            .await
-            .map_err(BackendRuntimeClientError::Http)?;
-        let upload_path = format!(
-            "{worker_path}/attachment-uploads/{}",
-            path_segment_encode(&grant.upload_id),
-        );
-        let response = api
-            .request(HttpMethod::PUT, &upload_path)?
-            .body(content)
-            .send()
-            .await
-            .map_err(BackendRuntimeClientError::Http)?;
-        api.check_status(response.status())?;
-        response
-            .json::<UploadedFileResponse>()
+        let client = runtime_server_api_client(&self.base_url, &api)?;
+        let grant = client
+            .runtime_worker_attachment_upload_grant(
+                self.workspace_id.clone(),
+                self.runtime_id.clone(),
+                self.worker_id.clone(),
+                server_api::WorkerFileUploadQuery {
+                    file_name: file_name.to_string(),
+                    media_type: media_type.to_string(),
+                    upload_id: Some(upload_id.to_string()),
+                },
+            )
+            .await?;
+        client
+            .runtime_worker_attachment_upload(
+                self.workspace_id.clone(),
+                self.runtime_id.clone(),
+                self.worker_id.clone(),
+                grant.upload_id,
+                server_api::BinaryBody::from(content),
+            )
             .await
             .map(|response| response.file)
-            .map_err(BackendRuntimeClientError::Http)
+            .map_err(BackendRuntimeClientError::from)
     }
 
     pub async fn cancel_file_upload(
@@ -133,19 +117,14 @@ impl BackendRuntimeTarget {
         upload_id: &str,
     ) -> Result<(), BackendRuntimeClientError> {
         let api = BackendApiClient::from_stored_token(&self.base_url)?;
-        let path = format!(
-            "/api/w/{}/runtimes/{}/workers/{}/attachment-uploads/{}",
-            path_segment_encode(&self.workspace_id),
-            path_segment_encode(&self.runtime_id),
-            path_segment_encode(&self.worker_id),
-            path_segment_encode(upload_id),
-        );
-        let response = api
-            .request(HttpMethod::DELETE, &path)?
-            .send()
-            .await
-            .map_err(BackendRuntimeClientError::Http)?;
-        api.check_status(response.status())?;
+        runtime_server_api_client(&self.base_url, &api)?
+            .runtime_worker_attachment_upload_cancel(
+                self.workspace_id.clone(),
+                self.runtime_id.clone(),
+                self.worker_id.clone(),
+                upload_id.to_string(),
+            )
+            .await?;
         Ok(())
     }
 
@@ -154,33 +133,16 @@ impl BackendRuntimeTarget {
         artifact_id: &str,
     ) -> Result<(), BackendRuntimeClientError> {
         let api = BackendApiClient::from_stored_token(&self.base_url)?;
-        let path = format!(
-            "/api/w/{}/runtimes/{}/workers/{}/attachments/{}",
-            path_segment_encode(&self.workspace_id),
-            path_segment_encode(&self.runtime_id),
-            path_segment_encode(&self.worker_id),
-            path_segment_encode(artifact_id),
-        );
-        let response = api
-            .request(HttpMethod::DELETE, &path)?
-            .send()
-            .await
-            .map_err(BackendRuntimeClientError::Http)?;
-        api.check_status(response.status())?;
+        runtime_server_api_client(&self.base_url, &api)?
+            .runtime_worker_attachment_delete(
+                self.workspace_id.clone(),
+                self.runtime_id.clone(),
+                self.worker_id.clone(),
+                artifact_id.to_string(),
+            )
+            .await?;
         Ok(())
     }
-}
-
-#[derive(Deserialize)]
-struct AttachmentUploadGrantResponse {
-    upload_id: String,
-    #[allow(dead_code)]
-    expires_at_ms: u64,
-}
-
-#[derive(Deserialize)]
-struct UploadedFileResponse {
-    file: protocol::UploadedFileRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -280,6 +242,7 @@ pub enum BackendRuntimeClientError {
     InvalidTarget(String),
     Api(BackendApiClientError),
     SessionApi(server_api::ServerApiClientError),
+    ContractApi(server_api::client_support::ClientError<server_api::RepositoryApiError>),
     Http(reqwest::Error),
     Protocol(String),
 }
@@ -290,6 +253,7 @@ impl fmt::Display for BackendRuntimeClientError {
             Self::InvalidTarget(message) => f.write_str(message),
             Self::Api(error) => write!(f, "{error}"),
             Self::SessionApi(error) => write!(f, "{error}"),
+            Self::ContractApi(error) => write!(f, "{error}"),
             Self::Http(error) => write!(f, "{error}"),
             Self::Protocol(message) => f.write_str(message),
         }
@@ -301,6 +265,16 @@ impl std::error::Error for BackendRuntimeClientError {}
 impl From<server_api::ServerApiClientError> for BackendRuntimeClientError {
     fn from(value: server_api::ServerApiClientError) -> Self {
         Self::SessionApi(value)
+    }
+}
+
+impl From<server_api::client_support::ClientError<server_api::RepositoryApiError>>
+    for BackendRuntimeClientError
+{
+    fn from(
+        value: server_api::client_support::ClientError<server_api::RepositoryApiError>,
+    ) -> Self {
+        Self::ContractApi(value)
     }
 }
 
@@ -317,6 +291,34 @@ impl From<reqwest::Error> for BackendRuntimeClientError {
 }
 
 const WORKER_SESSION_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
+
+fn runtime_server_api_client(
+    base_url: &str,
+    backend: &BackendApiClient,
+) -> Result<server_api::ServerApiClient<StoredBearerAuthorizer>, BackendRuntimeClientError> {
+    server_api::ServerApiClient::builder(base_url)
+        .map_err(|error| BackendRuntimeClientError::Protocol(error.to_string()))?
+        .client(backend.asynchronous_client())
+        .authorizer(StoredBearerAuthorizer {
+            authorization: backend.authorization_header_value(),
+        })
+        .response_body_limit(WORKER_SESSION_RESPONSE_LIMIT)
+        .build()
+        .map_err(|error| BackendRuntimeClientError::Protocol(error.to_string()))
+}
+
+fn server_api_error_is_auth(
+    error: &server_api::client_support::ClientError<server_api::RepositoryApiError>,
+) -> bool {
+    matches!(
+        error,
+        server_api::client_support::ClientError::Public { status, .. }
+            if matches!(
+                *status,
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            )
+    )
+}
 
 #[derive(Clone, Debug)]
 struct StoredBearerAuthorizer {
@@ -351,15 +353,7 @@ async fn observe_backend_worker_session_with_client(
     target: &BackendRuntimeTarget,
     backend: &BackendApiClient,
 ) -> Result<server_api::WorkspaceWorkerSessionResponse, BackendRuntimeClientError> {
-    let client = server_api::ServerApiClient::builder(&target.base_url)
-        .map_err(|error| BackendRuntimeClientError::Protocol(error.to_string()))?
-        .authorizer(StoredBearerAuthorizer {
-            authorization: backend.authorization_header_value(),
-        })
-        .response_body_limit(WORKER_SESSION_RESPONSE_LIMIT)
-        .build()
-        .map_err(|error| BackendRuntimeClientError::Protocol(error.to_string()))?;
-    client
+    runtime_server_api_client(&target.base_url, backend)?
         .worker_session(
             target.workspace_id.clone(),
             target.runtime_id.clone(),
@@ -381,15 +375,16 @@ async fn get_backend_worker_launch_options_with_client(
     target: &BackendWorkerLaunchTarget,
     api: &BackendApiClient,
 ) -> Result<BackendWorkerLaunchOptions, BackendRuntimeClientError> {
-    let path = backend_workspace_workers_launch_options_path(
-        target
-            .workspace_id
-            .as_deref()
-            .expect("validated Backend Workspace scope"),
-    );
-    let response = api.request(HttpMethod::GET, &path)?.send().await?;
-    let response = api.require_success(response).await?;
-    Ok(response.json::<BackendWorkerLaunchOptions>().await?)
+    runtime_server_api_client(&target.base_url, api)?
+        .workspace_worker_launch_options(
+            target
+                .workspace_id
+                .as_deref()
+                .expect("validated Backend Workspace scope")
+                .to_string(),
+        )
+        .await
+        .map_err(Into::into)
 }
 
 pub async fn create_backend_worker(
@@ -406,19 +401,17 @@ async fn create_backend_worker_with_client(
     request: &BackendCreateWorkerRequest,
     api: &BackendApiClient,
 ) -> Result<BackendCreateWorkerResponse, BackendRuntimeClientError> {
-    let path = backend_workspace_workers_path(
-        target
-            .workspace_id
-            .as_deref()
-            .expect("validated Backend Workspace scope"),
-    );
-    let response = api
-        .request(HttpMethod::POST, &path)?
-        .json(request)
-        .send()
-        .await?;
-    let response = api.require_success(response).await?;
-    Ok(response.json::<BackendCreateWorkerResponse>().await?)
+    runtime_server_api_client(&target.base_url, api)?
+        .workspace_worker_create(
+            target
+                .workspace_id
+                .as_deref()
+                .expect("validated Backend Workspace scope")
+                .to_string(),
+            request.clone(),
+        )
+        .await
+        .map_err(Into::into)
 }
 
 pub async fn list_backend_workers(
@@ -426,80 +419,50 @@ pub async fn list_backend_workers(
 ) -> Result<BackendRuntimeListResponse<BackendWorkerSummary>, BackendRuntimeClientError> {
     validate_list_target(target)?;
     let api = BackendApiClient::from_stored_token(&target.base_url)?;
+    let client = runtime_server_api_client(&target.base_url, &api)?;
+    let workspace_id = target
+        .workspace_id
+        .as_deref()
+        .expect("validated Backend Workspace scope");
     if let Some(runtime_id) = target.runtime_id.as_deref() {
-        let path = backend_runtime_workers_path(
-            target
-                .workspace_id
-                .as_deref()
-                .expect("validated Backend Workspace scope"),
-            runtime_id,
-        );
-        let response = api.request(HttpMethod::GET, &path)?.send().await?;
-        api.check_status(response.status())?;
-        return Ok(response
-            .json::<BackendRuntimeListResponse<BackendWorkerSummary>>()
-            .await?);
+        return client
+            .runtime_worker_list(
+                workspace_id.to_string(),
+                runtime_id.to_string(),
+                server_api::RuntimeWorkersQuery::default(),
+            )
+            .await
+            .map(runtime_worker_list_response)
+            .map_err(Into::into);
     }
 
-    let runtime_path = backend_runtimes_path(
-        target
-            .workspace_id
-            .as_deref()
-            .expect("validated Backend Workspace scope"),
-    );
-    let response = api.request(HttpMethod::GET, &runtime_path)?.send().await?;
-    api.check_status(response.status())?;
-    let runtimes = response
-        .json::<BackendRuntimeListResponse<BackendRuntimeSummary>>()
-        .await?;
-
+    let runtimes = client.runtime_list(workspace_id.to_string()).await?;
     let mut items = Vec::new();
     let mut diagnostics = runtimes.diagnostics;
-    for runtime in runtimes.items {
-        let path = backend_runtime_workers_path(
-            target
-                .workspace_id
-                .as_deref()
-                .expect("validated Backend Workspace scope"),
-            &runtime.runtime_id,
-        );
-        let response = match api.request(HttpMethod::GET, &path)?.send().await {
-            Ok(response) => response,
-            Err(error) => {
-                diagnostics.push(BackendDiagnostic {
-                    code: "runtime_worker_list_failed".to_string(),
-                    severity: BackendDiagnosticSeverity::Error,
-                    message: format!(
-                        "failed to list workers for runtime {}: {error}",
-                        runtime.runtime_id
-                    ),
-                });
-                continue;
+    for resource in runtimes.items {
+        let runtime = resource.runtime;
+        match client
+            .runtime_worker_list(
+                workspace_id.to_string(),
+                runtime.runtime_id.clone(),
+                server_api::RuntimeWorkersQuery::default(),
+            )
+            .await
+        {
+            Ok(response) => {
+                diagnostics.extend(response.diagnostics);
+                items.extend(response.items);
             }
-        };
-        if matches!(
-            response.status(),
-            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-        ) {
-            api.check_status(response.status())?;
-        }
-        if !response.status().is_success() {
-            diagnostics.push(BackendDiagnostic {
+            Err(error) if server_api_error_is_auth(&error) => return Err(error.into()),
+            Err(error) => diagnostics.push(BackendDiagnostic {
                 code: "runtime_worker_list_failed".to_string(),
                 severity: BackendDiagnosticSeverity::Error,
                 message: format!(
-                    "failed to list workers for runtime {}: Backend returned HTTP {}",
-                    runtime.runtime_id,
-                    response.status().as_u16()
+                    "failed to list workers for runtime {}: {error}",
+                    runtime.runtime_id
                 ),
-            });
-            continue;
+            }),
         }
-        let response = response
-            .json::<BackendRuntimeListResponse<BackendWorkerSummary>>()
-            .await?;
-        diagnostics.extend(response.diagnostics);
-        items.extend(response.items);
     }
 
     Ok(BackendRuntimeListResponse {
@@ -521,21 +484,21 @@ pub async fn list_backend_stopped_workers(
         ));
     };
     let api = BackendApiClient::from_stored_token(&target.base_url)?;
-    let path = backend_runtime_workers_path(
-        target
-            .workspace_id
-            .as_deref()
-            .expect("validated Backend Workspace scope"),
-        runtime_id,
-    );
-    let response = api
-        .request(HttpMethod::GET, &format!("{path}?status=stopped"))?
-        .send()
-        .await?;
-    api.check_status(response.status())?;
-    Ok(response
-        .json::<BackendRuntimeListResponse<BackendWorkerSummary>>()
-        .await?)
+    runtime_server_api_client(&target.base_url, &api)?
+        .runtime_worker_list(
+            target
+                .workspace_id
+                .as_deref()
+                .expect("validated Backend Workspace scope")
+                .to_string(),
+            runtime_id.to_string(),
+            server_api::RuntimeWorkersQuery {
+                status: Some(server_api::RuntimeWorkersStatusFilter::Stopped),
+            },
+        )
+        .await
+        .map(runtime_worker_list_response)
+        .map_err(Into::into)
 }
 
 pub async fn restore_backend_worker(
@@ -543,18 +506,18 @@ pub async fn restore_backend_worker(
 ) -> Result<BackendWorkerRestoreResponse, BackendRuntimeClientError> {
     validate_target(target)?;
     let api = BackendApiClient::from_stored_token(&target.base_url)?;
-    let path = backend_runtime_worker_restore_path(
-        &target.workspace_id,
-        &target.runtime_id,
-        &target.worker_id,
-    );
-    let response = api
-        .request(HttpMethod::POST, &path)?
-        .json(&serde_json::json!({}))
-        .send()
-        .await?;
-    let response = api.require_success(response).await?;
-    Ok(response.json::<BackendWorkerRestoreResponse>().await?)
+    runtime_server_api_client(&target.base_url, &api)?
+        .runtime_worker_restore(
+            target.workspace_id.clone(),
+            target.runtime_id.clone(),
+            target.worker_id.clone(),
+            server_api::RestoreTicketAssignmentQuery {
+                ticket_id: None,
+                assignment_operation_id: None,
+            },
+        )
+        .await
+        .map_err(Into::into)
 }
 
 pub async fn connect_backend_runtime(
@@ -597,6 +560,18 @@ fn protocol_connect_error_message(
         "Backend protocol WebSocket connect failed for {}: {error}",
         target.display_label()
     )
+}
+
+fn runtime_worker_list_response(
+    response: server_api::RuntimeWorkerListResponse,
+) -> BackendRuntimeListResponse<BackendWorkerSummary> {
+    BackendRuntimeListResponse {
+        workspace_id: response.workspace_id,
+        limit: response.limit,
+        items: response.items,
+        source: response.source,
+        diagnostics: response.diagnostics,
+    }
 }
 
 fn validate_target(target: &BackendRuntimeTarget) -> Result<(), BackendRuntimeClientError> {
@@ -684,42 +659,6 @@ fn validate_list_target(
         ));
     }
     Ok(())
-}
-
-fn backend_workspace_workers_path(workspace_id: &str) -> String {
-    format!("/api/w/{}/workers", path_segment_encode(workspace_id))
-}
-
-fn backend_workspace_workers_launch_options_path(workspace_id: &str) -> String {
-    format!(
-        "{}/launch-options",
-        backend_workspace_workers_path(workspace_id)
-    )
-}
-
-fn backend_runtimes_path(workspace_id: &str) -> String {
-    format!("/api/w/{}/runtimes", path_segment_encode(workspace_id))
-}
-
-fn backend_runtime_workers_path(workspace_id: &str, runtime_id: &str) -> String {
-    format!(
-        "/api/w/{}/runtimes/{}/workers",
-        path_segment_encode(workspace_id),
-        path_segment_encode(runtime_id)
-    )
-}
-
-fn backend_runtime_worker_restore_path(
-    workspace_id: &str,
-    runtime_id: &str,
-    worker_id: &str,
-) -> String {
-    format!(
-        "/api/w/{}/runtimes/{}/workers/{}/restore",
-        path_segment_encode(workspace_id),
-        path_segment_encode(runtime_id),
-        path_segment_encode(worker_id)
-    )
 }
 
 fn protocol_ws_request(
@@ -1050,22 +989,5 @@ mod tests {
         stale["workdir_attachments"][0]["working_directory"]["occupied_by"]["runtime_worker_id"] =
             serde_json::json!(64);
         assert!(serde_json::from_value::<BackendWorkerSummary>(stale).is_err());
-    }
-
-    #[test]
-    fn workers_path_requires_workspace_scope_for_status_queries() {
-        let path = backend_runtime_workers_path("team main", "runtime/one");
-        assert_eq!(
-            format!("{path}?status=stopped"),
-            "/api/w/team%20main/runtimes/runtime%2Fone/workers?status=stopped"
-        );
-    }
-
-    #[test]
-    fn restore_worker_path_requires_workspace_scope() {
-        assert_eq!(
-            backend_runtime_worker_restore_path("team main", "runtime/one", "worker one"),
-            "/api/w/team%20main/runtimes/runtime%2Fone/workers/worker%20one/restore"
-        );
     }
 }

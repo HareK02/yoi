@@ -104,7 +104,7 @@ async fn execute_memory_backend(
     let response = client.execute(WorkspaceRequest::json(
         WorkspaceRequestMethod::Post,
         format!("/api/w/{workspace_id}/memory/backend"),
-        serde_json::to_string(&operation)?,
+        serde_json::to_string(&server_api::MemoryBackendRequest(operation))?,
     ))?;
     let status = reqwest::StatusCode::from_u16(response.status)
         .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
@@ -114,7 +114,7 @@ async fn execute_memory_backend(
             body: response.body,
         });
     }
-    match serde_json::from_str::<MemoryBackendHttpResponse>(&response.body)? {
+    match serde_json::from_str::<server_api::MemoryBackendResponse>(&response.body)?.0 {
         MemoryBackendHttpResponse::Ok { result } => Ok(result),
         MemoryBackendHttpResponse::Error { message } => {
             Err(WorkspaceMemoryBackendError::Backend(message))
@@ -138,7 +138,9 @@ async fn execute_memory_consolidation(
     let response = client.execute(WorkspaceRequest::json(
         WorkspaceRequestMethod::Post,
         format!("/api/w/{workspace_id}/memory/consolidation"),
-        serde_json::to_string(&operation)?,
+        serde_json::to_string(&server_api::MemoryConsolidateStagingRequest {
+            force: operation.force,
+        })?,
     ))?;
     let status = reqwest::StatusCode::from_u16(response.status)
         .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
@@ -148,7 +150,13 @@ async fn execute_memory_consolidation(
             body: response.body,
         });
     }
-    serde_json::from_str::<MemoryConsolidationOutput>(&response.body).map_err(Into::into)
+    let response = serde_json::from_str::<server_api::MemoryConsolidationResponse>(&response.body)?;
+    Ok(MemoryConsolidationOutput {
+        status: response.status,
+        summary: response.summary,
+        candidate_count: response.candidate_count,
+        total_bytes: response.total_bytes,
+    })
 }
 
 pub fn workspace_http_memory_tools(client: Arc<dyn WorkspaceClient>) -> Vec<ToolDefinition> {

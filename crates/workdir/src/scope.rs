@@ -9,6 +9,7 @@ use fs_operation::{
     ListResult, ReadRequest, ReadResult, StatRequest, StatResult, WriteRequest, WriteResult,
 };
 use manifest::SymlinkPolicy;
+use schemars::JsonSchema;
 use tokio::sync::broadcast;
 
 const MAX_SCOPED_COMMANDS: usize = 16;
@@ -19,25 +20,26 @@ use crate::{
     WorkdirSessionCapabilities, WorkdirSessionCapability, WorkdirSessionHandle,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkdirToolScopePermission {
     Read,
     Write,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkdirToolScopeRule {
     pub target: FsPath,
     pub permission: WorkdirToolScopePermission,
     pub recursive: bool,
     #[serde(default)]
+    #[schemars(with = "String")]
     pub symlink_policy: SymlinkPolicy,
 }
 
 /// Provider-side check for one operation under an attenuated tool scope.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkdirScopeAuthorizationRequest {
     pub rules: Vec<WorkdirToolScopeRule>,
@@ -46,14 +48,14 @@ pub struct WorkdirScopeAuthorizationRequest {
 }
 
 /// Provider-side overlap comparison that keeps resolved host paths private.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkdirScopeOverlapRequest {
     pub left: WorkdirToolScopeRule,
     pub right: WorkdirToolScopeRule,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkdirToolScope {
     pub rules: Vec<WorkdirToolScopeRule>,
@@ -82,6 +84,16 @@ impl WorkdirToolBroker {
     /// Own the parent Worker's active session and mediate every scoped child operation.
     pub fn new(source: WorkdirSessionHandle) -> Self {
         let capabilities = source.capabilities();
+        Self::with_capabilities(source, capabilities)
+    }
+
+    /// Own a session behind an additional Backend-authored capability ceiling.
+    /// The ceiling can only attenuate provider capabilities; it can never add one.
+    pub fn with_capabilities(
+        source: WorkdirSessionHandle,
+        capabilities: WorkdirSessionCapabilities,
+    ) -> Self {
+        let capabilities = source.capabilities().intersection(capabilities);
         let (command_events, _) = broadcast::channel(64);
         let authority = Arc::new(ScopedWorkdirSession {
             source,

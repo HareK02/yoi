@@ -1,12 +1,25 @@
 <script lang="ts">
+  import { goto } from "$app/navigation";
   import { untrack } from "svelte";
   import type { ApiResult } from "$lib/workspace/api/http";
-  import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
+  import {
+    loadJson,
+    workspaceApiJsonWithBody,
+    workspaceApiPath,
+  } from "$lib/workspace/api/http";
   import { parseBrowserWorkspaceOrchestratorResponse } from "$lib/workspace/api/workers";
+  import {
+    TICKET_BROWSER_API_LOAD_POLICY,
+    TICKET_BROWSER_API_MAX_RESPONSE_BYTES,
+    parseTicketListResponse,
+    parseTicketRecordRef,
+  } from "$lib/workspace/api/ticket-browser";
   import type {
+    NewTicket,
     QueryPage,
-    TicketListResponse,
-    TicketSummary,
+    TicketListItemSummary as TicketSummary,
+    TicketTarget,
+    TicketTargetAccess,
   } from "$lib/generated/ticket-api";
   import { ticketHref } from "$lib/workspace/resource-links";
   import {
@@ -21,6 +34,12 @@
     page: QueryPage;
     loading: boolean;
     error: string | null;
+  };
+
+  type EditableTicketTarget = {
+    repository_key: string;
+    ref_selector: string;
+    access: TicketTargetAccess;
   };
 
   let { data }: { data: PageData } = $props();
@@ -43,6 +62,25 @@
     untrack(() => data.orchestrator),
   );
   let orchestratorStarting = $state(false);
+  let creatingTicket = $state(false);
+  let createBusy = $state(false);
+  let createError = $state<string | null>(null);
+  let createTitle = $state("");
+  let createBody = $state("");
+  let createTargets = $state<EditableTicketTarget[]>([]);
+  const repositories = $derived(data.repositories.data?.items ?? []);
+  const createTargetsSavable = $derived.by(() => {
+    const keys = new Set<string>();
+    for (const target of createTargets) {
+      if (
+        !repositories.some((repository) =>
+          repository.repository_key === target.repository_key
+        ) || keys.has(target.repository_key)
+      ) return false;
+      keys.add(target.repository_key);
+    }
+    return true;
+  });
   const tickets = $derived(
     Object.values(laneState).flatMap((lane) => lane.tickets),
   );
@@ -70,15 +108,18 @@
         states: lane.states.join(","),
         cursor: lane.page.next_cursor,
       });
-      const response = await fetch(
+      const result = await loadJson(
+        fetch,
         `/api/w/${encodeURIComponent(data.workspaceId)}/tickets?${search}`,
+        undefined,
+        parseTicketListResponse,
+        TICKET_BROWSER_API_LOAD_POLICY,
       );
-      if (!response.ok) {
-        throw new Error(`追加読み込みに失敗しました (${response.status})`);
+      if (!result.data) {
+        throw new Error(result.error ?? "追加読み込みに失敗しました");
       }
-      const page = (await response.json()) as TicketListResponse;
-      lane.tickets = mergeTickets(lane.tickets, page.items);
-      lane.page = page.page;
+      lane.tickets = mergeTickets(lane.tickets, result.data.items);
+      lane.page = result.data.page;
     } catch (error) {
       lane.error = error instanceof Error ? error.message : String(error);
     } finally {
@@ -91,6 +132,61 @@
     const remaining =
       container.scrollHeight - container.scrollTop - container.clientHeight;
     if (remaining <= 96) void loadMore(laneId);
+  }
+
+  function addCreateTarget(): void {
+    createTargets.push({
+      repository_key: "",
+      ref_selector: "",
+      access: createTargets.some((target) => target.access === "read_write")
+        ? "read_only"
+        : "read_write",
+    });
+  }
+
+  function removeCreateTarget(index: number): void {
+    createTargets.splice(index, 1);
+  }
+
+  function normalizedCreateTargets(): TicketTarget[] {
+    return createTargets.map((target) => ({
+      repository_key: target.repository_key.trim(),
+      ref_selector: target.ref_selector.trim() || null,
+      access: target.access,
+    }));
+  }
+
+  async function createTicket(event: SubmitEvent): Promise<void> {
+    event.preventDefault();
+    if (createBusy || !createTitle.trim() || !createTargetsSavable) return;
+    createBusy = true;
+    createError = null;
+    const request: NewTicket = {
+      title: createTitle.trim(),
+      kind: "task",
+      priority: "P2",
+      labels: [],
+      body: createBody,
+      risk_flags: [],
+      workflow_state: "planning",
+      targets: normalizedCreateTargets(),
+    };
+    try {
+      const created = await workspaceApiJsonWithBody(
+        workspaceApiPath(data.workspaceId, "/tickets"),
+        { method: "POST", body: JSON.stringify(request) },
+        parseTicketRecordRef,
+        TICKET_BROWSER_API_MAX_RESPONSE_BYTES,
+      );
+      const reference = created.resource_key ?? created.id;
+      await goto(
+        `/w/${encodeURIComponent(data.workspaceId)}/tickets/${encodeURIComponent(reference)}`,
+      );
+    } catch (error) {
+      createError = error instanceof Error ? error.message : String(error);
+    } finally {
+      createBusy = false;
+    }
   }
 
   async function startOrchestrator() {
@@ -126,6 +222,11 @@
       </p>
     </div>
     <div class="ticket-panel-controls">
+      <button
+        class="workspace-primary-button"
+        type="button"
+        onclick={() => creatingTicket = !creatingTicket}
+      >{creatingTicket ? "Cancel" : "Add Ticket"}</button>
       <div class="orchestrator-status" data-online={orchestrator.data?.online ?? false}>
         <span class="orchestrator-status-dot"></span>
         <div>
@@ -149,6 +250,50 @@
       </div>
     </div>
   </header>
+
+  {#if creatingTicket}
+    <form class="ticket-editor ticket-create-form" onsubmit={createTicket}>
+      <h2>New Ticket</h2>
+      {#if createError}<p class="workspace-callout is-error" role="alert">{createError}</p>{/if}
+      {#if data.repositories.error}
+        <p class="workspace-callout is-error" role="alert">Repositories: {data.repositories.error}</p>
+      {/if}
+      <label>Title<input bind:value={createTitle} required /></label>
+      <label>Body<textarea bind:value={createBody} rows="8"></textarea></label>
+      <div class="ticket-target-list">
+        <strong>Repository targets</strong>
+        {#each createTargets as target, index}
+          {@const selectedRepository = repositories.find((repository) => repository.repository_key === target.repository_key)}
+          <fieldset class="ticket-target-row">
+            <legend>Target {index + 1}</legend>
+            <label>Repository
+              <select bind:value={target.repository_key} required>
+                <option value="">Choose repository</option>
+                {#each repositories as repository}
+                  <option value={repository.repository_key}>{repository.repository_key}</option>
+                {/each}
+              </select>
+            </label>
+            <label>Ref selector<input bind:value={target.ref_selector} placeholder={selectedRepository?.default_selector ?? "branch, tag, or revision"} /></label>
+            <label>Access
+              <select bind:value={target.access}>
+                <option value="read_write">Read and write</option>
+                <option value="read_only">Read only</option>
+              </select>
+            </label>
+            <button class="workspace-secondary-button" type="button" onclick={() => removeCreateTarget(index)}>Remove target</button>
+          </fieldset>
+        {/each}
+        <button class="workspace-secondary-button" type="button" onclick={addCreateTarget}>Add target</button>
+      </div>
+      {#if !createTargetsSavable}
+        <p class="workspace-empty-copy">Every target row must select a different repository. The exact one read-write target and selector requirements are enforced when the Ticket is marked ready.</p>
+      {/if}
+      <button class="workspace-primary-button" type="submit" disabled={createBusy || !createTitle.trim() || !createTargetsSavable}>
+        {createBusy ? "Creating…" : "Create Ticket"}
+      </button>
+    </form>
+  {/if}
 
   {#if orchestrator.error}
     <p class="workspace-callout is-error">

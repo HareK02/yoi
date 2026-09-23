@@ -107,16 +107,16 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeDiagnostic {
     pub code: String,
-    pub severity: DiagnosticSeverity,
+    pub severity: HostDiagnosticSeverity,
     pub message: String,
 }
 
 impl RuntimeDiagnostic {
     pub fn new(code: impl Into<String>, severity: &str, message: impl Into<String>) -> Self {
         let severity = match severity {
-            "error" => DiagnosticSeverity::Error,
-            "warning" => DiagnosticSeverity::Warning,
-            _ => DiagnosticSeverity::Info,
+            "error" => HostDiagnosticSeverity::Error,
+            "warning" => HostDiagnosticSeverity::Warning,
+            _ => HostDiagnosticSeverity::Info,
         };
         diagnostic(code, severity, message)
     }
@@ -124,7 +124,7 @@ impl RuntimeDiagnostic {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum DiagnosticSeverity {
+pub enum HostDiagnosticSeverity {
     Info,
     Warning,
     Error,
@@ -132,79 +132,79 @@ pub enum DiagnosticSeverity {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum RuntimeSourceKind {
+pub enum InternalRuntimeSourceKind {
     EmbeddedWorkerRuntime,
     RemoteHttp,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum RuntimeSourceStatus {
+pub enum InternalRuntimeSourceStatus {
     Active,
     Reserved,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum RuntimeIdentityAuthority {
+pub enum InternalRuntimeIdentityAuthority {
     /// Public Runtime/Host/Worker ids are registry projections, never raw
     /// socket addresses, session ids, credentials, or paths.
     RuntimeRegistryProjection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RuntimeSourceSummary {
-    pub kind: RuntimeSourceKind,
-    pub status: RuntimeSourceStatus,
-    pub identity_authority: RuntimeIdentityAuthority,
+pub struct InternalRuntimeSourceSummary {
+    pub kind: InternalRuntimeSourceKind,
+    pub status: InternalRuntimeSourceStatus,
+    pub identity_authority: InternalRuntimeIdentityAuthority,
     pub note: String,
 }
 
-impl RuntimeSourceSummary {
+impl InternalRuntimeSourceSummary {
     pub fn embedded_worker_runtime() -> Self {
         Self {
-            kind: RuntimeSourceKind::EmbeddedWorkerRuntime,
-            status: RuntimeSourceStatus::Active,
-            identity_authority: RuntimeIdentityAuthority::RuntimeRegistryProjection,
+            kind: InternalRuntimeSourceKind::EmbeddedWorkerRuntime,
+            status: InternalRuntimeSourceStatus::Active,
+            identity_authority: InternalRuntimeIdentityAuthority::RuntimeRegistryProjection,
             note: "backend-internal embedded worker-runtime Runtime exposed only through runtime_id plus worker_id projections".to_string(),
         }
     }
 
     pub fn embedded_worker_runtime_reserved() -> Self {
         Self {
-            kind: RuntimeSourceKind::EmbeddedWorkerRuntime,
-            status: RuntimeSourceStatus::Reserved,
-            identity_authority: RuntimeIdentityAuthority::RuntimeRegistryProjection,
+            kind: InternalRuntimeSourceKind::EmbeddedWorkerRuntime,
+            status: InternalRuntimeSourceStatus::Reserved,
+            identity_authority: InternalRuntimeIdentityAuthority::RuntimeRegistryProjection,
             note: "reserved boundary for an embedded worker-runtime adapter; not connected by this fixture source".to_string(),
         }
     }
 
     pub fn remote_http() -> Self {
         Self {
-            kind: RuntimeSourceKind::RemoteHttp,
-            status: RuntimeSourceStatus::Active,
-            identity_authority: RuntimeIdentityAuthority::RuntimeRegistryProjection,
+            kind: InternalRuntimeSourceKind::RemoteHttp,
+            status: InternalRuntimeSourceStatus::Active,
+            identity_authority: InternalRuntimeIdentityAuthority::RuntimeRegistryProjection,
             note: "backend-owned remote worker-runtime REST/WS client; endpoints and credentials remain backend-private".to_string(),
         }
     }
 
     pub fn remote_http_reserved() -> Self {
         Self {
-            kind: RuntimeSourceKind::RemoteHttp,
-            status: RuntimeSourceStatus::Reserved,
-            identity_authority: RuntimeIdentityAuthority::RuntimeRegistryProjection,
+            kind: InternalRuntimeSourceKind::RemoteHttp,
+            status: InternalRuntimeSourceStatus::Reserved,
+            identity_authority: InternalRuntimeIdentityAuthority::RuntimeRegistryProjection,
             note: "reserved boundary for a future remote Runtime adapter; no HTTP client or REST server is implemented here".to_string(),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RuntimeSummary {
+pub struct InternalRuntimeSummary {
     pub runtime_id: String,
     pub label: String,
     pub kind: String,
     pub status: String,
-    pub source: RuntimeSourceSummary,
+    pub source: InternalRuntimeSourceSummary,
     pub host_ids: Vec<String>,
     pub worker_creation_available: bool,
     pub os: String,
@@ -213,7 +213,7 @@ pub struct RuntimeSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct HostSummary {
+pub struct InternalHostSummary {
     pub runtime_id: String,
     pub host_id: String,
     pub label: String,
@@ -227,7 +227,7 @@ pub struct HostSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorkerWorkspaceSummary {
+pub struct InternalWorkerWorkspaceSummary {
     pub visibility: String,
     pub identity: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -235,19 +235,19 @@ pub struct WorkerWorkspaceSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorkerImplementationSummary {
+pub struct InternalWorkerImplementationSummary {
     pub kind: String,
     pub display_hint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorkerCapabilitySummary {
+pub struct InternalWorkerCapabilitySummary {
     pub can_stop: bool,
     pub can_spawn_followup: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorkerSummary {
+pub struct InternalWorkerSummary {
     #[serde(flatten)]
     pub worker: RuntimeWorkerRef,
     pub host_id: String,
@@ -259,7 +259,7 @@ pub struct WorkerSummary {
     pub singleton_key: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
-    pub workspace: WorkerWorkspaceSummary,
+    pub workspace: InternalWorkerWorkspaceSummary,
     /// Runtime catalog lifecycle compatibility state.
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -269,8 +269,8 @@ pub struct WorkerSummary {
     pub pinned: bool,
     #[serde(default)]
     pub retention_state: String,
-    pub implementation: WorkerImplementationSummary,
-    pub capabilities: WorkerCapabilitySummary,
+    pub implementation: InternalWorkerImplementationSummary,
+    pub capabilities: InternalWorkerCapabilitySummary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workdir_attachments: Vec<WorkingDirectoryAttachmentStatus>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
@@ -279,9 +279,9 @@ pub struct WorkerSummary {
 impl From<RuntimeDiagnostic> for server_api::Diagnostic {
     fn from(diagnostic: RuntimeDiagnostic) -> Self {
         let severity = match diagnostic.severity {
-            DiagnosticSeverity::Info => server_api::DiagnosticSeverity::Info,
-            DiagnosticSeverity::Warning => server_api::DiagnosticSeverity::Warning,
-            DiagnosticSeverity::Error => server_api::DiagnosticSeverity::Error,
+            HostDiagnosticSeverity::Info => server_api::DiagnosticSeverity::Info,
+            HostDiagnosticSeverity::Warning => server_api::DiagnosticSeverity::Warning,
+            HostDiagnosticSeverity::Error => server_api::DiagnosticSeverity::Error,
         };
         Self {
             code: diagnostic.code,
@@ -291,20 +291,37 @@ impl From<RuntimeDiagnostic> for server_api::Diagnostic {
     }
 }
 
-impl From<RuntimeSourceSummary> for server_api::RuntimeSourceSummary {
-    fn from(source: RuntimeSourceSummary) -> Self {
+impl From<InternalHostSummary> for server_api::HostSummary {
+    fn from(host: InternalHostSummary) -> Self {
+        Self {
+            runtime_id: host.runtime_id,
+            host_id: host.host_id,
+            label: host.label,
+            kind: host.kind,
+            status: host.status,
+            observed_at: host.observed_at,
+            last_seen_at: host.last_seen_at,
+            os: host.os,
+            arch: host.arch,
+            diagnostics: host.diagnostics.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<InternalRuntimeSourceSummary> for server_api::RuntimeSourceSummary {
+    fn from(source: InternalRuntimeSourceSummary) -> Self {
         let kind = match source.kind {
-            RuntimeSourceKind::EmbeddedWorkerRuntime => {
+            InternalRuntimeSourceKind::EmbeddedWorkerRuntime => {
                 server_api::RuntimeSourceKind::EmbeddedWorkerRuntime
             }
-            RuntimeSourceKind::RemoteHttp => server_api::RuntimeSourceKind::RemoteHttp,
+            InternalRuntimeSourceKind::RemoteHttp => server_api::RuntimeSourceKind::RemoteHttp,
         };
         let status = match source.status {
-            RuntimeSourceStatus::Active => server_api::RuntimeSourceStatus::Active,
-            RuntimeSourceStatus::Reserved => server_api::RuntimeSourceStatus::Reserved,
+            InternalRuntimeSourceStatus::Active => server_api::RuntimeSourceStatus::Active,
+            InternalRuntimeSourceStatus::Reserved => server_api::RuntimeSourceStatus::Reserved,
         };
         let identity_authority = match source.identity_authority {
-            RuntimeIdentityAuthority::RuntimeRegistryProjection => {
+            InternalRuntimeIdentityAuthority::RuntimeRegistryProjection => {
                 server_api::RuntimeIdentityAuthority::RuntimeRegistryProjection
             }
         };
@@ -317,8 +334,8 @@ impl From<RuntimeSourceSummary> for server_api::RuntimeSourceSummary {
     }
 }
 
-impl From<RuntimeSummary> for server_api::RuntimeSummary {
-    fn from(runtime: RuntimeSummary) -> Self {
+impl From<InternalRuntimeSummary> for server_api::RuntimeSummary {
+    fn from(runtime: InternalRuntimeSummary) -> Self {
         Self {
             runtime_id: runtime.runtime_id,
             label: runtime.label,
@@ -335,7 +352,7 @@ impl From<RuntimeSummary> for server_api::RuntimeSummary {
 }
 
 pub(crate) fn workspace_worker_summary(
-    summary: WorkerSummary,
+    summary: InternalWorkerSummary,
     resource_key: String,
     workdir_attachments: Vec<server_api::WorkerWorkdirAttachmentSummary>,
 ) -> server_api::WorkerSummary {
@@ -374,18 +391,18 @@ pub(crate) fn workspace_worker_summary(
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct WorkerRestoreResult {
+pub struct InternalWorkerRestoreResult {
     pub state: server_api::WorkerRestoreState,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker: Option<WorkerSummary>,
+    pub worker: Option<InternalWorkerSummary>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerWorkspaceApiResult {
-    pub state: WorkerOperationState,
+    pub state: InternalWorkerOperationState,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker: Option<WorkerSummary>,
+    pub worker: Option<InternalWorkerSummary>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -404,13 +421,13 @@ impl<T> RuntimeList<T> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerLookupResult {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker: Option<WorkerSummary>,
+    pub worker: Option<InternalWorkerSummary>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeWorkingDirectoryResult {
-    pub state: WorkerOperationState,
+    pub state: InternalWorkerOperationState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<WorkingDirectoryStatus>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
@@ -570,16 +587,16 @@ fn initial_worker_input(segments: &[Segment]) -> Option<EmbeddedWorkerInput> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerSpawnResult {
-    pub state: WorkerOperationState,
+    pub state: InternalWorkerOperationState,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker: Option<WorkerSummary>,
+    pub worker: Option<InternalWorkerSummary>,
     pub acceptance_evidence: Vec<WorkerSpawnAcceptanceEvidence>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConfigBundleSyncResult {
-    pub state: WorkerOperationState,
+    pub state: InternalWorkerOperationState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub availability: Option<ConfigBundleAvailability>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
@@ -587,7 +604,7 @@ pub struct ConfigBundleSyncResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConfigBundleCheckResult {
-    pub state: WorkerOperationState,
+    pub state: InternalWorkerOperationState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub availability: Option<ConfigBundleAvailability>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
@@ -605,7 +622,7 @@ fn required_worker_workspace_api(
     request.resolved_workspace_api.clone().ok_or_else(|| {
         diagnostic(
             "worker_workspace_api_missing",
-            DiagnosticSeverity::Error,
+            HostDiagnosticSeverity::Error,
             "Workspace-bound Worker spawn requires a resolved Workspace API binding",
         )
     })
@@ -613,18 +630,18 @@ fn required_worker_workspace_api(
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkerOperationState {
+pub enum InternalWorkerOperationState {
     Accepted,
     Unsupported,
     Rejected,
 }
 
-impl From<WorkerOperationState> for server_api::WorkerOperationState {
-    fn from(state: WorkerOperationState) -> Self {
+impl From<InternalWorkerOperationState> for server_api::WorkerOperationState {
+    fn from(state: InternalWorkerOperationState) -> Self {
         match state {
-            WorkerOperationState::Accepted => Self::Accepted,
-            WorkerOperationState::Unsupported => Self::Unsupported,
-            WorkerOperationState::Rejected => Self::Rejected,
+            InternalWorkerOperationState::Accepted => Self::Accepted,
+            InternalWorkerOperationState::Unsupported => Self::Unsupported,
+            InternalWorkerOperationState::Rejected => Self::Rejected,
         }
     }
 }
@@ -650,7 +667,7 @@ pub enum WorkerStopMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerStopResult {
-    pub state: WorkerOperationState,
+    pub state: InternalWorkerOperationState,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -664,7 +681,7 @@ pub struct WorkerLifecycleRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerLifecycleResult {
-    pub state: WorkerOperationState,
+    pub state: InternalWorkerOperationState,
     #[serde(flatten)]
     pub worker: RuntimeWorkerRef,
     pub diagnostics: Vec<RuntimeDiagnostic>,
@@ -682,7 +699,7 @@ pub enum WorkerInputKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerDeleteResult {
-    pub state: WorkerOperationState,
+    pub state: InternalWorkerOperationState,
     #[serde(flatten)]
     pub worker: RuntimeWorkerRef,
     pub deleted: bool,
@@ -717,7 +734,7 @@ pub struct WorkerCompletionsResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerInputResult {
-    pub state: WorkerOperationState,
+    pub state: InternalWorkerOperationState,
     #[serde(flatten)]
     pub worker: RuntimeWorkerRef,
     pub diagnostics: Vec<RuntimeDiagnostic>,
@@ -816,7 +833,7 @@ impl RuntimePingFailure {
     ) -> Self {
         Self {
             kind,
-            diagnostic: diagnostic(code, DiagnosticSeverity::Error, message.into()),
+            diagnostic: diagnostic(code, HostDiagnosticSeverity::Error, message.into()),
         }
     }
 }
@@ -824,7 +841,7 @@ impl RuntimePingFailure {
 pub trait WorkspaceWorkerRuntime: Send + Sync {
     fn runtime_id(&self) -> &str;
 
-    fn runtime_summary(&self, limit: usize) -> RuntimeSummary;
+    fn runtime_summary(&self, limit: usize) -> InternalRuntimeSummary;
 
     fn ping(&self) -> Result<RuntimeHttpPingResponse, RuntimePingFailure> {
         Err(RuntimePingFailure::new(
@@ -871,23 +888,23 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         ))
     }
 
-    fn list_hosts(&self, limit: usize) -> RuntimeList<HostSummary>;
+    fn list_hosts(&self, limit: usize) -> RuntimeList<InternalHostSummary>;
 
-    fn list_workers(&self, limit: usize) -> RuntimeList<WorkerSummary>;
+    fn list_workers(&self, limit: usize) -> RuntimeList<InternalWorkerSummary>;
 
-    fn list_stopped_workers(&self, _limit: usize) -> RuntimeList<WorkerSummary> {
+    fn list_stopped_workers(&self, _limit: usize) -> RuntimeList<InternalWorkerSummary> {
         RuntimeList::new(Vec::new(), Vec::new())
     }
 
     fn worker(&self, worker_id: &str) -> WorkerLookupResult;
 
-    fn restore_worker(&self, worker_id: &str) -> WorkerRestoreResult {
-        WorkerRestoreResult {
+    fn restore_worker(&self, worker_id: &str) -> InternalWorkerRestoreResult {
+        InternalWorkerRestoreResult {
             state: server_api::WorkerRestoreState::Rejected,
             worker: None,
             diagnostics: vec![diagnostic(
                 "worker_restore_unsupported",
-                DiagnosticSeverity::Info,
+                HostDiagnosticSeverity::Info,
                 format!("runtime does not implement worker restore for `{worker_id}`"),
             )],
         }
@@ -899,11 +916,11 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         _workspace_api: WorkspaceApiRef,
     ) -> WorkerWorkspaceApiResult {
         WorkerWorkspaceApiResult {
-            state: WorkerOperationState::Unsupported,
+            state: InternalWorkerOperationState::Unsupported,
             worker: None,
             diagnostics: vec![diagnostic(
                 "worker_workspace_api_replace_unsupported",
-                DiagnosticSeverity::Info,
+                HostDiagnosticSeverity::Info,
                 format!(
                     "runtime does not support replacing the Workspace API for worker `{worker_id}`"
                 ),
@@ -917,11 +934,11 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         _attachments: Vec<LogicalWorkdirAttachment>,
     ) -> WorkerWorkspaceApiResult {
         WorkerWorkspaceApiResult {
-            state: WorkerOperationState::Unsupported,
+            state: InternalWorkerOperationState::Unsupported,
             worker: None,
             diagnostics: vec![diagnostic(
                 "worker_workdir_attachments_replace_unsupported",
-                DiagnosticSeverity::Info,
+                HostDiagnosticSeverity::Info,
                 format!(
                     "runtime does not support replacing Workdir attachments for worker `{worker_id}`"
                 ),
@@ -934,11 +951,11 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         _request: WorkingDirectoryRequest,
     ) -> RuntimeWorkingDirectoryResult {
         RuntimeWorkingDirectoryResult {
-            state: WorkerOperationState::Unsupported,
+            state: InternalWorkerOperationState::Unsupported,
             working_directory: None,
             diagnostics: vec![diagnostic(
                 "runtime_working_directory_create_unsupported",
-                DiagnosticSeverity::Info,
+                HostDiagnosticSeverity::Info,
                 "runtime does not implement working directory creation".to_string(),
             )],
         }
@@ -971,11 +988,11 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
 
     fn working_directory(&self, working_directory_id: &str) -> RuntimeWorkingDirectoryResult {
         RuntimeWorkingDirectoryResult {
-            state: WorkerOperationState::Unsupported,
+            state: InternalWorkerOperationState::Unsupported,
             working_directory: None,
             diagnostics: vec![diagnostic(
                 "runtime_working_directory_lookup_unsupported",
-                DiagnosticSeverity::Info,
+                HostDiagnosticSeverity::Info,
                 format!(
                     "runtime does not implement working directory lookup for `{working_directory_id}`"
                 ),
@@ -1002,11 +1019,11 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         working_directory_id: &str,
     ) -> RuntimeWorkingDirectoryResult {
         RuntimeWorkingDirectoryResult {
-            state: WorkerOperationState::Unsupported,
+            state: InternalWorkerOperationState::Unsupported,
             working_directory: None,
             diagnostics: vec![diagnostic(
                 "runtime_working_directory_cleanup_unsupported",
-                DiagnosticSeverity::Info,
+                HostDiagnosticSeverity::Info,
                 format!(
                     "runtime does not implement working directory cleanup for `{working_directory_id}`"
                 ),
@@ -1020,12 +1037,12 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         request: WorkerSpawnRequest,
     ) -> WorkerSpawnResult {
         WorkerSpawnResult {
-            state: WorkerOperationState::Unsupported,
+            state: InternalWorkerOperationState::Unsupported,
             worker: None,
             acceptance_evidence: Vec::new(),
             diagnostics: vec![diagnostic(
                 "worker_spawn_resolver_pending",
-                DiagnosticSeverity::Info,
+                HostDiagnosticSeverity::Info,
                 format!(
                     "worker spawn intent '{}' was accepted as a typed request shape, but launch resolution is not implemented by this registry surface",
                     worker_spawn_intent_label(&request.intent)
@@ -1043,11 +1060,11 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
 
     fn sync_config_bundle(&self, _bundle: ConfigBundle) -> ConfigBundleSyncResult {
         ConfigBundleSyncResult {
-            state: WorkerOperationState::Unsupported,
+            state: InternalWorkerOperationState::Unsupported,
             availability: None,
             diagnostics: vec![diagnostic(
                 "config_bundle_sync_unsupported",
-                DiagnosticSeverity::Info,
+                HostDiagnosticSeverity::Info,
                 "runtime does not implement config bundle sync".to_string(),
             )],
         }
@@ -1055,11 +1072,11 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
 
     fn check_config_bundle(&self, _reference: ConfigBundleRef) -> ConfigBundleCheckResult {
         ConfigBundleCheckResult {
-            state: WorkerOperationState::Unsupported,
+            state: InternalWorkerOperationState::Unsupported,
             availability: None,
             diagnostics: vec![diagnostic(
                 "config_bundle_check_unsupported",
-                DiagnosticSeverity::Info,
+                HostDiagnosticSeverity::Info,
                 "runtime does not implement config bundle availability checks".to_string(),
             )],
         }
@@ -1070,7 +1087,7 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
             bundles: Vec::new(),
             diagnostics: vec![diagnostic(
                 "config_bundle_list_unsupported",
-                DiagnosticSeverity::Info,
+                HostDiagnosticSeverity::Info,
                 "runtime does not implement config bundle listing".to_string(),
             )],
         }
@@ -1094,11 +1111,11 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         _request: WorkerLifecycleRequest,
     ) -> WorkerLifecycleResult {
         WorkerLifecycleResult {
-            state: WorkerOperationState::Unsupported,
+            state: InternalWorkerOperationState::Unsupported,
             worker: RuntimeWorkerRef::new(self.runtime_id().to_string(), worker_id.to_string()),
             diagnostics: vec![diagnostic(
                 "worker_stop_pending",
-                DiagnosticSeverity::Info,
+                HostDiagnosticSeverity::Info,
                 format!(
                     "worker stop for '{worker_id}' is reserved for the runtime service boundary and is not implemented by this registry surface"
                 ),
@@ -1112,11 +1129,11 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         _request: WorkerLifecycleRequest,
     ) -> WorkerLifecycleResult {
         WorkerLifecycleResult {
-            state: WorkerOperationState::Unsupported,
+            state: InternalWorkerOperationState::Unsupported,
             worker: RuntimeWorkerRef::new(self.runtime_id().to_string(), worker_id.to_string()),
             diagnostics: vec![diagnostic(
                 "worker_cancel_pending",
-                DiagnosticSeverity::Info,
+                HostDiagnosticSeverity::Info,
                 format!(
                     "worker cancel for '{worker_id}' is reserved for the runtime service boundary and is not implemented by this registry surface"
                 ),
@@ -1126,12 +1143,12 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
 
     fn delete_worker(&self, worker_id: &str) -> WorkerDeleteResult {
         WorkerDeleteResult {
-            state: WorkerOperationState::Unsupported,
+            state: InternalWorkerOperationState::Unsupported,
             worker: RuntimeWorkerRef::new(self.runtime_id().to_string(), worker_id.to_string()),
             deleted: false,
             diagnostics: vec![diagnostic(
                 "worker_delete_unsupported",
-                DiagnosticSeverity::Info,
+                HostDiagnosticSeverity::Info,
                 format!("runtime does not implement worker deletion for '{worker_id}'"),
             )],
         }
@@ -1176,11 +1193,11 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
 
     fn send_input(&self, worker_id: &str, _request: WorkerInputRequest) -> WorkerInputResult {
         WorkerInputResult {
-            state: WorkerOperationState::Unsupported,
+            state: InternalWorkerOperationState::Unsupported,
             worker: RuntimeWorkerRef::new(self.runtime_id().to_string(), worker_id.to_string()),
             diagnostics: vec![diagnostic(
                 "worker_input_pending",
-                DiagnosticSeverity::Info,
+                HostDiagnosticSeverity::Info,
                 format!(
                     "worker input for '{worker_id}' is reserved for the runtime service boundary and is not implemented by this registry source"
                 ),
@@ -1229,7 +1246,7 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
             entries: Vec::new(),
             diagnostics: vec![diagnostic(
                 "worker_completions_unsupported",
-                DiagnosticSeverity::Info,
+                HostDiagnosticSeverity::Info,
                 format!("runtime does not implement completions for worker '{worker_id}'"),
             )],
         }
@@ -1241,7 +1258,7 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
             status: "not_implemented".to_string(),
             diagnostics: vec![diagnostic(
                 "worker_proxy_pending",
-                DiagnosticSeverity::Info,
+                HostDiagnosticSeverity::Info,
                 format!(
                     "worker proxy connect points for '{}' are not implemented by this overview-only registry surface",
                     worker_id
@@ -1361,7 +1378,7 @@ impl RuntimeRegistry {
         }
     }
 
-    pub fn list_runtimes(&self, limit: usize) -> RuntimeList<RuntimeSummary> {
+    pub fn list_runtimes(&self, limit: usize) -> RuntimeList<InternalRuntimeSummary> {
         let mut diagnostics = Vec::new();
         let mut items = Vec::new();
         for runtime in self.runtimes_snapshot().iter().take(limit) {
@@ -1373,7 +1390,7 @@ impl RuntimeRegistry {
         RuntimeList::new(items, diagnostics)
     }
 
-    pub fn list_hosts(&self, limit: usize) -> RuntimeList<HostSummary> {
+    pub fn list_hosts(&self, limit: usize) -> RuntimeList<InternalHostSummary> {
         let mut items = Vec::new();
         let mut diagnostics = Vec::new();
         for runtime in self.runtimes_snapshot() {
@@ -1388,7 +1405,7 @@ impl RuntimeRegistry {
         RuntimeList::new(items, diagnostics)
     }
 
-    pub fn list_workers(&self, limit: usize) -> RuntimeList<WorkerSummary> {
+    pub fn list_workers(&self, limit: usize) -> RuntimeList<InternalWorkerSummary> {
         let mut items = Vec::new();
         let mut diagnostics = Vec::new();
         for runtime in self.runtimes_snapshot() {
@@ -1411,7 +1428,7 @@ impl RuntimeRegistry {
         &self,
         runtime_id: &str,
         limit: usize,
-    ) -> Result<RuntimeList<WorkerSummary>, RuntimeRegistryError> {
+    ) -> Result<RuntimeList<InternalWorkerSummary>, RuntimeRegistryError> {
         validate_backend_identifier("runtime_id", runtime_id)?;
         let runtime = self.runtime(runtime_id)?;
         let worker_list = runtime.list_workers(limit);
@@ -1426,7 +1443,7 @@ impl RuntimeRegistry {
         &self,
         runtime_id: &str,
         limit: usize,
-    ) -> Result<RuntimeList<WorkerSummary>, RuntimeRegistryError> {
+    ) -> Result<RuntimeList<InternalWorkerSummary>, RuntimeRegistryError> {
         validate_backend_identifier("runtime_id", runtime_id)?;
         let runtime = self.runtime(runtime_id)?;
         let worker_list = runtime.list_stopped_workers(limit);
@@ -1441,7 +1458,7 @@ impl RuntimeRegistry {
         &self,
         host_id: &str,
         limit: usize,
-    ) -> Result<RuntimeList<WorkerSummary>, RuntimeRegistryError> {
+    ) -> Result<RuntimeList<InternalWorkerSummary>, RuntimeRegistryError> {
         validate_backend_identifier("host_id", host_id)?;
 
         let mut host_found = false;
@@ -1475,7 +1492,10 @@ impl RuntimeRegistry {
         }
     }
 
-    pub fn worker(&self, worker: &RuntimeWorkerRef) -> Result<WorkerSummary, RuntimeRegistryError> {
+    pub fn worker(
+        &self,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<InternalWorkerSummary, RuntimeRegistryError> {
         let runtime_id = worker.runtime_id.as_str();
         let worker_id = worker.worker_id.as_str();
         validate_backend_identifier("runtime_id", runtime_id)?;
@@ -1491,7 +1511,7 @@ impl RuntimeRegistry {
     pub fn restore_worker(
         &self,
         worker: &RuntimeWorkerRef,
-    ) -> Result<WorkerRestoreResult, RuntimeRegistryError> {
+    ) -> Result<InternalWorkerRestoreResult, RuntimeRegistryError> {
         let runtime_id = worker.runtime_id.as_str();
         let worker_id = worker.worker_id.as_str();
         validate_backend_identifier("runtime_id", runtime_id)?;
@@ -1539,7 +1559,7 @@ impl RuntimeRegistry {
                     .map(|message| {
                         diagnostic(
                             "workspace_prompt_projection_notification_failed",
-                            DiagnosticSeverity::Warning,
+                            HostDiagnosticSeverity::Warning,
                             format!(
                                 "runtime '{}' rejected Workspace Prompt projection revision {}: {message}",
                                 runtime.runtime_id(), projection.config_revision
@@ -1587,7 +1607,7 @@ impl RuntimeRegistry {
             && let Some(bundle) = request.resolved_config_bundle.clone()
         {
             let sync = runtime.sync_config_bundle(bundle);
-            if sync.state != WorkerOperationState::Accepted {
+            if sync.state != InternalWorkerOperationState::Accepted {
                 let message = sync
                     .diagnostics
                     .first()
@@ -2173,7 +2193,10 @@ impl EmbeddedWorkerRuntime {
         runtime_worker_can_stop(self.execution_enabled, status)
     }
 
-    fn map_worker_summary(&self, summary: worker_runtime::catalog::WorkerSummary) -> WorkerSummary {
+    fn map_worker_summary(
+        &self,
+        summary: worker_runtime::catalog::WorkerSummary,
+    ) -> InternalWorkerSummary {
         let worker_id = summary.worker_ref.worker_id.to_string();
         let profile = embedded_profile_label(&summary.profile);
         let display = worker_display_metadata(
@@ -2182,7 +2205,7 @@ impl EmbeddedWorkerRuntime {
             summary.display_name.as_deref(),
             true,
         );
-        WorkerSummary {
+        InternalWorkerSummary {
             worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
@@ -2190,7 +2213,7 @@ impl EmbeddedWorkerRuntime {
             profile,
             singleton_key: display.singleton_key,
             tags: display.tags,
-            workspace: WorkerWorkspaceSummary {
+            workspace: InternalWorkerWorkspaceSummary {
                 visibility: "backend_internal".to_string(),
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: summary.workspace_id.clone(),
@@ -2204,11 +2227,11 @@ impl EmbeddedWorkerRuntime {
             last_seen_at: None,
             pinned: false,
             retention_state: "transient".to_string(),
-            implementation: WorkerImplementationSummary {
+            implementation: InternalWorkerImplementationSummary {
                 kind: "embedded_worker_runtime".to_string(),
                 display_hint: "backend-internal worker-runtime Worker".to_string(),
             },
-            capabilities: WorkerCapabilitySummary {
+            capabilities: InternalWorkerCapabilitySummary {
                 can_stop: summary.execution_metadata_available
                     && self.can_stop_embedded_worker(summary.status),
                 can_spawn_followup: false,
@@ -2220,7 +2243,7 @@ impl EmbeddedWorkerRuntime {
         }
     }
 
-    fn map_worker_detail(&self, detail: EmbeddedWorkerDetail) -> WorkerSummary {
+    fn map_worker_detail(&self, detail: EmbeddedWorkerDetail) -> InternalWorkerSummary {
         let worker_id = detail.worker_id.to_string();
         let profile = embedded_profile_label(&detail.profile);
         let display = worker_display_metadata(
@@ -2229,7 +2252,7 @@ impl EmbeddedWorkerRuntime {
             detail.display_name.as_deref(),
             true,
         );
-        WorkerSummary {
+        InternalWorkerSummary {
             worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
@@ -2237,7 +2260,7 @@ impl EmbeddedWorkerRuntime {
             profile,
             singleton_key: display.singleton_key,
             tags: display.tags,
-            workspace: WorkerWorkspaceSummary {
+            workspace: InternalWorkerWorkspaceSummary {
                 visibility: "backend_internal".to_string(),
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: detail.workspace_id.clone(),
@@ -2248,11 +2271,11 @@ impl EmbeddedWorkerRuntime {
             last_seen_at: None,
             pinned: false,
             retention_state: "transient".to_string(),
-            implementation: WorkerImplementationSummary {
+            implementation: InternalWorkerImplementationSummary {
                 kind: "embedded_worker_runtime".to_string(),
                 display_hint: "backend-internal worker-runtime Worker".to_string(),
             },
-            capabilities: WorkerCapabilitySummary {
+            capabilities: InternalWorkerCapabilitySummary {
                 can_stop: detail.execution_metadata_available
                     && self.can_stop_embedded_worker(detail.status),
                 can_spawn_followup: false,
@@ -2270,18 +2293,18 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         &self.runtime_id
     }
 
-    fn runtime_summary(&self, limit: usize) -> RuntimeSummary {
+    fn runtime_summary(&self, limit: usize) -> InternalRuntimeSummary {
         let mut diagnostics = Vec::new();
         let summary = match self.runtime.summary() {
             Ok(summary) => summary,
             Err(err) => {
                 diagnostics.push(embedded_runtime_diagnostic(&err));
-                return RuntimeSummary {
+                return InternalRuntimeSummary {
                     runtime_id: self.runtime_id.clone(),
                     label: "Embedded backend Runtime".to_string(),
                     kind: "embedded_worker_runtime".to_string(),
                     status: "unavailable".to_string(),
-                    source: RuntimeSourceSummary::embedded_worker_runtime(),
+                    source: InternalRuntimeSourceSummary::embedded_worker_runtime(),
                     host_ids: Vec::new(),
                     worker_creation_available: false,
                     os: std::env::consts::OS.to_string(),
@@ -2291,7 +2314,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             }
         };
 
-        RuntimeSummary {
+        InternalRuntimeSummary {
             runtime_id: self.runtime_id.clone(),
             label: summary
                 .display_name
@@ -2299,7 +2322,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 .unwrap_or_else(|| "Embedded backend Runtime".to_string()),
             kind: "embedded_worker_runtime".to_string(),
             status: embedded_runtime_status_label(summary.status).to_string(),
-            source: RuntimeSourceSummary::embedded_worker_runtime(),
+            source: InternalRuntimeSourceSummary::embedded_worker_runtime(),
             host_ids: if limit == 0 {
                 Vec::new()
             } else {
@@ -2312,12 +2335,12 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         }
     }
 
-    fn list_hosts(&self, limit: usize) -> RuntimeList<HostSummary> {
+    fn list_hosts(&self, limit: usize) -> RuntimeList<InternalHostSummary> {
         if limit == 0 {
             return RuntimeList::new(Vec::new(), Vec::new());
         }
         RuntimeList::new(
-            vec![HostSummary {
+            vec![InternalHostSummary {
                 runtime_id: self.runtime_id.clone(),
                 host_id: self.host_id.clone(),
                 label: "embedded".to_string(),
@@ -2329,7 +2352,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 arch: std::env::consts::ARCH.to_string(),
                 diagnostics: vec![diagnostic(
                     "embedded_runtime_host_boundary",
-                    DiagnosticSeverity::Info,
+                    HostDiagnosticSeverity::Info,
                     "Backend-internal host exposes only bounded runtime and worker projections"
                         .to_string(),
                 )],
@@ -2338,7 +2361,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         )
     }
 
-    fn list_workers(&self, limit: usize) -> RuntimeList<WorkerSummary> {
+    fn list_workers(&self, limit: usize) -> RuntimeList<InternalWorkerSummary> {
         if limit == 0 {
             return RuntimeList::new(Vec::new(), Vec::new());
         }
@@ -2355,7 +2378,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         }
     }
 
-    fn list_stopped_workers(&self, limit: usize) -> RuntimeList<WorkerSummary> {
+    fn list_stopped_workers(&self, limit: usize) -> RuntimeList<InternalWorkerSummary> {
         if limit == 0 {
             return RuntimeList::new(Vec::new(), Vec::new());
         }
@@ -2378,7 +2401,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 worker: None,
                 diagnostics: vec![diagnostic(
                     "embedded_worker_id_invalid",
-                    DiagnosticSeverity::Warning,
+                    HostDiagnosticSeverity::Warning,
                     "Worker id was empty and cannot be resolved".to_string(),
                 )],
             };
@@ -2399,14 +2422,14 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         }
     }
 
-    fn restore_worker(&self, worker_id: &str) -> WorkerRestoreResult {
+    fn restore_worker(&self, worker_id: &str) -> InternalWorkerRestoreResult {
         let Some(worker_ref) = self.worker_ref(worker_id) else {
-            return WorkerRestoreResult {
+            return InternalWorkerRestoreResult {
                 state: server_api::WorkerRestoreState::Rejected,
                 worker: None,
                 diagnostics: vec![diagnostic(
                     "embedded_worker_id_invalid",
-                    DiagnosticSeverity::Warning,
+                    HostDiagnosticSeverity::Warning,
                     "Worker id was empty and cannot be restored".to_string(),
                 )],
             };
@@ -2415,17 +2438,17 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             Ok(result) => {
                 let diagnostics = match (result.reason_code, result.message) {
                     (Some(code), Some(message)) => {
-                        vec![diagnostic(code, DiagnosticSeverity::Warning, message)]
+                        vec![diagnostic(code, HostDiagnosticSeverity::Warning, message)]
                     }
                     _ => Vec::new(),
                 };
-                WorkerRestoreResult {
+                InternalWorkerRestoreResult {
                     state: result.state,
                     worker: result.worker.map(|detail| self.map_worker_detail(detail)),
                     diagnostics,
                 }
             }
-            Err(err) => WorkerRestoreResult {
+            Err(err) => InternalWorkerRestoreResult {
                 state: server_api::WorkerRestoreState::ReconciliationRequired,
                 worker: None,
                 diagnostics: vec![embedded_runtime_diagnostic(&err)],
@@ -2440,11 +2463,11 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
     ) -> WorkerWorkspaceApiResult {
         let Some(worker_ref) = self.worker_ref(worker_id) else {
             return WorkerWorkspaceApiResult {
-                state: WorkerOperationState::Rejected,
+                state: InternalWorkerOperationState::Rejected,
                 worker: None,
                 diagnostics: vec![diagnostic(
                     "embedded_worker_id_invalid",
-                    DiagnosticSeverity::Warning,
+                    HostDiagnosticSeverity::Warning,
                     "Worker id was empty and cannot receive Workspace access".to_string(),
                 )],
             };
@@ -2454,12 +2477,12 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             .replace_worker_workspace_api(&worker_ref, workspace_api)
         {
             Ok(detail) => WorkerWorkspaceApiResult {
-                state: WorkerOperationState::Accepted,
+                state: InternalWorkerOperationState::Accepted,
                 worker: Some(self.map_worker_detail(detail)),
                 diagnostics: Vec::new(),
             },
             Err(err) => WorkerWorkspaceApiResult {
-                state: WorkerOperationState::Rejected,
+                state: InternalWorkerOperationState::Rejected,
                 worker: None,
                 diagnostics: vec![embedded_runtime_diagnostic(&err)],
             },
@@ -2473,11 +2496,11 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
     ) -> WorkerWorkspaceApiResult {
         let Some(worker_ref) = self.worker_ref(worker_id) else {
             return WorkerWorkspaceApiResult {
-                state: WorkerOperationState::Rejected,
+                state: InternalWorkerOperationState::Rejected,
                 worker: None,
                 diagnostics: vec![diagnostic(
                     "embedded_worker_id_invalid",
-                    DiagnosticSeverity::Warning,
+                    HostDiagnosticSeverity::Warning,
                     "Worker id was empty and cannot change Workdir attachments".to_string(),
                 )],
             };
@@ -2487,12 +2510,12 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             .replace_worker_workdir_attachments(&worker_ref, attachments)
         {
             Ok(detail) => WorkerWorkspaceApiResult {
-                state: WorkerOperationState::Accepted,
+                state: InternalWorkerOperationState::Accepted,
                 worker: Some(self.map_worker_detail(detail)),
                 diagnostics: Vec::new(),
             },
             Err(err) => WorkerWorkspaceApiResult {
-                state: WorkerOperationState::Rejected,
+                state: InternalWorkerOperationState::Rejected,
                 worker: None,
                 diagnostics: vec![embedded_runtime_diagnostic(&err)],
             },
@@ -2504,7 +2527,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         _request: WorkingDirectoryRequest,
     ) -> RuntimeWorkingDirectoryResult {
         RuntimeWorkingDirectoryResult {
-            state: WorkerOperationState::Rejected,
+            state: InternalWorkerOperationState::Rejected,
             working_directory: None,
             diagnostics: vec![embedded_workdir_unsupported_diagnostic()],
         }
@@ -2538,7 +2561,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
 
     fn working_directory(&self, _working_directory_id: &str) -> RuntimeWorkingDirectoryResult {
         RuntimeWorkingDirectoryResult {
-            state: WorkerOperationState::Rejected,
+            state: InternalWorkerOperationState::Rejected,
             working_directory: None,
             diagnostics: vec![embedded_workdir_unsupported_diagnostic()],
         }
@@ -2549,7 +2572,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         _working_directory_id: &str,
     ) -> RuntimeWorkingDirectoryResult {
         RuntimeWorkingDirectoryResult {
-            state: WorkerOperationState::Rejected,
+            state: InternalWorkerOperationState::Rejected,
             working_directory: None,
             diagnostics: vec![embedded_workdir_unsupported_diagnostic()],
         }
@@ -2566,7 +2589,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         {
             diagnostics.push(embedded_workdir_unsupported_diagnostic());
             return WorkerSpawnResult {
-                state: WorkerOperationState::Rejected,
+                state: InternalWorkerOperationState::Rejected,
                 worker: None,
                 acceptance_evidence: Vec::new(),
                 diagnostics,
@@ -2578,11 +2601,11 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         ) {
             diagnostics.push(diagnostic(
                 "embedded_runtime_no_socket",
-                DiagnosticSeverity::Warning,
+                HostDiagnosticSeverity::Warning,
                 "Embedded backend Runtime is transportless; use run_accepted/create acceptance for backend-internal Workers".to_string(),
             ));
             return WorkerSpawnResult {
-                state: WorkerOperationState::Rejected,
+                state: InternalWorkerOperationState::Rejected,
                 worker: None,
                 acceptance_evidence: Vec::new(),
                 diagnostics,
@@ -2591,7 +2614,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         if request.requested_worker_name.is_some() {
             diagnostics.push(diagnostic(
                 "embedded_worker_name_display_only",
-                DiagnosticSeverity::Info,
+                HostDiagnosticSeverity::Info,
                 "requested_worker_name is used only as display_name; Worker identity is allocated by Workspace authority".to_string(),
             ));
         }
@@ -2599,7 +2622,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         {
             diagnostics.push(diagnostic(
                 "embedded_runtime_acceptance_projection",
-                DiagnosticSeverity::Info,
+                HostDiagnosticSeverity::Info,
                 "Embedded Runtime accepts creation through a runtime execution backend; provider segment counts are observed after execution, not faked at create time".to_string(),
             ));
         }
@@ -2610,11 +2633,11 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             Err(error) => {
                 diagnostics.push(diagnostic(
                     "embedded_profile_source_archive_invalid",
-                    DiagnosticSeverity::Error,
+                    HostDiagnosticSeverity::Error,
                     error,
                 ));
                 return WorkerSpawnResult {
-                    state: WorkerOperationState::Rejected,
+                    state: InternalWorkerOperationState::Rejected,
                     worker: None,
                     acceptance_evidence: Vec::new(),
                     diagnostics,
@@ -2626,7 +2649,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
                 return WorkerSpawnResult {
-                    state: WorkerOperationState::Rejected,
+                    state: InternalWorkerOperationState::Rejected,
                     worker: None,
                     acceptance_evidence: Vec::new(),
                     diagnostics,
@@ -2648,7 +2671,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             .create_worker_scoped(&workspace_scope, create_request)
         {
             Ok(detail) => WorkerSpawnResult {
-                state: WorkerOperationState::Accepted,
+                state: InternalWorkerOperationState::Accepted,
                 worker: Some(self.map_worker_detail(detail)),
                 acceptance_evidence: vec![
                     WorkerSpawnAcceptanceEvidence {
@@ -2668,7 +2691,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             Err(err) => {
                 diagnostics.push(embedded_runtime_diagnostic(&err));
                 WorkerSpawnResult {
-                    state: WorkerOperationState::Rejected,
+                    state: InternalWorkerOperationState::Rejected,
                     worker: None,
                     acceptance_evidence: Vec::new(),
                     diagnostics,
@@ -2689,12 +2712,12 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
     fn sync_config_bundle(&self, bundle: ConfigBundle) -> ConfigBundleSyncResult {
         match self.runtime.store_config_bundle(bundle) {
             Ok(availability) => ConfigBundleSyncResult {
-                state: WorkerOperationState::Accepted,
+                state: InternalWorkerOperationState::Accepted,
                 availability: Some(availability),
                 diagnostics: Vec::new(),
             },
             Err(error) => ConfigBundleSyncResult {
-                state: WorkerOperationState::Rejected,
+                state: InternalWorkerOperationState::Rejected,
                 availability: None,
                 diagnostics: vec![embedded_runtime_diagnostic(&error)],
             },
@@ -2704,12 +2727,12 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
     fn check_config_bundle(&self, reference: ConfigBundleRef) -> ConfigBundleCheckResult {
         match self.runtime.check_config_bundle(&reference) {
             Ok(availability) => ConfigBundleCheckResult {
-                state: WorkerOperationState::Accepted,
+                state: InternalWorkerOperationState::Accepted,
                 availability: Some(availability),
                 diagnostics: Vec::new(),
             },
             Err(error) => ConfigBundleCheckResult {
-                state: WorkerOperationState::Rejected,
+                state: InternalWorkerOperationState::Rejected,
                 availability: None,
                 diagnostics: vec![embedded_runtime_diagnostic(&error)],
             },
@@ -2740,7 +2763,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 worker_id,
                 diagnostic(
                     "embedded_worker_execution_unavailable",
-                    DiagnosticSeverity::Info,
+                    HostDiagnosticSeverity::Info,
                     format!("worker stop for '{worker_id}' requires an embedded execution backend"),
                 ),
             );
@@ -2751,14 +2774,14 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 worker_id,
                 diagnostic(
                     "embedded_worker_id_invalid",
-                    DiagnosticSeverity::Warning,
+                    HostDiagnosticSeverity::Warning,
                     "Worker id was empty and cannot be resolved".to_string(),
                 ),
             );
         };
         match self.runtime.stop_worker(&worker_ref, request.reason) {
             Ok(_) => WorkerLifecycleResult {
-                state: WorkerOperationState::Accepted,
+                state: InternalWorkerOperationState::Accepted,
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 diagnostics: Vec::new(),
             },
@@ -2781,7 +2804,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 worker_id,
                 diagnostic(
                     "embedded_worker_execution_unavailable",
-                    DiagnosticSeverity::Info,
+                    HostDiagnosticSeverity::Info,
                     format!(
                         "worker cancel for '{worker_id}' requires an embedded execution backend"
                     ),
@@ -2794,14 +2817,14 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 worker_id,
                 diagnostic(
                     "embedded_worker_id_invalid",
-                    DiagnosticSeverity::Warning,
+                    HostDiagnosticSeverity::Warning,
                     "Worker id was empty and cannot be resolved".to_string(),
                 ),
             );
         };
         match self.runtime.cancel_worker(&worker_ref, request.reason) {
             Ok(_) => WorkerLifecycleResult {
-                state: WorkerOperationState::Accepted,
+                state: InternalWorkerOperationState::Accepted,
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 diagnostics: Vec::new(),
             },
@@ -2816,19 +2839,19 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
     fn delete_worker(&self, worker_id: &str) -> WorkerDeleteResult {
         let Some(worker_ref) = self.worker_ref(worker_id) else {
             return WorkerDeleteResult {
-                state: WorkerOperationState::Rejected,
+                state: InternalWorkerOperationState::Rejected,
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 deleted: false,
                 diagnostics: vec![diagnostic(
                     "embedded_worker_id_invalid",
-                    DiagnosticSeverity::Warning,
+                    HostDiagnosticSeverity::Warning,
                     "Worker id was empty and cannot be resolved".to_string(),
                 )],
             };
         };
         match self.runtime.delete_worker(&worker_ref) {
             Ok(result) => WorkerDeleteResult {
-                state: WorkerOperationState::Accepted,
+                state: InternalWorkerOperationState::Accepted,
                 worker: RuntimeWorkerRef::new(
                     self.runtime_id.clone(),
                     result.worker_id.to_string(),
@@ -2837,7 +2860,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 diagnostics: Vec::new(),
             },
             Err(error) => WorkerDeleteResult {
-                state: WorkerOperationState::Rejected,
+                state: InternalWorkerOperationState::Rejected,
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 deleted: false,
                 diagnostics: vec![embedded_runtime_diagnostic(&error)],
@@ -2932,7 +2955,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 worker_id,
                 diagnostic(
                     "embedded_worker_execution_unavailable",
-                    DiagnosticSeverity::Info,
+                    HostDiagnosticSeverity::Info,
                     format!(
                         "worker input for '{worker_id}' requires an embedded execution backend"
                     ),
@@ -2945,7 +2968,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 worker_id,
                 diagnostic(
                     "embedded_worker_id_invalid",
-                    DiagnosticSeverity::Warning,
+                    HostDiagnosticSeverity::Warning,
                     "Worker id was empty and cannot be resolved".to_string(),
                 ),
             );
@@ -2964,7 +2987,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         };
         match self.runtime.send_input(&worker_ref, input) {
             Ok(_) => WorkerInputResult {
-                state: WorkerOperationState::Accepted,
+                state: InternalWorkerOperationState::Accepted,
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 diagnostics: Vec::new(),
             },
@@ -3040,7 +3063,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 entries: Vec::new(),
                 diagnostics: vec![diagnostic(
                     "embedded_worker_execution_unavailable",
-                    DiagnosticSeverity::Info,
+                    HostDiagnosticSeverity::Info,
                     format!(
                         "worker completions for '{worker_id}' require an embedded execution backend"
                     ),
@@ -3055,7 +3078,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 entries: Vec::new(),
                 diagnostics: vec![diagnostic(
                     "embedded_worker_id_invalid",
-                    DiagnosticSeverity::Warning,
+                    HostDiagnosticSeverity::Warning,
                     "Worker id was empty and cannot be resolved".to_string(),
                 )],
             };
@@ -3151,7 +3174,7 @@ impl WorkspaceRuntimeAuthorization {
             .map_err(|_| {
                 diagnostic(
                     "workspace_runtime_authorization_unavailable",
-                    DiagnosticSeverity::Error,
+                    HostDiagnosticSeverity::Error,
                     "Workspace Runtime authorization is unavailable".to_string(),
                 )
             })?
@@ -3159,7 +3182,7 @@ impl WorkspaceRuntimeAuthorization {
             .ok_or_else(|| {
                 diagnostic(
                     "workspace_runtime_verification_required",
-                    DiagnosticSeverity::Error,
+                    HostDiagnosticSeverity::Error,
                     "Workspace Runtime binding is not verified".to_string(),
                 )
             })?;
@@ -3172,14 +3195,14 @@ impl WorkspaceRuntimeAuthorization {
                 .map_err(|error| {
                     diagnostic(
                         "workspace_runtime_authorization_unavailable",
-                        DiagnosticSeverity::Error,
+                        HostDiagnosticSeverity::Error,
                         error.to_string(),
                     )
                 })?
         {
             return Err(diagnostic(
                 "workspace_runtime_authorization_stale",
-                DiagnosticSeverity::Error,
+                HostDiagnosticSeverity::Error,
                 "Workspace Runtime binding changed or was revoked".to_string(),
             ));
         }
@@ -3189,21 +3212,21 @@ impl WorkspaceRuntimeAuthorization {
             .map_err(|error| {
                 diagnostic(
                     "workspace_runtime_authorization_unavailable",
-                    DiagnosticSeverity::Error,
+                    HostDiagnosticSeverity::Error,
                     error.to_string(),
                 )
             })?;
         let workspace_key_id = binding.workspace_key_id.as_deref().ok_or_else(|| {
             diagnostic(
                 "workspace_runtime_authorization_invalid",
-                DiagnosticSeverity::Error,
+                HostDiagnosticSeverity::Error,
                 "Workspace Runtime binding is missing its Workspace key".to_string(),
             )
         })?;
         let trust_generation = binding.workspace_key_generation.ok_or_else(|| {
             diagnostic(
                 "workspace_runtime_authorization_invalid",
-                DiagnosticSeverity::Error,
+                HostDiagnosticSeverity::Error,
                 "Workspace Runtime binding is missing its trust generation".to_string(),
             )
         })?;
@@ -3220,14 +3243,14 @@ impl WorkspaceRuntimeAuthorization {
                 .map_err(|error| {
                     diagnostic(
                         "workspace_runtime_authorization_unavailable",
-                        DiagnosticSeverity::Error,
+                        HostDiagnosticSeverity::Error,
                         error.to_string(),
                     )
                 })?
         {
             return Err(diagnostic(
                 "workspace_runtime_authorization_stale",
-                DiagnosticSeverity::Error,
+                HostDiagnosticSeverity::Error,
                 "Workspace signing identity no longer matches the verified binding".to_string(),
             ));
         }
@@ -3254,7 +3277,7 @@ impl WorkspaceRuntimeAuthorization {
             .map_err(|error| {
                 diagnostic(
                     "workspace_runtime_authorization_sign_failed",
-                    DiagnosticSeverity::Error,
+                    HostDiagnosticSeverity::Error,
                     error.to_string(),
                 )
             })
@@ -3739,7 +3762,7 @@ impl RemoteWorkerRuntime {
             .map_err(|error| {
                 diagnostic(
                     "remote_runtime_client_build_failed",
-                    DiagnosticSeverity::Error,
+                    HostDiagnosticSeverity::Error,
                     error.to_string(),
                 )
             })?
@@ -3755,7 +3778,7 @@ impl RemoteWorkerRuntime {
             .map_err(|error| {
                 diagnostic(
                     "remote_runtime_client_build_failed",
-                    DiagnosticSeverity::Error,
+                    HostDiagnosticSeverity::Error,
                     error.to_string(),
                 )
             })
@@ -3889,7 +3912,7 @@ impl RemoteWorkerRuntime {
         let body = serde_json::to_vec(body).map_err(|error| {
             diagnostic(
                 "remote_runtime_request_encode_failed",
-                DiagnosticSeverity::Error,
+                HostDiagnosticSeverity::Error,
                 error.to_string(),
             )
         })?;
@@ -3971,7 +3994,7 @@ impl RemoteWorkerRuntime {
                     .map_err(|_| {
                         diagnostic(
                             "remote_runtime_response_read_failed",
-                            DiagnosticSeverity::Error,
+                            HostDiagnosticSeverity::Error,
                             format!(
                                 "Remote Runtime response could not be read for '{}'",
                                 runtime_id
@@ -3981,7 +4004,7 @@ impl RemoteWorkerRuntime {
                 if body.len() > MAX_REMOTE_RUNTIME_RESPONSE_BYTES {
                     return Err(diagnostic(
                         "remote_runtime_response_too_large",
-                        DiagnosticSeverity::Error,
+                        HostDiagnosticSeverity::Error,
                         format!(
                             "Remote Runtime response exceeded the allowed size for '{}'",
                             runtime_id
@@ -3991,7 +4014,7 @@ impl RemoteWorkerRuntime {
                 serde_json::from_slice::<T>(&body).map_err(|_| {
                     diagnostic(
                         "remote_runtime_malformed_response",
-                        DiagnosticSeverity::Error,
+                        HostDiagnosticSeverity::Error,
                         format!(
                             "Remote Runtime returned malformed JSON for '{}'",
                             runtime_id
@@ -4004,7 +4027,10 @@ impl RemoteWorkerRuntime {
         })
     }
 
-    fn map_worker_summary(&self, summary: worker_runtime::catalog::WorkerSummary) -> WorkerSummary {
+    fn map_worker_summary(
+        &self,
+        summary: worker_runtime::catalog::WorkerSummary,
+    ) -> InternalWorkerSummary {
         let worker_id = summary.worker_ref.worker_id.to_string();
         let profile = embedded_profile_label(&summary.profile);
         let display = worker_display_metadata(
@@ -4013,7 +4039,7 @@ impl RemoteWorkerRuntime {
             summary.display_name.as_deref(),
             false,
         );
-        WorkerSummary {
+        InternalWorkerSummary {
             worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
@@ -4021,7 +4047,7 @@ impl RemoteWorkerRuntime {
             profile,
             singleton_key: display.singleton_key,
             tags: display.tags,
-            workspace: WorkerWorkspaceSummary {
+            workspace: InternalWorkerWorkspaceSummary {
                 visibility: "remote_runtime".to_string(),
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: summary.workspace_id.clone(),
@@ -4035,11 +4061,11 @@ impl RemoteWorkerRuntime {
             last_seen_at: None,
             pinned: false,
             retention_state: "transient".to_string(),
-            implementation: WorkerImplementationSummary {
+            implementation: InternalWorkerImplementationSummary {
                 kind: "remote_worker_runtime".to_string(),
                 display_hint: "Backend-proxied remote worker-runtime Worker".to_string(),
             },
-            capabilities: WorkerCapabilitySummary {
+            capabilities: InternalWorkerCapabilitySummary {
                 can_stop: summary.execution_metadata_available
                     && runtime_worker_can_stop(true, summary.status),
                 can_spawn_followup: false,
@@ -4049,7 +4075,7 @@ impl RemoteWorkerRuntime {
         }
     }
 
-    fn map_worker_detail(&self, detail: EmbeddedWorkerDetail) -> WorkerSummary {
+    fn map_worker_detail(&self, detail: EmbeddedWorkerDetail) -> InternalWorkerSummary {
         let worker_id = detail.worker_id.to_string();
         let profile = embedded_profile_label(&detail.profile);
         let display = worker_display_metadata(
@@ -4058,7 +4084,7 @@ impl RemoteWorkerRuntime {
             detail.display_name.as_deref(),
             false,
         );
-        WorkerSummary {
+        InternalWorkerSummary {
             worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
@@ -4066,7 +4092,7 @@ impl RemoteWorkerRuntime {
             profile,
             singleton_key: display.singleton_key,
             tags: display.tags,
-            workspace: WorkerWorkspaceSummary {
+            workspace: InternalWorkerWorkspaceSummary {
                 visibility: "remote_runtime".to_string(),
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: detail.workspace_id.clone(),
@@ -4077,11 +4103,11 @@ impl RemoteWorkerRuntime {
             last_seen_at: None,
             pinned: false,
             retention_state: "transient".to_string(),
-            implementation: WorkerImplementationSummary {
+            implementation: InternalWorkerImplementationSummary {
                 kind: "remote_worker_runtime".to_string(),
                 display_hint: "Backend-proxied remote worker-runtime Worker".to_string(),
             },
-            capabilities: WorkerCapabilitySummary {
+            capabilities: InternalWorkerCapabilitySummary {
                 can_stop: detail.execution_metadata_available
                     && runtime_worker_can_stop(true, detail.status),
                 can_spawn_followup: false,
@@ -4097,11 +4123,11 @@ impl RemoteWorkerRuntime {
         response: worker_runtime::catalog::WorkerLifecycleAck,
     ) -> WorkerLifecycleResult {
         WorkerLifecycleResult {
-            state: WorkerOperationState::Accepted,
+            state: InternalWorkerOperationState::Accepted,
             worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
             diagnostics: vec![diagnostic(
                 "remote_runtime_lifecycle_accepted",
-                DiagnosticSeverity::Info,
+                HostDiagnosticSeverity::Info,
                 format!(
                     "Remote Runtime acknowledged lifecycle operation for '{worker_id}' with status {}",
                     embedded_worker_status_label(response.status)
@@ -4116,7 +4142,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         &self.runtime_id
     }
 
-    fn runtime_summary(&self, limit: usize) -> RuntimeSummary {
+    fn runtime_summary(&self, limit: usize) -> InternalRuntimeSummary {
         match self
             .run_runtime_api(
                 self.request_timeout,
@@ -4128,14 +4154,14 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                     value.runtime,
                 )
             }) {
-            Ok(response) => RuntimeSummary {
+            Ok(response) => InternalRuntimeSummary {
                 runtime_id: self.runtime_id.clone(),
                 label: response
                     .display_name
                     .unwrap_or_else(|| self.display_name.clone()),
                 kind: "remote_worker_runtime".to_string(),
                 status: embedded_runtime_status_label(response.status).to_string(),
-                source: RuntimeSourceSummary::remote_http(),
+                source: InternalRuntimeSourceSummary::remote_http(),
                 host_ids: if limit == 0 {
                     Vec::new()
                 } else {
@@ -4146,12 +4172,12 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 arch: response.arch,
                 diagnostics: Vec::new(),
             },
-            Err(diagnostic) => RuntimeSummary {
+            Err(diagnostic) => InternalRuntimeSummary {
                 runtime_id: self.runtime_id.clone(),
                 label: self.display_name.clone(),
                 kind: "remote_worker_runtime".to_string(),
                 status: self.cached_status.clone(),
-                source: RuntimeSourceSummary::remote_http(),
+                source: InternalRuntimeSourceSummary::remote_http(),
                 host_ids: if limit == 0 {
                     Vec::new()
                 } else {
@@ -4242,12 +4268,12 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         )
     }
 
-    fn list_hosts(&self, limit: usize) -> RuntimeList<HostSummary> {
+    fn list_hosts(&self, limit: usize) -> RuntimeList<InternalHostSummary> {
         if limit == 0 {
             return RuntimeList::new(Vec::new(), Vec::new());
         }
         RuntimeList::new(
-            vec![HostSummary {
+            vec![InternalHostSummary {
                 runtime_id: self.runtime_id.clone(),
                 host_id: self.host_id.clone(),
                 label: self.display_name.clone(),
@@ -4263,7 +4289,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         )
     }
 
-    fn list_workers(&self, limit: usize) -> RuntimeList<WorkerSummary> {
+    fn list_workers(&self, limit: usize) -> RuntimeList<InternalWorkerSummary> {
         if limit == 0 {
             return RuntimeList::new(Vec::new(), Vec::new());
         }
@@ -4294,7 +4320,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         }
     }
 
-    fn list_stopped_workers(&self, limit: usize) -> RuntimeList<WorkerSummary> {
+    fn list_stopped_workers(&self, limit: usize) -> RuntimeList<InternalWorkerSummary> {
         if limit == 0 {
             return RuntimeList::new(Vec::new(), Vec::new());
         }
@@ -4353,7 +4379,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         }
     }
 
-    fn restore_worker(&self, worker_id: &str) -> WorkerRestoreResult {
+    fn restore_worker(&self, worker_id: &str) -> InternalWorkerRestoreResult {
         let worker_id_owned = worker_id.to_string();
         match self
             .run_runtime_api(
@@ -4375,11 +4401,11 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             Ok((state, worker, reason_code, message)) => {
                 let diagnostics = match (reason_code, message) {
                     (Some(code), Some(message)) => {
-                        vec![diagnostic(code, DiagnosticSeverity::Warning, message)]
+                        vec![diagnostic(code, HostDiagnosticSeverity::Warning, message)]
                     }
                     _ => Vec::new(),
                 };
-                WorkerRestoreResult {
+                InternalWorkerRestoreResult {
                     state: match state {
                         runtime_api::WorkerRestoreState::Accepted => {
                             server_api::WorkerRestoreState::Accepted
@@ -4398,7 +4424,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                     diagnostics,
                 }
             }
-            Err(diagnostic) => WorkerRestoreResult {
+            Err(diagnostic) => InternalWorkerRestoreResult {
                 // A transport/protocol failure cannot prove that the Runtime
                 // rejected before side effects. Preserve uncertainty.
                 state: server_api::WorkerRestoreState::ReconciliationRequired,
@@ -4417,7 +4443,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             Ok(workspace_api) => runtime_api::WorkerWorkspaceApiRequest { workspace_api },
             Err(diagnostic) => {
                 return WorkerWorkspaceApiResult {
-                    state: WorkerOperationState::Rejected,
+                    state: InternalWorkerOperationState::Rejected,
                     worker: None,
                     diagnostics: vec![diagnostic],
                 };
@@ -4438,12 +4464,12 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 runtime_contract_convert::<_, worker_runtime::catalog::WorkerDetail>(value.worker)
             }) {
             Ok(response) => WorkerWorkspaceApiResult {
-                state: WorkerOperationState::Accepted,
+                state: InternalWorkerOperationState::Accepted,
                 worker: Some(self.map_worker_detail(response)),
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => WorkerWorkspaceApiResult {
-                state: WorkerOperationState::Rejected,
+                state: InternalWorkerOperationState::Rejected,
                 worker: None,
                 diagnostics: vec![diagnostic],
             },
@@ -4459,7 +4485,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             Ok(attachments) => attachments,
             Err(diagnostic) => {
                 return WorkerWorkspaceApiResult {
-                    state: WorkerOperationState::Rejected,
+                    state: InternalWorkerOperationState::Rejected,
                     worker: None,
                     diagnostics: vec![diagnostic],
                 };
@@ -4483,12 +4509,12 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 runtime_contract_convert::<_, worker_runtime::catalog::WorkerDetail>(value.worker)
             }) {
             Ok(response) => WorkerWorkspaceApiResult {
-                state: WorkerOperationState::Accepted,
+                state: InternalWorkerOperationState::Accepted,
                 worker: Some(self.map_worker_detail(response)),
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => WorkerWorkspaceApiResult {
-                state: WorkerOperationState::Rejected,
+                state: InternalWorkerOperationState::Rejected,
                 worker: None,
                 diagnostics: vec![diagnostic],
             },
@@ -4505,12 +4531,12 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             Some(REMOTE_WORKING_DIRECTORY_CREATE_TIMEOUT),
         ) {
             Ok(response) => RuntimeWorkingDirectoryResult {
-                state: WorkerOperationState::Accepted,
+                state: InternalWorkerOperationState::Accepted,
                 working_directory: Some(response.working_directory),
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => RuntimeWorkingDirectoryResult {
-                state: WorkerOperationState::Rejected,
+                state: InternalWorkerOperationState::Rejected,
                 working_directory: None,
                 diagnostics: vec![diagnostic],
             },
@@ -4565,12 +4591,12 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             "/v1/working-directories/{working_directory_id}"
         )) {
             Ok(response) => RuntimeWorkingDirectoryResult {
-                state: WorkerOperationState::Accepted,
+                state: InternalWorkerOperationState::Accepted,
                 working_directory: Some(response.working_directory),
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => RuntimeWorkingDirectoryResult {
-                state: WorkerOperationState::Rejected,
+                state: InternalWorkerOperationState::Rejected,
                 working_directory: None,
                 diagnostics: vec![diagnostic],
             },
@@ -4603,12 +4629,12 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             "/v1/working-directories/{working_directory_id}"
         )) {
             Ok(response) => RuntimeWorkingDirectoryResult {
-                state: WorkerOperationState::Accepted,
+                state: InternalWorkerOperationState::Accepted,
                 working_directory: Some(response.working_directory),
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => RuntimeWorkingDirectoryResult {
-                state: WorkerOperationState::Rejected,
+                state: InternalWorkerOperationState::Rejected,
                 working_directory: None,
                 diagnostics: vec![diagnostic],
             },
@@ -4625,12 +4651,12 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             WorkerSpawnAcceptanceRequirement::SocketReady
         ) {
             return WorkerSpawnResult {
-                state: WorkerOperationState::Rejected,
+                state: InternalWorkerOperationState::Rejected,
                 worker: None,
                 acceptance_evidence: Vec::new(),
                 diagnostics: vec![diagnostic(
                     "remote_runtime_no_socket_ready_acceptance",
-                    DiagnosticSeverity::Warning,
+                    HostDiagnosticSeverity::Warning,
                     "Remote Runtime v0 exposes backend-proxied REST/WS control, not direct socket readiness".to_string(),
                 )],
             };
@@ -4640,12 +4666,12 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             Ok(archive) => archive,
             Err(error) => {
                 return WorkerSpawnResult {
-                    state: WorkerOperationState::Rejected,
+                    state: InternalWorkerOperationState::Rejected,
                     worker: None,
                     acceptance_evidence: Vec::new(),
                     diagnostics: vec![diagnostic(
                         "remote_workspace_config_invalid",
-                        DiagnosticSeverity::Error,
+                        HostDiagnosticSeverity::Error,
                         error,
                     )],
                 };
@@ -4658,7 +4684,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             Ok(workspace_api) => workspace_api,
             Err(diagnostic) => {
                 return WorkerSpawnResult {
-                    state: WorkerOperationState::Rejected,
+                    state: InternalWorkerOperationState::Rejected,
                     worker: None,
                     acceptance_evidence: Vec::new(),
                     diagnostics: vec![diagnostic],
@@ -4677,7 +4703,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             Ok(create) => create,
             Err(diagnostic) => {
                 return WorkerSpawnResult {
-                    state: WorkerOperationState::Rejected,
+                    state: InternalWorkerOperationState::Rejected,
                     worker: None,
                     acceptance_evidence: Vec::new(),
                     diagnostics: vec![diagnostic],
@@ -4694,7 +4720,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 runtime_contract_convert::<_, worker_runtime::catalog::WorkerDetail>(value.worker)
             }) {
             Ok(response) => WorkerSpawnResult {
-                state: WorkerOperationState::Accepted,
+                state: InternalWorkerOperationState::Accepted,
                 worker: Some(self.map_worker_detail(response)),
                 acceptance_evidence: vec![WorkerSpawnAcceptanceEvidence {
                     kind: "remote_runtime_worker_created".to_string(),
@@ -4703,7 +4729,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => WorkerSpawnResult {
-                state: WorkerOperationState::Rejected,
+                state: InternalWorkerOperationState::Rejected,
                 worker: None,
                 acceptance_evidence: Vec::new(),
                 diagnostics: vec![diagnostic],
@@ -4730,12 +4756,12 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             &request,
         ) {
             Ok(response) => ConfigBundleSyncResult {
-                state: WorkerOperationState::Accepted,
+                state: InternalWorkerOperationState::Accepted,
                 availability: Some(response.availability),
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => ConfigBundleSyncResult {
-                state: WorkerOperationState::Rejected,
+                state: InternalWorkerOperationState::Rejected,
                 availability: None,
                 diagnostics: vec![diagnostic],
             },
@@ -4746,12 +4772,12 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         let path = Self::bundle_availability_path(&reference);
         match self.get_json::<RuntimeHttpConfigBundleAvailabilityResponse>(&path) {
             Ok(response) => ConfigBundleCheckResult {
-                state: WorkerOperationState::Accepted,
+                state: InternalWorkerOperationState::Accepted,
                 availability: Some(response.availability),
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => ConfigBundleCheckResult {
-                state: WorkerOperationState::Rejected,
+                state: InternalWorkerOperationState::Rejected,
                 availability: None,
                 diagnostics: vec![diagnostic],
             },
@@ -4822,7 +4848,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 )
             }) {
             Ok(response) => WorkerDeleteResult {
-                state: WorkerOperationState::Accepted,
+                state: InternalWorkerOperationState::Accepted,
                 worker: RuntimeWorkerRef::new(
                     self.runtime_id.clone(),
                     response.worker_id.to_string(),
@@ -4831,7 +4857,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => WorkerDeleteResult {
-                state: WorkerOperationState::Rejected,
+                state: InternalWorkerOperationState::Rejected,
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 deleted: false,
                 diagnostics: vec![diagnostic],
@@ -4923,7 +4949,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             Ok(input) => input,
             Err(diagnostic) => {
                 return WorkerInputResult {
-                    state: WorkerOperationState::Rejected,
+                    state: InternalWorkerOperationState::Rejected,
                     worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                     diagnostics: vec![diagnostic],
                 };
@@ -4936,7 +4962,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             move |client| async move { client.send_worker_input(worker_id_owned, input).await },
         ) {
             Ok(_) => WorkerInputResult {
-                state: WorkerOperationState::Accepted,
+                state: InternalWorkerOperationState::Accepted,
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 diagnostics: Vec::new(),
             },
@@ -5069,7 +5095,7 @@ fn execution_metadata_diagnostic(execution_metadata_available: bool) -> Option<R
     (!execution_metadata_available).then(|| {
         diagnostic(
             "worker_execution_unavailable",
-            DiagnosticSeverity::Error,
+            HostDiagnosticSeverity::Error,
             "Persisted Worker identity is available, but execution metadata is unavailable"
                 .to_string(),
         )
@@ -5081,7 +5107,7 @@ fn embedded_worker_projection_diagnostics(
 ) -> Vec<RuntimeDiagnostic> {
     let mut diagnostics = vec![diagnostic(
         "embedded_runtime_projection",
-        DiagnosticSeverity::Info,
+        HostDiagnosticSeverity::Info,
         "Worker identity is projected only as runtime_id plus worker_id; embedded runtime internals remain backend-private".to_string(),
     )];
     diagnostics.extend(execution_metadata_diagnostic(execution_metadata_available));
@@ -5093,7 +5119,7 @@ fn remote_worker_projection_diagnostics(
 ) -> Vec<RuntimeDiagnostic> {
     let mut diagnostics = vec![diagnostic(
         "remote_runtime_projection",
-        DiagnosticSeverity::Info,
+        HostDiagnosticSeverity::Info,
         "Remote Worker identity is projected only as runtime_id plus worker_id; endpoint and credentials remain backend-private".to_string(),
     )];
     diagnostics.extend(execution_metadata_diagnostic(execution_metadata_available));
@@ -5328,7 +5354,7 @@ fn embedded_input_rejected(
     diagnostic: RuntimeDiagnostic,
 ) -> WorkerInputResult {
     WorkerInputResult {
-        state: WorkerOperationState::Rejected,
+        state: InternalWorkerOperationState::Rejected,
         worker: RuntimeWorkerRef::new(runtime_id.to_string(), worker_id.to_string()),
         diagnostics: vec![diagnostic],
     }
@@ -5340,7 +5366,7 @@ fn remote_input_rejected(
     diagnostic: RuntimeDiagnostic,
 ) -> WorkerInputResult {
     WorkerInputResult {
-        state: WorkerOperationState::Rejected,
+        state: InternalWorkerOperationState::Rejected,
         worker: RuntimeWorkerRef::new(runtime_id.to_string(), worker_id.to_string()),
         diagnostics: vec![diagnostic],
     }
@@ -5352,7 +5378,7 @@ fn embedded_lifecycle_rejected(
     diagnostic: RuntimeDiagnostic,
 ) -> WorkerLifecycleResult {
     WorkerLifecycleResult {
-        state: WorkerOperationState::Rejected,
+        state: InternalWorkerOperationState::Rejected,
         worker: RuntimeWorkerRef::new(runtime_id.to_string(), worker_id.to_string()),
         diagnostics: vec![diagnostic],
     }
@@ -5364,7 +5390,7 @@ fn remote_lifecycle_rejected(
     diagnostic: RuntimeDiagnostic,
 ) -> WorkerLifecycleResult {
     WorkerLifecycleResult {
-        state: WorkerOperationState::Rejected,
+        state: InternalWorkerOperationState::Rejected,
         worker: RuntimeWorkerRef::new(runtime_id.to_string(), worker_id.to_string()),
         diagnostics: vec![diagnostic],
     }
@@ -5373,7 +5399,7 @@ fn remote_lifecycle_rejected(
 fn embedded_workdir_unsupported_diagnostic() -> RuntimeDiagnostic {
     diagnostic(
         "embedded_worker_workdir_unsupported",
-        DiagnosticSeverity::Error,
+        HostDiagnosticSeverity::Error,
         "Embedded Runtime is no-workdir only; choose a non-embedded Runtime for workspace-file Workers".to_string(),
     )
 }
@@ -5435,18 +5461,18 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
     match error {
         EmbeddedRuntimeError::RuntimeStopped => diagnostic(
             "embedded_runtime_stopped",
-            DiagnosticSeverity::Warning,
+            HostDiagnosticSeverity::Warning,
             "Embedded Runtime is stopped".to_string(),
         ),
         EmbeddedRuntimeError::WorkerNotFound { .. } => diagnostic(
             "embedded_worker_not_found",
-            DiagnosticSeverity::Warning,
+            HostDiagnosticSeverity::Warning,
             "Embedded Runtime worker was not found".to_string(),
         ),
         EmbeddedRuntimeError::WorkerExecutionUnavailable { .. }
         | EmbeddedRuntimeError::ExecutionBackendUnavailable { .. } => diagnostic(
             "embedded_worker_execution_unavailable",
-            DiagnosticSeverity::Warning,
+            HostDiagnosticSeverity::Warning,
             "Embedded Worker has no execution backend attached".to_string(),
         ),
         EmbeddedRuntimeError::WorkerExecutionRejected {
@@ -5456,22 +5482,22 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
             ..
         } => diagnostic(
             "embedded_worker_execution_rejected",
-            DiagnosticSeverity::Warning,
+            HostDiagnosticSeverity::Warning,
             sanitize_embedded_execution_message(message, operation, outcome),
         ),
         EmbeddedRuntimeError::LimitTooLarge { requested, max } => diagnostic(
             "embedded_runtime_limit_too_large",
-            DiagnosticSeverity::Warning,
+            HostDiagnosticSeverity::Warning,
             format!("Requested limit {requested} exceeds embedded Runtime maximum {max}"),
         ),
         EmbeddedRuntimeError::InvalidInitialInputKind { .. } => diagnostic(
             "embedded_worker_initial_input_kind_invalid",
-            DiagnosticSeverity::Warning,
+            HostDiagnosticSeverity::Warning,
             error.to_string(),
         ),
         EmbeddedRuntimeError::WorkingDirectory(workdir_diagnostic) => diagnostic(
             workdir_diagnostic.code.clone(),
-            DiagnosticSeverity::Warning,
+            HostDiagnosticSeverity::Warning,
             workdir_diagnostic.message.clone(),
         ),
         EmbeddedRuntimeError::InvalidRequest(_)
@@ -5481,17 +5507,17 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
         | EmbeddedRuntimeError::InvalidProfileSelector { .. }
         | EmbeddedRuntimeError::UnsupportedConfigDeclaration { .. } => diagnostic(
             "embedded_runtime_invalid_request",
-            DiagnosticSeverity::Warning,
+            HostDiagnosticSeverity::Warning,
             "Embedded Runtime rejected the request".to_string(),
         ),
         EmbeddedRuntimeError::RuntimeStoreAlreadyOpen { .. } => diagnostic(
             "embedded_runtime_store_already_open",
-            DiagnosticSeverity::Error,
+            HostDiagnosticSeverity::Error,
             "Embedded Runtime store is already owned by another Runtime process".to_string(),
         ),
         EmbeddedRuntimeError::WorkerDeletePersistenceFailed { .. } => diagnostic(
             "worker_delete_persistence_failed",
-            DiagnosticSeverity::Error,
+            HostDiagnosticSeverity::Error,
             "Worker metadata deletion failed; the persisted Worker identity was retained for retry"
                 .to_string(),
         ),
@@ -5499,12 +5525,12 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
         | EmbeddedRuntimeError::StoreMissing { .. }
         | EmbeddedRuntimeError::StoreCorrupt { .. } => diagnostic(
             "embedded_runtime_store_error",
-            DiagnosticSeverity::Error,
+            HostDiagnosticSeverity::Error,
             "Embedded Runtime storage operation failed; internal paths are not exposed".to_string(),
         ),
         EmbeddedRuntimeError::StatePoisoned => diagnostic(
             "embedded_runtime_state_unavailable",
-            DiagnosticSeverity::Error,
+            HostDiagnosticSeverity::Error,
             "Embedded Runtime state is unavailable".to_string(),
         ),
     }
@@ -5546,19 +5572,19 @@ fn remote_reqwest_diagnostic(runtime_id: &str, err: reqwest::Error) -> RuntimeDi
     if err.is_timeout() {
         diagnostic(
             "remote_runtime_timeout",
-            DiagnosticSeverity::Error,
+            HostDiagnosticSeverity::Error,
             format!("Timed out while contacting remote Runtime '{runtime_id}'"),
         )
     } else if err.is_connect() || err.is_request() {
         diagnostic(
             "remote_runtime_network_error",
-            DiagnosticSeverity::Error,
+            HostDiagnosticSeverity::Error,
             format!("Failed to contact remote Runtime '{runtime_id}'"),
         )
     } else {
         diagnostic(
             "remote_runtime_client_error",
-            DiagnosticSeverity::Error,
+            HostDiagnosticSeverity::Error,
             format!("Remote Runtime client error for '{runtime_id}'"),
         )
     }
@@ -5574,7 +5600,7 @@ where
         .map_err(|error| {
             diagnostic(
                 "remote_runtime_contract_conversion_failed",
-                DiagnosticSeverity::Error,
+                HostDiagnosticSeverity::Error,
                 error.to_string(),
             )
         })
@@ -5591,14 +5617,14 @@ fn runtime_api_diagnostic(
             let (code, severity) = match status {
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => (
                     "remote_runtime_auth_failed".to_string(),
-                    DiagnosticSeverity::Error,
+                    HostDiagnosticSeverity::Error,
                 ),
                 _ => (
                     remote_code,
                     if status.is_server_error() {
-                        DiagnosticSeverity::Error
+                        HostDiagnosticSeverity::Error
                     } else {
-                        DiagnosticSeverity::Warning
+                        HostDiagnosticSeverity::Warning
                     },
                 ),
             };
@@ -5635,7 +5661,7 @@ fn runtime_api_diagnostic(
             };
             diagnostic(
                 code,
-                DiagnosticSeverity::Error,
+                HostDiagnosticSeverity::Error,
                 format!("Remote Runtime client error for '{runtime_id}': {failure}"),
             )
         }
@@ -5672,15 +5698,18 @@ fn remote_http_status_diagnostic(
         .unwrap_or_else(|| "remote Runtime did not return a typed error body".to_string());
     let (code, severity) = match status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-            ("remote_runtime_auth_failed", DiagnosticSeverity::Error)
+            ("remote_runtime_auth_failed", HostDiagnosticSeverity::Error)
         }
-        _ if error.is_some() => (remote_code, DiagnosticSeverity::Warning),
-        StatusCode::NOT_FOUND => ("remote_runtime_not_found", DiagnosticSeverity::Warning),
-        StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED => {
-            ("remote_runtime_unsupported", DiagnosticSeverity::Warning)
+        _ if error.is_some() => (remote_code, HostDiagnosticSeverity::Warning),
+        StatusCode::NOT_FOUND => ("remote_runtime_not_found", HostDiagnosticSeverity::Warning),
+        StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED => (
+            "remote_runtime_unsupported",
+            HostDiagnosticSeverity::Warning,
+        ),
+        _ if status.is_server_error() => {
+            ("remote_runtime_http_error", HostDiagnosticSeverity::Error)
         }
-        _ if status.is_server_error() => ("remote_runtime_http_error", DiagnosticSeverity::Error),
-        _ => (remote_code, DiagnosticSeverity::Warning),
+        _ => (remote_code, HostDiagnosticSeverity::Warning),
     };
     diagnostic(
         code,
@@ -5691,7 +5720,7 @@ fn remote_http_status_diagnostic(
 
 fn diagnostic(
     code: impl Into<String>,
-    severity: DiagnosticSeverity,
+    severity: HostDiagnosticSeverity,
     message: impl Into<String>,
 ) -> RuntimeDiagnostic {
     RuntimeDiagnostic {
@@ -5708,7 +5737,7 @@ fn operation_failed_or_unknown_worker(
 ) -> RuntimeRegistryError {
     diagnostics
         .into_iter()
-        .find(|diagnostic| matches!(diagnostic.severity, DiagnosticSeverity::Error))
+        .find(|diagnostic| matches!(diagnostic.severity, HostDiagnosticSeverity::Error))
         .map(|diagnostic| RuntimeRegistryError::RuntimeOperationFailed {
             runtime_id: runtime_id.to_string(),
             code: diagnostic.code,
@@ -5819,9 +5848,9 @@ fn worker_spawn_intent_label(intent: &WorkerSpawnIntent) -> &'static str {
     }
 }
 
-pub fn placeholder_worker(host_id: impl Into<String>) -> WorkerSummary {
+pub fn placeholder_worker(host_id: impl Into<String>) -> InternalWorkerSummary {
     let host_id = host_id.into();
-    WorkerSummary {
+    InternalWorkerSummary {
         worker: RuntimeWorkerRef::new("placeholder", "worker-placeholder"),
         host_id,
         display_name: "Worker runtime actions are not implemented".to_string(),
@@ -5829,7 +5858,7 @@ pub fn placeholder_worker(host_id: impl Into<String>) -> WorkerSummary {
         profile: None,
         singleton_key: None,
         tags: Vec::new(),
-        workspace: WorkerWorkspaceSummary {
+        workspace: InternalWorkerWorkspaceSummary {
             visibility: "none".to_string(),
             identity: "unsupported".to_string(),
             workspace_id: None,
@@ -5839,18 +5868,18 @@ pub fn placeholder_worker(host_id: impl Into<String>) -> WorkerSummary {
         last_seen_at: None,
         pinned: false,
         retention_state: "transient".to_string(),
-        implementation: WorkerImplementationSummary {
+        implementation: InternalWorkerImplementationSummary {
             kind: "placeholder".to_string(),
             display_hint: "unsupported".to_string(),
         },
-        capabilities: WorkerCapabilitySummary {
+        capabilities: InternalWorkerCapabilitySummary {
             can_stop: false,
             can_spawn_followup: false,
         },
         workdir_attachments: Vec::new(),
         diagnostics: vec![diagnostic(
             "runtime_capability_unsupported",
-            DiagnosticSeverity::Info,
+            HostDiagnosticSeverity::Info,
             "worker control is outside this overview-only registry surface".to_string(),
         )],
     }
@@ -5858,12 +5887,12 @@ pub fn placeholder_worker(host_id: impl Into<String>) -> WorkerSummary {
 
 pub fn placeholder_spawn_response(host_id: impl Into<String>) -> WorkerSpawnResult {
     WorkerSpawnResult {
-        state: WorkerOperationState::Unsupported,
+        state: InternalWorkerOperationState::Unsupported,
         worker: Some(placeholder_worker(host_id)),
         acceptance_evidence: Vec::new(),
         diagnostics: vec![diagnostic(
             "worker_spawn_unsupported",
-            DiagnosticSeverity::Info,
+            HostDiagnosticSeverity::Info,
             "Workspace worker runtime control is not implemented yet".to_string(),
         )],
     }
@@ -5920,7 +5949,7 @@ mod tests {
             });
 
         assert_eq!(diagnostic.code, "worker_delete_persistence_failed");
-        assert_eq!(diagnostic.severity, DiagnosticSeverity::Error);
+        assert_eq!(diagnostic.severity, HostDiagnosticSeverity::Error);
         assert!(diagnostic.message.len() <= 256);
         assert!(!diagnostic.message.contains("/private/runtime"));
     }
@@ -6038,7 +6067,7 @@ mod tests {
         assert!(value.get("worker").is_none());
 
         let lifecycle = WorkerLifecycleResult {
-            state: WorkerOperationState::Accepted,
+            state: InternalWorkerOperationState::Accepted,
             worker: RuntimeWorkerRef::new("arcadia", "30"),
             diagnostics: Vec::new(),
         };
@@ -6454,7 +6483,7 @@ mod tests {
     struct FixtureRuntime {
         runtime_id: String,
         host_id: String,
-        workers: Vec<WorkerSummary>,
+        workers: Vec<InternalWorkerSummary>,
         observed_prompt_revisions: Arc<Mutex<Vec<u64>>>,
     }
 
@@ -6463,7 +6492,7 @@ mod tests {
             Self {
                 runtime_id: runtime_id.to_string(),
                 host_id: host_id.to_string(),
-                workers: vec![WorkerSummary {
+                workers: vec![InternalWorkerSummary {
                     worker: RuntimeWorkerRef::new(runtime_id, worker_id),
                     host_id: host_id.to_string(),
                     display_name: label.to_string(),
@@ -6471,7 +6500,7 @@ mod tests {
                     profile: None,
                     singleton_key: None,
                     tags: Vec::new(),
-                    workspace: WorkerWorkspaceSummary {
+                    workspace: InternalWorkerWorkspaceSummary {
                         visibility: "opaque".to_string(),
                         identity: host_id.to_string(),
                         workspace_id: None,
@@ -6481,11 +6510,11 @@ mod tests {
                     last_seen_at: None,
                     pinned: false,
                     retention_state: "transient".to_string(),
-                    implementation: WorkerImplementationSummary {
+                    implementation: InternalWorkerImplementationSummary {
                         kind: "fixture".to_string(),
                         display_hint: "test fixture".to_string(),
                     },
-                    capabilities: WorkerCapabilitySummary {
+                    capabilities: InternalWorkerCapabilitySummary {
                         can_stop: false,
                         can_spawn_followup: false,
                     },
@@ -6513,13 +6542,13 @@ mod tests {
             Ok(())
         }
 
-        fn runtime_summary(&self, _limit: usize) -> RuntimeSummary {
-            RuntimeSummary {
+        fn runtime_summary(&self, _limit: usize) -> InternalRuntimeSummary {
+            InternalRuntimeSummary {
                 runtime_id: self.runtime_id.clone(),
                 label: self.runtime_id.clone(),
                 kind: "fixture".to_string(),
                 status: "available".to_string(),
-                source: RuntimeSourceSummary::embedded_worker_runtime_reserved(),
+                source: InternalRuntimeSourceSummary::embedded_worker_runtime_reserved(),
                 host_ids: vec![self.host_id.clone()],
                 worker_creation_available: false,
                 os: "test".to_string(),
@@ -6528,9 +6557,9 @@ mod tests {
             }
         }
 
-        fn list_hosts(&self, _limit: usize) -> RuntimeList<HostSummary> {
+        fn list_hosts(&self, _limit: usize) -> RuntimeList<InternalHostSummary> {
             RuntimeList::new(
-                vec![HostSummary {
+                vec![InternalHostSummary {
                     runtime_id: self.runtime_id.clone(),
                     host_id: self.host_id.clone(),
                     label: "fixture host".to_string(),
@@ -6546,7 +6575,7 @@ mod tests {
             )
         }
 
-        fn list_workers(&self, limit: usize) -> RuntimeList<WorkerSummary> {
+        fn list_workers(&self, limit: usize) -> RuntimeList<InternalWorkerSummary> {
             RuntimeList::new(
                 self.workers.iter().take(limit).cloned().collect(),
                 Vec::new(),
@@ -6828,6 +6857,7 @@ mod tests {
             alias: workdir::WorkdirAttachmentAlias::new("workdir").unwrap(),
             working_directory_id: "workdir-1".to_string(),
             relative_cwd: Some("crates/yoi".to_string()),
+            capabilities: workdir::WorkdirSessionCapabilities::ALL,
         }];
         let profile_source =
             profile_source_archive_source(&request, &request.profile).expect("profile source");
@@ -6876,7 +6906,7 @@ mod tests {
         let result = registry
             .spawn_worker("embedded-worker-runtime", binding.clone(), request)
             .expect("spawn request");
-        assert_eq!(result.state, WorkerOperationState::Accepted);
+        assert_eq!(result.state, InternalWorkerOperationState::Accepted);
         assert_eq!(
             result.worker.as_ref().unwrap().worker.worker_id,
             binding.worker_id.to_string()
@@ -6884,7 +6914,7 @@ mod tests {
         let check = registry
             .check_config_bundle("embedded-worker-runtime", bundle_ref)
             .expect("bundle check");
-        assert_eq!(check.state, WorkerOperationState::Accepted);
+        assert_eq!(check.state, InternalWorkerOperationState::Accepted);
         assert!(check.availability.is_some());
     }
 
@@ -6900,7 +6930,7 @@ mod tests {
 
         let spawned = runtime.spawn_worker(test_create_binding(), request);
 
-        assert_eq!(spawned.state, WorkerOperationState::Rejected);
+        assert_eq!(spawned.state, InternalWorkerOperationState::Rejected);
         assert!(
             spawned
                 .diagnostics
@@ -6917,7 +6947,7 @@ mod tests {
         )
         .expect("test backend should connect");
         let spawned = runtime.spawn_worker(test_create_binding(), embedded_spawn_request());
-        assert_eq!(spawned.state, WorkerOperationState::Rejected);
+        assert_eq!(spawned.state, InternalWorkerOperationState::Rejected);
         assert!(spawned.acceptance_evidence.is_empty());
         assert!(spawned.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "embedded_worker_execution_rejected"
@@ -6984,7 +7014,7 @@ mod tests {
         )
         .expect("test backend should connect");
         let spawned = runtime.spawn_worker(test_create_binding(), embedded_spawn_request());
-        assert_eq!(spawned.state, WorkerOperationState::Accepted);
+        assert_eq!(spawned.state, InternalWorkerOperationState::Accepted);
         let worker = spawned.worker.expect("created embedded worker");
         assert!(worker.capabilities.can_stop);
 
@@ -6996,7 +7026,7 @@ mod tests {
                 segments: None,
             },
         );
-        assert_eq!(input.state, WorkerOperationState::Accepted);
+        assert_eq!(input.state, InternalWorkerOperationState::Accepted);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
@@ -7033,9 +7063,12 @@ mod tests {
             .expect("embedded runtime summary");
         assert_eq!(
             embedded_summary.source.kind,
-            RuntimeSourceKind::EmbeddedWorkerRuntime
+            InternalRuntimeSourceKind::EmbeddedWorkerRuntime
         );
-        assert_eq!(embedded_summary.source.status, RuntimeSourceStatus::Active);
+        assert_eq!(
+            embedded_summary.source.status,
+            InternalRuntimeSourceStatus::Active
+        );
         assert!(embedded_summary.worker_creation_available);
 
         let spawned = registry
@@ -7066,7 +7099,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(spawned.state, WorkerOperationState::Accepted);
+        assert_eq!(spawned.state, InternalWorkerOperationState::Accepted);
         assert!(
             spawned
                 .acceptance_evidence
@@ -7089,7 +7122,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(input.state, WorkerOperationState::Accepted);
+        assert_eq!(input.state, InternalWorkerOperationState::Accepted);
         assert_eq!(input.worker.runtime_id, EMBEDDED_RUNTIME_ID);
         assert_eq!(input.worker.worker_id, worker.worker.worker_id);
 
@@ -7128,7 +7161,7 @@ mod tests {
         let sync = registry
             .sync_config_bundle(EMBEDDED_RUNTIME_ID, bundle.clone())
             .unwrap();
-        assert_eq!(sync.state, WorkerOperationState::Accepted);
+        assert_eq!(sync.state, InternalWorkerOperationState::Accepted);
         let reference = sync.availability.expect("bundle availability").reference;
         assert_eq!(reference.id, bundle.metadata.id);
         assert_eq!(reference.digest, bundle.metadata.digest);
@@ -7136,7 +7169,7 @@ mod tests {
         let check = registry
             .check_config_bundle(EMBEDDED_RUNTIME_ID, reference.clone())
             .unwrap();
-        assert_eq!(check.state, WorkerOperationState::Accepted);
+        assert_eq!(check.state, InternalWorkerOperationState::Accepted);
 
         let spawned = registry
             .spawn_worker(
@@ -7166,7 +7199,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(spawned.state, WorkerOperationState::Accepted);
+        assert_eq!(spawned.state, InternalWorkerOperationState::Accepted);
         assert_eq!(
             spawned.worker.unwrap().profile.as_deref(),
             Some("builtin:coder")
@@ -7205,7 +7238,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(result.state, WorkerOperationState::Rejected);
+        assert_eq!(result.state, InternalWorkerOperationState::Rejected);
         assert!(result.worker.is_none());
         assert!(
             result
@@ -7361,7 +7394,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(input.state, WorkerOperationState::Accepted);
+        assert_eq!(input.state, InternalWorkerOperationState::Accepted);
 
         server.join().expect("mock remote server finished");
         let browser_payload = serde_json::to_string(&(workers, input)).unwrap();
@@ -7511,7 +7544,7 @@ mod tests {
         let sync = registry
             .sync_config_bundle("remote:primary", test_config_bundle())
             .unwrap();
-        assert_eq!(sync.state, WorkerOperationState::Rejected);
+        assert_eq!(sync.state, InternalWorkerOperationState::Rejected);
         let sync_payload = serde_json::to_string(&sync).unwrap();
         assert!(!sync_payload.contains(leaked_store_path), "{sync_payload}");
 
@@ -7524,7 +7557,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(check.state, WorkerOperationState::Rejected);
+        assert_eq!(check.state, InternalWorkerOperationState::Rejected);
         let check_payload = serde_json::to_string(&check).unwrap();
         assert!(
             !check_payload.contains(leaked_session_path),

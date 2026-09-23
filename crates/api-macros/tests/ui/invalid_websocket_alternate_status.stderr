@@ -1,0 +1,5 @@
+error: WebSocket operations cannot declare unary success responses or statuses
+  --> tests/ui/invalid_websocket_alternate_status.rs:13:9
+   |
+13 |         alternate_status = 204
+   |         ^^^^^^^^^^^^^^^^

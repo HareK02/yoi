@@ -73,12 +73,13 @@ impl ExtractedPayload {
 }
 
 /// Bounded evidence snippet copied into a flat staging record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StagingEvidence {
     pub id: String,
     pub kind: EvidenceKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<crate::schema::JsonSafeU64Pair>")]
     pub entry_range: Option<[u64; 2]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<EvidenceOrigin>,

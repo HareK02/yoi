@@ -1,3 +1,7 @@
+import type {
+  AttachmentUploadGrantResponse,
+  WorkerFileUploadResponse,
+} from "$lib/generated/runtime-api.ts";
 import type { UploadedFileRef } from "$lib/generated/protocol.ts";
 
 export const MAX_UPLOADED_FILE_BYTES = 10 * 1024 * 1024;
@@ -133,15 +137,24 @@ export function uploadAttachment(
 
 function isUploadGrantResponse(
   value: unknown,
-): value is { upload_id: string; expires_at_ms: number } {
-  return !!value && typeof value === "object" &&
-    "upload_id" in value && typeof value.upload_id === "string" &&
-    "expires_at_ms" in value && typeof value.expires_at_ms === "number";
+): value is AttachmentUploadGrantResponse {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  if (
+    keys.length !== 2 || !keys.includes("upload_id") ||
+    !keys.includes("expires_at_ms")
+  ) {
+    return false;
+  }
+  const grant = value as Record<string, unknown>;
+  return typeof grant.upload_id === "string" && grant.upload_id.length > 0 &&
+    grant.upload_id.length <= 256 && Number.isSafeInteger(grant.expires_at_ms) &&
+    (grant.expires_at_ms as number) >= 0;
 }
 
 function isUploadedFileResponse(
   value: unknown,
-): value is { file: UploadedFileRef } {
+): value is WorkerFileUploadResponse {
   if (!value || typeof value !== "object" || !("file" in value)) return false;
   const file = value.file;
   return !!file && typeof file === "object" &&

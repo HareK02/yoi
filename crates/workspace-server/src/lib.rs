@@ -16,8 +16,6 @@ pub mod observation;
 pub mod profile_settings;
 pub mod prompt_settings;
 pub mod records;
-#[cfg(feature = "typescript")]
-pub use records::ticket_api_typescript;
 pub mod repositories;
 pub mod repository_access;
 pub mod repository_source;
@@ -38,7 +36,7 @@ pub mod workspace_signing_identity;
 mod workspace_subscription;
 
 pub use authority::{
-    MemoryAuthority, MemoryDocument, MemoryStagingEntry, MemoryStagingResolution,
+    InternalMemoryStagingEntry, MemoryAuthority, MemoryDocument, MemoryStagingResolution,
     ObjectiveAuthority, SqliteWorkspaceAuthority, TicketAuthority, TicketMergeRevisionSource,
     WorkspaceAuthority,
 };

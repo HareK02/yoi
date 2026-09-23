@@ -5,12 +5,14 @@
 //! other application state remain explicit outer Axum layers. Each operation is also exposed as a
 //! separate router so route-specific layers can be applied before routers are merged.
 
-use std::str::FromStr;
+use std::{fmt, str::FromStr};
 
 use axum::{
-    Json,
+    Json, Router,
+    handler::Handler,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
+    routing::get,
 };
 use serde::Serialize;
 
@@ -26,6 +28,48 @@ where
         .map_err(|_| StatusCode::BAD_REQUEST)?
         .parse()
         .map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+pub fn parse_optional_header<T>(
+    headers: &HeaderMap,
+    name: &'static str,
+) -> Result<Option<T>, StatusCode>
+where
+    T: FromStr,
+{
+    headers
+        .get(name)
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| StatusCode::BAD_REQUEST)?
+                .parse()
+                .map_err(|_| StatusCode::BAD_REQUEST)
+        })
+        .transpose()
+}
+
+/// Opaque failure to encode one declared response header.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResponseHeaderError;
+
+impl fmt::Display for ResponseHeaderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("declared response header encoding failed")
+    }
+}
+
+impl std::error::Error for ResponseHeaderError {}
+
+/// Insert one typed declared response header without retaining its value in an error.
+pub fn insert_response_header<T: fmt::Display>(
+    headers: &mut HeaderMap,
+    name: &'static str,
+    value: &T,
+) -> Result<(), ResponseHeaderError> {
+    let value = value.to_string().parse().map_err(|_| ResponseHeaderError)?;
+    headers.insert(name, value);
+    Ok(())
 }
 
 /// Serialize a typed JSON response with the contract status.
@@ -48,14 +92,56 @@ pub fn status(code: u16) -> StatusCode {
     StatusCode::from_u16(code).expect("#[api] validates HTTP status constants")
 }
 
+/// Mount a manual Axum upgrade handler at a contract-declared WebSocket route.
+///
+/// The operation marker supplies the only path and method authority. Requiring
+/// [`crate::WebSocketOperation`] prevents HTTP operation markers from being registered through this
+/// helper while Axum retains its normal route composition and collision behavior.
+pub fn websocket_route<O, H, T, S>(router: Router<S>, handler: H) -> Router<S>
+where
+    O: crate::WebSocketOperation,
+    H: Handler<T, S>,
+    T: 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    debug_assert_eq!(O::METADATA.method, crate::HttpMethod::Get);
+    debug_assert!(matches!(
+        O::METADATA.transport,
+        crate::TransportMetadata::WebSocket { .. }
+    ));
+    router.route(O::METADATA.path, get(handler))
+}
+
 /// Reexports used by generated router code.
 pub mod framework {
     pub use axum::{
         Json, Router,
-        extract::{Extension, Path, Query, State, rejection::JsonRejection},
+        body::{Body, Bytes},
+        extract::{
+            DefaultBodyLimit, Extension, Path, Query, State,
+            rejection::{BytesRejection, JsonRejection},
+        },
         http::{HeaderMap, StatusCode},
         response::Response,
         routing::{delete, get, head, options, patch, post, put},
         serve,
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_header_encoding_failure_is_bounded_and_value_safe() {
+        let mut headers = HeaderMap::new();
+        let error = insert_response_header(&mut headers, "set-cookie", &"secret\ninvalid")
+            .expect_err("invalid header bytes must fail");
+        assert_eq!(
+            error.to_string(),
+            "declared response header encoding failed"
+        );
+        assert!(!format!("{error:?}").contains("secret"));
+        assert!(headers.is_empty());
+    }
 }

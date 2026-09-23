@@ -1,0 +1,5 @@
+error: GET operations cannot declare a request body
+ --> tests/ui/invalid_binary_method.rs:8:14
+  |
+8 |     async fn download(&self, #[binary] body: api_macros::BinaryBody) -> Response;
+  |              ^^^^^^^^

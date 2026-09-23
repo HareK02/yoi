@@ -6,6 +6,7 @@
 
 use std::{fmt, time::Duration};
 
+use bytes::Bytes;
 use futures::StreamExt as _;
 use reqwest::{
     Client, Method, StatusCode, Url,
@@ -319,15 +320,50 @@ impl<A> ClientCore<A> {
     }
 }
 
+/// A prepared request body whose bytes are authorized and transmitted without further encoding.
+pub struct EncodedBody {
+    bytes: Bytes,
+    content_type: &'static str,
+}
+
+impl EncodedBody {
+    fn json(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: bytes.into(),
+            content_type: "application/json",
+        }
+    }
+
+    fn binary(body: crate::BinaryBody) -> Self {
+        Self {
+            bytes: body.into_bytes(),
+            content_type: "application/octet-stream",
+        }
+    }
+}
+
+impl fmt::Debug for EncodedBody {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EncodedBody")
+            .field("bytes", &"<redacted>")
+            .field("content_type", &self.content_type)
+            .finish()
+    }
+}
+
 impl<A: RequestAuthorizer> ClientCore<A> {
     pub async fn send(
         &self,
         method: Method,
         url: Url,
         mut headers: HeaderMap,
-        body: Option<Vec<u8>>,
+        body: Option<EncodedBody>,
     ) -> Result<ReceivedResponse, ClientFailure> {
-        let body_bytes = body.as_deref().unwrap_or_default();
+        let body_bytes = body
+            .as_ref()
+            .map(|body| body.bytes.as_ref())
+            .unwrap_or_default();
         let path_and_query = &url[url::Position::BeforePath..url::Position::AfterQuery];
         let authorization = self
             .authorizer
@@ -338,6 +374,12 @@ impl<A: RequestAuthorizer> ClientCore<A> {
             })
             .map_err(|_| ClientFailure::Authorization)?;
         headers.extend(authorization);
+        if let Some(body) = body.as_ref() {
+            headers.insert(
+                reqwest::header::CONTENT_TYPE,
+                HeaderValue::from_static(body.content_type),
+            );
+        }
 
         let mut request = self
             .client
@@ -345,9 +387,7 @@ impl<A: RequestAuthorizer> ClientCore<A> {
             .headers(headers)
             .timeout(self.request_timeout);
         if let Some(body) = body {
-            request = request
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body);
+            request = request.body(body.bytes);
         }
         let response = request.send().await.map_err(|error| {
             if error.is_timeout() {
@@ -359,6 +399,7 @@ impl<A: RequestAuthorizer> ClientCore<A> {
             }
         })?;
         let status = response.status();
+        let headers = response.headers().clone();
         let mut stream = response.bytes_stream();
         let mut bytes = Vec::new();
         while let Some(chunk) = stream.next().await {
@@ -381,7 +422,11 @@ impl<A: RequestAuthorizer> ClientCore<A> {
             }
             bytes.extend_from_slice(&chunk);
         }
-        Ok(ReceivedResponse { status, bytes })
+        Ok(ReceivedResponse {
+            status,
+            headers,
+            bytes,
+        })
     }
 }
 
@@ -413,20 +458,58 @@ pub fn insert_header<T: fmt::Display>(
     Ok(())
 }
 
-/// Serialize the request body once. These exact bytes are authorized and transmitted.
-pub fn encode_json<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, ClientFailure> {
-    serde_json::to_vec(value).map_err(|_| ClientFailure::RequestEncoding)
+/// Insert an optional string-form header value when present.
+pub fn insert_optional_header<T: fmt::Display>(
+    headers: &mut HeaderMap,
+    name: &str,
+    value: &Option<T>,
+) -> Result<(), ClientFailure> {
+    match value {
+        Some(value) => insert_header(headers, name, value),
+        None => Ok(()),
+    }
+}
+
+/// Serialize a JSON request body once. These exact bytes are authorized and transmitted.
+pub fn encode_json<T: Serialize + ?Sized>(value: &T) -> Result<EncodedBody, ClientFailure> {
+    serde_json::to_vec(value)
+        .map(EncodedBody::json)
+        .map_err(|_| ClientFailure::RequestEncoding)
+}
+
+/// Move an explicit binary request body into the exact authorized/transmitted representation.
+pub fn encode_binary(value: crate::BinaryBody) -> EncodedBody {
+    EncodedBody::binary(value)
 }
 
 /// Response received under the configured byte limit. Its content is always redacted in Debug.
 pub struct ReceivedResponse {
     status: StatusCode,
+    headers: HeaderMap,
     bytes: Vec<u8>,
 }
 
 impl ReceivedResponse {
     pub fn status(&self) -> StatusCode {
         self.status
+    }
+
+    pub fn parse_header<T>(&self, name: &'static str) -> Result<T, ClientFailure>
+    where
+        T: std::str::FromStr,
+    {
+        let mut values = self.headers.get_all(name).iter();
+        let value = values
+            .next()
+            .ok_or(ClientFailure::MissingResponseHeader { name })?;
+        if values.next().is_some() {
+            return Err(ClientFailure::DuplicateResponseHeader { name });
+        }
+        value
+            .to_str()
+            .map_err(|_| ClientFailure::InvalidResponseHeader { name })?
+            .parse()
+            .map_err(|_| ClientFailure::InvalidResponseHeader { name })
     }
 
     pub fn decode_json<T: DeserializeOwned>(&self, kind: DecodeKind) -> Result<T, ClientFailure> {
@@ -447,6 +530,7 @@ impl fmt::Debug for ReceivedResponse {
         formatter
             .debug_struct("ReceivedResponse")
             .field("status", &self.status)
+            .field("headers", &"<redacted>")
             .field("bytes", &"<redacted>")
             .finish()
     }
@@ -470,6 +554,9 @@ pub enum ClientFailure {
     UnexpectedStatus { expected: u16, actual: u16 },
     ErrorResponseDecode { status: u16 },
     Decode { kind: DecodeKind },
+    MissingResponseHeader { name: &'static str },
+    DuplicateResponseHeader { name: &'static str },
+    InvalidResponseHeader { name: &'static str },
     UnexpectedBody,
 }
 
@@ -505,6 +592,18 @@ impl fmt::Display for ClientFailure {
             Self::Decode {
                 kind: DecodeKind::PublicError,
             } => formatter.write_str("public error response JSON was malformed"),
+            Self::MissingResponseHeader { name } => {
+                write!(formatter, "response header `{name}` was missing")
+            }
+            Self::DuplicateResponseHeader { name } => {
+                write!(
+                    formatter,
+                    "response header `{name}` occurred more than once"
+                )
+            }
+            Self::InvalidResponseHeader { name } => {
+                write!(formatter, "response header `{name}` was invalid")
+            }
             Self::UnexpectedBody => formatter.write_str("empty response contained a body"),
         }
     }
@@ -568,4 +667,20 @@ impl<E> std::error::Error for ClientError<E> {}
 /// Reexports used by generated code and advanced client construction.
 pub mod framework {
     pub use reqwest::{Client, Method, StatusCode, Url, header};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bodyless_response_validation_rejects_retained_bytes_without_exposing_them() {
+        let response = ReceivedResponse {
+            status: StatusCode::NOT_MODIFIED,
+            headers: HeaderMap::new(),
+            bytes: b"sensitive-body".to_vec(),
+        };
+        assert_eq!(response.require_empty(), Err(ClientFailure::UnexpectedBody));
+        assert!(!format!("{response:?}").contains("sensitive-body"));
+    }
 }

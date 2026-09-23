@@ -76,13 +76,17 @@ pub enum TicketError {
     #[error("ticket target selector is required for repository `{0}`")]
     MissingTargetSelector(String),
     #[error(
-        "ticket target selector `{selector}` is invalid for repository `{repository_id}`: {reason}"
+        "ticket target selector `{selector}` is invalid for repository `{repository_key}`: {reason}"
     )]
     InvalidTargetSelector {
-        repository_id: String,
+        repository_key: String,
         selector: String,
         reason: String,
     },
+    #[error("ticket target repository `{0}` appears more than once")]
+    DuplicateTargetRepository(String),
+    #[error("ticket requires exactly one read_write target, found {0}")]
+    InvalidReadWriteTargetCount(usize),
     #[error("ticket target authority is unavailable")]
     TargetAuthorityUnavailable,
     #[error("stale ticket workflow state: expected `{expected}`, found `{actual}`")]
@@ -133,7 +137,19 @@ fn sqlite_err(error: impl std::fmt::Display) -> TicketError {
     TicketError::Sqlite(error.to_string())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 pub enum TicketStatus {
     Open,
     Closed,
@@ -162,7 +178,9 @@ impl fmt::Display for TicketStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
 pub enum ExtensibleTicketStatus {
     Open,
     Closed,
@@ -206,7 +224,19 @@ impl From<TicketStatus> for ExtensibleTicketStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TicketWorkflowState {
     Planning,
@@ -273,7 +303,7 @@ impl fmt::Display for TicketWorkflowState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MarkdownText(pub String);
 
 impl MarkdownText {
@@ -298,7 +328,7 @@ impl From<String> for MarkdownText {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum TicketIdOrSlug {
     Id(String),
     Slug(String),
@@ -325,7 +355,7 @@ impl From<String> for TicketIdOrSlug {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TicketEventKind {
     Create,
@@ -390,13 +420,13 @@ impl From<&str> for TicketEventKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketReference {
     pub kind: String,
     pub target: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct NewTicketEvent {
     pub kind: TicketEventKind,
     pub author: Option<String>,
@@ -415,7 +445,7 @@ impl NewTicketEvent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketStateChange {
     pub from: String,
     pub to: String,
@@ -443,7 +473,7 @@ impl TicketStateChange {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketIntakeSummary {
     pub author: Option<String>,
     pub body: MarkdownText,
@@ -460,7 +490,7 @@ impl TicketIntakeSummary {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct NewTicket {
     pub title: String,
     pub slug: Option<String>,
@@ -475,9 +505,8 @@ pub struct NewTicket {
     pub workflow_state: Option<TicketWorkflowState>,
     pub queued_by: Option<String>,
     pub queued_at: Option<String>,
-    #[serde(rename = "repository_key")]
-    pub repository_id: Option<String>,
-    pub ref_selector: Option<String>,
+    #[serde(default)]
+    pub targets: Vec<TicketTarget>,
 }
 
 impl NewTicket {
@@ -496,27 +525,68 @@ impl NewTicket {
             workflow_state: None,
             queued_by: None,
             queued_at: None,
-            repository_id: None,
-            ref_selector: None,
+            targets: Vec::new(),
+        }
+    }
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketTargetAccess {
+    ReadOnly,
+    ReadWrite,
+}
+
+impl TicketTargetAccess {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::ReadWrite => "read_write",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "read_only" => Some(Self::ReadOnly),
+            "read_write" => Some(Self::ReadWrite),
+            _ => None,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketTarget {
+    pub repository_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_selector: Option<String>,
+    pub access: TicketTargetAccess,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "action", rename_all = "snake_case")]
-pub enum TicketTargetEdit {
-    Set {
-        #[serde(rename = "repository_key")]
-        repository_id: String,
-        ref_selector: Option<String>,
-    },
+pub enum TicketTargetsEdit {
+    Set { targets: Vec<TicketTarget> },
     Clear,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedTicketTarget {
-    pub repository_id: String,
+    pub repository_key: String,
     pub ref_selector: String,
+    pub access: TicketTargetAccess,
 }
 
 /// Workspace-owned authority used to resolve and validate implementation targets.
@@ -528,12 +598,12 @@ pub trait TicketTargetAuthority: Send + Sync {
     fn resolve_target(
         &self,
         workspace_id: &str,
-        repository_id: Option<&str>,
+        repository_key: &str,
         ref_selector: Option<&str>,
     ) -> Result<ResolvedTicketTarget>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketMarkReady {
     pub operation_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -544,50 +614,83 @@ pub struct TicketMarkReady {
     pub intake_summary: Option<TicketIntakeSummary>,
 }
 
-impl TicketTargetEdit {
+impl TicketTargetsEdit {
     fn validate(&self) -> Result<()> {
-        if let Self::Set {
-            repository_id,
-            ref_selector,
-        } = self
-        {
-            validate_ticket_target(Some(repository_id), ref_selector.as_deref())?;
+        if let Self::Set { targets } = self {
+            validate_ticket_targets(targets)?;
         }
         Ok(())
     }
 }
 
-fn validate_ticket_target(repository_id: Option<&str>, ref_selector: Option<&str>) -> Result<()> {
-    let Some(repository_id) = repository_id else {
-        if ref_selector.is_some() {
-            return Err(TicketError::Conflict(
-                "ref_selector requires repository_id".to_string(),
+fn validate_ticket_targets(targets: &[TicketTarget]) -> Result<()> {
+    let mut repositories = BTreeSet::new();
+    for target in targets {
+        validate_required_event_value("repository_key", &target.repository_key)?;
+        if let Some(ref_selector) = target.ref_selector.as_deref() {
+            validate_required_event_value("ref_selector", ref_selector)?;
+        }
+        if !repositories.insert(target.repository_key.as_str()) {
+            return Err(TicketError::DuplicateTargetRepository(
+                target.repository_key.clone(),
             ));
         }
-        return Ok(());
-    };
-    validate_required_event_value("repository_id", repository_id)?;
-    if let Some(ref_selector) = ref_selector {
-        validate_required_event_value("ref_selector", ref_selector)?;
     }
     Ok(())
 }
 
-fn resolve_ready_target(
+fn resolve_ready_targets(
     authority: Option<&Arc<dyn TicketTargetAuthority>>,
     workspace_id: &str,
-    ticket: &Ticket,
-) -> Result<ResolvedTicketTarget> {
-    authority
-        .ok_or(TicketError::TargetAuthorityUnavailable)?
-        .resolve_target(
+    targets: &[TicketTarget],
+) -> Result<Vec<ResolvedTicketTarget>> {
+    validate_ticket_targets(targets)?;
+    let read_write_count = targets
+        .iter()
+        .filter(|target| target.access == TicketTargetAccess::ReadWrite)
+        .count();
+    if read_write_count != 1 {
+        return Err(TicketError::InvalidReadWriteTargetCount(read_write_count));
+    }
+    let authority = authority.ok_or(TicketError::TargetAuthorityUnavailable)?;
+    let mut resolved = Vec::with_capacity(targets.len());
+    let mut repositories = BTreeSet::new();
+    for target in targets {
+        let mut canonical = authority.resolve_target(
             workspace_id,
-            ticket.meta.repository_id.as_deref(),
-            ticket.meta.ref_selector.as_deref(),
-        )
+            &target.repository_key,
+            target.ref_selector.as_deref(),
+        )?;
+        validate_required_event_value("repository_key", &canonical.repository_key)?;
+        validate_required_event_value("ref_selector", &canonical.ref_selector)?;
+        canonical.access = target.access;
+        if !repositories.insert(canonical.repository_key.clone()) {
+            return Err(TicketError::DuplicateTargetRepository(
+                canonical.repository_key,
+            ));
+        }
+        resolved.push(canonical);
+    }
+    Ok(resolved)
 }
 
-fn mark_ready_fingerprint(
+fn canonical_ticket_targets(targets: &[ResolvedTicketTarget]) -> Vec<TicketTarget> {
+    targets
+        .iter()
+        .map(|target| TicketTarget {
+            repository_key: target.repository_key.clone(),
+            ref_selector: Some(target.ref_selector.clone()),
+            access: target.access,
+        })
+        .collect()
+}
+
+fn encoded_resolved_targets(targets: &[ResolvedTicketTarget]) -> Result<String> {
+    serde_json::to_string(targets)
+        .map_err(|error| TicketError::Conflict(format!("failed to encode Ticket targets: {error}")))
+}
+
+fn mark_ready_fingerprint_v1(
     ticket: &Ticket,
     request: &TicketMarkReady,
     target: &ResolvedTicketTarget,
@@ -596,10 +699,47 @@ fn mark_ready_fingerprint(
     digest.update(b"ticket.mark-ready.v1\0");
     digest.update(ticket.meta.id.as_str().as_bytes());
     digest.update(b"\0planning\0");
-    digest.update(target.repository_id.as_bytes());
+    digest.update(target.repository_key.as_bytes());
     digest.update(b"\0");
     digest.update(target.ref_selector.as_bytes());
     digest.update(b"\0");
+    if let Some(reason) = request.reason.as_deref() {
+        digest.update(reason.as_bytes());
+    }
+    if let Some(summary) = request.intake_summary.as_ref() {
+        digest.update(b"\0intake-summary\0");
+        digest.update(summary.body.as_str().as_bytes());
+        for reference in &summary.references {
+            digest.update(b"\0");
+            digest.update(reference.kind.as_bytes());
+            digest.update(b":");
+            digest.update(reference.target.as_bytes());
+        }
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn mark_ready_fingerprint(
+    ticket: &Ticket,
+    request: &TicketMarkReady,
+    targets: &[ResolvedTicketTarget],
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"ticket.mark-ready.v2\0");
+    digest.update(ticket.meta.id.as_str().as_bytes());
+    digest.update(b"\0planning\0");
+    for target in targets {
+        digest.update(target.repository_key.as_bytes());
+        digest.update(b"\0");
+        digest.update(target.ref_selector.as_bytes());
+        digest.update(b"\0");
+        digest.update(target.access.as_str().as_bytes());
+        digest.update(b"\0");
+    }
     if let Some(reason) = request.reason.as_deref() {
         digest.update(reason.as_bytes());
     }
@@ -628,31 +768,36 @@ fn validate_mark_ready_replay(ticket: &Ticket, request: &TicketMarkReady) -> Res
     else {
         return Ok(false);
     };
-    let target = ResolvedTicketTarget {
-        repository_id: event
-            .attributes
-            .get("repository_id")
-            .cloned()
-            .ok_or_else(|| {
-                TicketError::Conflict("mark-ready event is missing repository_id".to_owned())
-            })?,
-        ref_selector: event
-            .attributes
-            .get("ref_selector")
-            .cloned()
-            .ok_or_else(|| {
-                TicketError::Conflict("mark-ready event is missing ref_selector".to_owned())
-            })?,
+    let targets = event
+        .attributes
+        .get("targets")
+        .ok_or_else(|| TicketError::Conflict("mark-ready event is missing targets".to_owned()))
+        .and_then(|targets| {
+            serde_json::from_str::<Vec<ResolvedTicketTarget>>(targets).map_err(|error| {
+                TicketError::Conflict(format!("mark-ready event has invalid targets: {error}"))
+            })
+        })?;
+    let fingerprint = match event
+        .attributes
+        .get("fingerprint_version")
+        .map(String::as_str)
+        .unwrap_or("1")
+    {
+        "1" if targets.len() == 1 => mark_ready_fingerprint_v1(ticket, request, &targets[0]),
+        "2" => mark_ready_fingerprint(ticket, request, &targets),
+        version => {
+            return Err(TicketError::Conflict(format!(
+                "mark-ready event has unsupported fingerprint version {version:?}"
+            )));
+        }
     };
-    let fingerprint = mark_ready_fingerprint(ticket, request, &target);
     if event.attributes.get("request_fingerprint") != Some(&fingerprint) {
         return Err(TicketError::OperationFingerprintMismatch {
             operation_key: request.operation_key.clone(),
         });
     }
     if ticket.meta.workflow_state != TicketWorkflowState::Ready
-        || ticket.meta.repository_id.as_deref() != Some(target.repository_id.as_str())
-        || ticket.meta.ref_selector.as_deref() != Some(target.ref_selector.as_str())
+        || ticket.meta.targets != canonical_ticket_targets(&targets)
     {
         return Err(TicketError::StaleWorkflowState {
             expected: TicketWorkflowState::Ready.as_str().to_owned(),
@@ -685,7 +830,7 @@ fn validate_generic_state_change(
     Ok(())
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketItemEdit {
     pub title: Option<String>,
     /// Whole-body replacement for legacy authoring surfaces. Prefer `body_replacement`
@@ -693,11 +838,11 @@ pub struct TicketItemEdit {
     pub body: Option<MarkdownText>,
     #[serde(default)]
     pub body_replacement: Option<TicketBodyReplacement>,
-    pub target: Option<TicketTargetEdit>,
+    pub targets: Option<TicketTargetsEdit>,
     pub author: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketBodyReplacement {
     pub old_string: String,
     pub new_string: String,
@@ -729,8 +874,8 @@ impl TicketItemEdit {
         if let Some(replacement) = &self.body_replacement {
             replacement.validate()?;
         }
-        if let Some(target) = &self.target {
-            target.validate()?;
+        if let Some(targets) = &self.targets {
+            targets.validate()?;
         }
 
         Ok(())
@@ -740,7 +885,7 @@ impl TicketItemEdit {
         self.title.is_some()
             || self.body.is_some()
             || self.body_replacement.is_some()
-            || self.target.is_some()
+            || self.targets.is_some()
     }
 }
 
@@ -787,7 +932,7 @@ impl TicketBodyReplacement {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketDependencyCheck {
     pub ticket: TicketSummary,
     pub blockers: Vec<TicketRelationBlocker>,
@@ -796,7 +941,7 @@ pub struct TicketDependencyCheck {
     pub recommended_action: TicketWorkspaceNextAction,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketQueueOutcome {
     pub requested_ticket: String,
     pub queued_tickets: Vec<String>,
@@ -923,7 +1068,7 @@ impl TicketListQuery {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketRef {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -932,7 +1077,19 @@ pub struct TicketRef {
     pub status: TicketStatus,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TicketRelationKind {
     DependsOn,
@@ -971,7 +1128,7 @@ impl fmt::Display for TicketRelationKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct NewTicketRelation {
     pub kind: TicketRelationKind,
     pub target: String,
@@ -979,7 +1136,7 @@ pub struct NewTicketRelation {
     pub author: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TicketRelation {
     pub ticket_id: String,
@@ -991,7 +1148,7 @@ pub struct TicketRelation {
     pub at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DerivedTicketRelation {
     pub source_ticket: String,
     pub inverse_kind: String,
@@ -1001,7 +1158,7 @@ pub struct DerivedTicketRelation {
     pub at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketRelationBlocker {
     pub blocking_ticket: String,
     pub reason_kind: String,
@@ -1010,14 +1167,14 @@ pub struct TicketRelationBlocker {
     pub blocking_state: TicketWorkflowState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketRelationNotice {
     pub related_ticket: String,
     pub kind: TicketRelationKind,
     pub message: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketRelationView {
     pub outgoing: Vec<TicketRelation>,
     pub incoming: Vec<DerivedTicketRelation>,
@@ -1033,7 +1190,7 @@ pub enum TicketWorkspaceActionPriority {
     Background,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TicketWorkspaceNextAction {
     Clarify,
@@ -1057,7 +1214,7 @@ pub struct TicketWorkspaceStateOverlay {
     pub workflow_state: TicketWorkflowState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketQueueGuard {
     pub can_queue_for_orchestrator: bool,
     pub reason: Option<String>,
@@ -1473,7 +1630,19 @@ fn format_workspace_relation_blockers(blockers: &[&TicketRelationBlocker]) -> St
     formatted
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum OrchestrationPlanKind {
     Before,
@@ -1533,7 +1702,7 @@ impl fmt::Display for OrchestrationPlanKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AcceptedOrchestrationPlan {
     pub summary: String,
@@ -1545,7 +1714,7 @@ pub struct AcceptedOrchestrationPlan {
     pub role_plan: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct NewOrchestrationPlanRecord {
     pub kind: OrchestrationPlanKind,
     pub related_ticket: Option<String>,
@@ -1554,7 +1723,7 @@ pub struct NewOrchestrationPlanRecord {
     pub author: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OrchestrationPlanRecord {
     pub id: String,
@@ -1570,7 +1739,7 @@ pub struct OrchestrationPlanRecord {
     pub at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketMeta {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1590,13 +1759,12 @@ pub struct TicketMeta {
     pub workflow_state_explicit: bool,
     pub queued_by: Option<String>,
     pub queued_at: Option<String>,
-    #[serde(rename = "repository_key")]
-    pub repository_id: Option<String>,
-    pub ref_selector: Option<String>,
+    #[serde(default)]
+    pub targets: Vec<TicketTarget>,
     pub raw: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketSummary {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1651,13 +1819,13 @@ pub struct SqliteTicketListPage {
     pub next: Option<SqliteTicketListCursor>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketDocument {
     pub body: MarkdownText,
     pub raw_frontmatter: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketEvent {
     pub kind: TicketEventKind,
     pub author: Option<String>,
@@ -1673,13 +1841,13 @@ pub struct TicketEvent {
     pub attributes: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketArtifactRef {
     /// Path relative to the ticket's `artifacts/` directory.
     pub relative_path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Ticket {
     pub meta: TicketMeta,
     pub document: TicketDocument,
@@ -1689,20 +1857,20 @@ pub struct Ticket {
     pub resolution: Option<MarkdownText>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum TicketDoctorSeverity {
     Error,
     Warning,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketDoctorDiagnostic {
     pub severity: TicketDoctorSeverity,
     pub message: String,
     pub path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketDoctorReport {
     pub diagnostics: Vec<TicketDoctorDiagnostic>,
 }
@@ -2502,10 +2670,11 @@ impl SqliteTicketBackend {
 
     fn insert_ticket(&self, conn: &Connection, ticket: &Ticket) -> Result<()> {
         conn.execute(r#"INSERT INTO typed_tickets
-            (workspace_id, ticket_id, slug, title, status, kind, priority, body, created_at, updated_at, assignee, readiness, workflow_state, workflow_state_explicit, queued_by, queued_at, resolution, repository_id, ref_selector)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)"#,
-            params![self.workspace_id, ticket.meta.id, ticket.meta.slug, ticket.meta.title, ticket.meta.status.as_str(), ticket.meta.kind, ticket.meta.priority, ticket.document.body.as_str(), ticket.meta.created_at, ticket.meta.updated_at, ticket.meta.assignee, ticket.meta.readiness, ticket.meta.workflow_state.as_str(), if ticket.meta.workflow_state_explicit { 1 } else { 0 }, ticket.meta.queued_by, ticket.meta.queued_at, ticket.resolution.as_ref().map(|body| body.as_str()), ticket.meta.repository_id, ticket.meta.ref_selector]
+            (workspace_id, ticket_id, slug, title, status, kind, priority, body, created_at, updated_at, assignee, readiness, workflow_state, workflow_state_explicit, queued_by, queued_at, resolution)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"#,
+            params![self.workspace_id, ticket.meta.id, ticket.meta.slug, ticket.meta.title, ticket.meta.status.as_str(), ticket.meta.kind, ticket.meta.priority, ticket.document.body.as_str(), ticket.meta.created_at, ticket.meta.updated_at, ticket.meta.assignee, ticket.meta.readiness, ticket.meta.workflow_state.as_str(), if ticket.meta.workflow_state_explicit { 1 } else { 0 }, ticket.meta.queued_by, ticket.meta.queued_at, ticket.resolution.as_ref().map(|body| body.as_str())]
         ).map_err(sqlite_err)?;
+        self.replace_ticket_targets(conn, &ticket.meta.id, &ticket.meta.targets)?;
         self.insert_ordered_values(
             conn,
             "typed_ticket_labels",
@@ -2530,6 +2699,67 @@ impl SqliteTicketBackend {
             self.insert_relation(conn, relation)?;
         }
         Ok(())
+    }
+
+    fn replace_ticket_targets(
+        &self,
+        conn: &Connection,
+        ticket_id: &str,
+        targets: &[TicketTarget],
+    ) -> Result<()> {
+        validate_ticket_targets(targets)?;
+        conn.execute(
+            "DELETE FROM typed_ticket_targets WHERE workspace_id = ?1 AND ticket_id = ?2",
+            params![self.workspace_id, ticket_id],
+        )
+        .map_err(sqlite_err)?;
+        for (ordinal, target) in targets.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO typed_ticket_targets
+                 (workspace_id, ticket_id, ordinal, repository_key, ref_selector, access)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    self.workspace_id,
+                    ticket_id,
+                    ordinal as i64,
+                    target.repository_key,
+                    target.ref_selector,
+                    target.access.as_str(),
+                ],
+            )
+            .map_err(sqlite_err)?;
+        }
+        Ok(())
+    }
+
+    fn load_ticket_targets(&self, conn: &Connection, ticket_id: &str) -> Result<Vec<TicketTarget>> {
+        let mut statement = conn
+            .prepare(
+                "SELECT repository_key, ref_selector, access
+                 FROM typed_ticket_targets
+                 WHERE workspace_id = ?1 AND ticket_id = ?2
+                 ORDER BY ordinal ASC",
+            )
+            .map_err(sqlite_err)?;
+        let rows = statement
+            .query_map(params![self.workspace_id, ticket_id], |row| {
+                let access = row.get::<_, String>(2)?;
+                let access = TicketTargetAccess::parse(&access).ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        format!("invalid Ticket target access {access:?}").into(),
+                    )
+                })?;
+                Ok(TicketTarget {
+                    repository_key: row.get(0)?,
+                    ref_selector: row.get(1)?,
+                    access,
+                })
+            })
+            .map_err(sqlite_err)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(sqlite_err)
     }
 
     fn insert_ordered_values(
@@ -2573,8 +2803,7 @@ impl SqliteTicketBackend {
             workflow_state_explicit: row.get::<_, i64>(13)? != 0,
             queued_by: row.get(14)?,
             queued_at: row.get(15)?,
-            repository_id: row.get(16)?,
-            ref_selector: row.get(17)?,
+            targets: Vec::new(),
             raw: BTreeMap::new(),
         })
     }
@@ -2582,9 +2811,10 @@ impl SqliteTicketBackend {
     fn load_ticket(&self, conn: &Connection, ticket_id: &str) -> Result<Ticket> {
         #[cfg(test)]
         self.full_ticket_load_count.fetch_add(1, Ordering::SeqCst);
-        let (mut meta, body, resolution): (TicketMeta, String, Option<String>) = conn.query_row(r#"SELECT ticket_id, slug, title, status, kind, priority, created_at, updated_at, assignee, readiness, body, resolution, workflow_state, workflow_state_explicit, queued_by, queued_at, repository_id, ref_selector FROM typed_tickets WHERE workspace_id = ?1 AND ticket_id = ?2"#,
+        let (mut meta, body, resolution): (TicketMeta, String, Option<String>) = conn.query_row(r#"SELECT ticket_id, slug, title, status, kind, priority, created_at, updated_at, assignee, readiness, body, resolution, workflow_state, workflow_state_explicit, queued_by, queued_at FROM typed_tickets WHERE workspace_id = ?1 AND ticket_id = ?2"#,
             params![self.workspace_id, ticket_id], |row| Ok((Self::ticket_meta_from_row(row)?, row.get(10)?, row.get(11)?))).optional().map_err(sqlite_err)?.ok_or_else(|| TicketError::NotFound(ticket_id.to_string()))?;
         meta.resource_key = Self::resource_key_for(conn, &self.workspace_id, ticket_id)?;
+        meta.targets = self.load_ticket_targets(conn, ticket_id)?;
         meta.labels = self.load_ordered_values(conn, "typed_ticket_labels", "label", ticket_id)?;
         meta.risk_flags =
             self.load_ordered_values(conn, "typed_ticket_risk_flags", "risk_flag", ticket_id)?;
@@ -2749,7 +2979,7 @@ impl SqliteTicketBackend {
         conn: &Connection,
         filter: TicketListQuery,
     ) -> Result<Vec<TicketSummary>> {
-        let mut stmt = conn.prepare(r#"SELECT ticket_id, slug, title, status, kind, priority, created_at, updated_at, assignee, readiness, body, resolution, workflow_state, workflow_state_explicit, queued_by, queued_at, repository_id, ref_selector FROM typed_tickets WHERE workspace_id = ?1 ORDER BY ticket_id ASC"#).map_err(sqlite_err)?;
+        let mut stmt = conn.prepare(r#"SELECT ticket_id, slug, title, status, kind, priority, created_at, updated_at, assignee, readiness, body, resolution, workflow_state, workflow_state_explicit, queued_by, queued_at FROM typed_tickets WHERE workspace_id = ?1 ORDER BY ticket_id ASC"#).map_err(sqlite_err)?;
         let rows = stmt
             .query_map(params![self.workspace_id], Self::ticket_meta_from_row)
             .map_err(sqlite_err)?;
@@ -2863,10 +3093,7 @@ impl TicketBackend for SqliteTicketBackend {
                     "ticket title must not be empty".to_string(),
                 ));
             }
-            validate_ticket_target(
-                input.repository_id.as_deref(),
-                input.ref_selector.as_deref(),
-            )?;
+            validate_ticket_targets(&input.targets)?;
             let base_millis = unix_epoch_millis_now().map_err(|err| {
                 TicketError::Conflict(format!("failed to read ticket id timestamp: {err}"))
             })?;
@@ -2903,8 +3130,7 @@ impl TicketBackend for SqliteTicketBackend {
                 workflow_state_explicit: true,
                 queued_by: input.queued_by,
                 queued_at: input.queued_at,
-                repository_id: input.repository_id,
-                ref_selector: input.ref_selector,
+                targets: input.targets,
                 raw: BTreeMap::new(),
             };
             let body = if input.body.as_str() == DEFAULT_TICKET_BODY {
@@ -2955,7 +3181,7 @@ impl TicketBackend for SqliteTicketBackend {
             edit.validate_body_edit_request()?;
             if !edit.has_changes() {
                 return Err(TicketError::Conflict(
-                    "TicketEditItem requires at least one of title, body, body_replacement, or target"
+                    "TicketEditItem requires at least one of title, body, body_replacement, or targets"
                         .to_string(),
                 ));
             }
@@ -2966,7 +3192,7 @@ impl TicketBackend for SqliteTicketBackend {
                 validate_required_event_value("author", author)?;
             }
             let ticket_id = self.resolve_ticket_id(conn, id)?;
-            if edit.target.is_some() {
+            if edit.targets.is_some() {
                 let current = self.load_ticket(conn, &ticket_id)?.meta.workflow_state;
                 if current != TicketWorkflowState::Planning {
                     return Err(TicketError::Conflict(format!(
@@ -3002,19 +3228,13 @@ impl TicketBackend for SqliteTicketBackend {
             if let Some(body) = updated_body.as_ref() {
                 conn.execute("UPDATE typed_tickets SET body = ?3, updated_at = ?4 WHERE workspace_id = ?1 AND ticket_id = ?2", params![self.workspace_id, ticket_id, body.as_str(), now]).map_err(sqlite_err)?;
             }
-            if let Some(target) = edit.target.as_ref() {
-                let (repository_id, ref_selector) = match target {
-                    TicketTargetEdit::Set {
-                        repository_id,
-                        ref_selector,
-                    } => (Some(repository_id.as_str()), ref_selector.as_deref()),
-                    TicketTargetEdit::Clear => (None, None),
+            if let Some(targets) = edit.targets.as_ref() {
+                let targets = match targets {
+                    TicketTargetsEdit::Set { targets } => targets.as_slice(),
+                    TicketTargetsEdit::Clear => &[],
                 };
-                conn.execute(
-                    "UPDATE typed_tickets SET repository_id = ?3, ref_selector = ?4, updated_at = ?5 WHERE workspace_id = ?1 AND ticket_id = ?2",
-                    params![self.workspace_id, ticket_id, repository_id, ref_selector, now],
-                )
-                .map_err(sqlite_err)?;
+                self.replace_ticket_targets(conn, &ticket_id, targets)?;
+                self.touch_ticket(conn, &ticket_id, &now)?;
             }
 
             let mut changes = Vec::new();
@@ -3024,8 +3244,8 @@ impl TicketBackend for SqliteTicketBackend {
             if !matches!(body_edit_audit, TicketBodyEditAudit::None) {
                 changes.push("body");
             }
-            if edit.target.is_some() {
-                changes.push("target");
+            if edit.targets.is_some() {
+                changes.push("targets");
             }
             let mut attributes = BTreeMap::new();
             attributes.insert("changes".to_string(), changes.join(","));
@@ -3073,10 +3293,10 @@ impl TicketBackend for SqliteTicketBackend {
                         let target_error = queue_tickets.iter().find_map(|candidate| {
                             self.load_ticket(conn, candidate)
                                 .and_then(|ticket| {
-                                    resolve_ready_target(
+                                    resolve_ready_targets(
                                         self.target_authority.as_ref(),
                                         &self.workspace_id,
-                                        &ticket,
+                                        &ticket.meta.targets,
                                     )
                                 })
                                 .err()
@@ -3235,18 +3455,31 @@ impl TicketBackend for SqliteTicketBackend {
             if validate_mark_ready_replay(&ticket, &request)? {
                 return Ok(ticket);
             }
-            let target = resolve_ready_target(
-                self.target_authority.as_ref(),
-                &self.workspace_id,
-                &ticket,
-            )?;
-            let fingerprint = mark_ready_fingerprint(&ticket, &request, &target);
             if ticket.meta.workflow_state != TicketWorkflowState::Planning {
                 return Err(TicketError::StaleWorkflowState {
                     expected: TicketWorkflowState::Planning.as_str().to_owned(),
                     actual: ticket.meta.workflow_state.as_str().to_owned(),
                 });
             }
+            let targets = resolve_ready_targets(
+                self.target_authority.as_ref(),
+                &self.workspace_id,
+                &ticket.meta.targets,
+            )?;
+            let fingerprint = mark_ready_fingerprint(&ticket, &request, &targets);
+            let encoded_targets = encoded_resolved_targets(&targets)?;
+            let target_summary = targets
+                .iter()
+                .map(|target| {
+                    format!(
+                        "{}@{} ({})",
+                        target.repository_key,
+                        target.ref_selector,
+                        target.access.as_str()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
             let reason = request
                 .reason
                 .as_deref()
@@ -3291,23 +3524,32 @@ impl TicketBackend for SqliteTicketBackend {
                     state_field: Some("state".to_owned()),
                     heading: Some(TicketEventKind::StateChanged.heading()),
                     body: MarkdownText::new(format!(
-                        "Implementation target `{}` at selector `{}` was validated and the Ticket was marked ready.",
-                        target.repository_id, target.ref_selector
+                        "Implementation targets [{target_summary}] were validated and the Ticket was marked ready."
                     )),
                     references: Vec::new(),
                     attributes: BTreeMap::from([
                         ("operation_key".to_owned(), request.operation_key),
                         ("request_fingerprint".to_owned(), fingerprint),
-                        ("repository_id".to_owned(), target.repository_id.clone()),
-                        ("ref_selector".to_owned(), target.ref_selector.clone()),
+                        ("fingerprint_version".to_owned(), "2".to_owned()),
+                        ("targets".to_owned(), encoded_targets),
                     ]),
                 },
             )?;
-            conn.execute(
-                "UPDATE typed_tickets SET workflow_state = 'ready', workflow_state_explicit = 1, repository_id = ?3, ref_selector = ?4, updated_at = ?5 WHERE workspace_id = ?1 AND ticket_id = ?2 AND workflow_state = 'planning'",
-                params![self.workspace_id, ticket_id, target.repository_id, target.ref_selector, at],
+            let updated = conn.execute(
+                "UPDATE typed_tickets SET workflow_state = 'ready', workflow_state_explicit = 1, updated_at = ?3 WHERE workspace_id = ?1 AND ticket_id = ?2 AND workflow_state = 'planning'",
+                params![self.workspace_id, ticket_id, at],
             )
             .map_err(sqlite_err)?;
+            if updated != 1 {
+                return Err(TicketError::Conflict(
+                    "Ticket changed while ready targets were being persisted".to_owned(),
+                ));
+            }
+            self.replace_ticket_targets(
+                conn,
+                &ticket_id,
+                &canonical_ticket_targets(&targets),
+            )?;
             self.load_ticket(conn, &ticket_id)
         })
     }
@@ -3339,33 +3581,37 @@ impl TicketBackend for SqliteTicketBackend {
                 }
             }
 
-            let mut targets = Vec::with_capacity(queued_tickets.len());
+            let mut resolved_targets = Vec::with_capacity(queued_tickets.len());
             for ticket_id in &queued_tickets {
                 let ticket = self.load_ticket(conn, ticket_id)?;
-                let target = resolve_ready_target(
+                let targets = resolve_ready_targets(
                     self.target_authority.as_ref(),
                     &self.workspace_id,
-                    &ticket,
+                    &ticket.meta.targets,
                 )?;
-                targets.push((ticket_id.clone(), target));
+                resolved_targets.push((ticket_id.clone(), targets));
             }
 
             let at = now_utc();
-            for (ticket_id, target) in targets {
+            for (ticket_id, targets) in resolved_targets {
                 let updated = conn.execute(
-                    "UPDATE typed_tickets SET workflow_state = 'queued', workflow_state_explicit = 1, queued_by = ?3, queued_at = ?4, repository_id = ?5, ref_selector = ?6, updated_at = ?4 WHERE workspace_id = ?1 AND ticket_id = ?2 AND workflow_state = 'ready'",
-                    params![self.workspace_id, ticket_id, queued_by, at, target.repository_id, target.ref_selector],
+                    "UPDATE typed_tickets SET workflow_state = 'queued', workflow_state_explicit = 1, queued_by = ?3, queued_at = ?4, updated_at = ?4 WHERE workspace_id = ?1 AND ticket_id = ?2 AND workflow_state = 'ready'",
+                    params![self.workspace_id, ticket_id, queued_by, at],
                 ).map_err(sqlite_err)?;
                 if updated != 1 {
                     return Err(TicketError::Conflict(format!(
                         "Ticket {ticket_id} changed while the dependency queue plan was being applied"
                     )));
                 }
+                self.replace_ticket_targets(
+                    conn,
+                    &ticket_id,
+                    &canonical_ticket_targets(&targets),
+                )?;
                 let mut attributes = BTreeMap::from([
                     ("queued_by".to_owned(), queued_by.to_owned()),
                     ("queued_at".to_owned(), at.clone()),
-                    ("repository_id".to_owned(), target.repository_id),
-                    ("ref_selector".to_owned(), target.ref_selector),
+                    ("targets".to_owned(), encoded_resolved_targets(&targets)?),
                     ("queue_root_ticket".to_owned(), requested_ticket.clone()),
                 ]);
                 if let Some(assignment_id) = self
@@ -4281,20 +4527,36 @@ mod tests {
         fn resolve_target(
             &self,
             _workspace_id: &str,
-            repository_id: Option<&str>,
+            repository_key: &str,
             ref_selector: Option<&str>,
         ) -> Result<ResolvedTicketTarget> {
-            let repository_id = repository_id.unwrap_or("main");
-            if repository_id == "unknown" {
+            if repository_key == "unknown" {
                 return Err(TicketError::UnknownTargetRepository(
-                    repository_id.to_owned(),
+                    repository_key.to_owned(),
                 ));
             }
             Ok(ResolvedTicketTarget {
-                repository_id: repository_id.to_owned(),
+                repository_key: repository_key.to_owned(),
                 ref_selector: ref_selector.unwrap_or("develop").to_owned(),
+                access: TicketTargetAccess::ReadOnly,
             })
         }
+    }
+
+    fn ticket_target(
+        repository_key: &str,
+        ref_selector: Option<&str>,
+        access: TicketTargetAccess,
+    ) -> TicketTarget {
+        TicketTarget {
+            repository_key: repository_key.to_owned(),
+            ref_selector: ref_selector.map(str::to_owned),
+            access,
+        }
+    }
+
+    fn write_target(repository_key: &str) -> TicketTarget {
+        ticket_target(repository_key, None, TicketTargetAccess::ReadWrite)
     }
 
     fn backend(dir: &TempDir) -> SqliteTicketBackend {
@@ -4305,30 +4567,46 @@ mod tests {
 
     fn assert_ticket_target_edit_semantics<B: TicketBackend>(backend: &B) {
         let mut input = NewTicket::new("Target Ticket");
-        input.repository_id = Some("main".to_string());
-        input.ref_selector = Some("feature/api".to_string());
+        input.targets = vec![ticket_target(
+            "main",
+            Some("feature/api"),
+            TicketTargetAccess::ReadWrite,
+        )];
         let created = backend.create(input).unwrap();
         let ticket = backend
             .show(TicketIdOrSlug::Id(created.id.clone()))
             .unwrap();
-        assert_eq!(ticket.meta.repository_id.as_deref(), Some("main"));
-        assert_eq!(ticket.meta.ref_selector.as_deref(), Some("feature/api"));
+        assert_eq!(
+            ticket.meta.targets,
+            vec![ticket_target(
+                "main",
+                Some("feature/api"),
+                TicketTargetAccess::ReadWrite,
+            )]
+        );
 
         let edited = backend
             .edit_item(
                 TicketIdOrSlug::Id(created.id.clone()),
                 TicketItemEdit {
-                    target: Some(TicketTargetEdit::Set {
-                        repository_id: "secondary".to_string(),
-                        ref_selector: None,
+                    targets: Some(TicketTargetsEdit::Set {
+                        targets: vec![
+                            write_target("secondary"),
+                            ticket_target("docs", Some("main"), TicketTargetAccess::ReadOnly),
+                        ],
                     }),
                     author: Some("tester".to_string()),
                     ..Default::default()
                 },
             )
             .unwrap();
-        assert_eq!(edited.meta.repository_id.as_deref(), Some("secondary"));
-        assert_eq!(edited.meta.ref_selector, None);
+        assert_eq!(
+            edited.meta.targets,
+            vec![
+                write_target("secondary"),
+                ticket_target("docs", Some("main"), TicketTargetAccess::ReadOnly),
+            ]
+        );
         let edit_event = edited
             .events
             .iter()
@@ -4337,20 +4615,19 @@ mod tests {
             .expect("item_edit event");
         assert_eq!(
             edit_event.attributes.get("changes"),
-            Some(&"target".to_string())
+            Some(&"targets".to_string())
         );
 
         let cleared = backend
             .edit_item(
                 TicketIdOrSlug::Id(created.id),
                 TicketItemEdit {
-                    target: Some(TicketTargetEdit::Clear),
+                    targets: Some(TicketTargetsEdit::Clear),
                     ..Default::default()
                 },
             )
             .unwrap();
-        assert_eq!(cleared.meta.repository_id, None);
-        assert_eq!(cleared.meta.ref_selector, None);
+        assert!(cleared.meta.targets.is_empty());
     }
 
     fn assert_partial_body_replacement_semantics<B: TicketBackend>(backend: &B) {
@@ -4826,11 +5103,11 @@ mod tests {
             .with_target_authority(Arc::new(TestTargetAuthority));
         let mut root_input = NewTicket::new("Ready root");
         root_input.workflow_state = Some(TicketWorkflowState::Ready);
-        root_input.repository_id = Some("main".to_string());
+        root_input.targets = vec![write_target("main")];
         let root = backend.create(root_input).unwrap();
         let mut middle_input = NewTicket::new("Queued middle");
         middle_input.workflow_state = Some(TicketWorkflowState::Queued);
-        middle_input.repository_id = Some("main".to_string());
+        middle_input.targets = vec![write_target("main")];
         let middle = backend.create(middle_input).unwrap();
         let leaf = backend.create(NewTicket::new("Planning leaf")).unwrap();
         for (ticket, target) in [
@@ -4891,8 +5168,11 @@ mod tests {
                 .unwrap();
         let mut sqlite_input = NewTicket::new("SQLite ready Ticket");
         sqlite_input.workflow_state = Some(TicketWorkflowState::Ready);
-        sqlite_input.repository_id = Some("main".to_string());
-        sqlite_input.ref_selector = Some("develop".to_string());
+        sqlite_input.targets = vec![ticket_target(
+            "main",
+            Some("develop"),
+            TicketTargetAccess::ReadWrite,
+        )];
         let sqlite_ticket = sqlite.create(sqlite_input).unwrap();
         let sqlite_check = sqlite
             .dependency_check(TicketIdOrSlug::Id(sqlite_ticket.id.clone()))
@@ -4920,11 +5200,11 @@ mod tests {
             .with_target_authority(Arc::new(TestTargetAuthority));
         let mut root_input = NewTicket::new("Ready root");
         root_input.workflow_state = Some(TicketWorkflowState::Ready);
-        root_input.repository_id = Some("main".to_string());
+        root_input.targets = vec![write_target("main")];
         let root = backend.create(root_input).unwrap();
         let mut done_input = NewTicket::new("Done dependency");
         done_input.workflow_state = Some(TicketWorkflowState::Done);
-        done_input.repository_id = Some("main".to_string());
+        done_input.targets = vec![write_target("main")];
         let done = backend.create(done_input).unwrap();
         for (ticket_id, target) in [
             (root.id.clone(), done.id.clone()),
@@ -4973,15 +5253,15 @@ mod tests {
             .with_target_authority(Arc::new(TestTargetAuthority));
         let mut first_input = NewTicket::new("First ready Ticket");
         first_input.workflow_state = Some(TicketWorkflowState::Ready);
-        first_input.repository_id = Some("main".to_string());
+        first_input.targets = vec![write_target("main")];
         let first = backend.create(first_input).unwrap();
         let mut second_input = NewTicket::new("Second ready Ticket");
         second_input.workflow_state = Some(TicketWorkflowState::Ready);
-        second_input.repository_id = Some("main".to_string());
+        second_input.targets = vec![write_target("main")];
         let second = backend.create(second_input).unwrap();
         let mut third_input = NewTicket::new("Third ready Ticket");
         third_input.workflow_state = Some(TicketWorkflowState::Ready);
-        third_input.repository_id = Some("main".to_string());
+        third_input.targets = vec![write_target("main")];
         let third = backend.create(third_input).unwrap();
         for (ticket, target) in [
             (first.id.clone(), second.id.clone()),
@@ -5055,11 +5335,11 @@ mod tests {
             .with_target_authority(Arc::new(TestTargetAuthority));
         let mut dependency_input = NewTicket::new("Invalid ready dependency");
         dependency_input.workflow_state = Some(TicketWorkflowState::Ready);
-        dependency_input.repository_id = Some("unknown".to_string());
+        dependency_input.targets = vec![write_target("unknown")];
         let dependency = backend.create(dependency_input).unwrap();
         let mut root_input = NewTicket::new("Queue root");
         root_input.workflow_state = Some(TicketWorkflowState::Ready);
-        root_input.repository_id = Some("main".to_string());
+        root_input.targets = vec![write_target("main")];
         let root = backend.create(root_input).unwrap();
         backend
             .add_ticket_relation(
@@ -5108,11 +5388,11 @@ mod tests {
             .unwrap()
             .with_target_authority(Arc::new(TestTargetAuthority));
         let mut dependency = NewTicket::new("Dependency");
-        dependency.repository_id = Some("main".to_owned());
+        dependency.targets = vec![write_target("main")];
         dependency.workflow_state = Some(TicketWorkflowState::Ready);
         let dependency = backend.create(dependency).unwrap();
         let mut implementation = NewTicket::new("Implementation");
-        implementation.repository_id = Some("main".to_owned());
+        implementation.targets = vec![write_target("main")];
         let implementation = backend.create(implementation).unwrap();
         backend
             .add_ticket_relation(
@@ -5137,7 +5417,14 @@ mod tests {
                 request.clone(),
             )
             .unwrap();
-        assert_eq!(ready.meta.ref_selector.as_deref(), Some("develop"));
+        assert_eq!(
+            ready.meta.targets,
+            vec![ticket_target(
+                "main",
+                Some("develop"),
+                TicketTargetAccess::ReadWrite,
+            )]
+        );
         let replay = backend
             .mark_ready(TicketIdOrSlug::Id(implementation.id.clone()), request)
             .unwrap();
@@ -5570,8 +5857,11 @@ mod tests {
 
         let mut ready_input = NewTicket::new("Ready Workflow");
         ready_input.workflow_state = Some(TicketWorkflowState::Ready);
-        ready_input.repository_id = Some("main".to_owned());
-        ready_input.ref_selector = Some("develop".to_owned());
+        ready_input.targets = vec![ticket_target(
+            "main",
+            Some("develop"),
+            TicketTargetAccess::ReadWrite,
+        )];
         let ready = backend.create(ready_input).unwrap();
         backend
             .queue_ready(TicketIdOrSlug::Id(ready.id.clone()), "workspace-panel")
@@ -5591,6 +5881,15 @@ mod tests {
         assert_eq!(event.from.as_deref(), Some("ready"));
         assert_eq!(event.to.as_deref(), Some("queued"));
         assert_eq!(event.reason.as_deref(), Some("queued"));
+        let event_targets = serde_json::from_str::<Vec<ResolvedTicketTarget>>(
+            event.attributes.get("targets").expect("canonical targets"),
+        )
+        .unwrap();
+        assert_eq!(event_targets.len(), 1);
+        assert_eq!(event_targets[0].repository_key, "main");
+        assert_eq!(event_targets[0].access, TicketTargetAccess::ReadWrite);
+        assert!(!event.attributes.contains_key("repository_id"));
+        assert!(!event.attributes.contains_key("ref_selector"));
     }
 
     #[test]
@@ -5619,7 +5918,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let backend = backend(&tmp);
         let mut input = NewTicket::new("Planning Ready");
-        input.repository_id = Some("main".to_owned());
+        input.targets = vec![
+            write_target("main"),
+            ticket_target("docs", None, TicketTargetAccess::ReadOnly),
+        ];
         let ticket = backend.create(input).unwrap();
         let request = TicketMarkReady {
             operation_key: "ready-op-1".to_owned(),
@@ -5635,9 +5937,37 @@ mod tests {
             .mark_ready(TicketIdOrSlug::Id(ticket.id.clone()), request)
             .unwrap();
         assert_eq!(first.meta.workflow_state, TicketWorkflowState::Ready);
-        assert_eq!(first.meta.repository_id.as_deref(), Some("main"));
-        assert_eq!(first.meta.ref_selector.as_deref(), Some("develop"));
+        assert_eq!(
+            first.meta.targets,
+            vec![
+                ticket_target("main", Some("develop"), TicketTargetAccess::ReadWrite,),
+                ticket_target("docs", Some("develop"), TicketTargetAccess::ReadOnly),
+            ]
+        );
         assert_eq!(first.events, second.events);
+        let ready_event = first
+            .events
+            .iter()
+            .find(|event| event.attributes.contains_key("operation_key"))
+            .unwrap();
+        let event_targets = serde_json::from_str::<Vec<ResolvedTicketTarget>>(
+            ready_event.attributes.get("targets").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(event_targets.len(), 2);
+        assert_eq!(event_targets[0].repository_key, "main");
+        assert_eq!(event_targets[0].access, TicketTargetAccess::ReadWrite);
+        assert_eq!(event_targets[1].repository_key, "docs");
+        assert_eq!(event_targets[1].access, TicketTargetAccess::ReadOnly);
+        assert_eq!(
+            ready_event
+                .attributes
+                .get("fingerprint_version")
+                .map(String::as_str),
+            Some("2")
+        );
+        assert!(!ready_event.attributes.contains_key("repository_id"));
+        assert!(!ready_event.attributes.contains_key("ref_selector"));
         assert_eq!(
             first
                 .events
@@ -5662,6 +5992,97 @@ mod tests {
             ),
             Err(TicketError::OperationFingerprintMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn target_validation_rejects_duplicates_and_invalid_write_layouts_without_state_change() {
+        let tmp = TempDir::new().unwrap();
+        let backend = backend(&tmp);
+
+        let mut duplicate = NewTicket::new("Duplicate targets");
+        duplicate.targets = vec![
+            write_target("main"),
+            ticket_target("main", Some("docs"), TicketTargetAccess::ReadOnly),
+        ];
+        assert!(matches!(
+            backend.create(duplicate),
+            Err(TicketError::DuplicateTargetRepository(repository)) if repository == "main"
+        ));
+
+        for (name, targets, expected_count) in [
+            (
+                "No write target",
+                vec![ticket_target("docs", None, TicketTargetAccess::ReadOnly)],
+                0,
+            ),
+            (
+                "Multiple write targets",
+                vec![write_target("main"), write_target("docs")],
+                2,
+            ),
+        ] {
+            let mut input = NewTicket::new(name);
+            input.targets = targets;
+            let ticket = backend.create(input).unwrap();
+            let error = backend
+                .mark_ready(
+                    TicketIdOrSlug::Id(ticket.id.clone()),
+                    TicketMarkReady {
+                        operation_key: format!("ready-{expected_count}"),
+                        reason: None,
+                        author: None,
+                        intake_summary: None,
+                    },
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                TicketError::InvalidReadWriteTargetCount(count) if count == expected_count
+            ));
+            let unchanged = backend.show(TicketIdOrSlug::Id(ticket.id)).unwrap();
+            assert_eq!(unchanged.meta.workflow_state, TicketWorkflowState::Planning);
+            assert!(
+                unchanged
+                    .events
+                    .iter()
+                    .all(|event| !event.attributes.contains_key("operation_key"))
+            );
+        }
+    }
+
+    #[test]
+    fn targets_are_locked_after_planning_and_queue_revalidates_every_target() {
+        let tmp = TempDir::new().unwrap();
+        let backend = backend(&tmp);
+        let mut ready_input = NewTicket::new("Ready with unknown reference target");
+        ready_input.workflow_state = Some(TicketWorkflowState::Ready);
+        ready_input.targets = vec![
+            ticket_target("main", Some("develop"), TicketTargetAccess::ReadWrite),
+            ticket_target("unknown", Some("main"), TicketTargetAccess::ReadOnly),
+        ];
+        let ticket = backend.create(ready_input).unwrap();
+
+        let edit_error = backend
+            .edit_item(
+                TicketIdOrSlug::Id(ticket.id.clone()),
+                TicketItemEdit {
+                    targets: Some(TicketTargetsEdit::Clear),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(edit_error.to_string().contains("locked after planning"));
+
+        let queue_error = backend
+            .queue_ready(TicketIdOrSlug::Id(ticket.id.clone()), "orchestrator")
+            .unwrap_err();
+        assert!(matches!(
+            queue_error,
+            TicketError::UnknownTargetRepository(repository) if repository == "unknown"
+        ));
+        let unchanged = backend.show(TicketIdOrSlug::Id(ticket.id)).unwrap();
+        assert_eq!(unchanged.meta.workflow_state, TicketWorkflowState::Ready);
+        assert!(unchanged.meta.queued_at.is_none());
     }
 
     #[test]
@@ -5744,6 +6165,7 @@ mod tests {
         let backend = backend(&tmp);
         let mut waiter_input = NewTicket::new("Ready After Queued Dependency");
         waiter_input.workflow_state = Some(TicketWorkflowState::Ready);
+        waiter_input.targets = vec![write_target("main")];
         let waiter = backend.create(waiter_input).unwrap();
         let mut dependency_input = NewTicket::new("Queued Dependency");
         dependency_input.workflow_state = Some(TicketWorkflowState::Queued);
@@ -5769,6 +6191,7 @@ mod tests {
 
         let mut incoming_input = NewTicket::new("Ready After Inprogress Blocker");
         incoming_input.workflow_state = Some(TicketWorkflowState::Ready);
+        incoming_input.targets = vec![write_target("main")];
         let incoming = backend.create(incoming_input).unwrap();
         let mut blocker_input = NewTicket::new("Inprogress Blocker");
         blocker_input.workflow_state = Some(TicketWorkflowState::InProgress);

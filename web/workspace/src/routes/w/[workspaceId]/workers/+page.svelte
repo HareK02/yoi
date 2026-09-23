@@ -1,11 +1,16 @@
 <script lang="ts">
   import { pushWorkspaceAlert } from '$lib/workspace/alerts/store';
   import { workspaceApiPath } from '$lib/workspace/api/http';
+  import {
+    parseRuntimeCleanupExecution,
+    parseRuntimeCleanupPlan,
+    parseWorkerRetentionResponse,
+  } from '$lib/workspace/api/runtime-workers';
   import { workerHref } from '$lib/workspace/resource-links';
   import { formatCurrentWorkdirRevision } from '$lib/workspace/settings/workdir-revision';
   import { canOpenWorkerConsole } from '$lib/workspace/sidebar/workers';
   import { liveWorkerState } from '$lib/workspace/sidebar/worker-state';
-  import type { CleanupWorkerCandidate, RuntimeCleanupExecutionResponse, RuntimeCleanupPlanResponse, Worker } from '$lib/workspace/sidebar/types';
+  import type { CleanupWorkerCandidate, RuntimeCleanupPlanResponse, Worker } from '$lib/workspace/sidebar/types';
   import type { PageProps } from './$types';
 
   type WorkerActionKind = 'pin' | 'delete';
@@ -55,7 +60,7 @@
       workspaceApiPath(data.workspaceId, `/runtimes/${encodeURIComponent(runtimeId)}/cleanup-plan`),
     );
     if (!response.ok) return;
-    const plan = (await response.json()) as RuntimeCleanupPlanResponse;
+    const plan = parseRuntimeCleanupPlan(await response.json());
     cleanupPlans = { ...cleanupPlans, [runtimeId]: plan };
   }
 
@@ -75,8 +80,9 @@
         pushWorkspaceAlert('error', errorMessage(payload, response.statusText), { title: 'Worker pin failed' });
         return;
       }
-      worker.pinned = Boolean(payload?.pinned);
-      worker.retention_state = payload?.retention_state ?? (worker.pinned ? 'pinned' : 'normal');
+      const retention = parseWorkerRetentionResponse(payload);
+      worker.pinned = retention.pinned;
+      worker.retention_state = retention.retention_state;
       await refreshCleanupPlan(worker.runtime_id);
     } catch (error) {
       pushWorkspaceAlert('error', error instanceof Error ? error.message : 'Worker pin failed', {
@@ -112,15 +118,11 @@
           }),
         },
       );
-      const payload = (await response.json().catch(() => null)) as RuntimeCleanupExecutionResponse | unknown;
+      const payload = await response.json().catch(() => null);
       if (!response.ok) throw new Error(errorMessage(payload, response.statusText));
-      if (payload && typeof payload === 'object' && 'plan_after' in payload) {
-        const execution = payload as RuntimeCleanupExecutionResponse;
-        cleanupPlans = { ...cleanupPlans, [worker.runtime_id]: execution.plan_after };
-      }
-      const result = payload && typeof payload === 'object' && 'results' in payload
-        ? (payload as RuntimeCleanupExecutionResponse).results.find((entry) => entry.target_id === candidate.target_id)
-        : undefined;
+      const execution = parseRuntimeCleanupExecution(payload);
+      cleanupPlans = { ...cleanupPlans, [worker.runtime_id]: execution.plan_after };
+      const result = execution.results.find((entry) => entry.target_id === candidate.target_id);
       if (!result || result.status !== 'deleted') {
         throw new Error(result?.message ?? 'Runtime did not delete the selected Worker');
       }

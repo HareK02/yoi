@@ -2,7 +2,7 @@
 #![allow(async_fn_in_trait, dead_code)]
 
 use api_macros::{
-    api,
+    BinaryBody, api,
     openapi::{OpenApiInfo, OpenApiSchema},
 };
 use schemars::JsonSchema;
@@ -81,6 +81,9 @@ impl OpenApiSchema for PublicError {}
 
 type OptionalRequestId = Option<String>;
 
+pub struct ClientFrame;
+pub struct ServerFrame;
+
 #[api(openapi)]
 pub trait FixtureApi {
     #[post(
@@ -100,6 +103,29 @@ pub trait FixtureApi {
 
     #[delete("/widgets/{widget_id}", operation_id = "widgets.delete", status = 204)]
     async fn delete(&self, #[path] widget_id: u32) -> ();
+
+    #[put("/uploads", operation_id = "uploads.put", status = 200)]
+    async fn upload(&self, #[binary] body: BinaryBody) -> Widget;
+
+    #[get(
+        "/conditional",
+        operation_id = "conditional.get",
+        responses = [
+            (status = 200, body = Widget, headers = [("etag", String), ("cache-control", String)]),
+            (status = 304, headers = [("etag", String), ("cache-control", String)])
+        ]
+    )]
+    async fn conditional(&self) -> fixture_api_responses::Conditional;
+
+    #[websocket(
+        "/widgets/{widget_id}/events",
+        operation_id = "widgets.events",
+        method = GET,
+        client_to_server = ClientFrame,
+        server_to_client = ServerFrame,
+        path_parameters = [widget_id: u32]
+    )]
+    type WidgetEvents;
 }
 
 fn document() -> api_macros::openapi::OpenApiDocument {
@@ -175,6 +201,10 @@ fn collect_schema_references<'a>(value: &'a Value, references: &mut Vec<&'a str>
 #[test]
 fn operations_and_components_preserve_the_wire_contract() {
     let value = document().as_value().clone();
+    assert!(
+        value["paths"]["/widgets/{widget_id}/events"].is_null(),
+        "WebSocket transports must not be projected as unary OpenAPI operations"
+    );
     let create = &value["paths"]["/widgets/{widget_id}"]["post"];
     assert_eq!(create["operationId"], "widgets.create");
     assert_eq!(create["security"], json!([{ "bearerAuth": [] }]));
@@ -281,6 +311,44 @@ fn operations_and_components_preserve_the_wire_contract() {
                 .contains(&json!("null"))
         );
     }
+
+    let upload = &value["paths"]["/uploads"]["put"];
+    assert_eq!(upload["operationId"], "uploads.put");
+    assert_eq!(
+        upload["requestBody"],
+        json!({
+            "required": true,
+            "content": {
+                "application/octet-stream": {
+                    "schema": { "type": "string", "format": "binary" }
+                }
+            }
+        })
+    );
+    assert!(
+        !schemas.contains_key("BinaryBody"),
+        "binary payloads are not JSON Schema components"
+    );
+
+    let conditional = &value["paths"]["/conditional"]["get"];
+    assert_eq!(
+        conditional["responses"]["200"]["content"]["application/json"]["schema"],
+        json!({ "$ref": "#/components/schemas/Widget" })
+    );
+    assert_eq!(
+        conditional["responses"]["200"]["headers"]["etag"]["schema"],
+        json!({ "$ref": "#/components/schemas/string" })
+    );
+    assert_eq!(
+        conditional["responses"]["304"],
+        json!({
+            "description": "Alternate successful response",
+            "headers": {
+                "cache-control": { "schema": { "$ref": "#/components/schemas/string" } },
+                "etag": { "schema": { "$ref": "#/components/schemas/string" } }
+            }
+        })
+    );
 
     let delete = &value["paths"]["/widgets/{widget_id}"]["delete"];
     assert_eq!(delete["operationId"], "widgets.delete");

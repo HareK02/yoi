@@ -1,27 +1,32 @@
 import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
+import { parseWorkerListResponse } from "$lib/workspace/api/workers";
+import { parseRuntimeCleanupPlan } from "$lib/workspace/api/runtime-workers";
 import type {
-  ListResponse,
   RuntimeCleanupPlanResponse,
-  Worker,
 } from "$lib/workspace/sidebar/types";
 import type { PageLoad } from "./$types";
 
 export const load: PageLoad = async ({ fetch, params }) => {
-  const workers = await loadJson<ListResponse<Worker>>(
+  const workers = await loadJson(
     fetch,
     workspaceApiPath(params.workspaceId, "/workers"),
+    undefined,
+    parseWorkerListResponse,
+    { diagnosticLabel: "Worker API", maxResponseBytes: 8 * 1024 * 1024 },
   );
   const runtimeIds = Array.from(
     new Set(workers.data?.items.map((worker) => worker.runtime_id) ?? []),
   );
   const cleanupPlanEntries = await Promise.all(
     runtimeIds.map(async (runtimeId) => {
-      const cleanupPlan = await loadJson<RuntimeCleanupPlanResponse>(
+      const cleanupPlan = await loadJson(
         fetch,
         workspaceApiPath(
           params.workspaceId,
           `/runtimes/${encodeURIComponent(runtimeId)}/cleanup-plan`,
         ),
+        undefined,
+        parseRuntimeCleanupPlan,
       );
       return [runtimeId, cleanupPlan] as const;
     }),

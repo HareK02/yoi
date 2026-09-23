@@ -1,0 +1,5 @@
+error: response header name must be a valid HTTP field name
+ --> tests/ui/invalid_response_header.rs:9:62
+  |
+9 |         responses = [(status = 200, body = Body, headers = [("bad header", String)])]
+  |                                                              ^^^^^^^^^^^^

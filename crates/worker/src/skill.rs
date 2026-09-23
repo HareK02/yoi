@@ -1,22 +1,12 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::worker::WorkspaceClient;
 
 pub use server_api::{
-    SkillActivationStatus, SkillCatalogEntry, SkillCatalogResponse, SkillDetailResponse,
-    SkillDiagnostic, SkillDiagnosticSeverity, SkillProjectionIdentity, SkillProjectionStatus,
-    SkillProvenance, SkillResourceRef, SkillSourceKind,
+    SkillActivationResponse, SkillActivationStatus, SkillCatalogEntry, SkillCatalogResponse,
+    SkillDetailResponse, SkillDiagnostic, SkillDiagnosticSeverity, SkillProjectionIdentity,
+    SkillProjectionStatus, SkillProvenance, SkillResourceRef, SkillSourceKind,
 };
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SkillActivationResponse {
-    pub name: String,
-    pub provenance: SkillProvenance,
-    #[serde(default)]
-    pub diagnostics: Vec<SkillDiagnostic>,
-    /// Imported Markdown content to append to Worker history on explicit activation.
-    pub body: String,
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SkillClientError {

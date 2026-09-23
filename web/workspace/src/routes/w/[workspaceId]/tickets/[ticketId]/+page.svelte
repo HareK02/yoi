@@ -6,6 +6,12 @@
     workspaceApiJsonWithBody,
     workspaceApiPath,
   } from "$lib/workspace/api/http";
+  import {
+    TICKET_BROWSER_API_MAX_RESPONSE_BYTES,
+    parseTicketDetail,
+    parseTicketQueueOutcome,
+    parseTicketRoleAssignmentMutationResponse,
+  } from "$lib/workspace/api/ticket-browser";
   import { mergeRequestPagePath } from "$lib/workspace/api/merge-requests";
   import {
     relationLabel,
@@ -14,14 +20,40 @@
   } from "$lib/workspace/tickets/ticket-panel";
   import type { ApiResult } from "$lib/workspace/api/http";
   import type {
+    TicketTarget,
+    TicketTargetAccess,
+  } from "$lib/generated/ticket-api";
+  import type {
     RepositoryListResponse,
     RepositorySummary,
     TicketDetail,
   } from "$lib/workspace/sidebar/types";
 
+  type EditableTicketTarget = {
+    repository_key: string;
+    ref_selector: string;
+    access: TicketTargetAccess;
+  };
+
   const MUTABLE_TICKET_STATES = TICKET_STATES.filter((state) =>
     state !== "done" && state !== "ready" && state !== "queued"
   );
+
+  function editableTargets(targets: TicketTarget[]): EditableTicketTarget[] {
+    return targets.map((target) => ({
+      repository_key: target.repository_key,
+      ref_selector: target.ref_selector ?? "",
+      access: target.access,
+    }));
+  }
+
+  function normalizedTargets(targets: EditableTicketTarget[]): TicketTarget[] {
+    return targets.map((target) => ({
+      repository_key: target.repository_key.trim(),
+      ref_selector: target.ref_selector.trim() || null,
+      access: target.access,
+    }));
+  }
 
   const { data } = $props<{
     data: {
@@ -38,18 +70,14 @@
   if (!loadedTicket) throw new Error(initialData.ticket.error ?? "ticket load failed");
   const loadedRepositories = $derived(data.repositories.data);
 
-  type QueueOutcome = {
-    requested_ticket: string;
-    queued_tickets: string[];
-  };
-
   let ticket = $state<TicketDetail>(loadedTicket);
   const mergeRequest = $derived(ticket.merge_request);
   let editing = $state(false);
   let editTitle = $state(loadedTicket.title);
   let editBody = $state(loadedTicket.body);
-  let repositoryKey = $state(loadedTicket.repository_key ?? "");
-  let refSelector = $state(loadedTicket.ref_selector ?? "");
+  let targetDrafts = $state<EditableTicketTarget[]>(
+    editableTargets(loadedTicket.targets),
+  );
   let nextState = $state(loadedTicket.state);
   let transitionReason = $state("");
   let threadRole = $state("comment");
@@ -67,23 +95,34 @@
   const coderAssignment = $derived(
     ticket.assignments.find((assignment) => assignment.role === "coder") ?? null,
   );
-  const selectedRepository = $derived(
-    (loadedRepositories?.items ?? []).find((repository: RepositorySummary) => repository.repository_key === repositoryKey) ?? null,
-  );
-  const effectiveRefSelector = $derived(refSelector.trim() || selectedRepository?.default_ref || "");
-  const targetCandidateValid = $derived(
-    ticket.state === "planning" &&
-      selectedRepository !== null &&
-      (selectedRepository.diagnostics ?? []).length === 0 &&
-      effectiveRefSelector.length > 0,
-  );
-  const persistedTargetValid = $derived(
-    ticket.repository_key !== null &&
-      ticket.ref_selector !== null &&
-      (loadedRepositories?.items ?? []).some((repository: RepositorySummary) =>
-        repository.repository_key === ticket.repository_key && (repository.diagnostics ?? []).length === 0
-      ),
-  );
+  function repositoryFor(repositoryKey: string): RepositorySummary | null {
+    return (loadedRepositories?.items ?? []).find((repository: RepositorySummary) =>
+      repository.repository_key === repositoryKey
+    ) ?? null;
+  }
+
+  function effectiveRefSelector(target: EditableTicketTarget): string {
+    return target.ref_selector.trim() ||
+      repositoryFor(target.repository_key)?.default_selector || "";
+  }
+
+  const targetCandidateValid = $derived.by(() => {
+    if (ticket.state !== "planning" || targetDrafts.length === 0) return false;
+    const repositoryKeys = new Set<string>();
+    let readWriteCount = 0;
+    for (const target of targetDrafts) {
+      const repository = repositoryFor(target.repository_key);
+      if (
+        !target.repository_key || repository === null ||
+        (repository.diagnostics ?? []).length > 0 ||
+        !effectiveRefSelector(target) ||
+        repositoryKeys.has(target.repository_key)
+      ) return false;
+      repositoryKeys.add(target.repository_key);
+      if (target.access === "read_write") readWriteCount += 1;
+    }
+    return readWriteCount === 1;
+  });
   const implementationStartEligible = $derived(
     ticket.action_eligibility.can_start_manual_coder,
   );
@@ -99,8 +138,7 @@
     ticket = updatedTicket;
     editTitle = updatedTicket.title;
     editBody = updatedTicket.body;
-    repositoryKey = updatedTicket.repository_key ?? "";
-    refSelector = updatedTicket.ref_selector ?? "";
+    targetDrafts = editableTargets(updatedTicket.targets);
     nextState = updatedTicket.state;
   }
 
@@ -146,10 +184,10 @@
     busy = action;
     errorMessage = null;
     try {
-      const response = await workspaceApiJsonWithBody<TicketDetail>(path, {
+      const response = await workspaceApiJsonWithBody(path, {
         method,
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      });
+      }, parseTicketDetail, TICKET_BROWSER_API_MAX_RESPONSE_BYTES);
       if (generation !== routeGeneration) return false;
       applyTicket(response);
       return true;
@@ -171,12 +209,18 @@
     errorMessage = null;
     queueMessage = null;
     try {
-      const outcome = await workspaceApiJsonWithBody<QueueOutcome>(
+      const outcome = await workspaceApiJsonWithBody(
         `${path}/queue`,
         { method: "POST", body: JSON.stringify({}) },
+        parseTicketQueueOutcome,
+        TICKET_BROWSER_API_MAX_RESPONSE_BYTES,
       );
       if (generation !== routeGeneration) return;
-      const updatedTicket = await workspaceApiJson<TicketDetail>(path);
+      const updatedTicket = await workspaceApiJson(
+        path,
+        parseTicketDetail,
+        TICKET_BROWSER_API_MAX_RESPONSE_BYTES,
+      );
       if (generation !== routeGeneration) return;
       queueMessage = `Queued ${outcome.queued_tickets.length} Ticket(s): ${outcome.queued_tickets.join(", ")}`;
       applyTicket(updatedTicket);
@@ -210,9 +254,15 @@
             expected_assignment_id: null,
           }),
         },
+        parseTicketRoleAssignmentMutationResponse,
+        TICKET_BROWSER_API_MAX_RESPONSE_BYTES,
       );
       if (generation !== routeGeneration) return;
-      const updatedTicket = await workspaceApiJson<TicketDetail>(path);
+      const updatedTicket = await workspaceApiJson(
+        path,
+        parseTicketDetail,
+        TICKET_BROWSER_API_MAX_RESPONSE_BYTES,
+      );
       if (generation !== routeGeneration) return;
       applyTicket(updatedTicket);
     } catch (error) {
@@ -263,32 +313,35 @@
     ) editing = false;
   }
 
+  function addTarget(access: TicketTargetAccess = "read_only"): void {
+    if (ticket.state !== "planning") return;
+    targetDrafts.push({ repository_key: "", ref_selector: "", access });
+  }
+
+  function removeTarget(index: number): void {
+    if (ticket.state !== "planning") return;
+    targetDrafts.splice(index, 1);
+  }
+
+  function targetEditBody(): Record<string, unknown> {
+    const targets = normalizedTargets(targetDrafts);
+    return {
+      target: targets.length > 0
+        ? { action: "set", targets }
+        : { action: "clear" },
+    };
+  }
+
   async function saveTarget(event: SubmitEvent) {
     event.preventDefault();
-    await mutate("target", "", {
-      target: repositoryKey
-        ? {
-          action: "set",
-          repository_key: repositoryKey,
-          ref_selector: refSelector.trim() || null,
-        }
-        : { action: "clear" },
-    }, "PATCH");
+    await mutate("target", "", targetEditBody(), "PATCH");
   }
 
   async function markReady() {
     if (!targetCandidateValid || busy) return;
-    if (
-      ticket.repository_key !== repositoryKey ||
-      (ticket.ref_selector ?? "") !== refSelector.trim()
-    ) {
-      const saved = await mutate("target", "", {
-        target: {
-          action: "set",
-          repository_key: repositoryKey,
-          ref_selector: refSelector.trim() || null,
-        },
-      }, "PATCH");
+    const targets = normalizedTargets(targetDrafts);
+    if (JSON.stringify(ticket.targets) !== JSON.stringify(targets)) {
+      const saved = await mutate("target", "", targetEditBody(), "PATCH");
       if (!saved) return;
     }
     readyOperationKey ??= crypto.randomUUID();
@@ -317,7 +370,7 @@
     event.preventDefault();
     if (!threadBody.trim()) return;
     if (
-      await mutate("thread", "/thread", {
+      await mutate("thread", "/events", {
         role: threadRole,
         body: threadBody.trim(),
       })
@@ -537,19 +590,45 @@
       </section>
 
       <section class="ticket-control-card">
-        <header><h2>Repository target</h2></header>
+        <header><h2>Repository targets</h2><span>{targetDrafts.length}</span></header>
         <form class="ticket-control-form" onsubmit={saveTarget}>
-          <label>Repository
-            <select bind:value={repositoryKey} disabled={ticket.state !== "planning"}>
-              <option value="">Not assigned</option>
-              {#each loadedRepositories?.items ?? [] as repository}
-                <option value={repository.repository_key}>{repository.repository_key}</option>
-              {/each}
-            </select>
-          </label>
-          <label>Ref selector<input bind:value={refSelector} placeholder={selectedRepository?.default_ref ?? "branch, tag, or revision"} disabled={ticket.state !== "planning"} /></label>
+          <div class="ticket-target-list">
+            {#each targetDrafts as target, index}
+              {@const selectedRepository = repositoryFor(target.repository_key)}
+              <fieldset class="ticket-target-row">
+                <legend>Target {index + 1}</legend>
+                <label>Repository
+                  <select bind:value={target.repository_key} disabled={ticket.state !== "planning"} required>
+                    <option value="">Choose repository</option>
+                    {#each loadedRepositories?.items ?? [] as repository}
+                      <option value={repository.repository_key}>{repository.repository_key}</option>
+                    {/each}
+                  </select>
+                </label>
+                <label>Ref selector<input bind:value={target.ref_selector} placeholder={selectedRepository?.default_selector ?? "branch, tag, or revision"} disabled={ticket.state !== "planning"} /></label>
+                <label>Access
+                  <select bind:value={target.access} disabled={ticket.state !== "planning"}>
+                    <option value="read_write">Read and write</option>
+                    <option value="read_only">Read only</option>
+                  </select>
+                </label>
+                {#if ticket.state === "planning"}
+                  <button class="workspace-secondary-button" type="button" onclick={() => removeTarget(index)}>Remove target</button>
+                {/if}
+              </fieldset>
+            {:else}
+              <p class="workspace-empty-copy">No repository targets.</p>
+            {/each}
+          </div>
+          {#if ticket.state === "planning"}
+            <button
+              class="workspace-secondary-button"
+              type="button"
+              onclick={() => addTarget(targetDrafts.some((target) => target.access === "read_write") ? "read_only" : "read_write")}
+            >Add target</button>
+          {/if}
           <button class="workspace-secondary-button" type="submit" disabled={busy === "target" || ticket.state !== "planning"}>
-            {busy === "target" ? "Saving…" : "Save target"}
+            {busy === "target" ? "Saving…" : "Save targets"}
           </button>
         </form>
       </section>
@@ -572,7 +651,7 @@
             {busy === "ready" ? "Marking ready…" : "Mark ready"}
           </button>
           {#if !targetCandidateValid}
-            <p class="workspace-empty-copy">Choose a healthy repository and an effective ref selector before marking ready.</p>
+            <p class="workspace-empty-copy">Add unique healthy repository targets with effective ref selectors and exactly one read-write target before marking ready.</p>
           {/if}
         {:else if ticket.state === "ready"}
           <button class="workspace-primary-button ticket-queue-button" type="button" disabled={busy === "queue" || !ticket.action_eligibility.can_queue} onclick={() => void queueTicket()}>

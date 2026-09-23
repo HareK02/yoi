@@ -14,11 +14,88 @@ function assertEquals(actual: unknown, expected: unknown): void {
   }
 }
 
-function event(
-  kind: string,
-  fields: Record<string, unknown>,
-): MergeRequestThreadEvent {
-  return { kind, sequence: 1, at: "2026-09-01T00:00:00Z", ...fields };
+const worker = { runtime_id: "runtime", worker_id: "worker" };
+const createdAt = "2026-09-01T00:00:00Z";
+
+type ReviewRequested = Extract<
+  MergeRequestThreadEvent,
+  { kind: "review_requested" }
+>;
+type Review = Extract<MergeRequestThreadEvent, { kind: "review" }>;
+type ReviewRevoked = Extract<
+  MergeRequestThreadEvent,
+  { kind: "review_revoked" }
+>;
+type ReviewCancelled = Extract<
+  MergeRequestThreadEvent,
+  { kind: "review_cancelled" }
+>;
+
+function reviewRequested(
+  eventId: string,
+  subjectRef: string,
+): ReviewRequested {
+  return {
+    kind: "review_requested",
+    event_id: eventId,
+    sequence: 1,
+    subject_ref: subjectRef,
+    requested_by: worker,
+    reviewer: worker,
+    created_at: createdAt,
+  };
+}
+
+function review(
+  eventId: string,
+  requestEventId: string,
+  subjectRef: string,
+): Review {
+  return {
+    kind: "review",
+    event_id: eventId,
+    sequence: 1,
+    request_event_id: requestEventId,
+    subject_ref: subjectRef,
+    decision: "approve",
+    body: "approved",
+    findings: [],
+    reviewer: worker,
+    created_at: createdAt,
+  };
+}
+
+function reviewRevoked(
+  eventId: string,
+  reviewEventId: string,
+  subjectRef: string,
+): ReviewRevoked {
+  return {
+    kind: "review_revoked",
+    event_id: eventId,
+    sequence: 1,
+    review_event_id: reviewEventId,
+    subject_ref: subjectRef,
+    reason: "superseded",
+    revoked_by: worker,
+    created_at: createdAt,
+  };
+}
+
+function reviewCancelled(
+  eventId: string,
+  requestEventId: string,
+  subjectRef: string,
+): ReviewCancelled {
+  return {
+    kind: "review_cancelled",
+    event_id: eventId,
+    sequence: 1,
+    request_event_id: requestEventId,
+    subject_ref: subjectRef,
+    reason: "cancelled",
+    created_at: createdAt,
+  };
 }
 
 function detail(thread: MergeRequestThreadEvent[]): MergeRequestDetail {
@@ -30,22 +107,17 @@ function detail(thread: MergeRequestThreadEvent[]): MergeRequestDetail {
     selector_from: "work/ticket",
     selector_to: "develop",
     state: "open",
-    opened_by: {
-      runtime_id: "runtime",
-      worker_id: "worker",
-      assignment_id: "assignment",
-    },
-    created_at: "2026-09-01T00:00:00Z",
-    updated_at: "2026-09-01T00:00:00Z",
+    created_at: createdAt,
+    updated_at: createdAt,
     source: {
       status: "known",
       ref: "source-2",
-      observed_at: "2026-09-01T00:00:00Z",
+      observed_at: createdAt,
     },
     target: {
       status: "known",
       ref: "target-2",
-      observed_at: "2026-09-01T00:00:00Z",
+      observed_at: createdAt,
     },
     linked_tickets: [{ ticket_id: "T-1", key: "T-1" }],
     thread,
@@ -54,20 +126,9 @@ function detail(thread: MergeRequestThreadEvent[]): MergeRequestDetail {
 
 Deno.test("revoked review requires a fresh review instead of appearing pending", () => {
   const mergeRequest = detail([
-    event("review_requested", {
-      event_id: "request-1",
-      subject_ref: "source-2",
-    }),
-    event("review", {
-      event_id: "review-1",
-      request_event_id: "request-1",
-      subject_ref: "source-2",
-      decision: "approve",
-    }),
-    event("review_revoked", {
-      event_id: "revoke-1",
-      review_event_id: "review-1",
-    }),
+    reviewRequested("request-1", "source-2"),
+    review("review-1", "request-1", "source-2"),
+    reviewRevoked("revoke-1", "review-1", "source-2"),
   ]);
 
   assertEquals(
@@ -78,10 +139,7 @@ Deno.test("revoked review requires a fresh review instead of appearing pending",
 
 Deno.test("unresolved review request for the current source is pending", () => {
   const mergeRequest = detail([
-    event("review_requested", {
-      event_id: "request-2",
-      subject_ref: "source-2",
-    }),
+    reviewRequested("request-2", "source-2"),
   ]);
 
   assertEquals(
@@ -92,16 +150,8 @@ Deno.test("unresolved review request for the current source is pending", () => {
 
 Deno.test("completed or cancelled request is not projected as pending", () => {
   const approved = detail([
-    event("review_requested", {
-      event_id: "request-3",
-      subject_ref: "source-2",
-    }),
-    event("review", {
-      event_id: "review-3",
-      request_event_id: "request-3",
-      subject_ref: "source-2",
-      decision: "approve",
-    }),
+    reviewRequested("request-3", "source-2"),
+    review("review-3", "request-3", "source-2"),
   ]);
   assertEquals(
     sourceReviewFreshness(approved),
@@ -109,15 +159,8 @@ Deno.test("completed or cancelled request is not projected as pending", () => {
   );
 
   const cancelled = detail([
-    event("review_requested", {
-      event_id: "request-4",
-      subject_ref: "source-2",
-    }),
-    event("review_cancelled", {
-      event_id: "cancel-4",
-      request_event_id: "request-4",
-      subject_ref: "source-2",
-    }),
+    reviewRequested("request-4", "source-2"),
+    reviewCancelled("cancel-4", "request-4", "source-2"),
   ]);
   assertEquals(
     sourceReviewFreshness(cancelled),
@@ -127,12 +170,7 @@ Deno.test("completed or cancelled request is not projected as pending", () => {
 
 Deno.test("source movement explains the exact stale and current refs", () => {
   const mergeRequest = detail([
-    event("review", {
-      event_id: "review-old",
-      request_event_id: "request-old",
-      subject_ref: "source-1",
-      decision: "approve",
-    }),
+    review("review-old", "request-old", "source-1"),
   ]);
 
   assertEquals(

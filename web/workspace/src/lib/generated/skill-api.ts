@@ -20,22 +20,76 @@ export const SKILL_API_LIMITS = {
 
 export type SkillDiagnosticSeverity = "error" | "warning";
 
-export type SkillDiagnostic = { severity: SkillDiagnosticSeverity, code: string, message: string, source?: string, };
+export type SkillDiagnostic = {
+  severity: SkillDiagnosticSeverity;
+  code: string;
+  message: string;
+  source?: string;
+};
 
 export type SkillSourceKind = "builtin" | "workspace";
 
-export type SkillProvenance = { kind: SkillSourceKind, id: string, virtual_path?: string, revision?: number, source_digest?: string, tree_digest?: string, };
+export type SkillProvenance = {
+  kind: SkillSourceKind;
+  id: string;
+  virtual_path?: string;
+  revision?: number;
+  source_digest?: string;
+  tree_digest?: string;
+};
 
 export type SkillActivationStatus = "active" | "inactive";
 
 export type SkillProjectionStatus = "valid" | "invalid";
 
-export type SkillProjectionIdentity = { config_revision: number, tree_digest: string, };
+export type SkillProjectionIdentity = {
+  config_revision: number;
+  tree_digest: string;
+};
 
-export type SkillResourceRef = { kind: string, name: string, supported: boolean, diagnostic?: string, };
+export type SkillResourceRef = {
+  kind: string;
+  name: string;
+  supported: boolean;
+  diagnostic?: string;
+};
 
-export type SkillCatalogEntry = { name: string, description: string, activation_status: SkillActivationStatus, projection_status: SkillProjectionStatus, provenance: SkillProvenance, overrides: Array<SkillProvenance>, diagnostics: Array<SkillDiagnostic>, };
+export type SkillCatalogEntry = {
+  name: string;
+  description: string;
+  activation_status: SkillActivationStatus;
+  projection_status: SkillProjectionStatus;
+  provenance: SkillProvenance;
+  overrides: Array<SkillProvenance>;
+  diagnostics: Array<SkillDiagnostic>;
+};
 
-export type SkillCatalogResponse = { authority: string, projection: SkillProjectionIdentity, entries: Array<SkillCatalogEntry>, diagnostics: Array<SkillDiagnostic>, };
+export type SkillCatalogResponse = {
+  authority: string;
+  projection: SkillProjectionIdentity;
+  entries: Array<SkillCatalogEntry>;
+  diagnostics: Array<SkillDiagnostic>;
+};
 
-export type SkillDetailResponse = { authority: string, projection: SkillProjectionIdentity, name: string, description: string, provenance: SkillProvenance, overrides: Array<SkillProvenance>, diagnostics: Array<SkillDiagnostic>, activation_status: SkillActivationStatus, projection_status: SkillProjectionStatus, body: string, allowed_tools: Array<string>, allowed_tools_status: string, resources: Array<SkillResourceRef>, };
+export type SkillDetailResponse = {
+  authority: string;
+  projection: SkillProjectionIdentity;
+  name: string;
+  description: string;
+  provenance: SkillProvenance;
+  overrides: Array<SkillProvenance>;
+  diagnostics: Array<SkillDiagnostic>;
+  activation_status: SkillActivationStatus;
+  projection_status: SkillProjectionStatus;
+  body: string;
+  allowed_tools: Array<string>;
+  allowed_tools_status: string;
+  resources: Array<SkillResourceRef>;
+};
+
+export type SkillActivationResponse = {
+  name: string;
+  provenance: SkillProvenance;
+  diagnostics: Array<SkillDiagnostic>;
+  body: string;
+};

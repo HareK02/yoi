@@ -1,0 +1,5 @@
+error: duplicate response header name within one response
+ --> tests/ui/duplicate_response_header.rs:9:80
+  |
+9 |         responses = [(status = 200, body = Body, headers = [("etag", String), ("ETag", String)])]
+  |                                                                                ^^^^^^

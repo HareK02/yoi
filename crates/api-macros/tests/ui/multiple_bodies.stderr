@@ -1,4 +1,4 @@
-error: an API operation may declare only one request body
+error: an API operation may declare only one JSON or binary request body
   --> tests/ui/multiple_bodies.rs:13:17
    |
 13 |         #[body] second: SecondBody,

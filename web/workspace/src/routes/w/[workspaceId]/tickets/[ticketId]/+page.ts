@@ -1,12 +1,16 @@
 import { redirect } from "@sveltejs/kit";
 import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
 import { loadWorkspaceRepositoryList } from "$lib/workspace/api/repositories";
+import { parseBrowserWorkspaceOrchestratorResponse } from "$lib/workspace/api/workers";
+import {
+  parseTicketDetail,
+  TICKET_BROWSER_API_LOAD_POLICY,
+} from "$lib/workspace/api/ticket-browser";
 import {
   canonicalResourceReference,
   resourceKey,
 } from "$lib/workspace/resource-links";
 import type { WorkspaceOrchestratorStatus } from "$lib/workspace/tickets/ticket-panel";
-import type { TicketDetail } from "$lib/workspace/sidebar/types";
 import type { PageLoad } from "./$types";
 
 export const load = (async ({ fetch, params }) => {
@@ -16,11 +20,19 @@ export const load = (async ({ fetch, params }) => {
     `/tickets/${encodeURIComponent(reference)}`,
   );
   const [ticket, repositoriesRaw, orchestrator] = await Promise.all([
-    loadJson<TicketDetail>(fetch, ticketPath),
+    loadJson(
+      fetch,
+      ticketPath,
+      undefined,
+      parseTicketDetail,
+      TICKET_BROWSER_API_LOAD_POLICY,
+    ),
     loadWorkspaceRepositoryList(fetch, params.workspaceId),
     loadJson<WorkspaceOrchestratorStatus>(
       fetch,
       workspaceApiPath(params.workspaceId, "/orchestrator"),
+      undefined,
+      parseBrowserWorkspaceOrchestratorResponse,
     ),
   ]);
   if (ticket.data) {

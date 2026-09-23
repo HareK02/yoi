@@ -21,7 +21,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 65;
+const LATEST_SCHEMA_VERSION: i64 = 66;
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
@@ -46,6 +46,10 @@ const MULTI_WORKDIR_ATTACHMENTS_MIGRATION_NAME: &str =
 const EXTERNAL_WORKDIR_GRANTS_MIGRATION_NAME: &str = "typed client-hosted External Workdir grants";
 const EXTERNAL_WORKDIR_CLEANUP_MIGRATION_NAME: &str =
     "durable External Workdir expiry cleanup state";
+const TICKET_TARGETS_AND_WORKDIR_CAPABILITIES_MIGRATION_NAME: &str =
+    "Ticket target collection and Workdir attachment capabilities";
+const TICKET_SCHEMA_VERSION_WITH_TARGETS: i64 = 7;
+const TICKET_SCHEMA_BASELINE_NAME: &str = "ticket schema baseline";
 const WORKER_REGISTRY_PROJECTION_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS worker_registry_observations (
     workspace_id TEXT NOT NULL,
@@ -165,6 +169,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 65,
         name: EXTERNAL_WORKDIR_CLEANUP_MIGRATION_NAME,
         apply: migrate_external_workdir_cleanup_v64_to_v65,
+    },
+    Migration {
+        version: 66,
+        name: TICKET_TARGETS_AND_WORKDIR_CAPABILITIES_MIGRATION_NAME,
+        apply: migrate_ticket_targets_and_workdir_capabilities_v65_to_v66,
     },
 ];
 
@@ -873,6 +882,7 @@ pub struct WorkerWorkdirLinkRecord {
     pub worker: RuntimeWorkerRef,
     pub workdir_id: String,
     pub alias: String,
+    pub capabilities: workdir::WorkdirSessionCapabilities,
     pub linked_at: String,
     pub unlinked_at: Option<String>,
 }
@@ -1721,6 +1731,12 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         &self,
         record: &WorkerWorkdirLinkRecord,
     ) -> Result<WorkerWorkdirLinkRecord>;
+    fn replace_worker_workdir_link_capabilities(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        active_links: &[WorkerWorkdirLinkRecord],
+    ) -> Result<()>;
     fn detach_worker_workdir(
         &self,
         workspace_id: &str,
@@ -6848,23 +6864,29 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     )));
             }
 
-            let (state, repository_id, ref_selector): (String, Option<String>, Option<String>) = tx
-                .query_row(
-                    "SELECT workflow_state, repository_id, ref_selector FROM typed_tickets
-                      WHERE workspace_id = ?1 AND ticket_id = ?2",
-                    params![record.workspace_id, record.ticket_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )?;
+            let state: String = tx.query_row(
+                "SELECT workflow_state FROM typed_tickets
+                  WHERE workspace_id = ?1 AND ticket_id = ?2",
+                params![record.workspace_id, record.ticket_id],
+                |row| row.get(0),
+            )?;
             if state != "ready" {
                 return Err(Error::TicketAssignmentConflict(format!(
                     "manual Coder assignment requires ready Ticket; current state is `{state}`"
                 )));
             }
-            if repository_id.as_deref().is_none_or(str::is_empty)
-                || ref_selector.as_deref().is_none_or(str::is_empty)
-            {
+            let (target_count, read_write_count): (i64, i64) = tx.query_row(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(CASE WHEN access = 'read_write' THEN 1 ELSE 0 END), 0)
+                   FROM typed_ticket_targets
+                  WHERE workspace_id = ?1 AND ticket_id = ?2",
+                params![record.workspace_id, record.ticket_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if target_count == 0 || read_write_count != 1 {
                 return Err(Error::TicketAssignmentConflict(
-                    "manual Coder assignment requires a valid repository/ref target".to_string(),
+                    "manual Coder assignment requires exactly one read_write repository target"
+                        .to_string(),
                 ));
             }
             let unresolved_blockers: i64 = tx.query_row(
@@ -8034,9 +8056,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             }
             tx.execute(
                 r#"INSERT INTO worker_workdir_links (
-                    workspace_id, runtime_id, worker_id, workdir_id, alias, linked_at, unlinked_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
+                    workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
                 ON CONFLICT(workspace_id, worker_id, workdir_id, alias) DO UPDATE SET
+                    capabilities = excluded.capabilities,
                     linked_at = excluded.linked_at,
                     unlinked_at = NULL"#,
                 params![
@@ -8045,6 +8068,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     record.worker.worker_id,
                     record.workdir_id,
                     record.alias,
+                    encode_workdir_link_capabilities(record.capabilities)?,
                     record.linked_at,
                 ],
             )
@@ -8118,7 +8142,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             }
             let active_for_alias = tx
                 .query_row(
-                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, linked_at, unlinked_at
+                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
                        FROM worker_workdir_links
                        WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
                          AND alias = ?4 AND unlinked_at IS NULL"#,
@@ -8131,8 +8155,26 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     read_worker_workdir_link_record,
                 )
                 .optional()?;
-            if let Some(active) = active_for_alias {
+            if let Some(mut active) = active_for_alias {
                 if active.workdir_id == record.workdir_id {
+                    let capabilities = active.capabilities.intersection(record.capabilities);
+                    if capabilities != active.capabilities {
+                        tx.execute(
+                            r#"UPDATE worker_workdir_links
+                               SET capabilities = ?1
+                               WHERE workspace_id = ?2 AND runtime_id = ?3 AND worker_id = ?4
+                                 AND workdir_id = ?5 AND alias = ?6 AND unlinked_at IS NULL"#,
+                            params![
+                                encode_workdir_link_capabilities(capabilities)?,
+                                record.workspace_id,
+                                record.worker.runtime_id,
+                                record.worker.worker_id,
+                                record.workdir_id,
+                                record.alias,
+                            ],
+                        )?;
+                        active.capabilities = capabilities;
+                    }
                     tx.commit()?;
                     return Ok(active);
                 }
@@ -8143,7 +8185,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             }
             let active_for_workdir = tx
                 .query_row(
-                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, linked_at, unlinked_at
+                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
                        FROM worker_workdir_links
                        WHERE workspace_id = ?1 AND workdir_id = ?2 AND unlinked_at IS NULL"#,
                     params![record.workspace_id, record.workdir_id],
@@ -8158,9 +8200,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             }
             let write = tx.execute(
                 r#"INSERT INTO worker_workdir_links (
-                    workspace_id, runtime_id, worker_id, workdir_id, alias, linked_at, unlinked_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
+                    workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
                 ON CONFLICT(workspace_id, worker_id, workdir_id, alias) DO UPDATE SET
+                    capabilities = excluded.capabilities,
                     linked_at = excluded.linked_at,
                     unlinked_at = NULL"#,
                 params![
@@ -8169,6 +8212,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     record.worker.worker_id,
                     record.workdir_id,
                     record.alias,
+                    encode_workdir_link_capabilities(record.capabilities)?,
                     record.linked_at,
                 ],
             );
@@ -8186,6 +8230,92 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn replace_worker_workdir_link_capabilities(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        active_links: &[WorkerWorkdirLinkRecord],
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let mut stmt = tx.prepare(
+                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
+                   FROM worker_workdir_links
+                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
+                     AND unlinked_at IS NULL"#,
+            )?;
+            let persisted = stmt
+                .query_map(
+                    params![workspace_id, worker.runtime_id, worker.worker_id],
+                    read_worker_workdir_link_record,
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(stmt);
+
+            let mut persisted_identity = persisted
+                .iter()
+                .map(|link| (link.alias.as_str(), link.workdir_id.as_str()))
+                .collect::<Vec<_>>();
+            persisted_identity.sort_unstable();
+            let mut requested_identity = active_links
+                .iter()
+                .map(|link| {
+                    if link.workspace_id != workspace_id
+                        || link.worker != *worker
+                        || link.unlinked_at.is_some()
+                    {
+                        return Err(Error::WorkdirAttachmentConflict(
+                            "Workdir capability replacement contains a foreign or inactive attachment"
+                                .to_string(),
+                        ));
+                    }
+                    workdir::WorkdirAttachmentAlias::new(link.alias.clone()).map_err(|error| {
+                        Error::WorkdirAttachmentConflict(format!(
+                            "invalid Workdir attachment alias `{}`: {error}",
+                            link.alias
+                        ))
+                    })?;
+                    Ok((link.alias.as_str(), link.workdir_id.as_str()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            requested_identity.sort_unstable();
+            if persisted_identity != requested_identity {
+                return Err(Error::WorkdirAttachmentConflict(format!(
+                    "Worker {}:{} attachments changed during capability replacement",
+                    worker.runtime_id, worker.worker_id
+                )));
+            }
+
+            for link in active_links {
+                let changed = tx.execute(
+                    r#"UPDATE worker_workdir_links
+                       SET capabilities = ?1
+                       WHERE workspace_id = ?2 AND runtime_id = ?3 AND worker_id = ?4
+                         AND workdir_id = ?5 AND alias = ?6 AND unlinked_at IS NULL"#,
+                    params![
+                        encode_workdir_link_capabilities(link.capabilities)?,
+                        workspace_id,
+                        worker.runtime_id,
+                        worker.worker_id,
+                        link.workdir_id,
+                        link.alias,
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(Error::WorkdirAttachmentConflict(format!(
+                        "Worker {}:{} attachment `{}` changed during capability replacement",
+                        worker.runtime_id, worker.worker_id, link.alias
+                    )));
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     fn detach_worker_workdir(
         &self,
         workspace_id: &str,
@@ -8200,7 +8330,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )?;
             let active = tx
                 .query_row(
-                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, linked_at, unlinked_at
+                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
                        FROM worker_workdir_links
                        WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
                          AND (?4 IS NULL OR workdir_id = ?4) AND unlinked_at IS NULL"#,
@@ -8264,7 +8394,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<Vec<WorkerWorkdirLinkRecord>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, linked_at, unlinked_at
+                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
                    FROM worker_workdir_links
                    WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3 AND unlinked_at IS NULL
                    ORDER BY linked_at DESC"#,
@@ -8285,7 +8415,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<Vec<WorkerWorkdirLinkRecord>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, linked_at, unlinked_at
+                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
                    FROM worker_workdir_links
                    WHERE workspace_id = ?1 AND workdir_id = ?2 AND unlinked_at IS NULL
                    ORDER BY linked_at DESC"#,
@@ -8306,7 +8436,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<Option<WorkerWorkdirLinkRecord>> {
         self.with_conn(|conn| {
             conn.query_row(
-                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, linked_at, unlinked_at
+                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
                    FROM worker_workdir_links
                    WHERE workspace_id = ?1 AND workdir_id = ?2
                    ORDER BY linked_at DESC, rowid DESC
@@ -8993,16 +9123,47 @@ fn read_device_login_flow_record(
     })
 }
 
+fn encode_workdir_link_capabilities(
+    capabilities: workdir::WorkdirSessionCapabilities,
+) -> Result<&'static str> {
+    if capabilities == workdir::WorkdirSessionCapabilities::ALL {
+        Ok("all")
+    } else if capabilities == workdir::WorkdirSessionCapabilities::READ_ONLY {
+        Ok("read_only")
+    } else {
+        Err(Error::InvalidInput(
+            "Workdir attachment capabilities must be exactly all or read_only".to_string(),
+        ))
+    }
+}
+
+fn decode_workdir_link_capabilities(
+    value: &str,
+    column: usize,
+) -> rusqlite::Result<workdir::WorkdirSessionCapabilities> {
+    match value {
+        "all" => Ok(workdir::WorkdirSessionCapabilities::ALL),
+        "read_only" => Ok(workdir::WorkdirSessionCapabilities::READ_ONLY),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            format!("invalid Worker Workdir link capabilities {value:?}").into(),
+        )),
+    }
+}
+
 fn read_worker_workdir_link_record(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<WorkerWorkdirLinkRecord> {
+    let capabilities = decode_workdir_link_capabilities(&row.get::<_, String>(5)?, 5)?;
     Ok(WorkerWorkdirLinkRecord {
         workspace_id: row.get(0)?,
         worker: RuntimeWorkerRef::new(row.get::<_, String>(1)?, row.get::<_, String>(2)?),
         workdir_id: row.get(3)?,
         alias: row.get(4)?,
-        linked_at: row.get(5)?,
-        unlinked_at: row.get(6)?,
+        capabilities,
+        linked_at: row.get(6)?,
+        unlinked_at: row.get(7)?,
     })
 }
 
@@ -9913,13 +10074,27 @@ fn read_workdir_registry_record(
 
 fn prepare_connection(conn: &Connection) -> Result<()> {
     configure_sqlite(conn)?;
-    ticket::migrate_sqlite_ticket_schema(conn)
-        .map_err(|error| Error::Store(format!("Ticket schema verification failed: {error}")))?;
-    merge_request::migrate(conn).map_err(|error| {
-        Error::Store(format!("Merge Request schema verification failed: {error}"))
-    })?;
-    apply_migrations(conn)
-        .map_err(|error| Error::Store(format!("workspace schema migration failed: {error}")))?;
+    let workspace_schema_version = current_schema_version(conn)?;
+    if workspace_schema_version == 0 {
+        ticket::migrate_sqlite_ticket_schema(conn)
+            .map_err(|error| Error::Store(format!("Ticket schema verification failed: {error}")))?;
+        merge_request::migrate(conn).map_err(|error| {
+            Error::Store(format!("Merge Request schema verification failed: {error}"))
+        })?;
+        apply_migrations(conn)
+            .map_err(|error| Error::Store(format!("workspace schema migration failed: {error}")))?;
+    } else {
+        // Workspace migrations own cross-domain table rebuilds. Apply them before
+        // component verification so the Ticket crate sees its new canonical target
+        // schema and migration marker rather than rejecting the legacy singular shape.
+        apply_migrations(conn)
+            .map_err(|error| Error::Store(format!("workspace schema migration failed: {error}")))?;
+        ticket::migrate_sqlite_ticket_schema(conn)
+            .map_err(|error| Error::Store(format!("Ticket schema verification failed: {error}")))?;
+        merge_request::migrate(conn).map_err(|error| {
+            Error::Store(format!("Merge Request schema verification failed: {error}"))
+        })?;
+    }
     validate_workspace_resource_references(conn)?;
     verify_workspace_resource_constraints(conn)
 }
@@ -11354,8 +11529,499 @@ fn migrate_external_workdir_cleanup_v64_to_v65(conn: &Connection) -> Result<()> 
     Ok(())
 }
 
+fn migrate_ticket_targets_and_workdir_capabilities_v65_to_v66(conn: &Connection) -> Result<()> {
+    let current = current_schema_version(conn)?;
+    if current != 65 {
+        return Err(Error::Store(format!(
+            "expected schema version 65 before {TICKET_TARGETS_AND_WORKDIR_CAPABILITIES_MIGRATION_NAME} migration, found {current}"
+        )));
+    }
+    apply_ticket_targets_and_workdir_capabilities_schema(conn)
+}
+
+fn apply_ticket_targets_and_workdir_capabilities_schema(conn: &Connection) -> Result<()> {
+    let foreign_keys_enabled =
+        conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))? != 0;
+    let legacy_alter_table_enabled =
+        conn.query_row("PRAGMA legacy_alter_table", [], |row| row.get::<_, i64>(0))? != 0;
+    if foreign_keys_enabled {
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    }
+    if !legacy_alter_table_enabled {
+        conn.execute_batch("PRAGMA legacy_alter_table = ON;")?;
+    }
+
+    let result = (|| {
+        let transaction =
+            rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+        let db: &Connection = &transaction;
+        let ticket_columns = table_columns(db, "typed_tickets")?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let has_repository_id = ticket_columns.contains("repository_id");
+        let has_ref_selector = ticket_columns.contains("ref_selector");
+        if has_repository_id != has_ref_selector {
+            return Err(Error::Store(
+                "typed_tickets has only one legacy singular target column".to_string(),
+            ));
+        }
+
+        let ticket_migration_history = {
+            let mut statement =
+                db.prepare("SELECT version, name FROM ticket_schema_migrations ORDER BY version")?;
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let expected_ticket_history = vec![(
+            TICKET_SCHEMA_VERSION_WITH_TARGETS - 1,
+            TICKET_SCHEMA_BASELINE_NAME.to_string(),
+        )];
+        if !has_repository_id || ticket_migration_history != expected_ticket_history {
+            return Err(Error::Store(format!(
+                "schema-65 Ticket authority is not the canonical version {} singular-target baseline: columns={ticket_columns:?}, history={ticket_migration_history:?}",
+                TICKET_SCHEMA_VERSION_WITH_TARGETS - 1
+            )));
+        }
+
+        if has_repository_id {
+            if table_exists(db, "typed_ticket_targets")? {
+                return Err(Error::Store(
+                    "legacy singular Ticket targets coexist with typed_ticket_targets".to_string(),
+                ));
+            }
+            let incomplete_targets: i64 = db.query_row(
+                "SELECT COUNT(*) FROM typed_tickets
+                  WHERE (repository_id IS NULL AND ref_selector IS NOT NULL)
+                     OR (repository_id IS NOT NULL AND trim(repository_id) = '')
+                     OR (ref_selector IS NOT NULL AND trim(ref_selector) = '')
+                     OR (repository_id IS NOT NULL AND NOT EXISTS (
+                            SELECT 1 FROM repositories AS repository
+                             WHERE repository.workspace_id = typed_tickets.workspace_id
+                               AND repository.repository_id = typed_tickets.repository_id
+                        ))",
+                [],
+                |row| row.get(0),
+            )?;
+            if incomplete_targets != 0 {
+                return Err(Error::Store(format!(
+                    "cannot migrate {incomplete_targets} Ticket(s) with incomplete singular targets"
+                )));
+            }
+            let mixed_version_attributes: i64 = db.query_row(
+                "SELECT COUNT(*) FROM typed_ticket_event_attributes
+                  WHERE key IN ('targets', 'fingerprint_version')",
+                [],
+                |row| row.get(0),
+            )?;
+            if mixed_version_attributes != 0 {
+                return Err(Error::Store(format!(
+                    "cannot migrate schema-65 Ticket evidence containing {mixed_version_attributes} canonical target attribute(s)"
+                )));
+            }
+            let incomplete_event_targets: i64 = db.query_row(
+                "SELECT COUNT(*)
+                   FROM typed_ticket_event_attributes AS attribute
+                  WHERE attribute.key IN ('repository_id', 'ref_selector')
+                    AND NOT EXISTS (
+                        SELECT 1 FROM typed_ticket_event_attributes AS counterpart
+                         WHERE counterpart.workspace_id = attribute.workspace_id
+                           AND counterpart.ticket_id = attribute.ticket_id
+                           AND counterpart.event_index = attribute.event_index
+                           AND counterpart.key = CASE attribute.key
+                               WHEN 'repository_id' THEN 'ref_selector'
+                               ELSE 'repository_id'
+                           END
+                    )",
+                [],
+                |row| row.get(0),
+            )?;
+            if incomplete_event_targets != 0 {
+                return Err(Error::Store(format!(
+                    "cannot migrate {incomplete_event_targets} incomplete legacy Ticket target evidence attribute(s)"
+                )));
+            }
+            let legacy_event_targets = {
+                let mut statement = db.prepare(
+                    "SELECT attribute.workspace_id, attribute.ticket_id, attribute.event_index,
+                            repository.repository_key, selector.value
+                       FROM typed_ticket_event_attributes AS attribute
+                       LEFT JOIN typed_ticket_event_attributes AS selector
+                         ON selector.workspace_id = attribute.workspace_id
+                        AND selector.ticket_id = attribute.ticket_id
+                        AND selector.event_index = attribute.event_index
+                        AND selector.key = 'ref_selector'
+                       LEFT JOIN repositories AS repository
+                         ON repository.workspace_id = attribute.workspace_id
+                        AND repository.repository_id = attribute.value
+                      WHERE attribute.key = 'repository_id'
+                      ORDER BY attribute.workspace_id, attribute.ticket_id, attribute.event_index",
+                )?;
+                statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for (_, ticket_id, _, repository_key, ref_selector) in &legacy_event_targets {
+                if repository_key.is_none() || ref_selector.is_none() {
+                    return Err(Error::Store(format!(
+                        "cannot migrate legacy target evidence for Ticket {ticket_id:?}"
+                    )));
+                }
+            }
+            db.execute_batch(
+                r#"
+                CREATE TEMP TABLE typed_ticket_targets_v66 AS
+                    SELECT ticket.workspace_id, ticket.ticket_id, 0 AS ordinal,
+                           repository.repository_key,
+                           ticket.ref_selector, 'read_write' AS access
+                      FROM typed_tickets AS ticket
+                      JOIN repositories AS repository
+                        ON repository.workspace_id = ticket.workspace_id
+                       AND repository.repository_id = ticket.repository_id
+                     WHERE ticket.repository_id IS NOT NULL;
+                ALTER TABLE typed_tickets RENAME TO typed_tickets_legacy_v66;
+                CREATE TABLE typed_tickets (
+                    workspace_id TEXT NOT NULL,
+                    ticket_id TEXT NOT NULL,
+                    slug TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    priority TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    assignee TEXT,
+                    readiness TEXT,
+                    workflow_state TEXT NOT NULL,
+                    workflow_state_explicit INTEGER NOT NULL,
+                    queued_by TEXT,
+                    queued_at TEXT,
+                    resolution TEXT,
+                    PRIMARY KEY (workspace_id, ticket_id),
+                    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+                );
+                INSERT INTO typed_tickets (
+                    workspace_id, ticket_id, slug, title, status, kind, priority, body,
+                    created_at, updated_at, assignee, readiness, workflow_state,
+                    workflow_state_explicit, queued_by, queued_at, resolution
+                )
+                SELECT workspace_id, ticket_id, slug, title, status, kind, priority, body,
+                       created_at, updated_at, assignee, readiness, workflow_state,
+                       workflow_state_explicit, queued_by, queued_at, resolution
+                  FROM typed_tickets_legacy_v66;
+                DROP TABLE typed_tickets_legacy_v66;
+                CREATE INDEX idx_typed_tickets_workspace_state_updated
+                    ON typed_tickets(workspace_id, workflow_state, updated_at DESC, ticket_id);
+                CREATE INDEX idx_typed_tickets_workspace_updated
+                    ON typed_tickets(workspace_id, updated_at DESC, ticket_id);
+                CREATE TRIGGER ticket_assignment_ticket_parent_tombstone
+                    BEFORE DELETE ON typed_tickets
+                    WHEN EXISTS (
+                        SELECT 1 FROM ticket_worker_assignments AS assignment
+                        WHERE assignment.workspace_id = OLD.workspace_id
+                          AND assignment.ticket_id = OLD.ticket_id
+                    )
+                    BEGIN
+                        INSERT OR IGNORE INTO ticket_assignment_ticket_tombstones (
+                            workspace_id, ticket_id, deleted_at
+                        ) VALUES (OLD.workspace_id, OLD.ticket_id, CURRENT_TIMESTAMP);
+                    END;
+                CREATE TABLE typed_ticket_targets (
+                    workspace_id TEXT NOT NULL,
+                    ticket_id TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    repository_key TEXT NOT NULL,
+                    ref_selector TEXT,
+                    access TEXT NOT NULL CHECK (access IN ('read_only', 'read_write')),
+                    PRIMARY KEY (workspace_id, ticket_id, ordinal),
+                    UNIQUE (workspace_id, ticket_id, repository_key),
+                    FOREIGN KEY (workspace_id, ticket_id)
+                        REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE,
+                    FOREIGN KEY (workspace_id, repository_key)
+                        REFERENCES repositories(workspace_id, repository_key) ON DELETE RESTRICT
+                );
+                INSERT INTO typed_ticket_targets (
+                    workspace_id, ticket_id, ordinal, repository_key, ref_selector, access
+                )
+                SELECT workspace_id, ticket_id, ordinal, repository_key, ref_selector, access
+                  FROM typed_ticket_targets_v66;
+                DROP TABLE typed_ticket_targets_v66;
+                CREATE INDEX typed_ticket_targets_workspace_repository
+                    ON typed_ticket_targets(workspace_id, repository_key, ticket_id);
+                "#,
+            )?;
+            for (workspace_id, ticket_id, event_index, repository_key, ref_selector) in
+                legacy_event_targets
+            {
+                let repository_key = repository_key.ok_or_else(|| {
+                    Error::Store(format!(
+                        "legacy target evidence for Ticket {ticket_id:?} has no repository key"
+                    ))
+                })?;
+                let ref_selector = ref_selector.ok_or_else(|| {
+                    Error::Store(format!(
+                        "legacy target evidence for Ticket {ticket_id:?} has no ref selector"
+                    ))
+                })?;
+                let targets = serde_json::to_string(&[serde_json::json!({
+                    "repository_key": repository_key,
+                    "ref_selector": ref_selector,
+                    "access": "read_write",
+                })])
+                .map_err(|error| {
+                    Error::Store(format!(
+                        "serialize migrated Ticket target evidence: {error}"
+                    ))
+                })?;
+                db.execute(
+                    "INSERT INTO typed_ticket_event_attributes (
+                         workspace_id, ticket_id, event_index, key, value
+                     ) VALUES (?1, ?2, ?3, 'targets', ?4)",
+                    params![workspace_id, ticket_id, event_index, targets],
+                )?;
+                db.execute(
+                    "INSERT INTO typed_ticket_event_attributes (
+                         workspace_id, ticket_id, event_index, key, value
+                     ) VALUES (?1, ?2, ?3, 'fingerprint_version', '1')",
+                    params![workspace_id, ticket_id, event_index],
+                )?;
+            }
+            db.execute(
+                "DELETE FROM typed_ticket_event_attributes
+                  WHERE key IN ('repository_id', 'ref_selector')",
+                [],
+            )?;
+        }
+
+        if column_exists(db, "worker_workdir_links", "capabilities")? {
+            return Err(Error::Store(
+                "schema-65 Worker Workdir links already contain schema-66 capabilities".to_string(),
+            ));
+        }
+        let unmappable_links: i64 = db.query_row(
+            "SELECT COUNT(*)
+                   FROM worker_workdir_links AS link
+                   LEFT JOIN workdir_registry AS registry
+                     ON registry.workspace_id = link.workspace_id
+                    AND registry.workdir_id = link.workdir_id
+                  WHERE registry.workdir_id IS NULL
+                     OR registry.source_kind NOT IN ('repository', 'external_grant')",
+            [],
+            |row| row.get(0),
+        )?;
+        if unmappable_links != 0 {
+            return Err(Error::Store(format!(
+                "cannot migrate {unmappable_links} Workdir attachment link(s) without a supported registered source"
+            )));
+        }
+        db.execute_batch(
+                r#"
+                CREATE TEMP TABLE worker_workdir_links_v66 AS
+                    SELECT link.workspace_id, link.runtime_id, link.worker_id,
+                           link.workdir_id, link.alias,
+                           CASE registry.source_kind
+                               WHEN 'repository' THEN 'all'
+                               WHEN 'external_grant' THEN 'read_only'
+                           END AS capabilities,
+                           link.linked_at, link.unlinked_at
+                      FROM worker_workdir_links AS link
+                      JOIN workdir_registry AS registry
+                        ON registry.workspace_id = link.workspace_id
+                       AND registry.workdir_id = link.workdir_id;
+                ALTER TABLE worker_workdir_links RENAME TO worker_workdir_links_legacy_v66;
+                CREATE TABLE worker_workdir_links (
+                    workspace_id TEXT NOT NULL,
+                    runtime_id TEXT NOT NULL,
+                    worker_id TEXT NOT NULL,
+                    workdir_id TEXT NOT NULL,
+                    alias TEXT NOT NULL,
+                    capabilities TEXT NOT NULL CHECK (capabilities IN ('all', 'read_only')),
+                    linked_at TEXT NOT NULL,
+                    unlinked_at TEXT,
+                    PRIMARY KEY (workspace_id, worker_id, workdir_id, alias),
+                    FOREIGN KEY (workspace_id, worker_id)
+                        REFERENCES worker_registry(workspace_id, worker_id) ON DELETE CASCADE,
+                    FOREIGN KEY (workspace_id, workdir_id)
+                        REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE
+                );
+                INSERT INTO worker_workdir_links (
+                    workspace_id, runtime_id, worker_id, workdir_id, alias,
+                    capabilities, linked_at, unlinked_at
+                )
+                SELECT workspace_id, runtime_id, worker_id, workdir_id, alias,
+                       capabilities, linked_at, unlinked_at
+                  FROM worker_workdir_links_v66;
+                DROP TABLE worker_workdir_links_legacy_v66;
+                DROP TABLE worker_workdir_links_v66;
+                CREATE UNIQUE INDEX worker_workdir_links_active_workdir_unique
+                    ON worker_workdir_links(workspace_id, workdir_id) WHERE unlinked_at IS NULL;
+                CREATE UNIQUE INDEX worker_workdir_links_active_alias_unique
+                    ON worker_workdir_links(workspace_id, worker_id, alias) WHERE unlinked_at IS NULL;
+                CREATE INDEX worker_workdir_links_workdir
+                    ON worker_workdir_links(workspace_id, workdir_id);
+                CREATE TRIGGER workdir_attachment_insert_blocked_by_runtime_removal
+                    BEFORE INSERT ON worker_workdir_links FOR EACH ROW
+                    WHEN EXISTS (
+                        SELECT 1 FROM runtime_removal_operations operation
+                        WHERE operation.runtime_id = NEW.runtime_id
+                          AND operation.state IN ('pending', 'cleanup_pending')
+                    )
+                    BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+                CREATE TRIGGER workdir_attachment_update_blocked_by_runtime_removal
+                    BEFORE UPDATE ON worker_workdir_links FOR EACH ROW
+                    WHEN EXISTS (
+                        SELECT 1 FROM runtime_removal_operations operation
+                        WHERE operation.runtime_id = NEW.runtime_id
+                          AND operation.state IN ('pending', 'cleanup_pending')
+                    )
+                    BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+            "#,
+        )?;
+
+        let invalid_capabilities: i64 = db.query_row(
+            "SELECT COUNT(*) FROM worker_workdir_links
+              WHERE capabilities IS NULL OR capabilities NOT IN ('all', 'read_only')",
+            [],
+            |row| row.get(0),
+        )?;
+        if invalid_capabilities != 0 {
+            return Err(Error::Store(format!(
+                "schema-66 migration produced {invalid_capabilities} invalid Workdir attachment capability row(s)"
+            )));
+        }
+
+        db.execute("DELETE FROM ticket_schema_migrations", [])?;
+        db.execute(
+            "INSERT INTO ticket_schema_migrations (version, name, applied_at)
+             VALUES (?1, ?2, CURRENT_TIMESTAMP)",
+            params![
+                TICKET_SCHEMA_VERSION_WITH_TARGETS,
+                TICKET_SCHEMA_BASELINE_NAME
+            ],
+        )?;
+        ticket::verify_sqlite_ticket_schema(db).map_err(|error| {
+            Error::Store(format!(
+                "schema-66 Ticket schema verification failed: {error}"
+            ))
+        })?;
+
+        let foreign_key_violations =
+            db.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        if foreign_key_violations != 0 {
+            return Err(Error::Store(format!(
+                "schema-66 migration left {foreign_key_violations} foreign-key violation(s)"
+            )));
+        }
+        db.execute(
+            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+            params![
+                66_i64,
+                TICKET_TARGETS_AND_WORKDIR_CAPABILITIES_MIGRATION_NAME
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })();
+
+    let restore_result = match (legacy_alter_table_enabled, foreign_keys_enabled) {
+        (false, true) => {
+            conn.execute_batch("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;")
+        }
+        (false, false) => conn.execute_batch("PRAGMA legacy_alter_table = OFF;"),
+        (true, true) => conn.execute_batch("PRAGMA foreign_keys = ON;"),
+        (true, false) => Ok(()),
+    }
+    .map_err(Error::from);
+    match (result, restore_result) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch("DROP TABLE IF EXISTS typed_ticket_targets;")?;
     conn.execute_batch(include_str!("latest_schema.sql"))?;
+    conn.execute_batch(
+        r#"
+        ALTER TABLE typed_tickets RENAME TO typed_tickets_legacy_v66;
+        CREATE TABLE typed_tickets (
+            workspace_id TEXT NOT NULL,
+            ticket_id TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            priority TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at TEXT,
+            updated_at TEXT,
+            assignee TEXT,
+            readiness TEXT,
+            workflow_state TEXT NOT NULL,
+            workflow_state_explicit INTEGER NOT NULL,
+            queued_by TEXT,
+            queued_at TEXT,
+            resolution TEXT,
+            PRIMARY KEY (workspace_id, ticket_id),
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+        );
+        DROP TABLE typed_tickets_legacy_v66;
+        CREATE INDEX idx_typed_tickets_workspace_state_updated
+            ON typed_tickets(workspace_id, workflow_state, updated_at DESC, ticket_id);
+        CREATE INDEX idx_typed_tickets_workspace_updated
+            ON typed_tickets(workspace_id, updated_at DESC, ticket_id);
+        CREATE TRIGGER ticket_assignment_ticket_parent_tombstone
+            BEFORE DELETE ON typed_tickets
+            WHEN EXISTS (
+                SELECT 1 FROM ticket_worker_assignments AS assignment
+                WHERE assignment.workspace_id = OLD.workspace_id
+                  AND assignment.ticket_id = OLD.ticket_id
+            )
+            BEGIN
+                INSERT OR IGNORE INTO ticket_assignment_ticket_tombstones (
+                    workspace_id, ticket_id, deleted_at
+                ) VALUES (OLD.workspace_id, OLD.ticket_id, CURRENT_TIMESTAMP);
+            END;
+        CREATE TABLE typed_ticket_targets (
+            workspace_id TEXT NOT NULL,
+            ticket_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            repository_key TEXT NOT NULL,
+            ref_selector TEXT,
+            access TEXT NOT NULL CHECK (access IN ('read_only', 'read_write')),
+            PRIMARY KEY (workspace_id, ticket_id, ordinal),
+            UNIQUE (workspace_id, ticket_id, repository_key),
+            FOREIGN KEY (workspace_id, ticket_id)
+                REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE,
+            FOREIGN KEY (workspace_id, repository_key)
+                REFERENCES repositories(workspace_id, repository_key) ON DELETE RESTRICT
+        );
+        CREATE INDEX typed_ticket_targets_workspace_repository
+            ON typed_ticket_targets(workspace_id, repository_key, ticket_id);
+        ALTER TABLE worker_workdir_links
+            ADD COLUMN capabilities TEXT NOT NULL
+            CHECK (capabilities IN ('all', 'read_only'));
+        "#,
+    )?;
+    ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
+        Error::Store(format!(
+            "fresh Workspace Ticket schema verification failed: {error}"
+        ))
+    })?;
     Ok(())
 }
 
@@ -11443,6 +12109,22 @@ fn workspace_resource_reference_diagnostics(conn: &Connection) -> Result<Vec<Str
                  ) LIMIT 100"
             ),
             &format!("{table}.repository_id"),
+            &mut diagnostics,
+        )?;
+    }
+    if table_exists(conn, "typed_ticket_targets")?
+        && column_exists(conn, "typed_ticket_targets", "repository_key")?
+    {
+        collect_reference_diagnostics(
+            conn,
+            "SELECT child.workspace_id || '/' || child.repository_key
+               FROM typed_ticket_targets AS child
+              WHERE NOT EXISTS (
+                    SELECT 1 FROM repositories AS parent
+                     WHERE parent.workspace_id = child.workspace_id
+                       AND parent.repository_key = child.repository_key
+              ) LIMIT 100",
+            "typed_ticket_targets.repository_key",
             &mut diagnostics,
         )?;
     }
@@ -11883,13 +12565,40 @@ fn workspace_schema_migration_plan(conn: &Connection) -> Result<WorkspaceSchemaM
 fn apply_migrations(conn: &Connection) -> Result<()> {
     let plan = workspace_schema_migration_plan(conn)?;
     if plan.current_schema_version == 0 {
-        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
-        create_latest_workspace_schema(&tx)?;
-        tx.execute(
-            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-            params![LATEST_SCHEMA_VERSION, SCHEMA_BASELINE_NAME],
-        )?;
-        tx.commit()?;
+        let foreign_keys_enabled =
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))? != 0;
+        let legacy_alter_table_enabled =
+            conn.query_row("PRAGMA legacy_alter_table", [], |row| row.get::<_, i64>(0))? != 0;
+        if foreign_keys_enabled {
+            conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        }
+        if !legacy_alter_table_enabled {
+            conn.execute_batch("PRAGMA legacy_alter_table = ON;")?;
+        }
+        let create_result = (|| {
+            let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+            create_latest_workspace_schema(&tx)?;
+            tx.execute(
+                "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+                params![LATEST_SCHEMA_VERSION, SCHEMA_BASELINE_NAME],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })();
+        let restore_result = match (legacy_alter_table_enabled, foreign_keys_enabled) {
+            (false, true) => {
+                conn.execute_batch("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;")
+            }
+            (false, false) => conn.execute_batch("PRAGMA legacy_alter_table = OFF;"),
+            (true, true) => conn.execute_batch("PRAGMA foreign_keys = ON;"),
+            (true, false) => Ok(()),
+        }
+        .map_err(Error::from);
+        match (create_result, restore_result) {
+            (Err(error), _) => return Err(error),
+            (Ok(()), Err(error)) => return Err(error),
+            (Ok(()), Ok(())) => {}
+        }
     } else {
         for step in &plan.migrations {
             let migration = MIGRATIONS
@@ -11987,6 +12696,19 @@ fn migrate_workdir_credential_candidate_snapshots_v58_to_v59(conn: &Connection) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn downgrade_schema_66_ticket_and_workdir_authority(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "DROP TABLE typed_ticket_targets;
+             ALTER TABLE typed_tickets ADD COLUMN repository_id TEXT;
+             ALTER TABLE typed_tickets ADD COLUMN ref_selector TEXT;
+             ALTER TABLE worker_workdir_links DROP COLUMN capabilities;
+             DELETE FROM ticket_schema_migrations;
+             INSERT INTO ticket_schema_migrations(version, name, applied_at)
+             VALUES (6, 'ticket schema baseline', CURRENT_TIMESTAMP);",
+        )?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn external_workdir_grant_persists_typed_source_and_fences_generations() {
@@ -12693,6 +13415,7 @@ mod tests {
         let store = SqliteWorkspaceStore::open(&path).unwrap();
         store
             .with_conn(|conn| {
+                downgrade_schema_66_ticket_and_workdir_authority(conn)?;
                 conn.execute_batch(
                     "DROP TRIGGER runtime_binding_insert_blocked_by_removal; \
                      DROP TRIGGER runtime_binding_update_blocked_by_removal; \
@@ -12761,6 +13484,7 @@ mod tests {
         drop(SqliteWorkspaceStore::open(&path).unwrap());
         {
             let conn = Connection::open(&path).unwrap();
+            downgrade_schema_66_ticket_and_workdir_authority(&conn).unwrap();
             conn.execute_batch(
                 "ALTER TABLE worker_removal_operations \
                  ADD COLUMN run_generation INTEGER NOT NULL DEFAULT 0; \
@@ -12844,6 +13568,219 @@ mod tests {
     }
 
     #[test]
+    fn schema_v65_migrates_ticket_targets_and_workdir_capabilities() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        drop(SqliteWorkspaceStore::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        conn.execute_batch(
+            r#"
+            PRAGMA foreign_keys = OFF;
+            DROP TABLE typed_ticket_targets;
+            ALTER TABLE typed_tickets ADD COLUMN repository_id TEXT;
+            ALTER TABLE typed_tickets ADD COLUMN ref_selector TEXT;
+            DROP INDEX worker_workdir_links_active_workdir_unique;
+            DROP INDEX worker_workdir_links_active_alias_unique;
+            DROP INDEX worker_workdir_links_workdir;
+            CREATE TABLE worker_workdir_links_v65 (
+                workspace_id TEXT NOT NULL,
+                runtime_id TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                workdir_id TEXT NOT NULL,
+                alias TEXT NOT NULL,
+                linked_at TEXT NOT NULL,
+                unlinked_at TEXT,
+                PRIMARY KEY (workspace_id, worker_id, workdir_id, alias),
+                FOREIGN KEY (workspace_id, worker_id)
+                    REFERENCES worker_registry(workspace_id, worker_id) ON DELETE CASCADE,
+                FOREIGN KEY (workspace_id, workdir_id)
+                    REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE
+            );
+            INSERT INTO worker_workdir_links_v65 (
+                workspace_id, runtime_id, worker_id, workdir_id, alias, linked_at, unlinked_at
+            )
+            SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, linked_at, unlinked_at
+              FROM worker_workdir_links;
+            DROP TABLE worker_workdir_links;
+            ALTER TABLE worker_workdir_links_v65 RENAME TO worker_workdir_links;
+            CREATE UNIQUE INDEX worker_workdir_links_active_workdir_unique
+                ON worker_workdir_links(workspace_id, workdir_id) WHERE unlinked_at IS NULL;
+            CREATE UNIQUE INDEX worker_workdir_links_active_alias_unique
+                ON worker_workdir_links(workspace_id, worker_id, alias) WHERE unlinked_at IS NULL;
+            CREATE INDEX worker_workdir_links_workdir
+                ON worker_workdir_links(workspace_id, workdir_id);
+            DELETE FROM __yoi_schema_migrations;
+            INSERT INTO __yoi_schema_migrations(version, name)
+                VALUES (65, 'workspace schema baseline');
+            DELETE FROM ticket_schema_migrations;
+            INSERT INTO ticket_schema_migrations(version, name, applied_at)
+                VALUES (6, 'ticket schema baseline', '1');
+
+            INSERT INTO accounts(account_id, kind, handle, display_name, created_at, updated_at)
+                VALUES ('owner', 'user', 'owner', 'Owner', '1', '1');
+            INSERT INTO workspaces(
+                workspace_id, owner_account_id, display_name, state, created_at, updated_at
+            ) VALUES ('workspace-a', 'owner', 'Workspace A', 'active', '1', '1');
+            INSERT INTO repositories(
+                workspace_id, repository_id, repository_key, kind, provider, uri, default_ref,
+                created_at, updated_at, source_kind, source_uri, source_revision,
+                source_fingerprint, observed_status, observed_at
+            ) VALUES
+                ('workspace-a', 'repo-main', 'main', 'git', 'git', '/main', 'develop',
+                 '1', '1', 'local_path', '/main', 1, 'sha256:main', 'unverified', NULL);
+            INSERT INTO typed_tickets(
+                workspace_id, ticket_id, slug, title, status, kind, priority, body,
+                created_at, updated_at, assignee, readiness, workflow_state,
+                workflow_state_explicit, queued_by, queued_at, resolution,
+                repository_id, ref_selector
+            ) VALUES (
+                'workspace-a', 'ticket-a', 'ticket-a', 'Ticket A', 'open', 'task', 'P2', '',
+                '1', '1', NULL, NULL, 'planning', 1, NULL, NULL, NULL,
+                'repo-main', 'develop'
+            );
+            INSERT INTO typed_ticket_events(
+                workspace_id, ticket_id, event_index, kind, author, at, status,
+                from_state, to_state, reason, state_field, heading, body
+            ) VALUES (
+                'workspace-a', 'ticket-a', 0, 'state_changed', 'user', '1', NULL,
+                'planning', 'ready', NULL, 'state', 'State changed', ''
+            );
+            INSERT INTO typed_ticket_event_attributes(
+                workspace_id, ticket_id, event_index, key, value
+            ) VALUES
+                ('workspace-a', 'ticket-a', 0, 'repository_id', 'repo-main'),
+                ('workspace-a', 'ticket-a', 0, 'ref_selector', 'develop');
+            INSERT INTO worker_registry(
+                workspace_id, worker_id, runtime_id, display_name, profile, retention_state,
+                transcript_ref, session_ref, summary_ref, diagnostics_ref, created_at, updated_at
+            ) VALUES
+                ('workspace-a', 'worker-repository', 'runtime-a', 'Repository Worker', NULL,
+                 'normal', NULL, NULL, NULL, NULL, '1', '1'),
+                ('workspace-a', 'worker-external', 'runtime-a', 'External Worker', NULL,
+                 'normal', NULL, NULL, NULL, NULL, '1', '1');
+            INSERT INTO workdir_registry(
+                workspace_id, workdir_id, display_name, source_kind, runtime_id, repository_id,
+                external_grant_id, creation_selector, creation_ref, materialization_status,
+                cleanliness, created_at, updated_at, current_selector, current_ref,
+                creation_tree, current_tree, observed_at_epoch_seconds
+            ) VALUES
+                ('workspace-a', 'workdir-repository', 'Repository', 'repository', 'runtime-a',
+                 'repo-main', NULL, 'develop', 'abc', 'present', 'clean', '1', '1',
+                 'develop', 'abc', NULL, NULL, NULL),
+                ('workspace-a', 'workdir-external', 'External', 'external_grant', NULL,
+                 NULL, 'grant-a', NULL, NULL, 'present', 'unknown', '1', '1',
+                 NULL, NULL, NULL, NULL, NULL);
+            INSERT INTO external_workdir_grants(
+                grant_id, workspace_id, workdir_id, provider_instance_id, display_name,
+                permissions, created_by, created_at, expires_at, generation, status, updated_at,
+                cleanup_state, cleanup_error, cleanup_updated_at
+            ) VALUES (
+                'grant-a', 'workspace-a', 'workdir-external', 'provider-a', 'External',
+                'read_only', 'owner', '1', '9', 1, 'online', '1',
+                'not_required', NULL, NULL
+            );
+            INSERT INTO worker_workdir_links(
+                workspace_id, runtime_id, worker_id, workdir_id, alias, linked_at, unlinked_at
+            ) VALUES
+                ('workspace-a', 'runtime-a', 'worker-repository', 'workdir-repository',
+                 'checkout', '1', NULL),
+                ('workspace-a', 'runtime-a', 'worker-external', 'workdir-external',
+                 'external', '1', NULL);
+            PRAGMA foreign_keys = ON;
+            "#,
+        )
+        .unwrap();
+
+        migrate_ticket_targets_and_workdir_capabilities_v65_to_v66(&conn).unwrap();
+
+        assert_eq!(current_schema_version(&conn).unwrap(), 66);
+        ticket::verify_sqlite_ticket_schema(&conn).unwrap();
+        assert!(!column_exists(&conn, "typed_tickets", "repository_id").unwrap());
+        assert!(!column_exists(&conn, "typed_tickets", "ref_selector").unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT repository_key || ':' || ref_selector || ':' || access
+                   FROM typed_ticket_targets
+                  WHERE workspace_id = 'workspace-a' AND ticket_id = 'ticket-a' AND ordinal = 0",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "main:develop:read_write"
+        );
+        let target_evidence: String = conn
+            .query_row(
+                "SELECT value FROM typed_ticket_event_attributes
+                  WHERE workspace_id = 'workspace-a' AND ticket_id = 'ticket-a'
+                    AND event_index = 0 AND key = 'targets'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&target_evidence).unwrap(),
+            serde_json::json!([{
+                "repository_key": "main",
+                "ref_selector": "develop",
+                "access": "read_write"
+            }])
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM typed_ticket_event_attributes
+                  WHERE workspace_id = 'workspace-a' AND ticket_id = 'ticket-a'
+                    AND event_index = 0 AND key IN ('repository_id', 'ref_selector')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM typed_ticket_event_attributes
+                  WHERE workspace_id = 'workspace-a' AND ticket_id = 'ticket-a'
+                    AND event_index = 0 AND key = 'fingerprint_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "1"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT version || ':' || name FROM ticket_schema_migrations",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "7:ticket schema baseline"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT group_concat(workdir_id || ':' || capabilities, ',')
+                   FROM (SELECT workdir_id, capabilities FROM worker_workdir_links ORDER BY workdir_id)",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "workdir-external:read_only,workdir-repository:all"
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        let foreign_key_failures: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_failures, 0);
+    }
+
+    #[test]
     fn current_schema_accepts_every_retained_canonical_provenance() {
         for baseline_version in OLDEST_SCHEMA_VERSION..=LATEST_SCHEMA_VERSION {
             let conn = Connection::open_in_memory().unwrap();
@@ -12888,6 +13825,10 @@ mod tests {
                     )]
                 );
                 ticket::verify_sqlite_ticket_schema(conn)?;
+                assert!(table_exists(conn, "typed_ticket_targets")?);
+                assert!(!column_exists(conn, "typed_tickets", "repository_id")?);
+                assert!(!column_exists(conn, "typed_tickets", "ref_selector")?);
+                assert!(column_exists(conn, "worker_workdir_links", "capabilities")?);
                 merge_request::migrate(conn)?;
                 let foreign_key_failures: i64 =
                     conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
@@ -12904,7 +13845,12 @@ mod tests {
         configure_sqlite(&conn).unwrap();
         ticket::migrate_sqlite_ticket_schema(&conn).unwrap();
         merge_request::migrate(&conn).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;")
+            .unwrap();
         create_latest_workspace_schema(&conn).unwrap();
+        downgrade_schema_66_ticket_and_workdir_authority(&conn).unwrap();
+        conn.execute_batch("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;")
+            .unwrap();
         conn.execute_batch(
             r#"
             DROP TABLE workdir_create_credential_revision_retentions;
@@ -13099,6 +14045,10 @@ mod tests {
                     version: 65,
                     name: EXTERNAL_WORKDIR_CLEANUP_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 66,
+                    name: TICKET_TARGETS_AND_WORKDIR_CAPABILITIES_MIGRATION_NAME.to_string(),
+                },
             ]
         );
 
@@ -13153,6 +14103,10 @@ mod tests {
                         (63, MULTI_WORKDIR_ATTACHMENTS_MIGRATION_NAME.to_string()),
                         (64, EXTERNAL_WORKDIR_GRANTS_MIGRATION_NAME.to_string()),
                         (65, EXTERNAL_WORKDIR_CLEANUP_MIGRATION_NAME.to_string()),
+                        (
+                            66,
+                            TICKET_TARGETS_AND_WORKDIR_CAPABILITIES_MIGRATION_NAME.to_string(),
+                        ),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -13223,7 +14177,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec![52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65]
+            vec![52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
         let conn = Connection::open(&path).unwrap();
@@ -13231,8 +14185,9 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 16);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 17);
         assert!(column_exists(&conn, "worker_workdir_links", "alias").unwrap());
+        assert!(column_exists(&conn, "worker_workdir_links", "capabilities").unwrap());
         assert!(!column_exists(&conn, "worker_workdir_links", "role").unwrap());
     }
 
@@ -14370,7 +15325,11 @@ mod tests {
         )
         .unwrap();
         let mut input = ticket::NewTicket::new("Foreign repository");
-        input.repository_id = Some("main".to_string());
+        input.targets = vec![ticket::TicketTarget {
+            repository_key: "main".to_string(),
+            ref_selector: None,
+            access: ticket::TicketTargetAccess::ReadWrite,
+        }];
         let error = ticket::TicketBackend::create(&backend, input).unwrap_err();
         assert!(
             error.to_string().contains("FOREIGN KEY constraint failed"),
@@ -15227,8 +16186,11 @@ INSERT INTO worker_registry (
         let mut input = ticket::NewTicket::new("Role assignment");
         input.body = ticket::MarkdownText::new("test");
         input.workflow_state = Some(ticket::TicketWorkflowState::Ready);
-        input.repository_id = Some("main".to_string());
-        input.ref_selector = Some("develop".to_string());
+        input.targets = vec![ticket::TicketTarget {
+            repository_key: "main".to_string(),
+            ref_selector: Some("develop".to_string()),
+            access: ticket::TicketTargetAccess::ReadWrite,
+        }];
         let ticket = ticket::TicketBackend::create(&backend, input).unwrap();
 
         let orchestrator = TicketRoleAssignmentRecord {
@@ -15991,6 +16953,7 @@ INSERT INTO worker_registry (
             worker: worker.worker.clone(),
             workdir_id: workdir.workdir_id.clone(),
             alias: "checkout".to_string(),
+            capabilities: workdir::WorkdirSessionCapabilities::ALL,
             linked_at: "4".to_string(),
             unlinked_at: None,
         };
@@ -16021,6 +16984,19 @@ INSERT INTO worker_registry (
             link
         );
         assert_eq!(store.attach_worker_workdir(&link).unwrap(), link);
+        let downgraded_link = WorkerWorkdirLinkRecord {
+            capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+            ..link.clone()
+        };
+        assert_eq!(
+            store.attach_worker_workdir(&downgraded_link).unwrap(),
+            downgraded_link
+        );
+        assert_eq!(
+            store.attach_worker_workdir(&link).unwrap(),
+            downgraded_link,
+            "reattaching an existing link cannot expand its persisted capability ceiling"
+        );
 
         assert_eq!(
             store
@@ -16042,7 +17018,7 @@ INSERT INTO worker_registry (
             store
                 .list_worker_workdir_links("local-dev", &worker.worker)
                 .unwrap(),
-            vec![link.clone()]
+            vec![downgraded_link.clone()]
         );
 
         let worker_conflict = WorkerWorkdirLinkRecord {
@@ -16065,8 +17041,17 @@ INSERT INTO worker_registry (
         ));
         let second_attachment = WorkerWorkdirLinkRecord {
             alias: "docs".to_string(),
+            capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
             ..worker_conflict
         };
+        let invalid_capabilities = WorkerWorkdirLinkRecord {
+            capabilities: workdir::WorkdirSessionCapabilities::EMPTY,
+            ..second_attachment.clone()
+        };
+        assert!(matches!(
+            store.attach_worker_workdir(&invalid_capabilities),
+            Err(Error::InvalidInput(_))
+        ));
         assert_eq!(
             store.attach_worker_workdir(&second_attachment).unwrap(),
             second_attachment
@@ -16113,6 +17098,21 @@ INSERT INTO worker_registry (
         assert_eq!(
             store.attach_worker_workdir(&workdir_conflict).unwrap(),
             workdir_conflict
+        );
+
+        drop(store);
+        let reopened = SqliteWorkspaceStore::open(&db).unwrap();
+        assert_eq!(
+            reopened
+                .list_worker_workdir_links("local-dev", &worker.worker)
+                .unwrap(),
+            vec![second_attachment]
+        );
+        assert_eq!(
+            reopened
+                .list_worker_workdir_links("local-dev", &second_worker.worker)
+                .unwrap(),
+            vec![workdir_conflict]
         );
     }
 

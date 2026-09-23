@@ -3,7 +3,7 @@
     ConfirmRepositorySshHostTrustRequest,
     RepositorySshConnectionProbeRequest,
     RepositorySshConnectionProbeResponse
-  } from '$lib/generated/legacy-server-api';
+  } from '$lib/generated/repository-api';
   import { parseRepositorySshHostTrust } from '$lib/workspace/api/repository-access';
   import { formatDate, workspaceApiPath } from '$lib/workspace/api/http';
   import { parseRepositorySshConnectionProbeResponse } from '$lib/workspace/api/workspace-model';

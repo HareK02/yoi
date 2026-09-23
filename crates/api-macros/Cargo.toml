@@ -20,6 +20,7 @@ reqwest = [
 
 [dependencies]
 api-macros-impl = { path = "../api-macros-impl" }
+bytes.workspace = true
 axum = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 reqwest = { version = "0.13", default-features = false, optional = true, features = ["stream", "rustls"] }

@@ -1,11 +1,22 @@
 import type {
+  CleanupTargetKind,
+  CleanupWorkdirCandidate,
+  CleanupWorkerCandidate,
+  RuntimeCleanupExecutionResponse,
+  RuntimeCleanupPlanResponse,
+} from "$lib/generated/runtime-api";
+import type {
   BrowserCreateWorkerResponse as SharedBrowserCreateWorkerResponse,
   BrowserWorkerWorkingDirectorySelection
     as SharedBrowserWorkerWorkingDirectorySelection,
+  Diagnostic as SharedDiagnostic,
+  WorkerCapabilitySummary as SharedWorkerCapabilitySummary,
   WorkerLaunchOptionsResponse as SharedWorkerLaunchOptionsResponse,
   WorkerLaunchProfileCandidate as SharedWorkerLaunchProfileCandidate,
   WorkerLaunchRuntimeOption as SharedWorkerLaunchRuntimeOption,
-  WorkerLaunchWorkerSummary as WorkerSummary,
+  WorkerLaunchWorkerSummary,
+  WorkerSummary as SharedWorkerSummary,
+  WorkerWorkdirAttachmentSummary as SharedWorkerWorkdirAttachmentSummary,
   WorkingDirectoryRepositoryOption as SharedWorkingDirectoryRepositoryOption,
 } from "$lib/generated/worker-launch-api";
 import type {
@@ -46,11 +57,7 @@ export type {
 };
 export type WorkspaceResponse = SharedWorkspaceResponse;
 
-export type Diagnostic = {
-  code: string;
-  severity: string;
-  message: string;
-};
+export type Diagnostic = SharedDiagnostic;
 
 export type Runtime = {
   runtime_id: string;
@@ -71,50 +78,21 @@ export type Runtime = {
   };
 };
 
-export type Host = {
-  runtime_id: string;
-  host_id: string;
-  label: string;
-  kind: string;
-  status: string;
-  observed_at: string;
-  last_seen_at: string | null;
-  os: string;
-  arch: string;
-  diagnostics: Diagnostic[];
-};
+export type WorkerCapabilities = SharedWorkerCapabilitySummary;
 
-export type WorkerCapabilities = {
-  can_stop: boolean;
-  can_spawn_followup: boolean;
-};
+export type WorkerWorkdirAttachment = SharedWorkerWorkdirAttachmentSummary;
 
-export type WorkerWorkdirAttachment = {
-  alias: string;
-  working_directory: WorkingDirectorySummary;
-};
-
-export type Worker = {
-  runtime_id: string;
-  worker_id: string;
-  resource_key: string;
-  host_id: string;
-  display_name: string;
-  label: string;
-  profile?: string | null;
-  singleton_key?: string | null;
-  tags: string[];
-  workspace: { visibility: string; identity: string };
-  state: string;
-  worker_state?: WorkerStateSnapshot | null;
-  pinned?: boolean;
-  retention_state?: string;
-  last_seen_at?: string | null;
-  implementation: { kind: string; display_hint: string };
-  capabilities: WorkerCapabilities;
-  workdir_attachments?: WorkerWorkdirAttachment[];
-  diagnostics: Diagnostic[];
-};
+export type Worker =
+  & Omit<
+    SharedWorkerSummary,
+    "display_name" | "tags" | "worker_state" | "diagnostics"
+  >
+  & {
+    display_name: string;
+    tags: string[];
+    worker_state?: WorkerStateSnapshot | null;
+    diagnostics: Diagnostic[];
+  };
 
 export type WorkerOperationState = "accepted" | "unsupported" | "rejected";
 
@@ -127,7 +105,7 @@ export type WorkerRestoreState =
 
 export type WorkerRestoreResult = {
   state: WorkerRestoreState;
-  worker?: WorkerSummary | null;
+  worker?: WorkerLaunchWorkerSummary | null;
   diagnostics: Diagnostic[];
 };
 
@@ -136,67 +114,12 @@ export type WorkerLaunchProfileCandidate = SharedWorkerLaunchProfileCandidate;
 export type WorkingDirectoryRepositoryOption =
   SharedWorkingDirectoryRepositoryOption;
 
-export type CleanupTargetKind =
-  | "worker_delete"
-  | "workdir_clean_cleanup"
-  | "workdir_dirty_discard"
-  | "workdir_record_delete";
-
-export type CleanupWorkerCandidate = {
-  target_id: string;
-  action: CleanupTargetKind;
-  worker_id: string;
-  runtime_worker_id: string;
-  runtime_id: string;
-  reason: string;
-  blocking_reason?: string | null;
-  pinned: boolean;
-  retention_state: string;
-  linked_workdir_ids: string[];
-  running_linked: boolean;
-  estimated_reclaim_bytes?: number | null;
-};
-
-export type CleanupWorkdirCandidate = {
-  target_id: string;
-  action: CleanupTargetKind;
-  workdir_id: string;
-  runtime_id: string;
-  repository_key: string;
-  reason: string;
-  blocking_reason?: string | null;
-  linked_worker_ids: string[];
-  linked_running_worker_ids: string[];
-  running_linked: boolean;
-  pinned_linked: boolean;
-  file_status: string;
-  cleanliness: string;
-  estimated_reclaim_bytes?: number | null;
-};
-
-export type RuntimeCleanupPlanResponse = {
-  workspace_id: string;
-  runtime_id: string;
-  generated_at: string;
-  revision: string;
-  digest: string;
-  workers: CleanupWorkerCandidate[];
-  workdirs: CleanupWorkdirCandidate[];
-  diagnostics: Diagnostic[];
-};
-
-export type RuntimeCleanupExecutionResponse = {
-  workspace_id: string;
-  runtime_id: string;
-  executed_at: string;
-  results: {
-    target_id: string;
-    action: CleanupTargetKind;
-    status: string;
-    message: string;
-  }[];
-  plan_after: RuntimeCleanupPlanResponse;
-  diagnostics: Diagnostic[];
+export type {
+  CleanupTargetKind,
+  CleanupWorkdirCandidate,
+  CleanupWorkerCandidate,
+  RuntimeCleanupExecutionResponse,
+  RuntimeCleanupPlanResponse,
 };
 
 export type BrowserWorkerWorkingDirectorySelection =
@@ -228,61 +151,22 @@ export type RepositoryDetailResponse = SharedRepositoryDetailResponse;
 export type RepositoryLogResponse = SharedRepositoryLogResponse;
 
 export type {
-  DerivedTicketRelation,
+  ObjectiveDetail,
+  ObjectiveLinkedTicketSummary,
+  ObjectiveListResponse,
+  ObjectiveSummary,
   TicketDetail,
   TicketEventDetail,
   TicketListResponse,
-  TicketRelation,
-  TicketRelationBlocker,
-  TicketRelationNotice,
-  TicketRelationView,
-  TicketSummary,
 } from "$lib/generated/ticket-api";
-
-export type ObjectiveSummary = {
-  id: string;
-  resource_key: string;
-  title: string;
-  state: string;
-  updated_at?: string | null;
-  summary: string;
-  linked_tickets?: string[];
-  record_source?: string;
-};
-
-export type ObjectiveLinkedTicketSummary = {
-  id: string;
-  resource_key: string;
-  title: string;
-  state: string;
-};
-
-export type ObjectiveDetail = {
-  id: string;
-  resource_key: string;
-  title: string;
-  state: string;
-  created_at?: string | null;
-  updated_at?: string | null;
-  linked_tickets: string[];
-  linked_ticket_summaries: ObjectiveLinkedTicketSummary[];
-  body: string;
-  body_truncated: boolean;
-  record_source: string;
-};
-
-export type InvalidProjectRecord = {
-  label: string;
-  reason: string;
-};
-
-export type ObjectiveListResponse = {
-  workspace_id: string;
-  limit: number;
-  items: ObjectiveSummary[];
-  invalid_records: InvalidProjectRecord[];
-  record_authority: string;
-};
+export type {
+  TicketDetailDerivedRelation as DerivedTicketRelation,
+  TicketDetailRelation as TicketRelation,
+  TicketDetailRelationBlocker as TicketRelationBlocker,
+  TicketDetailRelationNotice as TicketRelationNotice,
+  TicketDetailRelationView as TicketRelationView,
+  TicketListItemSummary as TicketSummary,
+} from "$lib/generated/ticket-api";
 
 export type {
   CompanionCancelRequest,

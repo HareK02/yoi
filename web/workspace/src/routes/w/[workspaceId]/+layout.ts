@@ -7,21 +7,18 @@ import type { LayoutLoad } from "./$types";
 export const load: LayoutLoad = async ({ fetch, params }) => {
   const workspaceId = params.workspaceId;
   const [workspaceResult, repositoryResult] = await Promise.all([
-    loadJson<unknown>(fetch, workspaceApiPath(workspaceId, "/workspace")),
+    loadJson(
+      fetch,
+      workspaceApiPath(workspaceId, "/workspace"),
+      undefined,
+      parseWorkspaceResponse,
+      { diagnosticLabel: "Workspace API", maxResponseBytes: 1024 * 1024 },
+    ),
     loadWorkspaceRepositoryList(fetch, workspaceId),
   ]);
 
-  let workspace = null;
-  let workspaceError = workspaceResult.error;
-  if (workspaceResult.data !== null) {
-    try {
-      workspace = parseWorkspaceResponse(workspaceResult.data);
-    } catch (cause) {
-      workspaceError = cause instanceof Error
-        ? cause.message
-        : "invalid workspace response";
-    }
-  }
+  const workspace = workspaceResult.data;
+  const workspaceError = workspaceResult.error;
   if (!workspace) {
     error(404, {
       message: workspaceError ?? `Workspace ${workspaceId} is unavailable`,

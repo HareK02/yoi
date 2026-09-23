@@ -544,6 +544,112 @@ pub struct WorkspaceWorkerDiscoveryRequest {
     pub query: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub enum WorkspaceServerOperation {
+    WorkerControlList,
+    WorkerControlSpawn(server_api::CreateWorkspaceWorkerRequest),
+    WorkerControlInput {
+        runtime_id: String,
+        worker_id: String,
+        request: server_api::RuntimeWorkerInputRequest,
+    },
+    WorkerControlCancel {
+        runtime_id: String,
+        worker_id: String,
+        request: server_api::RuntimeWorkerLifecycleRequest,
+    },
+    WorkerControlStop {
+        runtime_id: String,
+        worker_id: String,
+        request: server_api::RuntimeWorkerLifecycleRequest,
+    },
+    WorkerControlRestore {
+        runtime_id: String,
+        worker_id: String,
+    },
+    WorkerObservationSessions,
+    WorkerObservationCapture(server_api::WorkerObservationSubjectRef),
+}
+
+fn workspace_server_json_request<T: serde::Serialize>(
+    path: String,
+    body: &T,
+) -> Result<WorkspaceRequest, WorkspaceClientError> {
+    Ok(WorkspaceRequest::json(
+        WorkspaceRequestMethod::Post,
+        path,
+        serde_json::to_string(body)
+            .map_err(|error| WorkspaceClientError::Request(error.to_string()))?,
+    ))
+}
+
+fn encode_workspace_path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+fn workspace_server_operation_request(
+    workspace_id: &str,
+    operation: WorkspaceServerOperation,
+) -> Result<WorkspaceRequest, WorkspaceClientError> {
+    let workspace_id = encode_workspace_path_segment(workspace_id);
+    let base = format!("/api/w/{workspace_id}");
+    match operation {
+        WorkspaceServerOperation::WorkerControlList => Ok(WorkspaceRequest::get(format!(
+            "{base}/worker-control/workers"
+        ))),
+        WorkspaceServerOperation::WorkerControlSpawn(request) => {
+            workspace_server_json_request(format!("{base}/worker-control/workers"), &request)
+        }
+        WorkspaceServerOperation::WorkerControlInput {
+            runtime_id,
+            worker_id,
+            request,
+        } => workspace_server_json_request(
+            format!("{base}/worker-control/workers/{runtime_id}/{worker_id}/input"),
+            &request,
+        ),
+        WorkspaceServerOperation::WorkerControlCancel {
+            runtime_id,
+            worker_id,
+            request,
+        } => workspace_server_json_request(
+            format!("{base}/worker-control/workers/{runtime_id}/{worker_id}/cancel"),
+            &request,
+        ),
+        WorkspaceServerOperation::WorkerControlStop {
+            runtime_id,
+            worker_id,
+            request,
+        } => workspace_server_json_request(
+            format!("{base}/worker-control/workers/{runtime_id}/{worker_id}/stop"),
+            &request,
+        ),
+        WorkspaceServerOperation::WorkerControlRestore {
+            runtime_id,
+            worker_id,
+        } => Ok(WorkspaceRequest::json(
+            WorkspaceRequestMethod::Post,
+            format!("{base}/worker-control/workers/{runtime_id}/{worker_id}/restore"),
+            "".to_string(),
+        )),
+        WorkspaceServerOperation::WorkerObservationSessions => Ok(WorkspaceRequest::get(format!(
+            "{base}/worker-observation/sessions"
+        ))),
+        WorkspaceServerOperation::WorkerObservationCapture(request) => {
+            workspace_server_json_request(format!("{base}/worker-observation/session"), &request)
+        }
+    }
+}
+
 /// Path-free Workspace operation authority injected by Runtime/host code.
 ///
 /// Workers receive this trait object rather than a Backend URL. The concrete
@@ -555,6 +661,18 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
     fn is_available(&self) -> bool;
     fn execute(&self, request: WorkspaceRequest)
     -> Result<WorkspaceResponse, WorkspaceClientError>;
+
+    fn execute_server_operation(
+        &self,
+        operation: WorkspaceServerOperation,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        let workspace_id = self.workspace_id().ok_or_else(|| {
+            WorkspaceClientError::Unavailable(
+                "Workspace Server operation requires Workspace identity".to_string(),
+            )
+        })?;
+        self.execute(workspace_server_operation_request(workspace_id, operation)?)
+    }
 
     /// Lists Workspace-visible Workers through dedicated Runtime-owned source
     /// proof. Implementations must not fall back to generic Workspace request
@@ -3942,8 +4060,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .ok_or_else(|| {
                 WorkerError::FlowInput("Workspace client has no Workspace scope".to_string())
             })?;
-        let request = flow::FlowSourceResolveRequest {
-            selector: selector.clone(),
+        let request = server_api::FlowSourceResolveRequest {
+            selector: selector.to_string(),
         };
         let response = workspace
             .execute(WorkspaceRequest {
@@ -3968,13 +4086,19 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 response.status
             )));
         }
-        let source: flow::ResolvedFlowSource = serde_json::from_str(&response.body)
+        let wire_source: server_api::ResolvedFlowSource = serde_json::from_str(&response.body)
             .map_err(|error| WorkerError::FlowInput(format!("decode Flow source: {error}")))?;
-        if source.workspace_id != workspace_id || source.selector != selector {
+        if wire_source.workspace_id != workspace_id || wire_source.selector != selector.to_string()
+        {
             return Err(WorkerError::FlowInput(
                 "Workspace returned a Flow source outside the requested scope".to_string(),
             ));
         }
+        let source: flow::ResolvedFlowSource =
+            serde_json::from_value(serde_json::to_value(wire_source).map_err(|error| {
+                WorkerError::FlowInput(format!("project Flow source transport: {error}"))
+            })?)
+            .map_err(|error| WorkerError::FlowInput(format!("convert Flow source: {error}")))?;
         let (state, initial_instructions) =
             flow::FlowRuntimeState::start(&source, uuid::Uuid::now_v7().to_string())
                 .map_err(|error| WorkerError::FlowInput(error.to_string()))?;

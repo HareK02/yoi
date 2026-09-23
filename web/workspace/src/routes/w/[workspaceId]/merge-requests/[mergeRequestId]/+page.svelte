@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { MergeRequestThreadEvent } from "$lib/generated/ticket-api";
   import { mergeRequestPagePath } from "$lib/workspace/api/merge-requests";
   import {
     sourceReviewFreshness,
@@ -13,8 +14,15 @@
     return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
   }
 
-  function textField(event: Record<string, unknown>, key: string): string | null {
-    const value = event[key];
+  function textField(
+    event: MergeRequestThreadEvent,
+    key: "subject_ref" | "decision" | "reason" | "body",
+  ): string | null {
+    let value: unknown;
+    if (key === "subject_ref" && "subject_ref" in event) value = event.subject_ref;
+    if (key === "decision" && "decision" in event) value = event.decision;
+    if (key === "reason" && "reason" in event) value = event.reason;
+    if (key === "body" && "body" in event) value = event.body;
     return typeof value === "string" && value.length > 0 ? value : null;
   }
 
@@ -77,7 +85,7 @@
                 <div>
                   <header>
                     <strong>{event.kind}</strong>
-                    <time>{prettyDate(event.at)}</time>
+                    <time>{prettyDate(event.created_at)}</time>
                   </header>
                   {#if textField(event, "subject_ref")}
                     <p><code>{textField(event, "subject_ref")}</code></p>

@@ -1,0 +1,5 @@
+error: status 304 cannot have a response body
+ --> tests/ui/not_modified_body.rs:9:32
+  |
+9 |         responses = [(status = 304, body = Body)]
+  |                                ^^^

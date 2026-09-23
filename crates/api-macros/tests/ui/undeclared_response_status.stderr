@@ -1,0 +1,14 @@
+error[E0599]: no variant named `Status201` found for enum `undeclared_status_api_responses::Status`
+  --> tests/ui/undeclared_response_status.rs:15:46
+   |
+ 5 | #[api]
+   | ------ variant `Status201` not found here
+...
+15 |     undeclared_status_api_responses::Status::Status201 { body: Body }
+   |                                              ^^^^^^^^^
+   |
+help: there is a variant with a similar name
+   |
+15 -     undeclared_status_api_responses::Status::Status201 { body: Body }
+15 +     undeclared_status_api_responses::Status::Status200 { body: Body }
+   |

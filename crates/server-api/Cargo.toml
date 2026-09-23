@@ -11,12 +11,15 @@ typescript = ["dep:ts-rs", "protocol/typescript"]
 
 [dependencies]
 api-macros = { workspace = true, features = ["reqwest", "axum", "openapi"] }
-protocol.workspace = true
+memory.workspace = true
+merge-request.workspace = true
+protocol = { workspace = true, features = ["json-schema"] }
 runtime-api.workspace = true
 schemars.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
+ticket.workspace = true
 ts-rs = { version = "12.0.1", optional = true }
 webauthn-rs-proto = "0.5.5"
 workdir.workspace = true
@@ -30,15 +33,12 @@ required-features = ["typescript"]
 
 [[example]]
 name = "generate_workdir_api_types"
-required-features = ["typescript"]
 
 [[example]]
 name = "generate_worker_launch_api_types"
-required-features = ["typescript"]
 
 [[example]]
 name = "generate_companion_api_types"
-required-features = ["typescript"]
 
 [[example]]
 name = "generate_memory_api_types"

@@ -1,9 +1,11 @@
 use crate::BackendOrigin;
-use serde::Deserialize;
 use std::fmt;
 use std::time::Duration;
 
-use server_api::{DeviceLoginPollRequest, DeviceLoginPollStatus, DeviceLoginStartRequest};
+use server_api::{
+    DeviceLoginPollRequest, DeviceLoginPollStatus, DeviceLoginStartRequest, RepositoryApiError,
+    ServerApiClient,
+};
 pub use server_api::{DeviceLoginPollResponse, DeviceLoginStartResponse};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,21 +21,12 @@ impl BackendAuthTarget {
             .unwrap_or(base_url);
         Self { base_url }
     }
-
-    fn api_url(&self, path: &str) -> String {
-        format!(
-            "{}{}",
-            self.base_url.trim_end_matches('/'),
-            path.strip_prefix('/')
-                .map(|path| format!("/{path}"))
-                .unwrap_or_else(|| path.to_string())
-        )
-    }
 }
 
 #[derive(Debug)]
 pub enum BackendAuthClientError {
-    Http(reqwest::Error),
+    InvalidTarget(String),
+    ServerApi(server_api::client_support::ClientError<RepositoryApiError>),
     BackendStatus { status: u16, body: String },
     MissingAccessToken,
 }
@@ -41,7 +34,8 @@ pub enum BackendAuthClientError {
 impl fmt::Display for BackendAuthClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Http(error) => write!(f, "Backend auth request failed: {error}"),
+            Self::InvalidTarget(message) => f.write_str(message),
+            Self::ServerApi(error) => write!(f, "{error}"),
             Self::BackendStatus { status, body } => {
                 write!(f, "Backend auth returned HTTP {status}: {body}")
             }
@@ -54,40 +48,38 @@ impl fmt::Display for BackendAuthClientError {
 
 impl std::error::Error for BackendAuthClientError {}
 
-impl From<reqwest::Error> for BackendAuthClientError {
-    fn from(value: reqwest::Error) -> Self {
-        Self::Http(value)
-    }
+const AUTH_RESPONSE_LIMIT: usize = 2 * 1024 * 1024;
+
+fn auth_client(target: &BackendAuthTarget) -> Result<ServerApiClient, BackendAuthClientError> {
+    ServerApiClient::builder(&target.base_url)
+        .map_err(|error| BackendAuthClientError::InvalidTarget(error.to_string()))?
+        .response_body_limit(AUTH_RESPONSE_LIMIT)
+        .build()
+        .map_err(|error| BackendAuthClientError::InvalidTarget(error.to_string()))
 }
 
 pub async fn start_device_login(
     target: &BackendAuthTarget,
     client_name: Option<&str>,
 ) -> Result<DeviceLoginStartResponse, BackendAuthClientError> {
-    let client = reqwest::Client::new();
-    let response = client
-        .post(target.api_url("/api/auth/device-login/start"))
-        .json(&DeviceLoginStartRequest {
+    auth_client(target)?
+        .auth_device_login_start(DeviceLoginStartRequest {
             client_name: client_name.map(ToOwned::to_owned),
         })
-        .send()
-        .await?;
-    parse_json_response(response).await
+        .await
+        .map_err(BackendAuthClientError::ServerApi)
 }
 
 pub async fn poll_device_login(
     target: &BackendAuthTarget,
     device_code: &str,
 ) -> Result<DeviceLoginPollResponse, BackendAuthClientError> {
-    let client = reqwest::Client::new();
-    let response = client
-        .post(target.api_url("/api/auth/device-login/poll"))
-        .json(&DeviceLoginPollRequest {
+    auth_client(target)?
+        .auth_device_login_poll(DeviceLoginPollRequest {
             device_code: device_code.to_string(),
         })
-        .send()
-        .await?;
-    parse_json_response(response).await
+        .await
+        .map_err(BackendAuthClientError::ServerApi)
 }
 
 fn device_login_poll_result(
@@ -136,24 +128,13 @@ pub async fn wait_for_device_login(
     }
 }
 
-async fn parse_json_response<T: for<'de> Deserialize<'de>>(
-    response: reqwest::Response,
-) -> Result<T, BackendAuthClientError> {
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(BackendAuthClientError::BackendStatus {
-            status: status.as_u16(),
-            body,
-        });
-    }
-    Ok(response.json::<T>().await?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use server_api::DeviceAccessTokenType;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     fn poll_response(status: DeviceLoginPollStatus) -> DeviceLoginPollResponse {
         DeviceLoginPollResponse {
@@ -161,6 +142,34 @@ mod tests {
             access_token: None,
             token_type: None,
         }
+    }
+
+    #[tokio::test]
+    async fn device_login_start_uses_generated_server_api_client() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = vec![0; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("POST /api/auth/device-login/start HTTP/1.1"));
+            assert!(request.contains(r#"{"client_name":"yoi-cli"}"#));
+            let body = r#"{"device_code":"device-secret","user_code":"ABCD-EFGH","verification_uri":"https://yoi.example/login/device","verification_uri_complete":"https://yoi.example/login/device?user_code=ABCD-EFGH","expires_in":600,"interval":5}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let response = start_device_login(&BackendAuthTarget::new(base_url), Some("yoi-cli"))
+            .await
+            .unwrap();
+        assert_eq!(response.user_code, "ABCD-EFGH");
+        handle.join().unwrap();
     }
 
     #[test]

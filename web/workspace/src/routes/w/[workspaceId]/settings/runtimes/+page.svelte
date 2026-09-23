@@ -4,7 +4,7 @@
     RuntimeConnectionTestResponse,
     RuntimePublicIdentityBundle,
     WorkspaceRuntimeResource,
-  } from '$lib/generated/legacy-server-api';
+  } from '$lib/generated/runtime-api';
   import {
     createRemoteRuntime,
     previewRuntimePublicKeyFingerprint,
@@ -397,12 +397,12 @@
               </td>
             </tr>
             {@const currentResult = currentTestResult(runtime)}
-            {#if runtime.diagnostics.length > 0 || currentResult}
+            {#if (runtime.diagnostics ?? []).length > 0 || currentResult}
               <tr class="settings-runtime-detail-row">
                 <td colspan="7">
-                  {#if runtime.diagnostics.length > 0}
+                  {#if (runtime.diagnostics ?? []).length > 0}
                     <ul class="settings-diagnostics-list">
-                      {#each runtime.diagnostics as diagnostic}
+                      {#each runtime.diagnostics ?? [] as diagnostic}
                         <li class:error={diagnostic.severity === 'error'} class:warning={diagnostic.severity === 'warning'}>
                           <strong>{diagnostic.code}</strong>
                           <span>{diagnostic.message}</span>
@@ -413,8 +413,8 @@
                   {#if currentResult}
                     <div class:failed={currentResult.status === 'failed'} class="settings-test-result">
                       <strong>Connection test: {connectionTestSummary(currentResult)}</strong>
-                      {#if currentResult.diagnostics[0]}
-                        <span>{currentResult.diagnostics[0].message}</span>
+                      {#if (currentResult.diagnostics ?? [])[0]}
+                        <span>{(currentResult.diagnostics ?? [])[0].message}</span>
                       {/if}
                       <small>Checked {new Date(currentResult.checked_at).toLocaleString()}</small>
                     </div>

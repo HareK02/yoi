@@ -5,6 +5,10 @@ import type {
   RepositorySshPublicKey,
 } from "../../generated/repository-access-api.ts";
 
+export const REPOSITORY_ACCESS_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
+const MAX_COLLECTION_ITEMS = 1000;
+const MAX_STRING_BYTES = 1024 * 1024;
+
 export class RepositoryAccessSchemaError extends Error {
   constructor(path: string, expected: string) {
     super(
@@ -165,7 +169,7 @@ function readRecord(
   );
   if (unknownKey !== undefined) {
     throw new RepositoryAccessSchemaError(
-      `${path}.${unknownKey}`,
+      `${path}.${unknownKey.slice(0, 128)}`,
       "no unknown field",
     );
   }
@@ -173,7 +177,7 @@ function readRecord(
 }
 
 function readArray(value: unknown, path: string): unknown[] {
-  if (!Array.isArray(value)) {
+  if (!Array.isArray(value) || value.length > MAX_COLLECTION_ITEMS) {
     throw new RepositoryAccessSchemaError(path, "an array");
   }
   return value;
@@ -185,8 +189,11 @@ function readString(
   path: string,
 ): string {
   const value = record[key];
-  if (typeof value !== "string") {
-    throw new RepositoryAccessSchemaError(`${path}.${key}`, "a string");
+  if (
+    typeof value !== "string" ||
+    new TextEncoder().encode(value).byteLength > MAX_STRING_BYTES
+  ) {
+    throw new RepositoryAccessSchemaError(`${path}.${key}`, "a bounded string");
   }
   return value;
 }
@@ -197,8 +204,15 @@ function readNullableString(
   path: string,
 ): string | null {
   const value = record[key];
-  if (value !== null && typeof value !== "string") {
-    throw new RepositoryAccessSchemaError(`${path}.${key}`, "a string or null");
+  if (
+    value !== null &&
+    (typeof value !== "string" ||
+      new TextEncoder().encode(value).byteLength > MAX_STRING_BYTES)
+  ) {
+    throw new RepositoryAccessSchemaError(
+      `${path}.${key}`,
+      "a bounded string or null",
+    );
   }
   return value;
 }
@@ -210,10 +224,13 @@ function readStringArray(
 ): string[] {
   const values = readArray(record[key], `${path}.${key}`);
   values.forEach((value, index) => {
-    if (typeof value !== "string") {
+    if (
+      typeof value !== "string" ||
+      new TextEncoder().encode(value).byteLength > MAX_STRING_BYTES
+    ) {
       throw new RepositoryAccessSchemaError(
         `${path}.${key}[${index}]`,
-        "a string",
+        "a bounded string",
       );
     }
   });

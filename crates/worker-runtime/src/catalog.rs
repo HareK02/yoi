@@ -209,7 +209,9 @@ pub struct LogicalWorkdirAttachment {
 }
 
 fn default_workdir_session_capabilities() -> workdir::WorkdirSessionCapabilities {
-    workdir::WorkdirSessionCapabilities::ALL
+    // Capability-less wire and persisted records fail closed instead of
+    // silently regaining write or command authority.
+    workdir::WorkdirSessionCapabilities::READ_ONLY
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +220,9 @@ pub struct WorkingDirectoryAttachmentClaim {
     pub working_directory_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relative_cwd: Option<String>,
+    /// Backend-authoritative maximum capabilities for the attachment session.
+    #[serde(default = "default_workdir_session_capabilities")]
+    pub capabilities: workdir::WorkdirSessionCapabilities,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

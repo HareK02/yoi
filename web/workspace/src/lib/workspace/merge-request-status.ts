@@ -3,11 +3,17 @@ import type {
   MergeRequestThreadEvent,
 } from "./api/merge-requests.ts";
 
+type ReviewEvent = Extract<MergeRequestThreadEvent, { kind: "review" }>;
+type SourceEvidenceEvent = Extract<
+  MergeRequestThreadEvent,
+  { kind: "review" | "review_requested" }
+>;
+
 function isCurrentSourceEvent(
   event: MergeRequestThreadEvent,
   source: string,
 ): boolean {
-  return event.subject_ref === source;
+  return "subject_ref" in event && event.subject_ref === source;
 }
 
 function requestHasTerminalOutcome(
@@ -26,16 +32,18 @@ export function sourceReviewFreshness(
   const source = mergeRequest.source.ref;
   if (!source) return "Source review unavailable: selector_from is unresolved.";
 
-  const effectiveReview = [...mergeRequest.thread].reverse().find((event) => {
-    if (event.kind !== "review" || !isCurrentSourceEvent(event, source)) {
-      return false;
-    }
-    return !mergeRequest.thread.some(
-      (candidate) =>
-        candidate.kind === "review_revoked" &&
-        candidate.review_event_id === event.event_id,
-    );
-  });
+  const effectiveReview = [...mergeRequest.thread].reverse().find(
+    (event): event is ReviewEvent => {
+      if (event.kind !== "review" || !isCurrentSourceEvent(event, source)) {
+        return false;
+      }
+      return !mergeRequest.thread.some(
+        (candidate) =>
+          candidate.kind === "review_revoked" &&
+          candidate.review_event_id === event.event_id,
+      );
+    },
+  );
   if (effectiveReview) {
     return effectiveReview.decision === "approve"
       ? `Current source approved at exact ref ${source}.`
@@ -43,9 +51,8 @@ export function sourceReviewFreshness(
   }
 
   const latestEvidence = [...mergeRequest.thread].reverse().find(
-    (event) =>
-      (event.kind === "review" || event.kind === "review_requested") &&
-      typeof event.subject_ref === "string",
+    (event): event is SourceEvidenceEvent =>
+      event.kind === "review" || event.kind === "review_requested",
   );
   if (latestEvidence?.subject_ref && latestEvidence.subject_ref !== source) {
     return `Fresh source review required: selector_from moved from ${latestEvidence.subject_ref} to ${source}.`;

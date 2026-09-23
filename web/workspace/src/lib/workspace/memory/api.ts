@@ -1,3 +1,4 @@
+import { MEMORY_API_LIMITS } from "$lib/generated/memory-api";
 import type {
   Diagnostic,
   DiagnosticSeverity,
@@ -13,10 +14,10 @@ import type {
   MemoryStagingRecord,
 } from "$lib/generated/memory-api";
 
-const MAX_STAGING_ITEMS = 500;
-const MAX_EVIDENCE_PER_RECORD = 500;
-const MAX_SOURCE_REFS_PER_RECORD = 500;
-const MAX_ORIGIN_VALUE_LENGTH = 512;
+const MAX_STAGING_ITEMS = MEMORY_API_LIMITS.maxCollectionItems;
+const MAX_EVIDENCE_PER_RECORD = MEMORY_API_LIMITS.maxCollectionItems;
+const MAX_SOURCE_REFS_PER_RECORD = MEMORY_API_LIMITS.maxCollectionItems;
+const MAX_ORIGIN_VALUE_LENGTH = MEMORY_API_LIMITS.maxIdentifierBytes;
 
 const candidateKinds = new Set<MemoryCandidateKind>([
   "preference",
@@ -51,7 +52,11 @@ export function parseMemoryDocumentResponse(
     "Memory document response",
   );
   return {
-    body_md: requiredString(record, "body_md"),
+    body_md: requiredString(
+      record,
+      "body_md",
+      MEMORY_API_LIMITS.maxDocumentBytes,
+    ),
     created_at: requiredString(record, "created_at"),
     updated_at: requiredString(record, "updated_at"),
     bytes: requiredNonNegativeInteger(record, "bytes"),
@@ -258,7 +263,10 @@ function parseEvidenceOrigin(value: unknown): MemoryEvidenceOrigin {
   ) {
     if (key in record) {
       const text = nullableString(record, key);
-      if (text !== null && text.length > MAX_ORIGIN_VALUE_LENGTH) {
+      if (
+        text !== null &&
+        new TextEncoder().encode(text).byteLength > MAX_ORIGIN_VALUE_LENGTH
+      ) {
         invalid(`${key} exceeds the Memory origin limit`);
       }
       result[key] = text;
@@ -328,11 +336,19 @@ function boundedArray(
   return value;
 }
 
-function requiredString(record: Record<string, unknown>, key: string): string {
-  if (typeof record[key] !== "string") {
-    invalid(`${key} must be a string`);
+function requiredString(
+  record: Record<string, unknown>,
+  key: string,
+  maxBytes: number = MEMORY_API_LIMITS.maxStringBytes,
+): string {
+  const value = record[key];
+  if (
+    typeof value !== "string" ||
+    new TextEncoder().encode(value).byteLength > maxBytes
+  ) {
+    invalid(`${key} must be a bounded string`);
   }
-  return record[key];
+  return value;
 }
 
 function nullableString(
@@ -340,8 +356,13 @@ function nullableString(
   key: string,
 ): string | null {
   const value = record[key];
-  if (value !== null && typeof value !== "string") {
-    invalid(`${key} must be a string or null`);
+  if (
+    value !== null &&
+    (typeof value !== "string" ||
+      new TextEncoder().encode(value).byteLength >
+        MEMORY_API_LIMITS.maxStringBytes)
+  ) {
+    invalid(`${key} must be a bounded string or null`);
   }
   return value;
 }

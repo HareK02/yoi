@@ -55,7 +55,12 @@ Deno.test("sidebar Stop uses the workspace-scoped Worker lifecycle endpoint", as
   const requests: Array<{ url: string; init?: RequestInit }> = [];
   const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
     requests.push({ url: input.toString(), init });
-    return jsonResponse({ state: "accepted", diagnostics: [] });
+    return jsonResponse({
+      state: "accepted",
+      runtime_id: worker.runtime_id,
+      worker_id: worker.worker_id,
+      diagnostics: [],
+    });
   }) as typeof fetch;
 
   await stopSidebarWorker("team space", worker, fetchFn);
@@ -76,7 +81,13 @@ Deno.test("sidebar Stop rejects non-accepted lifecycle responses", async () => {
     Promise.resolve(
       jsonResponse({
         state: "rejected",
-        diagnostics: [{ severity: "error", message: "Worker cannot stop" }],
+        runtime_id: worker.runtime_id,
+        worker_id: worker.worker_id,
+        diagnostics: [{
+          code: "cannot_stop",
+          severity: "error",
+          message: "Worker cannot stop",
+        }],
       }),
     )) as typeof fetch;
 
@@ -92,25 +103,48 @@ Deno.test("sidebar Delete executes the authoritative runtime cleanup plan", asyn
     requests.push({ url: input.toString(), init });
     if (requests.length === 1) {
       return jsonResponse({
-        revision: 7,
+        workspace_id: "team",
+        runtime_id: worker.runtime_id,
+        generated_at: "2026-01-01T00:00:00Z",
+        revision: "7",
         digest: "digest-7",
-        candidates: [],
         workers: [{
           target_id: "worker-target",
+          action: "worker_delete",
+          worker_id: worker.worker_id,
           runtime_id: worker.runtime_id,
           runtime_worker_id: worker.worker_id,
+          reason: "stopped worker",
           blocking_reason: null,
+          pinned: false,
+          retention_state: "stopped",
+          linked_workdir_ids: [],
+          running_linked: false,
         }],
         workdirs: [],
         diagnostics: [],
       });
     }
     return jsonResponse({
+      workspace_id: "team",
+      runtime_id: worker.runtime_id,
+      executed_at: "2026-01-01T00:00:01Z",
       results: [{
         target_id: "worker-target",
+        action: "worker_delete",
         status: "deleted",
-        message: null,
+        message: "",
       }],
+      plan_after: {
+        workspace_id: "team",
+        runtime_id: worker.runtime_id,
+        generated_at: "2026-01-01T00:00:01Z",
+        revision: "8",
+        digest: "digest-8",
+        workers: [],
+        workdirs: [],
+        diagnostics: [],
+      },
       diagnostics: [],
     });
   }) as typeof fetch;
@@ -123,7 +157,7 @@ Deno.test("sidebar Delete executes the authoritative runtime cleanup plan", asyn
   ]);
   assertEquals(requests[1]?.init?.method, "POST");
   assertEquals(JSON.parse(String(requests[1]?.init?.body)), {
-    expected_plan_revision: 7,
+    expected_plan_revision: "7",
     expected_plan_digest: "digest-7",
     worker_target_ids: ["worker-target"],
     workdir_target_ids: [],
@@ -135,14 +169,23 @@ Deno.test("sidebar Delete reports cleanup-plan blocking reasons", async () => {
   const fetchFn = (() =>
     Promise.resolve(
       jsonResponse({
-        revision: 8,
+        workspace_id: "team",
+        runtime_id: worker.runtime_id,
+        generated_at: "2026-01-01T00:00:00Z",
+        revision: "8",
         digest: "digest-8",
-        candidates: [],
         workers: [{
           target_id: "worker-target",
+          action: "worker_delete",
+          worker_id: worker.worker_id,
           runtime_id: worker.runtime_id,
           runtime_worker_id: worker.worker_id,
+          reason: "stopped worker",
           blocking_reason: "Worker is pinned",
+          pinned: true,
+          retention_state: "pinned",
+          linked_workdir_ids: [],
+          running_linked: false,
         }],
         workdirs: [],
         diagnostics: [],

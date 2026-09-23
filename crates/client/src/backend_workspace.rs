@@ -1,8 +1,7 @@
 use crate::{BackendApiClient, BackendApiClientError};
-use reqwest::Method;
 use server_api::{
-    InitialRepositoryIntent, RepositorySummary, WorkspaceCatalogListResponse,
-    WorkspaceCreateRequest, WorkspaceCreateResponse, WorkspaceSummary,
+    InitialRepositoryIntent, RepositorySummary, WorkspaceCreateRequest, WorkspaceCreateResponse,
+    WorkspaceListQuery, WorkspaceSummary,
 };
 use std::fmt;
 
@@ -31,7 +30,10 @@ pub enum BackendWorkspaceClientError {
     InvalidTarget(String),
     Api(BackendApiClientError),
     Http(reqwest::Error),
-    RepositoryApi(server_api::client_support::ClientError<server_api::RepositoryApiError>),
+    ServerApi(server_api::client_support::ClientError<server_api::RepositoryApiError>),
+    RuntimeManagementApi(
+        server_api::client_support::ClientError<server_api::RuntimeManagementApiError>,
+    ),
 }
 
 impl fmt::Display for BackendWorkspaceClientError {
@@ -40,7 +42,8 @@ impl fmt::Display for BackendWorkspaceClientError {
             Self::InvalidTarget(message) => f.write_str(message),
             Self::Api(error) => write!(f, "{error}"),
             Self::Http(error) => write!(f, "{error}"),
-            Self::RepositoryApi(error) => write!(f, "{error}"),
+            Self::ServerApi(error) => write!(f, "{error}"),
+            Self::RuntimeManagementApi(error) => write!(f, "{error}"),
         }
     }
 }
@@ -65,11 +68,11 @@ impl From<server_api::client_support::ClientError<server_api::RepositoryApiError
     fn from(
         error: server_api::client_support::ClientError<server_api::RepositoryApiError>,
     ) -> Self {
-        Self::RepositoryApi(error)
+        Self::ServerApi(error)
     }
 }
 
-fn repository_client_error(
+pub(crate) fn server_client_error(
     backend: &BackendApiClient,
     error: server_api::client_support::ClientError<server_api::RepositoryApiError>,
 ) -> BackendWorkspaceClientError {
@@ -88,16 +91,39 @@ fn repository_client_error(
                 origin: backend.origin().clone(),
             })
         }
-        _ => BackendWorkspaceClientError::RepositoryApi(error),
+        _ => BackendWorkspaceClientError::ServerApi(error),
+    }
+}
+
+pub(crate) fn runtime_management_client_error(
+    backend: &BackendApiClient,
+    error: server_api::client_support::ClientError<server_api::RuntimeManagementApiError>,
+) -> BackendWorkspaceClientError {
+    let status = match &error {
+        server_api::client_support::ClientError::Public { status, .. } => Some(*status),
+        server_api::client_support::ClientError::Failure(_) => None,
+    };
+    match status {
+        Some(reqwest::StatusCode::UNAUTHORIZED) => {
+            BackendWorkspaceClientError::Api(BackendApiClientError::Unauthorized {
+                origin: backend.origin().clone(),
+            })
+        }
+        Some(reqwest::StatusCode::FORBIDDEN) => {
+            BackendWorkspaceClientError::Api(BackendApiClientError::Forbidden {
+                origin: backend.origin().clone(),
+            })
+        }
+        _ => BackendWorkspaceClientError::RuntimeManagementApi(error),
     }
 }
 
 #[derive(Clone, Debug)]
-struct RepositoryBearerAuthorizer {
+pub(crate) struct ServerBearerAuthorizer {
     authorization: String,
 }
 
-impl server_api::client_support::RequestAuthorizer for RepositoryBearerAuthorizer {
+impl server_api::client_support::RequestAuthorizer for ServerBearerAuthorizer {
     fn authorize(
         &self,
         _request: server_api::client_support::AuthorizerRequest<'_>,
@@ -113,20 +139,70 @@ impl server_api::client_support::RequestAuthorizer for RepositoryBearerAuthorize
     }
 }
 
-const REPOSITORY_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
+const SERVER_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
+
+pub(crate) fn server_api_client(
+    backend: &BackendApiClient,
+) -> Result<server_api::ServerApiClient<ServerBearerAuthorizer>, BackendWorkspaceClientError> {
+    server_api::ServerApiClient::builder(backend.origin().as_str())
+        .map_err(|error| BackendWorkspaceClientError::InvalidTarget(error.to_string()))?
+        .client(backend.asynchronous_client())
+        .authorizer(ServerBearerAuthorizer {
+            authorization: backend.authorization_header_value(),
+        })
+        .response_body_limit(SERVER_RESPONSE_LIMIT)
+        .build()
+        .map_err(|error| BackendWorkspaceClientError::InvalidTarget(error.to_string()))
+}
+
+pub(crate) fn memory_document_blocking(
+    backend: &BackendApiClient,
+    workspace_id: &str,
+) -> Result<server_api::MemoryDocumentResponse, BackendWorkspaceClientError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| BackendWorkspaceClientError::InvalidTarget(error.to_string()))?;
+    runtime.block_on(async {
+        server_api_client(backend)?
+            .memory_document(workspace_id.to_owned())
+            .await
+            .map_err(|error| server_client_error(backend, error))
+    })
+}
+
+pub(crate) fn memory_staging_list_blocking(
+    backend: &BackendApiClient,
+    workspace_id: &str,
+    limit: usize,
+) -> Result<server_api::MemoryStagingListResponse, BackendWorkspaceClientError> {
+    let limit = u32::try_from(limit).map_err(|_| {
+        BackendWorkspaceClientError::InvalidTarget("Memory staging limit exceeds u32".to_string())
+    })?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| BackendWorkspaceClientError::InvalidTarget(error.to_string()))?;
+    runtime.block_on(async {
+        server_api_client(backend)?
+            .memory_staging_list(
+                workspace_id.to_owned(),
+                server_api::MemoryStagingQuery { limit: Some(limit) },
+            )
+            .await
+            .map_err(|error| server_client_error(backend, error))
+    })
+}
 
 pub fn list_backend_workspaces_blocking(
     target: &BackendWorkspaceCatalogTarget,
 ) -> Result<Vec<BackendWorkspace>, BackendWorkspaceClientError> {
     let client = BackendApiClient::from_stored_token(&target.base_url)?;
-    let response = client
-        .blocking_request(
-            Method::GET,
-            &format!("/api/workspaces?limit={DEFAULT_WORKSPACE_LIMIT}"),
-        )?
-        .send()?;
-    client.check_status(response.status())?;
-    Ok(response.json::<WorkspaceCatalogListResponse>()?.0)
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| BackendWorkspaceClientError::InvalidTarget(error.to_string()))?;
+    runtime.block_on(list_backend_workspaces_with_client(&client))
 }
 
 pub fn list_backend_workspace_repositories_blocking(
@@ -158,19 +234,10 @@ async fn list_backend_workspace_repositories_with_client(
             "Workspace id returned by Backend is invalid".to_string(),
         ));
     }
-    let client = server_api::ServerApiClient::builder(backend.origin().as_str())
-        .map_err(|error| BackendWorkspaceClientError::InvalidTarget(error.to_string()))?
-        .client(backend.asynchronous_client())
-        .authorizer(RepositoryBearerAuthorizer {
-            authorization: backend.authorization_header_value(),
-        })
-        .response_body_limit(REPOSITORY_RESPONSE_LIMIT)
-        .build()
-        .map_err(|error| BackendWorkspaceClientError::InvalidTarget(error.to_string()))?;
-    let response = client
+    let response = server_api_client(backend)?
         .repository_list(workspace_id.to_owned())
         .await
-        .map_err(|error| repository_client_error(backend, error))?;
+        .map_err(|error| server_client_error(backend, error))?;
     if response.workspace_id != workspace_id {
         return Err(BackendWorkspaceClientError::InvalidTarget(
             "Repository catalog response does not match the requested Workspace".to_string(),
@@ -189,15 +256,13 @@ pub async fn list_backend_workspaces(
 async fn list_backend_workspaces_with_client(
     client: &BackendApiClient,
 ) -> Result<Vec<BackendWorkspace>, BackendWorkspaceClientError> {
-    let response = client
-        .request(
-            Method::GET,
-            &format!("/api/workspaces?limit={DEFAULT_WORKSPACE_LIMIT}"),
-        )?
-        .send()
-        .await?;
-    client.check_status(response.status())?;
-    Ok(response.json::<WorkspaceCatalogListResponse>().await?.0)
+    let response = server_api_client(client)?
+        .workspace_catalog_list(WorkspaceListQuery {
+            limit: Some(DEFAULT_WORKSPACE_LIMIT as u32),
+        })
+        .await
+        .map_err(|error| server_client_error(client, error))?;
+    Ok(response.0)
 }
 
 pub async fn create_backend_workspace(
@@ -205,13 +270,10 @@ pub async fn create_backend_workspace(
     request: &CreateBackendWorkspaceRequest,
 ) -> Result<CreateBackendWorkspaceResponse, BackendWorkspaceClientError> {
     let client = BackendApiClient::from_stored_token(&target.base_url)?;
-    let response = client
-        .request(Method::POST, "/api/workspaces")?
-        .json(request)
-        .send()
-        .await?;
-    client.check_status(response.status())?;
-    Ok(response.json::<CreateBackendWorkspaceResponse>().await?)
+    server_api_client(&client)?
+        .workspace_catalog_create(request.clone())
+        .await
+        .map_err(|error| server_client_error(&client, error))
 }
 
 #[cfg(test)]
@@ -292,12 +354,12 @@ mod tests {
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                REPOSITORY_RESPONSE_LIMIT + 1,
+                SERVER_RESPONSE_LIMIT + 1,
             )
             .unwrap();
             stream.flush().unwrap();
             let chunk = [b' '; 8192];
-            let mut remaining = REPOSITORY_RESPONSE_LIMIT + 1;
+            let mut remaining = SERVER_RESPONSE_LIMIT + 1;
             while remaining > 0 {
                 let length = remaining.min(chunk.len());
                 if stream.write_all(&chunk[..length]).is_err() {
@@ -315,10 +377,10 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                BackendWorkspaceClientError::RepositoryApi(
+                BackendWorkspaceClientError::ServerApi(
                     server_api::client_support::ClientError::Failure(
                         server_api::client_support::ClientFailure::ResponseTooLarge {
-                            limit: REPOSITORY_RESPONSE_LIMIT
+                            limit: SERVER_RESPONSE_LIMIT
                         }
                     )
                 )
@@ -329,11 +391,11 @@ mod tests {
     }
 
     #[test]
-    fn repository_client_preserves_authentication_error_taxonomy() {
+    fn server_client_preserves_authentication_error_taxonomy() {
         let client =
             BackendApiClient::from_access_token_for_test("https://backend.example.test", "token")
                 .unwrap();
-        let unauthorized = repository_client_error(
+        let unauthorized = server_client_error(
             &client,
             server_api::client_support::ClientError::public(
                 reqwest::StatusCode::UNAUTHORIZED,
@@ -349,7 +411,7 @@ mod tests {
             unauthorized,
             BackendWorkspaceClientError::Api(BackendApiClientError::Unauthorized { .. })
         ));
-        let forbidden = repository_client_error(
+        let forbidden = server_client_error(
             &client,
             server_api::client_support::ClientError::public(
                 reqwest::StatusCode::FORBIDDEN,

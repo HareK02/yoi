@@ -1,0 +1,5 @@
+error: WebSocket operations require `server_to_client = FrameType`
+ --> tests/ui/missing_websocket_frame.rs:8:9
+  |
+8 |         "/events",
+  |         ^^^^^^^^^

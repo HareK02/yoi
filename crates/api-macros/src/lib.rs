@@ -39,20 +39,53 @@
 //! method name but should be set explicitly for contracts which must remain stable while Rust
 //! names evolve. Success status defaults to `200`, except an empty (`()`) response defaults to
 //! `204`. `alternate_status` opts a JSON response into [`HttpSuccess`] when two successful HTTP
-//! outcomes share one schema. A public error inferred from `Result<T, E>` defaults to status `400`;
+//! outcomes share one schema. Operations whose successful statuses have different body or header
+//! shapes use `responses = [(status = 200, body = Widget, headers = [("etag", String)]),
+//! (status = 304, headers = [("etag", String)])]`; the macro emits a typed result enum in the
+//! `<trait_name>_responses` module. Only explicit body-less `304` declarations extend success
+//! beyond 2xx. A public error inferred from `Result<T, E>` defaults to status `400`;
 //! `additional_error_statuses` publishes the same typed error schema for other declared outcomes.
 //! `bearer_auth = true` and `browser_auth = true` attach standard bearer and browser-session cookie
 //! security schemes. Body operations may opt into typed Axum rejection normalization with
 //! typed Axum rejection normalization with `normalize_body_errors = true` and [`HttpRequestError`].
 //!
-//! Arguments are classified with `#[body]`, `#[query]`, `#[header]`, `#[path]`, or `#[extension]`.
-//! Extension values are trusted server-local Axum context: generated clients and OpenAPI omit them.
-//! An unannotated argument whose Rust name occurs in the route template is inferred as a path
-//! argument. Header attributes may carry a wire name, as in `#[header("x-request-id")]`.
-//! Exactly one JSON body is allowed. JSON request, response, and error bodies must be named
-//! Rust types; tuples, references, arrays, and other anonymous structural types are rejected.
+//! Arguments are classified with `#[body]`, `#[binary]`, `#[query]`, `#[header]`, `#[path]`, or
+//! `#[extension]`. Extension values are trusted server-local Axum context: generated clients and
+//! OpenAPI omit them. An unannotated argument whose Rust name occurs in the route template is
+//! inferred as a path argument. Header attributes may carry a wire name, as in
+//! `#[header("x-request-id")]`. Exactly one JSON or binary body is allowed. JSON request, response,
+//! and error bodies must be named Rust types; tuples, references, arrays, and other anonymous
+//! structural types are rejected. Binary request bodies use [`BinaryBody`] and remain byte-exact.
 //! `openapi = false` explicitly excludes an operation whose wire body cannot yet satisfy the
 //! strict OpenAPI schema boundary; Reqwest and Axum adapters are still generated.
+//!
+//! WebSocket routes use a declaration-only associated type rather than a dummy unary method:
+//!
+//! ```
+//! # mod websocket_example {
+//! # use api_macros::api;
+//! # pub struct ClientFrame;
+//! # pub struct ServerFrame;
+//! #[api]
+//! pub trait EventApi {
+//!     #[websocket(
+//!         "/events/{stream_id}",
+//!         operation_id = "events.stream",
+//!         method = GET,
+//!         client_to_server = ClientFrame,
+//!         server_to_client = ServerFrame,
+//!         path_parameters = [stream_id: u64]
+//!     )]
+//!     type EventStream;
+//! }
+//! # }
+//! ```
+//!
+//! The declaration is removed from the emitted service trait and becomes a typed marker implementing
+//! [`WebSocketOperation`]. It participates in the same operation/route inventory and path validation,
+//! but never generates a Reqwest method, unary Axum adapter, or OpenAPI path. Under the `axum`
+//! feature, [`axum::websocket_route`] mounts an existing manual upgrade handler at its declared GET
+//! path without exposing framework WebSocket types to the contract.
 //!
 //! # Generated names
 //!
@@ -63,9 +96,9 @@
 //! deterministic `Operation<utf8-hex>` fallback. The `ApiContract::OPERATIONS` inventory is
 //! sorted by operation ID, so its ordering is independent of source method order.
 //!
-//! Only empty and JSON bodies are accepted by this first contract. [`WireKind`] reserves
-//! explicit variants for future transport work; accepting one requires a deliberate macro and
-//! adapter change rather than silently treating it as JSON.
+//! Empty, JSON, and bounded binary request bodies are supported. [`WireKind`] reserves explicit
+//! variants for other future transport work; accepting one requires a deliberate macro and adapter
+//! change rather than silently treating it as JSON.
 //!
 //! # OpenAPI 3.1 export
 //!
@@ -115,6 +148,70 @@ pub mod openapi;
 #[cfg(feature = "reqwest")]
 pub mod reqwest;
 
+/// Framework-neutral owned bytes used by explicit `#[binary]` request bodies.
+///
+/// The wrapper preserves the exact byte sequence while keeping payload content out of `Debug`
+/// output. Its `bytes::Bytes` storage lets generated Axum adapters transfer an extracted body
+/// without reserialization and lets generated Reqwest clients authorize and send the same storage.
+#[derive(Clone, Default, Eq, Hash, PartialEq)]
+pub struct BinaryBody(bytes::Bytes);
+
+impl BinaryBody {
+    pub const fn new(bytes: bytes::Bytes) -> Self {
+        Self(bytes)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn into_bytes(self) -> bytes::Bytes {
+        self.0
+    }
+}
+
+impl AsRef<[u8]> for BinaryBody {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+
+impl std::ops::Deref for BinaryBody {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+impl From<bytes::Bytes> for BinaryBody {
+    fn from(value: bytes::Bytes) -> Self {
+        Self(value)
+    }
+}
+
+impl From<Vec<u8>> for BinaryBody {
+    fn from(value: Vec<u8>) -> Self {
+        Self(value.into())
+    }
+}
+
+impl From<&'static [u8]> for BinaryBody {
+    fn from(value: &'static [u8]) -> Self {
+        Self(bytes::Bytes::from_static(value))
+    }
+}
+
+impl std::fmt::Debug for BinaryBody {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BinaryBody(<redacted>)")
+    }
+}
+
 /// A transport-neutral HTTP method.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum HttpMethod {
@@ -147,12 +244,25 @@ pub enum WireKind {
     Binary,
 }
 
-/// Stable metadata for one Rust method argument.
+/// Stable metadata for one operation argument.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ParameterMetadata {
     pub rust_name: &'static str,
+    pub rust_type: &'static str,
     pub wire_name: &'static str,
     pub location: ParameterLocation,
+}
+
+/// Transport semantics declared by one operation.
+///
+/// WebSocket frame directions remain distinct even when both directions use the same Rust type.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TransportMetadata {
+    Http,
+    WebSocket {
+        client_to_server_frame: &'static str,
+        server_to_client_frame: &'static str,
+    },
 }
 
 /// Stable metadata for a request or response body.
@@ -161,11 +271,21 @@ pub struct BodyMetadata {
     pub wire_kind: WireKind,
 }
 
+/// Stable metadata for one explicitly declared response header.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ResponseHeaderMetadata {
+    /// Canonical wire name declared in the API contract.
+    pub wire_name: &'static str,
+    /// Rust type spelling declared alongside the wire name.
+    pub rust_type: &'static str,
+}
+
 /// Stable metadata for one HTTP response.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ResponseMetadata {
     pub status: u16,
     pub body: BodyMetadata,
+    pub headers: &'static [ResponseHeaderMetadata],
 }
 
 /// Complete transport metadata for one operation.
@@ -174,10 +294,13 @@ pub struct OperationMetadata {
     pub operation_id: &'static str,
     pub method: HttpMethod,
     pub path: &'static str,
+    pub transport: TransportMetadata,
     pub parameters: &'static [ParameterMetadata],
     pub request_body: BodyMetadata,
-    pub response: ResponseMetadata,
-    pub error_response: Option<ResponseMetadata>,
+    /// Every declared successful response, including status-specific body and header shape.
+    pub success_responses: &'static [ResponseMetadata],
+    /// Every declared public-error status. Error responses currently have no declared headers.
+    pub error_responses: &'static [ResponseMetadata],
 }
 
 /// Deterministic operation inventory emitted for an `#[api]` trait.
@@ -189,12 +312,27 @@ pub trait ApiContract {
 pub trait Operation {
     /// Tuple of all non-receiver parameter types in declaration order.
     type Parameters;
-    /// JSON request body type, or [`NoBody`].
+    /// Typed JSON or binary request body, or [`NoBody`].
     type RequestBody;
-    /// JSON success response body type, or [`NoBody`].
+    /// JSON success response body type, generated declared-response result, or [`NoBody`].
     type ResponseBody;
     /// JSON public error body type, or [`NoBody`].
     type ErrorBody;
+
+    const METADATA: OperationMetadata;
+}
+
+/// Compile-time connection between a WebSocket route and its directional frame authorities.
+///
+/// This is intentionally separate from [`Operation`]: WebSocket routes do not have unary request,
+/// response, or error bodies and therefore cannot be passed to HTTP adapter surfaces.
+pub trait WebSocketOperation {
+    /// Tuple of path parameter types in path-template order.
+    type PathParameters;
+    /// Frame received by the server from the connected client.
+    type ClientToServerFrame;
+    /// Frame sent by the server to the connected client.
+    type ServerToClientFrame;
 
     const METADATA: OperationMetadata;
 }

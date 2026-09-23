@@ -1,0 +1,5 @@
+error: WebSocket frame authorities must use direct named Rust types
+  --> tests/ui/invalid_websocket_frame.rs:10:28
+   |
+10 |         client_to_server = (Frame, Frame),
+   |                            ^^^^^^^^^^^^^^

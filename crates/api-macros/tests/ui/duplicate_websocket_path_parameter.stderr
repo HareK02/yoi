@@ -1,0 +1,5 @@
+error: duplicate path parameter `widget_id`
+  --> tests/ui/duplicate_websocket_path_parameter.rs:12:44
+   |
+12 |         path_parameters = [widget_id: u64, widget_id: String]
+   |                                            ^^^^^^^^^

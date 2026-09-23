@@ -4,9 +4,10 @@
 //! transport projections. They intentionally do not expose provider/session
 //! handles, host paths, Runtime URLs, or credentials.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkingDirectoryMaterializerKind {
     #[default]
@@ -14,7 +15,7 @@ pub enum WorkingDirectoryMaterializerKind {
     ClientHostedExternal,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkingDirectoryStatusKind {
     Active,
@@ -42,7 +43,7 @@ impl std::fmt::Display for WorkingDirectoryStatusKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkingDirectoryCleanupTarget {
     pub kind: String,
@@ -50,7 +51,7 @@ pub struct WorkingDirectoryCleanupTarget {
     pub repository_key: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkingDirectoryOccupancy {
     pub runtime_id: String,
@@ -59,7 +60,7 @@ pub struct WorkingDirectoryOccupancy {
     pub linked_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeWorkingDirectoryCleanupTarget {
     pub kind: String,
@@ -67,7 +68,7 @@ pub struct RuntimeWorkingDirectoryCleanupTarget {
     pub repository_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeWorkingDirectorySummary {
     pub working_directory_id: String,
@@ -99,14 +100,14 @@ pub struct RuntimeWorkingDirectorySummary {
     pub occupied_by: Option<WorkingDirectoryOccupancy>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkingDirectorySource {
     Repository { repository_key: String },
     ExternalGrant { grant_id: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkingDirectorySummary {
     pub working_directory_id: String,
@@ -146,7 +147,9 @@ impl WorkingDirectorySummary {
 pub use WorkingDirectoryMaterializerKind as MaterializerKind;
 
 /// Stable Workspace identity for a Worker hosted by a Runtime.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeWorkerRef {
     pub runtime_id: String,
@@ -164,7 +167,7 @@ impl RuntimeWorkerRef {
 }
 
 /// Immutable materialization provenance retained by Workspace inventory.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkingDirectoryProvenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -179,7 +182,7 @@ pub struct WorkingDirectoryProvenance {
 }
 
 /// Latest provider-neutral observation attached to Workspace inventory.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkingDirectoryCurrentObservation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -247,7 +250,7 @@ mod tests {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceWorkdirSessionOperationRequest {
     /// Worker-local attachment alias selected by the calling tool router.

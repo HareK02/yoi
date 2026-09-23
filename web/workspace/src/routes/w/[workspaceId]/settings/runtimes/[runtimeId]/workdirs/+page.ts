@@ -1,18 +1,17 @@
 import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
+import { parseWorkspaceRuntimeList } from "$lib/workspace/api/runtime-management";
+import { parseRuntimeCleanupPlan } from "$lib/workspace/api/runtime-workers";
 import { parseWorkingDirectoryListResponse } from "$lib/workspace/api/workdirs";
-import type {
-  ListResponse,
-  Runtime,
-  RuntimeCleanupPlanResponse,
-} from "$lib/workspace/sidebar/types";
 import type { PageLoad } from "./$types";
 
 export const load: PageLoad = async ({ fetch, params }) => {
   const runtimeId = params.runtimeId;
   const [runtimes, workdirs, cleanupPlan] = await Promise.all([
-    loadJson<ListResponse<Runtime>>(
+    loadJson(
       fetch,
       workspaceApiPath(params.workspaceId, "/runtimes"),
+      undefined,
+      parseWorkspaceRuntimeList,
     ),
     loadJson(
       fetch,
@@ -23,12 +22,14 @@ export const load: PageLoad = async ({ fetch, params }) => {
       undefined,
       parseWorkingDirectoryListResponse,
     ),
-    loadJson<RuntimeCleanupPlanResponse>(
+    loadJson(
       fetch,
       workspaceApiPath(
         params.workspaceId,
         `/runtimes/${encodeURIComponent(runtimeId)}/cleanup-plan`,
       ),
+      undefined,
+      parseRuntimeCleanupPlan,
     ),
   ]);
 

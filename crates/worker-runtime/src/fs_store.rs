@@ -1801,6 +1801,11 @@ impl<'de> Deserialize<'de> for WorkerExecutionRecord {
                         alias,
                         working_directory_id: claim.working_directory_id,
                         relative_cwd: claim.relative_cwd,
+                        // The removed singular field represented a full local
+                        // Workdir binding. Preserve that known legacy contract
+                        // explicitly; missing capabilities on the current claim
+                        // shape default to read-only instead.
+                        capabilities: workdir::WorkdirSessionCapabilities::ALL,
                     });
             }
         }
@@ -2474,8 +2479,39 @@ mod tests {
         assert_eq!(attachment.alias.as_str(), "workdir");
         assert_eq!(attachment.working_directory_id, "wd-legacy");
         assert_eq!(attachment.relative_cwd.as_deref(), Some("crates/yoi"));
+        assert_eq!(
+            attachment.capabilities,
+            workdir::WorkdirSessionCapabilities::ALL
+        );
         let serialized = serde_json::to_value(execution).unwrap();
         assert!(serialized["request"].get("working_directory").is_none());
+    }
+
+    #[test]
+    fn current_attachment_claim_without_capabilities_defaults_to_read_only() {
+        let worker_id = WorkerId::now_v7();
+        let mut request = schema_v7_worker_document(worker_id)["request"].clone();
+        request["workdir_attachments"] = serde_json::json!([{
+            "alias": "docs",
+            "working_directory_id": "wd-docs"
+        }]);
+        let execution: WorkerExecutionRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "request": request,
+            "binding": {},
+            "restore_intent": "automatic"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            execution.request.workdir_attachments[0].capabilities,
+            workdir::WorkdirSessionCapabilities::READ_ONLY
+        );
+        let serialized = serde_json::to_value(execution).unwrap();
+        assert_eq!(
+            serialized["request"]["workdir_attachments"][0]["capabilities"],
+            serde_json::to_value(workdir::WorkdirSessionCapabilities::READ_ONLY).unwrap()
+        );
     }
 
     #[test]
@@ -2512,7 +2548,7 @@ mod tests {
             [LogicalWorkdirAttachment {
                 alias: workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
                 working_directory_id: "remote-workdir".to_string(),
-                capabilities: workdir::WorkdirSessionCapabilities::ALL,
+                capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
             }]
         );
     }

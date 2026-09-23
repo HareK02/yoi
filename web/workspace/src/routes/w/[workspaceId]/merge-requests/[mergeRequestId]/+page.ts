@@ -1,38 +1,25 @@
 import type { PageLoad } from "./$types";
+import { loadJson } from "$lib/workspace/api/http";
+import { mergeRequestDetailPath } from "$lib/workspace/api/merge-requests";
 import {
-  type MergeRequestDetail,
-  mergeRequestDetailPath,
-} from "$lib/workspace/api/merge-requests";
+  parseMergeRequestDetailResponse,
+  TICKET_BROWSER_API_LOAD_POLICY,
+} from "$lib/workspace/api/ticket-browser";
 
 export const load: PageLoad = async ({ params, fetch }) => {
-  try {
-    const response = await fetch(
-      `${
-        mergeRequestDetailPath(params.workspaceId, params.mergeRequestId)
-      }?limit=100`,
-    );
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      return {
-        workspaceId: params.workspaceId,
-        mergeRequestId: params.mergeRequestId,
-        mergeRequest: null,
-        error: body?.error ?? body?.message ??
-          `Request failed (${response.status})`,
-      };
-    }
-    return {
-      workspaceId: params.workspaceId,
-      mergeRequestId: params.mergeRequestId,
-      mergeRequest: body as MergeRequestDetail,
-      error: null,
-    };
-  } catch (error) {
-    return {
-      workspaceId: params.workspaceId,
-      mergeRequestId: params.mergeRequestId,
-      mergeRequest: null,
-      error: error instanceof Error ? error.message : String(error),
-    };
-  }
+  const result = await loadJson(
+    fetch,
+    `${
+      mergeRequestDetailPath(params.workspaceId, params.mergeRequestId)
+    }?limit=100`,
+    undefined,
+    parseMergeRequestDetailResponse,
+    TICKET_BROWSER_API_LOAD_POLICY,
+  );
+  return {
+    workspaceId: params.workspaceId,
+    mergeRequestId: params.mergeRequestId,
+    mergeRequest: result.data,
+    error: result.error,
+  };
 };

@@ -60,6 +60,6 @@ pub use worker::{
     LocalWorkingDirectory, Worker, WorkerError, WorkerFilesystemAuthority, WorkerRunResult,
     WorkerWorkspaceContext, WorkspaceClient, WorkspaceClientError, WorkspaceId, WorkspaceIdError,
     WorkspacePromptCatalogResolution, WorkspaceRequest, WorkspaceRequestMethod, WorkspaceResponse,
-    WorkspaceWorkerDiscoveryRequest, apply_worker_manifest, marker_workspace_client,
-    unavailable_workspace_client,
+    WorkspaceServerOperation, WorkspaceWorkerDiscoveryRequest, apply_worker_manifest,
+    marker_workspace_client, unavailable_workspace_client,
 };

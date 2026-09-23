@@ -1,0 +1,5 @@
+error: duplicate route for GET `/widgets/{widget_id}/events`
+  --> tests/ui/duplicate_websocket_route.rs:18:10
+   |
+18 |     type WidgetEvents;
+   |          ^^^^^^^^^^^^
