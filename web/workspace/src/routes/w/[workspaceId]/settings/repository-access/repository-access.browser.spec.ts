@@ -240,6 +240,14 @@ test("keeps a deferred row failure on that row while unrelated actions remain en
       name: "Add pinned key",
     }) as HTMLButtonElement).disabled,
   ).toBe(false);
+  const rotate = within(row).getByRole("button", { name: "Rotate" });
+  const remove = within(row).getByRole("button", { name: "Delete" });
+  expect((rotate as HTMLButtonElement).disabled).toBe(true);
+  expect((remove as HTMLButtonElement).disabled).toBe(true);
+  await fireEvent.click(rotate);
+  await fireEvent.click(remove);
+  expect(screen.queryByRole("heading", { name: "Rotate Deploy key" }))
+    .toBeNull();
   await fireEvent.click(within(row).getByRole("button", { name: "Loading…" }));
   expect(fetchMock).toHaveBeenCalledTimes(1);
 

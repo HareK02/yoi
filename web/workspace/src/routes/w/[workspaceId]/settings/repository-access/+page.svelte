@@ -730,9 +730,9 @@
                       {isPending(`copy-${credential.credential_id}`) ? 'Loading…' : copiedCredentialId === credential.credential_id ? 'Copied' : 'Copy public key'}
                     </button>
                     {#if credential.credential_id !== workspaceDefaultCredentialId}
-                      <button id={`rotate-credential-${credential.credential_id}`} type="button" class="secondary" disabled={credentialEditorPending() || isPending(`delete-${credential.credential_id}`)} onclick={() => void openCredentialRotation(credential)}>Rotate</button>
+                      <button id={`rotate-credential-${credential.credential_id}`} type="button" class="secondary" disabled={credentialEditorPending() || isPending(`copy-${credential.credential_id}`) || isPending(`delete-${credential.credential_id}`)} onclick={() => void openCredentialRotation(credential)}>Rotate</button>
                       {#if credential.referenced_repositories.length === 0}
-                        <button type="button" class="danger" disabled={isPending(`delete-${credential.credential_id}`) || isPending(`rotate-${credential.credential_id}`)} onclick={() => void deleteCredential(credential)}>Delete</button>
+                        <button type="button" class="danger" disabled={isPending(`delete-${credential.credential_id}`) || isPending(`copy-${credential.credential_id}`) || isPending(`rotate-${credential.credential_id}`)} onclick={() => void deleteCredential(credential)}>Delete</button>
                       {/if}
                     {/if}
                   </div>
