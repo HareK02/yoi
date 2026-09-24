@@ -809,7 +809,12 @@ permission = "write"
         let mut persisted = Vec::new();
         write_worker_record(&mut persisted, &decoded).unwrap();
         let persisted: serde_json::Value = serde_json::from_slice(&persisted).unwrap();
-        assert_eq!(persisted["manifest"]["schema_version"], 2);
+        let current_manifest =
+            manifest::write_persisted_worker_manifest_snapshot(&decoded.manifest).unwrap();
+        assert_eq!(
+            persisted["manifest"]["schema_version"],
+            current_manifest["schema_version"]
+        );
         assert_eq!(
             persisted["manifest"]["manifest"]["feature"]["memory"]["profile"]["enabled"],
             false

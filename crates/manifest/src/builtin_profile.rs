@@ -8,6 +8,7 @@ use crate::profile::ProfileError;
 
 pub const BUILTIN_PROFILE_CATALOG_ID: &str = "builtin-profiles-v2";
 pub const BUILTIN_DEFAULT_PROFILE: &str = "builtin:default";
+pub const BUILTIN_STANDALONE_PROFILE: &str = "builtin:standalone";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuiltinProfileImport {
@@ -25,9 +26,14 @@ pub struct BuiltinProfileResource {
 }
 
 const BASE_PATH: &str = "profiles/base.dcdl";
+const DEFAULT_PATH: &str = "profiles/default.dcdl";
 const BASE_IMPORT: &[BuiltinProfileImport] = &[BuiltinProfileImport {
     specifier: "./base.dcdl",
     resolved_path: BASE_PATH,
+}];
+const DEFAULT_IMPORT: &[BuiltinProfileImport] = &[BuiltinProfileImport {
+    specifier: "./default.dcdl",
+    resolved_path: DEFAULT_PATH,
 }];
 const NO_IMPORTS: &[BuiltinProfileImport] = &[];
 
@@ -41,10 +47,17 @@ pub const BUILTIN_PROFILE_RESOURCES: &[BuiltinProfileResource] = &[
     },
     BuiltinProfileResource {
         selector: Some(BUILTIN_DEFAULT_PROFILE),
-        path: "profiles/default.dcdl",
+        path: DEFAULT_PATH,
         source: include_str!("../../../resources/profiles/default.dcdl"),
-        description: "Standalone Yoi coding profile.",
+        description: "Default Yoi coding profile.",
         imports: BASE_IMPORT,
+    },
+    BuiltinProfileResource {
+        selector: Some(BUILTIN_STANDALONE_PROFILE),
+        path: "profiles/standalone.dcdl",
+        source: include_str!("../../../resources/profiles/standalone.dcdl"),
+        description: "Standalone Yoi coding profile.",
+        imports: DEFAULT_IMPORT,
     },
     BuiltinProfileResource {
         selector: Some("builtin:coder"),
@@ -281,7 +294,11 @@ mod tests {
         assert_eq!(catalog.entrypoints.len() + 1, catalog.sources.len());
         assert_eq!(
             catalog.entrypoints.get(BUILTIN_DEFAULT_PROFILE),
-            Some(&"profiles/default.dcdl".to_owned())
+            Some(&DEFAULT_PATH.to_owned())
+        );
+        assert_eq!(
+            catalog.entrypoints.get(BUILTIN_STANDALONE_PROFILE),
+            Some(&"profiles/standalone.dcdl".to_owned())
         );
         assert!(catalog.digest().starts_with("sha256:"));
     }
@@ -301,10 +318,29 @@ mod tests {
     }
 
     #[test]
+    fn standalone_profile_inherits_default_and_overrides_workspace_policy() {
+        let value = resolve_builtin_profile_artifact(BUILTIN_STANDALONE_PROFILE)
+            .expect("evaluate built-in standalone")
+            .expect("standalone exists");
+        assert_eq!(value["slug"], "standalone");
+        assert_eq!(value["model"]["ref"], "codex-oauth/gpt-5.6-sol");
+        assert_eq!(value["scope"]["intent"], "workspace_write");
+        assert_eq!(value["scope"]["symlink_policy"], "logical");
+        assert_eq!(value["delegation_scope"]["intent"], "workspace_write");
+        assert_eq!(value["delegation_scope"]["symlink_policy"], "logical");
+        assert_eq!(value["feature"]["sub_worker"]["enabled"], true);
+        assert_eq!(value["feature"]["memory"]["enabled"], false);
+    }
+
+    #[test]
     fn imports_cannot_escape_the_builtin_resource_catalog() {
         assert_eq!(
             resolve_import_path("profiles/default.dcdl", "./base.dcdl").as_deref(),
             Some("profiles/base.dcdl")
+        );
+        assert_eq!(
+            resolve_import_path("profiles/standalone.dcdl", "./default.dcdl").as_deref(),
+            Some(DEFAULT_PATH)
         );
         assert_eq!(
             resolve_import_path("profiles/default.dcdl", "../outside.dcdl"),

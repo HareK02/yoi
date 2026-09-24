@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use manifest::{
-    ProfileExecutionTarget, ProfileResolveOptions, ProfileResolver, ProfileSelector,
-    ResolvedProfile,
+    BUILTIN_DEFAULT_PROFILE, BUILTIN_STANDALONE_PROFILE, ProfileDiscovery, ProfileExecutionTarget,
+    ProfileRegistry, ProfileRegistrySource, ProfileResolveOptions, ProfileResolver,
+    ProfileSelector, ResolvedProfile, validate_profile_execution_target,
 };
 use thiserror::Error;
 use worker::PromptCatalogSource;
@@ -56,15 +57,22 @@ impl StandaloneLaunchConfig {
             return Err(StandaloneLaunchError::PathProfileUnsupported);
         }
         let cwd = canonical_directory(&self.cwd)?;
+        let registry = ProfileDiscovery::user_settings()
+            .discover()
+            .map_err(|_| StandaloneLaunchError::ProfileResolutionFailed)?;
+        let selector = standalone_profile_selector(&self.profile, &registry)
+            .map_err(|_| StandaloneLaunchError::ProfileResolutionFailed)?;
         let profile = ProfileResolver::new()
             .with_workspace_base(&cwd)
-            .resolve_for_target(
-                &self.profile,
+            .resolve_from_registry(
+                &selector,
+                &registry,
                 ProfileResolveOptions {
                     worker_name: Some(self.worker_name),
                 },
-                ProfileExecutionTarget::Standalone,
             )
+            .map_err(|_| StandaloneLaunchError::ProfileResolutionFailed)?;
+        validate_profile_execution_target(&profile.manifest, ProfileExecutionTarget::Standalone)
             .map_err(|_| StandaloneLaunchError::ProfileResolutionFailed)?;
 
         Ok(ResolvedStandaloneLaunch {
@@ -76,6 +84,23 @@ impl StandaloneLaunchConfig {
     }
 }
 
+fn standalone_profile_selector(
+    requested: &ProfileSelector,
+    registry: &ProfileRegistry,
+) -> Result<ProfileSelector, manifest::ProfileError> {
+    if requested != &ProfileSelector::Default
+        || registry.default_entry()?.qualified_name() != BUILTIN_DEFAULT_PROFILE
+    {
+        return Ok(requested.clone());
+    }
+    Ok(ProfileSelector::source_named(
+        ProfileRegistrySource::Builtin,
+        BUILTIN_STANDALONE_PROFILE
+            .strip_prefix("builtin:")
+            .expect("built-in standalone selector must be source-qualified"),
+    ))
+}
+
 fn canonical_directory(path: &Path) -> Result<PathBuf, StandaloneLaunchError> {
     let path = std::fs::canonicalize(path)
         .map_err(|_| StandaloneLaunchError::WorkingDirectoryUnavailable)?;
@@ -83,4 +108,52 @@ fn canonical_directory(path: &Path) -> Result<PathBuf, StandaloneLaunchError> {
         return Err(StandaloneLaunchError::WorkingDirectoryUnavailable);
     }
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_default_maps_to_standalone_only_for_standalone_launch() {
+        let registry = ProfileDiscovery::with_sources(None, None)
+            .discover()
+            .unwrap();
+        assert_eq!(
+            standalone_profile_selector(&ProfileSelector::Default, &registry).unwrap(),
+            ProfileSelector::source_named(ProfileRegistrySource::Builtin, "standalone")
+        );
+        let explicit_default =
+            ProfileSelector::source_named(ProfileRegistrySource::Builtin, "default");
+        assert_eq!(
+            standalone_profile_selector(&explicit_default, &registry).unwrap(),
+            explicit_default
+        );
+        assert_eq!(
+            registry.default_entry().unwrap().qualified_name(),
+            BUILTIN_DEFAULT_PROFILE
+        );
+    }
+
+    #[test]
+    fn operator_default_remains_the_standalone_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry_path = temp.path().join("profiles.toml");
+        std::fs::write(
+            &registry_path,
+            "default = 'operator'\n[profile]\noperator = 'operator.toml'\n",
+        )
+        .unwrap();
+        let registry = ProfileDiscovery::with_sources(Some(registry_path), None)
+            .discover()
+            .unwrap();
+        assert_eq!(
+            standalone_profile_selector(&ProfileSelector::Default, &registry).unwrap(),
+            ProfileSelector::Default
+        );
+        assert_eq!(
+            registry.default_entry().unwrap().qualified_name(),
+            "user:operator"
+        );
+    }
 }

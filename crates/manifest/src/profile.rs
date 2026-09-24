@@ -20,8 +20,8 @@ use crate::config::{
 use crate::model::{AuthRef, ModelManifest};
 use crate::{
     EngineManifestConfig, McpConfig, McpStdioCwdPolicy, Permission, ResolveError, ScopeConfig,
-    ScopeRule, SkillsConfig, WebConfig, WorkerManifest, WorkerManifestConfig, WorkerMetaConfig,
-    paths,
+    ScopeRule, SkillsConfig, SymlinkPolicy, WebConfig, WorkerManifest, WorkerManifestConfig,
+    WorkerMetaConfig, paths,
 };
 
 const PROFILE_FORMAT_V1: &str = "yoi.profile.v1";
@@ -698,6 +698,8 @@ struct ProfileScopeTable {
     intent: ProfileScopeIntent,
     #[serde(default)]
     deny_write: Vec<PathBuf>,
+    #[serde(default)]
+    symlink_policy: SymlinkPolicy,
 }
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -938,10 +940,14 @@ fn profile_scope_intent_to_config(
     default_intent: Option<ProfileScopeIntent>,
     field: &'static str,
 ) -> Result<ScopeConfig, ProfileError> {
-    let (intent, deny_write) = match scope {
-        Some(ProfileScopeConfig::Table(table)) => (Some(table.intent), table.deny_write),
-        Some(ProfileScopeConfig::String(intent)) => (Some(intent), Vec::new()),
-        None => (default_intent, Vec::new()),
+    let (intent, deny_write, symlink_policy) = match scope {
+        Some(ProfileScopeConfig::Table(table)) => {
+            (Some(table.intent), table.deny_write, table.symlink_policy)
+        }
+        Some(ProfileScopeConfig::String(intent)) => {
+            (Some(intent), Vec::new(), SymlinkPolicy::default())
+        }
+        None => (default_intent, Vec::new(), SymlinkPolicy::default()),
     };
     let Some(intent) = intent else {
         return Ok(ScopeConfig::default());
@@ -969,7 +975,7 @@ fn profile_scope_intent_to_config(
             target: workspace_base.to_path_buf(),
             permission,
             recursive: true,
-            symlink_policy: Default::default(),
+            symlink_policy,
         }],
         deny,
     })
@@ -1247,6 +1253,7 @@ mod tests {
 
         for name in [
             "default",
+            "standalone",
             "intake",
             "orchestrator",
             "companion",
@@ -1386,12 +1393,12 @@ mod tests {
     }
 
     #[test]
-    fn builtin_default_resolves_as_a_standalone_local_capability_profile() {
+    fn builtin_standalone_resolves_as_a_local_capability_profile() {
         let tmp = TempDir::new().unwrap();
         let resolved = ProfileResolver::new()
             .with_workspace_base(tmp.path())
             .resolve_for_target(
-                &ProfileSelector::source_named(ProfileRegistrySource::Builtin, "default"),
+                &ProfileSelector::source_named(ProfileRegistrySource::Builtin, "standalone"),
                 ProfileResolveOptions::with_worker_name("standalone-worker"),
                 ProfileExecutionTarget::Standalone,
             )
@@ -1405,17 +1412,25 @@ mod tests {
                 path: None,
                 provenance: Some(provenance),
                 ..
-            } if name == "default" && provenance.starts_with("profiles/default.dcdl#sha256:")
+            } if name == "standalone" && provenance.starts_with("profiles/standalone.dcdl#sha256:")
         ));
+        assert_eq!(
+            resolved.manifest.model.ref_.as_deref(),
+            Some("codex-oauth/gpt-5.6-sol")
+        );
         assert!(resolved.manifest.feature.task.enabled);
         assert!(resolved.manifest.feature.web.enabled);
         assert!(resolved.manifest.feature.image.enabled);
         assert!(resolved.manifest.feature.sub_worker.enabled);
         assert!(resolved.manifest.scope.allow.iter().any(|rule| {
-            rule.permission == protocol::Permission::Write && rule.target == tmp.path()
+            rule.permission == protocol::Permission::Write
+                && rule.target == tmp.path()
+                && rule.symlink_policy == protocol::SymlinkPolicy::Logical
         }));
         assert!(resolved.manifest.delegation_scope.allow.iter().any(|rule| {
-            rule.permission == protocol::Permission::Write && rule.target == tmp.path()
+            rule.permission == protocol::Permission::Write
+                && rule.target == tmp.path()
+                && rule.symlink_policy == protocol::SymlinkPolicy::Logical
         }));
         assert!(!resolved.manifest.feature.memory.profile.enabled);
         assert!(!resolved.manifest.feature.ticket.enabled);

@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use manifest::ProfileDiscovery;
+use manifest::{BUILTIN_DEFAULT_PROFILE, BUILTIN_STANDALONE_PROFILE, ProfileDiscovery};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -224,12 +224,20 @@ fn run_picker(
 }
 
 fn profile_choices(registry: &manifest::ProfileRegistry) -> Vec<ProfileChoice> {
+    let use_standalone_fallback = registry
+        .default_entry()
+        .is_ok_and(|entry| entry.qualified_name() == BUILTIN_DEFAULT_PROFILE);
     registry
         .entries()
         .iter()
         .map(|entry| {
             let selector = entry.qualified_name();
-            let default_marker = if entry.is_default { " (default)" } else { "" };
+            let is_default = if use_standalone_fallback {
+                selector == BUILTIN_STANDALONE_PROFILE
+            } else {
+                entry.is_default
+            };
+            let default_marker = if is_default { " (default)" } else { "" };
             let mut label = format!("{selector}{default_marker}");
             if let Some(description) = &entry.description {
                 label.push_str(" — ");
@@ -238,7 +246,7 @@ fn profile_choices(registry: &manifest::ProfileRegistry) -> Vec<ProfileChoice> {
             ProfileChoice {
                 selector,
                 label,
-                is_default: entry.is_default,
+                is_default,
             }
         })
         .collect()
@@ -370,8 +378,8 @@ mod tests {
     fn choices() -> Vec<ProfileChoice> {
         vec![
             ProfileChoice {
-                selector: "builtin:default".to_owned(),
-                label: "builtin:default (default) — Default".to_owned(),
+                selector: "builtin:standalone".to_owned(),
+                label: "builtin:standalone (default) — Standalone".to_owned(),
                 is_default: true,
             },
             ProfileChoice {
@@ -386,7 +394,7 @@ mod tests {
     fn default_form_preserves_old_spawn_layout_defaults() {
         let form = SpawnForm::new(None, "yoi".to_owned(), choices());
         assert_eq!(form.worker_name, "yoi");
-        assert_eq!(form.selected_profile().selector, "builtin:default");
+        assert_eq!(form.selected_profile().selector, "builtin:standalone");
     }
 
     #[test]
@@ -398,7 +406,7 @@ mod tests {
         );
         assert_eq!(form.selected_profile().selector, "builtin:coder");
         form.apply_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        assert_eq!(form.selected_profile().selector, "builtin:default");
+        assert_eq!(form.selected_profile().selector, "builtin:standalone");
         form.apply_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(form.selected_profile().selector, "builtin:coder");
     }
@@ -445,7 +453,7 @@ mod tests {
 
         assert!(rendered.contains("spawn worker"));
         assert!(rendered.contains("name: yoi"));
-        assert!(rendered.contains("profile: builtin:default (default) — Default"));
+        assert!(rendered.contains("profile: builtin:standalone (default) — Standalone"));
         assert!(rendered.contains("enter spawn · left/right edit · esc cancel"));
     }
 
@@ -456,8 +464,25 @@ mod tests {
             .unwrap();
         let choices = profile_choices(&registry);
         let default = choices.iter().find(|choice| choice.is_default).unwrap();
-        assert_eq!(default.selector, "builtin:default");
+        assert_eq!(default.selector, "builtin:standalone");
         assert!(default.label.contains("(default)"));
+    }
+
+    #[test]
+    fn operator_profile_default_overrides_standalone_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry_path = temp.path().join("profiles.toml");
+        std::fs::write(
+            &registry_path,
+            "default = 'operator'\n[profile]\noperator = 'operator.toml'\n",
+        )
+        .unwrap();
+        let registry = ProfileDiscovery::with_sources(Some(registry_path), None)
+            .discover()
+            .unwrap();
+        let choices = profile_choices(&registry);
+        let default = choices.iter().find(|choice| choice.is_default).unwrap();
+        assert_eq!(default.selector, "user:operator");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 import "./base.dcdl" // {
     slug = "default";
-    description = "Standalone Yoi coding profile.";
+    description = "Default Yoi coding profile.";
     scope = "workspace_write";
     delegation_scope = "workspace_write";
 

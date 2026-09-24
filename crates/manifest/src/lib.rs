@@ -10,8 +10,8 @@ mod scope;
 
 pub use builtin_profile::{
     BUILTIN_DEFAULT_PROFILE, BUILTIN_PROFILE_CATALOG_ID, BUILTIN_PROFILE_RESOURCES,
-    BuiltinProfileCatalogSnapshot, BuiltinProfileImport, BuiltinProfileResource,
-    builtin_profile_catalog_snapshot, builtin_profile_entrypoints,
+    BUILTIN_STANDALONE_PROFILE, BuiltinProfileCatalogSnapshot, BuiltinProfileImport,
+    BuiltinProfileResource, builtin_profile_catalog_snapshot, builtin_profile_entrypoints,
 };
 pub use config::{
     CompactionConfigPartial, EngineManifestConfig, FileUploadLimitsPartial,
