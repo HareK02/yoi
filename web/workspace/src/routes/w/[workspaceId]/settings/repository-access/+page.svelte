@@ -186,6 +186,10 @@
     if (!isCurrentOperation(operationKey)) throw new StaleRepositoryAccessRequestError();
   }
 
+  function credentialLifecyclePending(credentialId: string): boolean {
+    return isPending(`copy-${credentialId}`) || isPending(`rotate-${credentialId}`) || isPending(`delete-${credentialId}`);
+  }
+
   function credentialEditorPending(): boolean {
     const credentialRotationPrefix = `${pageEpoch}:rotate-`;
     const hostRotationPrefix = `${pageEpoch}:rotate-host-`;
@@ -354,6 +358,7 @@
   }
 
   async function copyPublicKey(credential: RepositorySshCredential) {
+    if (credentialLifecyclePending(credential.credential_id)) return;
     const operation = startOperation(`copy-${credential.credential_id}`);
     if (!operation) return;
     publicKeyNotices = { ...publicKeyNotices, [credential.credential_id]: { tone: 'success', text: 'Loading public key…' } };
@@ -414,6 +419,7 @@
   }
 
   async function openCredentialRotation(credential: RepositorySshCredential) {
+    if (credentialLifecyclePending(credential.credential_id)) return;
     credentialReturnFocus = currentFocus();
     credentialForm = null;
     credentialFormNotice = null;
@@ -439,6 +445,7 @@
   }
 
   async function rotateCredential(credential: RepositorySshCredential) {
+    if (credentialLifecyclePending(credential.credential_id)) return;
     rotateErrors = validateCredentialRotation(rotatePrivateKey);
     if (Object.keys(rotateErrors).length > 0) {
       await focusFirstInvalid(rotationFormElement);
@@ -485,9 +492,8 @@
   }
 
   async function deleteCredential(credential: RepositorySshCredential) {
-    if (credential.referenced_repositories.length > 0) return;
+    if (credential.referenced_repositories.length > 0 || credentialLifecyclePending(credential.credential_id)) return;
     const operationName = `delete-${credential.credential_id}`;
-    if (isPending(operationName)) return;
     if (!confirm(`Delete SSH credential ${credential.name} (${credential.credential_id})? This cannot be undone.`)) return;
     const operation = startOperation(operationName);
     if (!operation) return;
@@ -711,7 +717,7 @@
           <thead><tr><th>Credential</th><th>Role</th><th>Fingerprint</th><th>Repository application</th><th><span class="visually-hidden">Actions</span></th></tr></thead>
           <tbody>
             {#each credentials as credential (credential.credential_id)}
-              <tr aria-busy={isPending(`copy-${credential.credential_id}`) || isPending(`delete-${credential.credential_id}`) || isPending(`rotate-${credential.credential_id}`)}>
+              <tr aria-busy={credentialLifecyclePending(credential.credential_id)}>
                 <td><strong>{credential.name}</strong><code>{credential.credential_id}</code></td>
                 <td>{credential.credential_id === workspaceDefaultCredentialId ? 'Workspace default' : 'Additional'}</td>
                 <td><code>{credential.public_key_algorithm}</code><code>{credential.public_key_fingerprint}</code></td>
@@ -726,13 +732,13 @@
                 </td>
                 <td>
                   <div class="repository-access-row-actions">
-                    <button type="button" class="secondary" disabled={isPending(`copy-${credential.credential_id}`) || isPending(`rotate-${credential.credential_id}`) || isPending(`delete-${credential.credential_id}`)} onclick={() => void copyPublicKey(credential)}>
+                    <button type="button" class="secondary" disabled={credentialLifecyclePending(credential.credential_id)} onclick={() => void copyPublicKey(credential)}>
                       {isPending(`copy-${credential.credential_id}`) ? 'Loading…' : copiedCredentialId === credential.credential_id ? 'Copied' : 'Copy public key'}
                     </button>
                     {#if credential.credential_id !== workspaceDefaultCredentialId}
-                      <button id={`rotate-credential-${credential.credential_id}`} type="button" class="secondary" disabled={credentialEditorPending() || isPending(`copy-${credential.credential_id}`) || isPending(`delete-${credential.credential_id}`)} onclick={() => void openCredentialRotation(credential)}>Rotate</button>
+                      <button id={`rotate-credential-${credential.credential_id}`} type="button" class="secondary" disabled={credentialEditorPending() || credentialLifecyclePending(credential.credential_id)} onclick={() => void openCredentialRotation(credential)}>Rotate</button>
                       {#if credential.referenced_repositories.length === 0}
-                        <button type="button" class="danger" disabled={isPending(`delete-${credential.credential_id}`) || isPending(`copy-${credential.credential_id}`) || isPending(`rotate-${credential.credential_id}`)} onclick={() => void deleteCredential(credential)}>Delete</button>
+                        <button type="button" class="danger" disabled={credentialLifecyclePending(credential.credential_id)} onclick={() => void deleteCredential(credential)}>Delete</button>
                       {/if}
                     {/if}
                   </div>
@@ -789,7 +795,7 @@
           <label class="wide"><span>New OpenSSH private key (Ed25519)</span><textarea bind:this={rotatePrivateKeyInput} bind:value={rotatePrivateKey} rows="8" autocomplete="off" data-web-ux-redact aria-invalid={Boolean(rotateErrors.privateKey)} aria-describedby={rotateErrors.privateKey ? 'rotate-key-error' : 'rotate-key-help'}></textarea><small id="rotate-key-help">Secret value; it cannot be read back after rotation.</small>{#if rotateErrors.privateKey}<small id="rotate-key-error" class="field-error">{rotateErrors.privateKey}</small>{/if}</label>
           <label class="wide"><span>Passphrase (optional)</span><input type="password" bind:value={rotatePassphrase} autocomplete="new-password" data-web-ux-redact /></label>
         </div>
-        <div class="repository-access-form-actions"><button type="submit" class="primary" disabled={isPending(`rotate-${selectedCredential.credential_id}`)}>{isPending(`rotate-${selectedCredential.credential_id}`) ? 'Rotating…' : 'Rotate credential'}</button><button type="button" class="secondary" disabled={isPending(`rotate-${selectedCredential.credential_id}`)} onclick={() => void closeCredentialRotation()}>Cancel</button></div>
+        <div class="repository-access-form-actions"><button type="submit" class="primary" disabled={credentialLifecyclePending(selectedCredential.credential_id)}>{isPending(`rotate-${selectedCredential.credential_id}`) ? 'Rotating…' : 'Rotate credential'}</button><button type="button" class="secondary" disabled={isPending(`rotate-${selectedCredential.credential_id}`)} onclick={() => void closeCredentialRotation()}>Cancel</button></div>
       </form>
     {/if}
 

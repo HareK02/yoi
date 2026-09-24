@@ -212,7 +212,7 @@ test("fences a deferred editor while an unrelated host draft remains active afte
   expect(fetchMock).toHaveBeenCalledTimes(2);
 });
 
-test("keeps a deferred row failure on that row while unrelated actions remain enabled", async () => {
+test("fences same-credential actions during a deferred row failure while unrelated controls remain enabled", async () => {
   const publicKeyResponse = deferred<Response>();
   const fetchMock = vi.fn(() => publicKeyResponse.promise);
   vi.stubGlobal("fetch", fetchMock);
@@ -220,6 +220,13 @@ test("keeps a deferred row failure on that row while unrelated actions remain en
 
   const row = screen.getByText("Deploy key").closest("tr");
   if (!row) throw new Error("missing credential row");
+  const rotate = within(row).getByRole("button", { name: "Rotate" });
+  await fireEvent.click(rotate);
+  const rotateSubmit = screen.getByRole("button", {
+    name: "Rotate credential",
+  });
+  expect((rotateSubmit as HTMLButtonElement).disabled).toBe(false);
+
   const copy = within(row).getByRole("button", { name: "Copy public key" });
   await fireEvent.click(copy);
 
@@ -240,13 +247,14 @@ test("keeps a deferred row failure on that row while unrelated actions remain en
       name: "Add pinned key",
     }) as HTMLButtonElement).disabled,
   ).toBe(false);
-  const rotate = within(row).getByRole("button", { name: "Rotate" });
   const remove = within(row).getByRole("button", { name: "Delete" });
   expect((rotate as HTMLButtonElement).disabled).toBe(true);
   expect((remove as HTMLButtonElement).disabled).toBe(true);
+  expect((rotateSubmit as HTMLButtonElement).disabled).toBe(true);
+  await fireEvent.click(rotateSubmit);
   await fireEvent.click(rotate);
   await fireEvent.click(remove);
-  expect(screen.queryByRole("heading", { name: "Rotate Deploy key" }))
+  expect(screen.getByRole("heading", { name: "Rotate Deploy key" })).not
     .toBeNull();
   await fireEvent.click(within(row).getByRole("button", { name: "Loading…" }));
   expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -255,6 +263,9 @@ test("keeps a deferred row failure on that row while unrelated actions remain en
   const alert = await within(row).findByRole("alert");
   expect(alert.textContent).toContain("Unable to load this public key");
   expect(screen.getAllByRole("alert")).toHaveLength(1);
+  expect((rotateSubmit as HTMLButtonElement).disabled).toBe(false);
+  expect(screen.getByRole("heading", { name: "Rotate Deploy key" })).not
+    .toBeNull();
 });
 
 test("rerendering for another Workspace resets local state and fences stale responses", async () => {
