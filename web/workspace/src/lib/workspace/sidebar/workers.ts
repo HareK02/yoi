@@ -1,3 +1,5 @@
+import { workerHref } from '../resource-links';
+import { ownsRoutePath } from './route-ownership';
 import type { Worker } from './types';
 
 export type SidebarWorkerActivity =
@@ -29,6 +31,38 @@ export function canOpenWorkerConsole(
   worker: Pick<Worker, 'implementation'>,
 ): boolean {
   return canShowWorkerInSidebar(worker);
+}
+
+type SidebarWorkerLink = Pick<Worker, 'resource_key' | 'display_name'>;
+
+export function workerOwnsSidebarPath(
+  workspaceId: string,
+  worker: SidebarWorkerLink,
+  currentPath: string,
+): boolean {
+  return ownsRoutePath(workerHref(workspaceId, worker), currentPath);
+}
+
+export function visibleWorkersForSidebar<T extends SidebarWorkerLink>(
+  workers: readonly T[],
+  options: {
+    workspaceId: string;
+    currentPath: string;
+    expanded: boolean;
+    limit: number;
+  },
+): readonly T[] {
+  if (options.expanded || workers.length <= options.limit) return workers;
+  if (options.limit <= 0) return [];
+
+  const visible = workers.slice(0, options.limit);
+  const currentIndex = workers.findIndex((worker) =>
+    workerOwnsSidebarPath(options.workspaceId, worker, options.currentPath)
+  );
+  if (currentIndex < options.limit) return visible;
+
+  visible[visible.length - 1] = workers[currentIndex];
+  return visible;
 }
 
 type SortableWorker = Pick<

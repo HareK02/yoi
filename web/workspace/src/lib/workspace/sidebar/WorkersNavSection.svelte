@@ -11,7 +11,12 @@
     workspaceWorkersStore,
     type SidebarWorker,
   } from './worker-subscription';
-  import { canShowWorkerInSidebar, sidebarWorkerActivity } from './workers';
+  import {
+    canShowWorkerInSidebar,
+    sidebarWorkerActivity,
+    visibleWorkersForSidebar,
+    workerOwnsSidebarPath,
+  } from './workers';
   import { sidebarWorkdirMeta } from './worker-workdir-meta';
 
   const COLLAPSED_WORKER_COUNT = 6;
@@ -32,7 +37,12 @@
   let menuTrigger = $state<HTMLButtonElement | null>(null);
   let busyAction = $state<{ workerKey: string; kind: WorkerActionKind } | null>(null);
   let visibleWorkers = $derived(
-    expanded ? workers : workers.slice(0, COLLAPSED_WORKER_COUNT),
+    visibleWorkersForSidebar(workers, {
+      workspaceId,
+      currentPath,
+      expanded,
+      limit: COLLAPSED_WORKER_COUNT,
+    }),
   );
   let hiddenWorkerCount = $derived(
     Math.max(0, workers.length - COLLAPSED_WORKER_COUNT),
@@ -173,13 +183,14 @@
         {@const activity = sidebarWorkerActivity(worker)}
         {@const key = workerKey(worker)}
         {@const label = worker.display_name || worker.label}
+        {@const active = workerOwnsSidebarPath(workspaceId, worker, currentPath)}
         {@const workdir = sidebarWorkdirMeta(worker.workdir_attachments)}
         <li class="worker-nav-item" data-worker-actions={key}>
           <a
             href={href}
             class="worker-nav-link"
-            class:active={currentPath === href}
-            aria-current={currentPath === href ? 'page' : undefined}
+            class:active
+            aria-current={active ? 'page' : undefined}
           >
             <span class="worker-status-indicator">
               {#if activity === 'worker-running'}

@@ -3,6 +3,8 @@ import {
   canShowWorkerInSidebar,
   compareWorkersForSidebar,
   sidebarWorkerActivity,
+  visibleWorkersForSidebar,
+  workerOwnsSidebarPath,
 } from "./workers.ts";
 import type { Worker } from "./types.ts";
 
@@ -77,6 +79,39 @@ Deno.test("sidebar workers sort running then idle then stopped", () => {
   ];
   workers.sort(compareWorkersForSidebar);
   assertEquals(workers.map((candidate) => candidate.worker_id).join(","), "2,1,4,3");
+});
+
+Deno.test("collapsed sidebar keeps the current Worker visible", () => {
+  const workers = Array.from({ length: 8 }, (_, index) =>
+    worker({
+      worker_id: String(index + 1),
+      resource_key: `W-${index + 1}`,
+      display_name: `Worker ${index + 1}`,
+    }));
+  const currentPath = "/w/workspace-1/workers/W-8-worker-8/console";
+
+  assertEquals(
+    workerOwnsSidebarPath("workspace-1", workers[7], currentPath),
+    true,
+  );
+  assertEquals(
+    visibleWorkersForSidebar(workers, {
+      workspaceId: "workspace-1",
+      currentPath,
+      expanded: false,
+      limit: 6,
+    }).map((candidate) => candidate.resource_key).join(","),
+    "W-1,W-2,W-3,W-4,W-5,W-8",
+  );
+  assertEquals(
+    visibleWorkersForSidebar(workers, {
+      workspaceId: "workspace-1",
+      currentPath,
+      expanded: true,
+      limit: 6,
+    }).length,
+    8,
+  );
 });
 
 Deno.test("fatal child stop clears the sidebar SubWorker spinner activity", () => {
