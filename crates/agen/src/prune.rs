@@ -133,6 +133,33 @@ pub fn project(items: &mut [Item], indices: &[usize]) -> usize {
     count
 }
 
+/// Remove binary attachments after the first model request that could consume them.
+///
+/// Attachments on tool results following the latest model output are fresh outputs for the
+/// immediate follow-up request and remain visible. Once a later assistant/reasoning/tool-call
+/// item exists, the model has already had an opportunity to inspect the attachment. Subsequent
+/// requests keep the durable tool summary and can call the originating tool again when the image
+/// is still needed. Only the request-context clone is modified.
+pub fn project_consumed_attachments(items: &mut [Item]) -> usize {
+    let latest_model_output = items.iter().rposition(|item| {
+        item.is_assistant_message() || item.is_reasoning() || item.is_tool_call()
+    });
+    let mut count = 0;
+    for (index, item) in items.iter_mut().enumerate() {
+        let is_fresh = latest_model_output.is_some_and(|boundary| index > boundary);
+        if is_fresh {
+            continue;
+        }
+        if let Item::ToolResult { attachments, .. } = item
+            && !attachments.is_empty()
+        {
+            attachments.clear();
+            count += 1;
+        }
+    }
+    count
+}
+
 /// Indices of detailed `Item::ToolResult` values that lie before
 /// the suffix protected by `protected_tokens`. Pure: does not mutate `items`.
 ///
@@ -409,6 +436,52 @@ mod tests {
         assert!(matches!(
             &original[0],
             Item::ToolResult { attachments, .. } if attachments.len() == 1
+        ));
+    }
+
+    fn image_result(call_id: &str, bytes: &[u8]) -> Item {
+        Item::tool_result_item_with_attachments(
+            call_id,
+            "Attached image.png",
+            None,
+            false,
+            vec![crate::tool::Attachment::Image(
+                crate::tool::ImageAttachment::new("image/png", bytes.to_vec()),
+            )],
+        )
+    }
+
+    #[test]
+    fn consumed_attachment_projection_keeps_only_fresh_tool_outputs() {
+        let mut immediate = vec![
+            Item::tool_call("image-1", "ViewImage", r#"{"path":"first.png"}"#),
+            image_result("image-1", b"first"),
+        ];
+        assert_eq!(project_consumed_attachments(&mut immediate), 0);
+        assert!(matches!(
+            &immediate[1],
+            Item::ToolResult { attachments, .. } if attachments.len() == 1
+        ));
+
+        let mut consumed = immediate.clone();
+        consumed.push(Item::assistant_message("I inspected the image."));
+        consumed.push(Item::user_message("continue"));
+        assert_eq!(project_consumed_attachments(&mut consumed), 1);
+        assert!(matches!(
+            &consumed[1],
+            Item::ToolResult { attachments, .. } if attachments.is_empty()
+        ));
+
+        consumed.push(Item::tool_call(
+            "image-2",
+            "ViewImage",
+            r#"{"path":"second.png"}"#,
+        ));
+        consumed.push(image_result("image-2", b"second"));
+        assert_eq!(project_consumed_attachments(&mut consumed), 0);
+        assert!(matches!(
+            consumed.last(),
+            Some(Item::ToolResult { attachments, .. }) if attachments.len() == 1
         ));
     }
 

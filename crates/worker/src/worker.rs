@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
@@ -5571,11 +5571,20 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let history_entries = self.session.history().entries();
         let retain_from = cut.index.min(history_entries.len());
         let retained_history_entries = history_entries[retain_from..].to_vec();
-        let retained_items = retained_history_entries
+        let mut retained_items = retained_history_entries
             .iter()
             .map(|entry| entry.item.clone())
             .collect::<Vec<_>>();
-        let entries_to_summarise = history_entries[..retain_from].to_vec();
+        let default_workdir_alias = (self.workdir_sessions.len() == 1)
+            .then(|| self.workdir_sessions.aliases().into_iter().next())
+            .flatten()
+            .map(|alias| alias.as_str().to_string());
+        let retained_image_references =
+            project_compaction_attachments(&mut retained_items, default_workdir_alias.as_deref());
+        // The compactor explores summaries, text details, and ViewImage call arguments. It
+        // never needs durable image bodies; relevant images are nominated with add_reference.
+        let mut entries_to_summarise = history_entries[..retain_from].to_vec();
+        project_compactor_capture_attachments(&mut entries_to_summarise);
         let items_to_summarise = entries_to_summarise
             .iter()
             .map(|entry| entry.item.clone())
@@ -5840,15 +5849,16 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     "You have not called `write_summary` yet. Deliver the structured \
                      summary now (Completed Tasks / Active Task / Key Decisions / \
                      User Directives / Current Work) and nominate any files the next \
-                     session needs with `mark_read_required`."
+                     session needs with `mark_read_required` for UTF-8 text or \
+                     `add_reference` for images, binary files, and on-demand reads."
                         .to_string(),
                 )
             } else if snapshot.read_required.is_empty() && !default_refs.is_empty() {
                 Some(
-                    "Summary received. If any of the referenced files are required \
-                     for the next session to continue the task, call \
-                     `mark_read_required` on them now. Otherwise reply briefly to \
-                     close out."
+                    "Summary received. If any of the referenced UTF-8 text files must \
+                     be present in the next session, call `mark_read_required` on them. \
+                     Use `add_reference` for images, binary files, or files that can be \
+                     fetched on demand. Otherwise reply briefly to close out."
                         .to_string(),
                 )
             } else {
@@ -5983,20 +5993,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             }
         }
 
-        // Reference list as a single system message; omitted when empty.
-        let reference_message = (!final_ctx.references.is_empty()).then(|| {
-            let list = final_ctx
-                .references
-                .iter()
-                .map(|p| format!("- {}", p.display()))
-                .collect::<Vec<_>>()
-                .join("\n");
-            Item::system_message(format!(
-                "[Referenced files — read before compaction, contents not included]\n\
-                 {list}\n\
-                 Use read_file to access current contents if needed."
-            ))
-        });
+        // Related files are carried by name only. Retained ViewImage payloads are
+        // projected out above and become explicit on-demand image references here.
+        let reference_message =
+            build_related_file_message(&final_ctx.references, &retained_image_references);
 
         // Count surviving user_messages before consuming `retained_items`
         // — needed to align `self.user_segments` after the swap below.
@@ -7276,6 +7276,124 @@ impl From<EngineResult> for WorkerRunResult {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompactionImageReference {
+    target_workdir: Option<String>,
+    path: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ViewImageCallArguments {
+    #[serde(default)]
+    target_workdir: Option<String>,
+    path: String,
+}
+
+/// Remove binary bodies from the immutable capture exposed to the compactor.
+fn project_compactor_capture_attachments<A>(entries: &mut [HistoryEntry<A>]) -> usize {
+    let mut projected = 0;
+    for entry in entries {
+        if let Item::ToolResult { attachments, .. } = &mut entry.item
+            && !attachments.is_empty()
+        {
+            attachments.clear();
+            projected += 1;
+        }
+    }
+    projected
+}
+
+/// Remove every durable binary attachment from the compacted tail and preserve
+/// re-readable ViewImage origins as related-file references.
+fn project_compaction_attachments(
+    items: &mut [Item],
+    default_workdir_alias: Option<&str>,
+) -> Vec<CompactionImageReference> {
+    let view_image_calls = items
+        .iter()
+        .filter_map(|item| match item {
+            Item::ToolCall {
+                call_id,
+                name,
+                arguments,
+                ..
+            } if name == "ViewImage" => serde_json::from_str::<ViewImageCallArguments>(arguments)
+                .ok()
+                .map(|arguments| {
+                    (
+                        call_id.clone(),
+                        CompactionImageReference {
+                            target_workdir: arguments
+                                .target_workdir
+                                .or_else(|| default_workdir_alias.map(str::to_string)),
+                            path: arguments.path,
+                        },
+                    )
+                }),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut references = Vec::new();
+    for item in items {
+        let Item::ToolResult {
+            call_id,
+            attachments,
+            ..
+        } = item
+        else {
+            continue;
+        };
+        if attachments.is_empty() {
+            continue;
+        }
+        attachments.clear();
+        if let Some(reference) = view_image_calls.get(call_id)
+            && !references.contains(reference)
+        {
+            references.push(reference.clone());
+        }
+    }
+    references
+}
+
+fn build_related_file_message(
+    references: &[PathBuf],
+    image_references: &[CompactionImageReference],
+) -> Option<Item> {
+    if references.is_empty() && image_references.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::with_capacity(references.len() + image_references.len());
+    for reference in references {
+        let path = reference.display().to_string();
+        if image_references
+            .iter()
+            .any(|image| image.target_workdir.is_none() && image.path == path)
+        {
+            continue;
+        }
+        lines.push(format!("- {path}"));
+    }
+    for reference in image_references {
+        match reference.target_workdir.as_deref() {
+            Some(target_workdir) => lines.push(format!(
+                "- {} (image; use ViewImage with target_workdir {:?})",
+                reference.path, target_workdir
+            )),
+            None => lines.push(format!("- {} (image; use ViewImage)", reference.path)),
+        }
+    }
+
+    Some(Item::system_message(format!(
+        "[Related files — contents not included]\n{}\n\
+         Use Read for text files and ViewImage for image references when their current contents \
+         are needed.",
+        lines.join("\n")
+    )))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SummaryInputOptions {
     overview_target_tokens: u64,
@@ -7329,9 +7447,9 @@ fn build_summary_input(
     if !default_refs.is_empty() {
         out.push_str(
             "These files were touched recently in this session. Use `read_file` \
-             on them as needed, then call `mark_read_required` for any whose \
-             contents the next session must have, and `add_reference` for files \
-             it should know about by name only.\n\n## Referenced files\n",
+             on text files as needed, then call `mark_read_required` for UTF-8 text \
+             whose contents the next session must have. Call `add_reference` for images, \
+             binary files, and files it should know about by name only.\n\n## Referenced files\n",
         );
         for p in default_refs {
             out.push_str("- ");
@@ -8454,6 +8572,63 @@ mod build_summary_prompt_tests {
             },
         )
         .text
+    }
+
+    #[test]
+    fn retained_images_become_on_demand_related_files() {
+        let mut items = vec![
+            Item::tool_call_json(
+                "image-1",
+                "ViewImage",
+                serde_json::json!({
+                    "path": "screenshots/result.png"
+                }),
+            ),
+            Item::tool_result_item_with_attachments(
+                "image-1",
+                "Attached image screenshots/result.png",
+                None,
+                false,
+                vec![agen::tool::Attachment::Image(
+                    agen::tool::ImageAttachment::new("image/png", vec![7_u8; 100_000]),
+                )],
+            ),
+        ];
+
+        let mut capture_entries = items
+            .iter()
+            .cloned()
+            .map(|item| HistoryEntry::new(item, ()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            project_compactor_capture_attachments(&mut capture_entries),
+            1
+        );
+        assert!(matches!(
+            &capture_entries[1].item,
+            Item::ToolResult { attachments, .. } if attachments.is_empty()
+        ));
+
+        let references = project_compaction_attachments(&mut items, Some("main"));
+
+        assert_eq!(
+            references,
+            vec![CompactionImageReference {
+                target_workdir: Some("main".to_string()),
+                path: "screenshots/result.png".to_string(),
+            }]
+        );
+        assert!(matches!(
+            &items[1],
+            Item::ToolResult { attachments, .. } if attachments.is_empty()
+        ));
+        let message = build_related_file_message(&[], &references)
+            .and_then(|item| item.as_text().map(str::to_string))
+            .unwrap();
+        assert!(message.contains("[Related files — contents not included]"));
+        assert!(message.contains("screenshots/result.png"));
+        assert!(message.contains("target_workdir \"main\""));
+        assert!(message.contains("ViewImage"));
     }
 
     #[test]

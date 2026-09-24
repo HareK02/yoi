@@ -7,7 +7,7 @@ The conversation input is a bounded overview/index, not the full transcript. Tre
 1. Read the provided overview/index and current TaskStore snapshot.
 2. If the provided index is not enough, call `ShowOverview` on the pinned capture. Use `SearchEntries` to locate relevant entries, then `ReadEntry` with the returned stable entry reference to inspect only what is needed.
 3. Use `Read` to inspect referenced Workdir files before deciding what the next session needs. Prefer skimming over blind inclusion.
-4. For files whose current contents are load-bearing for the active work, call `mark_read_required` to inject them into the next session. These count against the auto-read token budget — spend it deliberately.
+4. For UTF-8 text files whose current contents are load-bearing for the active work, call `mark_read_required` to inject them into the next session. These count against the auto-read token budget — spend it deliberately. Images and binary files cannot be injected; record them with `add_reference` so the next session can fetch them with `ViewImage` or the appropriate read tool.
 5. For files the next session should know about but can fetch on demand, call `add_reference` to record the path without embedding contents.
 6. Finish with `write_summary` carrying the final text. You may call it multiple times; only the last call is kept.
 

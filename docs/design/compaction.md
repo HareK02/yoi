@@ -32,6 +32,22 @@ Compaction should preserve persisted reasoning history and avoid serializing unv
 
 The important property is explainability: after compaction, records should still show what summary replaced which older context and why future turns can rely on it.
 
+## Binary tool details
+
+Durable binary attachments are not text and must not be charged by applying the text
+`bytes / 4` fallback to their base64 persistence encoding. Provider usage measurements remain
+authoritative for requests that actually include an attachment.
+
+An image returned by `ViewImage` is sent for the immediate follow-up model request. Later requests
+project the consumed image body out while retaining the tool summary, so the Worker can call
+`ViewImage` again when it needs the current file. Compaction likewise never carries image bodies
+into the replacement Segment: retained images become related-file references with their Workdir
+alias and path where available.
+
+The compactor may auto-read only UTF-8 text with `mark_read_required`. Images and other binary
+files can be nominated only with `add_reference`; the next Worker fetches them on demand with
+`ViewImage` or the appropriate read tool.
+
 ## Activation boundary
 
 A compacted Segment is staged completely before it can become authoritative. The

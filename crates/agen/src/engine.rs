@@ -1790,6 +1790,19 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
             // this clone, so the caller-owned `history` stays intact.
             let mut request_context = history.items_cloned();
 
+            // Binary tool attachments are single-consumption request details. Keep fresh
+            // attachments emitted after the latest model output for the immediate follow-up,
+            // but stop resending them once a model response has consumed them. Durable history
+            // remains untouched and retains the tool summary needed to fetch the file again.
+            let projected_attachments =
+                crate::prune::project_consumed_attachments(&mut request_context);
+            if projected_attachments > 0 {
+                debug!(
+                    projected_attachments,
+                    "Projected consumed tool-result attachments out of request context"
+                );
+            }
+
             // Prune projection: if both the config and the savings
             // estimator are configured, drop ToolResult.content from
             // prunable candidates whose estimated savings meet the

@@ -47,11 +47,18 @@ pub fn prefix_bytes(items: &[Item]) -> Vec<u64> {
     prefix
 }
 
-/// 1 Item の大きさ。JSON シリアライズ長を使う粗い近似。
-/// トークン数との絶対変換ではなく区間の按分にしか使わないので、
-/// プロバイダごとの overhead は比率でキャンセルされる。
+/// 1 Item の text-shaped size。JSON シリアライズ長を使う粗い近似。
+///
+/// Binary attachments are deliberately projected out. Their durable base64 encoding is a
+/// storage representation, not provider text, so charging it at the text `bytes / 4` fallback
+/// rate produces meaningless estimates. Exact provider usage measurements remain authoritative
+/// when an attachment was actually sent.
 pub fn item_bytes(item: &Item) -> u64 {
-    serde_json::to_string(item)
+    let mut projected = item.clone();
+    if let Item::ToolResult { attachments, .. } = &mut projected {
+        attachments.clear();
+    }
+    serde_json::to_string(&projected)
         .map(|s| s.len() as u64)
         .unwrap_or(0)
 }
@@ -263,6 +270,31 @@ mod tests {
 
         assert_eq!(est.source, EstimateSource::Extrapolated);
         assert_eq!(est.tokens, 30_000 + delta_bytes / 4);
+    }
+
+    #[test]
+    fn fallback_does_not_count_durable_image_bytes_as_text_tokens() {
+        let small = Item::tool_result_item_with_attachments(
+            "call",
+            "Attached image.png",
+            None,
+            false,
+            vec![crate::tool::Attachment::Image(
+                crate::tool::ImageAttachment::new("image/png", vec![1_u8; 8]),
+            )],
+        );
+        let large = Item::tool_result_item_with_attachments(
+            "call",
+            "Attached image.png",
+            None,
+            false,
+            vec![crate::tool::Attachment::Image(
+                crate::tool::ImageAttachment::new("image/png", vec![1_u8; 1_000_000]),
+            )],
+        );
+
+        assert_eq!(item_bytes(&small), item_bytes(&large));
+        assert_eq!(total_tokens(&[small], &[]), total_tokens(&[large], &[]));
     }
 
     #[test]

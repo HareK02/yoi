@@ -339,6 +339,33 @@ mod tests {
     }
 
     #[test]
+    fn retained_split_does_not_treat_image_base64_as_text_tokens() {
+        fn history_with_image(bytes: usize) -> Vec<Item> {
+            vec![
+                msg(&"older text ".repeat(2_000)),
+                Item::tool_call("image", "ViewImage", r#"{"path":"screen.png"}"#),
+                Item::tool_result_item_with_attachments(
+                    "image",
+                    "Attached image screen.png",
+                    None,
+                    false,
+                    vec![agen::tool::Attachment::Image(
+                        agen::tool::ImageAttachment::new("image/png", vec![7_u8; bytes]),
+                    )],
+                ),
+            ]
+        }
+
+        let small = history_with_image(8);
+        let large = history_with_image(1_000_000);
+
+        assert_eq!(
+            split_for_retained_impl(&small, &[], 1_000),
+            split_for_retained_impl(&large, &[], 1_000)
+        );
+    }
+
+    #[test]
     fn split_all_when_retained_zero() {
         let history = vec![msg("a"), msg("b")];
         let records = vec![record(2, 100)];

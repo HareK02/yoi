@@ -93,10 +93,11 @@ struct SummaryParams {
     pub text: String,
 }
 
-const MARK_DESCRIPTION: &str = "Inject a file's contents into the compacted context so the \
-next session starts with it already read. Use this for files the next task needs in full. \
-Optionally specify `offset` (0-based line) and `limit` (line count) to inject only a slice. \
-Counts against `auto_read_budget`; overflow returns an error and the mark is not recorded.";
+const MARK_DESCRIPTION: &str = "Inject a UTF-8 text file's contents into the compacted context so the \
+next session starts with it already read. Images and binary files are rejected; use add_reference \
+for those so they can be fetched on demand. Optionally specify `offset` (0-based line) and `limit` \
+(line count) to inject only a slice. Counts against `auto_read_budget`; overflow returns an error \
+and the mark is not recorded.";
 
 const REFERENCE_DESCRIPTION: &str = "Record a Workdir-relative file path as a named reference in \
 the compacted context without injecting its contents. Use for files that are contextually \
@@ -105,6 +106,14 @@ relevant but whose current content the next session can fetch on demand.";
 const SUMMARY_DESCRIPTION: &str = "Provide the final structured summary text. Subsequent calls \
 replace the previous content; only the last call is used. Must be called before the compact run \
 ends or compaction fails.";
+
+fn is_supported_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        || bytes.starts_with(&[0xff, 0xd8, 0xff])
+        || bytes.starts_with(b"GIF87a")
+        || bytes.starts_with(b"GIF89a")
+        || (bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP")
+}
 
 struct MarkReadRequiredTool {
     session: WorkdirSessionHandle,
@@ -136,9 +145,25 @@ impl Tool for MarkReadRequiredTool {
             })
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("read failed: {e}")))?;
-        let text = String::from_utf8_lossy(&result.bytes);
-        let slice = text.as_ref();
-        let estimated_tokens = estimate_tokens(slice.len());
+        if result.truncated {
+            return Err(ToolError::ExecutionFailed(
+                "file is too large for auto-read; use add_reference so the next session can fetch it on demand"
+                    .to_string(),
+            ));
+        }
+        if is_supported_image(&result.bytes) {
+            return Err(ToolError::ExecutionFailed(
+                "image files cannot be injected into compacted context; use add_reference so the next session can call ViewImage on demand"
+                    .to_string(),
+            ));
+        }
+        let text = std::str::from_utf8(&result.bytes).map_err(|_| {
+            ToolError::ExecutionFailed(
+                "binary files cannot be injected into compacted context; use add_reference so the next session can fetch them on demand"
+                    .to_string(),
+            )
+        })?;
+        let estimated_tokens = estimate_tokens(text.len());
 
         let mut guard = self.ctx.lock().expect("compact worker context poisoned");
         let budget = guard.auto_read_budget;
@@ -613,6 +638,46 @@ mod tests {
         assert_eq!(guard.read_required.len(), 1);
         assert!(guard.auto_read_consumed > 0);
         assert!(guard.auto_read_consumed <= 1_000);
+    }
+
+    #[tokio::test]
+    async fn mark_read_required_rejects_images_without_recording_auto_read() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("screen.png");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nbody").unwrap();
+
+        let ctx = Arc::new(Mutex::new(CompactWorkerContext::with_budget(1_000)));
+        let tool: Arc<dyn Tool> = Arc::new(MarkReadRequiredTool {
+            session: make_fs(tmp.path()),
+            ctx: ctx.clone(),
+        });
+        let input = serde_json::json!({ "file_path": "screen.png" }).to_string();
+
+        let error = tool.execute(&input, Default::default()).await.unwrap_err();
+
+        assert!(error.to_string().contains("use add_reference"));
+        let guard = ctx.lock().unwrap();
+        assert!(guard.read_required.is_empty());
+        assert_eq!(guard.auto_read_consumed, 0);
+    }
+
+    #[tokio::test]
+    async fn mark_read_required_rejects_non_utf8_binary() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("data.bin");
+        std::fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+
+        let ctx = Arc::new(Mutex::new(CompactWorkerContext::with_budget(1_000)));
+        let tool: Arc<dyn Tool> = Arc::new(MarkReadRequiredTool {
+            session: make_fs(tmp.path()),
+            ctx: ctx.clone(),
+        });
+        let input = serde_json::json!({ "file_path": "data.bin" }).to_string();
+
+        let error = tool.execute(&input, Default::default()).await.unwrap_err();
+
+        assert!(error.to_string().contains("use add_reference"));
+        assert!(ctx.lock().unwrap().read_required.is_empty());
     }
 
     #[tokio::test]
