@@ -3013,6 +3013,10 @@ mod tests {
             ),
             Some("workers:input")
         );
+        assert_eq!(
+            required_runtime_permission(&Method::POST, "/v1/workers/7/workdir-attachments"),
+            Some("workers:input")
+        );
     }
 
     fn test_bundle(profile: ProfileSelector) -> ConfigBundle {

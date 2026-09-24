@@ -3569,7 +3569,11 @@ fn workspace_runtime_operation(method: &str, path_and_query: &str) -> &'static s
     if path.ends_with("/workspace-api") {
         return "workers:create";
     }
-    if path.ends_with("/input") || path.ends_with("/restore") || path.contains("/attachments") {
+    if path.ends_with("/input")
+        || path.ends_with("/restore")
+        || path.contains("/attachments")
+        || path.contains("/workdir-attachments")
+    {
         return "workers:input";
     }
     if path.ends_with("/stop") || path.ends_with("/cancel") {
@@ -7299,6 +7303,13 @@ mod tests {
         assert_eq!(
             workspace_runtime_operation("GET", &format!("/v1/workers/{worker_id}/protocol/ws")),
             "workers:protocol"
+        );
+        assert_eq!(
+            workspace_runtime_operation(
+                "POST",
+                &format!("/v1/workers/{worker_id}/workdir-attachments")
+            ),
+            "workers:input"
         );
         assert_eq!(
             workspace_runtime_operation("POST", SSH_HOST_KEY_PROBE_PATH),
