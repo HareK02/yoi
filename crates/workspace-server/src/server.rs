@@ -10351,11 +10351,10 @@ async fn start_manual_ticket_coder_assignment(
         }
     }
 
-    match api.store.start_ready_ticket_with_coder_assignment(
-        record,
-        &new_id("tasev"),
-        operation_id,
-    ) {
+    match api
+        .store
+        .start_ready_ticket_with_coder_assignment(record, &new_id("tasev"), operation_id)
+    {
         Ok(assignment) => Ok(assignment),
         Err(error) => {
             let diagnostics =
@@ -33621,7 +33620,9 @@ mod tests {
             "idle",
             "manual assignment must restore the live Worker after capability binding"
         );
-        let runtime_attachments = fixture.runtime.logical_attachments(&fixture.worker.worker_id);
+        let runtime_attachments = fixture
+            .runtime
+            .logical_attachments(&fixture.worker.worker_id);
         assert_eq!(runtime_attachments.len(), 2);
         assert_eq!(
             runtime_attachments
@@ -33635,7 +33636,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_coder_assignment_rejects_incomplete_or_mismatched_workdirs_before_state_change() {
+    async fn manual_coder_assignment_rejects_incomplete_or_mismatched_workdirs_before_state_change()
+    {
         for case in ["missing", "undeclared", "selector"] {
             let fixture = manual_coder_assignment_fixture().await;
             match case {
@@ -33817,15 +33819,22 @@ mod tests {
             .store
             .list_worker_workdir_links(TEST_WORKSPACE_ID, &fixture.worker)
             .unwrap();
-        assert!(links.iter().all(|link| {
-            link.capabilities == workdir::WorkdirSessionCapabilities::ALL
-        }));
-        let runtime_attachments = fixture.runtime.logical_attachments(&fixture.worker.worker_id);
+        assert!(
+            links
+                .iter()
+                .all(|link| { link.capabilities == workdir::WorkdirSessionCapabilities::ALL })
+        );
+        let runtime_attachments = fixture
+            .runtime
+            .logical_attachments(&fixture.worker.worker_id);
         assert_eq!(runtime_attachments.len(), 2);
         assert!(runtime_attachments.iter().all(|attachment| {
             attachment.capabilities == workdir::WorkdirSessionCapabilities::ALL
         }));
-        assert_eq!(fixture.api.runtime.worker(&fixture.worker).unwrap().state, "idle");
+        assert_eq!(
+            fixture.api.runtime.worker(&fixture.worker).unwrap().state,
+            "idle"
+        );
     }
 
     #[tokio::test]
