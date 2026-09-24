@@ -1646,24 +1646,27 @@ impl Runtime {
                     "Worker restore cleanup or reconciliation is still pending",
                 ));
             }
-            match mode {
-                WorkerRestoreMode::Explicit
-                    if worker.execution_metadata_available
-                        && worker.status != WorkerStatus::Stopped =>
-                {
-                    return Ok(RuntimeWorkerRestoreResult::failed(
-                        WorkerRestoreState::Rejected,
-                        "worker_restore_not_stopped",
-                        "Worker restore requires a stopped Worker",
-                    ));
-                }
-                WorkerRestoreMode::Automatic
-                    if !worker.status.is_active()
-                        || worker.restore_intent != WorkerRestoreIntent::Automatic =>
-                {
-                    return Ok(RuntimeWorkerRestoreResult::accepted(worker.detail()));
-                }
-                _ => {}
+            // An active persisted Worker can still have no live handle when its
+            // startup restore was rejected before side effects (for example,
+            // before Workspace Backend renewed operation-scoped Repository
+            // access). Preserve its automatic intent so an explicit restore can
+            // serve as the authorized retry for that state.
+            if mode == WorkerRestoreMode::Explicit
+                && worker.execution_metadata_available
+                && worker.status != WorkerStatus::Stopped
+                && worker.restore_intent != WorkerRestoreIntent::Automatic
+            {
+                return Ok(RuntimeWorkerRestoreResult::failed(
+                    WorkerRestoreState::Rejected,
+                    "worker_restore_not_stopped",
+                    "Worker restore requires a stopped Worker",
+                ));
+            }
+            if mode == WorkerRestoreMode::Automatic
+                && (!worker.status.is_active()
+                    || worker.restore_intent != WorkerRestoreIntent::Automatic)
+            {
+                return Ok(RuntimeWorkerRestoreResult::accepted(worker.detail()));
             }
             let Some(worker_request) = worker.request.clone() else {
                 return Ok(RuntimeWorkerRestoreResult::failed(
@@ -8030,6 +8033,59 @@ mod tests {
         assert_eq!(restored_worker.status, WorkerStatus::Idle);
         restored
             .send_input(&worker.worker_ref, WorkerInput::user("after restart"))
+            .unwrap();
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn fs_store_explicitly_retries_rejected_automatic_restore() {
+        let root = fs_store_root("retry-rejected-automatic-restore");
+        let options = crate::fs_store::FsRuntimeStoreOptions {
+            root: root.clone(),
+            runtime_id: "test-runtime".to_string(),
+            display_name: None,
+        };
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            options.clone(),
+            Arc::new(TestExecutionBackend::default()),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("retry rejected automatic restore"))
+            .unwrap();
+        drop(runtime);
+
+        let restoring_backend = Arc::new(TestExecutionBackend::default());
+        *restoring_backend.restore_result.lock().unwrap() = Some(
+            WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::rejected(
+                WorkerExecutionOperation::Restore,
+                "repository access must be reacquired",
+            )),
+        );
+        let restored =
+            Runtime::with_fs_store_and_execution_backend(options, restoring_backend.clone())
+                .unwrap();
+
+        assert_eq!(*restoring_backend.restore_count.lock().unwrap(), 1);
+        let pending_worker = restored.worker_detail(&worker.worker_ref).unwrap();
+        assert_eq!(pending_worker.status, WorkerStatus::Idle);
+        assert!(pending_worker.execution_metadata_available);
+
+        restoring_backend.restore_result.lock().unwrap().take();
+        let retry = restored
+            .restore_worker_operation(&worker.worker_ref)
+            .unwrap();
+
+        assert_eq!(retry.state, WorkerRestoreState::Accepted);
+        assert_eq!(*restoring_backend.restore_count.lock().unwrap(), 2);
+        restored
+            .send_input(
+                &worker.worker_ref,
+                WorkerInput::user("after repository access renewal"),
+            )
             .unwrap();
 
         let _ = std::fs::remove_dir_all(root);
