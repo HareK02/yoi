@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { untrack } from 'svelte';
+  import { tick, untrack } from 'svelte';
   import type {
     CreateRepositorySshCredentialRequest,
     DeleteRepositorySshCredentialRequest,
@@ -32,17 +32,25 @@
   type CredentialForm = 'generate' | 'import' | null;
 
   let { data }: PageProps = $props();
-  let credentials = $state<RepositorySshCredential[]>(untrack(() => data.credentials));
+  const workspaceDefaultCredentialId = 'workspace-default';
+
+  function sortCredentials(items: RepositorySshCredential[]): RepositorySshCredential[] {
+    return [...items].sort((a, b) => {
+      if (a.credential_id === workspaceDefaultCredentialId) return -1;
+      if (b.credential_id === workspaceDefaultCredentialId) return 1;
+      return a.credential_id.localeCompare(b.credential_id);
+    });
+  }
+
+  let credentials = $state<RepositorySshCredential[]>(sortCredentials(untrack(() => data.credentials)));
   let publicKeys = $state<Record<string, RepositorySshPublicKey>>(
     Object.fromEntries(untrack(() => data.publicKeys).map((key) => [key.credential_id, key]))
   );
   let hostTrusts = $state<RepositorySshHostTrust[]>(untrack(() => data.hostTrusts));
   const accessProjection = untrack(() => data.accessProjection);
-  const workspaceDefaultCredentialId = 'workspace-default';
-  let activeOperation = $state<string | null>(null);
+  let pendingOperations = $state<string[]>([]);
   let rotateCredentialId = $state<string | null>(null);
   const base = $derived(`/api/w/${encodeURIComponent(data.workspaceId)}/settings/repository-access`);
-  const busy = $derived(activeOperation !== null);
   const selectedCredential = $derived(
     rotateCredentialId ? credentials.find((credential) => credential.credential_id === rotateCredentialId) ?? null : null
   );
@@ -55,7 +63,11 @@
 
   let copiedCredentialId = $state<string | null>(null);
   let credentialNotice = $state<Notice | null>(null);
+  let credentialFormNotice = $state<Notice | null>(null);
+  let credentialRowNotices = $state<Record<string, Notice>>({});
   let hostNotice = $state<Notice | null>(null);
+  let hostFormNotice = $state<Notice | null>(null);
+  let hostRowNotices = $state<Record<string, Notice>>({});
   let publicKeyNotices = $state<Record<string, Notice>>({});
 
   let credentialForm = $state<CredentialForm>(null);
@@ -70,6 +82,12 @@
   let rotatePrivateKey = $state('');
   let rotatePassphrase = $state('');
   let rotateErrors = $state<RepositoryAccessFieldErrors>({});
+  let generateCredentialIdInput = $state<HTMLInputElement>();
+  let importCredentialIdInput = $state<HTMLInputElement>();
+  let rotatePrivateKeyInput = $state<HTMLTextAreaElement>();
+  let credentialFormElement = $state<HTMLFormElement>();
+  let rotationFormElement = $state<HTMLFormElement>();
+  let credentialReturnFocus: HTMLElement | null = null;
 
   let hostEditorOpen = $state(false);
   let hostTrustId = $state('');
@@ -78,6 +96,13 @@
   let hostKey = $state('');
   let hostExpectedRevision = $state<number | null>(null);
   let hostErrors = $state<RepositoryAccessFieldErrors>({});
+  let hostTrustIdInput = $state<HTMLInputElement>();
+  let hostKeyInput = $state<HTMLTextAreaElement>();
+  let hostFormElement = $state<HTMLFormElement>();
+  let hostReturnFocus: HTMLElement | null = null;
+  const editingHostTrust = $derived(
+    hostExpectedRevision === null ? null : hostTrusts.find((entry) => entry.host_trust_id === hostTrustId) ?? null
+  );
 
   function operationId(prefix: string): string {
     return `${prefix}-${crypto.randomUUID()}`;
@@ -85,6 +110,36 @@
 
   function operationError(error: unknown, fallback: string): Notice {
     return { tone: 'error', text: error instanceof Error ? error.message : fallback };
+  }
+
+  function isPending(operation: string): boolean {
+    return pendingOperations.includes(operation);
+  }
+
+  function startOperation(operation: string): boolean {
+    if (isPending(operation)) return false;
+    pendingOperations = [...pendingOperations, operation];
+    return true;
+  }
+
+  function finishOperation(operation: string): void {
+    pendingOperations = pendingOperations.filter((entry) => entry !== operation);
+  }
+
+  function currentFocus(): HTMLElement | null {
+    return document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  }
+
+  async function restoreFocus(target: HTMLElement | null, fallbackId?: string): Promise<void> {
+    await tick();
+    const fallback = fallbackId ? document.getElementById(fallbackId) : null;
+    const destination = fallback ?? (target?.isConnected ? target : null);
+    destination?.focus();
+  }
+
+  async function focusFirstInvalid(form: HTMLFormElement | undefined): Promise<void> {
+    await tick();
+    form?.querySelector<HTMLElement>('[aria-invalid="true"]')?.focus();
   }
 
   function request<T>(
@@ -149,15 +204,20 @@
     }
   }
 
-  function openCredentialForm(form: Exclude<CredentialForm, null>) {
+  async function openCredentialForm(form: Exclude<CredentialForm, null>) {
+    credentialReturnFocus = currentFocus();
     credentialForm = form;
     rotateCredentialId = null;
     credentialNotice = null;
+    credentialFormNotice = null;
     generateErrors = {};
     importErrors = {};
+    await tick();
+    (form === 'generate' ? generateCredentialIdInput : importCredentialIdInput)?.focus();
   }
 
-  function closeCredentialForms() {
+  async function closeCredentialForms(restore = true) {
+    const returnFocus = credentialReturnFocus;
     credentialForm = null;
     generateCredentialId = '';
     generateCredentialName = '';
@@ -167,13 +227,20 @@
     passphrase = '';
     generateErrors = {};
     importErrors = {};
+    credentialFormNotice = null;
+    credentialReturnFocus = null;
+    if (restore) await restoreFocus(returnFocus);
   }
 
   async function generateCredential() {
     generateErrors = validateGeneratedCredential({ credentialId: generateCredentialId, name: generateCredentialName });
-    if (Object.keys(generateErrors).length > 0 || busy) return;
-    activeOperation = 'generate-credential';
-    credentialNotice = null;
+    if (Object.keys(generateErrors).length > 0) {
+      await focusFirstInvalid(credentialFormElement);
+      return;
+    }
+    const operation = 'generate-credential';
+    if (!startOperation(operation)) return;
+    credentialFormNotice = null;
     try {
       const body: GenerateRepositorySshCredentialRequest = {
         operation_id: operationId('credential-generate'),
@@ -181,21 +248,20 @@
         name: generateCredentialName.trim()
       };
       const created = await request('/credentials/generate', 'POST', body, parseRepositorySshCredential, 'generate this SSH credential');
-      credentials = [...credentials.filter((item) => item.credential_id !== created.credential_id), created]
-        .sort((a, b) => a.credential_id.localeCompare(b.credential_id));
+      credentials = sortCredentials([...credentials.filter((item) => item.credential_id !== created.credential_id), created]);
       await refreshPublicKey(created.credential_id);
-      closeCredentialForms();
+      await closeCredentialForms();
       credentialNotice = { tone: 'success', text: `Generated ${created.name}. Copy its public key before configuring the Repository provider.` };
     } catch (error) {
-      credentialNotice = operationError(error, 'Failed to generate the SSH credential.');
+      credentialFormNotice = operationError(error, 'Failed to generate the SSH credential.');
     } finally {
-      activeOperation = null;
+      finishOperation(operation);
     }
   }
 
   async function copyPublicKey(credential: RepositorySshCredential) {
-    if (busy) return;
-    activeOperation = `copy-${credential.credential_id}`;
+    const operation = `copy-${credential.credential_id}`;
+    if (!startOperation(operation)) return;
     publicKeyNotices = { ...publicKeyNotices, [credential.credential_id]: { tone: 'success', text: 'Loading public key…' } };
     try {
       const publicKey = publicKeys[credential.credential_id] ?? await loadPublicKey(credential.credential_id);
@@ -209,15 +275,19 @@
     } catch (error) {
       publicKeyNotices = { ...publicKeyNotices, [credential.credential_id]: operationError(error, 'Failed to copy the public key.') };
     } finally {
-      activeOperation = null;
+      finishOperation(operation);
     }
   }
 
   async function createCredential() {
     importErrors = validateImportedCredential({ credentialId, name: credentialName, privateKey });
-    if (Object.keys(importErrors).length > 0 || busy) return;
-    activeOperation = 'import-credential';
-    credentialNotice = null;
+    if (Object.keys(importErrors).length > 0) {
+      await focusFirstInvalid(credentialFormElement);
+      return;
+    }
+    const operation = 'import-credential';
+    if (!startOperation(operation)) return;
+    credentialFormNotice = null;
     try {
       const body: CreateRepositorySshCredentialRequest = {
         operation_id: operationId('credential-create'),
@@ -227,40 +297,52 @@
         passphrase: passphrase || null
       };
       const created = await request('/credentials', 'POST', body, parseRepositorySshCredential, 'import this SSH credential');
-      credentials = [...credentials, created].sort((a, b) => a.credential_id.localeCompare(b.credential_id));
+      credentials = sortCredentials([...credentials, created]);
       await refreshPublicKey(created.credential_id);
-      closeCredentialForms();
+      await closeCredentialForms();
       credentialNotice = { tone: 'success', text: `Imported ${created.name}. The private key and passphrase fields were cleared.` };
     } catch (error) {
-      credentialNotice = operationError(error, 'Credential import failed.');
+      credentialFormNotice = operationError(error, 'Credential import failed.');
     } finally {
       privateKey = '';
       passphrase = '';
-      activeOperation = null;
+      finishOperation(operation);
     }
   }
 
-  function openCredentialRotation(credential: RepositorySshCredential) {
+  async function openCredentialRotation(credential: RepositorySshCredential) {
+    credentialReturnFocus = currentFocus();
     credentialForm = null;
-    credentialNotice = null;
+    credentialFormNotice = null;
     rotateCredentialId = credential.credential_id;
     rotatePrivateKey = '';
     rotatePassphrase = '';
     rotateErrors = {};
+    await tick();
+    rotatePrivateKeyInput?.focus();
   }
 
-  function closeCredentialRotation() {
+  async function closeCredentialRotation(restore = true) {
+    const returnFocus = credentialReturnFocus;
+    const fallbackId = rotateCredentialId ? `rotate-credential-${rotateCredentialId}` : undefined;
     rotateCredentialId = null;
     rotatePrivateKey = '';
     rotatePassphrase = '';
     rotateErrors = {};
+    credentialFormNotice = null;
+    credentialReturnFocus = null;
+    if (restore) await restoreFocus(returnFocus, fallbackId);
   }
 
   async function rotateCredential(credential: RepositorySshCredential) {
     rotateErrors = validateCredentialRotation(rotatePrivateKey);
-    if (Object.keys(rotateErrors).length > 0 || busy) return;
-    activeOperation = `rotate-${credential.credential_id}`;
-    credentialNotice = null;
+    if (Object.keys(rotateErrors).length > 0) {
+      await focusFirstInvalid(rotationFormElement);
+      return;
+    }
+    const operation = `rotate-${credential.credential_id}`;
+    if (!startOperation(operation)) return;
+    credentialFormNotice = null;
     try {
       const body: RotateRepositorySshCredentialRequest = {
         operation_id: operationId('credential-rotate'),
@@ -277,22 +359,28 @@
       );
       credentials = credentials.map((entry) => entry.credential_id === rotated.credential_id ? rotated : entry);
       await refreshPublicKey(rotated.credential_id);
-      closeCredentialRotation();
-      credentialNotice = { tone: 'success', text: `Rotated ${rotated.name}. Copy the new public key and update every external provider that uses it.` };
+      finishOperation(operation);
+      await closeCredentialRotation();
+      credentialRowNotices = {
+        ...credentialRowNotices,
+        [rotated.credential_id]: { tone: 'success', text: `Rotated ${rotated.name}. Copy the new public key and update every external provider that uses it.` }
+      };
     } catch (error) {
-      credentialNotice = operationError(error, 'Credential rotation failed.');
+      credentialFormNotice = operationError(error, 'Credential rotation failed.');
     } finally {
       rotatePrivateKey = '';
       rotatePassphrase = '';
-      activeOperation = null;
+      finishOperation(operation);
     }
   }
 
   async function deleteCredential(credential: RepositorySshCredential) {
-    if (credential.referenced_repositories.length > 0 || busy) return;
+    if (credential.referenced_repositories.length > 0) return;
+    const operation = `delete-${credential.credential_id}`;
+    if (isPending(operation)) return;
     if (!confirm(`Delete SSH credential ${credential.name} (${credential.credential_id})? This cannot be undone.`)) return;
-    activeOperation = `delete-${credential.credential_id}`;
-    credentialNotice = null;
+    if (!startOperation(operation)) return;
+    credentialRowNotices = { ...credentialRowNotices, [credential.credential_id]: { tone: 'success', text: 'Deleting credential…' } };
     try {
       const body: DeleteRepositorySshCredentialRequest = {
         operation_id: operationId('credential-delete'),
@@ -305,13 +393,14 @@
       publicKeys = remainingPublicKeys;
       credentialNotice = { tone: 'success', text: `Deleted ${credential.name}.` };
     } catch (error) {
-      credentialNotice = operationError(error, 'Credential deletion failed.');
+      credentialRowNotices = { ...credentialRowNotices, [credential.credential_id]: operationError(error, 'Credential deletion failed.') };
     } finally {
-      activeOperation = null;
+      finishOperation(operation);
     }
   }
 
-  function openNewHostTrust() {
+  async function openNewHostTrust() {
+    hostReturnFocus = currentFocus();
     hostEditorOpen = true;
     hostTrustId = '';
     hostname = '';
@@ -319,10 +408,13 @@
     hostKey = '';
     hostExpectedRevision = null;
     hostErrors = {};
-    hostNotice = null;
+    hostFormNotice = null;
+    await tick();
+    hostTrustIdInput?.focus();
   }
 
-  function editHostTrust(hostTrust: RepositorySshHostTrust) {
+  async function editHostTrust(hostTrust: RepositorySshHostTrust) {
+    hostReturnFocus = currentFocus();
     hostEditorOpen = true;
     hostTrustId = hostTrust.host_trust_id;
     hostname = hostTrust.hostname;
@@ -330,10 +422,14 @@
     hostKey = hostTrust.host_key;
     hostExpectedRevision = hostTrust.current_revision;
     hostErrors = {};
-    hostNotice = null;
+    hostFormNotice = null;
+    await tick();
+    hostKeyInput?.focus();
   }
 
-  function closeHostEditor() {
+  async function closeHostEditor(restore = true) {
+    const returnFocus = hostReturnFocus;
+    const fallbackId = hostExpectedRevision !== null ? `rotate-host-${hostTrustId}` : undefined;
     hostEditorOpen = false;
     hostTrustId = '';
     hostname = '';
@@ -341,41 +437,58 @@
     hostKey = '';
     hostExpectedRevision = null;
     hostErrors = {};
+    hostFormNotice = null;
+    hostReturnFocus = null;
+    if (restore) await restoreFocus(returnFocus, fallbackId);
   }
 
   async function saveHostTrust() {
     hostErrors = validateHostTrust({ hostTrustId, hostname, port, hostKey });
-    if (Object.keys(hostErrors).length > 0 || busy) return;
-    activeOperation = hostExpectedRevision === null ? 'add-host-trust' : `rotate-host-${hostTrustId}`;
-    hostNotice = null;
+    if (Object.keys(hostErrors).length > 0) {
+      await focusFirstInvalid(hostFormElement);
+      return;
+    }
+    const rotating = hostExpectedRevision !== null;
+    const rotationTarget = editingHostTrust;
+    if (rotating && !rotationTarget) {
+      hostFormNotice = { tone: 'error', text: 'This pinned host key changed or was removed. Close the editor and try again.' };
+      return;
+    }
+    const operation = rotating ? `rotate-host-${hostTrustId}` : 'add-host-trust';
+    if (!startOperation(operation)) return;
+    hostFormNotice = null;
     try {
       const body: PutRepositorySshHostTrustRequest = {
         operation_id: operationId('host-trust-save'),
         host_trust_id: hostTrustId.trim(),
-        hostname: hostname.trim(),
-        port,
+        hostname: rotationTarget?.hostname ?? hostname.trim(),
+        port: rotationTarget?.port ?? port,
         host_key: hostKey.trim(),
         expected_revision: hostExpectedRevision
       };
-      const saved = await request('/host-trusts', 'POST', body, parseRepositorySshHostTrust, hostExpectedRevision === null ? 'pin this SSH host key' : 'rotate this pinned SSH host key');
-      hostTrusts = hostExpectedRevision === null
-        ? [...hostTrusts, saved].sort((a, b) => a.host_trust_id.localeCompare(b.host_trust_id))
-        : hostTrusts.map((entry) => entry.host_trust_id === saved.host_trust_id ? saved : entry);
-      const action = hostExpectedRevision === null ? 'Pinned' : 'Rotated';
-      closeHostEditor();
-      hostNotice = { tone: 'success', text: `${action} the key for ${saved.hostname}:${saved.port}. This records host identity; it does not prove Git authentication succeeded.` };
+      const saved = await request('/host-trusts', 'POST', body, parseRepositorySshHostTrust, rotating ? 'rotate this pinned SSH host key' : 'pin this SSH host key');
+      hostTrusts = rotating
+        ? hostTrusts.map((entry) => entry.host_trust_id === saved.host_trust_id ? saved : entry)
+        : [...hostTrusts, saved].sort((a, b) => a.host_trust_id.localeCompare(b.host_trust_id));
+      finishOperation(operation);
+      await closeHostEditor();
+      const notice: Notice = { tone: 'success', text: `${rotating ? 'Rotated' : 'Pinned'} the key for ${saved.hostname}:${saved.port}. This records host identity; it does not prove Git authentication succeeded.` };
+      if (rotating) hostRowNotices = { ...hostRowNotices, [saved.host_trust_id]: notice };
+      else hostNotice = notice;
     } catch (error) {
-      hostNotice = operationError(error, 'Failed to save the pinned host key.');
+      hostFormNotice = operationError(error, 'Failed to save the pinned host key.');
     } finally {
-      activeOperation = null;
+      finishOperation(operation);
     }
   }
 
   async function deleteHostTrust(hostTrust: RepositorySshHostTrust) {
-    if (hostTrust.referenced_repositories.length > 0 || busy) return;
+    if (hostTrust.referenced_repositories.length > 0) return;
+    const operation = `delete-host-${hostTrust.host_trust_id}`;
+    if (isPending(operation)) return;
     if (!confirm(`Delete the pinned host key for ${hostTrust.hostname}:${hostTrust.port}? Future SSH connections cannot verify this host until another key is pinned.`)) return;
-    activeOperation = `delete-host-${hostTrust.host_trust_id}`;
-    hostNotice = null;
+    if (!startOperation(operation)) return;
+    hostRowNotices = { ...hostRowNotices, [hostTrust.host_trust_id]: { tone: 'success', text: 'Deleting pinned key…' } };
     try {
       const body: DeleteRepositorySshHostTrustRequest = {
         operation_id: operationId('host-trust-delete'),
@@ -385,9 +498,9 @@
       hostTrusts = hostTrusts.filter((entry) => entry.host_trust_id !== hostTrust.host_trust_id);
       hostNotice = { tone: 'success', text: `Deleted the pin for ${hostTrust.hostname}:${hostTrust.port}.` };
     } catch (error) {
-      hostNotice = operationError(error, 'Host key deletion failed.');
+      hostRowNotices = { ...hostRowNotices, [hostTrust.host_trust_id]: operationError(error, 'Host key deletion failed.') };
     } finally {
-      activeOperation = null;
+      finishOperation(operation);
     }
   }
 </script>
@@ -402,12 +515,18 @@
         <p>Explicit overrides for Repository authentication and host identity.</p>
       </div>
     </div>
-    {#if accessProjection.bindings.length === 0}
+    {#if data.accessProjectionError}
+      <div class="repository-access-empty error" role="alert">
+        <strong>Repository bindings unavailable</strong>
+        <p>{data.accessProjectionError}</p>
+        <button type="button" class="secondary" onclick={() => window.location.reload()}>Retry bindings</button>
+      </div>
+    {:else if accessProjection && accessProjection.bindings.length === 0}
       <div class="repository-access-empty">
         <strong>No explicit bindings</strong>
         <p>SSH Repositories can still use the Workspace default credential and a unique pinned key that matches their host and port.</p>
       </div>
-    {:else}
+    {:else if accessProjection}
       <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
       <div class="repository-access-table-wrap" tabindex="0" role="region" aria-label="Explicit Repository access bindings">
         <table class="repository-access-table repository-access-binding-table">
@@ -425,16 +544,18 @@
         </table>
       </div>
     {/if}
-    <details class="repository-access-technical">
-      <summary>Technical details</summary>
-      <dl>
-        <div><dt>Config revision</dt><dd>{accessProjection.config_revision}</dd></div>
-        <div><dt>Projection digest</dt><dd><code>{accessProjection.projection_digest}</code></dd></div>
-      </dl>
-    </details>
+    {#if accessProjection}
+      <details class="repository-access-technical">
+        <summary>Technical details</summary>
+        <dl>
+          <div><dt>Config revision</dt><dd>{accessProjection.config_revision}</dd></div>
+          <div><dt>Projection digest</dt><dd><code>{accessProjection.projection_digest}</code></dd></div>
+        </dl>
+      </details>
+    {/if}
   </section>
 
-  <section class="repository-access-section" aria-labelledby="credentials-heading" aria-busy={busy}>
+  <section class="repository-access-section" aria-labelledby="credentials-heading">
     <div class="repository-access-section-heading">
       <div>
         <h2 id="credentials-heading">SSH credentials</h2>
@@ -442,8 +563,8 @@
       </div>
       {#if !data.credentialsError}
         <div class="repository-access-actions" aria-label="Add SSH credential">
-          <button type="button" class="secondary" disabled={busy} onclick={() => openCredentialForm('generate')}>Generate credential</button>
-          <button type="button" class="secondary" disabled={busy} onclick={() => openCredentialForm('import')}>Import credential</button>
+          <button type="button" class="secondary" onclick={() => void openCredentialForm('generate')}>Generate credential</button>
+          <button type="button" class="secondary" onclick={() => void openCredentialForm('import')}>Import credential</button>
         </div>
       {/if}
     </div>
@@ -467,34 +588,37 @@
       <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
       <div class="repository-access-table-wrap" tabindex="0" role="region" aria-label="SSH credentials">
         <table class="repository-access-table repository-access-credential-table">
-          <thead><tr><th>Credential</th><th>Role</th><th>Fingerprint</th><th>Used by</th><th><span class="visually-hidden">Actions</span></th></tr></thead>
+          <thead><tr><th>Credential</th><th>Role</th><th>Fingerprint</th><th>Repository application</th><th><span class="visually-hidden">Actions</span></th></tr></thead>
           <tbody>
             {#each credentials as credential (credential.credential_id)}
-              <tr>
+              <tr aria-busy={isPending(`copy-${credential.credential_id}`) || isPending(`delete-${credential.credential_id}`) || isPending(`rotate-${credential.credential_id}`)}>
                 <td><strong>{credential.name}</strong><code>{credential.credential_id}</code></td>
                 <td>{credential.credential_id === workspaceDefaultCredentialId ? 'Workspace default' : 'Additional'}</td>
                 <td><code>{credential.public_key_algorithm}</code><code>{credential.public_key_fingerprint}</code></td>
                 <td>
                   {#if credential.credential_id === workspaceDefaultCredentialId}
-                    All SSH Repositories
+                    Automatic for all SSH Repositories
                   {:else if credential.referenced_repositories.length > 0}
-                    {credential.referenced_repositories.join(', ')}
+                    Explicit: {credential.referenced_repositories.join(', ')}
                   {:else}
-                    Not referenced
+                    No explicit references
                   {/if}
                 </td>
                 <td>
                   <div class="repository-access-row-actions">
-                    <button type="button" class="secondary" disabled={busy} onclick={() => void copyPublicKey(credential)}>
-                      {activeOperation === `copy-${credential.credential_id}` ? 'Loading…' : copiedCredentialId === credential.credential_id ? 'Copied' : 'Copy public key'}
+                    <button type="button" class="secondary" disabled={isPending(`copy-${credential.credential_id}`)} onclick={() => void copyPublicKey(credential)}>
+                      {isPending(`copy-${credential.credential_id}`) ? 'Loading…' : copiedCredentialId === credential.credential_id ? 'Copied' : 'Copy public key'}
                     </button>
                     {#if credential.credential_id !== workspaceDefaultCredentialId}
-                      <button type="button" class="secondary" disabled={busy} onclick={() => openCredentialRotation(credential)}>Rotate</button>
+                      <button id={`rotate-credential-${credential.credential_id}`} type="button" class="secondary" disabled={isPending(`rotate-${credential.credential_id}`)} onclick={() => void openCredentialRotation(credential)}>Rotate</button>
                       {#if credential.referenced_repositories.length === 0}
-                        <button type="button" class="danger" disabled={busy} onclick={() => void deleteCredential(credential)}>Delete</button>
+                        <button type="button" class="danger" disabled={isPending(`delete-${credential.credential_id}`)} onclick={() => void deleteCredential(credential)}>Delete</button>
                       {/if}
                     {/if}
                   </div>
+                  {#if credentialRowNotices[credential.credential_id]}
+                    <small class:field-error={credentialRowNotices[credential.credential_id].tone === 'error'} role={credentialRowNotices[credential.credential_id].tone === 'error' ? 'alert' : 'status'}>{credentialRowNotices[credential.credential_id].text}</small>
+                  {/if}
                   {#if publicKeyNotices[credential.credential_id]}
                     <small class:field-error={publicKeyNotices[credential.credential_id].tone === 'error'} role={publicKeyNotices[credential.credential_id].tone === 'error' ? 'alert' : 'status'}>{publicKeyNotices[credential.credential_id].text}</small>
                   {:else if credential.credential_id === workspaceDefaultCredentialId && data.defaultPublicKeyError}
@@ -511,38 +635,41 @@
     {/if}
 
     {#if credentialForm === 'generate'}
-      <form class="repository-access-form" novalidate onsubmit={(event) => { event.preventDefault(); void generateCredential(); }}>
+      <form bind:this={credentialFormElement} class="repository-access-form" aria-busy={isPending('generate-credential')} novalidate onsubmit={(event) => { event.preventDefault(); void generateCredential(); }}>
         <div class="repository-access-form-heading"><div><h3>Generate SSH credential</h3><p>Creates an Ed25519 key. Copy the public key to the Repository provider after saving.</p></div></div>
+        {#if credentialFormNotice}<p class="repository-access-notice {credentialFormNotice.tone}" role={credentialFormNotice.tone === 'error' ? 'alert' : 'status'}>{credentialFormNotice.text}</p>{/if}
         <div class="repository-access-form-grid">
-          <label><span>Credential id</span><input bind:value={generateCredentialId} aria-invalid={Boolean(generateErrors.credentialId)} aria-describedby={generateErrors.credentialId ? 'generate-id-error' : undefined} autocomplete="off" />{#if generateErrors.credentialId}<small id="generate-id-error" class="field-error">{generateErrors.credentialId}</small>{/if}</label>
+          <label><span>Credential id</span><input bind:this={generateCredentialIdInput} bind:value={generateCredentialId} aria-invalid={Boolean(generateErrors.credentialId)} aria-describedby={generateErrors.credentialId ? 'generate-id-error' : undefined} autocomplete="off" />{#if generateErrors.credentialId}<small id="generate-id-error" class="field-error">{generateErrors.credentialId}</small>{/if}</label>
           <label><span>Name</span><input bind:value={generateCredentialName} aria-invalid={Boolean(generateErrors.name)} aria-describedby={generateErrors.name ? 'generate-name-error' : undefined} autocomplete="off" />{#if generateErrors.name}<small id="generate-name-error" class="field-error">{generateErrors.name}</small>{/if}</label>
         </div>
-        <div class="repository-access-form-actions"><button type="submit" class="primary" disabled={busy}>{activeOperation === 'generate-credential' ? 'Generating…' : 'Generate credential'}</button><button type="button" class="secondary" disabled={busy} onclick={closeCredentialForms}>Cancel</button></div>
+        <div class="repository-access-form-actions"><button type="submit" class="primary" disabled={isPending('generate-credential')}>{isPending('generate-credential') ? 'Generating…' : 'Generate credential'}</button><button type="button" class="secondary" disabled={isPending('generate-credential')} onclick={() => void closeCredentialForms()}>Cancel</button></div>
       </form>
     {:else if credentialForm === 'import'}
-      <form class="repository-access-form" novalidate onsubmit={(event) => { event.preventDefault(); void createCredential(); }}>
+      <form bind:this={credentialFormElement} class="repository-access-form" aria-busy={isPending('import-credential')} novalidate onsubmit={(event) => { event.preventDefault(); void createCredential(); }}>
         <div class="repository-access-form-heading"><div><h3>Import SSH credential</h3><p>The private key and optional passphrase are write-only and cleared after every save attempt.</p></div></div>
+        {#if credentialFormNotice}<p class="repository-access-notice {credentialFormNotice.tone}" role={credentialFormNotice.tone === 'error' ? 'alert' : 'status'}>{credentialFormNotice.text}</p>{/if}
         <div class="repository-access-form-grid">
-          <label><span>Credential id</span><input bind:value={credentialId} aria-invalid={Boolean(importErrors.credentialId)} aria-describedby={importErrors.credentialId ? 'import-id-error' : undefined} autocomplete="off" />{#if importErrors.credentialId}<small id="import-id-error" class="field-error">{importErrors.credentialId}</small>{/if}</label>
+          <label><span>Credential id</span><input bind:this={importCredentialIdInput} bind:value={credentialId} aria-invalid={Boolean(importErrors.credentialId)} aria-describedby={importErrors.credentialId ? 'import-id-error' : undefined} autocomplete="off" />{#if importErrors.credentialId}<small id="import-id-error" class="field-error">{importErrors.credentialId}</small>{/if}</label>
           <label><span>Name</span><input bind:value={credentialName} aria-invalid={Boolean(importErrors.name)} aria-describedby={importErrors.name ? 'import-name-error' : undefined} autocomplete="off" />{#if importErrors.name}<small id="import-name-error" class="field-error">{importErrors.name}</small>{/if}</label>
           <label class="wide"><span>OpenSSH private key (Ed25519)</span><textarea bind:value={privateKey} rows="8" autocomplete="off" data-web-ux-redact aria-invalid={Boolean(importErrors.privateKey)} aria-describedby={importErrors.privateKey ? 'import-key-error' : 'import-key-help'}></textarea><small id="import-key-help">Secret value; it cannot be read back after import.</small>{#if importErrors.privateKey}<small id="import-key-error" class="field-error">{importErrors.privateKey}</small>{/if}</label>
           <label class="wide"><span>Passphrase (optional)</span><input type="password" bind:value={passphrase} autocomplete="new-password" data-web-ux-redact /><small>Enter only when the private key is encrypted.</small></label>
         </div>
-        <div class="repository-access-form-actions"><button type="submit" class="primary" disabled={busy}>{activeOperation === 'import-credential' ? 'Importing…' : 'Import credential'}</button><button type="button" class="secondary" disabled={busy} onclick={closeCredentialForms}>Cancel</button></div>
+        <div class="repository-access-form-actions"><button type="submit" class="primary" disabled={isPending('import-credential')}>{isPending('import-credential') ? 'Importing…' : 'Import credential'}</button><button type="button" class="secondary" disabled={isPending('import-credential')} onclick={() => void closeCredentialForms()}>Cancel</button></div>
       </form>
     {/if}
 
     {#if selectedCredential}
-      <form class="repository-access-form" novalidate onsubmit={(event) => { event.preventDefault(); void rotateCredential(selectedCredential); }}>
+      <form bind:this={rotationFormElement} class="repository-access-form" aria-busy={isPending(`rotate-${selectedCredential.credential_id}`)} novalidate onsubmit={(event) => { event.preventDefault(); void rotateCredential(selectedCredential); }}>
         <div class="repository-access-form-heading">
-          <div><h3>Rotate {selectedCredential.name}</h3><p>Used by {selectedCredential.referenced_repositories.join(', ') || 'no Repositories'}. Existing provider keys must be replaced with the new public key after rotation.</p></div>
+          <div><h3>Rotate {selectedCredential.name}</h3><p>{selectedCredential.referenced_repositories.length > 0 ? `Explicitly referenced by ${selectedCredential.referenced_repositories.join(', ')}. ` : 'No Repository explicitly references this credential. '}Every external provider where the current public key is installed must be updated after rotation.</p></div>
           <code>{selectedCredential.public_key_fingerprint}</code>
         </div>
+        {#if credentialFormNotice}<p class="repository-access-notice {credentialFormNotice.tone}" role={credentialFormNotice.tone === 'error' ? 'alert' : 'status'}>{credentialFormNotice.text}</p>{/if}
         <div class="repository-access-form-grid">
-          <label class="wide"><span>New OpenSSH private key (Ed25519)</span><textarea bind:value={rotatePrivateKey} rows="8" autocomplete="off" data-web-ux-redact aria-invalid={Boolean(rotateErrors.privateKey)} aria-describedby={rotateErrors.privateKey ? 'rotate-key-error' : 'rotate-key-help'}></textarea><small id="rotate-key-help">Secret value; it cannot be read back after rotation.</small>{#if rotateErrors.privateKey}<small id="rotate-key-error" class="field-error">{rotateErrors.privateKey}</small>{/if}</label>
+          <label class="wide"><span>New OpenSSH private key (Ed25519)</span><textarea bind:this={rotatePrivateKeyInput} bind:value={rotatePrivateKey} rows="8" autocomplete="off" data-web-ux-redact aria-invalid={Boolean(rotateErrors.privateKey)} aria-describedby={rotateErrors.privateKey ? 'rotate-key-error' : 'rotate-key-help'}></textarea><small id="rotate-key-help">Secret value; it cannot be read back after rotation.</small>{#if rotateErrors.privateKey}<small id="rotate-key-error" class="field-error">{rotateErrors.privateKey}</small>{/if}</label>
           <label class="wide"><span>Passphrase (optional)</span><input type="password" bind:value={rotatePassphrase} autocomplete="new-password" data-web-ux-redact /></label>
         </div>
-        <div class="repository-access-form-actions"><button type="submit" class="primary" disabled={busy}>{activeOperation === `rotate-${selectedCredential.credential_id}` ? 'Rotating…' : 'Rotate credential'}</button><button type="button" class="secondary" disabled={busy} onclick={closeCredentialRotation}>Cancel</button></div>
+        <div class="repository-access-form-actions"><button type="submit" class="primary" disabled={isPending(`rotate-${selectedCredential.credential_id}`)}>{isPending(`rotate-${selectedCredential.credential_id}`) ? 'Rotating…' : 'Rotate credential'}</button><button type="button" class="secondary" disabled={isPending(`rotate-${selectedCredential.credential_id}`)} onclick={() => void closeCredentialRotation()}>Cancel</button></div>
       </form>
     {/if}
 
@@ -554,13 +681,13 @@
     {/if}
   </section>
 
-  <section class="repository-access-section" aria-labelledby="host-trust-heading" aria-busy={busy}>
+  <section class="repository-access-section" aria-labelledby="host-trust-heading">
     <div class="repository-access-section-heading">
       <div>
         <h2 id="host-trust-heading">Pinned SSH host keys</h2>
         <p>Keys used to verify the identity of a specific SSH host and port.</p>
       </div>
-      {#if !data.hostTrustsError}<button type="button" class="secondary" disabled={busy} onclick={openNewHostTrust}>Add pinned key</button>{/if}
+      {#if !data.hostTrustsError}<button type="button" class="secondary" disabled={isPending('add-host-trust')} onclick={() => void openNewHostTrust()}>Add pinned key</button>{/if}
     </div>
 
     {#if hostNotice}<p class="repository-access-notice {hostNotice.tone}" role={hostNotice.tone === 'error' ? 'alert' : 'status'}>{hostNotice.text}</p>{/if}
@@ -577,19 +704,23 @@
       <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
       <div class="repository-access-table-wrap" tabindex="0" role="region" aria-label="Pinned SSH host keys">
         <table class="repository-access-table repository-access-host-table">
-          <thead><tr><th>Host and port</th><th>Fingerprint</th><th>Used by</th><th><span class="visually-hidden">Actions</span></th></tr></thead>
+          <thead><tr><th>Host and port</th><th>Fingerprint</th><th>Repository application</th><th><span class="visually-hidden">Actions</span></th></tr></thead>
           <tbody>
             {#each hostTrusts as hostTrust (hostTrust.host_trust_id)}
-              <tr>
+              <tr aria-busy={isPending(`rotate-host-${hostTrust.host_trust_id}`) || isPending(`delete-host-${hostTrust.host_trust_id}`)}>
                 <td><strong>{hostTrust.hostname}:{hostTrust.port}</strong><code>{hostTrust.host_trust_id}</code></td>
                 <td><code>{hostTrust.key_algorithm}</code><code>{hostTrust.fingerprint}</code></td>
-                <td>{hostTrust.referenced_repositories.join(', ') || 'Not referenced'}</td>
+                <td>{hostTrust.referenced_repositories.length > 0 ? `Explicit: ${hostTrust.referenced_repositories.join(', ')}` : 'No explicit references; may apply automatically when this is the unique pin for a matching host and port.'}</td>
                 <td>
                   <div class="repository-access-row-actions">
-                    <button type="button" class="secondary" disabled={busy} onclick={() => editHostTrust(hostTrust)}>Rotate key</button>
-                    {#if hostTrust.referenced_repositories.length === 0}<button type="button" class="danger" disabled={busy} onclick={() => void deleteHostTrust(hostTrust)}>Delete</button>{/if}
+                    <button id={`rotate-host-${hostTrust.host_trust_id}`} type="button" class="secondary" disabled={isPending(`rotate-host-${hostTrust.host_trust_id}`)} onclick={() => void editHostTrust(hostTrust)}>Rotate key</button>
+                    {#if hostTrust.referenced_repositories.length === 0}<button type="button" class="danger" disabled={isPending(`delete-host-${hostTrust.host_trust_id}`)} onclick={() => void deleteHostTrust(hostTrust)}>Delete</button>{/if}
                   </div>
-                  {#if hostTrust.referenced_repositories.length > 0}<small>Remove Repository references before deletion.</small>{/if}
+                  {#if hostRowNotices[hostTrust.host_trust_id]}
+                    <small class:field-error={hostRowNotices[hostTrust.host_trust_id].tone === 'error'} role={hostRowNotices[hostTrust.host_trust_id].tone === 'error' ? 'alert' : 'status'}>{hostRowNotices[hostTrust.host_trust_id].text}</small>
+                  {:else if hostTrust.referenced_repositories.length > 0}
+                    <small>Remove explicit Repository references before deletion.</small>
+                  {/if}
                 </td>
               </tr>
             {/each}
@@ -602,18 +733,22 @@
     <a class="inline-link" href={connectionTestHref}>{sshRepository ? `Check ${sshRepository.repository_key} SSH connection` : 'Open Repository settings'}</a>
 
     {#if hostEditorOpen}
-      <form class="repository-access-form" novalidate onsubmit={(event) => { event.preventDefault(); void saveHostTrust(); }}>
+      <form bind:this={hostFormElement} class="repository-access-form" aria-busy={hostExpectedRevision === null ? isPending('add-host-trust') : isPending(`rotate-host-${hostTrustId}`)} novalidate onsubmit={(event) => { event.preventDefault(); void saveHostTrust(); }}>
         <div class="repository-access-form-heading">
-          <div><h3>{hostExpectedRevision === null ? 'Add pinned host key' : `Rotate ${hostname}:${port}`}</h3><p>{hostExpectedRevision === null ? 'Confirm the host, port, and fingerprint against a trusted source before saving.' : 'The new key replaces the current trusted identity for this host and port.'}</p></div>
-          {#if hostExpectedRevision !== null}<code>{hostTrusts.find((entry) => entry.host_trust_id === hostTrustId)?.fingerprint}</code>{/if}
+          <div>
+            <h3>{hostExpectedRevision === null ? 'Add pinned host key' : `Rotate key for ${hostname}:${port}`}</h3>
+            <p>{hostExpectedRevision === null ? 'Confirm the host, port, and fingerprint against a trusted source before saving.' : `This keeps the endpoint fixed and replaces its current trusted identity. ${editingHostTrust?.referenced_repositories.length ? `Explicitly referenced by ${editingHostTrust.referenced_repositories.join(', ')}. ` : 'No Repository explicitly references this pin. '}Repositories without an explicit host-key binding may also select it automatically when it is the unique pin matching this host and port.`}</p>
+          </div>
+          {#if hostExpectedRevision !== null}<div><small>Current fingerprint</small><code>{editingHostTrust?.fingerprint}</code></div>{/if}
         </div>
+        {#if hostFormNotice}<p class="repository-access-notice {hostFormNotice.tone}" role={hostFormNotice.tone === 'error' ? 'alert' : 'status'}>{hostFormNotice.text}</p>{/if}
         <div class="repository-access-form-grid">
-          <label><span>Host trust id</span><input bind:value={hostTrustId} disabled={hostExpectedRevision !== null} aria-invalid={Boolean(hostErrors.hostTrustId)} aria-describedby={hostErrors.hostTrustId ? 'host-id-error' : undefined} />{#if hostErrors.hostTrustId}<small id="host-id-error" class="field-error">{hostErrors.hostTrustId}</small>{/if}</label>
-          <label><span>Hostname</span><input bind:value={hostname} aria-invalid={Boolean(hostErrors.hostname)} aria-describedby={hostErrors.hostname ? 'hostname-error' : undefined} />{#if hostErrors.hostname}<small id="hostname-error" class="field-error">{hostErrors.hostname}</small>{/if}</label>
-          <label><span>Port</span><input type="number" bind:value={port} aria-invalid={Boolean(hostErrors.port)} aria-describedby={hostErrors.port ? 'host-port-error' : undefined} />{#if hostErrors.port}<small id="host-port-error" class="field-error">{hostErrors.port}</small>{/if}</label>
-          <label class="wide"><span>OpenSSH public host key (Ed25519)</span><textarea bind:value={hostKey} rows="4" aria-invalid={Boolean(hostErrors.hostKey)} aria-describedby={hostErrors.hostKey ? 'host-key-error' : undefined}></textarea>{#if hostErrors.hostKey}<small id="host-key-error" class="field-error">{hostErrors.hostKey}</small>{/if}</label>
+          <label><span>Host trust id</span><input bind:this={hostTrustIdInput} bind:value={hostTrustId} disabled={hostExpectedRevision !== null} aria-invalid={Boolean(hostErrors.hostTrustId)} aria-describedby={hostErrors.hostTrustId ? 'host-id-error' : undefined} />{#if hostErrors.hostTrustId}<small id="host-id-error" class="field-error">{hostErrors.hostTrustId}</small>{/if}</label>
+          <label><span>Hostname</span><input bind:value={hostname} disabled={hostExpectedRevision !== null} aria-invalid={Boolean(hostErrors.hostname)} aria-describedby={hostErrors.hostname ? 'hostname-error' : undefined} />{#if hostErrors.hostname}<small id="hostname-error" class="field-error">{hostErrors.hostname}</small>{/if}</label>
+          <label><span>Port</span><input type="number" bind:value={port} disabled={hostExpectedRevision !== null} aria-invalid={Boolean(hostErrors.port)} aria-describedby={hostErrors.port ? 'host-port-error' : undefined} />{#if hostErrors.port}<small id="host-port-error" class="field-error">{hostErrors.port}</small>{/if}</label>
+          <label class="wide"><span>OpenSSH public host key (Ed25519)</span><textarea bind:this={hostKeyInput} bind:value={hostKey} rows="4" aria-invalid={Boolean(hostErrors.hostKey)} aria-describedby={hostErrors.hostKey ? 'host-key-error host-key-help' : 'host-key-help'}></textarea><small id="host-key-help">The new fingerprint is derived from this key after save; compare the key with a trusted source first.</small>{#if hostErrors.hostKey}<small id="host-key-error" class="field-error">{hostErrors.hostKey}</small>{/if}</label>
         </div>
-        <div class="repository-access-form-actions"><button type="submit" class="primary" disabled={busy}>{activeOperation === 'add-host-trust' || activeOperation?.startsWith('rotate-host-') ? 'Saving…' : hostExpectedRevision === null ? 'Pin host key' : 'Save new key'}</button><button type="button" class="secondary" disabled={busy} onclick={closeHostEditor}>Cancel</button></div>
+        <div class="repository-access-form-actions"><button type="submit" class="primary" disabled={hostExpectedRevision === null ? isPending('add-host-trust') : isPending(`rotate-host-${hostTrustId}`)}>{hostExpectedRevision === null ? (isPending('add-host-trust') ? 'Saving…' : 'Pin host key') : (isPending(`rotate-host-${hostTrustId}`) ? 'Saving…' : 'Save new key')}</button><button type="button" class="secondary" disabled={hostExpectedRevision === null ? isPending('add-host-trust') : isPending(`rotate-host-${hostTrustId}`)} onclick={() => void closeHostEditor()}>Cancel</button></div>
       </form>
     {/if}
 

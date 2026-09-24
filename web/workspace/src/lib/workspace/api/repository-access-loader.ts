@@ -21,6 +21,29 @@ function sectionErrorMessage(cause: unknown, label: string): string {
   return `${label} could not be loaded.`;
 }
 
+function httpErrorStatus(cause: unknown): number | null {
+  if (!cause || typeof cause !== "object" || !("status" in cause)) return null;
+  const status = (cause as { status?: unknown }).status;
+  return typeof status === "number" ? status : null;
+}
+
+export async function loadRepositoryAccessPermissionGate<T>(
+  fetcher: typeof fetch,
+  path: string,
+  parse: (value: unknown) => T,
+  label: string,
+): Promise<RepositoryAccessSectionResult<T>> {
+  try {
+    return {
+      data: await loadRepositoryAccessJson(fetcher, path, parse),
+      error: null,
+    };
+  } catch (cause) {
+    if (httpErrorStatus(cause) === 403) throw cause;
+    return { data: null, error: sectionErrorMessage(cause, label) };
+  }
+}
+
 export async function loadRepositoryAccessSection<T>(
   fetcher: typeof fetch,
   path: string,

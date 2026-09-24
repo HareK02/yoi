@@ -1254,9 +1254,12 @@
     background: var(--bg-subtle);
   }
 
-  .repository-access-form-heading > code {
+  .repository-access-form-heading > code,
+  .repository-access-form-heading > div > code {
+    display: block;
     max-width: 28rem;
     overflow-wrap: anywhere;
+    white-space: normal;
     color: var(--text-muted);
     font-size: var(--font-size-compact);
   }

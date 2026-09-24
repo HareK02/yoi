@@ -67,6 +67,7 @@ test("Repository Access authorizes first and preserves independently available s
       "credentialsError",
       "hostTrustsError",
       "defaultPublicKeyError",
+      "accessProjectionError",
     ]
   ) {
     assert(
@@ -143,7 +144,7 @@ test("Repository Access explains automatic application without inventing a bindi
   );
 });
 
-test("Repository Access opens one scoped form with validation, cancellation, and pending fences", () => {
+test("Repository Access keeps mutation forms disclosed and operation state scoped", () => {
   for (
     const token of [
       "credentialForm === 'generate'",
@@ -156,16 +157,20 @@ test("Repository Access opens one scoped form with validation, cancellation, and
       "validateHostTrust",
       'class="field-error"',
       "aria-invalid",
-      "disabled={busy}",
+      "pendingOperations",
+      "credentialFormNotice",
+      "credentialRowNotices",
+      "hostFormNotice",
+      "hostRowNotices",
       ">Cancel</button>",
-      "Generating…",
-      "Importing…",
-      "Rotating…",
-      "Saving…",
     ]
   ) {
-    assert(source.includes(token), `missing scoped form behavior ${token}`);
+    assert(source.includes(token), `missing scoped form structure ${token}`);
   }
+  assert(
+    !source.includes("disabled={busy}") && !source.includes("activeOperation"),
+    "unrelated controls must not share page-wide mutation state",
+  );
   const permanentFormStart = source.indexOf("<form");
   const generateDisclosure = source.indexOf(
     "{#if credentialForm === 'generate'}",

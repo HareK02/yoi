@@ -6,7 +6,7 @@ import {
   parseRepositorySshPublicKey,
 } from "$lib/workspace/api/repository-access";
 import {
-  loadRepositoryAccessJson,
+  loadRepositoryAccessPermissionGate,
   loadRepositoryAccessSection,
 } from "$lib/workspace/api/repository-access-loader";
 import type { PageLoad } from "./$types";
@@ -15,10 +15,11 @@ const WORKSPACE_DEFAULT_CREDENTIAL_ID = "workspace-default";
 
 export const load: PageLoad = async ({ fetch, params }) => {
   const workspaceId = params.workspaceId;
-  const accessProjection = await loadRepositoryAccessJson(
+  const accessProjectionResult = await loadRepositoryAccessPermissionGate(
     fetch,
     workspaceApiPath(workspaceId, "/settings/repository-access"),
     parseRepositoryAccessProjection,
+    "Repository bindings",
   );
   const [credentialsResult, hostTrustsResult] = await Promise.all([
     loadRepositoryAccessSection(
@@ -64,6 +65,7 @@ export const load: PageLoad = async ({ fetch, params }) => {
     defaultPublicKeyError: defaultPublicKeyResult.error,
     hostTrusts: hostTrustsResult.data ?? [],
     hostTrustsError: hostTrustsResult.error,
-    accessProjection,
+    accessProjection: accessProjectionResult.data,
+    accessProjectionError: accessProjectionResult.error,
   };
 };
