@@ -718,7 +718,7 @@ mod tests {
                 command: "printf done".to_string(),
                 timeout_secs: 5,
                 output_limit: 1024,
-                cwd: None,
+                cwd: crate::WorkdirPath::root(),
                 spill_dir: None,
                 tool_call_id: None,
             })
@@ -752,7 +752,7 @@ mod tests {
                 command: "sleep 30".to_string(),
                 timeout_secs: 60,
                 output_limit: 1024,
-                cwd: None,
+                cwd: crate::WorkdirPath::root(),
                 spill_dir: None,
                 tool_call_id: None,
             })
@@ -779,7 +779,7 @@ mod tests {
                 command: "sleep 30".to_string(),
                 timeout_secs: 60,
                 output_limit: 1024,
-                cwd: None,
+                cwd: crate::WorkdirPath::root(),
                 spill_dir: None,
                 tool_call_id: None,
             })

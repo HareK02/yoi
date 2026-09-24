@@ -1192,18 +1192,13 @@ impl WorkdirSession for LocalWorkdirSession {
         {
             return Err(WorkdirError::OutOfScope(spill_dir.to_path_buf()));
         }
-        let cwd = if let Some(logical_cwd) = request.cwd.as_ref() {
-            let cwd = self.resolve(logical_cwd);
-            let scope = self.inner.scope.snapshot();
-            if !scope.is_readable(&cwd)
-                || !std::fs::metadata(&cwd).is_ok_and(|metadata| metadata.is_dir())
-            {
-                return Err(WorkdirError::OutOfScope(cwd));
-            }
-            cwd
-        } else {
-            self.inner.cwd.clone()
-        };
+        let cwd = self.resolve(&request.cwd);
+        let scope = self.inner.scope.snapshot();
+        if !scope.is_readable(&cwd)
+            || !std::fs::metadata(&cwd).is_ok_and(|metadata| metadata.is_dir())
+        {
+            return Err(WorkdirError::OutOfScope(cwd));
+        }
         let id = self.inner.next_command_id.fetch_add(1, Ordering::Relaxed);
         let handle = CommandHandle(format!("command-{id}"));
         let (completion_tx, completion) = watch::channel(false);
@@ -2080,7 +2075,7 @@ mod tests {
                 command: "sleep 30".to_owned(),
                 timeout_secs: 60,
                 output_limit: 1024,
-                cwd: None,
+                cwd: WorkdirPath::root(),
                 spill_dir: None,
                 tool_call_id: None,
             },
@@ -2777,7 +2772,7 @@ mod tests {
                 command: "pwd && printf provider-command".into(),
                 timeout_secs: 5,
                 output_limit: 4096,
-                cwd: None,
+                cwd: WorkdirPath::root(),
                 spill_dir: None,
                 tool_call_id: None,
             },
@@ -2867,6 +2862,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_rejects_explicit_cwd_outside_attachment_scope() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let workdir = make_fs(&dir);
+        let cwd = WorkdirPath::new_scoped(outside.path().display().to_string()).unwrap();
+
+        let error = WorkdirSession::start_command(
+            &workdir,
+            CommandRequest {
+                command: "printf hidden".into(),
+                timeout_secs: 5,
+                output_limit: 1024,
+                cwd,
+                spill_dir: None,
+                tool_call_id: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, WorkdirError::OutOfScope(path) if path == outside.path()));
+    }
+
+    #[tokio::test]
     async fn command_rejects_spill_directory_without_read_scope() {
         let dir = TempDir::new().unwrap();
         let spill = TempDir::new().unwrap();
@@ -2878,7 +2897,7 @@ mod tests {
                 command: "printf hidden".into(),
                 timeout_secs: 5,
                 output_limit: 1,
-                cwd: None,
+                cwd: WorkdirPath::root(),
                 spill_dir: Some(spill.path().to_path_buf()),
                 tool_call_id: None,
             },
@@ -2918,7 +2937,7 @@ mod tests {
                 command: "i=0; while [ $i -lt 200 ]; do printf 'line-%03d\\n' \"$i\"; i=$((i+1)); done; printf 'FINAL-NEEDLE\\n'".into(),
                 timeout_secs: 5,
                 output_limit: 64,
-                cwd: None,
+                cwd: WorkdirPath::root(),
                 spill_dir: Some(spill.path().to_path_buf()),
                 tool_call_id: None,
             },
@@ -2965,7 +2984,7 @@ mod tests {
                 command: "printf 'aéz'".into(),
                 timeout_secs: 5,
                 output_limit: 1024,
-                cwd: None,
+                cwd: WorkdirPath::root(),
                 spill_dir: None,
                 tool_call_id: None,
             },
@@ -3191,7 +3210,7 @@ mod tests {
                 command: "printf ready; printf warning >&2; sleep 0.2; printf done".into(),
                 timeout_secs: 5,
                 output_limit: 1024,
-                cwd: None,
+                cwd: WorkdirPath::root(),
                 spill_dir: None,
                 tool_call_id: Some("tool-7".into()),
             },
@@ -3296,7 +3315,7 @@ mod tests {
                 command: "sleep 30".into(),
                 timeout_secs: 1,
                 output_limit: 1024,
-                cwd: None,
+                cwd: WorkdirPath::root(),
                 spill_dir: None,
                 tool_call_id: None,
             },
@@ -3367,7 +3386,7 @@ mod tests {
                 command: "sleep 30".into(),
                 timeout_secs: 60,
                 output_limit: 1024,
-                cwd: None,
+                cwd: WorkdirPath::root(),
                 spill_dir: None,
                 tool_call_id: None,
             },

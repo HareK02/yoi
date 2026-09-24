@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use workdir::{
-    CommandHandle, CommandOutputRequest, CommandRequest, WorkdirSessionHandle, WorkdirSessionRouter,
+    CommandHandle, CommandOutputRequest, CommandRequest, WorkdirPath, WorkdirSessionHandle,
+    WorkdirSessionRouter,
 };
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -19,6 +20,8 @@ struct BashParams {
     /// Worker-local alias of the Workdir attachment to use.
     #[serde(default)]
     target_workdir: Option<String>,
+    /// Workdir-relative directory in which to execute the command.
+    cwd: WorkdirPath,
     command: String,
     #[serde(default)]
     timeout: Option<u64>,
@@ -129,7 +132,7 @@ impl Tool for BashTool {
                 command: params.command,
                 timeout_secs,
                 output_limit: INLINE_BYTE_BUDGET,
-                cwd: None,
+                cwd: params.cwd,
                 spill_dir: Some(self.output_dir.clone()),
                 tool_call_id: Some(call_id.clone()),
             })
@@ -341,7 +344,7 @@ mod tests {
         let command = "i=0; while [ $i -lt 2000 ]; do printf 'line-%04d\\n' \"$i\"; i=$((i+1)); done; printf 'FINAL-NEEDLE\\n'";
         let result = bash
             .execute(
-                &serde_json::json!({ "command": command }).to_string(),
+                &serde_json::json!({ "command": command, "cwd": "." }).to_string(),
                 Default::default(),
             )
             .await
@@ -402,6 +405,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_cwd_is_rejected_before_command_start() {
+        let root = TempDir::new().unwrap();
+        let output = TempDir::new().unwrap();
+        let session = session_with_output_scope(&root, &output);
+        let (_, bash) = bash_tool(session, output.path().to_path_buf())();
+
+        let error = bash
+            .execute(
+                &serde_json::json!({ "command": "printf hidden" }).to_string(),
+                Default::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("missing field `cwd`"));
+    }
+
+    #[tokio::test]
     async fn short_output_does_not_leave_a_spill_artifact() {
         let root = TempDir::new().unwrap();
         let output = TempDir::new().unwrap();
@@ -410,7 +431,7 @@ mod tests {
 
         let result = bash
             .execute(
-                &serde_json::json!({ "command": "printf short" }).to_string(),
+                &serde_json::json!({ "command": "printf short", "cwd": "." }).to_string(),
                 Default::default(),
             )
             .await

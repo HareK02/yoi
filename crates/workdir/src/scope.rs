@@ -1094,10 +1094,7 @@ impl WorkdirSession for ScopedWorkdirSession {
         }
         let tool_call_id = request.tool_call_id.clone();
         if self.scope.is_some() {
-            request.cwd = Some(match request.cwd.as_ref() {
-                Some(cwd) => self.resolve_path(cwd)?,
-                None => self.cwd.clone(),
-            });
+            request.cwd = self.resolve_path(&request.cwd)?;
         }
         if let Some(tool_call_id) = &tool_call_id {
             self.starting_tool_calls
@@ -1677,7 +1674,7 @@ mod tests {
                 command: command.into(),
                 timeout_secs: 5,
                 output_limit: 1024,
-                cwd: None,
+                cwd: FsPath::root(),
                 spill_dir: None,
                 tool_call_id: Some(tool_call_id.into()),
             })
@@ -1706,7 +1703,7 @@ mod tests {
                 command: "printf ready; sleep 0.2; printf done".into(),
                 timeout_secs: 5,
                 output_limit: 1024,
-                cwd: None,
+                cwd: FsPath::root(),
                 spill_dir: None,
                 tool_call_id: Some("tool-delegated".into()),
             })
@@ -1773,7 +1770,7 @@ mod tests {
                 command: "pwd".into(),
                 timeout_secs: 5,
                 output_limit: 1024,
-                cwd: None,
+                cwd: FsPath::root(),
                 spill_dir: None,
                 tool_call_id: None,
             })
@@ -1805,7 +1802,7 @@ mod tests {
                 command: "pwd; sleep 0.2".into(),
                 timeout_secs: 5,
                 output_limit: 4096,
-                cwd: None,
+                cwd: FsPath::root(),
                 spill_dir: None,
                 tool_call_id: Some("first-command".into()),
             })
@@ -1907,7 +1904,7 @@ mod tests {
                     command: "printf denied".into(),
                     timeout_secs: 5,
                     output_limit: 1024,
-                    cwd: None,
+                    cwd: FsPath::root(),
                     spill_dir: None,
                     tool_call_id: Some("read-only-command".into()),
                 })
@@ -2213,7 +2210,7 @@ mod tests {
                     command: "printf revoked".into(),
                     timeout_secs: 5,
                     output_limit: 1024,
-                    cwd: None,
+                    cwd: FsPath::root(),
                     spill_dir: None,
                     tool_call_id: Some("revoked-child-command".into()),
                 })
@@ -2315,7 +2312,7 @@ mod tests {
                     command: "sleep 30".into(),
                     timeout_secs: 60,
                     output_limit: 1024,
-                    cwd: None,
+                    cwd: FsPath::root(),
                     spill_dir: None,
                     tool_call_id: Some(format!("command-{index}")),
                 })
@@ -2328,7 +2325,7 @@ mod tests {
                 command: "sleep 30".into(),
                 timeout_secs: 60,
                 output_limit: 1024,
-                cwd: None,
+                cwd: FsPath::root(),
                 spill_dir: None,
                 tool_call_id: Some("command-over-limit".into()),
             })
@@ -2362,7 +2359,7 @@ mod tests {
                     command: "sleep 30".into(),
                     timeout_secs: 60,
                     output_limit: 1024,
-                    cwd: None,
+                    cwd: FsPath::root(),
                     spill_dir: None,
                     tool_call_id: Some("racing-command".into()),
                 })
@@ -2408,7 +2405,7 @@ mod tests {
                 command: "sleep 30; printf leaked > marker".into(),
                 timeout_secs: 60,
                 output_limit: 1024,
-                cwd: None,
+                cwd: FsPath::root(),
                 spill_dir: None,
                 tool_call_id: Some("owned-command".into()),
             })
@@ -2603,7 +2600,7 @@ mod tests {
                     command: "printf closed".into(),
                     timeout_secs: 5,
                     output_limit: 1024,
-                    cwd: None,
+                    cwd: FsPath::root(),
                     spill_dir: None,
                     tool_call_id: Some("closed-parent-command".into()),
                 })

@@ -1357,7 +1357,7 @@ mod tests {
                 command: "true".to_string(),
                 timeout_secs: 120,
                 output_limit: 1024,
-                cwd: None,
+                cwd: workdir::WorkdirPath::root(),
                 spill_dir: Some("/worker-local/bash-output".into()),
                 tool_call_id: Some("call-1".to_string()),
             })
@@ -1370,6 +1370,7 @@ mod tests {
             serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
         assert_eq!(body["operation"]["operation"], "command_start");
         assert_eq!(body["operation"]["request"]["command"], "true");
+        assert_eq!(body["operation"]["request"]["cwd"], "");
         assert!(body["operation"]["request"]["spill_dir"].is_null());
         assert_eq!(body["operation"]["request"]["tool_call_id"], "call-1");
         assert!(
@@ -1638,7 +1639,7 @@ mod tests {
                 command: "printf done".to_string(),
                 timeout_secs: 5,
                 output_limit: 1024,
-                cwd: None,
+                cwd: workdir::WorkdirPath::root(),
                 spill_dir: None,
                 tool_call_id: None,
             })

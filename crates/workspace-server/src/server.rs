@@ -27415,7 +27415,7 @@ mod tests {
                 command: "printf ready; sleep 30".to_string(),
                 timeout_secs: 60,
                 output_limit: 4096,
-                cwd: None,
+                cwd: workdir::WorkdirPath::root(),
                 spill_dir: None,
                 tool_call_id: Some("tool-call-command-session".to_string()),
             })
@@ -27529,7 +27529,7 @@ mod tests {
             command: "sleep 30".to_string(),
             timeout_secs: 60,
             output_limit: 4096,
-            cwd: None,
+            cwd: workdir::WorkdirPath::root(),
             spill_dir: None,
             tool_call_id: None,
         };

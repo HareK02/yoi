@@ -62,7 +62,7 @@ async fn external_local_provider_is_strictly_read_only() {
             command: "echo changed > item.txt".to_string(),
             timeout_secs: 1,
             output_limit: 1024,
-            cwd: None,
+            cwd: WorkdirPath::root(),
             spill_dir: None,
             tool_call_id: None,
         },

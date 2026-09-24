@@ -534,7 +534,7 @@ mod tests {
             command: "cat /home/operator/private/session.log".to_string(),
             timeout_secs: 1,
             output_limit: 1024,
-            cwd: None,
+            cwd: WorkdirPath::root(),
             spill_dir: Some("/home/operator/private/output".into()),
             tool_call_id: None,
         });
