@@ -47,7 +47,8 @@
     Object.fromEntries(untrack(() => data.publicKeys).map((key) => [key.credential_id, key]))
   );
   let hostTrusts = $state<RepositorySshHostTrust[]>(untrack(() => data.hostTrusts));
-  const accessProjection = untrack(() => data.accessProjection);
+  let accessProjection = $state(untrack(() => data.accessProjection));
+  let pageEpoch = 0;
   let pendingOperations = $state<string[]>([]);
   let rotateCredentialId = $state<string | null>(null);
   const base = $derived(`/api/w/${encodeURIComponent(data.workspaceId)}/settings/repository-access`);
@@ -104,6 +105,52 @@
     hostExpectedRevision === null ? null : hostTrusts.find((entry) => entry.host_trust_id === hostTrustId) ?? null
   );
 
+  function resetPageState(next: PageProps['data']): void {
+    pageEpoch += 1;
+    credentials = sortCredentials(next.credentials);
+    publicKeys = Object.fromEntries(next.publicKeys.map((key) => [key.credential_id, key]));
+    hostTrusts = next.hostTrusts;
+    accessProjection = next.accessProjection;
+    pendingOperations = [];
+    rotateCredentialId = null;
+    copiedCredentialId = null;
+    credentialNotice = null;
+    credentialFormNotice = null;
+    credentialRowNotices = {};
+    hostNotice = null;
+    hostFormNotice = null;
+    hostRowNotices = {};
+    publicKeyNotices = {};
+    credentialForm = null;
+    generateCredentialId = '';
+    generateCredentialName = '';
+    generateErrors = {};
+    credentialId = '';
+    credentialName = '';
+    privateKey = '';
+    passphrase = '';
+    importErrors = {};
+    rotatePrivateKey = '';
+    rotatePassphrase = '';
+    rotateErrors = {};
+    credentialReturnFocus = null;
+    hostEditorOpen = false;
+    hostTrustId = '';
+    hostname = '';
+    port = 22;
+    hostKey = '';
+    hostExpectedRevision = null;
+    hostErrors = {};
+    hostReturnFocus = null;
+  }
+
+  $effect(() => {
+    const next = data;
+    untrack(() => resetPageState(next));
+  });
+
+  class StaleRepositoryAccessRequestError extends Error {}
+
   function operationId(prefix: string): string {
     return `${prefix}-${crypto.randomUUID()}`;
   }
@@ -112,22 +159,49 @@
     return { tone: 'error', text: error instanceof Error ? error.message : fallback };
   }
 
+  function pendingOperationKey(operation: string): string {
+    return `${pageEpoch}:${operation}`;
+  }
+
   function isPending(operation: string): boolean {
-    return pendingOperations.includes(operation);
+    return pendingOperations.includes(pendingOperationKey(operation));
   }
 
-  function startOperation(operation: string): boolean {
-    if (isPending(operation)) return false;
-    pendingOperations = [...pendingOperations, operation];
-    return true;
+  function startOperation(operation: string): string | null {
+    const key = pendingOperationKey(operation);
+    if (pendingOperations.includes(key)) return null;
+    pendingOperations = [...pendingOperations, key];
+    return key;
   }
 
-  function finishOperation(operation: string): void {
-    pendingOperations = pendingOperations.filter((entry) => entry !== operation);
+  function finishOperation(operationKey: string): void {
+    pendingOperations = pendingOperations.filter((entry) => entry !== operationKey);
+  }
+
+  function isCurrentOperation(operationKey: string): boolean {
+    return operationKey.startsWith(`${pageEpoch}:`);
+  }
+
+  function requireCurrentOperation(operationKey: string): void {
+    if (!isCurrentOperation(operationKey)) throw new StaleRepositoryAccessRequestError();
+  }
+
+  function credentialEditorPending(): boolean {
+    const credentialRotationPrefix = `${pageEpoch}:rotate-`;
+    const hostRotationPrefix = `${pageEpoch}:rotate-host-`;
+    return isPending('generate-credential') || isPending('import-credential') || pendingOperations.some((entry) => entry.startsWith(credentialRotationPrefix) && !entry.startsWith(hostRotationPrefix));
+  }
+
+  function hostEditorPending(): boolean {
+    return isPending('add-host-trust') || pendingOperations.some((entry) => entry.startsWith(`${pageEpoch}:rotate-host-`));
   }
 
   function currentFocus(): HTMLElement | null {
     return document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  }
+
+  function focusIsInside(element: HTMLElement | undefined): boolean {
+    return element?.contains(document.activeElement) ?? false;
   }
 
   async function restoreFocus(target: HTMLElement | null, fallbackId?: string): Promise<void> {
@@ -157,11 +231,16 @@
     parse: ((value: unknown) => T) | null,
     operation: string
   ): Promise<T | undefined> {
+    const epoch = pageEpoch;
     const response = await fetch(`${base}${path}`, {
       method,
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body)
     });
+    if (epoch !== pageEpoch) {
+      await response.body?.cancel();
+      throw new StaleRepositoryAccessRequestError();
+    }
     if (!response.ok) {
       await response.body?.cancel();
       throw repositoryAccessRequestError(response.status, operation);
@@ -176,27 +255,37 @@
     }
     if (response.status === 204) throw new Error('Repository Access returned an unexpected empty response.');
     const payload = await readBoundedJson(response, REPOSITORY_ACCESS_MAX_RESPONSE_BYTES);
+    if (epoch !== pageEpoch) throw new StaleRepositoryAccessRequestError();
     return parse(payload);
   }
 
   async function loadPublicKey(credentialId: string): Promise<RepositorySshPublicKey> {
+    const epoch = pageEpoch;
     const response = await fetch(
       `${base}/credentials/${encodeURIComponent(credentialId)}/public-key`,
       { headers: { accept: 'application/json' } }
     );
+    if (epoch !== pageEpoch) {
+      await response.body?.cancel();
+      throw new StaleRepositoryAccessRequestError();
+    }
     if (!response.ok) {
       await response.body?.cancel();
       throw repositoryAccessRequestError(response.status, 'load this public key');
     }
     const body = await readBoundedJson(response, REPOSITORY_ACCESS_MAX_RESPONSE_BYTES);
+    if (epoch !== pageEpoch) throw new StaleRepositoryAccessRequestError();
     return parseRepositorySshPublicKey(body);
   }
 
   async function refreshPublicKey(credentialId: string): Promise<void> {
+    const epoch = pageEpoch;
     try {
       const publicKey = await loadPublicKey(credentialId);
+      if (epoch !== pageEpoch) throw new StaleRepositoryAccessRequestError();
       publicKeys = { ...publicKeys, [credentialId]: publicKey };
     } catch (error) {
+      if (error instanceof StaleRepositoryAccessRequestError) throw error;
       publicKeyNotices = {
         ...publicKeyNotices,
         [credentialId]: operationError(error, 'The credential was saved, but its public key could not be loaded. Use Copy public key to retry.')
@@ -218,6 +307,7 @@
 
   async function closeCredentialForms(restore = true) {
     const returnFocus = credentialReturnFocus;
+    const shouldRestoreFocus = restore && focusIsInside(credentialFormElement);
     credentialForm = null;
     generateCredentialId = '';
     generateCredentialName = '';
@@ -229,7 +319,7 @@
     importErrors = {};
     credentialFormNotice = null;
     credentialReturnFocus = null;
-    if (restore) await restoreFocus(returnFocus);
+    if (shouldRestoreFocus) await restoreFocus(returnFocus);
   }
 
   async function generateCredential() {
@@ -238,8 +328,8 @@
       await focusFirstInvalid(credentialFormElement);
       return;
     }
-    const operation = 'generate-credential';
-    if (!startOperation(operation)) return;
+    const operation = startOperation('generate-credential');
+    if (!operation) return;
     credentialFormNotice = null;
     try {
       const body: GenerateRepositorySshCredentialRequest = {
@@ -248,11 +338,15 @@
         name: generateCredentialName.trim()
       };
       const created = await request('/credentials/generate', 'POST', body, parseRepositorySshCredential, 'generate this SSH credential');
+      requireCurrentOperation(operation);
       credentials = sortCredentials([...credentials.filter((item) => item.credential_id !== created.credential_id), created]);
       await refreshPublicKey(created.credential_id);
+      requireCurrentOperation(operation);
       await closeCredentialForms();
+      requireCurrentOperation(operation);
       credentialNotice = { tone: 'success', text: `Generated ${created.name}. Copy its public key before configuring the Repository provider.` };
     } catch (error) {
+      if (error instanceof StaleRepositoryAccessRequestError) return;
       credentialFormNotice = operationError(error, 'Failed to generate the SSH credential.');
     } finally {
       finishOperation(operation);
@@ -260,19 +354,22 @@
   }
 
   async function copyPublicKey(credential: RepositorySshCredential) {
-    const operation = `copy-${credential.credential_id}`;
-    if (!startOperation(operation)) return;
+    const operation = startOperation(`copy-${credential.credential_id}`);
+    if (!operation) return;
     publicKeyNotices = { ...publicKeyNotices, [credential.credential_id]: { tone: 'success', text: 'Loading public key…' } };
     try {
       const publicKey = publicKeys[credential.credential_id] ?? await loadPublicKey(credential.credential_id);
+      requireCurrentOperation(operation);
       publicKeys = { ...publicKeys, [credential.credential_id]: publicKey };
       await navigator.clipboard.writeText(publicKey.public_key);
+      requireCurrentOperation(operation);
       copiedCredentialId = credential.credential_id;
       publicKeyNotices = { ...publicKeyNotices, [credential.credential_id]: { tone: 'success', text: 'Public key copied.' } };
       window.setTimeout(() => {
-        if (copiedCredentialId === credential.credential_id) copiedCredentialId = null;
+        if (isCurrentOperation(operation) && copiedCredentialId === credential.credential_id) copiedCredentialId = null;
       }, 1500);
     } catch (error) {
+      if (error instanceof StaleRepositoryAccessRequestError) return;
       publicKeyNotices = { ...publicKeyNotices, [credential.credential_id]: operationError(error, 'Failed to copy the public key.') };
     } finally {
       finishOperation(operation);
@@ -285,8 +382,8 @@
       await focusFirstInvalid(credentialFormElement);
       return;
     }
-    const operation = 'import-credential';
-    if (!startOperation(operation)) return;
+    const operation = startOperation('import-credential');
+    if (!operation) return;
     credentialFormNotice = null;
     try {
       const body: CreateRepositorySshCredentialRequest = {
@@ -297,15 +394,21 @@
         passphrase: passphrase || null
       };
       const created = await request('/credentials', 'POST', body, parseRepositorySshCredential, 'import this SSH credential');
+      requireCurrentOperation(operation);
       credentials = sortCredentials([...credentials, created]);
       await refreshPublicKey(created.credential_id);
+      requireCurrentOperation(operation);
       await closeCredentialForms();
+      requireCurrentOperation(operation);
       credentialNotice = { tone: 'success', text: `Imported ${created.name}. The private key and passphrase fields were cleared.` };
     } catch (error) {
+      if (error instanceof StaleRepositoryAccessRequestError) return;
       credentialFormNotice = operationError(error, 'Credential import failed.');
     } finally {
-      privateKey = '';
-      passphrase = '';
+      if (isCurrentOperation(operation)) {
+        privateKey = '';
+        passphrase = '';
+      }
       finishOperation(operation);
     }
   }
@@ -324,6 +427,7 @@
 
   async function closeCredentialRotation(restore = true) {
     const returnFocus = credentialReturnFocus;
+    const shouldRestoreFocus = restore && focusIsInside(rotationFormElement);
     const fallbackId = rotateCredentialId ? `rotate-credential-${rotateCredentialId}` : undefined;
     rotateCredentialId = null;
     rotatePrivateKey = '';
@@ -331,7 +435,7 @@
     rotateErrors = {};
     credentialFormNotice = null;
     credentialReturnFocus = null;
-    if (restore) await restoreFocus(returnFocus, fallbackId);
+    if (shouldRestoreFocus) await restoreFocus(returnFocus, fallbackId);
   }
 
   async function rotateCredential(credential: RepositorySshCredential) {
@@ -340,8 +444,8 @@
       await focusFirstInvalid(rotationFormElement);
       return;
     }
-    const operation = `rotate-${credential.credential_id}`;
-    if (!startOperation(operation)) return;
+    const operation = startOperation(`rotate-${credential.credential_id}`);
+    if (!operation) return;
     credentialFormNotice = null;
     try {
       const body: RotateRepositorySshCredentialRequest = {
@@ -357,29 +461,36 @@
         parseRepositorySshCredential,
         `rotate ${credential.name}`
       );
+      requireCurrentOperation(operation);
       credentials = credentials.map((entry) => entry.credential_id === rotated.credential_id ? rotated : entry);
       await refreshPublicKey(rotated.credential_id);
+      requireCurrentOperation(operation);
       finishOperation(operation);
       await closeCredentialRotation();
+      requireCurrentOperation(operation);
       credentialRowNotices = {
         ...credentialRowNotices,
         [rotated.credential_id]: { tone: 'success', text: `Rotated ${rotated.name}. Copy the new public key and update every external provider that uses it.` }
       };
     } catch (error) {
+      if (error instanceof StaleRepositoryAccessRequestError) return;
       credentialFormNotice = operationError(error, 'Credential rotation failed.');
     } finally {
-      rotatePrivateKey = '';
-      rotatePassphrase = '';
+      if (isCurrentOperation(operation)) {
+        rotatePrivateKey = '';
+        rotatePassphrase = '';
+      }
       finishOperation(operation);
     }
   }
 
   async function deleteCredential(credential: RepositorySshCredential) {
     if (credential.referenced_repositories.length > 0) return;
-    const operation = `delete-${credential.credential_id}`;
-    if (isPending(operation)) return;
+    const operationName = `delete-${credential.credential_id}`;
+    if (isPending(operationName)) return;
     if (!confirm(`Delete SSH credential ${credential.name} (${credential.credential_id})? This cannot be undone.`)) return;
-    if (!startOperation(operation)) return;
+    const operation = startOperation(operationName);
+    if (!operation) return;
     credentialRowNotices = { ...credentialRowNotices, [credential.credential_id]: { tone: 'success', text: 'Deleting credential…' } };
     try {
       const body: DeleteRepositorySshCredentialRequest = {
@@ -387,12 +498,14 @@
         expected_revision: credential.current_revision
       };
       await request(`/credentials/${encodeURIComponent(credential.credential_id)}`, 'DELETE', body, null, `delete ${credential.name}`);
+      requireCurrentOperation(operation);
       credentials = credentials.filter((entry) => entry.credential_id !== credential.credential_id);
       const remainingPublicKeys = { ...publicKeys };
       delete remainingPublicKeys[credential.credential_id];
       publicKeys = remainingPublicKeys;
       credentialNotice = { tone: 'success', text: `Deleted ${credential.name}.` };
     } catch (error) {
+      if (error instanceof StaleRepositoryAccessRequestError) return;
       credentialRowNotices = { ...credentialRowNotices, [credential.credential_id]: operationError(error, 'Credential deletion failed.') };
     } finally {
       finishOperation(operation);
@@ -429,6 +542,7 @@
 
   async function closeHostEditor(restore = true) {
     const returnFocus = hostReturnFocus;
+    const shouldRestoreFocus = restore && focusIsInside(hostFormElement);
     const fallbackId = hostExpectedRevision !== null ? `rotate-host-${hostTrustId}` : undefined;
     hostEditorOpen = false;
     hostTrustId = '';
@@ -439,7 +553,7 @@
     hostErrors = {};
     hostFormNotice = null;
     hostReturnFocus = null;
-    if (restore) await restoreFocus(returnFocus, fallbackId);
+    if (shouldRestoreFocus) await restoreFocus(returnFocus, fallbackId);
   }
 
   async function saveHostTrust() {
@@ -454,8 +568,8 @@
       hostFormNotice = { tone: 'error', text: 'This pinned host key changed or was removed. Close the editor and try again.' };
       return;
     }
-    const operation = rotating ? `rotate-host-${hostTrustId}` : 'add-host-trust';
-    if (!startOperation(operation)) return;
+    const operation = startOperation(rotating ? `rotate-host-${hostTrustId}` : 'add-host-trust');
+    if (!operation) return;
     hostFormNotice = null;
     try {
       const body: PutRepositorySshHostTrustRequest = {
@@ -467,15 +581,18 @@
         expected_revision: hostExpectedRevision
       };
       const saved = await request('/host-trusts', 'POST', body, parseRepositorySshHostTrust, rotating ? 'rotate this pinned SSH host key' : 'pin this SSH host key');
+      requireCurrentOperation(operation);
       hostTrusts = rotating
         ? hostTrusts.map((entry) => entry.host_trust_id === saved.host_trust_id ? saved : entry)
         : [...hostTrusts, saved].sort((a, b) => a.host_trust_id.localeCompare(b.host_trust_id));
       finishOperation(operation);
       await closeHostEditor();
+      requireCurrentOperation(operation);
       const notice: Notice = { tone: 'success', text: `${rotating ? 'Rotated' : 'Pinned'} the key for ${saved.hostname}:${saved.port}. This records host identity; it does not prove Git authentication succeeded.` };
       if (rotating) hostRowNotices = { ...hostRowNotices, [saved.host_trust_id]: notice };
       else hostNotice = notice;
     } catch (error) {
+      if (error instanceof StaleRepositoryAccessRequestError) return;
       hostFormNotice = operationError(error, 'Failed to save the pinned host key.');
     } finally {
       finishOperation(operation);
@@ -484,10 +601,11 @@
 
   async function deleteHostTrust(hostTrust: RepositorySshHostTrust) {
     if (hostTrust.referenced_repositories.length > 0) return;
-    const operation = `delete-host-${hostTrust.host_trust_id}`;
-    if (isPending(operation)) return;
+    const operationName = `delete-host-${hostTrust.host_trust_id}`;
+    if (isPending(operationName)) return;
     if (!confirm(`Delete the pinned host key for ${hostTrust.hostname}:${hostTrust.port}? Future SSH connections cannot verify this host until another key is pinned.`)) return;
-    if (!startOperation(operation)) return;
+    const operation = startOperation(operationName);
+    if (!operation) return;
     hostRowNotices = { ...hostRowNotices, [hostTrust.host_trust_id]: { tone: 'success', text: 'Deleting pinned key…' } };
     try {
       const body: DeleteRepositorySshHostTrustRequest = {
@@ -495,9 +613,11 @@
         expected_revision: hostTrust.current_revision
       };
       await request(`/host-trusts/${encodeURIComponent(hostTrust.host_trust_id)}`, 'DELETE', body, null, `delete the pin for ${hostTrust.hostname}:${hostTrust.port}`);
+      requireCurrentOperation(operation);
       hostTrusts = hostTrusts.filter((entry) => entry.host_trust_id !== hostTrust.host_trust_id);
       hostNotice = { tone: 'success', text: `Deleted the pin for ${hostTrust.hostname}:${hostTrust.port}.` };
     } catch (error) {
+      if (error instanceof StaleRepositoryAccessRequestError) return;
       hostRowNotices = { ...hostRowNotices, [hostTrust.host_trust_id]: operationError(error, 'Host key deletion failed.') };
     } finally {
       finishOperation(operation);
@@ -563,8 +683,8 @@
       </div>
       {#if !data.credentialsError}
         <div class="repository-access-actions" aria-label="Add SSH credential">
-          <button type="button" class="secondary" onclick={() => void openCredentialForm('generate')}>Generate credential</button>
-          <button type="button" class="secondary" onclick={() => void openCredentialForm('import')}>Import credential</button>
+          <button type="button" class="secondary" disabled={credentialEditorPending()} onclick={() => void openCredentialForm('generate')}>Generate credential</button>
+          <button type="button" class="secondary" disabled={credentialEditorPending()} onclick={() => void openCredentialForm('import')}>Import credential</button>
         </div>
       {/if}
     </div>
@@ -606,13 +726,13 @@
                 </td>
                 <td>
                   <div class="repository-access-row-actions">
-                    <button type="button" class="secondary" disabled={isPending(`copy-${credential.credential_id}`)} onclick={() => void copyPublicKey(credential)}>
+                    <button type="button" class="secondary" disabled={isPending(`copy-${credential.credential_id}`) || isPending(`rotate-${credential.credential_id}`) || isPending(`delete-${credential.credential_id}`)} onclick={() => void copyPublicKey(credential)}>
                       {isPending(`copy-${credential.credential_id}`) ? 'Loading…' : copiedCredentialId === credential.credential_id ? 'Copied' : 'Copy public key'}
                     </button>
                     {#if credential.credential_id !== workspaceDefaultCredentialId}
-                      <button id={`rotate-credential-${credential.credential_id}`} type="button" class="secondary" disabled={isPending(`rotate-${credential.credential_id}`)} onclick={() => void openCredentialRotation(credential)}>Rotate</button>
+                      <button id={`rotate-credential-${credential.credential_id}`} type="button" class="secondary" disabled={credentialEditorPending() || isPending(`delete-${credential.credential_id}`)} onclick={() => void openCredentialRotation(credential)}>Rotate</button>
                       {#if credential.referenced_repositories.length === 0}
-                        <button type="button" class="danger" disabled={isPending(`delete-${credential.credential_id}`)} onclick={() => void deleteCredential(credential)}>Delete</button>
+                        <button type="button" class="danger" disabled={isPending(`delete-${credential.credential_id}`) || isPending(`rotate-${credential.credential_id}`)} onclick={() => void deleteCredential(credential)}>Delete</button>
                       {/if}
                     {/if}
                   </div>
@@ -687,7 +807,7 @@
         <h2 id="host-trust-heading">Pinned SSH host keys</h2>
         <p>Keys used to verify the identity of a specific SSH host and port.</p>
       </div>
-      {#if !data.hostTrustsError}<button type="button" class="secondary" disabled={isPending('add-host-trust')} onclick={() => void openNewHostTrust()}>Add pinned key</button>{/if}
+      {#if !data.hostTrustsError}<button type="button" class="secondary" disabled={hostEditorPending()} onclick={() => void openNewHostTrust()}>Add pinned key</button>{/if}
     </div>
 
     {#if hostNotice}<p class="repository-access-notice {hostNotice.tone}" role={hostNotice.tone === 'error' ? 'alert' : 'status'}>{hostNotice.text}</p>{/if}
@@ -713,8 +833,8 @@
                 <td>{hostTrust.referenced_repositories.length > 0 ? `Explicit: ${hostTrust.referenced_repositories.join(', ')}` : 'No explicit references; may apply automatically when this is the unique pin for a matching host and port.'}</td>
                 <td>
                   <div class="repository-access-row-actions">
-                    <button id={`rotate-host-${hostTrust.host_trust_id}`} type="button" class="secondary" disabled={isPending(`rotate-host-${hostTrust.host_trust_id}`)} onclick={() => void editHostTrust(hostTrust)}>Rotate key</button>
-                    {#if hostTrust.referenced_repositories.length === 0}<button type="button" class="danger" disabled={isPending(`delete-host-${hostTrust.host_trust_id}`)} onclick={() => void deleteHostTrust(hostTrust)}>Delete</button>{/if}
+                    <button id={`rotate-host-${hostTrust.host_trust_id}`} type="button" class="secondary" disabled={hostEditorPending() || isPending(`delete-host-${hostTrust.host_trust_id}`)} onclick={() => void editHostTrust(hostTrust)}>Rotate key</button>
+                    {#if hostTrust.referenced_repositories.length === 0}<button type="button" class="danger" disabled={isPending(`delete-host-${hostTrust.host_trust_id}`) || isPending(`rotate-host-${hostTrust.host_trust_id}`)} onclick={() => void deleteHostTrust(hostTrust)}>Delete</button>{/if}
                   </div>
                   {#if hostRowNotices[hostTrust.host_trust_id]}
                     <small class:field-error={hostRowNotices[hostTrust.host_trust_id].tone === 'error'} role={hostRowNotices[hostTrust.host_trust_id].tone === 'error' ? 'alert' : 'status'}>{hostRowNotices[hostTrust.host_trust_id].text}</small>

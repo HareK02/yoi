@@ -52,10 +52,13 @@ const hostTrust = {
   referenced_repositories: [],
 };
 
-function pageData() {
+function pageData(workspaceId = "workspace-1") {
   return {
-    workspaceId: "workspace-1",
-    credentials: [defaultCredential, deployCredential],
+    workspaceId,
+    credentials: [
+      { ...defaultCredential, workspace_id: workspaceId },
+      { ...deployCredential, workspace_id: workspaceId },
+    ],
     credentialsError: null,
     publicKeys: [{
       credential_id: "workspace-default",
@@ -65,10 +68,10 @@ function pageData() {
       public_key: "ssh-ed25519 AAAA-default",
     }],
     defaultPublicKeyError: null,
-    hostTrusts: [hostTrust],
+    hostTrusts: [{ ...hostTrust, workspace_id: workspaceId }],
     hostTrustsError: null,
     accessProjection: {
-      workspace_id: "workspace-1",
+      workspace_id: workspaceId,
       config_revision: 1,
       projection_digest: "sha256:projection",
       bindings: [],
@@ -91,12 +94,15 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-function renderPage() {
-  const props = {
-    data: pageData(),
-    params: { workspaceId: "workspace-1" },
+function pageProps(data = pageData()): PageProps {
+  return {
+    data,
+    params: { workspaceId: data.workspaceId },
   } as unknown as PageProps;
-  return render(RepositoryAccessPage, props);
+}
+
+function renderPage(data = pageData()) {
+  return render(RepositoryAccessPage, pageProps(data));
 }
 
 afterEach(() => {
@@ -130,7 +136,7 @@ test("opens disclosures with focus, focuses invalid fields, and restores trigger
   expect(document.activeElement).toBe(trigger);
 });
 
-test("fences a deferred submission without disabling unrelated controls and restores focus after success", async () => {
+test("fences a deferred editor while an unrelated host draft remains active after success", async () => {
   const createResponse = deferred<Response>();
   const fetchMock = vi.fn((input: RequestInfo | URL) => {
     const url = String(input);
@@ -173,14 +179,23 @@ test("fences a deferred submission without disabling unrelated controls and rest
     (screen.getByRole("button", {
       name: "Import credential",
     }) as HTMLButtonElement).disabled,
-  ).toBe(false);
+  ).toBe(true);
+  const deployRow = screen.getByText("Deploy key").closest("tr");
+  if (!deployRow) throw new Error("missing deploy credential row");
   expect(
-    (screen.getByRole("button", {
-      name: "Add pinned key",
+    (within(deployRow).getByRole("button", {
+      name: "Rotate",
     }) as HTMLButtonElement).disabled,
-  ).toBe(false);
+  ).toBe(true);
+  const addHost = screen.getByRole("button", { name: "Add pinned key" });
+  expect((addHost as HTMLButtonElement).disabled).toBe(false);
   await fireEvent.click(screen.getByRole("button", { name: "Generating…" }));
   expect(fetchMock).toHaveBeenCalledTimes(1);
+
+  await fireEvent.click(addHost);
+  const hostDraft = screen.getByRole("textbox", { name: "Host trust id" });
+  await fireEvent.input(hostDraft, { target: { value: "draft-host" } });
+  hostDraft.focus();
 
   createResponse.resolve(Response.json({
     ...deployCredential,
@@ -190,7 +205,10 @@ test("fences a deferred submission without disabling unrelated controls and rest
     current_revision: 1,
   }));
   expect(await screen.findByText("Generated key")).not.toBeNull();
-  await waitFor(() => expect(document.activeElement).toBe(trigger));
+  expect(screen.getByRole("heading", { name: "Add pinned host key" })).not
+    .toBeNull();
+  expect((hostDraft as HTMLInputElement).value).toBe("draft-host");
+  expect(document.activeElement).toBe(hostDraft);
   expect(fetchMock).toHaveBeenCalledTimes(2);
 });
 
@@ -231,14 +249,96 @@ test("keeps a deferred row failure on that row while unrelated actions remain en
   expect(screen.getAllByRole("alert")).toHaveLength(1);
 });
 
-test("locks a rotation to its host and port and discloses explicit and automatic impact", async () => {
-  const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) =>
-    Promise.resolve(Response.json({
+test("rerendering for another Workspace resets local state and fences stale responses", async () => {
+  const stalePublicKey = deferred<Response>();
+  const fetchMock = vi.fn((input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes("/api/w/workspace-1/")) return stalePublicKey.promise;
+    if (url.includes("/api/w/workspace-2/")) {
+      return Promise.resolve(new Response(null, { status: 500 }));
+    }
+    throw new Error(`unexpected request: ${url}`);
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const { rerender } = renderPage();
+
+  await fireEvent.click(
+    screen.getByRole("button", { name: "Generate credential" }),
+  );
+  await fireEvent.input(
+    screen.getByRole("textbox", { name: "Credential id" }),
+    {
+      target: { value: "workspace-a-draft" },
+    },
+  );
+  const workspaceARow = screen.getByText("Deploy key").closest("tr");
+  if (!workspaceARow) throw new Error("missing Workspace A credential row");
+  await fireEvent.click(
+    within(workspaceARow).getByRole("button", { name: "Copy public key" }),
+  );
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+  const workspaceBData = {
+    ...pageData("workspace-2"),
+    credentials: [
+      {
+        ...defaultCredential,
+        workspace_id: "workspace-2",
+        name: "Workspace B default",
+      },
+      {
+        ...deployCredential,
+        workspace_id: "workspace-2",
+        credential_id: "workspace-b-deploy",
+        name: "Workspace B deploy",
+      },
+    ],
+    publicKeys: [],
+    hostTrusts: [{
       ...hostTrust,
-      host_key: "ssh-ed25519 AAAA-new",
-      fingerprint: "SHA256:host-new",
-      current_revision: 5,
-    }))
+      workspace_id: "workspace-2",
+      host_trust_id: "workspace-b-host",
+      hostname: "git.example.test",
+    }],
+    accessProjection: {
+      workspace_id: "workspace-2",
+      config_revision: 7,
+      projection_digest: "sha256:workspace-b",
+      bindings: [],
+    },
+  };
+  await rerender(pageProps(workspaceBData));
+
+  expect(await screen.findByText("Workspace B deploy")).not.toBeNull();
+  expect(screen.queryByText("Deploy key")).toBeNull();
+  expect(screen.queryByDisplayValue("workspace-a-draft")).toBeNull();
+  expect(screen.getByText("git.example.test:22")).not.toBeNull();
+
+  stalePublicKey.resolve(Response.json({
+    credential_id: "deploy",
+    current_revision: 2,
+    public_key_algorithm: "ssh-ed25519",
+    public_key_fingerprint: "SHA256:deploy",
+    public_key: "ssh-ed25519 AAAA-stale",
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(screen.queryByText("Public key copied.")).toBeNull();
+
+  const workspaceBRow = screen.getByText("Workspace B deploy").closest("tr");
+  if (!workspaceBRow) throw new Error("missing Workspace B credential row");
+  await fireEvent.click(
+    within(workspaceBRow).getByRole("button", { name: "Copy public key" }),
+  );
+  expect(await within(workspaceBRow).findByRole("alert")).not.toBeNull();
+  expect(String(fetchMock.mock.calls[1]?.[0])).toContain(
+    "/api/w/workspace-2/settings/repository-access/credentials/workspace-b-deploy/public-key",
+  );
+});
+
+test("locks a rotation to its host and port and discloses explicit and automatic impact", async () => {
+  const rotateResponse = deferred<Response>();
+  const fetchMock = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
+    rotateResponse.promise
   );
   vi.stubGlobal("fetch", fetchMock);
   renderPage();
@@ -272,6 +372,27 @@ test("locks a rotation to its host and port and discloses explicit and automatic
   expect(body.hostname).toBe("github.com");
   expect(body.port).toBe(22);
   expect(body.expected_revision).toBe(4);
+  expect(
+    (screen.getByRole("button", { name: "Saving…" }) as HTMLButtonElement)
+      .disabled,
+  ).toBe(true);
+  expect(
+    (screen.getByRole("button", {
+      name: "Add pinned key",
+    }) as HTMLButtonElement).disabled,
+  ).toBe(true);
+  expect(
+    (screen.getByRole("button", {
+      name: "Generate credential",
+    }) as HTMLButtonElement).disabled,
+  ).toBe(false);
+
+  rotateResponse.resolve(Response.json({
+    ...hostTrust,
+    host_key: "ssh-ed25519 AAAA-new",
+    fingerprint: "SHA256:host-new",
+    current_revision: 5,
+  }));
   expect(await within(row).findByText(/Rotated the key for github.com:22/)).not
     .toBeNull();
   await waitFor(() =>
