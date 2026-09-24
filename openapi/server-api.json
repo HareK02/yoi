@@ -408,19 +408,16 @@
                 "const": "set",
                 "type": "string"
               },
-              "ref_selector": {
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
-              "repository_key": {
-                "type": "string"
+              "targets": {
+                "items": {
+                  "$ref": "#/components/schemas/TicketTarget"
+                },
+                "type": "array"
               }
             },
             "required": [
               "action",
-              "repository_key"
+              "targets"
             ],
             "type": "object"
           },
@@ -4254,18 +4251,6 @@
               "null"
             ]
           },
-          "ref_selector": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "repository_key": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "risk_flags": {
             "items": {
               "type": "string"
@@ -4277,6 +4262,13 @@
               "string",
               "null"
             ]
+          },
+          "targets": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/TicketTarget"
+            },
+            "type": "array"
           },
           "title": {
             "type": "string"
@@ -8974,20 +8966,8 @@
           "record_source": {
             "type": "string"
           },
-          "ref_selector": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "relations": {
             "$ref": "#/components/schemas/TicketDetailRelationView"
-          },
-          "repository_key": {
-            "type": [
-              "string",
-              "null"
-            ]
           },
           "resolution": {
             "type": [
@@ -9007,6 +8987,12 @@
           "state": {
             "type": "string"
           },
+          "targets": {
+            "items": {
+              "$ref": "#/components/schemas/TicketTarget"
+            },
+            "type": "array"
+          },
           "title": {
             "type": "string"
           },
@@ -9024,6 +9010,7 @@
           "state",
           "priority",
           "item_revision",
+          "targets",
           "risk_flags",
           "body",
           "body_truncated",
@@ -9659,10 +9646,10 @@
             ],
             "default": null
           },
-          "target": {
+          "targets": {
             "anyOf": [
               {
-                "$ref": "#/components/schemas/TicketTargetEdit"
+                "$ref": "#/components/schemas/TicketTargetsEdit"
               },
               {
                 "type": "null"
@@ -9951,18 +9938,6 @@
               "null"
             ]
           },
-          "ref_selector": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "repository_key": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "resource_key": {
             "type": [
               "string",
@@ -9980,6 +9955,13 @@
           },
           "status": {
             "$ref": "#/components/schemas/ExtensibleTicketStatus"
+          },
+          "targets": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/TicketTarget"
+            },
+            "type": "array"
           },
           "title": {
             "type": "string"
@@ -10825,7 +10807,36 @@
         },
         "type": "object"
       },
-      "TicketTargetEdit": {
+      "TicketTarget": {
+        "additionalProperties": false,
+        "properties": {
+          "access": {
+            "$ref": "#/components/schemas/TicketTargetAccess"
+          },
+          "ref_selector": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repository_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository_key",
+          "access"
+        ],
+        "type": "object"
+      },
+      "TicketTargetAccess": {
+        "enum": [
+          "read_only",
+          "read_write"
+        ],
+        "type": "string"
+      },
+      "TicketTargetsEdit": {
         "oneOf": [
           {
             "properties": {
@@ -10833,19 +10844,16 @@
                 "const": "set",
                 "type": "string"
               },
-              "ref_selector": {
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
-              "repository_key": {
-                "type": "string"
+              "targets": {
+                "items": {
+                  "$ref": "#/components/schemas/TicketTarget"
+                },
+                "type": "array"
               }
             },
             "required": [
               "action",
-              "repository_key"
+              "targets"
             ],
             "type": "object"
           },
@@ -13893,7 +13901,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:7a9d11f50cc41eca55a6dded4b8f55aa6d23b1beb2dc69b0a9b6c8349efc894f"
+    "x-yoi-source-digest": "sha256:80be292e32441730f7de890e64836f4ca9655576d655e60e6d44daf5227a1b1c"
   },
   "openapi": "3.1.0",
   "paths": {

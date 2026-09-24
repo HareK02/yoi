@@ -88,8 +88,18 @@ Deno.test("ticket worker launch uses the common Worker route and bounded Ticket 
   const ticket = {
     id: "00001KYRRDVH9",
     title: "Ticket panel API",
-    repository_key: "main repo",
-    ref_selector: "work/ticket",
+    targets: [
+      {
+        repository_key: "docs",
+        ref_selector: "main",
+        access: "read_only",
+      },
+      {
+        repository_key: "main repo",
+        ref_selector: "work/ticket",
+        access: "read_write",
+      },
+    ],
   } as TicketDetail;
 
   assertEquals(
@@ -108,6 +118,38 @@ Deno.test("ticket worker launch uses the common Worker route and bounded Ticket 
     url.searchParams.get("initialInput"),
     "Work on Ticket 00001KYRRDVH9 as its reviewer.",
   );
+});
+
+Deno.test("ticket worker launch never selects a read_only or ambiguous write target", () => {
+  const readOnly = {
+    id: "ticket-read-only",
+    title: "Read only",
+    targets: [{
+      repository_key: "docs",
+      ref_selector: "main",
+      access: "read_only",
+    }],
+  } as TicketDetail;
+  const readOnlyUrl = new URL(
+    ticketWorkerLaunchHref("workspace", readOnly, "coder"),
+    "https://example.test",
+  );
+  assertEquals(readOnlyUrl.searchParams.has("repositoryKey"), false);
+  assertEquals(readOnlyUrl.searchParams.has("refSelector"), false);
+
+  const ambiguous = {
+    ...readOnly,
+    targets: [
+      { repository_key: "main", ref_selector: "develop", access: "read_write" },
+      { repository_key: "docs", ref_selector: "main", access: "read_write" },
+    ],
+  } as TicketDetail;
+  const ambiguousUrl = new URL(
+    ticketWorkerLaunchHref("workspace", ambiguous, "coder"),
+    "https://example.test",
+  );
+  assertEquals(ambiguousUrl.searchParams.has("repositoryKey"), false);
+  assertEquals(ambiguousUrl.searchParams.has("refSelector"), false);
 });
 
 Deno.test("ticket detail uses server-derived role assignment actions", async () => {
@@ -138,6 +180,26 @@ Deno.test("ticket detail uses server-derived role assignment actions", async () 
   assertEquals(source.includes('kind: "workspace_agent"'), true);
   assertEquals(source.includes('kind: "worker"'), true);
   assertEquals(source.includes("ticket.assignee"), false);
+  assertEquals(source.includes('action: "set", targets'), true);
+  assertEquals(source.includes("updatedTicket.targets"), true);
+  assertEquals(source.includes("ticket.repository_key"), false);
+  assertEquals(source.includes("ticket.ref_selector"), false);
+});
+
+Deno.test("Ticket authoring creates the target collection without singular authority", async () => {
+  const source = await Deno.readTextFile(
+    new URL(
+      "../../../routes/w/[workspaceId]/tickets/+page.svelte",
+      import.meta.url,
+    ),
+  );
+
+  assertEquals(source.includes("const request: NewTicket"), true);
+  assertEquals(source.includes("targets: normalizedCreateTargets()"), true);
+  assertEquals(source.includes('value="read_write"'), true);
+  assertEquals(source.includes('value="read_only"'), true);
+  assertEquals(source.includes("repository_key: create"), false);
+  assertEquals(source.includes("ref_selector: create"), false);
 });
 
 Deno.test("ticket detail keeps the operation rail outside main content", async () => {

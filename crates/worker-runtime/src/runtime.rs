@@ -2215,8 +2215,13 @@ impl Runtime {
                 let _ = worker.apply_worker_state(snapshot);
             }
             worker.restore_intent = restore_intent_for_status(worker.status);
+            let claims = worker
+                .request
+                .as_ref()
+                .map(|request| request.workdir_attachments.as_slice())
+                .unwrap_or_default();
             worker.logical_workdir_attachments =
-                logical_workdir_attachments_from_statuses(&workdir_attachments);
+                logical_workdir_attachments_from_statuses(&workdir_attachments, claims);
             worker.workdir_attachments = workdir_attachments;
             worker.detail()
         };
@@ -2867,8 +2872,13 @@ impl Runtime {
         candidate.execution_bound = true;
         candidate.status = WorkerStatus::Idle;
         candidate.restore_intent = WorkerRestoreIntent::Explicit;
+        let claims = candidate
+            .request
+            .as_ref()
+            .map(|request| request.workdir_attachments.as_slice())
+            .unwrap_or_default();
         candidate.logical_workdir_attachments =
-            logical_workdir_attachments_from_statuses(&workdir_attachments);
+            logical_workdir_attachments_from_statuses(&workdir_attachments, claims);
         candidate.workdir_attachments = workdir_attachments;
         state.workers.insert(worker_ref.worker_id, candidate);
         state.publish_worker_upsert(worker_ref.worker_id)?;
@@ -3213,7 +3223,11 @@ impl RuntimeState {
                     }
                 };
             let logical_workdir_attachments = if worker.logical_workdir_attachments.is_empty() {
-                logical_workdir_attachments_from_statuses(&worker.workdir_attachments)
+                let claims = request
+                    .as_ref()
+                    .map(|request| request.workdir_attachments.as_slice())
+                    .unwrap_or_default();
+                logical_workdir_attachments_from_statuses(&worker.workdir_attachments, claims)
             } else {
                 worker.logical_workdir_attachments
             };
@@ -4283,17 +4297,29 @@ fn requested_workdir_ids(request: &CreateWorkerRequest) -> Vec<&str> {
 
 fn logical_workdir_attachments_from_statuses(
     attachments: &[crate::catalog::WorkingDirectoryAttachmentStatus],
+    claims: &[crate::catalog::WorkingDirectoryAttachmentClaim],
 ) -> Vec<LogicalWorkdirAttachment> {
     attachments
         .iter()
-        .map(|attachment| LogicalWorkdirAttachment {
-            alias: attachment.alias.clone(),
-            working_directory_id: attachment
-                .working_directory
-                .summary
-                .working_directory_id
-                .clone(),
-            capabilities: workdir::WorkdirSessionCapabilities::ALL,
+        .map(|attachment| {
+            let working_directory_id = &attachment.working_directory.summary.working_directory_id;
+            let capabilities = match claims.iter().find(|claim| claim.alias == attachment.alias) {
+                Some(claim) if claim.working_directory_id == *working_directory_id => {
+                    claim.capabilities
+                }
+                // An alias/id mismatch is invalid at the operation boundary. If
+                // corrupted persisted state reaches this compatibility path,
+                // fail closed rather than silently restoring write authority.
+                Some(_) => workdir::WorkdirSessionCapabilities::READ_ONLY,
+                // Runtime-materialized attachment requests predate capability
+                // claims and retain their existing full local-session behavior.
+                None => workdir::WorkdirSessionCapabilities::ALL,
+            };
+            LogicalWorkdirAttachment {
+                alias: attachment.alias.clone(),
+                working_directory_id: working_directory_id.clone(),
+                capabilities,
+            }
         })
         .collect()
 }
@@ -6584,6 +6610,7 @@ mod tests {
             alias: workdir::WorkdirAttachmentAlias::new("workdir").unwrap(),
             working_directory_id: "workdir-idempotent".to_string(),
             relative_cwd: None,
+            capabilities: workdir::WorkdirSessionCapabilities::ALL,
         }];
 
         let first = runtime.create_worker(request.clone()).unwrap();
@@ -6974,7 +7001,13 @@ mod tests {
                     .unwrap(),
                 }],
             });
-        let request = task_request("uncertain create cleanup");
+        let mut request = task_request("uncertain create cleanup");
+        request.workdir_attachments = vec![WorkingDirectoryAttachmentClaim {
+            alias: workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
+            working_directory_id: "wd-uncertain".to_string(),
+            relative_cwd: None,
+            capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+        }];
         let worker_ref = WorkerRef::new(request.worker_id);
 
         let error = runtime.create_worker(request).unwrap_err();
@@ -6986,6 +7019,16 @@ mod tests {
         let retained = runtime.worker_detail(&worker_ref).unwrap();
         assert_eq!(retained.status, WorkerStatus::Idle);
         assert!(!retained.execution_metadata_available);
+        assert_eq!(
+            runtime
+                .lock()
+                .unwrap()
+                .worker(&worker_ref)
+                .unwrap()
+                .logical_workdir_attachments[0]
+                .capabilities,
+            workdir::WorkdirSessionCapabilities::READ_ONLY
+        );
         assert!(matches!(
             runtime.delete_worker(&worker_ref),
             Err(RuntimeError::InvalidRequest(_))

@@ -4,6 +4,6 @@ Use the existing Merge Request as the routine authority for review requests, ver
 
 Do not add a Ticket comment for each review or fix iteration. Add a Ticket comment only when a blocker or decision requires Orchestrator attention, or once after approval to hand off the final implementation and validation evidence.
 
-Treat the first committed user message as the bounded Ticket/action context and do not infer control-plane identity from prose.
+Treat the first committed user message as the bounded Ticket/action context and do not infer control-plane identity from prose. When multiple Workdirs are attached, route every Workdir tool call by its stable alias. Only the Ticket's sole `read_write` target is an implementation/publish/Merge Request repository; `read_only` targets are reference material and must never be modified or used as a command target. Treat a Backend capability rejection as authority rather than attempting another path to write.
 
 Before opening a Merge Request, publish only the committed Ticket work branch with a normal non-force push and verify that the Ticket repository remote resolves it to the exact local `HEAD`; a local branch name or dirty Workdir is not immutable review evidence. Do not push the target branch, tags, or unrelated refs, and never force-push.

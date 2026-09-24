@@ -1,5 +1,6 @@
 //! Semantic Ticket orchestration tools backed by Feature Services.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
@@ -10,6 +11,7 @@ use serde::Deserialize;
 
 use super::manage_worker::{
     WORKER_LIFECYCLE_SERVICE_ID, WorkerLifecycleService, WorkerLifecycleSpawnRequest,
+    WorkerLifecycleWorkdirAttachment,
 };
 use super::ticket::{TICKET_SERVICE_ID, TicketService};
 use crate::feature::{
@@ -43,7 +45,7 @@ impl FeatureModule for OrchestrationFeature {
             ))
             .with_tool(ToolDeclaration::new(
                 TOOL_NAME,
-                "Spawn and atomically assign a Coder Worker for a queued or already-inprogress Ticket. The guarded operation records queued acceptance only after spawn, initial input, assignment, and Workdir finalization. The profile, Flow, display name, assignment operation, and initial message are fixed by orchestration policy.",
+                "Spawn and atomically assign a Coder Worker for a queued or already-inprogress Ticket. Select every required Workdir by stable alias; Backend authority derives each attachment's access from the Ticket targets. The guarded operation records queued acceptance only after spawn, initial input, assignment, and Workdir finalization. The profile, Flow, display name, assignment operation, and initial message are fixed by orchestration policy.",
             ))
     }
 
@@ -66,12 +68,24 @@ impl FeatureModule for OrchestrationFeature {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct SpawnTicketCoderWorkdirInput {
+    /// Stable Worker-local routing alias (for example `checkout` or `docs`).
+    alias: String,
+    /// Workspace-authoritative Workdir id. Paths and URLs are not accepted.
+    working_directory_id: String,
+    /// Optional normalized path inside this Workdir for the Worker's initial cwd.
+    #[serde(default)]
+    relative_cwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SpawnTicketCoderInput {
     ticket_id: String,
     runtime_id: String,
-    working_directory_id: String,
-    #[serde(default)]
-    relative_cwd: Option<String>,
+    /// Every Workdir required by the Ticket target set. Backend authority derives
+    /// effective read/write capabilities; callers cannot request capabilities.
+    workdir_attachments: Vec<SpawnTicketCoderWorkdirInput>,
 }
 
 struct SpawnTicketCoderTool {
@@ -105,16 +119,13 @@ impl Tool for SpawnTicketCoderTool {
             )));
         }
         let call_id = non_empty(ctx.call_id, "tool call_id")?;
-        let relative_cwd = input.relative_cwd.map(validate_relative_cwd).transpose()?;
+        let runtime_id = authority_id(input.runtime_id, "runtime_id")?;
+        let workdir_attachments = validate_workdir_attachments(input.workdir_attachments)?;
         let response = self
             .worker_service
             .spawn(WorkerLifecycleSpawnRequest {
-                runtime_id: authority_id(input.runtime_id, "runtime_id")?,
-                working_directory_id: authority_id(
-                    input.working_directory_id,
-                    "working_directory_id",
-                )?,
-                relative_cwd,
+                runtime_id,
+                workdir_attachments,
                 profile: CODER_PROFILE.to_string(),
                 ticket_id: Some(ticket.id.clone()),
                 operation_id: Some(format!("spawn-ticket-coder:{}:{call_id}", ticket.id)),
@@ -142,6 +153,47 @@ impl Tool for SpawnTicketCoderTool {
     }
 }
 
+fn validate_workdir_attachments(
+    attachments: Vec<SpawnTicketCoderWorkdirInput>,
+) -> Result<Vec<WorkerLifecycleWorkdirAttachment>, ToolError> {
+    if attachments.is_empty() {
+        return Err(ToolError::InvalidArgument(
+            "workdir_attachments must contain at least one Workdir".to_string(),
+        ));
+    }
+
+    let mut aliases = BTreeSet::new();
+    let mut workdir_ids = BTreeSet::new();
+    attachments
+        .into_iter()
+        .map(|attachment| {
+            let alias = authority_id(attachment.alias, "workdir_attachments.alias")?;
+            if !aliases.insert(alias.clone()) {
+                return Err(ToolError::InvalidArgument(format!(
+                    "duplicate Workdir attachment alias `{alias}`"
+                )));
+            }
+            let working_directory_id = authority_id(
+                attachment.working_directory_id,
+                "workdir_attachments.working_directory_id",
+            )?;
+            if !workdir_ids.insert(working_directory_id.clone()) {
+                return Err(ToolError::InvalidArgument(format!(
+                    "duplicate Workdir attachment `{working_directory_id}`"
+                )));
+            }
+            Ok(WorkerLifecycleWorkdirAttachment {
+                alias,
+                working_directory_id,
+                relative_cwd: attachment
+                    .relative_cwd
+                    .map(validate_relative_cwd)
+                    .transpose()?,
+            })
+        })
+        .collect()
+}
+
 fn definition(
     ticket_service: Arc<dyn TicketService>,
     worker_service: Arc<dyn WorkerLifecycleService>,
@@ -150,7 +202,9 @@ fn definition(
         let schema = serde_json::to_value(schemars::schema_for!(SpawnTicketCoderInput))
             .unwrap_or_else(|_| serde_json::json!({}));
         let meta = ToolMeta::new(TOOL_NAME)
-            .description("Spawn and atomically assign a policy-configured Coder for a Ticket.")
+            .description(
+                "Spawn and atomically assign a policy-configured Coder for a Ticket with every required alias-keyed Workdir attachment.",
+            )
             .input_schema(schema);
         let tool: Arc<dyn Tool> = Arc::new(SpawnTicketCoderTool {
             ticket_service: ticket_service.clone(),
@@ -260,8 +314,17 @@ mod tests {
             &serde_json::json!({
                 "ticket_id": "T-482",
                 "runtime_id": "runtime-1",
-                "working_directory_id": "workdir-1",
-                "relative_cwd": "crates/yoi"
+                "workdir_attachments": [
+                    {
+                        "alias": "checkout",
+                        "working_directory_id": "workdir-1",
+                        "relative_cwd": "crates/yoi"
+                    },
+                    {
+                        "alias": "docs",
+                        "working_directory_id": "workdir-2"
+                    }
+                ]
             })
             .to_string(),
             ToolExecutionContext::new("call-7", "batch-1", 0),
@@ -278,8 +341,22 @@ mod tests {
             Some("spawn-ticket-coder:00001KZXN51C7:call-7")
         );
         assert_eq!(request.display_name, "Coder · T-482");
-        assert_eq!(request.working_directory_id, "workdir-1");
-        assert_eq!(request.relative_cwd.as_deref(), Some("crates/yoi"));
+        assert_eq!(request.workdir_attachments.len(), 2);
+        assert_eq!(request.workdir_attachments[0].alias, "checkout");
+        assert_eq!(
+            request.workdir_attachments[0].working_directory_id,
+            "workdir-1"
+        );
+        assert_eq!(
+            request.workdir_attachments[0].relative_cwd.as_deref(),
+            Some("crates/yoi")
+        );
+        assert_eq!(request.workdir_attachments[1].alias, "docs");
+        assert_eq!(
+            request.workdir_attachments[1].working_directory_id,
+            "workdir-2"
+        );
+        assert_eq!(request.workdir_attachments[1].relative_cwd, None);
         assert_eq!(
             request.initial_submit,
             vec![
@@ -307,7 +384,10 @@ mod tests {
                 &serde_json::json!({
                     "ticket_id": "00001KZXN51C7",
                     "runtime_id": "runtime-1",
-                    "working_directory_id": "workdir-1"
+                    "workdir_attachments": [{
+                        "alias": "checkout",
+                        "working_directory_id": "workdir-1"
+                    }]
                 })
                 .to_string(),
                 ToolExecutionContext::new("call-queued", "batch-1", 0),
@@ -315,6 +395,106 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("must be queued or inprogress"));
+        assert!(worker_service.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_ticket_coder_rejects_invalid_workdir_collections_before_worker_side_effect() {
+        let worker_service = Arc::new(RecordingService::default());
+        let tool = SpawnTicketCoderTool {
+            ticket_service: Arc::new(FixedTicketService(TicketWorkflowState::Queued)),
+            worker_service: worker_service.clone(),
+        };
+        let cases = [
+            (
+                serde_json::json!({
+                    "ticket_id": "T-482",
+                    "runtime_id": "runtime-1",
+                    "workdir_attachments": []
+                }),
+                "must contain at least one Workdir",
+            ),
+            (
+                serde_json::json!({
+                    "ticket_id": "T-482",
+                    "runtime_id": "runtime-1",
+                    "workdir_attachments": [
+                        {"alias": "checkout", "working_directory_id": "workdir-1"},
+                        {"alias": " checkout ", "working_directory_id": "workdir-2"}
+                    ]
+                }),
+                "duplicate Workdir attachment alias `checkout`",
+            ),
+            (
+                serde_json::json!({
+                    "ticket_id": "T-482",
+                    "runtime_id": "runtime-1",
+                    "workdir_attachments": [
+                        {"alias": "checkout", "working_directory_id": "workdir-1"},
+                        {"alias": "docs", "working_directory_id": " workdir-1 "}
+                    ]
+                }),
+                "duplicate Workdir attachment `workdir-1`",
+            ),
+            (
+                serde_json::json!({
+                    "ticket_id": "T-482",
+                    "runtime_id": "runtime-1",
+                    "workdir_attachments": [
+                        {"alias": "docs/path", "working_directory_id": "workdir-1"}
+                    ]
+                }),
+                "workdir_attachments.alias must be an authority id",
+            ),
+            (
+                serde_json::json!({
+                    "ticket_id": "T-482",
+                    "runtime_id": "runtime-1",
+                    "workdir_attachments": [
+                        {"alias": "docs", "working_directory_id": "https://example.test/workdir"}
+                    ]
+                }),
+                "workdir_attachments.working_directory_id must be an authority id",
+            ),
+            (
+                serde_json::json!({
+                    "ticket_id": "T-482",
+                    "runtime_id": "runtime/1",
+                    "workdir_attachments": [
+                        {"alias": "checkout", "working_directory_id": "workdir-1"}
+                    ]
+                }),
+                "runtime_id must be an authority id",
+            ),
+            (
+                serde_json::json!({
+                    "ticket_id": "T-482",
+                    "runtime_id": "runtime-1",
+                    "workdir_attachments": [
+                        {
+                            "alias": "checkout",
+                            "working_directory_id": "workdir-1",
+                            "relative_cwd": "../outside"
+                        }
+                    ]
+                }),
+                "relative_cwd must be a normalized relative path inside the Workdir",
+            ),
+        ];
+
+        for (index, (input, expected)) in cases.into_iter().enumerate() {
+            let error = tool
+                .execute(
+                    &input.to_string(),
+                    ToolExecutionContext::new(format!("call-{index}"), "batch-validation", index),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected error for case {index}: {error}"
+            );
+        }
         assert!(worker_service.requests.lock().unwrap().is_empty());
     }
 
@@ -341,6 +521,8 @@ mod tests {
         for field in [
             "ticket_id",
             "runtime_id",
+            "workdir_attachments",
+            "alias",
             "working_directory_id",
             "relative_cwd",
         ] {

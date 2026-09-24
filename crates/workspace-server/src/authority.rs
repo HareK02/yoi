@@ -840,7 +840,24 @@ impl SqliteWorkspaceAuthority {
         let has_coder = role_assignments
             .iter()
             .any(|assignment| assignment.role == TicketAssignmentRole::Coder);
-        let has_target = ticket.meta.repository_id.is_some() && ticket.meta.ref_selector.is_some();
+        let targets = ticket
+            .meta
+            .targets
+            .iter()
+            .map(|target| {
+                let repository = self
+                    .store
+                    .get_repository_by_key(&self.workspace_id, &target.repository_key)?
+                    .ok_or_else(|| Error::UnknownRepository(target.repository_key.clone()))?;
+                Ok::<_, Error>(ticket::TicketTarget {
+                    repository_key: repository.repository_key,
+                    ref_selector: target.ref_selector.clone(),
+                    access: target.access,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let write_repository_key = ticket_write_target_repository_key(&targets);
+        let has_target = write_repository_key.is_some();
         let has_blockers = !ticket.relations.blockers.is_empty();
         let mut queue_assignment_blockers = Vec::new();
         for ticket_id in &dependency_check.queue_tickets {
@@ -932,22 +949,8 @@ impl SqliteWorkspaceAuthority {
             Err(MergeRequestError::NotFound) => None,
             Err(error) => return Err(Error::Store(error.to_string())),
         };
-        let repository_key = ticket
-            .meta
-            .repository_id
-            .as_deref()
-            .map(|repository_id| {
-                self.store
-                    .get_repository(&self.workspace_id, repository_id)?
-                    .map(|repository| repository.repository_key)
-                    .ok_or_else(|| Error::UnknownRepository(repository_id.to_string()))
-            })
-            .transpose()?;
-        let evidence = ticket_evidence_summary(
-            repository_key.as_deref(),
-            &ticket.events,
-            merge_request.as_ref(),
-        );
+        let evidence =
+            ticket_evidence_summary(write_repository_key, &ticket.events, merge_request.as_ref());
         let item_revision = ticket
             .events
             .iter()
@@ -1000,8 +1003,7 @@ impl SqliteWorkspaceAuthority {
             item_revision,
             queued_by: ticket.meta.queued_by,
             queued_at: ticket.meta.queued_at,
-            repository_key,
-            ref_selector: ticket.meta.ref_selector,
+            targets,
             risk_flags: ticket.meta.risk_flags,
             body,
             body_truncated,
@@ -1837,7 +1839,7 @@ fn substantive_item_edit(event: &TicketEvent) -> bool {
     changes
         .split(',')
         .map(str::trim)
-        .any(|field| matches!(field, "title" | "body" | "target"))
+        .any(|field| matches!(field, "title" | "body" | "target" | "targets"))
 }
 
 fn event_timestamp(event: &TicketEvent) -> Option<DateTime<Utc>> {
@@ -1848,15 +1850,26 @@ fn event_timestamp(event: &TicketEvent) -> Option<DateTime<Utc>> {
         .map(|value| value.with_timezone(&Utc))
 }
 
+fn ticket_write_target_repository_key(targets: &[ticket::TicketTarget]) -> Option<&str> {
+    let mut write_targets = targets
+        .iter()
+        .filter(|target| target.access == ticket::TicketTargetAccess::ReadWrite);
+    let write_target = write_targets.next()?;
+    write_targets
+        .next()
+        .is_none()
+        .then_some(write_target.repository_key.as_str())
+}
+
 fn ticket_evidence_summary(
-    ticket_repository_id: Option<&str>,
+    ticket_write_repository_key: Option<&str>,
     events: &[TicketEvent],
     merge_request: Option<&TicketMergeRequestSummary>,
 ) -> TicketEvidenceSummary {
     let linked_merge_request = merge_request.filter(|request| {
         request.state == "open"
-            && ticket_repository_id
-                .is_some_and(|repository_id| repository_id == request.repository_key)
+            && ticket_write_repository_key
+                .is_some_and(|repository_key| repository_key == request.repository_key)
     });
     let has_merge_request = linked_merge_request.is_some();
     let has_current_subject_ref = linked_merge_request.is_some_and(|request| {
@@ -1906,8 +1919,8 @@ fn ticket_evidence_summary(
         None => missing.push("merge_request".to_string()),
         Some(request) if request.state != "open" => missing.push("open_merge_request".to_string()),
         Some(request)
-            if ticket_repository_id
-                .is_none_or(|repository_id| repository_id != request.repository_key) =>
+            if ticket_write_repository_key
+                .is_none_or(|repository_key| repository_key != request.repository_key) =>
         {
             missing.push("merge_request_repository".to_string())
         }
@@ -2866,6 +2879,54 @@ mod tests {
     }
 
     #[test]
+    fn ticket_target_projection_requires_exactly_one_write_target() {
+        let target = |repository_key: &str, access| ticket::TicketTarget {
+            repository_key: repository_key.to_string(),
+            ref_selector: Some("develop".to_string()),
+            access,
+        };
+
+        assert_eq!(ticket_write_target_repository_key(&[]), None);
+        assert_eq!(
+            ticket_write_target_repository_key(&[target(
+                "docs",
+                ticket::TicketTargetAccess::ReadOnly,
+            )]),
+            None,
+        );
+
+        let one_write = [
+            target("main", ticket::TicketTargetAccess::ReadWrite),
+            target("docs", ticket::TicketTargetAccess::ReadOnly),
+        ];
+        assert_eq!(ticket_write_target_repository_key(&one_write), Some("main"),);
+
+        let two_writes = [
+            target("main", ticket::TicketTargetAccess::ReadWrite),
+            target("docs", ticket::TicketTargetAccess::ReadWrite),
+        ];
+        assert_eq!(ticket_write_target_repository_key(&two_writes), None);
+    }
+
+    #[test]
+    fn ticket_evidence_is_tied_only_to_the_write_target() {
+        let read_only_request = merge_request_summary(
+            reviewed_merge_request(ReviewDecision::Approve, false),
+            "docs".to_string(),
+            Some("commit-1".to_string()),
+        );
+        let evidence = ticket_evidence_summary(Some("main"), &[], Some(&read_only_request));
+
+        assert!(!evidence.has_merge_request);
+        assert!(!evidence.complete_for_integration);
+        assert!(
+            evidence
+                .missing
+                .contains(&"merge_request_repository".to_string())
+        );
+    }
+
+    #[test]
     fn ticket_readiness_requires_current_unrevoked_approval_without_a_report() {
         let approved = merge_request_summary(
             reviewed_merge_request(ReviewDecision::Approve, false),
@@ -3013,7 +3074,7 @@ mod tests {
         let stale_events = vec![ticket_event(
             "item_edit",
             "2026-01-01T00:05:00Z",
-            Some("target"),
+            Some("targets"),
         )];
         let stale = ticket_evidence_summary(Some("main"), &stale_events, Some(&approved_summary));
         assert!(ticket_attention_matches(

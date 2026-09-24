@@ -357,7 +357,9 @@ pub struct LogicalWorkdirAttachment {
 }
 
 fn default_workdir_session_capabilities() -> workdir::WorkdirSessionCapabilities {
-    workdir::WorkdirSessionCapabilities::ALL
+    // Capability-less wire and persisted records must not silently regain write
+    // or command authority when read by a newer Runtime.
+    workdir::WorkdirSessionCapabilities::READ_ONLY
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -367,6 +369,9 @@ pub struct WorkingDirectoryAttachmentClaim {
     pub working_directory_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relative_cwd: Option<String>,
+    /// Backend-authoritative maximum capabilities for the attachment session.
+    #[serde(default = "default_workdir_session_capabilities")]
+    pub capabilities: workdir::WorkdirSessionCapabilities,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -954,6 +959,50 @@ mod tests {
 
     fn test_error(status: u16) -> RuntimeApiError {
         RuntimeApiError::new(status, "test_error", "test error")
+    }
+
+    #[test]
+    fn capability_less_attachment_claims_default_to_read_only() {
+        let claim: WorkingDirectoryAttachmentClaim = serde_json::from_value(serde_json::json!({
+            "alias": "docs",
+            "working_directory_id": "workdir-docs"
+        }))
+        .unwrap();
+        assert_eq!(
+            claim.capabilities,
+            workdir::WorkdirSessionCapabilities::READ_ONLY
+        );
+
+        let logical: LogicalWorkdirAttachment = serde_json::from_value(serde_json::json!({
+            "alias": "docs",
+            "working_directory_id": "workdir-docs"
+        }))
+        .unwrap();
+        assert_eq!(
+            logical.capabilities,
+            workdir::WorkdirSessionCapabilities::READ_ONLY
+        );
+    }
+
+    #[test]
+    fn attachment_claim_serializes_backend_authored_capabilities() {
+        let claim = WorkingDirectoryAttachmentClaim {
+            alias: workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
+            working_directory_id: "workdir-main".to_string(),
+            relative_cwd: None,
+            capabilities: workdir::WorkdirSessionCapabilities::ALL,
+        };
+        let value = serde_json::to_value(&claim).unwrap();
+        assert_eq!(
+            value.get("capabilities"),
+            Some(&serde_json::to_value(workdir::WorkdirSessionCapabilities::ALL).unwrap())
+        );
+        assert_eq!(
+            serde_json::from_value::<WorkingDirectoryAttachmentClaim>(value)
+                .unwrap()
+                .capabilities,
+            workdir::WorkdirSessionCapabilities::ALL
+        );
     }
 
     impl RuntimeApi for RoundTripService {

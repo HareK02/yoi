@@ -140,6 +140,12 @@ impl WorkdirSessionCapabilities {
         }
     }
 
+    pub const fn intersection(self, other: Self) -> Self {
+        Self {
+            bits: self.bits & other.bits,
+        }
+    }
+
     pub const fn supports(self, capability: WorkdirSessionCapability) -> bool {
         let bit = match capability {
             WorkdirSessionCapability::Read => Self::READ,

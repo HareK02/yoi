@@ -7,7 +7,9 @@ use crate::{Result, TicketError, sqlite_err};
 
 const MIGRATION_TABLE: &str = "ticket_schema_migrations";
 const MAX_SCHEMA_DIAGNOSTICS: usize = 32;
-const LATEST_SQLITE_TICKET_SCHEMA_VERSION: i64 = 6;
+const LATEST_SQLITE_TICKET_SCHEMA_VERSION: i64 = 7;
+const PREVIOUS_SQLITE_TICKET_SCHEMA_VERSION: i64 = 6;
+const BASELINE_MIGRATION_NAME: &str = "ticket schema baseline";
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -18,7 +20,7 @@ struct Migration {
 
 const MIGRATIONS: &[Migration] = &[Migration {
     version: LATEST_SQLITE_TICKET_SCHEMA_VERSION,
-    name: "ticket schema baseline",
+    name: BASELINE_MIGRATION_NAME,
     apply: create_latest_ticket_schema,
 }];
 
@@ -40,6 +42,7 @@ struct ExpectedForeignKey {
 
 const OWNED_TABLES: &[&str] = &[
     "typed_tickets",
+    "typed_ticket_targets",
     "typed_ticket_labels",
     "typed_ticket_risk_flags",
     "typed_ticket_raw_frontmatter",
@@ -91,8 +94,15 @@ const TICKET_COLUMNS: &[ExpectedColumn] = &[
     column("queued_by", "TEXT", false, 0),
     column("queued_at", "TEXT", false, 0),
     column("resolution", "TEXT", false, 0),
-    column("repository_id", "TEXT", false, 0),
+];
+
+const TARGET_COLUMNS: &[ExpectedColumn] = &[
+    column("workspace_id", "TEXT", true, 1),
+    column("ticket_id", "TEXT", true, 2),
+    column("ordinal", "INTEGER", true, 3),
+    column("repository_key", "TEXT", true, 0),
     column("ref_selector", "TEXT", false, 0),
+    column("access", "TEXT", true, 0),
 ];
 
 const LABEL_COLUMNS: &[ExpectedColumn] = &[
@@ -273,6 +283,30 @@ pub fn migrate_sqlite_ticket_schema(connection: &Connection) -> Result<()> {
                     ],
                 )
                 .map_err(sqlite_err)?;
+        } else if applied
+            == BTreeMap::from([(
+                PREVIOUS_SQLITE_TICKET_SCHEMA_VERSION,
+                BASELINE_MIGRATION_NAME.to_string(),
+            )])
+        {
+            migrate_v6_to_v7(connection)?;
+            connection
+                .execute(
+                    "DELETE FROM ticket_schema_migrations WHERE version = ?1",
+                    params![PREVIOUS_SQLITE_TICKET_SCHEMA_VERSION],
+                )
+                .map_err(sqlite_err)?;
+            connection
+                .execute(
+                    "INSERT INTO ticket_schema_migrations (version, name, applied_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        LATEST_SQLITE_TICKET_SCHEMA_VERSION,
+                        BASELINE_MIGRATION_NAME,
+                        chrono::Utc::now().to_rfc3339()
+                    ],
+                )
+                .map_err(sqlite_err)?;
         } else {
             validate_applied_migrations(&applied)?;
         }
@@ -321,6 +355,7 @@ pub fn verify_sqlite_ticket_schema(connection: &Connection) -> Result<()> {
 
     for (table, columns, foreign_keys) in [
         ("typed_tickets", TICKET_COLUMNS, TICKET_FOREIGN_KEYS),
+        ("typed_ticket_targets", TARGET_COLUMNS, CHILD_FOREIGN_KEYS),
         ("typed_ticket_labels", LABEL_COLUMNS, CHILD_FOREIGN_KEYS),
         (
             "typed_ticket_risk_flags",
@@ -362,6 +397,14 @@ pub fn verify_sqlite_ticket_schema(connection: &Connection) -> Result<()> {
         collect_table_diagnostics(connection, table, columns, foreign_keys, &mut diagnostics);
     }
 
+    collect_index_diagnostics(
+        connection,
+        "typed_ticket_targets",
+        None,
+        true,
+        &["workspace_id", "ticket_id", "repository_key"],
+        &mut diagnostics,
+    );
     collect_column_diagnostics(
         connection,
         "workspace_resource_keys",
@@ -428,6 +471,144 @@ pub fn verify_sqlite_ticket_schema(connection: &Connection) -> Result<()> {
 fn create_latest_ticket_schema(connection: &Connection) -> Result<()> {
     connection
         .execute_batch(include_str!("latest_schema.sql"))
+        .map_err(sqlite_err)
+}
+
+fn migrate_v6_to_v7(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(
+            "CREATE TABLE typed_ticket_targets (
+                workspace_id TEXT NOT NULL,
+                ticket_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                repository_key TEXT NOT NULL,
+                ref_selector TEXT,
+                access TEXT NOT NULL CHECK (access IN ('read_only', 'read_write')),
+                PRIMARY KEY (workspace_id, ticket_id, ordinal),
+                UNIQUE (workspace_id, ticket_id, repository_key),
+                FOREIGN KEY (workspace_id, ticket_id)
+                    REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
+            );",
+        )
+        .map_err(sqlite_err)?;
+
+    let legacy_targets = {
+        let mut statement = connection
+            .prepare(
+                "SELECT workspace_id, ticket_id, repository_id, ref_selector
+                 FROM typed_tickets
+                 WHERE repository_id IS NOT NULL OR ref_selector IS NOT NULL
+                 ORDER BY workspace_id, ticket_id",
+            )
+            .map_err(sqlite_err)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(sqlite_err)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(sqlite_err)?
+    };
+    for (workspace_id, ticket_id, repository_key, ref_selector) in legacy_targets {
+        let repository_key = repository_key.ok_or_else(|| {
+            TicketError::Sqlite(format!(
+                "legacy Ticket {ticket_id:?} in Workspace {workspace_id:?} has ref_selector without repository_id"
+            ))
+        })?;
+        connection
+            .execute(
+                "INSERT INTO typed_ticket_targets
+                 (workspace_id, ticket_id, ordinal, repository_key, ref_selector, access)
+                 VALUES (?1, ?2, 0, ?3, ?4, 'read_write')",
+                params![workspace_id, ticket_id, repository_key, ref_selector],
+            )
+            .map_err(sqlite_err)?;
+    }
+
+    let legacy_event_targets = {
+        let mut statement = connection
+            .prepare(
+                "SELECT repository.workspace_id, repository.ticket_id, repository.event_index,
+                        repository.value, selector.value
+                 FROM typed_ticket_event_attributes AS repository
+                 JOIN typed_ticket_event_attributes AS selector
+                   ON selector.workspace_id = repository.workspace_id
+                  AND selector.ticket_id = repository.ticket_id
+                  AND selector.event_index = repository.event_index
+                  AND selector.key = 'ref_selector'
+                 WHERE repository.key = 'repository_id'
+                 ORDER BY repository.workspace_id, repository.ticket_id, repository.event_index",
+            )
+            .map_err(sqlite_err)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(sqlite_err)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(sqlite_err)?
+    };
+    for (workspace_id, ticket_id, event_index, repository_key, ref_selector) in legacy_event_targets
+    {
+        let targets = serde_json::to_string(&[serde_json::json!({
+            "repository_key": repository_key,
+            "ref_selector": ref_selector,
+            "access": "read_write",
+        })])
+        .map_err(sqlite_err)?;
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO typed_ticket_event_attributes
+                 (workspace_id, ticket_id, event_index, key, value)
+                 VALUES (?1, ?2, ?3, 'targets', ?4)",
+                params![workspace_id, ticket_id, event_index, targets],
+            )
+            .map_err(sqlite_err)?;
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO typed_ticket_event_attributes
+                 (workspace_id, ticket_id, event_index, key, value)
+                 SELECT ?1, ?2, ?3, 'fingerprint_version', '1'
+                 WHERE EXISTS (
+                    SELECT 1 FROM typed_ticket_event_attributes
+                    WHERE workspace_id = ?1 AND ticket_id = ?2 AND event_index = ?3
+                      AND key = 'request_fingerprint'
+                 )",
+                params![workspace_id, ticket_id, event_index],
+            )
+            .map_err(sqlite_err)?;
+    }
+    connection
+        .execute(
+            "DELETE FROM typed_ticket_event_attributes AS legacy
+             WHERE legacy.key IN ('repository_id', 'ref_selector')
+               AND EXISTS (
+                    SELECT 1 FROM typed_ticket_event_attributes AS canonical
+                    WHERE canonical.workspace_id = legacy.workspace_id
+                      AND canonical.ticket_id = legacy.ticket_id
+                      AND canonical.event_index = legacy.event_index
+                      AND canonical.key = 'targets'
+               )",
+            [],
+        )
+        .map_err(sqlite_err)?;
+
+    connection
+        .execute_batch(
+            "ALTER TABLE typed_tickets DROP COLUMN repository_id;
+             ALTER TABLE typed_tickets DROP COLUMN ref_selector;",
+        )
         .map_err(sqlite_err)
 }
 
@@ -843,6 +1024,124 @@ mod tests {
     }
 
     #[test]
+    fn migrates_single_target_rows_to_ordered_read_write_targets() {
+        let connection = Connection::open_in_memory().unwrap();
+        create_latest_ticket_schema(&connection).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE typed_ticket_targets;
+                 ALTER TABLE typed_tickets ADD COLUMN repository_id TEXT;
+                 ALTER TABLE typed_tickets ADD COLUMN ref_selector TEXT;
+                 CREATE TABLE ticket_schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    applied_at TEXT NOT NULL
+                 );
+                 INSERT INTO ticket_schema_migrations (version, name, applied_at)
+                 VALUES (6, 'ticket schema baseline', '2026-09-23T00:00:00Z');
+                 INSERT INTO typed_tickets (
+                    workspace_id, ticket_id, slug, title, status, kind, priority, body,
+                    workflow_state, workflow_state_explicit, repository_id, ref_selector
+                 ) VALUES (
+                    'workspace-1', 'ticket-1', 'ticket-1', 'Migrated', 'open', 'task', 'P2',
+                    'body', 'ready', 1, 'main', 'develop'
+                 );
+                 INSERT INTO typed_ticket_events (
+                    workspace_id, ticket_id, event_index, kind, body
+                 ) VALUES (
+                    'workspace-1', 'ticket-1', 0, 'state_changed', 'ready'
+                 );
+                 INSERT INTO typed_ticket_event_attributes (
+                    workspace_id, ticket_id, event_index, key, value
+                 ) VALUES
+                    ('workspace-1', 'ticket-1', 0, 'repository_id', 'main'),
+                    ('workspace-1', 'ticket-1', 0, 'ref_selector', 'develop'),
+                    ('workspace-1', 'ticket-1', 0, 'request_fingerprint', 'legacy');",
+            )
+            .unwrap();
+
+        migrate_sqlite_ticket_schema(&connection).unwrap();
+        verify_sqlite_ticket_schema(&connection).unwrap();
+
+        let target = connection
+            .query_row(
+                "SELECT ordinal, repository_key, ref_selector, access
+                 FROM typed_ticket_targets
+                 WHERE workspace_id = 'workspace-1' AND ticket_id = 'ticket-1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            target,
+            (
+                0,
+                "main".to_owned(),
+                Some("develop".to_owned()),
+                "read_write".to_owned()
+            )
+        );
+        let columns = load_columns(&connection, "typed_tickets").unwrap();
+        assert!(
+            columns
+                .iter()
+                .all(|column| { column.name != "repository_id" && column.name != "ref_selector" })
+        );
+        let encoded_targets: String = connection
+            .query_row(
+                "SELECT value FROM typed_ticket_event_attributes
+                 WHERE workspace_id = 'workspace-1' AND ticket_id = 'ticket-1'
+                   AND event_index = 0 AND key = 'targets'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encoded_targets).unwrap(),
+            serde_json::json!([{
+                "repository_key": "main",
+                "ref_selector": "develop",
+                "access": "read_write"
+            }])
+        );
+        let migrated_attributes = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT key, value FROM typed_ticket_event_attributes
+                     WHERE workspace_id = 'workspace-1' AND ticket_id = 'ticket-1'
+                       AND event_index = 0 ORDER BY key",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<std::result::Result<BTreeMap<_, _>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            migrated_attributes
+                .get("fingerprint_version")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert!(!migrated_attributes.contains_key("repository_id"));
+        assert!(!migrated_attributes.contains_key("ref_selector"));
+        assert_eq!(
+            load_applied_migrations(&connection).unwrap(),
+            BTreeMap::from([(7, BASELINE_MIGRATION_NAME.to_owned())])
+        );
+    }
+
+    #[test]
     fn rejects_unknown_future_migration_history_without_changing_schema() {
         let connection = Connection::open_in_memory().unwrap();
         migrate_sqlite_ticket_schema(&connection).unwrap();
@@ -856,7 +1155,7 @@ mod tests {
 
         let error = migrate_sqlite_ticket_schema(&connection).unwrap_err();
         assert!(error.to_string().contains(
-            "migration history must contain only the canonical version 6 baseline marker"
+            "migration history must contain only the canonical version 7 baseline marker"
         ));
         assert_eq!(load_applied_migrations(&connection).unwrap().len(), 2);
     }
@@ -878,7 +1177,7 @@ mod tests {
 
         let error = migrate_sqlite_ticket_schema(&connection).unwrap_err();
         assert!(error.to_string().contains(
-            "migration history must contain only the canonical version 6 baseline marker"
+            "migration history must contain only the canonical version 7 baseline marker"
         ));
         assert!(!table_exists(&connection, "typed_tickets").unwrap());
     }

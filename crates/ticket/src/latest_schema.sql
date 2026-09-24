@@ -84,8 +84,19 @@ CREATE TABLE typed_tickets (
     workflow_state_explicit INTEGER NOT NULL,
     queued_by TEXT,
     queued_at TEXT,
-    resolution TEXT, repository_id TEXT, ref_selector TEXT,
+    resolution TEXT,
     PRIMARY KEY (workspace_id, ticket_id)
+);
+CREATE TABLE typed_ticket_targets (
+    workspace_id TEXT NOT NULL,
+    ticket_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    repository_key TEXT NOT NULL,
+    ref_selector TEXT,
+    access TEXT NOT NULL CHECK (access IN ('read_only', 'read_write')),
+    PRIMARY KEY (workspace_id, ticket_id, ordinal),
+    UNIQUE (workspace_id, ticket_id, repository_key),
+    FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
 );
 CREATE TABLE "workspace_resource_key_counters" (
             workspace_id TEXT NOT NULL,

@@ -32,9 +32,11 @@ import type {
   TicketListResponse,
   TicketMergeRequestSummary,
   TicketQueueOutcome,
+  TicketRef,
   TicketRoleAssignmentMutationResponse,
   TicketRoleAssignmentRecord,
   TicketRoleAssignmentSummary,
+  TicketTarget,
 } from "$lib/generated/ticket-api.ts";
 
 export const TICKET_BROWSER_API_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
@@ -671,6 +673,23 @@ function parseObjectiveLink(value: unknown, label: string) {
   };
 }
 
+function parseTicketTarget(value: unknown, label: string): TicketTarget {
+  const item = object(value, label);
+  exact(item, ["access", "ref_selector", "repository_key"], label);
+  const access = string(item.access, `${label}.access`);
+  if (access !== "read_only" && access !== "read_write") {
+    throw new Error(`${label}.access is invalid`);
+  }
+  return {
+    access,
+    ref_selector: optionalNullableString(
+      item.ref_selector,
+      `${label}.ref_selector`,
+    ),
+    repository_key: string(item.repository_key, `${label}.repository_key`),
+  };
+}
+
 export function parseTicketDetail(value: unknown): TicketDetail {
   const label = "Ticket detail";
   const item = object(value, label);
@@ -698,13 +717,12 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     "queued_by",
     "readiness",
     "record_source",
-    "ref_selector",
     "relations",
-    "repository_key",
     "resolution",
     "resource_key",
     "risk_flags",
     "state",
+    "targets",
     "title",
     "updated_at",
   ], label);
@@ -764,21 +782,33 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     queued_by: optionalNullableString(item.queued_by, `${label}.queued_by`),
     readiness: optionalNullableString(item.readiness, `${label}.readiness`),
     record_source: string(item.record_source, `${label}.record_source`),
-    ref_selector: optionalNullableString(
-      item.ref_selector,
-      `${label}.ref_selector`,
-    ),
     relations: parseRelationView(item.relations, `${label}.relations`),
-    repository_key: optionalNullableString(
-      item.repository_key,
-      `${label}.repository_key`,
-    ),
     resolution: optionalNullableString(item.resolution, `${label}.resolution`),
     resource_key: string(item.resource_key, `${label}.resource_key`),
     risk_flags: strings(item.risk_flags, `${label}.risk_flags`),
     state: string(item.state, `${label}.state`),
+    targets: array(item.targets, `${label}.targets`, parseTicketTarget),
     title: string(item.title, `${label}.title`),
     updated_at: optionalNullableString(item.updated_at, `${label}.updated_at`),
+  };
+}
+
+export function parseTicketRecordRef(value: unknown): TicketRef {
+  const label = "Ticket create response";
+  const item = object(value, label);
+  exact(item, ["id", "resource_key", "slug", "status"], label);
+  const status = string(item.status, `${label}.status`);
+  if (status !== "Open" && status !== "Closed") {
+    throw new Error(`${label}.status is invalid`);
+  }
+  return {
+    id: string(item.id, `${label}.id`),
+    resource_key: optionalNullableString(
+      item.resource_key,
+      `${label}.resource_key`,
+    ),
+    slug: string(item.slug, `${label}.slug`),
+    status,
   };
 }
 
