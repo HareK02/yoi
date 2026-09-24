@@ -289,7 +289,10 @@
       if (epoch !== pageEpoch) throw new StaleRepositoryAccessRequestError();
       publicKeys = { ...publicKeys, [credentialId]: publicKey };
     } catch (error) {
-      if (error instanceof StaleRepositoryAccessRequestError) throw error;
+      if (error instanceof StaleRepositoryAccessRequestError || epoch !== pageEpoch) throw new StaleRepositoryAccessRequestError();
+      const remainingPublicKeys = { ...publicKeys };
+      delete remainingPublicKeys[credentialId];
+      publicKeys = remainingPublicKeys;
       publicKeyNotices = {
         ...publicKeyNotices,
         [credentialId]: operationError(error, 'The credential was saved, but its public key could not be loaded. Use Copy public key to retry.')

@@ -354,6 +354,70 @@ test("rerendering for another Workspace resets local state and fences stale resp
   );
 });
 
+test("retries public-key loading after a post-rotation refresh failure", async () => {
+  let publicKeyLoads = 0;
+  const newPublicKey = "ssh-ed25519 AAAA-new-deploy";
+  const fetchMock = vi.fn((input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/credentials/deploy/rotate")) {
+      return Promise.resolve(Response.json({
+        ...deployCredential,
+        public_key_fingerprint: "SHA256:deploy-new",
+        current_revision: 3,
+        rotated_at: "2026-02-01T00:00:00Z",
+      }));
+    }
+    if (url.endsWith("/credentials/deploy/public-key")) {
+      publicKeyLoads += 1;
+      if (publicKeyLoads === 1) {
+        return Promise.resolve(new Response(null, { status: 500 }));
+      }
+      return Promise.resolve(Response.json({
+        credential_id: "deploy",
+        current_revision: 3,
+        public_key_algorithm: "ssh-ed25519",
+        public_key_fingerprint: "SHA256:deploy-new",
+        public_key: newPublicKey,
+      }));
+    }
+    throw new Error(`unexpected request: ${url}`);
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const writeText = vi.spyOn(navigator.clipboard, "writeText")
+    .mockResolvedValue();
+  const data = pageData();
+  data.publicKeys.push({
+    credential_id: "deploy",
+    current_revision: 2,
+    public_key_algorithm: "ssh-ed25519",
+    public_key_fingerprint: "SHA256:deploy",
+    public_key: "ssh-ed25519 AAAA-old-deploy",
+  });
+  renderPage(data);
+
+  const row = screen.getByText("Deploy key").closest("tr");
+  if (!row) throw new Error("missing credential row");
+  await fireEvent.click(within(row).getByRole("button", { name: "Rotate" }));
+  await fireEvent.input(
+    screen.getByRole("textbox", { name: /^New OpenSSH private key/ }),
+    { target: { value: "-----BEGIN OPENSSH PRIVATE KEY-----" } },
+  );
+  await fireEvent.click(
+    screen.getByRole("button", { name: "Rotate credential" }),
+  );
+
+  const refreshAlert = await within(row).findByRole("alert");
+  expect(refreshAlert.textContent).toContain("Unable to load this public key");
+  expect(publicKeyLoads).toBe(1);
+
+  await fireEvent.click(
+    within(row).getByRole("button", { name: "Copy public key" }),
+  );
+  expect(await within(row).findByText("Public key copied.")).not.toBeNull();
+  expect(publicKeyLoads).toBe(2);
+  expect(writeText).toHaveBeenCalledWith(newPublicKey);
+});
+
 test("locks a rotation to its host and port and discloses explicit and automatic impact", async () => {
   const rotateResponse = deferred<Response>();
   const fetchMock = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
