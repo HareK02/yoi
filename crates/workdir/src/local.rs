@@ -426,6 +426,7 @@ struct LocalWorkdirSessionInner {
     root: PathBuf,
     pinned_root: Option<Arc<std::fs::File>>,
     scope: SharedScope,
+    command_output_scope: SharedScope,
     cwd: PathBuf,
     capabilities: WorkdirSessionCapabilities,
     read_limits: Option<BoundedReadLimits>,
@@ -644,11 +645,36 @@ impl LocalWorkdirSession {
         command_environment: BTreeMap<String, String>,
         resources: Vec<Arc<dyn WorkdirSessionResource>>,
     ) -> Self {
+        Self::materialized_bound_with_environment_and_command_output_scope(
+            workdir,
+            root,
+            cwd,
+            scope.clone(),
+            scope,
+            capabilities,
+            command_environment,
+            resources,
+        )
+    }
+
+    /// Construct a local provider session whose Workdir filesystem authority is
+    /// independent from the provider-owned command output authority.
+    pub fn materialized_bound_with_environment_and_command_output_scope(
+        workdir: Workdir,
+        root: PathBuf,
+        cwd: PathBuf,
+        scope: SharedScope,
+        command_output_scope: SharedScope,
+        capabilities: WorkdirSessionCapabilities,
+        command_environment: BTreeMap<String, String>,
+        resources: Vec<Arc<dyn WorkdirSessionResource>>,
+    ) -> Self {
         Self::materialized_bound_with_policy(
             workdir,
             root,
             cwd,
             scope,
+            command_output_scope,
             capabilities,
             command_environment,
             resources,
@@ -698,11 +724,13 @@ impl LocalWorkdirSession {
                 "External Workdir read scope could not be established".to_string(),
             )
         })?;
+        let scope = SharedScope::new(scope);
         Ok(Self::materialized_bound_with_policy(
             workdir,
             root.clone(),
             root,
-            SharedScope::new(scope),
+            scope.clone(),
+            scope,
             WorkdirSessionCapabilities::READ_ONLY,
             BTreeMap::new(),
             Vec::new(),
@@ -729,6 +757,7 @@ impl LocalWorkdirSession {
         root: PathBuf,
         cwd: PathBuf,
         scope: SharedScope,
+        command_output_scope: SharedScope,
         capabilities: WorkdirSessionCapabilities,
         command_environment: BTreeMap<String, String>,
         resources: Vec<Arc<dyn WorkdirSessionResource>>,
@@ -742,6 +771,7 @@ impl LocalWorkdirSession {
                 root,
                 pinned_root,
                 scope,
+                command_output_scope,
                 cwd,
                 capabilities,
                 read_limits,
@@ -1154,7 +1184,11 @@ impl WorkdirSession for LocalWorkdirSession {
         self.ensure_capability(WorkdirSessionCapability::Command)?;
         self.ensure_open()?;
         if let Some(spill_dir) = request.spill_dir.as_deref()
-            && !self.inner.scope.snapshot().is_readable(spill_dir)
+            && !self
+                .inner
+                .command_output_scope
+                .snapshot()
+                .is_readable(spill_dir)
         {
             return Err(WorkdirError::OutOfScope(spill_dir.to_path_buf()));
         }

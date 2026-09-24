@@ -768,33 +768,73 @@ fn initial_workdir_session_capabilities(
         .unwrap_or(WorkdirSessionCapabilities::ALL)
 }
 
+fn runtime_attachment_scope(
+    root: &Path,
+    capabilities: WorkdirSessionCapabilities,
+) -> Result<manifest::SharedScope, String> {
+    if capabilities == WorkdirSessionCapabilities::EMPTY {
+        return Ok(manifest::SharedScope::new(manifest::Scope::empty()));
+    }
+    let writable = [
+        workdir::WorkdirSessionCapability::Write,
+        workdir::WorkdirSessionCapability::Edit,
+        workdir::WorkdirSessionCapability::Command,
+    ]
+    .into_iter()
+    .any(|capability| capabilities.supports(capability));
+    let scope = manifest::Scope::from_config(&manifest::ScopeConfig {
+        allow: vec![manifest::ScopeRule {
+            target: root.to_path_buf(),
+            permission: if writable {
+                manifest::Permission::Write
+            } else {
+                manifest::Permission::Read
+            },
+            recursive: true,
+            symlink_policy: manifest::SymlinkPolicy::Resolved,
+        }],
+        deny: Vec::new(),
+    })
+    .map_err(|error| format!("create Runtime-local attachment scope: {error}"))?;
+    Ok(manifest::SharedScope::new(scope))
+}
+
 fn runtime_local_workdir_session(
     workdir_id: &str,
     root: &Path,
     cwd: &Path,
     scope: manifest::SharedScope,
+    command_output_scope: manifest::SharedScope,
     capabilities: WorkdirSessionCapabilities,
     command_environment: std::collections::BTreeMap<String, String>,
     resources: Vec<Arc<dyn workdir::WorkdirSessionResource>>,
 ) -> WorkdirSessionHandle {
-    Arc::new(LocalWorkdirSession::materialized_bound_with_environment(
-        Workdir::new(workdir_id),
-        root.to_path_buf(),
-        cwd.to_path_buf(),
-        scope,
-        capabilities,
-        command_environment,
-        resources,
-    ))
+    Arc::new(
+        LocalWorkdirSession::materialized_bound_with_environment_and_command_output_scope(
+            Workdir::new(workdir_id),
+            root.to_path_buf(),
+            cwd.to_path_buf(),
+            scope,
+            command_output_scope,
+            capabilities,
+            command_environment,
+            resources,
+        ),
+    )
 }
 
 fn runtime_local_workdir_router(
     attachments: &BTreeMap<WorkdirAttachmentAlias, WorkingDirectoryBinding>,
     capabilities: &BTreeMap<WorkdirAttachmentAlias, WorkdirSessionCapabilities>,
-    scope: manifest::SharedScope,
+    command_output_scope: manifest::SharedScope,
 ) -> Result<Arc<WorkdirSessionRouter>, String> {
     let router = Arc::new(WorkdirSessionRouter::new());
     for (alias, binding) in attachments {
+        let capabilities = capabilities
+            .get(alias)
+            .copied()
+            .unwrap_or(WorkdirSessionCapabilities::READ_ONLY);
+        let scope = runtime_attachment_scope(binding.root(), capabilities)?;
         router
             .attach(
                 alias.clone(),
@@ -802,11 +842,9 @@ fn runtime_local_workdir_router(
                     &binding.working_directory.id,
                     binding.root(),
                     binding.cwd(),
-                    scope.clone(),
-                    capabilities
-                        .get(alias)
-                        .copied()
-                        .unwrap_or(WorkdirSessionCapabilities::READ_ONLY),
+                    scope,
+                    command_output_scope.clone(),
+                    capabilities,
                     binding.command_environment(),
                     binding.session_resources(),
                 ),
@@ -2221,11 +2259,13 @@ where
                 format!("failed to create Workdir session scope: {error}"),
             )
         })?;
+        let scope = manifest::SharedScope::new(scope);
         Ok(runtime_local_workdir_session(
             working_directory_id,
             binding.root(),
             binding.cwd(),
-            manifest::SharedScope::new(scope),
+            scope.clone(),
+            scope,
             WorkdirSessionCapabilities::ALL,
             binding.command_environment(),
             binding.session_resources(),
@@ -3044,7 +3084,28 @@ mod tests {
     }
 
     #[test]
-    fn restored_router_preserves_read_only_capabilities_for_local_attachment() {
+    fn runtime_attachment_scope_matches_session_capabilities() {
+        let root = tempfile::tempdir().unwrap();
+        let writable = runtime_attachment_scope(root.path(), WorkdirSessionCapabilities::ALL)
+            .unwrap()
+            .snapshot();
+        assert_eq!(
+            writable.permission_at(root.path()),
+            Some(manifest::Permission::Write)
+        );
+
+        let read_only =
+            runtime_attachment_scope(root.path(), WorkdirSessionCapabilities::READ_ONLY)
+                .unwrap()
+                .snapshot();
+        assert_eq!(
+            read_only.permission_at(root.path()),
+            Some(manifest::Permission::Read)
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_router_preserves_read_only_capabilities_for_local_attachment() {
         let runtime_base = tempfile::tempdir().unwrap();
         let repo = create_clean_repo();
         let materializer = RuntimeGitMaterializer::new(runtime_base.path());
@@ -3054,7 +3115,7 @@ mod tests {
             .unwrap();
         let alias = WorkdirAttachmentAlias::new("docs").unwrap();
         let workdir_id = binding.working_directory.id.clone();
-        let scope = manifest::SharedScope::new(manifest::Scope::writable(binding.root()).unwrap());
+        let command_output_scope = manifest::SharedScope::new(manifest::Scope::empty());
         let attachments = BTreeMap::from([(alias.clone(), binding)]);
         let logical = [LogicalWorkdirAttachment {
             alias: alias.clone(),
@@ -3066,12 +3127,38 @@ mod tests {
         ))
         .client_handle();
 
-        let router = restored_workdir_router(&attachments, &logical, &[], scope, client).unwrap();
+        let router =
+            restored_workdir_router(&attachments, &logical, &[], command_output_scope, client)
+                .unwrap();
 
+        let session = router.session(&alias).unwrap();
         assert_eq!(
-            router.session(&alias).unwrap().capabilities(),
+            session.capabilities(),
             WorkdirSessionCapabilities::READ_ONLY
         );
+        let read = session
+            .read(workdir::ReadRequest {
+                path: workdir::WorkdirPath::new("README.md").unwrap(),
+                offset: 0,
+                limit: 10,
+                max_bytes: 1024,
+            })
+            .await
+            .unwrap();
+        assert_eq!(read.bytes, b"clean\n");
+        session
+            .authorize_scope_path(workdir::WorkdirScopeAuthorizationRequest {
+                rules: vec![workdir::WorkdirToolScopeRule {
+                    target: workdir::WorkdirPath::root(),
+                    permission: workdir::WorkdirToolScopePermission::Read,
+                    recursive: true,
+                    symlink_policy: manifest::SymlinkPolicy::Resolved,
+                }],
+                path: workdir::WorkdirPath::new("README.md").unwrap(),
+                permission: workdir::WorkdirToolScopePermission::Read,
+            })
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -4054,20 +4141,24 @@ mod tests {
     #[test]
     fn restore_opens_a_fresh_session_with_the_same_read_only_capabilities() {
         let root = tempfile::tempdir().unwrap();
+        let spawned_scope = manifest::SharedScope::new(Scope::writable(root.path()).unwrap());
         let spawned = runtime_local_workdir_session(
             "working-directory-42",
             root.path(),
             root.path(),
-            manifest::SharedScope::new(Scope::writable(root.path()).unwrap()),
+            spawned_scope.clone(),
+            spawned_scope,
             WorkdirSessionCapabilities::READ_ONLY,
             Default::default(),
             Vec::new(),
         );
+        let restored_scope = manifest::SharedScope::new(Scope::writable(root.path()).unwrap());
         let restored = runtime_local_workdir_session(
             "working-directory-42",
             root.path(),
             root.path(),
-            manifest::SharedScope::new(Scope::writable(root.path()).unwrap()),
+            restored_scope.clone(),
+            restored_scope,
             WorkdirSessionCapabilities::READ_ONLY,
             Default::default(),
             Vec::new(),
