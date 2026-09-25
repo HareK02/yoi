@@ -7367,6 +7367,10 @@
         "additionalProperties": false,
         "description": "Workspace-authoritative Worker projection.\n\n`resource_key` is required here even though Runtime-internal Worker summaries\ndo not carry one. The Workspace Server must resolve it from Workspace\nauthority before constructing this response.",
         "properties": {
+          "availability": {
+            "$ref": "#/components/schemas/SubscriptionWorkerAvailability",
+            "description": "Freshness of the Runtime observation used to construct `worker_state`.\n`Unavailable` means no current controller snapshot is being asserted."
+          },
           "capabilities": {
             "$ref": "#/components/schemas/WorkerCapabilitySummary"
           },
@@ -7466,6 +7470,7 @@
           "host_id",
           "label",
           "workspace",
+          "availability",
           "state",
           "implementation",
           "capabilities",
@@ -8604,6 +8609,14 @@
           "kind"
         ],
         "type": "object"
+      },
+      "SubscriptionWorkerAvailability": {
+        "description": "Whether the Workspace Server has a current Runtime observation for a Worker.\n\n`Unavailable` deliberately does not imply `Stopped`: it means the last observed\nlifecycle state is retained while the Runtime observation source is unavailable.",
+        "enum": [
+          "observed",
+          "unavailable"
+        ],
+        "type": "string"
       },
       "Ticket": {
         "properties": {
@@ -11722,6 +11735,10 @@
       "WorkerSummary": {
         "description": "Workspace-authoritative Worker projection.\n\n`resource_key` is required here even though Runtime-internal Worker summaries\ndo not carry one. The Workspace Server must resolve it from Workspace\nauthority before constructing this response.",
         "properties": {
+          "availability": {
+            "$ref": "#/components/schemas/SubscriptionWorkerAvailability",
+            "description": "Freshness of the Runtime observation used to construct `worker_state`.\n`Unavailable` means no current controller snapshot is being asserted."
+          },
           "capabilities": {
             "$ref": "#/components/schemas/WorkerCapabilitySummary"
           },
@@ -11818,6 +11835,7 @@
           "host_id",
           "label",
           "workspace",
+          "availability",
           "state",
           "implementation",
           "capabilities"
@@ -13901,7 +13919,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:80be292e32441730f7de890e64836f4ca9655576d655e60e6d44daf5227a1b1c"
+    "x-yoi-source-digest": "sha256:a92b7346166ec2316878ef38b0426090cb4bdd0d5b96cae3014bef35c60df02a"
   },
   "openapi": "3.1.0",
   "paths": {

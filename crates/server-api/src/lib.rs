@@ -7931,6 +7931,9 @@ pub struct WorkerSummary {
     #[serde(default)]
     pub tags: Vec<String>,
     pub workspace: WorkerWorkspaceSummary,
+    /// Freshness of the Runtime observation used to construct `worker_state`.
+    /// `Unavailable` means no current controller snapshot is being asserted.
+    pub availability: protocol::subscription::SubscriptionWorkerAvailability,
     /// Runtime catalog lifecycle compatibility state. Live foreground state, when
     /// available, is carried separately in `worker_state`.
     pub state: String,

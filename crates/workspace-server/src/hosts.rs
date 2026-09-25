@@ -260,6 +260,9 @@ pub struct InternalWorkerSummary {
     #[serde(default)]
     pub tags: Vec<String>,
     pub workspace: InternalWorkerWorkspaceSummary,
+    /// Freshness of the Runtime observation carried by `worker_state`.
+    #[serde(default)]
+    pub availability: protocol::subscription::SubscriptionWorkerAvailability,
     /// Runtime catalog lifecycle compatibility state.
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -371,6 +374,7 @@ pub(crate) fn workspace_worker_summary(
             identity: summary.workspace.identity,
             workspace_id: summary.workspace.workspace_id,
         },
+        availability: summary.availability,
         state: summary.state,
         worker_state: summary.worker_state,
         last_seen_at: summary.last_seen_at,
@@ -2218,6 +2222,8 @@ impl EmbeddedWorkerRuntime {
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: summary.workspace_id.clone(),
             },
+            availability:
+                protocol::subscription::SubscriptionWorkerAvailability::Observed,
             state: embedded_worker_state_label(
                 summary.status,
                 summary.execution_metadata_available,
@@ -2265,6 +2271,8 @@ impl EmbeddedWorkerRuntime {
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: detail.workspace_id.clone(),
             },
+            availability:
+                protocol::subscription::SubscriptionWorkerAvailability::Observed,
             state: embedded_worker_state_label(detail.status, detail.execution_metadata_available)
                 .to_string(),
             worker_state: detail.worker_state.clone(),
@@ -4056,6 +4064,8 @@ impl RemoteWorkerRuntime {
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: summary.workspace_id.clone(),
             },
+            availability:
+                protocol::subscription::SubscriptionWorkerAvailability::Observed,
             state: embedded_worker_state_label(
                 summary.status,
                 summary.execution_metadata_available,
@@ -4101,6 +4111,8 @@ impl RemoteWorkerRuntime {
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: detail.workspace_id.clone(),
             },
+            availability:
+                protocol::subscription::SubscriptionWorkerAvailability::Observed,
             state: embedded_worker_state_label(detail.status, detail.execution_metadata_available)
                 .to_string(),
             worker_state: detail.worker_state.clone(),
@@ -5867,6 +5879,7 @@ pub fn placeholder_worker(host_id: impl Into<String>) -> InternalWorkerSummary {
             identity: "unsupported".to_string(),
             workspace_id: None,
         },
+        availability: protocol::subscription::SubscriptionWorkerAvailability::Unavailable,
         state: "unsupported".to_string(),
         worker_state: None,
         last_seen_at: None,
@@ -6509,6 +6522,8 @@ mod tests {
                         identity: host_id.to_string(),
                         workspace_id: None,
                     },
+                    availability:
+                        protocol::subscription::SubscriptionWorkerAvailability::Observed,
                     state: "available".to_string(),
                     worker_state: None,
                     last_seen_at: None,

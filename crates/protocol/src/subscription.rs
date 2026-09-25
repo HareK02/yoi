@@ -564,6 +564,7 @@ pub enum SubscriptionWorkerState {
 /// `Unavailable` deliberately does not imply `Stopped`: it means the last observed
 /// lifecycle state is retained while the Runtime observation source is unavailable.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum SubscriptionWorkerAvailability {

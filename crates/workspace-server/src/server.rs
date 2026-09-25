@@ -24059,6 +24059,7 @@ fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> InternalWorker
             identity: record.workspace_id.clone(),
             workspace_id: Some(record.workspace_id.clone()),
         },
+        availability: protocol::subscription::SubscriptionWorkerAvailability::Unavailable,
         profile: record.profile.clone(),
         implementation: InternalWorkerImplementationSummary {
             kind: "backend_worker_registry".to_string(),
@@ -24082,6 +24083,7 @@ fn worker_summary_from_projection(
     let mut summary = worker_summary_from_registry(&projection.registry);
     let observed = observation.availability
         == protocol::subscription::SubscriptionWorkerAvailability::Observed;
+    summary.availability = observation.availability;
     summary.state = if observed {
         match observation.worker.state {
             protocol::subscription::SubscriptionWorkerState::Idle => "idle",
@@ -24093,7 +24095,9 @@ fn worker_summary_from_projection(
         "unavailable"
     }
     .to_string();
-    summary.worker_state = observation.worker.worker_state.clone();
+    summary.worker_state = observed
+        .then(|| observation.worker.worker_state.clone())
+        .flatten();
     summary.last_seen_at = Some(observation.observed_at.clone());
     summary.capabilities.can_stop = observed
         && observation.worker.state != protocol::subscription::SubscriptionWorkerState::Stopped;
@@ -25798,8 +25802,78 @@ mod tests {
     use crate::store::{
         AccountRecord, ApiTokenRecord, BrowserSessionRecord, MemoryDocumentRecord,
         MemoryStagingRecord, ObjectiveRecord, ObjectiveResourceRecord, ObjectiveTicketLinkRecord,
-        SqliteWorkspaceStore, UserRecord, WorkspaceRecord, WorkspaceRuntimeBinding,
+        SqliteWorkspaceStore, UserRecord, WorkerRegistryObservationRecord,
+        WorkerRegistryProjectionRecord, WorkerRegistryRecord, WorkspaceRecord,
+        WorkspaceRuntimeBinding,
     };
+
+    #[test]
+    fn worker_projection_does_not_expose_unavailable_snapshot_as_current() {
+        let availability =
+            protocol::subscription::SubscriptionWorkerAvailability::Unavailable;
+        let worker_ref = RuntimeWorkerRef::new("runtime-a", "worker-a");
+        let projection = WorkerRegistryProjectionRecord {
+            registry: WorkerRegistryRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                worker: worker_ref,
+                display_name: "Worker A".to_string(),
+                profile: Some("builtin:coder".to_string()),
+                retention_state: "normal".to_string(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: "2026-09-24T00:00:00Z".to_string(),
+                updated_at: "2026-09-24T00:00:00Z".to_string(),
+            },
+            resource_key: Some("W-1".to_string()),
+            observation: Some(WorkerRegistryObservationRecord {
+                worker: protocol::subscription::SubscriptionWorker {
+                    worker_id: protocol::subscription::SubscriptionWorkerId::new("worker-a")
+                        .unwrap(),
+                    runtime_id: Some("runtime-a".to_string()),
+                    resource_key: Some("W-1".to_string()),
+                    availability,
+                    subject_revision: 4,
+                    worker_state: Some(protocol::WorkerStateSnapshot::initial()),
+                    state: protocol::subscription::SubscriptionWorkerState::Idle,
+                    has_running_internal_workers: false,
+                    workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
+                    display_name: Some("Worker A".to_string()),
+                    profile: Some("builtin:coder".to_string()),
+                    workdir_attachments: Vec::new(),
+                },
+                availability,
+                connection_generation: 2,
+                subject_revision: 4,
+                snapshot_revision: 7,
+                projection_revision: 9,
+                observed_at: "2026-09-24T00:00:01Z".to_string(),
+            }),
+        };
+
+        let unavailable = worker_summary_from_projection(&projection).unwrap();
+        assert_eq!(unavailable.availability, availability);
+        assert_eq!(unavailable.state, "unavailable");
+        assert_eq!(unavailable.worker_state, None);
+        assert!(!unavailable.capabilities.can_stop);
+
+        let mut observed_stopped = projection;
+        let observation = observed_stopped.observation.as_mut().unwrap();
+        observation.availability =
+            protocol::subscription::SubscriptionWorkerAvailability::Observed;
+        observation.worker.availability =
+            protocol::subscription::SubscriptionWorkerAvailability::Observed;
+        observation.worker.state = protocol::subscription::SubscriptionWorkerState::Stopped;
+        observation.worker.worker_state = None;
+        let observed_stopped = worker_summary_from_projection(&observed_stopped).unwrap();
+        assert_eq!(
+            observed_stopped.availability,
+            protocol::subscription::SubscriptionWorkerAvailability::Observed
+        );
+        assert_eq!(observed_stopped.state, "stopped");
+        assert_eq!(observed_stopped.worker_state, None);
+    }
 
     #[tokio::test]
     async fn external_provider_session_reuses_operation_contract_and_read_only_capabilities() {
@@ -26717,6 +26791,8 @@ mod tests {
                     identity: TEST_WORKSPACE_ID.to_string(),
                     workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
                 },
+                availability:
+                    protocol::subscription::SubscriptionWorkerAvailability::Observed,
                 state: "idle".to_string(),
                 worker_state: None,
                 last_seen_at: None,
@@ -38514,6 +38590,8 @@ mod tests {
                     identity: "workspace-test".to_string(),
                     workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
                 },
+                availability:
+                    protocol::subscription::SubscriptionWorkerAvailability::Observed,
                 state: "idle".to_string(),
                 worker_state: None,
                 last_seen_at: None,
@@ -38611,6 +38689,8 @@ mod tests {
                     identity: "workspace-test".to_string(),
                     workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
                 },
+                availability:
+                    protocol::subscription::SubscriptionWorkerAvailability::Observed,
                 state: "idle".to_string(),
                 worker_state: None,
                 last_seen_at: None,

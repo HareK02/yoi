@@ -146,6 +146,7 @@ function projectWorker(
       visibility: "workspace",
       identity: "runtime_subscription_worker",
     },
+    availability: worker.availability,
     state: liveWorkerState(worker),
     worker_state: worker.worker_state,
     pinned: false,

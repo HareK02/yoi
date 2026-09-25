@@ -343,6 +343,10 @@ export function parseWorkerSummary(
   label = "Worker summary",
 ): ParsedWorkerSummary {
   const item = record(value, label);
+  const availability = string(item.availability, `${label}.availability`);
+  if (availability !== "observed" && availability !== "unavailable") {
+    throw new Error(`${label}.availability is invalid`);
+  }
   exact(
     item,
     [
@@ -356,6 +360,7 @@ export function parseWorkerSummary(
       "singleton_key",
       "tags",
       "workspace",
+      "availability",
       "state",
       "worker_state",
       "last_seen_at",
@@ -368,6 +373,16 @@ export function parseWorkerSummary(
     ],
     label,
   );
+  const workerState = optional(
+    item.worker_state,
+    `${label}.worker_state`,
+    workerStateSnapshot,
+  );
+  if (availability === "unavailable" && workerState != null) {
+    throw new Error(
+      `${label}.worker_state must be absent when availability is unavailable`,
+    );
+  }
   return {
     runtime_id: string(item.runtime_id, `${label}.runtime_id`),
     worker_id: string(item.worker_id, `${label}.worker_id`),
@@ -387,12 +402,9 @@ export function parseWorkerSummary(
       ? []
       : array(item.tags, `${label}.tags`, string),
     workspace: workspaceSummary(item.workspace, `${label}.workspace`),
+    availability,
     state: string(item.state, `${label}.state`),
-    worker_state: optional(
-      item.worker_state,
-      `${label}.worker_state`,
-      workerStateSnapshot,
-    ),
+    worker_state: workerState,
     last_seen_at: optional(item.last_seen_at, `${label}.last_seen_at`, string),
     pinned: item.pinned === undefined
       ? false

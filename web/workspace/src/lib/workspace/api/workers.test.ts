@@ -31,6 +31,7 @@ import {
   parseBrowserWorkspaceOrchestratorResponse,
   parseCreateWorkspaceWorkerRequest,
   parseWorkerLaunchOptionsResponse,
+  parseWorkerSummary,
 } from "./workers.ts";
 
 const worker = {
@@ -61,6 +62,39 @@ const worker = {
   },
   diagnostics: [],
 };
+
+Deno.test("Worker summary parser enforces observation freshness", () => {
+  const unavailable = {
+    ...worker,
+    resource_key: "W-1",
+    availability: "unavailable",
+    state: "unavailable",
+  };
+  const parsed = parseWorkerSummary(unavailable);
+  assertEquals(parsed.availability, "unavailable");
+  assertEquals(parsed.worker_state, undefined);
+
+  assertThrows(
+    () =>
+      parseWorkerSummary({
+        ...unavailable,
+        worker_state: {
+          last_command_id: 0,
+          state: { kind: "idle" },
+        },
+      }),
+    Error,
+    "worker_state must be absent",
+  );
+
+  const observedStopped = parseWorkerSummary({
+    ...unavailable,
+    availability: "observed",
+    state: "stopped",
+  });
+  assertEquals(observedStopped.availability, "observed");
+  assertEquals(observedStopped.state, "stopped");
+});
 
 Deno.test("Worker launch options parser accepts the generated wire shape", () => {
   const parsed = parseWorkerLaunchOptionsResponse({
