@@ -388,6 +388,13 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         Ok(())
     }
 
+    fn reconcile_restore(
+        &self,
+        request: WorkerExecutionRestoreRequest,
+    ) -> WorkerExecutionSpawnResult {
+        self.restore_worker(request)
+    }
+
     fn restore_worker(
         &self,
         _request: WorkerExecutionRestoreRequest,
@@ -606,6 +613,13 @@ impl WorkerExecutionBackendRef {
         request: &WorkerExecutionRestoreRequest,
     ) -> Result<(), WorkerExecutionResult> {
         self.backend.preflight_restore(request)
+    }
+
+    pub(crate) fn reconcile_restore(
+        &self,
+        request: WorkerExecutionRestoreRequest,
+    ) -> WorkerExecutionSpawnResult {
+        self.backend.reconcile_restore(request)
     }
 
     pub(crate) fn restore_worker(

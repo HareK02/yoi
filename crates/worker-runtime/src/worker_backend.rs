@@ -472,6 +472,17 @@ impl ProfileRuntimeWorkerFactory {
             .join(uuid::Uuid::now_v7().to_string()))
     }
 
+    fn worker_restore_run_dir(
+        &self,
+        worker_ref: &WorkerRef,
+        operation_id: crate::execution::WorkerLifecycleOperationId,
+    ) -> Result<PathBuf, String> {
+        Ok(self
+            .worker_aggregate_dir(worker_ref)?
+            .join("runs")
+            .join(format!("restore-{operation_id}")))
+    }
+
     fn runtime_worker_name_for_ref(worker_ref: &crate::identity::WorkerRef) -> String {
         format!("worker-runtime-{}", worker_ref.worker_id)
     }
@@ -1423,7 +1434,8 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         }
 
         let workspace_client = worker.workspace_client_handle();
-        let run_dir = self.worker_run_dir(&request.worker_ref)?;
+        let run_dir =
+            self.worker_restore_run_dir(&request.worker_ref, request.operation_id)?;
         let bash_output_dir = bash_output_dir_for_worker_id(&request.worker_ref.worker_id);
         let started = PreparedWorker::new(
             worker,
@@ -1567,6 +1579,8 @@ struct RuntimeWorkerExecution {
     tasks: RuntimeExecutionTaskScope,
     worker_state: Arc<RwLock<protocol::WorkerStateSnapshot>>,
     workspace_client: Option<Arc<dyn WorkspaceClient>>,
+    restore_operation_id: Option<crate::execution::WorkerLifecycleOperationId>,
+    workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
 }
 
 /// `worker-runtime` execution backend backed by real `worker` crate Workers.
@@ -1836,6 +1850,8 @@ where
         tasks: RuntimeExecutionTaskScope,
         worker_state: Arc<RwLock<protocol::WorkerStateSnapshot>>,
         workspace_client: Option<Arc<dyn WorkspaceClient>>,
+        restore_operation_id: Option<crate::execution::WorkerLifecycleOperationId>,
+        workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
     ) -> Result<WorkerExecutionHandle, String> {
         let mut workers = self
             .workers
@@ -1853,6 +1869,8 @@ where
                 tasks,
                 worker_state,
                 workspace_client,
+                restore_operation_id,
+                workdir_attachments,
             },
         );
         Ok(WorkerExecutionHandle::new(
@@ -1907,6 +1925,7 @@ where
         handle: WorkerHandle,
         shutdown: Arc<tokio::sync::Mutex<Option<worker::ShutdownReceiver>>>,
         controller_task: tokio::task::JoinHandle<()>,
+        restore_operation_id: Option<crate::execution::WorkerLifecycleOperationId>,
         workdir_attachments: BTreeMap<WorkdirAttachmentAlias, WorkingDirectoryBinding>,
         workspace_client: Option<Arc<dyn WorkspaceClient>>,
     ) -> WorkerExecutionSpawnResult {
@@ -1921,6 +1940,15 @@ where
         let worker_state_snapshot = handle.shared_state.snapshot();
         let worker_state = Arc::new(RwLock::new(worker_state_snapshot));
         let tasks = RuntimeExecutionTaskScope::new(controller_task);
+        let workdir_attachment_statuses = workdir_attachments
+            .iter()
+            .map(
+                |(alias, binding)| crate::catalog::WorkingDirectoryAttachmentStatus {
+                    alias: alias.clone(),
+                    working_directory: binding.status(),
+                },
+            )
+            .collect::<Vec<_>>();
         #[cfg(feature = "ws-server")]
         {
             let mut events = streams.events;
@@ -1987,13 +2015,8 @@ where
                             Err(_) => {
                                 let retained_state =
                                     worker_state.read().ok().map(|state| state.clone());
-                                let retained_workdir_attachments = workdir_attachments
-                                    .iter()
-                                    .map(|(alias, binding)| crate::catalog::WorkingDirectoryAttachmentStatus {
-                                        alias: alias.clone(),
-                                        working_directory: binding.status(),
-                                    })
-                                    .collect();
+                                let retained_workdir_attachments =
+                                    workdir_attachment_statuses.clone();
                                 let retained_handle = self
                                     .retain_uncertain_unconnected_controller(
                                         &worker_ref,
@@ -2002,6 +2025,8 @@ where
                                         tasks,
                                         worker_state,
                                         workspace_client,
+                                        restore_operation_id,
+                                        retained_workdir_attachments.clone(),
                                     )
                                     .ok();
                                 WorkerExecutionSpawnResult::ReconciliationRequired {
@@ -2072,21 +2097,15 @@ where
                 tasks,
                 worker_state,
                 workspace_client,
+                restore_operation_id,
+                workdir_attachments: workdir_attachment_statuses.clone(),
             },
         );
 
         WorkerExecutionSpawnResult::Connected {
             handle: WorkerExecutionHandle::new(worker_ref, self.backend_id()),
             worker_state: connected_worker_state,
-            workdir_attachments: workdir_attachments
-                .into_iter()
-                .map(
-                    |(alias, binding)| crate::catalog::WorkingDirectoryAttachmentStatus {
-                        alias,
-                        working_directory: binding.status(),
-                    },
-                )
-                .collect(),
+            workdir_attachments: workdir_attachment_statuses,
         }
     }
 }
@@ -2338,6 +2357,7 @@ where
                     controller.handle,
                     controller.shutdown,
                     controller.controller_task,
+                    None,
                     BTreeMap::new(),
                     Some(controller.workspace_client),
                 );
@@ -2465,6 +2485,7 @@ where
             controller.handle,
             controller.shutdown,
             controller.controller_task,
+            None,
             workdir_attachments,
             Some(controller.workspace_client),
         )
@@ -2577,10 +2598,25 @@ where
             .workers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if workers.contains_key(&request.worker_ref) {
+        if let Some(existing) = workers.get(&request.worker_ref) {
+            if existing.restore_operation_id == Some(request.operation_id) {
+                let worker_state = existing
+                    .worker_state
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                return WorkerExecutionSpawnResult::Connected {
+                    handle: WorkerExecutionHandle::new(
+                        request.worker_ref.clone(),
+                        self.backend_id(),
+                    ),
+                    worker_state,
+                    workdir_attachments: existing.workdir_attachments.clone(),
+                };
+            }
             return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::busy(
                 WorkerExecutionOperation::Restore,
-                "Worker is already connected to execution backend",
+                "Worker is already connected to execution backend by another lifecycle operation",
             ));
         }
         drop(workers);
@@ -2671,6 +2707,7 @@ where
         let factory = self.factory.clone();
         let bridge_context = request.context.clone();
         let worker_ref = request.worker_ref.clone();
+        let operation_id = request.operation_id;
         let restore_result = self
             .run_cancellable_on_adapter_runtime(self.spawn_restore_timeout, async move {
                 factory.restore_controller(request).await
@@ -2698,6 +2735,7 @@ where
             controller.handle,
             controller.shutdown,
             controller.controller_task,
+            Some(operation_id),
             workdir_attachments,
             Some(controller.workspace_client),
         )
@@ -3555,7 +3593,13 @@ mod tests {
     fn test_execution_context(worker_ref: WorkerRef) -> WorkerExecutionContext {
         WorkerExecutionContext::new(
             worker_ref,
-            Arc::new(|_, _| panic!("unused test event sink")),
+            Arc::new(|worker_ref, payload| {
+                Ok(crate::observation::WorkerObservationEvent::new(
+                    1,
+                    worker_ref,
+                    payload,
+                ))
+            }),
         )
     }
 
@@ -4560,6 +4604,102 @@ mod tests {
             .unwrap();
         drop(restored);
         drop(restored_backend);
+    }
+
+    #[test]
+    #[serial_test::serial(worker_allocation)]
+    fn restore_reconciliation_reuses_the_operation_controller() {
+        let client = MockClient::sequential(Vec::new());
+        let runtime_base = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let observed_workspace_clients = Arc::new(Mutex::new(Vec::new()));
+        let factory = MockFactory {
+            client,
+            runtime_base: runtime_base.path().to_path_buf(),
+            cwd: cwd.path().to_path_buf(),
+            store_dir: store.path().join("sessions"),
+            worker_metadata_dir: store.path().join("workers"),
+            observed_cwds: Arc::new(Mutex::new(Vec::new())),
+            observed_workspace_clients: observed_workspace_clients.clone(),
+        };
+        let backend = Arc::new(WorkerRuntimeExecutionBackend::new(factory).unwrap());
+        let runtime = EmbeddedRuntime::with_execution_backend(
+            RuntimeOptions::default(),
+            backend.clone(),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let request = create_request("idempotent restore reconciliation");
+        let worker = runtime.create_worker(request.clone()).unwrap();
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        let operation_id = crate::execution::WorkerLifecycleOperationId::new();
+        let restore_request = WorkerExecutionRestoreRequest {
+            operation_id,
+            worker_ref: worker.worker_ref.clone(),
+            request,
+            workspace_scope: None,
+            context: test_execution_context(worker.worker_ref.clone()),
+            previous_workdir_attachments: Vec::new(),
+            logical_workdir_attachments: Vec::new(),
+            workdir_attachments: BTreeMap::new(),
+            config_bundle: None,
+        };
+
+        let first = backend.restore_worker(restore_request.clone());
+        let first_handle = match first {
+            WorkerExecutionSpawnResult::Connected { handle, .. } => handle,
+            other => panic!("initial restore was not connected: {other:?}"),
+        };
+        let factory_calls_after_restore = observed_workspace_clients.lock().unwrap().len();
+
+        let reconciled = backend.reconcile_restore(restore_request);
+        assert!(matches!(
+            reconciled,
+            WorkerExecutionSpawnResult::Connected { .. }
+        ));
+        assert_eq!(
+            observed_workspace_clients.lock().unwrap().len(),
+            factory_calls_after_restore,
+            "reconciliation must not construct a second controller"
+        );
+        let workers = backend.workers.lock().unwrap();
+        let execution = workers.get(&worker.worker_ref).unwrap();
+        assert_eq!(execution.restore_operation_id, Some(operation_id));
+        assert_eq!(workers.len(), 1);
+        drop(workers);
+
+        assert!(backend.stop_worker(&first_handle).is_accepted());
+    }
+
+    #[test]
+    fn profile_restore_run_directory_is_operation_scoped() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_store_dir = root.path().join("runtime");
+        let factory = ProfileRuntimeWorkerFactory::new(root.path())
+            .with_runtime_store_dir(&runtime_store_dir);
+        let worker_ref = WorkerRef::new(WorkerId::now_v7());
+        let operation_id = crate::execution::WorkerLifecycleOperationId::new();
+
+        let first = factory
+            .worker_restore_run_dir(&worker_ref, operation_id)
+            .unwrap();
+        let retry = factory
+            .worker_restore_run_dir(&worker_ref, operation_id)
+            .unwrap();
+        let different = factory
+            .worker_restore_run_dir(
+                &worker_ref,
+                crate::execution::WorkerLifecycleOperationId::new(),
+            )
+            .unwrap();
+
+        assert_eq!(first, retry);
+        assert_ne!(first, different);
+        assert_eq!(
+            first.file_name().unwrap().to_string_lossy(),
+            format!("restore-{operation_id}")
+        );
     }
 
     #[test]

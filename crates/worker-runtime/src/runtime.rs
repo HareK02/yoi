@@ -1668,19 +1668,25 @@ impl Runtime {
         worker_ref: &WorkerRef,
         mode: WorkerRestoreMode,
     ) -> Result<RuntimeWorkerRestoreResult, RuntimeError> {
-        let operation_id = WorkerLifecycleOperationId::new();
-        let (backend, request) = {
+        let fresh_operation_id = WorkerLifecycleOperationId::new();
+        let (backend, request, operation_id, operation_mode, reconcile) = {
             let state = self.lock()?;
             state.ensure_running()?;
             let worker = state.worker(worker_ref)?;
-            if worker.has_pending_lifecycle_operation() {
+            if worker.pending_stop.is_some() {
                 return Ok(RuntimeWorkerRestoreResult::failed(
                     WorkerRestoreState::ReconciliationRequired,
-                    "worker_restore_reconciliation_pending",
-                    "Worker restore reconciliation is still pending",
+                    "worker_stop_reconciliation_pending",
+                    "Worker stop reconciliation is still pending",
                 ));
             }
-            if worker.execution_handle.is_some() {
+            let pending_restore = worker.pending_restore;
+            let reconcile = pending_restore.is_some();
+            let operation_id = pending_restore
+                .map(|pending| pending.operation_id)
+                .unwrap_or(fresh_operation_id);
+            let operation_mode = pending_restore.map(|pending| pending.mode).unwrap_or(mode);
+            if !reconcile && worker.execution_handle.is_some() {
                 if worker.status.is_active() {
                     return Ok(RuntimeWorkerRestoreResult::accepted(worker.detail()));
                 }
@@ -1695,7 +1701,8 @@ impl Runtime {
             // before Workspace Backend renewed operation-scoped Repository
             // access). Preserve its automatic intent so an explicit restore can
             // serve as the authorized retry for that state.
-            if mode == WorkerRestoreMode::Explicit
+            if !reconcile
+                && mode == WorkerRestoreMode::Explicit
                 && worker.execution_metadata_available
                 && worker.status != WorkerStatus::Stopped
                 && worker.restore_intent != WorkerRestoreIntent::Automatic
@@ -1706,7 +1713,8 @@ impl Runtime {
                     "Worker restore requires a stopped Worker",
                 ));
             }
-            if mode == WorkerRestoreMode::Automatic
+            if !reconcile
+                && mode == WorkerRestoreMode::Automatic
                 && (!worker.status.is_active()
                     || worker.restore_intent != WorkerRestoreIntent::Automatic)
             {
@@ -1743,10 +1751,10 @@ impl Runtime {
                 workdir_attachments: BTreeMap::new(),
                 config_bundle: None,
             };
-            (backend, request)
+            (backend, request, operation_id, operation_mode, reconcile)
         };
 
-        if let Err(_result) = backend.preflight_restore(&request) {
+        if !reconcile && let Err(_result) = backend.preflight_restore(&request) {
             return Ok(RuntimeWorkerRestoreResult::failed(
                 WorkerRestoreState::Rejected,
                 "worker_restore_preflight_rejected",
@@ -1754,7 +1762,10 @@ impl Runtime {
             ));
         }
 
-        if let Err(error) = self.begin_restore_operation(worker_ref, operation_id, mode) {
+        if !reconcile
+            && let Err(error) =
+                self.begin_restore_operation(worker_ref, operation_id, operation_mode)
+        {
             if matches!(error, RuntimeError::StoreCommitOutcomeUnknown { .. }) {
                 return Ok(RuntimeWorkerRestoreResult::failed(
                     WorkerRestoreState::ReconciliationRequired,
@@ -1765,7 +1776,12 @@ impl Runtime {
             return Err(error);
         }
 
-        match backend.restore_worker(request) {
+        let restore_result = if reconcile {
+            backend.reconcile_restore(request)
+        } else {
+            backend.restore_worker(request)
+        };
+        match restore_result {
             WorkerExecutionSpawnResult::Connected {
                 handle,
                 worker_state,
@@ -1860,6 +1876,13 @@ impl Runtime {
                 }
             }
             WorkerExecutionSpawnResult::Rejected(_result) => {
+                if reconcile {
+                    return Ok(RuntimeWorkerRestoreResult::failed(
+                        WorkerRestoreState::ReconciliationRequired,
+                        "worker_restore_reconciliation_rejected",
+                        "Worker restore reconciliation was not completed",
+                    ));
+                }
                 if let Err(error) = self.settle_restore_rollback(worker_ref) {
                     tracing::error!(
                         worker_id = %worker_ref.worker_id,
@@ -2918,6 +2941,32 @@ impl Runtime {
                     worker_id = %worker_ref.worker_id,
                     error = %error,
                     "Worker stop reconciliation remains pending after Runtime startup"
+                );
+            }
+        }
+
+        let pending_restores = {
+            let state = self.lock()?;
+            state
+                .workers
+                .values()
+                .filter_map(|worker| {
+                    worker
+                        .pending_restore
+                        .map(|pending| (worker.worker_ref.clone(), pending.mode))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (worker_ref, mode) in pending_restores {
+            let operation_lock = self.worker_operation_lock(worker_ref.worker_id)?;
+            let _operation_guard = operation_lock
+                .lock()
+                .map_err(|_| RuntimeError::StatePoisoned)?;
+            if let Err(error) = self.restore_worker_under_lock(&worker_ref, mode) {
+                tracing::warn!(
+                    worker_id = %worker_ref.worker_id,
+                    error = %error,
+                    "Worker restore reconciliation remains pending after Runtime startup"
                 );
             }
         }
@@ -8806,18 +8855,20 @@ mod tests {
         let retry = runtime
             .restore_worker_operation(&created.worker_ref)
             .unwrap();
-        assert_eq!(retry.state, WorkerRestoreState::ReconciliationRequired);
-        assert_eq!(*backend.restore_count.lock().unwrap(), 1);
+        assert_eq!(retry.state, WorkerRestoreState::Accepted);
+        assert_eq!(*backend.restore_count.lock().unwrap(), 2);
         assert_eq!(
+            backend.restore_operation_ids.lock().unwrap().as_slice(),
+            &[operation_id, operation_id]
+        );
+        assert!(
             runtime
                 .lock()
                 .unwrap()
                 .worker(&created.worker_ref)
                 .unwrap()
                 .pending_restore
-                .unwrap()
-                .operation_id,
-            operation_id
+                .is_none()
         );
     }
 
@@ -9226,24 +9277,28 @@ mod tests {
         let retry = restarted
             .restore_worker_operation(&worker.worker_ref)
             .unwrap();
-        assert_eq!(retry.state, WorkerRestoreState::ReconciliationRequired);
-        assert_eq!(*restarted_backend.restore_count.lock().unwrap(), 0);
+        assert_eq!(retry.state, WorkerRestoreState::Accepted);
+        assert_eq!(*restarted_backend.restore_count.lock().unwrap(), 1);
         assert_eq!(
+            restarted_backend
+                .restore_operation_ids
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &[operation_id]
+        );
+        assert!(
             restarted
                 .lock()
                 .unwrap()
                 .worker(&worker.worker_ref)
                 .unwrap()
                 .pending_restore
-                .unwrap()
-                .operation_id,
-            operation_id
+                .is_none()
         );
-        let delete_error = restarted.delete_worker(&worker.worker_ref).unwrap_err();
-        assert!(
-            delete_error
-                .to_string()
-                .contains("pending restore reconciliation")
+        assert_eq!(
+            restarted.worker_detail(&worker.worker_ref).unwrap().status,
+            WorkerStatus::Idle
         );
 
         let _ = std::fs::remove_dir_all(root);
@@ -9298,37 +9353,32 @@ mod tests {
         let retry = restored
             .restore_worker_operation(&worker.worker_ref)
             .unwrap();
-        assert_eq!(retry.state, WorkerRestoreState::ReconciliationRequired);
-        assert_eq!(*restoring_backend.restore_count.lock().unwrap(), 1);
-
-        drop(restored);
-        let restarted_backend = Arc::new(TestExecutionBackend::default());
-        let restarted = Runtime::with_fs_store_and_execution_backend(
-            crate::fs_store::FsRuntimeStoreOptions {
-                root: root.clone(),
-                runtime_id: "test-runtime".to_string(),
-                display_name: None,
-            },
-            restarted_backend.clone(),
-        )
-        .unwrap();
-        assert_eq!(*restarted_backend.restore_count.lock().unwrap(), 0);
+        assert_eq!(retry.state, WorkerRestoreState::Accepted);
+        assert_eq!(*restoring_backend.restore_count.lock().unwrap(), 2);
         assert_eq!(
-            restarted
+            restoring_backend
+                .restore_operation_ids
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &[operation_id, operation_id]
+        );
+        assert!(
+            restored
                 .lock()
                 .unwrap()
                 .worker(&worker.worker_ref)
                 .unwrap()
                 .pending_restore
-                .unwrap()
-                .operation_id,
-            operation_id
+                .is_none()
         );
-        let retry = restarted
-            .restore_worker_operation(&worker.worker_ref)
+        restored
+            .send_input(
+                &worker.worker_ref,
+                WorkerInput::user("after restore reconciliation"),
+            )
             .unwrap();
-        assert_eq!(retry.state, WorkerRestoreState::ReconciliationRequired);
-        assert_eq!(*restarted_backend.restore_count.lock().unwrap(), 0);
+        restored.stop_worker(&worker.worker_ref, None).unwrap();
 
         let _ = std::fs::remove_dir_all(root);
     }
