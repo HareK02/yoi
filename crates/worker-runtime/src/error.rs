@@ -96,6 +96,17 @@ pub enum RuntimeError {
         source: std::io::Error,
     },
 
+    #[error(
+        "runtime store {operation} may have committed at {} before durability confirmation failed: {source}",
+        path.display()
+    )]
+    StoreCommitOutcomeUnknown {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("runtime store {operation} missing data at {}", path.display())]
     StoreMissing {
         operation: &'static str,

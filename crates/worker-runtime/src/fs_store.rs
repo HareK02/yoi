@@ -18,11 +18,12 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-const SCHEMA_VERSION: u32 = 8;
-const PREVIOUS_SCHEMA_VERSION: u32 = 7;
-const LEGACY_SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 9;
+const PREVIOUS_SCHEMA_VERSION: u32 = 8;
+const LEGACY_SCHEMA_VERSION: u32 = 7;
+const OLDEST_SCHEMA_VERSION: u32 = 6;
 const RUNTIME_FILE: &str = "runtime.json";
 const WORKERS_DIR: &str = "workers";
 const ORPHANED_WORKERS_DIR: &str = "orphaned-workers";
@@ -34,6 +35,24 @@ const MAX_WORKER_RECORD_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_PERSISTED_WORKER_RECORDS: usize = 4096;
 
 static NEXT_TMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum AtomicWriteFault {
+    None = 0,
+    BeforeRename = 1,
+    AfterRename = 2,
+}
+
+impl AtomicWriteFault {
+    fn take(slot: &AtomicU8) -> Self {
+        match slot.swap(Self::None as u8, Ordering::AcqRel) {
+            value if value == Self::BeforeRename as u8 => Self::BeforeRename,
+            value if value == Self::AfterRename as u8 => Self::AfterRename,
+            _ => Self::None,
+        }
+    }
+}
 
 /// Options for constructing a filesystem-backed Runtime store.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,6 +96,7 @@ impl Drop for RuntimeStoreOwnerLock {
 pub struct FsRuntimeStore {
     root: PathBuf,
     _owner_lock: Option<Arc<RuntimeStoreOwnerLock>>,
+    worker_write_fault: Arc<AtomicU8>,
 }
 
 impl PartialEq for FsRuntimeStore {
@@ -109,6 +129,11 @@ impl FsRuntimeStore {
 
     pub fn runtime_dir(&self) -> &Path {
         &self.root
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_worker_write(&self, fault: AtomicWriteFault) {
+        self.worker_write_fault.store(fault as u8, Ordering::Release);
     }
 
     pub(crate) fn open_or_create(
@@ -169,6 +194,7 @@ impl FsRuntimeStore {
         let store = Self {
             root,
             _owner_lock: Some(owner_lock),
+            worker_write_fault: Arc::new(AtomicU8::new(AtomicWriteFault::None as u8)),
         };
         let state = if snapshot_exists {
             Some(store.load_runtime_state()?)
@@ -197,18 +223,12 @@ impl FsRuntimeStore {
             path: worker_dir.clone(),
             source,
         })?;
-        atomic_write_json(
+        atomic_write_json_with_fault(
             &worker_dir.join(WORKER_FILE),
-            &WorkerIdentityRecord::from_persisted(worker),
-            "write Worker identity",
+            &WorkerAggregateRecord::from_persisted(worker),
+            "write Worker aggregate",
+            AtomicWriteFault::take(&self.worker_write_fault),
         )?;
-        if let PersistedWorkerExecutionState::Available(execution) = &worker.execution_state {
-            atomic_write_json(
-                &worker_dir.join(WORKER_EXECUTION_FILE),
-                &WorkerExecutionRecord::from_persisted(execution),
-                "write Worker execution record",
-            )?;
-        }
         remove_legacy_observations(&worker_dir);
         Ok(())
     }
@@ -285,44 +305,32 @@ impl FsRuntimeStore {
                 );
                 continue;
             }
-            let identity_path = path.join(WORKER_FILE);
-            let identity: WorkerIdentityRecord =
-                match read_bounded_json(&identity_path, "read Worker identity") {
-                    Ok(identity) => identity,
+            let aggregate_path = path.join(WORKER_FILE);
+            let aggregate: WorkerAggregateRecord =
+                match read_bounded_json(&aggregate_path, "read Worker aggregate") {
+                    Ok(aggregate) => aggregate,
                     Err(_error) => {
                         record_worker_load_diagnostic(
                             &mut snapshot,
                             None,
-                            "ignored corrupt Worker identity while loading Runtime store",
+                            "ignored corrupt Worker aggregate while loading Runtime store",
                         );
                         continue;
                     }
                 };
-            if identity.validate(&identity_path).is_err() {
-                record_worker_load_diagnostic(
-                    &mut snapshot,
-                    Some(identity.worker_ref.clone()),
-                    "ignored invalid Worker identity while loading Runtime store",
-                );
-                continue;
-            }
-            let execution_path = path.join(WORKER_EXECUTION_FILE);
-            let execution_state = read_bounded_json::<WorkerExecutionRecord>(
-                &execution_path,
-                "read Worker execution record",
-            )
-            .and_then(|execution| execution.validate(&identity, &execution_path))
-            .map(PersistedWorkerExecutionState::Available)
-            .unwrap_or_else(|_error| {
-                record_worker_load_diagnostic(
-                    &mut snapshot,
-                    Some(identity.worker_ref.clone()),
-                    "Worker execution record is unavailable; retained Worker identity",
-                );
-                PersistedWorkerExecutionState::Unavailable
-            });
+            let worker_ref = aggregate.worker_ref.clone();
+            let worker = match aggregate.validate(&aggregate_path) {
+                Ok(worker) => worker,
+                Err(_error) => {
+                    record_worker_load_diagnostic(
+                        &mut snapshot,
+                        Some(worker_ref),
+                        "ignored invalid Worker aggregate while loading Runtime store",
+                    );
+                    continue;
+                }
+            };
             remove_legacy_observations(&path);
-            let worker = identity.into_persisted(execution_state);
             if workers.insert(worker.worker_id.clone(), worker).is_some() {
                 record_worker_load_diagnostic(
                     &mut snapshot,
@@ -557,8 +565,8 @@ fn plan_runtime_store_migration(
             format!("Runtime store schema version {schema_version} is out of range"),
         )
     })?;
-    let staging = migration_sibling(root, "schema-v8-staging")?;
-    let backup = migration_sibling(root, "pre-schema-v8-backup")?;
+    let staging = migration_sibling(root, "schema-v9-staging")?;
+    let backup = migration_sibling(root, "pre-schema-v9-backup")?;
     if staging.exists() || backup.exists() {
         return Err(runtime_store_corrupt(
             root,
@@ -587,12 +595,12 @@ fn plan_runtime_store_migration(
     }
     if !matches!(
         current_schema_version,
-        LEGACY_SCHEMA_VERSION | PREVIOUS_SCHEMA_VERSION
+        OLDEST_SCHEMA_VERSION | LEGACY_SCHEMA_VERSION | PREVIOUS_SCHEMA_VERSION
     ) {
         return Err(runtime_store_corrupt(
             &runtime_path,
             format!(
-                "unsupported Runtime store schema version {schema_version}; expected {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
+                "unsupported Runtime store schema version {schema_version}; expected {OLDEST_SCHEMA_VERSION}, {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
             ),
         ));
     }
@@ -697,23 +705,22 @@ fn plan_runtime_store_migration(
     for worker in &mut planned {
         let snapshot_path = worker.source_dir.join(WORKER_FILE);
         let snapshot: serde_json::Value = read_json(&snapshot_path, "read Worker record")?;
-        let migrated = migrate_worker_document(
+        let migrated = migrate_worker_record(
             snapshot,
             current_schema_version,
             worker.legacy_mapping.as_ref(),
             &snapshot_path,
         )?;
-        let identity = validate_migrated_worker_documents(&migrated, &snapshot_path)?;
-        if identity.worker_id != worker.worker_id {
+        if migrated.worker_id != worker.worker_id {
             return Err(runtime_store_corrupt(
                 &snapshot_path,
                 format!(
                     "Worker identity {} does not match directory identity {}",
-                    identity.worker_id, worker.worker_id
+                    migrated.worker_id, worker.worker_id
                 ),
             ));
         }
-        worker.workspace_id = worker.workspace_id.clone().or(identity.workspace_id);
+        worker.workspace_id = worker.workspace_id.clone().or(migrated.workspace_id);
 
         let metadata_path = worker.source_dir.join(WORKER_METADATA_FILE);
         if metadata_path.is_file() {
@@ -807,7 +814,7 @@ fn migrate_schema_v6_worker_document_to_v7(
     }
     object.insert(
         "schema_version".to_string(),
-        serde_json::Value::from(PREVIOUS_SCHEMA_VERSION),
+        serde_json::Value::from(LEGACY_SCHEMA_VERSION),
     );
     Ok(document)
 }
@@ -818,19 +825,19 @@ fn migrate_worker_document(
     _mapping: Option<&LegacyWorkerIdentityMapping>,
     identity_path: &Path,
 ) -> Result<MigratedWorkerDocuments, RuntimeError> {
-    let mut document = if source_schema_version == LEGACY_SCHEMA_VERSION {
+    let mut document = if source_schema_version == OLDEST_SCHEMA_VERSION {
         migrate_schema_v6_worker_document_to_v7(document, identity_path)?
     } else {
         document
     };
     if !matches!(
         source_schema_version,
-        LEGACY_SCHEMA_VERSION | PREVIOUS_SCHEMA_VERSION
+        OLDEST_SCHEMA_VERSION | LEGACY_SCHEMA_VERSION
     ) {
         return Err(runtime_store_corrupt(
             identity_path,
             format!(
-                "unsupported Worker identity schema {source_schema_version}; expected {LEGACY_SCHEMA_VERSION} or {PREVIOUS_SCHEMA_VERSION}"
+                "unsupported Worker identity schema {source_schema_version}; expected {OLDEST_SCHEMA_VERSION} or {LEGACY_SCHEMA_VERSION}"
             ),
         ));
     }
@@ -879,11 +886,11 @@ fn migrate_worker_document(
     execution.insert("request".to_string(), request_value);
     execution.insert(
         "schema_version".to_string(),
-        serde_json::Value::from(SCHEMA_VERSION),
+        serde_json::Value::from(PREVIOUS_SCHEMA_VERSION),
     );
     object.insert(
         "schema_version".to_string(),
-        serde_json::Value::from(SCHEMA_VERSION),
+        serde_json::Value::from(PREVIOUS_SCHEMA_VERSION),
     );
     let migrated = MigratedWorkerDocuments {
         identity: document,
@@ -904,7 +911,7 @@ fn validate_migrated_worker_documents(
                 format!("decode migrated Worker identity: {error}"),
             )
         })?;
-    identity.validate(identity_path)?;
+    identity.validate_for_schema(identity_path, PREVIOUS_SCHEMA_VERSION)?;
     let execution_path = identity_path.with_file_name(WORKER_EXECUTION_FILE);
     let execution: WorkerExecutionRecord = serde_json::from_value(documents.execution.clone())
         .map_err(|error| {
@@ -913,8 +920,54 @@ fn validate_migrated_worker_documents(
                 format!("decode migrated Worker execution record: {error}"),
             )
         })?;
-    execution.validate(&identity, &execution_path)?;
+    execution.validate_for_schema(&identity, &execution_path, PREVIOUS_SCHEMA_VERSION)?;
     Ok(identity)
+}
+
+fn migrate_worker_record(
+    identity_document: serde_json::Value,
+    source_schema_version: u32,
+    mapping: Option<&LegacyWorkerIdentityMapping>,
+    identity_path: &Path,
+) -> Result<WorkerAggregateRecord, RuntimeError> {
+    if source_schema_version == PREVIOUS_SCHEMA_VERSION {
+        let identity: WorkerIdentityRecord = serde_json::from_value(identity_document).map_err(|error| {
+            runtime_store_corrupt(
+                identity_path,
+                format!("decode schema-v8 Worker identity: {error}"),
+            )
+        })?;
+        identity.validate_for_schema(identity_path, PREVIOUS_SCHEMA_VERSION)?;
+        let execution_path = identity_path.with_file_name(WORKER_EXECUTION_FILE);
+        let execution: WorkerExecutionRecord =
+            read_bounded_json(&execution_path, "read schema-v8 Worker execution record")?;
+        execution.validate_for_schema(&identity, &execution_path, PREVIOUS_SCHEMA_VERSION)?;
+        return Ok(WorkerAggregateRecord::from_v8(identity, execution));
+    }
+
+    let documents = migrate_worker_document(
+        identity_document,
+        source_schema_version,
+        mapping,
+        identity_path,
+    )?;
+    let identity: WorkerIdentityRecord = serde_json::from_value(documents.identity).map_err(|error| {
+        runtime_store_corrupt(
+            identity_path,
+            format!("decode validated schema-v8 Worker identity: {error}"),
+        )
+    })?;
+    let execution_path = identity_path.with_file_name(WORKER_EXECUTION_FILE);
+    let execution: WorkerExecutionRecord =
+        serde_json::from_value(documents.execution).map_err(|error| {
+            runtime_store_corrupt(
+                &execution_path,
+                format!("decode validated schema-v8 Worker execution record: {error}"),
+            )
+        })?;
+    identity.validate_for_schema(identity_path, PREVIOUS_SCHEMA_VERSION)?;
+    execution.validate_for_schema(&identity, &execution_path, PREVIOUS_SCHEMA_VERSION)?;
+    Ok(WorkerAggregateRecord::from_v8(identity, execution))
 }
 
 fn runtime_worker_name(worker_id: WorkerId) -> String {
@@ -1178,6 +1231,7 @@ fn validate_current_runtime_store(root: &Path) -> Result<(), RuntimeError> {
     let store = FsRuntimeStore {
         root: root.to_path_buf(),
         _owner_lock: None,
+        worker_write_fault: Arc::new(AtomicU8::new(AtomicWriteFault::None as u8)),
     };
     store.load_runtime_state().map(|_| ())
 }
@@ -1186,6 +1240,7 @@ fn validate_completed_migration_staging(root: &Path) -> Result<(), RuntimeError>
     let store = FsRuntimeStore {
         root: root.to_path_buf(),
         _owner_lock: None,
+        worker_write_fault: Arc::new(AtomicU8::new(AtomicWriteFault::None as u8)),
     };
     let state = store.load_runtime_state()?;
     if let Some(worker) = state.workers.values().find(|worker| {
@@ -1224,8 +1279,8 @@ fn remove_runtime_migration_directory(path: &Path) -> Result<(), RuntimeError> {
 }
 
 fn recover_runtime_store_migration(root: &Path) -> Result<(), RuntimeError> {
-    let staging = migration_sibling(root, "schema-v8-staging")?;
-    let backup = migration_sibling(root, "pre-schema-v8-backup")?;
+    let staging = migration_sibling(root, "schema-v9-staging")?;
+    let backup = migration_sibling(root, "pre-schema-v9-backup")?;
     let root_exists = migration_directory_exists(root)?;
     let staging_exists = migration_directory_exists(&staging)?;
     let backup_exists = migration_directory_exists(&backup)?;
@@ -1427,8 +1482,8 @@ fn migrate_runtime_store(
     if !plan.migration_required {
         return Ok(plan);
     }
-    let staging = migration_sibling(root, "schema-v8-staging")?;
-    let backup = migration_sibling(root, "pre-schema-v8-backup")?;
+    let staging = migration_sibling(root, "schema-v9-staging")?;
+    let backup = migration_sibling(root, "pre-schema-v9-backup")?;
     if staging.exists() || backup.exists() {
         return Err(runtime_store_corrupt(
             root,
@@ -1556,7 +1611,7 @@ fn migrate_runtime_store_in_place(
                 ),
             )
         })?;
-        let documents = migrate_worker_document(
+        let aggregate = migrate_worker_record(
             snapshot,
             plan.current_schema_version,
             planned_worker.legacy_mapping.as_ref(),
@@ -1585,17 +1640,24 @@ fn migrate_runtime_store_in_place(
             fs::rename(source_dir, &migrated_dir)
                 .map_err(|error| runtime_io_error("rename", source_dir, error))?;
         }
-        let migrated_identity_path = migrated_dir.join(WORKER_FILE);
+        let migrated_aggregate_path = migrated_dir.join(WORKER_FILE);
         atomic_write_json(
-            &migrated_identity_path,
-            &documents.identity,
-            "migrate Worker identity",
+            &migrated_aggregate_path,
+            &aggregate,
+            "migrate Worker aggregate",
         )?;
-        atomic_write_json(
-            &migrated_dir.join(WORKER_EXECUTION_FILE),
-            &documents.execution,
-            "migrate Worker execution record",
-        )?;
+        let legacy_execution_path = migrated_dir.join(WORKER_EXECUTION_FILE);
+        match fs::remove_file(&legacy_execution_path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(runtime_io_error(
+                    "remove migrated Worker execution record",
+                    &legacy_execution_path,
+                    source,
+                ));
+            }
+        }
         if let Some(metadata) = metadata {
             atomic_write_json(
                 &migrated_dir.join(WORKER_METADATA_FILE),
@@ -1711,6 +1773,121 @@ impl RuntimeSnapshot {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct WorkerAggregateRecord {
+    schema_version: u32,
+    worker_ref: WorkerRef,
+    worker_id: WorkerId,
+    profile: ProfileSelector,
+    display_name: Option<String>,
+    profile_source: ProfileSourceArchiveRef,
+    config_bundle: Option<ConfigBundleRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_at_ms: Option<u64>,
+    status: WorkerStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    workdir_attachments: Vec<WorkingDirectoryAttachmentStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    logical_workdir_attachments: Vec<LogicalWorkdirAttachment>,
+    execution_state: WorkerExecutionStateRecord,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "state", content = "execution", rename_all = "snake_case")]
+enum WorkerExecutionStateRecord {
+    Available(WorkerExecutionData),
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerExecutionData {
+    request: CreateWorkerRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binding: Option<PersistedWorkerExecutionBinding>,
+    restore_intent: WorkerRestoreIntent,
+}
+
+impl WorkerAggregateRecord {
+    fn from_persisted(worker: &PersistedWorkerRecord) -> Self {
+        let execution_state = match &worker.execution_state {
+            PersistedWorkerExecutionState::Available(execution) => {
+                WorkerExecutionStateRecord::Available(WorkerExecutionData {
+                    request: execution.request.clone(),
+                    binding: execution.binding.clone(),
+                    restore_intent: execution.restore_intent,
+                })
+            }
+            PersistedWorkerExecutionState::Unavailable => WorkerExecutionStateRecord::Unavailable,
+        };
+        Self {
+            schema_version: SCHEMA_VERSION,
+            worker_ref: worker.worker_ref.clone(),
+            worker_id: worker.worker_id,
+            profile: worker.profile.clone(),
+            display_name: worker.display_name.clone(),
+            profile_source: worker.profile_source.clone(),
+            config_bundle: worker.config_bundle.clone(),
+            created_at_ms: worker.created_at_ms,
+            status: worker.status,
+            workspace_id: worker.workspace_id.clone(),
+            workdir_attachments: worker.workdir_attachments.clone(),
+            logical_workdir_attachments: worker.logical_workdir_attachments.clone(),
+            execution_state,
+        }
+    }
+
+    fn from_v8(identity: WorkerIdentityRecord, execution: WorkerExecutionRecord) -> Self {
+        let persisted = identity.into_persisted(PersistedWorkerExecutionState::Available(
+            PersistedWorkerExecution {
+                request: execution.request,
+                binding: execution.binding,
+                restore_intent: execution.restore_intent,
+            },
+        ));
+        Self::from_persisted(&persisted)
+    }
+
+    fn validate(self, path: &Path) -> Result<PersistedWorkerRecord, RuntimeError> {
+        let identity = WorkerIdentityRecord {
+            schema_version: self.schema_version,
+            worker_ref: self.worker_ref,
+            worker_id: self.worker_id,
+            profile: self.profile,
+            display_name: self.display_name,
+            profile_source: self.profile_source,
+            config_bundle: self.config_bundle,
+            created_at_ms: self.created_at_ms,
+            status: self.status,
+            workspace_id: self.workspace_id,
+            workdir_attachments: self.workdir_attachments,
+            logical_workdir_attachments: self.logical_workdir_attachments,
+            legacy_working_directory: None,
+        };
+        identity.validate_for_schema(path, SCHEMA_VERSION)?;
+        let execution_state = match self.execution_state {
+            WorkerExecutionStateRecord::Available(execution) => {
+                let execution = WorkerExecutionRecord {
+                    schema_version: SCHEMA_VERSION,
+                    request: execution.request,
+                    binding: execution.binding,
+                    restore_intent: execution.restore_intent,
+                };
+                PersistedWorkerExecutionState::Available(execution.validate_for_schema(
+                    &identity,
+                    path,
+                    SCHEMA_VERSION,
+                )?)
+            }
+            WorkerExecutionStateRecord::Unavailable => PersistedWorkerExecutionState::Unavailable,
+        };
+        Ok(identity.into_persisted(execution_state))
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WorkerIdentityRecord {
     schema_version: u32,
     worker_ref: WorkerRef,
@@ -1819,32 +1996,14 @@ impl<'de> Deserialize<'de> for WorkerExecutionRecord {
 }
 
 impl WorkerIdentityRecord {
-    fn from_persisted(worker: &PersistedWorkerRecord) -> Self {
-        Self {
-            schema_version: SCHEMA_VERSION,
-            worker_ref: worker.worker_ref.clone(),
-            worker_id: worker.worker_id,
-            profile: worker.profile.clone(),
-            display_name: worker.display_name.clone(),
-            profile_source: worker.profile_source.clone(),
-            config_bundle: worker.config_bundle.clone(),
-            created_at_ms: worker.created_at_ms,
-            status: worker.status,
-            workspace_id: worker.workspace_id.clone(),
-            workdir_attachments: worker.workdir_attachments.clone(),
-            logical_workdir_attachments: worker.logical_workdir_attachments.clone(),
-            legacy_working_directory: None,
-        }
-    }
-
-    fn validate(&self, path: &Path) -> Result<(), RuntimeError> {
-        if self.schema_version != SCHEMA_VERSION {
+    fn validate_for_schema(&self, path: &Path, expected_schema: u32) -> Result<(), RuntimeError> {
+        if self.schema_version != expected_schema {
             return Err(RuntimeError::StoreCorrupt {
                 operation: "read Worker identity",
                 path: path.to_path_buf(),
                 message: format!(
                     "unsupported schema version {}, expected {}",
-                    self.schema_version, SCHEMA_VERSION
+                    self.schema_version, expected_schema
                 ),
             });
         }
@@ -1912,27 +2071,19 @@ impl WorkerIdentityRecord {
 }
 
 impl WorkerExecutionRecord {
-    fn from_persisted(execution: &PersistedWorkerExecution) -> Self {
-        Self {
-            schema_version: SCHEMA_VERSION,
-            request: execution.request.clone(),
-            binding: execution.binding.clone(),
-            restore_intent: execution.restore_intent,
-        }
-    }
-
-    fn validate(
+    fn validate_for_schema(
         &self,
         identity: &WorkerIdentityRecord,
         path: &Path,
+        expected_schema: u32,
     ) -> Result<PersistedWorkerExecution, RuntimeError> {
-        if self.schema_version != SCHEMA_VERSION {
+        if self.schema_version != expected_schema {
             return Err(RuntimeError::StoreCorrupt {
                 operation: "read Worker execution record",
                 path: path.to_path_buf(),
                 message: format!(
                     "unsupported schema version {}, expected {}",
-                    self.schema_version, SCHEMA_VERSION
+                    self.schema_version, expected_schema
                 ),
             });
         }
@@ -2071,6 +2222,18 @@ fn atomic_write_json<T>(path: &Path, value: &T, operation: &'static str) -> Resu
 where
     T: Serialize,
 {
+    atomic_write_json_with_fault(path, value, operation, AtomicWriteFault::None)
+}
+
+fn atomic_write_json_with_fault<T>(
+    path: &Path,
+    value: &T,
+    operation: &'static str,
+    fault: AtomicWriteFault,
+) -> Result<(), RuntimeError>
+where
+    T: Serialize,
+{
     let parent = path.parent().ok_or_else(|| RuntimeError::StoreCorrupt {
         operation,
         path: path.to_path_buf(),
@@ -2112,12 +2275,32 @@ where
             source,
         })?;
         drop(file);
+        if fault == AtomicWriteFault::BeforeRename {
+            return Err(RuntimeError::StoreIo {
+                operation,
+                path: path.to_path_buf(),
+                source: std::io::Error::other("injected failure before atomic rename"),
+            });
+        }
         fs::rename(&tmp_path, path).map_err(|source| RuntimeError::StoreIo {
             operation,
             path: path.to_path_buf(),
             source,
         })?;
-        sync_directory(parent, operation)
+        if fault == AtomicWriteFault::AfterRename {
+            return Err(RuntimeError::StoreCommitOutcomeUnknown {
+                operation,
+                path: path.to_path_buf(),
+                source: std::io::Error::other("injected failure after atomic rename"),
+            });
+        }
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| RuntimeError::StoreCommitOutcomeUnknown {
+                operation,
+                path: path.to_path_buf(),
+                source,
+            })
     })();
 
     if write_result.is_err() {
@@ -2152,7 +2335,7 @@ fn sync_directory(path: &Path, operation: &'static str) -> Result<(), RuntimeErr
 mod tests {
     use super::*;
 
-    fn write_empty_schema_v7_store(root: &Path) {
+    fn write_empty_schema_v8_store(root: &Path) {
         fs::create_dir_all(root.join(WORKERS_DIR)).unwrap();
         fs::write(
             root.join(RUNTIME_FILE),
@@ -2378,7 +2561,7 @@ mod tests {
 
     fn schema_v7_worker_document(worker_id: WorkerId) -> serde_json::Value {
         serde_json::json!({
-            "schema_version": PREVIOUS_SCHEMA_VERSION,
+            "schema_version": LEGACY_SCHEMA_VERSION,
             "worker_ref": { "worker_id": worker_id },
             "worker_id": worker_id,
             "request": {
@@ -2410,7 +2593,7 @@ mod tests {
 
     fn schema_v6_worker_document(worker_id: WorkerId) -> serde_json::Value {
         let mut document = schema_v7_worker_document(worker_id);
-        document["schema_version"] = serde_json::json!(LEGACY_SCHEMA_VERSION);
+        document["schema_version"] = serde_json::json!(OLDEST_SCHEMA_VERSION);
         document["execution"]["last_run_generation"] = serde_json::json!(7);
         document["execution"]["binding"] = serde_json::json!({ "run_generation": 7 });
         document
@@ -2557,8 +2740,8 @@ mod tests {
     fn startup_recovers_staging_created_before_source_backup() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime-store");
-        write_empty_schema_v7_store(&root);
-        let staging = migration_sibling(&root, "schema-v8-staging").unwrap();
+        write_empty_schema_v8_store(&root);
+        let staging = migration_sibling(&root, "schema-v9-staging").unwrap();
         fs::create_dir_all(&staging).unwrap();
         fs::write(staging.join("partial"), b"partial").unwrap();
         let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
@@ -2572,8 +2755,8 @@ mod tests {
     fn startup_restores_backup_when_source_was_renamed_before_activation() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime-store");
-        write_empty_schema_v7_store(&root);
-        let backup = migration_sibling(&root, "pre-schema-v8-backup").unwrap();
+        write_empty_schema_v8_store(&root);
+        let backup = migration_sibling(&root, "pre-schema-v9-backup").unwrap();
         fs::rename(&root, &backup).unwrap();
         let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
 
@@ -2586,11 +2769,11 @@ mod tests {
     fn startup_promotes_valid_staging_after_source_backup() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime-store");
-        write_empty_schema_v7_store(&root);
-        let staging = migration_sibling(&root, "schema-v8-staging").unwrap();
+        write_empty_schema_v8_store(&root);
+        let staging = migration_sibling(&root, "schema-v9-staging").unwrap();
         copy_runtime_tree(&root, &root, &staging).unwrap();
         migrate_runtime_store_in_place(&staging, "test-runtime").unwrap();
-        let backup = migration_sibling(&root, "pre-schema-v8-backup").unwrap();
+        let backup = migration_sibling(&root, "pre-schema-v9-backup").unwrap();
         fs::rename(&root, &backup).unwrap();
         let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
 
@@ -2604,11 +2787,11 @@ mod tests {
     fn startup_restores_backup_when_staging_is_incomplete() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime-store");
-        write_empty_schema_v7_store(&root);
-        let staging = migration_sibling(&root, "schema-v8-staging").unwrap();
+        write_empty_schema_v8_store(&root);
+        let staging = migration_sibling(&root, "schema-v9-staging").unwrap();
         fs::create_dir_all(&staging).unwrap();
         fs::write(staging.join(RUNTIME_FILE), b"{\"schema_version\":8}").unwrap();
-        let backup = migration_sibling(&root, "pre-schema-v8-backup").unwrap();
+        let backup = migration_sibling(&root, "pre-schema-v9-backup").unwrap();
         fs::rename(&root, &backup).unwrap();
 
         let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
@@ -2623,10 +2806,10 @@ mod tests {
     fn startup_removes_backup_left_after_activation() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime-store");
-        write_empty_schema_v7_store(&root);
+        write_empty_schema_v8_store(&root);
         migrate_runtime_store_in_place(&root, "test-runtime").unwrap();
-        let backup = migration_sibling(&root, "pre-schema-v8-backup").unwrap();
-        write_empty_schema_v7_store(&backup);
+        let backup = migration_sibling(&root, "pre-schema-v9-backup").unwrap();
+        write_empty_schema_v8_store(&backup);
         let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
 
         store.store.load_runtime_state().unwrap();
@@ -2650,6 +2833,109 @@ mod tests {
     }
 
     #[test]
+    fn worker_aggregate_write_distinguishes_pre_and_post_rename_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("runtime-store");
+        let opened = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
+        let worker_id = WorkerId::now_v7();
+        let aggregate_path = root
+            .join(WORKERS_DIR)
+            .join(worker_id.to_string())
+            .join(WORKER_FILE);
+        let mut worker = migrate_worker_record(
+            schema_v7_worker_document(worker_id),
+            LEGACY_SCHEMA_VERSION,
+            None,
+            &aggregate_path,
+        )
+        .unwrap()
+        .validate(&aggregate_path)
+        .unwrap();
+
+        opened
+            .store
+            .fail_next_worker_write(AtomicWriteFault::BeforeRename);
+        let error = opened.store.write_worker_record(&worker).unwrap_err();
+        assert!(matches!(error, RuntimeError::StoreIo { .. }));
+        assert!(!aggregate_path.exists());
+
+        worker.created_at_ms = Some(1);
+        opened.store.write_worker_record(&worker).unwrap();
+        worker.created_at_ms = Some(2);
+        opened
+            .store
+            .fail_next_worker_write(AtomicWriteFault::AfterRename);
+        let error = opened.store.write_worker_record(&worker).unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::StoreCommitOutcomeUnknown { .. }
+        ));
+        let committed: WorkerAggregateRecord =
+            read_bounded_json(&aggregate_path, "read test Worker aggregate").unwrap();
+        assert_eq!(committed.created_at_ms, Some(2));
+        assert!(!aggregate_path.with_file_name(WORKER_EXECUTION_FILE).exists());
+    }
+
+    #[test]
+    fn schema_v8_pair_migrates_to_one_worker_aggregate() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("runtime-store");
+        write_empty_schema_v8_store(&root);
+        let worker_id = WorkerId::now_v7();
+        let worker_dir = root.join(WORKERS_DIR).join(worker_id.to_string());
+        fs::create_dir_all(&worker_dir).unwrap();
+        let identity_path = worker_dir.join(WORKER_FILE);
+        let pair = migrate_worker_document(
+            schema_v7_worker_document(worker_id),
+            LEGACY_SCHEMA_VERSION,
+            None,
+            &identity_path,
+        )
+        .unwrap();
+        atomic_write_json(&identity_path, &pair.identity, "write schema-v8 identity").unwrap();
+        atomic_write_json(
+            &worker_dir.join(WORKER_EXECUTION_FILE),
+            &pair.execution,
+            "write schema-v8 execution",
+        )
+        .unwrap();
+
+        let opened = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
+        let state = opened.state.unwrap();
+        let worker = state.workers.get(&worker_id).unwrap();
+        assert!(matches!(
+            worker.execution_state,
+            PersistedWorkerExecutionState::Available(_)
+        ));
+        assert!(!worker_dir.join(WORKER_EXECUTION_FILE).exists());
+        let aggregate: WorkerAggregateRecord =
+            read_bounded_json(&identity_path, "read schema-v9 aggregate").unwrap();
+        assert_eq!(aggregate.schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn schema_v8_migration_fails_closed_without_execution_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("runtime-store");
+        write_empty_schema_v8_store(&root);
+        let worker_id = WorkerId::now_v7();
+        let worker_dir = root.join(WORKERS_DIR).join(worker_id.to_string());
+        fs::create_dir_all(&worker_dir).unwrap();
+        let identity_path = worker_dir.join(WORKER_FILE);
+        let pair = migrate_worker_document(
+            schema_v7_worker_document(worker_id),
+            LEGACY_SCHEMA_VERSION,
+            None,
+            &identity_path,
+        )
+        .unwrap();
+        atomic_write_json(&identity_path, &pair.identity, "write schema-v8 identity").unwrap();
+
+        let error = FsRuntimeStore::open_or_create(root, "test-runtime").unwrap_err();
+        assert!(matches!(error, RuntimeError::StoreMissing { .. }));
+    }
+
+    #[test]
     fn schema_v6_worker_migrates_through_v7_to_split_v8_records() {
         let worker_id = WorkerId::now_v7();
         let root = tempfile::tempdir().unwrap();
@@ -2660,16 +2946,22 @@ mod tests {
             .join(WORKER_FILE);
         let migrated = migrate_worker_document(
             schema_v6_worker_document(worker_id),
-            LEGACY_SCHEMA_VERSION,
+            OLDEST_SCHEMA_VERSION,
             None,
             &identity_path,
         )
         .unwrap();
 
-        assert_eq!(migrated.identity["schema_version"], SCHEMA_VERSION);
+        assert_eq!(
+            migrated.identity["schema_version"],
+            PREVIOUS_SCHEMA_VERSION
+        );
         assert!(migrated.identity.get("request").is_none());
         assert!(migrated.identity.get("execution").is_none());
-        assert_eq!(migrated.execution["schema_version"], SCHEMA_VERSION);
+        assert_eq!(
+            migrated.execution["schema_version"],
+            PREVIOUS_SCHEMA_VERSION
+        );
         assert_eq!(
             migrated.execution["request"]["worker_id"],
             worker_id.to_string()
@@ -2696,7 +2988,7 @@ mod tests {
         source["execution"]["restore_intent"] = serde_json::json!("explicit");
 
         let migrated =
-            migrate_worker_document(source, LEGACY_SCHEMA_VERSION, None, &identity_path).unwrap();
+            migrate_worker_document(source, OLDEST_SCHEMA_VERSION, None, &identity_path).unwrap();
 
         assert_eq!(migrated.identity["status"], "stopped");
         assert_eq!(migrated.execution["binding"], serde_json::Value::Null);
@@ -2711,7 +3003,7 @@ mod tests {
 
         let error = migrate_worker_document(
             source,
-            LEGACY_SCHEMA_VERSION,
+            OLDEST_SCHEMA_VERSION,
             None,
             Path::new("worker.json"),
         )
@@ -2727,11 +3019,11 @@ mod tests {
     #[test]
     fn schema_v6_runtime_store_is_migrated_in_place() {
         let root = tempfile::tempdir().unwrap();
-        write_empty_schema_v7_store(root.path());
+        write_empty_schema_v8_store(root.path());
         let runtime_path = root.path().join(RUNTIME_FILE);
         let mut runtime_document: serde_json::Value =
             read_json(&runtime_path, "read test Runtime").unwrap();
-        runtime_document["schema_version"] = serde_json::json!(LEGACY_SCHEMA_VERSION);
+        runtime_document["schema_version"] = serde_json::json!(OLDEST_SCHEMA_VERSION);
         atomic_write_json(&runtime_path, &runtime_document, "write test Runtime").unwrap();
 
         let worker_id = WorkerId::now_v7();
@@ -2767,14 +3059,15 @@ mod tests {
                 .workers
                 .contains_key(&worker_id)
         );
-        assert!(worker_dir.join(WORKER_EXECUTION_FILE).exists());
-        let execution: serde_json::Value = read_json(
-            &worker_dir.join(WORKER_EXECUTION_FILE),
-            "read migrated test execution",
-        )
-        .unwrap();
-        assert_eq!(execution["schema_version"], SCHEMA_VERSION);
-        assert_eq!(execution["binding"], serde_json::json!({}));
+        assert!(!worker_dir.join(WORKER_EXECUTION_FILE).exists());
+        let aggregate: serde_json::Value =
+            read_json(&worker_dir.join(WORKER_FILE), "read migrated Worker aggregate").unwrap();
+        assert_eq!(aggregate["schema_version"], SCHEMA_VERSION);
+        assert_eq!(aggregate["execution_state"]["state"], "available");
+        assert_eq!(
+            aggregate["execution_state"]["execution"]["binding"],
+            serde_json::json!({})
+        );
         assert!(
             root.path()
                 .join(ORPHANED_WORKERS_DIR)
@@ -2795,17 +3088,23 @@ mod tests {
 
         let migrated = migrate_worker_document(
             schema_v7_worker_document(worker_id),
-            PREVIOUS_SCHEMA_VERSION,
+            LEGACY_SCHEMA_VERSION,
             None,
             &identity_path,
         )
         .unwrap();
 
-        assert_eq!(migrated.identity["schema_version"], SCHEMA_VERSION);
+        assert_eq!(
+            migrated.identity["schema_version"],
+            PREVIOUS_SCHEMA_VERSION
+        );
         assert_eq!(migrated.identity["status"], "running");
         assert!(migrated.identity.get("request").is_none());
         assert!(migrated.identity.get("execution").is_none());
-        assert_eq!(migrated.execution["schema_version"], SCHEMA_VERSION);
+        assert_eq!(
+            migrated.execution["schema_version"],
+            PREVIOUS_SCHEMA_VERSION
+        );
         assert_eq!(
             migrated.execution["request"]["worker_id"],
             worker_id.to_string()
@@ -2824,7 +3123,7 @@ mod tests {
         let mut source = schema_v7_worker_document(worker_id);
         source["execution"]["restore_intent"] = serde_json::json!(17);
 
-        let error = migrate_worker_document(source, PREVIOUS_SCHEMA_VERSION, None, &identity_path)
+        let error = migrate_worker_document(source, LEGACY_SCHEMA_VERSION, None, &identity_path)
             .unwrap_err();
 
         assert!(

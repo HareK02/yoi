@@ -2500,6 +2500,7 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
         | RuntimeError::UnsupportedConfigDeclaration { .. } => StatusCode::BAD_REQUEST,
         RuntimeError::WorkingDirectory(_) => StatusCode::BAD_REQUEST,
         RuntimeError::StoreIo { .. }
+        | RuntimeError::StoreCommitOutcomeUnknown { .. }
         | RuntimeError::StoreMissing { .. }
         | RuntimeError::StoreCorrupt { .. }
         | RuntimeError::WorkerDeletePersistenceFailed { .. }
@@ -2541,6 +2542,9 @@ fn code_for_runtime_error(error: &RuntimeError) -> String {
             "unsupported_config_declaration".to_string()
         }
         RuntimeError::StoreIo { .. } => "store_io".to_string(),
+        RuntimeError::StoreCommitOutcomeUnknown { .. } => {
+            "store_commit_outcome_unknown".to_string()
+        }
         RuntimeError::StoreMissing { .. } => "store_missing".to_string(),
         RuntimeError::StoreCorrupt { .. } => "store_corrupt".to_string(),
         RuntimeError::StatePoisoned => "state_poisoned".to_string(),

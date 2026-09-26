@@ -1724,6 +1724,30 @@ impl Runtime {
                 );
                 match commit {
                     Ok(worker) => Ok(RuntimeWorkerRestoreResult::accepted(worker)),
+                    Err(error @ RuntimeError::StoreCommitOutcomeUnknown { .. }) => {
+                        tracing::error!(
+                            worker_id = %worker_ref.worker_id,
+                            error = %error,
+                            "Worker restore commit outcome is unknown; preserving execution evidence"
+                        );
+                        if let Err(retain_error) = self.retain_restore_execution_evidence(
+                            worker_ref,
+                            handle,
+                            worker_state,
+                            workdir_attachments,
+                        ) {
+                            tracing::error!(
+                                worker_id = %worker_ref.worker_id,
+                                error = %retain_error,
+                                "failed to persist restore execution evidence after an uncertain commit"
+                            );
+                        }
+                        Ok(RuntimeWorkerRestoreResult::failed(
+                            WorkerRestoreState::ReconciliationRequired,
+                            "worker_restore_commit_outcome_unknown",
+                            "Worker restore commit outcome is uncertain; reread or retry the Worker restore",
+                        ))
+                    }
                     Err(error) => {
                         match self.cleanup_failed_restore(&backend, worker_ref, &handle) {
                             Ok(()) => {
@@ -4488,6 +4512,9 @@ fn runtime_worker_create_failure_fields(
             ("unsupported_config_declaration", None, None)
         }
         RuntimeError::StoreIo { .. } => ("store_io", None, None),
+        RuntimeError::StoreCommitOutcomeUnknown { .. } => {
+            ("store_commit_outcome_unknown", None, None)
+        }
         RuntimeError::StoreMissing { .. } => ("store_missing", None, None),
         RuntimeError::StoreCorrupt { .. } => ("store_corrupt", None, None),
         RuntimeError::StatePoisoned => ("state_poisoned", None, None),
@@ -7807,7 +7834,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("unsupported Runtime store schema version 2; expected 6, 7, or 8")
+                .contains("unsupported Runtime store schema version 2; expected 6, 7, 8, or 9")
         );
 
         let _ = std::fs::remove_dir_all(root);
@@ -7846,21 +7873,24 @@ mod tests {
             .stop_worker(&worker.worker_ref, Some("finished".to_string()))
             .unwrap();
         let worker_store_dir = root.join("workers").join(worker.worker_id.to_string());
-        let worker_identity: serde_json::Value =
+        let worker_aggregate: serde_json::Value =
             serde_json::from_slice(&std::fs::read(worker_store_dir.join("worker.json")).unwrap())
                 .unwrap();
-        let worker_execution: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(worker_store_dir.join("execution.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(worker_identity["schema_version"], serde_json::json!(8));
-        assert_eq!(worker_identity["status"], serde_json::json!("stopped"));
-        assert_eq!(worker_execution["schema_version"], serde_json::json!(8));
-        assert_eq!(worker_execution["binding"], serde_json::json!({}));
+        assert_eq!(worker_aggregate["schema_version"], serde_json::json!(9));
+        assert_eq!(worker_aggregate["status"], serde_json::json!("stopped"));
         assert_eq!(
-            worker_execution["restore_intent"],
+            worker_aggregate["execution_state"]["state"],
+            serde_json::json!("available")
+        );
+        assert_eq!(
+            worker_aggregate["execution_state"]["execution"]["binding"],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            worker_aggregate["execution_state"]["execution"]["restore_intent"],
             serde_json::json!("explicit")
         );
+        assert!(!worker_store_dir.join("execution.json").exists());
         assert!(!root.join("events.jsonl").exists());
         std::fs::write(
             worker_store_dir.join("observations.jsonl"),
@@ -7978,12 +8008,10 @@ mod tests {
             missing_identity_error,
             RuntimeError::WorkerNotFound { .. }
         ));
-        assert!(
-            !restored
-                .worker_detail(&recoverable_legacy.worker_ref)
-                .unwrap()
-                .execution_metadata_available
-        );
+        assert!(matches!(
+            restored.worker_detail(&recoverable_legacy.worker_ref),
+            Err(RuntimeError::WorkerNotFound { .. })
+        ));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -8207,8 +8235,8 @@ mod tests {
 
     #[cfg(feature = "fs-store")]
     #[test]
-    fn fs_store_retains_identity_when_execution_metadata_is_corrupt() {
-        let root = fs_store_root("corrupt-execution-retains-identity");
+    fn fs_store_rejects_corrupt_worker_aggregate() {
+        let root = fs_store_root("corrupt-worker-aggregate");
         let options = crate::fs_store::FsRuntimeStoreOptions {
             root: root.clone(),
             runtime_id: "test-runtime".to_string(),
@@ -8233,13 +8261,13 @@ mod tests {
 
         let worker_dir = root.join("workers").join(worker.worker_id.to_string());
         let restorable_worker_dir = root.join("workers").join(restorable.worker_id.to_string());
-        let execution_path = worker_dir.join("execution.json");
-        let mut execution: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&execution_path).unwrap()).unwrap();
-        execution["restore_intent"] = serde_json::json!(17);
+        let aggregate_path = worker_dir.join("worker.json");
+        let mut aggregate: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&aggregate_path).unwrap()).unwrap();
+        aggregate["execution_state"]["execution"]["restore_intent"] = serde_json::json!(17);
         std::fs::write(
-            &execution_path,
-            serde_json::to_vec_pretty(&execution).unwrap(),
+            &aggregate_path,
+            serde_json::to_vec_pretty(&aggregate).unwrap(),
         )
         .unwrap();
 
@@ -8249,33 +8277,17 @@ mod tests {
         )
         .unwrap();
         let workers = restored.list_workers().unwrap();
-        assert_eq!(workers.len(), 2);
-        let worker_summary = workers
+        assert_eq!(workers.len(), 1);
+        assert!(workers.iter().all(|summary| summary.worker_id != worker.worker_id));
+        assert!(matches!(
+            restored.worker_detail(&worker.worker_ref),
+            Err(RuntimeError::WorkerNotFound { .. })
+        ));
+        assert!(restored
+            .diagnostics()
+            .unwrap()
             .iter()
-            .find(|summary| summary.worker_id == worker.worker_id)
-            .expect("retained Worker identity");
-        assert!(!worker_summary.execution_metadata_available);
-        assert!(
-            !restored
-                .worker_detail(&worker.worker_ref)
-                .unwrap()
-                .execution_metadata_available
-        );
-        assert!(restored.diagnostics().unwrap().iter().any(|diagnostic| {
-            diagnostic.code == "worker_record_unavailable"
-                && diagnostic.worker_ref.as_ref() == Some(&worker.worker_ref)
-        }));
-
-        assert!(matches!(
-            restored.send_input(&worker.worker_ref, WorkerInput::user("hello")),
-            Err(RuntimeError::WorkerExecutionUnavailable { .. })
-        ));
-        assert!(matches!(
-            restored.worker_observation_snapshot(&worker.worker_ref),
-            Err(RuntimeError::WorkerExecutionUnavailable { .. })
-        ));
-        assert!(restored.delete_worker(&worker.worker_ref).unwrap().deleted);
-        assert!(!worker_dir.exists());
+            .any(|diagnostic| diagnostic.code == "worker_record_unavailable"));
 
         let restored_detail = restored
             .restore_worker(&restorable.worker_ref)
@@ -8316,7 +8328,7 @@ mod tests {
 
         runtime.stop_runtime().unwrap();
 
-        let identity: serde_json::Value = serde_json::from_slice(
+        let aggregate: serde_json::Value = serde_json::from_slice(
             &std::fs::read(
                 root.join("workers")
                     .join(worker.worker_id.to_string())
@@ -8325,17 +8337,18 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let execution: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(
-                root.join("workers")
-                    .join(worker.worker_id.to_string())
-                    .join("execution.json"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(identity["status"], serde_json::json!("idle"));
-        assert_eq!(execution["restore_intent"], serde_json::json!("automatic"));
+        assert_eq!(aggregate["status"], serde_json::json!("idle"));
+        assert_eq!(
+            aggregate["execution_state"]["execution"]["restore_intent"],
+            serde_json::json!("automatic")
+        );
+        assert!(
+            !root
+                .join("workers")
+                .join(worker.worker_id.to_string())
+                .join("execution.json")
+                .exists()
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -8395,7 +8408,7 @@ mod tests {
 
     #[cfg(feature = "fs-store")]
     #[test]
-    fn fs_store_migrates_schema_v7_workers_into_identity_and_execution_records() {
+    fn fs_store_migrates_schema_v7_workers_into_one_aggregate() {
         let root = fs_store_root("schema-v7-split-records");
         let options = crate::fs_store::FsRuntimeStoreOptions {
             root: root.clone(),
@@ -8427,21 +8440,20 @@ mod tests {
         )
         .expect("write runtime snapshot");
         let mut worker_identity: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&worker_path).expect("worker identity"))
-                .expect("worker identity json");
-        let mut worker_execution: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&execution_path).expect("worker execution"))
-                .expect("worker execution json");
+            serde_json::from_slice(&std::fs::read(&worker_path).expect("worker aggregate"))
+                .expect("worker aggregate json");
         worker_identity["schema_version"] = serde_json::json!(7);
+        let mut worker_execution = worker_identity
+            .as_object_mut()
+            .expect("worker aggregate object")
+            .remove("execution_state")
+            .and_then(|state| state.get("execution").cloned())
+            .expect("schema v9 execution data");
         let request = worker_execution
             .as_object_mut()
             .expect("worker execution object")
             .remove("request")
-            .expect("schema v8 execution request");
-        worker_execution
-            .as_object_mut()
-            .expect("worker execution object")
-            .remove("schema_version");
+            .expect("schema v9 execution request");
         worker_identity["request"] = request;
         worker_identity["execution"] = worker_execution;
         std::fs::write(
@@ -8449,7 +8461,7 @@ mod tests {
             serde_json::to_vec_pretty(&worker_identity).expect("worker record bytes"),
         )
         .expect("write worker record");
-        std::fs::remove_file(&execution_path).expect("remove split execution record");
+        assert!(!execution_path.exists());
 
         let plan = crate::fs_store::FsRuntimeStore::migration_plan(&options)
             .expect("read-only migration preflight");
@@ -8469,21 +8481,77 @@ mod tests {
             migrated.worker_detail(&worker.worker_ref).unwrap().status,
             WorkerStatus::Idle
         );
-        let migrated_identity: serde_json::Value =
+        let migrated_aggregate: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&worker_path).unwrap()).unwrap();
-        let migrated_execution: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&execution_path).unwrap()).unwrap();
-        assert_eq!(migrated_identity["schema_version"], serde_json::json!(8));
-        assert!(migrated_identity.get("request").is_none());
-        assert!(migrated_identity.get("execution").is_none());
-        assert_eq!(migrated_execution["schema_version"], serde_json::json!(8));
+        assert_eq!(migrated_aggregate["schema_version"], serde_json::json!(9));
+        assert!(migrated_aggregate.get("request").is_none());
+        assert!(migrated_aggregate.get("execution").is_none());
         assert_eq!(
-            migrated_execution["request"]["worker_id"],
+            migrated_aggregate["execution_state"]["state"],
+            serde_json::json!("available")
+        );
+        assert_eq!(
+            migrated_aggregate["execution_state"]["execution"]["request"]["worker_id"],
             worker.worker_id.to_string()
         );
-        assert_eq!(migrated_execution["binding"], serde_json::json!({}));
         assert_eq!(
-            migrated_execution["restore_intent"],
+            migrated_aggregate["execution_state"]["execution"]["binding"],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            migrated_aggregate["execution_state"]["execution"]["restore_intent"],
+            serde_json::json!("automatic")
+        );
+        assert!(!execution_path.exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn fs_store_does_not_roll_back_an_unknown_restore_commit() {
+        let root = fs_store_root("restore-commit-outcome-unknown");
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            crate::fs_store::FsRuntimeStoreOptions {
+                root: root.clone(),
+                runtime_id: "test-runtime".to_string(),
+                display_name: None,
+            },
+            backend.clone(),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("uncertain restore commit"))
+            .unwrap();
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        assert_eq!(*backend.stop_count.lock().unwrap(), 1);
+
+        runtime_store(&runtime)
+            .fail_next_worker_write(crate::fs_store::AtomicWriteFault::AfterRename);
+        let result = runtime
+            .restore_worker_operation(&worker.worker_ref)
+            .unwrap();
+
+        assert_eq!(result.state, WorkerRestoreState::ReconciliationRequired);
+        assert_eq!(*backend.stop_count.lock().unwrap(), 1);
+        assert_eq!(
+            runtime.worker_detail(&worker.worker_ref).unwrap().status,
+            WorkerStatus::Idle
+        );
+        let aggregate: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                root.join("workers")
+                    .join(worker.worker_id.to_string())
+                    .join("worker.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(aggregate["status"], serde_json::json!("idle"));
+        assert_eq!(
+            aggregate["execution_state"]["execution"]["restore_intent"],
             serde_json::json!("automatic")
         );
 
