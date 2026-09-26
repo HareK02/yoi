@@ -188,6 +188,14 @@ pub trait RuntimeWorkerFactory: Send + Sync + 'static {
         &self,
         request: WorkerExecutionRestoreRequest,
     ) -> Result<RuntimeWorkerController, String>;
+
+    fn activate_restored_controller(
+        &self,
+        _worker_ref: &WorkerRef,
+        _workspace_id: Option<&str>,
+        _handle: &WorkerHandle,
+    ) {
+    }
 }
 
 /// Production factory that resolves a normal Worker profile and spawns it under
@@ -1461,17 +1469,25 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         if flow_transition_enabled {
             handle.shared_state.enable_flow_transition();
         }
-        self.observation_hub.register(
-            request.worker_ref.clone(),
-            observation_workspace_id,
-            &handle,
-        );
         Ok(RuntimeWorkerController {
             handle,
             shutdown: Arc::new(tokio::sync::Mutex::new(Some(shutdown_rx))),
             controller_task,
             workspace_client,
         })
+    }
+
+    fn activate_restored_controller(
+        &self,
+        worker_ref: &WorkerRef,
+        workspace_id: Option<&str>,
+        handle: &WorkerHandle,
+    ) {
+        self.observation_hub.register(
+            worker_ref.clone(),
+            workspace_id.map(str::to_string),
+            handle,
+        );
     }
 }
 
@@ -1579,6 +1595,7 @@ struct RuntimeWorkerExecution {
     tasks: RuntimeExecutionTaskScope,
     worker_state: Arc<RwLock<protocol::WorkerStateSnapshot>>,
     workspace_client: Option<Arc<dyn WorkspaceClient>>,
+    workspace_id: Option<String>,
     restore_operation_id: Option<crate::execution::WorkerLifecycleOperationId>,
     workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
 }
@@ -1860,6 +1877,9 @@ where
         if workers.contains_key(worker_ref) {
             return Err("Worker already has a retained execution handle".to_string());
         }
+        let workspace_id = workspace_client
+            .as_ref()
+            .and_then(|client| client.workspace_id().map(str::to_string));
         workers.insert(
             worker_ref.clone(),
             RuntimeWorkerExecution {
@@ -1869,6 +1889,7 @@ where
                 tasks,
                 worker_state,
                 workspace_client,
+                workspace_id,
                 restore_operation_id,
                 workdir_attachments,
             },
@@ -2088,6 +2109,9 @@ where
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        let workspace_id = workspace_client
+            .as_ref()
+            .and_then(|client| client.workspace_id().map(str::to_string));
         workers.insert(
             worker_ref.clone(),
             RuntimeWorkerExecution {
@@ -2097,6 +2121,7 @@ where
                 tasks,
                 worker_state,
                 workspace_client,
+                workspace_id,
                 restore_operation_id,
                 workdir_attachments: workdir_attachment_statuses.clone(),
             },
@@ -2739,6 +2764,36 @@ where
             workdir_attachments,
             Some(controller.workspace_client),
         )
+    }
+
+    fn activate_restored_worker(
+        &self,
+        operation_id: crate::execution::WorkerLifecycleOperationId,
+        handle: &WorkerExecutionHandle,
+    ) -> Result<(), String> {
+        if handle.backend_id() != self.backend_id() {
+            return Err(format!(
+                "execution handle belongs to backend {}, not {}",
+                handle.backend_id(),
+                self.backend_id()
+            ));
+        }
+        let workers = self
+            .workers
+            .lock()
+            .map_err(|_| "worker adapter registry lock is poisoned".to_string())?;
+        let execution = workers
+            .get(handle.worker_ref())
+            .ok_or_else(|| "restored Worker execution is not registered".to_string())?;
+        if execution.restore_operation_id != Some(operation_id) {
+            return Err("restored Worker operation identity does not match".to_string());
+        }
+        self.factory.activate_restored_controller(
+            handle.worker_ref(),
+            execution.workspace_id.as_deref(),
+            &execution.handle,
+        );
+        Ok(())
     }
 
     fn dispatch_input(

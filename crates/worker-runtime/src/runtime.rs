@@ -1083,6 +1083,7 @@ impl Runtime {
                 restore_intent: WorkerRestoreIntent::Explicit,
                 pending_restore: None,
                 pending_stop: None,
+                restore_candidate_context: None,
                 workdir_attachments: Vec::new(),
                 logical_workdir_attachments: Vec::new(),
                 execution_handle: None,
@@ -1129,7 +1130,7 @@ impl Runtime {
             } => {
                 let retain_result =
                     if let (Some(handle), Some(worker_state)) = (handle, worker_state) {
-                        self.retain_restore_execution_evidence(
+                        self.retain_create_execution_evidence(
                             &worker_ref,
                             handle,
                             worker_state,
@@ -1669,7 +1670,7 @@ impl Runtime {
         mode: WorkerRestoreMode,
     ) -> Result<RuntimeWorkerRestoreResult, RuntimeError> {
         let fresh_operation_id = WorkerLifecycleOperationId::new();
-        let (backend, request, operation_id, operation_mode, reconcile) = {
+        let (backend, request, operation_id, operation_mode, reconcile, candidate_context) = {
             let state = self.lock()?;
             state.ensure_running()?;
             let worker = state.worker(worker_ref)?;
@@ -1740,18 +1741,29 @@ impl Runtime {
                     .get(&api.workspace_id)
                     .map(|server_id| RuntimeWorkspaceScope::new(&api.workspace_id, server_id))
             });
+            let candidate_context = worker
+                .restore_candidate_context
+                .clone()
+                .unwrap_or_else(|| self.restore_candidate_execution_context(worker_ref.clone()));
             let request = WorkerExecutionRestoreRequest {
                 operation_id,
                 worker_ref: worker_ref.clone(),
                 request: worker_request,
                 workspace_scope,
-                context: self.execution_context(worker_ref.clone()),
+                context: candidate_context.clone(),
                 previous_workdir_attachments: worker.workdir_attachments.clone(),
                 logical_workdir_attachments: worker.logical_workdir_attachments.clone(),
                 workdir_attachments: BTreeMap::new(),
                 config_bundle: None,
             };
-            (backend, request, operation_id, operation_mode, reconcile)
+            (
+                backend,
+                request,
+                operation_id,
+                operation_mode,
+                reconcile,
+                candidate_context,
+            )
         };
 
         if !reconcile && let Err(_result) = backend.preflight_restore(&request) {
@@ -1764,7 +1776,12 @@ impl Runtime {
 
         if !reconcile
             && let Err(error) =
-                self.begin_restore_operation(worker_ref, operation_id, operation_mode)
+                self.begin_restore_operation(
+                    worker_ref,
+                    operation_id,
+                    operation_mode,
+                    candidate_context.clone(),
+                )
         {
             if matches!(error, RuntimeError::StoreCommitOutcomeUnknown { .. }) {
                 return Ok(RuntimeWorkerRestoreResult::failed(
@@ -1795,7 +1812,25 @@ impl Runtime {
                     workdir_attachments.clone(),
                 );
                 match commit {
-                    Ok(worker) => Ok(RuntimeWorkerRestoreResult::accepted(worker)),
+                    Ok(worker) => {
+                        if let Err(error) =
+                            backend.activate_restored_worker(operation_id, &handle)
+                        {
+                            tracing::error!(
+                                worker_id = %worker_ref.worker_id,
+                                error = %error,
+                                "Worker restore committed but Backend observation activation failed"
+                            );
+                        }
+                        if let Err(error) = candidate_context.activate_candidate() {
+                            tracing::error!(
+                                worker_id = %worker_ref.worker_id,
+                                error = %error,
+                                "Worker restore committed but buffered protocol observations could not be activated"
+                            );
+                        }
+                        Ok(RuntimeWorkerRestoreResult::accepted(worker))
+                    }
                     Err(error @ RuntimeError::StoreCommitOutcomeUnknown { .. }) => {
                         tracing::error!(
                             worker_id = %worker_ref.worker_id,
@@ -1807,6 +1842,7 @@ impl Runtime {
                             handle,
                             worker_state,
                             workdir_attachments,
+                            candidate_context.clone(),
                         ) {
                             tracing::error!(
                                 worker_id = %worker_ref.worker_id,
@@ -1823,6 +1859,7 @@ impl Runtime {
                     Err(error) => {
                         match self.cleanup_failed_restore(&backend, worker_ref, &handle) {
                             Ok(()) => {
+                                candidate_context.discard_candidate();
                                 tracing::warn!(
                                     worker_id = %worker_ref.worker_id,
                                     error = %error,
@@ -1858,6 +1895,7 @@ impl Runtime {
                                     handle,
                                     worker_state,
                                     workdir_attachments,
+                                    candidate_context.clone(),
                                 ) {
                                     tracing::error!(
                                         worker_id = %worker_ref.worker_id,
@@ -1883,6 +1921,7 @@ impl Runtime {
                         "Worker restore reconciliation was not completed",
                     ));
                 }
+                candidate_context.discard_candidate();
                 if let Err(error) = self.settle_restore_rollback(worker_ref) {
                     tracing::error!(
                         worker_id = %worker_ref.worker_id,
@@ -1902,6 +1941,7 @@ impl Runtime {
                 ))
             }
             WorkerExecutionSpawnResult::RolledBack(_result) => {
+                candidate_context.discard_candidate();
                 #[cfg(feature = "fs-store")]
                 if let Err(error) = self.lock()?.record_restore_failure(worker_ref, _result) {
                     tracing::error!(
@@ -1935,6 +1975,7 @@ impl Runtime {
                         handle,
                         worker_state,
                         workdir_attachments,
+                        candidate_context.clone(),
                     ) {
                         tracing::error!(
                             worker_id = %worker_ref.worker_id,
@@ -1943,7 +1984,10 @@ impl Runtime {
                         );
                     }
                 } else if let Err(retain_error) =
-                    self.retain_restore_reconciliation_pending(worker_ref)
+                    self.retain_restore_reconciliation_pending(
+                        worker_ref,
+                        candidate_context.clone(),
+                    )
                 {
                     tracing::error!(
                         worker_id = %worker_ref.worker_id,
@@ -1958,7 +2002,10 @@ impl Runtime {
                 ))
             }
             WorkerExecutionSpawnResult::Errored(_result) => {
-                if let Err(retain_error) = self.retain_restore_reconciliation_pending(worker_ref) {
+                if let Err(retain_error) = self.retain_restore_reconciliation_pending(
+                    worker_ref,
+                    candidate_context.clone(),
+                ) {
                     tracing::error!(
                         worker_id = %worker_ref.worker_id,
                         error = %retain_error,
@@ -2917,6 +2964,42 @@ impl Runtime {
         crate::execution::WorkerExecutionContext::new(worker_ref)
     }
 
+    #[cfg(feature = "ws-server")]
+    fn restore_candidate_execution_context(
+        &self,
+        worker_ref: WorkerRef,
+    ) -> crate::execution::WorkerExecutionContext {
+        let runtime = Arc::downgrade(&self.inner);
+        crate::execution::WorkerExecutionContext::candidate(
+            worker_ref,
+            Arc::new(move |worker_ref, payload| {
+                let runtime = runtime.upgrade().ok_or(RuntimeError::RuntimeStopped)?;
+                let mut state = runtime.lock().map_err(|_| RuntimeError::StatePoisoned)?;
+                state.ensure_worker_ref(&worker_ref)?;
+                let worker_state_changed =
+                    state.project_protocol_event_to_worker_state(&worker_ref, &payload);
+                let activity_changed =
+                    state.project_internal_worker_activity(&worker_ref, &payload);
+                if worker_state_changed || activity_changed {
+                    state.publish_worker_upsert(worker_ref.worker_id)?;
+                }
+                if worker_state_changed {
+                    state.persist_runtime_snapshot()?;
+                    state.persist_worker(&worker_ref.worker_id)?;
+                }
+                Ok(state.push_worker_observation_event(worker_ref, payload))
+            }),
+        )
+    }
+
+    #[cfg(not(feature = "ws-server"))]
+    fn restore_candidate_execution_context(
+        &self,
+        worker_ref: WorkerRef,
+    ) -> crate::execution::WorkerExecutionContext {
+        crate::execution::WorkerExecutionContext::candidate(worker_ref)
+    }
+
     #[cfg(feature = "fs-store")]
     fn restore_persisted_worker_executions(&self) -> Result<(), RuntimeError> {
         let pending_stops = {
@@ -3128,6 +3211,7 @@ impl Runtime {
         worker_ref: &WorkerRef,
         operation_id: WorkerLifecycleOperationId,
         mode: WorkerRestoreMode,
+        candidate_context: crate::execution::WorkerExecutionContext,
     ) -> Result<(), RuntimeError> {
         let mut state = self.lock()?;
         state.ensure_worker_ref(worker_ref)?;
@@ -3149,6 +3233,7 @@ impl Runtime {
             mode,
             last_settled_status: candidate.status,
         });
+        candidate.restore_candidate_context = Some(candidate_context);
         match state.persist_worker_record(&candidate) {
             Ok(()) => {
                 state.workers.insert(worker_ref.worker_id, candidate);
@@ -3166,6 +3251,7 @@ impl Runtime {
         let mut state = self.lock()?;
         let mut candidate = state.worker(worker_ref)?.clone();
         candidate.pending_restore = None;
+        candidate.restore_candidate_context = None;
         state.persist_worker_record(&candidate)?;
         state.workers.insert(worker_ref.worker_id, candidate);
         Ok(())
@@ -3193,6 +3279,7 @@ impl Runtime {
         candidate.execution_bound = true;
         candidate.pending_restore = None;
         candidate.pending_stop = None;
+        candidate.restore_candidate_context = None;
         candidate.status = status;
         let _ = candidate.apply_worker_state(&worker_state);
         candidate.restore_intent = restore_intent_for_status(candidate.status);
@@ -3220,12 +3307,35 @@ impl Runtime {
         Ok(detail)
     }
 
+    fn retain_create_execution_evidence(
+        &self,
+        worker_ref: &WorkerRef,
+        handle: WorkerExecutionHandle,
+        worker_state: protocol::WorkerStateSnapshot,
+        workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
+    ) -> Result<(), RuntimeError> {
+        let mut state = self.lock()?;
+        let mut candidate = state.worker(worker_ref)?.clone();
+        candidate.execution_handle = Some(handle);
+        candidate.execution_metadata_available = true;
+        candidate.execution_bound = true;
+        candidate.status = WorkerStatus::Idle;
+        candidate.apply_worker_state(&worker_state);
+        candidate.restore_intent = WorkerRestoreIntent::Automatic;
+        candidate.workdir_attachments = workdir_attachments;
+        state.persist_worker_record(&candidate)?;
+        state.workers.insert(worker_ref.worker_id, candidate);
+        state.publish_worker_upsert(worker_ref.worker_id)?;
+        Ok(())
+    }
+
     fn retain_restore_execution_evidence(
         &self,
         worker_ref: &WorkerRef,
         handle: WorkerExecutionHandle,
         _worker_state: protocol::WorkerStateSnapshot,
         workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
+        candidate_context: crate::execution::WorkerExecutionContext,
     ) -> Result<(), RuntimeError> {
         let mut state = self.lock()?;
         let mut candidate = state.worker(worker_ref)?.clone();
@@ -3238,6 +3348,7 @@ impl Runtime {
         candidate.execution_handle = Some(handle);
         candidate.execution_metadata_available = true;
         candidate.execution_bound = true;
+        candidate.restore_candidate_context = Some(candidate_context);
         candidate.workdir_attachments = workdir_attachments;
         state.persist_worker_record(&candidate)?;
         state.workers.insert(worker_ref.worker_id, candidate);
@@ -3273,14 +3384,18 @@ impl Runtime {
     fn retain_restore_reconciliation_pending(
         &self,
         worker_ref: &WorkerRef,
+        candidate_context: crate::execution::WorkerExecutionContext,
     ) -> Result<(), RuntimeError> {
-        let state = self.lock()?;
-        if state.worker(worker_ref)?.pending_restore.is_none() {
+        let mut state = self.lock()?;
+        let mut candidate = state.worker(worker_ref)?.clone();
+        if candidate.pending_restore.is_none() {
             return Err(RuntimeError::InvalidRequest(format!(
                 "worker {} has no pending restore operation",
                 worker_ref.worker_id
             )));
         }
+        candidate.restore_candidate_context = Some(candidate_context);
+        state.workers.insert(worker_ref.worker_id, candidate);
         Ok(())
     }
 
@@ -3678,6 +3793,7 @@ impl RuntimeState {
                     restore_intent,
                     pending_restore,
                     pending_stop,
+                    restore_candidate_context: None,
                     workdir_attachments: worker.workdir_attachments,
                     logical_workdir_attachments,
                     execution_handle: None,
@@ -4198,6 +4314,7 @@ impl RuntimeState {
         candidate.execution_bound = false;
         candidate.pending_restore = None;
         candidate.pending_stop = None;
+        candidate.restore_candidate_context = None;
         candidate.status = WorkerStatus::Stopped;
         candidate.restore_intent = WorkerRestoreIntent::Explicit;
         candidate.internal_workers.clear();
@@ -4594,6 +4711,7 @@ struct WorkerRecord {
     restore_intent: WorkerRestoreIntent,
     pending_restore: Option<PendingWorkerRestore>,
     pending_stop: Option<PendingWorkerStop>,
+    restore_candidate_context: Option<crate::execution::WorkerExecutionContext>,
     workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
     logical_workdir_attachments: Vec<LogicalWorkdirAttachment>,
     execution_handle: Option<WorkerExecutionHandle>,
@@ -6113,6 +6231,8 @@ mod tests {
         restore_gate: Mutex<Option<Arc<RestoreGate>>>,
         restore_count: Mutex<u64>,
         restore_operation_ids: Mutex<Vec<WorkerLifecycleOperationId>>,
+        #[cfg(feature = "ws-server")]
+        restore_event: Mutex<Option<protocol::Event>>,
         config_bundles: Mutex<Vec<Option<ConfigBundle>>>,
         workspace_config_fetches: Mutex<Vec<WorkspaceConfigFetchRequest>>,
         workspace_config_results: Mutex<Vec<WorkspaceConfigFetchResult>>,
@@ -6258,6 +6378,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(request.operation_id);
+            #[cfg(feature = "ws-server")]
+            if let Some(event) = self.restore_event.lock().unwrap().take() {
+                request.context.publish_protocol_event(event).unwrap();
+            }
             let restore_gate = self.restore_gate.lock().unwrap().clone();
             if let Some(gate) = restore_gate {
                 gate.enter_and_wait();
@@ -7504,6 +7628,66 @@ mod tests {
         assert!(matches!(error, RuntimeError::WorkerNotFound { .. }));
         assert_eq!(*backend.stop_count.lock().unwrap(), 0);
         assert!(runtime.worker_operations.lock().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "ws-server")]
+    #[test]
+    fn restore_candidate_observation_is_hidden_until_aggregate_commit() {
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime = Arc::new(
+            Runtime::with_execution_backend(RuntimeOptions::default(), backend.clone()).unwrap(),
+        );
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("isolated restore observation"))
+            .unwrap();
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        let cursor_before = runtime
+            .worker_observation_cursor_now(&worker.worker_ref)
+            .unwrap();
+        backend.restore_event.lock().unwrap().replace(
+            protocol::Event::WorkerState {
+                snapshot: protocol::WorkerStatus::Running.into(),
+            },
+        );
+        let gate = Arc::new(RestoreGate::default());
+        *backend.restore_gate.lock().unwrap() = Some(gate.clone());
+
+        let restoring_runtime = runtime.clone();
+        let restoring_ref = worker.worker_ref.clone();
+        let restoring = std::thread::spawn(move || {
+            restoring_runtime.restore_worker_operation(&restoring_ref)
+        });
+        assert!(gate.wait_for_entered(1, std::time::Duration::from_secs(2)));
+
+        let pending = runtime.worker_detail(&worker.worker_ref).unwrap();
+        assert_eq!(pending.status, WorkerStatus::Stopped);
+        assert!(pending.worker_state.is_none());
+        assert_eq!(
+            runtime
+                .worker_observation_cursor_now(&worker.worker_ref)
+                .unwrap(),
+            cursor_before
+        );
+
+        gate.release();
+        let result = restoring.join().unwrap().unwrap();
+        assert_eq!(result.state, WorkerRestoreState::Accepted);
+        let committed = runtime.worker_detail(&worker.worker_ref).unwrap();
+        assert_eq!(committed.status, WorkerStatus::Idle);
+        assert_eq!(
+            committed
+                .worker_state
+                .as_ref()
+                .map(protocol::WorkerStateSnapshot::catalog_status),
+            Some(protocol::WorkerStatus::Running)
+        );
+        assert!(
+            runtime
+                .worker_observation_cursor_now(&worker.worker_ref)
+                .unwrap()
+                > cursor_before
+        );
     }
 
     #[test]

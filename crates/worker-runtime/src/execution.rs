@@ -13,8 +13,12 @@ use crate::working_directory::{WorkingDirectoryBinding, WorkingDirectoryDiagnost
 use protocol::{Method, UploadedFileRef};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+#[cfg(feature = "ws-server")]
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
+#[cfg(feature = "ws-server")]
+use std::sync::Mutex;
 use workdir::WorkdirSessionHandle;
 
 /// Execution operation that produced a result.
@@ -202,30 +206,53 @@ impl WorkerExecutionHandle {
 }
 
 /// Runtime hooks available to an execution backend for one Worker.
+#[cfg(feature = "ws-server")]
+type WorkerObservationPublisher = Arc<
+    dyn Fn(WorkerRef, protocol::Event) -> Result<WorkerObservationEvent, RuntimeError> + Send + Sync,
+>;
+
+#[cfg(feature = "ws-server")]
+#[derive(Debug)]
+enum WorkerExecutionPublicationState {
+    Pending(VecDeque<protocol::Event>),
+    Activating(VecDeque<protocol::Event>),
+    Active,
+    Discarded,
+}
+
 #[derive(Clone)]
 pub struct WorkerExecutionContext {
     worker_ref: WorkerRef,
     #[cfg(feature = "ws-server")]
-    observation_publisher: Arc<
-        dyn Fn(WorkerRef, protocol::Event) -> Result<WorkerObservationEvent, RuntimeError>
-            + Send
-            + Sync,
-    >,
+    observation_publisher: WorkerObservationPublisher,
+    #[cfg(feature = "ws-server")]
+    publication_state: Arc<Mutex<WorkerExecutionPublicationState>>,
 }
 
 impl WorkerExecutionContext {
     #[cfg(feature = "ws-server")]
     pub(crate) fn new(
         worker_ref: WorkerRef,
-        observation_publisher: Arc<
-            dyn Fn(WorkerRef, protocol::Event) -> Result<WorkerObservationEvent, RuntimeError>
-                + Send
-                + Sync,
-        >,
+        observation_publisher: WorkerObservationPublisher,
     ) -> Self {
         Self {
             worker_ref,
             observation_publisher,
+            publication_state: Arc::new(Mutex::new(WorkerExecutionPublicationState::Active)),
+        }
+    }
+
+    #[cfg(feature = "ws-server")]
+    pub(crate) fn candidate(
+        worker_ref: WorkerRef,
+        observation_publisher: WorkerObservationPublisher,
+    ) -> Self {
+        Self {
+            worker_ref,
+            observation_publisher,
+            publication_state: Arc::new(Mutex::new(WorkerExecutionPublicationState::Pending(
+                VecDeque::new(),
+            ))),
         }
     }
 
@@ -234,16 +261,109 @@ impl WorkerExecutionContext {
         Self { worker_ref }
     }
 
+    #[cfg(not(feature = "ws-server"))]
+    pub(crate) fn candidate(worker_ref: WorkerRef) -> Self {
+        Self { worker_ref }
+    }
+
     pub fn worker_ref(&self) -> &WorkerRef {
         &self.worker_ref
     }
+
+    #[cfg(feature = "ws-server")]
+    pub(crate) fn activate_candidate(&self) -> Result<(), RuntimeError> {
+        {
+            let mut state = self
+                .publication_state
+                .lock()
+                .map_err(|_| RuntimeError::StatePoisoned)?;
+            match &*state {
+                WorkerExecutionPublicationState::Pending(_) => {
+                    let WorkerExecutionPublicationState::Pending(events) =
+                        std::mem::replace(
+                            &mut *state,
+                            WorkerExecutionPublicationState::Activating(VecDeque::new()),
+                        )
+                    else {
+                        unreachable!()
+                    };
+                    *state = WorkerExecutionPublicationState::Activating(events);
+                }
+                WorkerExecutionPublicationState::Activating(_) => {}
+                WorkerExecutionPublicationState::Active => return Ok(()),
+                WorkerExecutionPublicationState::Discarded => {
+                    return Err(RuntimeError::InvalidRequest(
+                        "discarded Worker execution candidate cannot be activated".to_string(),
+                    ));
+                }
+            }
+        }
+        loop {
+            let event = {
+                let mut state = self
+                    .publication_state
+                    .lock()
+                    .map_err(|_| RuntimeError::StatePoisoned)?;
+                let WorkerExecutionPublicationState::Activating(events) = &mut *state else {
+                    return Ok(());
+                };
+                match events.pop_front() {
+                    Some(event) => Some(event),
+                    None => {
+                        *state = WorkerExecutionPublicationState::Active;
+                        None
+                    }
+                }
+            };
+            let Some(event) = event else {
+                return Ok(());
+            };
+            (self.observation_publisher)(self.worker_ref.clone(), event)?;
+        }
+    }
+
+    #[cfg(not(feature = "ws-server"))]
+    pub(crate) fn activate_candidate(&self) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    #[cfg(feature = "ws-server")]
+    pub(crate) fn discard_candidate(&self) {
+        if let Ok(mut state) = self.publication_state.lock() {
+            *state = WorkerExecutionPublicationState::Discarded;
+        }
+    }
+
+    #[cfg(not(feature = "ws-server"))]
+    pub(crate) fn discard_candidate(&self) {}
 
     #[cfg(feature = "ws-server")]
     pub fn publish_observation(
         &self,
         payload: protocol::Event,
     ) -> Result<WorkerObservationEvent, RuntimeError> {
-        (self.observation_publisher)(self.worker_ref.clone(), payload)
+        let mut state = self
+            .publication_state
+            .lock()
+            .map_err(|_| RuntimeError::StatePoisoned)?;
+        match &mut *state {
+            WorkerExecutionPublicationState::Pending(events)
+            | WorkerExecutionPublicationState::Activating(events) => {
+                events.push_back(payload.clone());
+                Ok(WorkerObservationEvent::new(
+                    0,
+                    self.worker_ref.clone(),
+                    payload,
+                ))
+            }
+            WorkerExecutionPublicationState::Active => {
+                drop(state);
+                (self.observation_publisher)(self.worker_ref.clone(), payload)
+            }
+            WorkerExecutionPublicationState::Discarded => Err(RuntimeError::InvalidRequest(
+                "Worker execution candidate was discarded".to_string(),
+            )),
+        }
     }
 
     #[cfg(feature = "ws-server")]
@@ -393,6 +513,14 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         request: WorkerExecutionRestoreRequest,
     ) -> WorkerExecutionSpawnResult {
         self.restore_worker(request)
+    }
+
+    fn activate_restored_worker(
+        &self,
+        _operation_id: WorkerLifecycleOperationId,
+        _handle: &WorkerExecutionHandle,
+    ) -> Result<(), String> {
+        Ok(())
     }
 
     fn restore_worker(
@@ -622,6 +750,14 @@ impl WorkerExecutionBackendRef {
         self.backend.reconcile_restore(request)
     }
 
+    pub(crate) fn activate_restored_worker(
+        &self,
+        operation_id: WorkerLifecycleOperationId,
+        handle: &WorkerExecutionHandle,
+    ) -> Result<(), String> {
+        self.backend.activate_restored_worker(operation_id, handle)
+    }
+
     pub(crate) fn restore_worker(
         &self,
         request: WorkerExecutionRestoreRequest,
@@ -755,6 +891,38 @@ impl WorkerExecutionBackendRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "ws-server")]
+    #[test]
+    fn restore_candidate_buffers_observations_until_activation() {
+        let worker_ref = WorkerRef::new(crate::identity::WorkerId::now_v7());
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_publisher = observed.clone();
+        let context = WorkerExecutionContext::candidate(
+            worker_ref.clone(),
+            Arc::new(move |worker_ref, payload| {
+                observed_for_publisher.lock().unwrap().push(payload.clone());
+                Ok(WorkerObservationEvent::new(1, worker_ref, payload))
+            }),
+        );
+
+        context
+            .publish_protocol_event(protocol::Event::TextDelta {
+                text: "before commit".to_string(),
+            })
+            .unwrap();
+        assert!(observed.lock().unwrap().is_empty());
+
+        context.activate_candidate().unwrap();
+        assert_eq!(observed.lock().unwrap().len(), 1);
+
+        context
+            .publish_protocol_event(protocol::Event::TextDelta {
+                text: "after commit".to_string(),
+            })
+            .unwrap();
+        assert_eq!(observed.lock().unwrap().len(), 2);
+    }
 
     #[test]
     fn submission_ack_survives_json_round_trip() {
