@@ -31,6 +31,29 @@ pub enum WorkerExecutionOperation {
     Cancel,
 }
 
+/// Stable identity of one Runtime lifecycle operation across retries and restarts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WorkerLifecycleOperationId(uuid::Uuid);
+
+impl WorkerLifecycleOperationId {
+    pub fn new() -> Self {
+        Self(uuid::Uuid::now_v7())
+    }
+}
+
+impl Default for WorkerLifecycleOperationId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for WorkerLifecycleOperationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 /// Evidence that a Submit request reached the durable Worker session boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerSubmissionAck {
@@ -254,6 +277,7 @@ pub struct WorkerExecutionSpawnRequest {
 /// Request passed to a [`WorkerExecutionBackend`] when restoring a persisted Worker.
 #[derive(Clone, Debug)]
 pub struct WorkerExecutionRestoreRequest {
+    pub operation_id: WorkerLifecycleOperationId,
     pub worker_ref: WorkerRef,
     pub request: crate::catalog::CreateWorkerRequest,
     pub workspace_scope: Option<crate::runtime::RuntimeWorkspaceScope>,

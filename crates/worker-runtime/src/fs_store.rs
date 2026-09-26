@@ -6,6 +6,7 @@ use crate::catalog::{
 use crate::config_bundle::ConfigBundle;
 use crate::diagnostics::{DiagnosticSeverity, RuntimeDiagnostic};
 use crate::error::RuntimeError;
+use crate::execution::WorkerLifecycleOperationId;
 use crate::identity::{
     LegacyWorkerIdentityMapping, WorkerId, WorkerRef, legacy_worker_identity_mapping_digest,
 };
@@ -470,9 +471,27 @@ pub(crate) struct PersistedWorkerExecution {
     pub(crate) restore_intent: WorkerRestoreIntent,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PersistedWorkerRestoreMode {
+    Automatic,
+    Explicit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PersistedWorkerRestoreOperation {
+    pub(crate) operation_id: WorkerLifecycleOperationId,
+    pub(crate) mode: PersistedWorkerRestoreMode,
+    pub(crate) request: CreateWorkerRequest,
+    pub(crate) binding: Option<PersistedWorkerExecutionBinding>,
+    pub(crate) last_settled_status: WorkerStatus,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PersistedWorkerExecutionState {
     Available(PersistedWorkerExecution),
+    ReconciliationRequired(PersistedWorkerRestoreOperation),
     Unavailable,
 }
 
@@ -1797,6 +1816,7 @@ struct WorkerAggregateRecord {
 #[serde(tag = "state", content = "execution", rename_all = "snake_case")]
 enum WorkerExecutionStateRecord {
     Available(WorkerExecutionData),
+    ReconciliationRequired(PersistedWorkerRestoreOperation),
     Unavailable,
 }
 
@@ -1818,6 +1838,9 @@ impl WorkerAggregateRecord {
                     binding: execution.binding.clone(),
                     restore_intent: execution.restore_intent,
                 })
+            }
+            PersistedWorkerExecutionState::ReconciliationRequired(operation) => {
+                WorkerExecutionStateRecord::ReconciliationRequired(operation.clone())
             }
             PersistedWorkerExecutionState::Unavailable => WorkerExecutionStateRecord::Unavailable,
         };
@@ -1879,6 +1902,39 @@ impl WorkerAggregateRecord {
                     path,
                     SCHEMA_VERSION,
                 )?)
+            }
+            WorkerExecutionStateRecord::ReconciliationRequired(operation) => {
+                if identity.status != operation.last_settled_status {
+                    return Err(RuntimeError::StoreCorrupt {
+                        operation: "read Worker restore reconciliation",
+                        path: path.to_path_buf(),
+                        message: "Worker reconciliation status does not match the last settled status"
+                            .to_string(),
+                    });
+                }
+                if operation.mode == PersistedWorkerRestoreMode::Automatic
+                    && !operation.last_settled_status.is_active()
+                {
+                    return Err(RuntimeError::StoreCorrupt {
+                        operation: "read Worker restore reconciliation",
+                        path: path.to_path_buf(),
+                        message: "automatic restore reconciliation requires an active settled Worker"
+                            .to_string(),
+                    });
+                }
+                let restore_intent = if operation.last_settled_status.is_active() {
+                    WorkerRestoreIntent::Automatic
+                } else {
+                    WorkerRestoreIntent::Explicit
+                };
+                WorkerExecutionRecord {
+                    schema_version: SCHEMA_VERSION,
+                    request: operation.request.clone(),
+                    binding: operation.binding.clone(),
+                    restore_intent,
+                }
+                .validate_for_schema(&identity, path, SCHEMA_VERSION)?;
+                PersistedWorkerExecutionState::ReconciliationRequired(operation)
             }
             WorkerExecutionStateRecord::Unavailable => PersistedWorkerExecutionState::Unavailable,
         };

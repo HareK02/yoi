@@ -4263,6 +4263,7 @@ mod tests {
             .with_runtime_store_dir(&runtime_store_dir)
             .with_remote_worker_mutation_identity(identity)
             .restore_controller(WorkerExecutionRestoreRequest {
+                operation_id: crate::execution::WorkerLifecycleOperationId::new(),
                 worker_ref: worker_ref.clone(),
                 request,
                 workspace_scope: Some(crate::runtime::RuntimeWorkspaceScope::new(
@@ -4357,6 +4358,7 @@ mod tests {
             .with_runtime_store_dir(&runtime_store_dir)
             .with_controller_transport(WorkerControllerTransport::InProcess)
             .restore_controller(WorkerExecutionRestoreRequest {
+                operation_id: crate::execution::WorkerLifecycleOperationId::new(),
                 worker_ref: worker_ref.clone(),
                 request: create_request("embedded restore"),
                 workspace_scope: None,
