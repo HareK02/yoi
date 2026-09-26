@@ -5537,6 +5537,12 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
             "Worker metadata deletion failed; the persisted Worker identity was retained for retry"
                 .to_string(),
         ),
+        EmbeddedRuntimeError::StoreCommitOutcomeUnknown { .. } => diagnostic(
+            "embedded_runtime_store_commit_unknown",
+            HostDiagnosticSeverity::Error,
+            "Embedded Runtime storage commit is uncertain; reconcile the Worker before retrying"
+                .to_string(),
+        ),
         EmbeddedRuntimeError::StoreIo { .. }
         | EmbeddedRuntimeError::StoreMissing { .. }
         | EmbeddedRuntimeError::StoreCorrupt { .. } => diagnostic(
@@ -5969,6 +5975,25 @@ mod tests {
         assert_eq!(diagnostic.severity, HostDiagnosticSeverity::Error);
         assert!(diagnostic.message.len() <= 256);
         assert!(!diagnostic.message.contains("/private/runtime"));
+    }
+
+    #[test]
+    fn embedded_store_commit_unknown_diagnostic_is_path_free() {
+        let diagnostic = embedded_runtime_diagnostic(
+            &EmbeddedRuntimeError::StoreCommitOutcomeUnknown {
+                operation: "sync Worker aggregate directory",
+                path: std::path::PathBuf::from("/private/runtime/workers/worker.json"),
+                source: std::io::Error::other("raw fsync failure"),
+            },
+        );
+
+        assert_eq!(
+            diagnostic.code,
+            "embedded_runtime_store_commit_unknown"
+        );
+        assert_eq!(diagnostic.severity, HostDiagnosticSeverity::Error);
+        assert!(!diagnostic.message.contains("/private/runtime"));
+        assert!(!diagnostic.message.contains("raw fsync failure"));
     }
 
     #[test]
