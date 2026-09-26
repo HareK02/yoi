@@ -488,10 +488,27 @@ pub(crate) struct PersistedWorkerRestoreOperation {
     pub(crate) last_settled_status: WorkerStatus,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PersistedWorkerStopOperation {
+    pub(crate) operation_id: WorkerLifecycleOperationId,
+    pub(crate) request: CreateWorkerRequest,
+    pub(crate) binding: Option<PersistedWorkerExecutionBinding>,
+    pub(crate) restore_intent: WorkerRestoreIntent,
+    pub(crate) last_settled_status: WorkerStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", content = "intent", rename_all = "snake_case")]
+pub(crate) enum PersistedWorkerLifecycleOperation {
+    Restore(PersistedWorkerRestoreOperation),
+    Stop(PersistedWorkerStopOperation),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PersistedWorkerExecutionState {
     Available(PersistedWorkerExecution),
-    ReconciliationRequired(PersistedWorkerRestoreOperation),
+    ReconciliationRequired(PersistedWorkerLifecycleOperation),
     Unavailable,
 }
 
@@ -1816,7 +1833,7 @@ struct WorkerAggregateRecord {
 #[serde(tag = "state", content = "execution", rename_all = "snake_case")]
 enum WorkerExecutionStateRecord {
     Available(WorkerExecutionData),
-    ReconciliationRequired(PersistedWorkerRestoreOperation),
+    ReconciliationRequired(PersistedWorkerLifecycleOperation),
     Unavailable,
 }
 
@@ -1904,33 +1921,58 @@ impl WorkerAggregateRecord {
                 )?)
             }
             WorkerExecutionStateRecord::ReconciliationRequired(operation) => {
-                if identity.status != operation.last_settled_status {
+                let (request, binding, restore_intent, last_settled_status) = match &operation {
+                    PersistedWorkerLifecycleOperation::Restore(restore) => {
+                        if restore.mode == PersistedWorkerRestoreMode::Automatic
+                            && !restore.last_settled_status.is_active()
+                        {
+                            return Err(RuntimeError::StoreCorrupt {
+                                operation: "read Worker restore reconciliation",
+                                path: path.to_path_buf(),
+                                message: "automatic restore reconciliation requires an active settled Worker"
+                                    .to_string(),
+                            });
+                        }
+                        (
+                            &restore.request,
+                            &restore.binding,
+                            if restore.last_settled_status.is_active() {
+                                WorkerRestoreIntent::Automatic
+                            } else {
+                                WorkerRestoreIntent::Explicit
+                            },
+                            restore.last_settled_status,
+                        )
+                    }
+                    PersistedWorkerLifecycleOperation::Stop(stop) => {
+                        if !stop.last_settled_status.is_active() {
+                            return Err(RuntimeError::StoreCorrupt {
+                                operation: "read Worker stop reconciliation",
+                                path: path.to_path_buf(),
+                                message: "stop reconciliation requires an active settled Worker"
+                                    .to_string(),
+                            });
+                        }
+                        (
+                            &stop.request,
+                            &stop.binding,
+                            stop.restore_intent,
+                            stop.last_settled_status,
+                        )
+                    }
+                };
+                if identity.status != last_settled_status {
                     return Err(RuntimeError::StoreCorrupt {
-                        operation: "read Worker restore reconciliation",
+                        operation: "read Worker lifecycle reconciliation",
                         path: path.to_path_buf(),
                         message: "Worker reconciliation status does not match the last settled status"
                             .to_string(),
                     });
                 }
-                if operation.mode == PersistedWorkerRestoreMode::Automatic
-                    && !operation.last_settled_status.is_active()
-                {
-                    return Err(RuntimeError::StoreCorrupt {
-                        operation: "read Worker restore reconciliation",
-                        path: path.to_path_buf(),
-                        message: "automatic restore reconciliation requires an active settled Worker"
-                            .to_string(),
-                    });
-                }
-                let restore_intent = if operation.last_settled_status.is_active() {
-                    WorkerRestoreIntent::Automatic
-                } else {
-                    WorkerRestoreIntent::Explicit
-                };
                 WorkerExecutionRecord {
                     schema_version: SCHEMA_VERSION,
-                    request: operation.request.clone(),
-                    binding: operation.binding.clone(),
+                    request: request.clone(),
+                    binding: binding.clone(),
                     restore_intent,
                 }
                 .validate_for_schema(&identity, path, SCHEMA_VERSION)?;

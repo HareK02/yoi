@@ -288,6 +288,14 @@ pub struct WorkerExecutionRestoreRequest {
     pub config_bundle: Option<ConfigBundle>,
 }
 
+/// Request to execute or reconcile one durably journaled Worker stop.
+#[derive(Clone, Debug)]
+pub struct WorkerExecutionStopRequest {
+    pub operation_id: WorkerLifecycleOperationId,
+    pub worker_ref: WorkerRef,
+    pub handle: Option<WorkerExecutionHandle>,
+}
+
 /// Runtime-side request to refresh the latest Workspace Config before Worker creation.
 #[derive(Clone, Debug)]
 pub struct WorkspaceConfigFetchRequest {
@@ -519,6 +527,19 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         Vec::new()
     }
 
+    fn stop_worker_operation(
+        &self,
+        request: WorkerExecutionStopRequest,
+    ) -> WorkerExecutionResult {
+        let Some(handle) = request.handle.as_ref() else {
+            return WorkerExecutionResult::unsupported(
+                WorkerExecutionOperation::Stop,
+                "execution backend cannot reconcile a stopped Worker without a live handle",
+            );
+        };
+        self.stop_worker(handle)
+    }
+
     fn stop_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
         WorkerExecutionResult::unsupported(
             WorkerExecutionOperation::Stop,
@@ -699,6 +720,13 @@ impl WorkerExecutionBackendRef {
         prefix: &str,
     ) -> Vec<protocol::CompletionEntry> {
         self.backend.worker_completions(handle, kind, prefix)
+    }
+
+    pub(crate) fn stop_worker_operation(
+        &self,
+        request: WorkerExecutionStopRequest,
+    ) -> WorkerExecutionResult {
+        self.backend.stop_worker_operation(request)
     }
 
     pub(crate) fn stop_worker(&self, handle: &WorkerExecutionHandle) -> WorkerExecutionResult {

@@ -15,14 +15,15 @@ use crate::execution::WorkerExecutionRestoreRequest;
 use crate::execution::{
     WorkerExecutionBackend, WorkerExecutionBackendRef, WorkerExecutionHandle,
     WorkerExecutionOperation, WorkerExecutionResult, WorkerExecutionSpawnRequest,
-    WorkerExecutionSpawnResult, WorkerLifecycleOperationId, WorkerSessionObservationRequest,
-    WorkspaceConfigFetchRequest, WorkspaceConfigFetchResult,
+    WorkerExecutionSpawnResult, WorkerExecutionStopRequest, WorkerLifecycleOperationId,
+    WorkerSessionObservationRequest, WorkspaceConfigFetchRequest, WorkspaceConfigFetchResult,
 };
 #[cfg(feature = "fs-store")]
 use crate::fs_store::{
     FsRuntimeStore, FsRuntimeStoreOptions, PersistedRuntimeState, PersistedWorkerExecution,
-    PersistedWorkerExecutionBinding, PersistedWorkerExecutionState, PersistedWorkerRecord,
-    PersistedWorkerRestoreMode, PersistedWorkerRestoreOperation,
+    PersistedWorkerExecutionBinding, PersistedWorkerExecutionState,
+    PersistedWorkerLifecycleOperation, PersistedWorkerRecord, PersistedWorkerRestoreMode,
+    PersistedWorkerRestoreOperation, PersistedWorkerStopOperation,
 };
 use crate::identity::{WorkerId, WorkerRef};
 use crate::interaction::{WorkerInput, WorkerInputKind, WorkerInteractionAck};
@@ -1081,6 +1082,7 @@ impl Runtime {
                 execution_bound: true,
                 restore_intent: WorkerRestoreIntent::Explicit,
                 pending_restore: None,
+                pending_stop: None,
                 workdir_attachments: Vec::new(),
                 logical_workdir_attachments: Vec::new(),
                 execution_handle: None,
@@ -1421,7 +1423,7 @@ impl Runtime {
         let previous_workspace_api = {
             let state = self.lock()?;
             let worker = state.worker(worker_ref)?;
-            if worker.pending_restore.is_some() {
+            if worker.has_pending_lifecycle_operation() {
                 return Err(RuntimeError::InvalidRequest(format!(
                     "worker {} has pending restore reconciliation",
                     worker_ref.worker_id
@@ -1449,7 +1451,7 @@ impl Runtime {
         {
             let mut state = self.lock()?;
             let worker = state.worker_mut(worker_ref)?;
-            if worker.pending_restore.is_some() {
+            if worker.has_pending_lifecycle_operation() {
                 return Err(RuntimeError::InvalidRequest(format!(
                     "worker {} has pending restore reconciliation",
                     worker_ref.worker_id
@@ -1671,7 +1673,7 @@ impl Runtime {
             let state = self.lock()?;
             state.ensure_running()?;
             let worker = state.worker(worker_ref)?;
-            if worker.pending_restore.is_some() {
+            if worker.has_pending_lifecycle_operation() {
                 return Ok(RuntimeWorkerRestoreResult::failed(
                     WorkerRestoreState::ReconciliationRequired,
                     "worker_restore_reconciliation_pending",
@@ -1952,7 +1954,7 @@ impl Runtime {
     fn ensure_worker_execution(&self, worker_ref: &WorkerRef) -> Result<(), RuntimeError> {
         let state = self.lock()?;
         let worker = state.worker(worker_ref)?;
-        if worker.pending_restore.is_some() {
+        if worker.has_pending_lifecycle_operation() {
             return Err(RuntimeError::WorkerExecutionUnavailable {
                 worker_id: worker_ref.worker_id,
                 message: "worker restore reconciliation is pending".to_string(),
@@ -2238,7 +2240,7 @@ impl Runtime {
             let state = self.lock()?;
             state.ensure_worker_ref(worker_ref)?;
             let worker = state.worker(worker_ref)?;
-            if worker.pending_restore.is_some() {
+            if worker.has_pending_lifecycle_operation() {
                 return Ok(Vec::new());
             }
             (
@@ -2504,7 +2506,7 @@ impl Runtime {
             self.ensure_worker_in_workspace(scope, worker_ref)?;
         }
 
-        let (backend, handle) = {
+        let (backend, handle, pending_stop, status) = {
             let state = self.lock()?;
             state.ensure_running()?;
             let worker = state.worker(worker_ref)?;
@@ -2514,47 +2516,57 @@ impl Runtime {
                     worker_ref.worker_id
                 )));
             }
-            match worker.execution_handle.clone() {
-                Some(handle) => {
-                    let backend = state.execution_backend.clone().ok_or_else(|| {
-                        RuntimeError::WorkerExecutionUnavailable {
-                            worker_id: worker_ref.worker_id,
-                            message: "runtime has no execution backend".to_string(),
-                        }
-                    })?;
-                    (Some(backend), Some(handle))
-                }
-                None if worker.status == WorkerStatus::Stopped => (None, None),
-                None => {
-                    return Err(RuntimeError::WorkerExecutionUnavailable {
-                        worker_id: worker_ref.worker_id,
-                        message: "worker has no execution handle".to_string(),
-                    });
-                }
+            (
+                state.execution_backend.clone(),
+                worker.execution_handle.clone(),
+                worker.pending_stop,
+                worker.status,
+            )
+        };
+        if status == WorkerStatus::Stopped && pending_stop.is_none() {
+            let state = self.lock()?;
+            let worker = state.worker(worker_ref)?;
+            return Ok(WorkerLifecycleAck {
+                worker_ref: worker_ref.clone(),
+                status: worker.status,
+                worker_state: worker.worker_state.clone(),
+            });
+        }
+        let backend = backend.ok_or_else(|| RuntimeError::WorkerExecutionUnavailable {
+            worker_id: worker_ref.worker_id,
+            message: "runtime has no execution backend".to_string(),
+        })?;
+        if handle.is_none() && pending_stop.is_none() {
+            return Err(RuntimeError::WorkerExecutionUnavailable {
+                worker_id: worker_ref.worker_id,
+                message: "worker has no execution handle".to_string(),
+            });
+        }
+        let operation_id = match pending_stop {
+            Some(pending) => pending.operation_id,
+            None => {
+                let operation_id = WorkerLifecycleOperationId::new();
+                self.begin_stop_operation(worker_ref, operation_id)?;
+                operation_id
             }
         };
-
-        if let (Some(backend), Some(handle)) = (backend, handle) {
-            let result = backend.stop_worker(&handle);
-            if !result.is_accepted() {
-                return Err(RuntimeError::WorkerExecutionRejected {
-                    worker_id: worker_ref.worker_id,
-                    operation: result.operation,
-                    outcome: result.outcome,
-                    message: result.message_or_default(),
-                    result,
-                });
-            }
-            self.transition_worker(worker_ref, WorkerStatus::Stopped)?;
-        }
-        let _ = reason;
-        let state = self.lock()?;
-        let worker = state.worker(worker_ref)?;
-        Ok(WorkerLifecycleAck {
+        let result = backend.stop_worker_operation(WorkerExecutionStopRequest {
+            operation_id,
             worker_ref: worker_ref.clone(),
-            status: worker.status,
-            worker_state: worker.worker_state.clone(),
-        })
+            handle,
+        });
+        if !result.is_accepted() {
+            return Err(RuntimeError::WorkerExecutionRejected {
+                worker_id: worker_ref.worker_id,
+                operation: result.operation,
+                outcome: result.outcome,
+                message: result.message_or_default(),
+                result,
+            });
+        }
+        let ack = self.commit_stopped_worker(worker_ref, operation_id)?;
+        let _ = reason;
+        Ok(ack)
     }
 
     /// Cancel a Worker through a workspace-scoped Runtime authorization context.
@@ -2578,7 +2590,7 @@ impl Runtime {
             let state = self.lock()?;
             state.ensure_running()?;
             let worker = state.worker(worker_ref)?;
-            if worker.pending_restore.is_some() {
+            if worker.has_pending_lifecycle_operation() {
                 return Err(RuntimeError::InvalidRequest(format!(
                     "worker {} has pending restore reconciliation",
                     worker_ref.worker_id
@@ -2637,7 +2649,7 @@ impl Runtime {
             state.ensure_running()?;
             state.ensure_worker_ref(worker_ref)?;
             let worker = state.worker(worker_ref)?;
-            if worker.pending_restore.is_some() {
+            if worker.has_pending_lifecycle_operation() {
                 return Err(RuntimeError::InvalidRequest(format!(
                     "worker {} has pending restore reconciliation and cannot be deleted",
                     worker_ref.worker_id
@@ -2678,7 +2690,7 @@ impl Runtime {
         state.ensure_running()?;
         state.ensure_worker_ref(worker_ref)?;
         let worker = state.worker(worker_ref)?;
-        if worker.pending_restore.is_some() {
+        if worker.has_pending_lifecycle_operation() {
             return Err(RuntimeError::InvalidRequest(format!(
                 "worker {} still has pending restore reconciliation",
                 worker_ref.worker_id
@@ -2842,32 +2854,6 @@ impl Runtime {
         Ok(())
     }
 
-    fn transition_worker(
-        &self,
-        worker_ref: &WorkerRef,
-        status: WorkerStatus,
-    ) -> Result<WorkerLifecycleAck, RuntimeError> {
-        let mut state = self.lock()?;
-        state.ensure_running()?;
-        state.ensure_worker_ref(worker_ref)?;
-
-        let worker = state.worker_mut(worker_ref)?;
-        worker.status = status;
-        worker.worker_state = None;
-        worker.restore_intent = restore_intent_for_status(status);
-        worker.execution_handle = None;
-        worker.internal_workers.clear();
-        let status = worker.status;
-        state.publish_worker_upsert(worker_ref.worker_id)?;
-        state.persist_runtime_snapshot()?;
-        state.persist_worker(&worker_ref.worker_id)?;
-        Ok(WorkerLifecycleAck {
-            worker_ref: worker_ref.clone(),
-            status,
-            worker_state: None,
-        })
-    }
-
     fn install_execution_backend(
         &self,
         backend: Arc<dyn WorkerExecutionBackend>,
@@ -2910,6 +2896,32 @@ impl Runtime {
 
     #[cfg(feature = "fs-store")]
     fn restore_persisted_worker_executions(&self) -> Result<(), RuntimeError> {
+        let pending_stops = {
+            let state = self.lock()?;
+            if state.execution_backend.is_none() {
+                return Ok(());
+            }
+            state
+                .workers
+                .values()
+                .filter(|worker| worker.pending_stop.is_some())
+                .map(|worker| worker.worker_ref.clone())
+                .collect::<Vec<_>>()
+        };
+        for worker_ref in pending_stops {
+            let operation_lock = self.worker_operation_lock(worker_ref.worker_id)?;
+            let _operation_guard = operation_lock
+                .lock()
+                .map_err(|_| RuntimeError::StatePoisoned)?;
+            if let Err(error) = self.reconcile_pending_stop_under_lock(&worker_ref) {
+                tracing::warn!(
+                    worker_id = %worker_ref.worker_id,
+                    error = %error,
+                    "Worker stop reconciliation remains pending after Runtime startup"
+                );
+            }
+        }
+
         let candidates = {
             let state = self.lock()?;
             if state.execution_backend.is_none() {
@@ -2921,6 +2933,7 @@ impl Runtime {
                 .filter(|worker| {
                     worker.execution_handle.is_none()
                         && worker.pending_restore.is_none()
+                        && worker.pending_stop.is_none()
                         && worker.execution_bound
                         && worker.status.is_active()
                         && worker.restore_intent == WorkerRestoreIntent::Automatic
@@ -2946,6 +2959,121 @@ impl Runtime {
         Ok(())
     }
 
+    fn reconcile_pending_stop_under_lock(
+        &self,
+        worker_ref: &WorkerRef,
+    ) -> Result<(), RuntimeError> {
+        let (backend, handle, operation_id) = {
+            let state = self.lock()?;
+            let worker = state.worker(worker_ref)?;
+            let pending = worker.pending_stop.ok_or_else(|| {
+                RuntimeError::InvalidRequest(format!(
+                    "worker {} has no pending stop operation",
+                    worker_ref.worker_id
+                ))
+            })?;
+            let backend = state.execution_backend.clone().ok_or_else(|| {
+                RuntimeError::WorkerExecutionUnavailable {
+                    worker_id: worker_ref.worker_id,
+                    message: "runtime has no execution backend".to_string(),
+                }
+            })?;
+            (backend, worker.execution_handle.clone(), pending.operation_id)
+        };
+        let result = backend.stop_worker_operation(WorkerExecutionStopRequest {
+            operation_id,
+            worker_ref: worker_ref.clone(),
+            handle,
+        });
+        if !result.is_accepted() {
+            return Err(RuntimeError::WorkerExecutionRejected {
+                worker_id: worker_ref.worker_id,
+                operation: result.operation,
+                outcome: result.outcome,
+                message: result.message_or_default(),
+                result,
+            });
+        }
+        self.commit_stopped_worker(worker_ref, operation_id)?;
+        Ok(())
+    }
+
+    fn begin_stop_operation(
+        &self,
+        worker_ref: &WorkerRef,
+        operation_id: WorkerLifecycleOperationId,
+    ) -> Result<(), RuntimeError> {
+        let mut state = self.lock()?;
+        let mut candidate = state.worker(worker_ref)?.clone();
+        if candidate.has_pending_lifecycle_operation() {
+            return Err(RuntimeError::InvalidRequest(format!(
+                "worker {} already has pending lifecycle reconciliation",
+                worker_ref.worker_id
+            )));
+        }
+        if !candidate.status.is_active() || candidate.request.is_none() {
+            return Err(RuntimeError::InvalidRequest(format!(
+                "worker {} cannot begin a stop operation from its current state",
+                worker_ref.worker_id
+            )));
+        }
+        candidate.pending_stop = Some(PendingWorkerStop {
+            operation_id,
+            last_settled_status: candidate.status,
+        });
+        match state.persist_worker_record(&candidate) {
+            Ok(()) => {
+                state.workers.insert(worker_ref.worker_id, candidate);
+                Ok(())
+            }
+            Err(error @ RuntimeError::StoreCommitOutcomeUnknown { .. }) => {
+                state.workers.insert(worker_ref.worker_id, candidate);
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn commit_stopped_worker(
+        &self,
+        worker_ref: &WorkerRef,
+        operation_id: WorkerLifecycleOperationId,
+    ) -> Result<WorkerLifecycleAck, RuntimeError> {
+        let mut state = self.lock()?;
+        let mut candidate = state.worker(worker_ref)?.clone();
+        if candidate
+            .pending_stop
+            .is_none_or(|pending| pending.operation_id != operation_id)
+        {
+            return Err(RuntimeError::InvalidRequest(format!(
+                "worker {} stop operation identity changed during reconciliation",
+                worker_ref.worker_id
+            )));
+        }
+        candidate.pending_stop = None;
+        candidate.status = WorkerStatus::Stopped;
+        candidate.worker_state = None;
+        candidate.restore_intent = WorkerRestoreIntent::Explicit;
+        candidate.execution_handle = None;
+        candidate.internal_workers.clear();
+        state.persist_worker_record(&candidate)?;
+        let ack = WorkerLifecycleAck {
+            worker_ref: worker_ref.clone(),
+            status: candidate.status,
+            worker_state: None,
+        };
+        state.workers.insert(worker_ref.worker_id, candidate);
+        state.publish_worker_upsert(worker_ref.worker_id)?;
+        if let Err(error) = state.persist_runtime_snapshot() {
+            tracing::warn!(
+                worker_id = %worker_ref.worker_id,
+                error = %error,
+                "Worker stop committed to its canonical record but Runtime snapshot refresh failed"
+            );
+        }
+        Ok(ack)
+    }
+
     fn begin_restore_operation(
         &self,
         worker_ref: &WorkerRef,
@@ -2955,9 +3083,9 @@ impl Runtime {
         let mut state = self.lock()?;
         state.ensure_worker_ref(worker_ref)?;
         let mut candidate = state.worker(worker_ref)?.clone();
-        if candidate.pending_restore.is_some() {
+        if candidate.has_pending_lifecycle_operation() {
             return Err(RuntimeError::InvalidRequest(format!(
-                "worker {} already has pending restore reconciliation",
+                "worker {} already has pending lifecycle reconciliation",
                 worker_ref.worker_id
             )));
         }
@@ -3015,6 +3143,7 @@ impl Runtime {
         candidate.execution_metadata_available = true;
         candidate.execution_bound = true;
         candidate.pending_restore = None;
+        candidate.pending_stop = None;
         candidate.status = status;
         let _ = candidate.apply_worker_state(&worker_state);
         candidate.restore_intent = restore_intent_for_status(candidate.status);
@@ -3248,7 +3377,7 @@ impl Runtime {
                 "Worker retention requires a stopped Worker".to_string(),
             ));
         }
-        if worker.pending_restore.is_some() {
+        if worker.has_pending_lifecycle_operation() {
             return Err(RuntimeError::InvalidRequest(
                 "Worker retention cannot remove pending restore reconciliation".to_string(),
             ));
@@ -3422,6 +3551,7 @@ impl RuntimeState {
                 execution_bound,
                 restore_intent,
                 pending_restore,
+                pending_stop,
             ) = match worker.execution_state {
                 PersistedWorkerExecutionState::Available(execution) => (
                     Some(execution.request),
@@ -3429,26 +3559,45 @@ impl RuntimeState {
                     execution.binding.is_some(),
                     execution.restore_intent,
                     None,
+                    None,
                 ),
                 PersistedWorkerExecutionState::ReconciliationRequired(operation) => {
-                    let restore_intent = restore_intent_for_status(operation.last_settled_status);
-                    (
-                        Some(operation.request),
-                        true,
-                        operation.binding.is_some(),
-                        restore_intent,
-                        Some(PendingWorkerRestore {
-                            operation_id: operation.operation_id,
-                            mode: operation.mode.into(),
-                            last_settled_status: operation.last_settled_status,
-                        }),
-                    )
+                    match operation {
+                        PersistedWorkerLifecycleOperation::Restore(operation) => {
+                            let restore_intent =
+                                restore_intent_for_status(operation.last_settled_status);
+                            (
+                                Some(operation.request),
+                                true,
+                                operation.binding.is_some(),
+                                restore_intent,
+                                Some(PendingWorkerRestore {
+                                    operation_id: operation.operation_id,
+                                    mode: operation.mode.into(),
+                                    last_settled_status: operation.last_settled_status,
+                                }),
+                                None,
+                            )
+                        }
+                        PersistedWorkerLifecycleOperation::Stop(operation) => (
+                            Some(operation.request),
+                            true,
+                            operation.binding.is_some(),
+                            operation.restore_intent,
+                            None,
+                            Some(PendingWorkerStop {
+                                operation_id: operation.operation_id,
+                                last_settled_status: operation.last_settled_status,
+                            }),
+                        ),
+                    }
                 }
                 PersistedWorkerExecutionState::Unavailable => (
                     None,
                     false,
                     false,
                     restore_intent_for_status(worker.status),
+                    None,
                     None,
                 ),
             };
@@ -3479,6 +3628,7 @@ impl RuntimeState {
                     execution_bound,
                     restore_intent,
                     pending_restore,
+                    pending_stop,
                     workdir_attachments: worker.workdir_attachments,
                     logical_workdir_attachments,
                     execution_handle: None,
@@ -3998,6 +4148,7 @@ impl RuntimeState {
         candidate.execution_handle = None;
         candidate.execution_bound = false;
         candidate.pending_restore = None;
+        candidate.pending_stop = None;
         candidate.status = WorkerStatus::Stopped;
         candidate.restore_intent = WorkerRestoreIntent::Explicit;
         candidate.internal_workers.clear();
@@ -4370,6 +4521,12 @@ struct PendingWorkerRestore {
     last_settled_status: WorkerStatus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingWorkerStop {
+    operation_id: WorkerLifecycleOperationId,
+    last_settled_status: WorkerStatus,
+}
+
 #[derive(Debug, Clone)]
 struct WorkerRecord {
     worker_ref: WorkerRef,
@@ -4387,6 +4544,7 @@ struct WorkerRecord {
     execution_bound: bool,
     restore_intent: WorkerRestoreIntent,
     pending_restore: Option<PendingWorkerRestore>,
+    pending_stop: Option<PendingWorkerStop>,
     workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
     logical_workdir_attachments: Vec<LogicalWorkdirAttachment>,
     execution_handle: Option<WorkerExecutionHandle>,
@@ -4396,6 +4554,10 @@ struct WorkerRecord {
 impl WorkerRecord {
     fn apply_worker_state(&mut self, incoming: &protocol::WorkerStateSnapshot) {
         self.worker_state = Some(incoming.clone());
+    }
+
+    fn has_pending_lifecycle_operation(&self) -> bool {
+        self.pending_restore.is_some() || self.pending_stop.is_some()
     }
 
     fn belongs_to_workspace(&self, workspace_id: &str) -> bool {
@@ -4438,11 +4600,26 @@ impl WorkerRecord {
 
     #[cfg(feature = "fs-store")]
     fn persisted_record(&self) -> PersistedWorkerRecord {
+        debug_assert!(self.pending_restore.is_none() || self.pending_stop.is_none());
         let execution_state = if let (Some(pending), Some(request)) =
+            (self.pending_stop, self.request.clone())
+        {
+            PersistedWorkerExecutionState::ReconciliationRequired(
+                PersistedWorkerLifecycleOperation::Stop(PersistedWorkerStopOperation {
+                    operation_id: pending.operation_id,
+                    request,
+                    binding: self
+                        .execution_bound
+                        .then_some(PersistedWorkerExecutionBinding {}),
+                    restore_intent: self.restore_intent,
+                    last_settled_status: pending.last_settled_status,
+                }),
+            )
+        } else if let (Some(pending), Some(request)) =
             (self.pending_restore, self.request.clone())
         {
             PersistedWorkerExecutionState::ReconciliationRequired(
-                PersistedWorkerRestoreOperation {
+                PersistedWorkerLifecycleOperation::Restore(PersistedWorkerRestoreOperation {
                     operation_id: pending.operation_id,
                     mode: pending.mode.into(),
                     request,
@@ -4450,7 +4627,7 @@ impl WorkerRecord {
                         .execution_bound
                         .then_some(PersistedWorkerExecutionBinding {}),
                     last_settled_status: pending.last_settled_status,
-                },
+                }),
             )
         } else {
             match (self.execution_metadata_available, self.request.clone()) {
@@ -5881,6 +6058,7 @@ mod tests {
         stop_result: Mutex<Option<WorkerExecutionResult>>,
         stop_gate: Mutex<Option<Arc<RestoreGate>>>,
         stop_count: Mutex<u64>,
+        stop_operation_ids: Mutex<Vec<WorkerLifecycleOperationId>>,
         restore_result: Mutex<Option<WorkerExecutionSpawnResult>>,
         preflight_restore_result: Mutex<Option<WorkerExecutionResult>>,
         restore_gate: Mutex<Option<Arc<RestoreGate>>>,
@@ -6093,6 +6271,20 @@ mod tests {
                 ack.submission_request_id = submission_id;
             }
             result
+        }
+
+        fn stop_worker_operation(
+            &self,
+            request: WorkerExecutionStopRequest,
+        ) -> WorkerExecutionResult {
+            self.stop_operation_ids
+                .lock()
+                .unwrap()
+                .push(request.operation_id);
+            let handle = request.handle.unwrap_or_else(|| {
+                WorkerExecutionHandle::new(request.worker_ref, self.backend_id())
+            });
+            self.stop_worker(&handle)
         }
 
         fn stop_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
@@ -6991,10 +7183,143 @@ mod tests {
             runtime.worker_detail(&created.worker_ref).unwrap().status,
             WorkerStatus::Idle
         );
+        let operation_id = runtime
+            .lock()
+            .unwrap()
+            .worker(&created.worker_ref)
+            .unwrap()
+            .pending_stop
+            .unwrap()
+            .operation_id;
+        assert_eq!(
+            backend.stop_operation_ids.lock().unwrap().as_slice(),
+            &[operation_id]
+        );
 
         let stopped = runtime.stop_worker(&created.worker_ref, None).unwrap();
         assert_eq!(stopped.status, WorkerStatus::Stopped);
         assert_eq!(*backend.stop_count.lock().unwrap(), 2);
+        assert_eq!(
+            backend.stop_operation_ids.lock().unwrap().as_slice(),
+            &[operation_id, operation_id]
+        );
+        assert!(
+            runtime
+                .lock()
+                .unwrap()
+                .worker(&created.worker_ref)
+                .unwrap()
+                .pending_stop
+                .is_none()
+        );
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn fs_store_reconciles_pending_stop_before_automatic_restore() {
+        let root = fs_store_root("pending-stop-reconciliation");
+        let options = crate::fs_store::FsRuntimeStoreOptions {
+            root: root.clone(),
+            runtime_id: "test-runtime".to_string(),
+            display_name: None,
+        };
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            options.clone(),
+            backend.clone(),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("reconcile pending stop"))
+            .unwrap();
+        runtime_store(&runtime)
+            .fail_next_worker_write(crate::fs_store::AtomicWriteFault::AfterRename);
+
+        let error = runtime
+            .stop_worker(&worker.worker_ref, None)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::StoreCommitOutcomeUnknown { .. }
+        ));
+        assert_eq!(*backend.stop_count.lock().unwrap(), 0);
+        let operation_id = runtime
+            .lock()
+            .unwrap()
+            .worker(&worker.worker_ref)
+            .unwrap()
+            .pending_stop
+            .unwrap()
+            .operation_id;
+        let aggregate: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                root.join("workers")
+                    .join(worker.worker_id.to_string())
+                    .join("worker.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            aggregate["execution_state"]["state"],
+            serde_json::json!("reconciliation_required")
+        );
+        assert_eq!(
+            aggregate["execution_state"]["execution"]["operation"],
+            serde_json::json!("stop")
+        );
+        assert_eq!(
+            aggregate["execution_state"]["execution"]["intent"]["operation_id"],
+            serde_json::json!(operation_id.to_string())
+        );
+        drop(runtime);
+
+        let reconciling_backend = Arc::new(TestExecutionBackend::default());
+        let reconciled = Runtime::with_fs_store_and_execution_backend(
+            options.clone(),
+            reconciling_backend.clone(),
+        )
+        .unwrap();
+        assert_eq!(*reconciling_backend.stop_count.lock().unwrap(), 1);
+        assert_eq!(*reconciling_backend.restore_count.lock().unwrap(), 0);
+        assert_eq!(
+            reconciling_backend
+                .stop_operation_ids
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &[operation_id]
+        );
+        assert_eq!(
+            reconciled.worker_detail(&worker.worker_ref).unwrap().status,
+            WorkerStatus::Stopped
+        );
+        assert!(
+            reconciled
+                .lock()
+                .unwrap()
+                .worker(&worker.worker_ref)
+                .unwrap()
+                .pending_stop
+                .is_none()
+        );
+        drop(reconciled);
+
+        let restarted_backend = Arc::new(TestExecutionBackend::default());
+        let restarted = Runtime::with_fs_store_and_execution_backend(
+            options,
+            restarted_backend.clone(),
+        )
+        .unwrap();
+        assert_eq!(*restarted_backend.stop_count.lock().unwrap(), 0);
+        assert_eq!(*restarted_backend.restore_count.lock().unwrap(), 0);
+        assert_eq!(
+            restarted.worker_detail(&worker.worker_ref).unwrap().status,
+            WorkerStatus::Stopped
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -8875,11 +9200,15 @@ mod tests {
             serde_json::json!("reconciliation_required")
         );
         assert_eq!(
-            aggregate["execution_state"]["execution"]["operation_id"],
+            aggregate["execution_state"]["execution"]["operation"],
+            serde_json::json!("restore")
+        );
+        assert_eq!(
+            aggregate["execution_state"]["execution"]["intent"]["operation_id"],
             serde_json::json!(operation_id.to_string())
         );
         assert_eq!(
-            aggregate["execution_state"]["execution"]["mode"],
+            aggregate["execution_state"]["execution"]["intent"]["mode"],
             serde_json::json!("explicit")
         );
 

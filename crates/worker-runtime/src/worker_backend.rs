@@ -25,8 +25,8 @@ use crate::config_bundle::{ConfigBundle, workspace_config_etag};
 use crate::execution::{
     WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation,
     WorkerExecutionRestoreRequest, WorkerExecutionResult, WorkerExecutionSpawnRequest,
-    WorkerExecutionSpawnResult, WorkerSessionObservationRequest, WorkspaceConfigFetchRequest,
-    WorkspaceConfigFetchResult,
+    WorkerExecutionSpawnResult, WorkerExecutionStopRequest, WorkerSessionObservationRequest,
+    WorkspaceConfigFetchRequest, WorkspaceConfigFetchResult,
 };
 use crate::identity::WorkerRef;
 use crate::interaction::{WorkerInput, WorkerInputKind};
@@ -2858,6 +2858,16 @@ where
         };
 
         self.send_method(WorkerExecutionOperation::ProtocolMethod, worker, method)
+    }
+
+    fn stop_worker_operation(
+        &self,
+        request: WorkerExecutionStopRequest,
+    ) -> WorkerExecutionResult {
+        let handle = request.handle.unwrap_or_else(|| {
+            WorkerExecutionHandle::new(request.worker_ref, self.backend_id())
+        });
+        self.stop_worker(&handle)
     }
 
     fn stop_worker(&self, handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
