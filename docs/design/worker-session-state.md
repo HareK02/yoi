@@ -7,7 +7,7 @@ This identity rule separates durable conversation history from execution attempt
 - **Worker ID** identifies the Runtime catalog aggregate and remains stable across stop/restore.
 - **Session ID** identifies that Worker's sole replayable history and remains stable across compaction.
 - **Segment ID** identifies a branch or compacted history projection inside the Session.
-- **run generation** identifies one process/controller execution attempt and increases before every spawn or restore.
+- **run identity** identifies one process/controller execution attempt. Fresh spawn uses a unique run ID; Restore uses the durable lifecycle operation ID so reconciliation addresses the same attempt rather than allocating another controller.
 
 ## Canonical Runtime layout
 
@@ -23,7 +23,13 @@ workers/<worker_id>/
       <segment_id>.jsonl
       <segment_id>.trace.jsonl
   runs/
-    <generation>/
+    <spawn-run-id>/
+      worker.sock
+      worker.out.log
+      worker.err.log
+      artifacts/
+      spawned/
+    restore-<lifecycle-operation-id>/
       worker.sock
       worker.out.log
       worker.err.log
@@ -31,7 +37,7 @@ workers/<worker_id>/
       spawned/
 ```
 
-`worker.json` is Runtime catalog authority: Workspace attribution, create/restore request, execution binding, and the last durably reserved run generation. `metadata.json` is the current Worker projection used to restore active/pending Segment pointers, resolved manifest state, delegation metadata, and child/peer visibility. It is not a second transcript.
+`worker.json` is the atomic Runtime catalog authority: Worker identity and Workspace attribution, the settled lifecycle status, the create/restore request and execution binding, plus any pending Restore or Stop reconciliation operation. `metadata.json` is the current Worker projection used to restore active/pending Segment pointers, resolved manifest state, delegation metadata, and child/peer visibility. It is not a second transcript.
 
 `session/session.json` fixes the single Session ID for the aggregate. The Worker-specific Session store rejects attempts to address another Session ID. Session JSONL is the append-oriented replay authority for committed user inputs, assistant items, tool results, system/runtime events, Segment lineage, and effective snapshots required to explain later behavior.
 
@@ -47,15 +53,19 @@ This keeps existing Worker IDs, Session IDs, Segment references, observation ent
 
 ## Run lifecycle
 
-Run generations are monotonic per Worker. Runtime durably reserves and persists the next generation before invoking the execution backend:
+A lifecycle transition has a stable operation ID distinct from settled Worker status. Runtime commits a pending operation into `worker.json` before invoking a side-effecting Backend call:
 
-- initial spawn reserves generation `1`;
-- explicit restore reserves the next generation;
-- startup restoration after a process crash reserves the next generation before reconnecting providers or observation state.
+- fresh spawn uses a unique run ID and commits the connected aggregate only after Backend startup succeeds;
+- Restore records `ReconciliationRequired::Restore(operation_id, mode, last_settled_status, restore request)` after preflight and before controller startup;
+- Stop records `ReconciliationRequired::Stop(operation_id, last_settled_status, execution evidence)` before requesting controller shutdown.
 
-A generation directory is created with `create_new` semantics. An existing directory is a collision and is never reused as a new execution. This makes a crash between reservation and controller startup recoverable: startup consumes another generation instead of treating stale socket/log state as live authority.
+Restore run directories are named `restore-<operation_id>` and use `create_new` semantics. Retry and startup reconciliation reuse that operation ID. An in-process Backend returns an already registered controller for the same operation; after Backend restart, the existing operation-scoped directory prevents the same operation from allocating a second run generation. A different Restore operation receives a different operation ID and directory only after the previous operation has reached a proved terminal outcome.
 
-Stopping a Worker waits for controller shutdown completion and removes `worker.sock`. The generation directory and diagnostic files remain evidence. How old generations are retained, archived, or purged is a separate policy; aggregate creation and migration do not invent that disposition.
+Startup reconciles pending Stop operations before considering automatic Restore. A proved Stop commits `Stopped` atomically and is therefore never selected as an active restore candidate. Pending or uncertain operations remain orthogonal to the last settled status and block conflicting input, lifecycle, deletion, and retention operations.
+
+Restore candidates keep protocol events and observation registration isolated until the Active aggregate commit succeeds. After that commit, Runtime activates the Backend observation registration and flushes buffered protocol events in order. A rollback discards the candidate context, so external observers cannot see a live candidate beside a settled `Stopped` catalog record.
+
+Stopping a Worker waits for controller shutdown completion and removes `worker.sock`. Run directories and diagnostic files remain evidence. How old runs are retained, archived, or purged is a separate policy; aggregate creation and migration do not invent that disposition.
 
 Live sockets and provider sessions are execution hints, not durable identity. Restore reconstructs Workspace client attribution, observation registration, and Workdir/provider bindings from Runtime/Backend authority while keeping the Worker and Session identities unchanged.
 
