@@ -3,9 +3,10 @@ use std::io;
 use std::time::Duration;
 
 use client::{
-    BackendRuntimeListTarget, BackendWorkerSummary, BackendWorkingDirectorySource,
-    WorkerSessionAvailability, list_backend_stopped_workers, list_backend_workers,
-    observe_backend_worker_session,
+    BackendRuntimeListTarget, BackendWorkerRestoreResponse, BackendWorkerRestoreState,
+    BackendWorkerSummary, BackendWorkingDirectorySource, WorkerSessionAvailability,
+    WorkspaceWorkerSessionResponse, list_backend_stopped_workers, list_backend_workers,
+    observe_backend_worker_session, restore_backend_worker,
 };
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
@@ -15,6 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
+use crate::BackendWorkerPickerIntent;
 use crate::backend_workspace_picker::select_backend_workspace;
 use crate::console;
 use crate::inline_terminal::with_inline_terminal;
@@ -22,9 +24,53 @@ use crate::inline_terminal::with_inline_terminal;
 const MAX_ROWS: usize = 10;
 const VIEWPORT_LINES: u16 = MAX_ROWS as u16 + 4;
 
+#[async_trait::async_trait]
+trait BackendWorkerLifecycle {
+    async fn restore(
+        &self,
+        target: &client::BackendRuntimeTarget,
+    ) -> Result<BackendWorkerRestoreResponse, io::Error>;
+
+    async fn observe(
+        &self,
+        target: &client::BackendRuntimeTarget,
+    ) -> Result<WorkspaceWorkerSessionResponse, io::Error>;
+}
+
+struct LiveBackendWorkerLifecycle;
+
+#[async_trait::async_trait]
+impl BackendWorkerLifecycle for LiveBackendWorkerLifecycle {
+    async fn restore(
+        &self,
+        target: &client::BackendRuntimeTarget,
+    ) -> Result<BackendWorkerRestoreResponse, io::Error> {
+        restore_backend_worker(target).await.map_err(|error| {
+            io::Error::other(format!(
+                "failed to restore Backend Worker {}: {error}",
+                target.display_label()
+            ))
+        })
+    }
+
+    async fn observe(
+        &self,
+        target: &client::BackendRuntimeTarget,
+    ) -> Result<WorkspaceWorkerSessionResponse, io::Error> {
+        observe_backend_worker_session(target)
+            .await
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "failed to observe Worker Session {}: {error}",
+                    target.display_label()
+                ))
+            })
+    }
+}
+
 pub(crate) async fn run(
     mut target: BackendRuntimeListTarget,
-    include_stopped: bool,
+    intent: BackendWorkerPickerIntent,
 ) -> Result<(), Box<dyn Error>> {
     loop {
         if target.workspace_id().is_none() {
@@ -40,7 +86,10 @@ pub(crate) async fn run(
                 target.base_url
             ))
         })?;
-        if include_stopped {
+        if intent == BackendWorkerPickerIntent::Resume {
+            response.items.retain(is_resume_candidate);
+        }
+        if intent.include_stopped() {
             match list_backend_stopped_workers(&target).await {
                 Ok(stopped) => {
                     response.items.extend(stopped.items);
@@ -81,19 +130,77 @@ pub(crate) async fn run(
             }
             WorkerPickerResult::Selected(selected) => selected,
         };
-        let mut attach_target = target
+        let attach_target = target
             .runtime_target(selected.runtime_id.clone(), selected.worker_id.clone())
             .map_err(|error| io::Error::other(error.to_string()))?;
-        let response = observe_backend_worker_session(&attach_target)
-            .await
-            .map_err(|error| {
-                io::Error::other(format!(
-                    "failed to observe Worker Session {}/{}: {error}",
-                    selected.runtime_id, selected.worker_id
-                ))
-            })?;
-        apply_worker_session_observation(&mut attach_target, response.observation);
+        let attach_target =
+            prepare_selected_worker(&LiveBackendWorkerLifecycle, attach_target, intent).await?;
         return console::run_backend_runtime(attach_target).await;
+    }
+}
+
+async fn prepare_selected_worker(
+    lifecycle: &impl BackendWorkerLifecycle,
+    mut target: client::BackendRuntimeTarget,
+    intent: BackendWorkerPickerIntent,
+) -> Result<client::BackendRuntimeTarget, io::Error> {
+    if intent == BackendWorkerPickerIntent::Resume {
+        let response = lifecycle.restore(&target).await?;
+        ensure_restore_accepted(&response)?;
+        let observation = lifecycle.observe(&target).await?;
+        require_live_resume_observation(observation.observation)?;
+        return Ok(target);
+    }
+
+    let observation = lifecycle.observe(&target).await?;
+    apply_worker_session_observation(&mut target, observation.observation);
+    Ok(target)
+}
+
+fn is_resume_candidate(worker: &BackendWorkerSummary) -> bool {
+    worker.worker_state.is_none()
+}
+
+fn ensure_restore_accepted(response: &BackendWorkerRestoreResponse) -> Result<(), io::Error> {
+    if response.result.state == BackendWorkerRestoreState::Accepted {
+        return Ok(());
+    }
+    let detail = response
+        .result
+        .diagnostics
+        .iter()
+        .take(3)
+        .map(|diagnostic| {
+            let message = diagnostic.message.chars().take(512).collect::<String>();
+            format!("{}: {message}", diagnostic.code)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let detail = if detail.is_empty() {
+        "no Backend diagnostics".to_string()
+    } else {
+        detail
+    };
+    Err(io::Error::other(format!(
+        "Backend Worker restore for {}/{} returned {:?} ({detail})",
+        response.runtime_id, response.worker_id, response.result.state
+    )))
+}
+
+fn require_live_resume_observation(
+    observation: WorkerSessionAvailability,
+) -> Result<(), io::Error> {
+    match observation {
+        WorkerSessionAvailability::LiveProtocol => Ok(()),
+        WorkerSessionAvailability::RetainedSnapshot { .. } => Err(io::Error::other(
+            "Backend Worker restore completed without a live protocol Session; retained history was not opened because resume requires a live Worker",
+        )),
+        WorkerSessionAvailability::Unavailable { reason, message } => {
+            let message = message.chars().take(512).collect::<String>();
+            Err(io::Error::other(format!(
+                "Backend Worker restore completed without a live protocol Session: {reason:?}: {message}"
+            )))
+        }
     }
 }
 
@@ -432,7 +539,8 @@ fn working_directory_text(worker: &BackendWorkerSummary) -> String {
 mod tests {
     use super::*;
     use client::{
-        BackendWorkerCapabilitySummary, BackendWorkerImplementationSummary,
+        BackendDiagnostic, BackendDiagnosticSeverity, BackendWorkerCapabilitySummary,
+        BackendWorkerImplementationSummary, BackendWorkerRestoreResult,
         BackendWorkerWorkspaceSummary,
     };
 
@@ -453,6 +561,7 @@ mod tests {
                 workspace_id: Some("ws".to_string()),
             },
             state: "idle".to_string(),
+            availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
             worker_state: Some(protocol::WorkerStateSnapshot {
                 state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
                     protocol::WorkerRunState::Running,
@@ -486,6 +595,178 @@ mod tests {
     fn display_column(text: &str, value: &str) -> usize {
         let byte_offset = text.find(value).expect("value in rendered row");
         text_width(&text[..byte_offset])
+    }
+
+    fn restore_response(state: BackendWorkerRestoreState) -> BackendWorkerRestoreResponse {
+        BackendWorkerRestoreResponse {
+            workspace_id: "workspace-a".to_string(),
+            runtime_id: "runtime-a".to_string(),
+            worker_id: "worker-a".to_string(),
+            result: BackendWorkerRestoreResult {
+                state,
+                worker: None,
+                diagnostics: Vec::new(),
+            },
+        }
+    }
+
+    struct FakeBackendWorkerLifecycle {
+        restore_response: BackendWorkerRestoreResponse,
+        observation: WorkspaceWorkerSessionResponse,
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BackendWorkerLifecycle for FakeBackendWorkerLifecycle {
+        async fn restore(
+            &self,
+            _target: &client::BackendRuntimeTarget,
+        ) -> Result<BackendWorkerRestoreResponse, io::Error> {
+            self.calls.lock().unwrap().push("restore");
+            Ok(self.restore_response.clone())
+        }
+
+        async fn observe(
+            &self,
+            _target: &client::BackendRuntimeTarget,
+        ) -> Result<WorkspaceWorkerSessionResponse, io::Error> {
+            self.calls.lock().unwrap().push("observe");
+            Ok(self.observation.clone())
+        }
+    }
+
+    fn session_observation(observation: serde_json::Value) -> WorkspaceWorkerSessionResponse {
+        let mut value = serde_json::json!({
+            "subject": {
+                "kind": "runtime_worker",
+                "runtime_id": "runtime-a",
+                "worker_id": "worker-a"
+            }
+        });
+        value.as_object_mut().unwrap().extend(
+            observation
+                .as_object()
+                .expect("observation must be an object")
+                .clone(),
+        );
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[tokio::test]
+    async fn resume_restores_before_requiring_live_observation() {
+        let lifecycle = FakeBackendWorkerLifecycle {
+            restore_response: restore_response(BackendWorkerRestoreState::Accepted),
+            observation: session_observation(serde_json::json!({
+                "availability": "live_protocol"
+            })),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let target = client::BackendRuntimeTarget::new(
+            "http://127.0.0.1:3000",
+            "workspace-a",
+            "runtime-a",
+            "worker-a",
+        );
+
+        let prepared =
+            prepare_selected_worker(&lifecycle, target, BackendWorkerPickerIntent::Resume)
+                .await
+                .unwrap();
+
+        assert_eq!(*lifecycle.calls.lock().unwrap(), ["restore", "observe"]);
+        assert!(prepared.initial_snapshot.is_none());
+    }
+
+    #[tokio::test]
+    async fn rejected_resume_does_not_observe_or_open_retained_state() {
+        let lifecycle = FakeBackendWorkerLifecycle {
+            restore_response: restore_response(BackendWorkerRestoreState::Rejected),
+            observation: session_observation(serde_json::json!({
+                "availability": "unavailable",
+                "reason": "retention_missing",
+                "message": "must not be opened"
+            })),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let target = client::BackendRuntimeTarget::new(
+            "http://127.0.0.1:3000",
+            "workspace-a",
+            "runtime-a",
+            "worker-a",
+        );
+
+        let error = prepare_selected_worker(&lifecycle, target, BackendWorkerPickerIntent::Resume)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("Rejected"));
+        assert_eq!(*lifecycle.calls.lock().unwrap(), ["restore"]);
+    }
+
+    #[test]
+    fn resume_candidates_have_no_current_worker_state() {
+        let live = worker("runtime-a", "worker-live", None);
+        let mut stopped = worker("runtime-a", "worker-stopped", None);
+        stopped.state = "stopped".to_string();
+        stopped.worker_state = None;
+        let mut unknown = worker("runtime-a", "worker-unknown", None);
+        unknown.worker_state = None;
+
+        assert!(!is_resume_candidate(&live));
+        assert!(is_resume_candidate(&stopped));
+        assert!(is_resume_candidate(&unknown));
+    }
+
+    #[test]
+    fn backend_resume_requires_an_accepted_restore_result() {
+        assert!(
+            ensure_restore_accepted(&restore_response(BackendWorkerRestoreState::Accepted)).is_ok()
+        );
+        for state in [
+            BackendWorkerRestoreState::Rejected,
+            BackendWorkerRestoreState::RolledBack,
+            BackendWorkerRestoreState::ReconciliationRequired,
+        ] {
+            let mut response = restore_response(state);
+            response.result.diagnostics.push(BackendDiagnostic {
+                code: "restore_failed".to_string(),
+                severity: BackendDiagnosticSeverity::Error,
+                message: "bounded reason".to_string(),
+            });
+            let error = ensure_restore_accepted(&response).unwrap_err().to_string();
+            assert!(error.contains("restore_failed: bounded reason"));
+        }
+    }
+
+    #[test]
+    fn backend_resume_requires_live_protocol_after_restore() {
+        assert!(require_live_resume_observation(WorkerSessionAvailability::LiveProtocol).is_ok());
+
+        let retained =
+            require_live_resume_observation(WorkerSessionAvailability::RetainedSnapshot {
+                identity: client::RetainedSessionIdentity {
+                    session_id: "session-a".to_string(),
+                    segment_id: "segment-a".to_string(),
+                    entry_count: 1,
+                },
+                snapshot: protocol::SessionSnapshot {
+                    pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                    entries: Vec::new(),
+                },
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(retained.contains("resume requires a live Worker"));
+
+        let unavailable = require_live_resume_observation(WorkerSessionAvailability::Unavailable {
+            reason: client::WorkerSessionUnavailableReason::RetentionMissing,
+            message: "retained state missing".to_string(),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(unavailable.contains("RetentionMissing"));
+        assert!(unavailable.contains("retained state missing"));
     }
 
     #[test]

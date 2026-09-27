@@ -23,7 +23,7 @@ use cli_connection::{
 };
 use client::{BackendAuthTarget, Target, TargetKind, start_device_login, wait_for_device_login};
 use serde::Deserialize;
-use tui::{LaunchMode, LaunchOptions};
+use tui::{BackendWorkerPickerIntent, LaunchMode, LaunchOptions};
 use workspace_bootstrap::{
     InitOptions, discover_repository_root, run_init, select_backend_workspace_for_repository,
 };
@@ -1028,7 +1028,9 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
             target,
             mode: LaunchMode::Workers {
                 runtime_id,
-                include_stopped: false,
+                intent: BackendWorkerPickerIntent::Attach {
+                    include_stopped: false,
+                },
             },
             workspace_root,
         });
@@ -1154,7 +1156,7 @@ fn parse_workers_args<R: CliConnectionResolver + ?Sized>(
         target,
         mode: LaunchMode::Workers {
             runtime_id,
-            include_stopped,
+            intent: BackendWorkerPickerIntent::Attach { include_stopped },
         },
         workspace_root,
     })
@@ -1272,7 +1274,7 @@ fn parse_resume_args<R: CliConnectionResolver + ?Sized>(
         }
         LaunchMode::Workers {
             runtime_id,
-            include_stopped: true,
+            intent: BackendWorkerPickerIntent::Resume,
         }
     };
 
@@ -2611,6 +2613,60 @@ backend = "shared"
                 !production.contains(forbidden),
                 "repository-local Memory CLI returned through {forbidden}"
             );
+        }
+    }
+
+    #[test]
+    fn parse_backend_resume_uses_restore_picker_intent() {
+        match parse_args_from([
+            "--backend",
+            "http://127.0.0.1:8787",
+            "--workspace-id",
+            "workspace-a",
+            "resume",
+            "--runtime-id",
+            "arcadia",
+        ])
+        .unwrap()
+        {
+            Mode::Tui {
+                mode:
+                    LaunchMode::Workers {
+                        runtime_id,
+                        intent: BackendWorkerPickerIntent::Resume,
+                    },
+                ..
+            } => assert_eq!(runtime_id.as_deref(), Some("arcadia")),
+            other => panic!("expected Backend resume picker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_workers_stopped_keeps_retained_attach_intent() {
+        match parse_args_from([
+            "--backend",
+            "http://127.0.0.1:8787",
+            "--workspace-id",
+            "workspace-a",
+            "workers",
+            "--stopped",
+            "--runtime-id",
+            "arcadia",
+        ])
+        .unwrap()
+        {
+            Mode::Tui {
+                mode:
+                    LaunchMode::Workers {
+                        runtime_id,
+                        intent: BackendWorkerPickerIntent::Attach { include_stopped },
+                    },
+                ..
+            } => {
+                assert_eq!(runtime_id.as_deref(), Some("arcadia"));
+                assert!(include_stopped);
+            }
+            other => panic!("expected retained Backend worker picker, got {other:?}"),
         }
     }
 

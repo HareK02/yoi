@@ -42,6 +42,21 @@ pub struct LaunchOptions {
     pub workspace_root: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendWorkerPickerIntent {
+    Attach { include_stopped: bool },
+    Resume,
+}
+
+impl BackendWorkerPickerIntent {
+    pub(crate) fn include_stopped(self) -> bool {
+        match self {
+            Self::Attach { include_stopped } => include_stopped,
+            Self::Resume => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum LaunchMode {
     /// Start one client-owned in-process Standalone Worker.
@@ -54,10 +69,10 @@ pub enum LaunchMode {
     StandaloneResume { include_all: bool },
     /// Create one Backend Worker and attach to it.
     BackendSpawn,
-    /// List Backend Workers and attach to the selected Worker.
+    /// List Backend Workers and open the selected Worker according to the caller's intent.
     Workers {
         runtime_id: Option<String>,
-        include_stopped: bool,
+        intent: BackendWorkerPickerIntent,
     },
     /// Open one Backend Worker through the selected connection target.
     OpenWorker {
@@ -212,20 +227,18 @@ async fn launch_mode(
             Ok(launch) => backend_spawn::run(launch.target).await,
             Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
         },
-        LaunchMode::Workers {
-            runtime_id,
-            include_stopped,
-        } => match target.list_workers(if include_stopped {
-            WorkerListRequest::with_stopped(runtime_id)
-        } else {
-            WorkerListRequest::new(runtime_id)
-        }) {
-            Ok(worker_list) => {
-                backend_worker_picker::run(worker_list.backend_target, worker_list.include_stopped)
-                    .await
+        LaunchMode::Workers { runtime_id, intent } => {
+            match target.list_workers(if intent.include_stopped() {
+                WorkerListRequest::with_stopped(runtime_id)
+            } else {
+                WorkerListRequest::new(runtime_id)
+            }) {
+                Ok(worker_list) => {
+                    backend_worker_picker::run(worker_list.backend_target, intent).await
+                }
+                Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
             }
-            Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
-        },
+        }
         LaunchMode::OpenWorker {
             runtime_id,
             worker_id,
