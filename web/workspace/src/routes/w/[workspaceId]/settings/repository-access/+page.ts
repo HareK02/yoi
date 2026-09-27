@@ -5,49 +5,67 @@ import {
   parseRepositorySshHostTrusts,
   parseRepositorySshPublicKey,
 } from "$lib/workspace/api/repository-access";
-import { loadRepositoryAccessJson } from "$lib/workspace/api/repository-access-loader";
+import {
+  loadRepositoryAccessPermissionGate,
+  loadRepositoryAccessSection,
+} from "$lib/workspace/api/repository-access-loader";
 import type { PageLoad } from "./$types";
+
+const WORKSPACE_DEFAULT_CREDENTIAL_ID = "workspace-default";
 
 export const load: PageLoad = async ({ fetch, params }) => {
   const workspaceId = params.workspaceId;
-  const accessProjection = await loadRepositoryAccessJson(
+  const accessProjectionResult = await loadRepositoryAccessPermissionGate(
     fetch,
     workspaceApiPath(workspaceId, "/settings/repository-access"),
     parseRepositoryAccessProjection,
+    "Repository bindings",
   );
-  const [credentials, hostTrusts] = await Promise.all([
-    loadRepositoryAccessJson(
+  const [credentialsResult, hostTrustsResult] = await Promise.all([
+    loadRepositoryAccessSection(
       fetch,
       workspaceApiPath(workspaceId, "/settings/repository-access/credentials"),
       parseRepositorySshCredentials,
+      "SSH credentials",
     ),
-    loadRepositoryAccessJson(
+    loadRepositoryAccessSection(
       fetch,
       workspaceApiPath(workspaceId, "/settings/repository-access/host-trusts"),
       parseRepositorySshHostTrusts,
+      "Pinned SSH host keys",
     ),
   ]);
 
-  const publicKeys = await Promise.all(
-    credentials.map((credential) =>
-      loadRepositoryAccessJson(
-        fetch,
-        workspaceApiPath(
-          workspaceId,
-          `/settings/repository-access/credentials/${
-            encodeURIComponent(credential.credential_id)
-          }/public-key`,
-        ),
-        parseRepositorySshPublicKey,
-      )
-    ),
+  const credentials = credentialsResult.data ?? [];
+  const defaultCredential = credentials.find(
+    (credential) =>
+      credential.credential_id === WORKSPACE_DEFAULT_CREDENTIAL_ID,
   );
+  const defaultPublicKeyResult = defaultCredential
+    ? await loadRepositoryAccessSection(
+      fetch,
+      workspaceApiPath(
+        workspaceId,
+        `/settings/repository-access/credentials/${
+          encodeURIComponent(defaultCredential.credential_id)
+        }/public-key`,
+      ),
+      parseRepositorySshPublicKey,
+      "The Workspace default public key",
+    )
+    : { data: null, error: null };
 
   return {
     workspaceId,
     credentials,
-    publicKeys,
-    hostTrusts,
-    accessProjection,
+    credentialsError: credentialsResult.error,
+    publicKeys: defaultPublicKeyResult.data
+      ? [defaultPublicKeyResult.data]
+      : [],
+    defaultPublicKeyError: defaultPublicKeyResult.error,
+    hostTrusts: hostTrustsResult.data ?? [],
+    hostTrustsError: hostTrustsResult.error,
+    accessProjection: accessProjectionResult.data,
+    accessProjectionError: accessProjectionResult.error,
   };
 };

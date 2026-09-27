@@ -45,6 +45,7 @@ function worker(overrides: Partial<Worker>): Worker {
     workdir_attachments: [],
     diagnostics: [],
     ...overrides,
+    availability: overrides.availability ?? "observed",
   };
 }
 
@@ -78,7 +79,10 @@ Deno.test("sidebar workers sort running then idle then stopped", () => {
     worker({ worker_id: "1", display_name: "Idle A", state: "idle" }),
   ];
   workers.sort(compareWorkersForSidebar);
-  assertEquals(workers.map((candidate) => candidate.worker_id).join(","), "2,1,4,3");
+  assertEquals(
+    workers.map((candidate) => candidate.worker_id).join(","),
+    "2,1,4,3",
+  );
 });
 
 Deno.test("collapsed sidebar keeps the current Worker visible", () => {
