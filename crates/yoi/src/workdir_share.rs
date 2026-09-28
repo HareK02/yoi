@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,16 +21,17 @@ use workdir::external::{
 use workdir::http::{WorkdirTransportError, dispatch_workdir_session_operation};
 use workdir::{
     BoundedReadLimits, ExternalWorkdirRoot, LocalWorkdirSession, Workdir, WorkdirSession,
-    WorkdirSessionCapabilities,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkdirShareOptions {
     pub path: PathBuf,
-    pub workspace_id: String,
+    pub workspace_id: Option<String>,
     pub backend_url: String,
     pub display_name: String,
-    pub ttl: Duration,
+    pub ttl: Option<Duration>,
+    pub permission: server_api::ExternalWorkdirPermission,
+    pub non_interactive: bool,
 }
 
 const PROVIDER_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -126,7 +128,254 @@ fn authenticated_server_api_client(
     Ok(ServerApiClient::with_client(base_url, http_client))
 }
 
+fn permission_label(permission: server_api::ExternalWorkdirPermission) -> &'static str {
+    match permission {
+        server_api::ExternalWorkdirPermission::ReadOnly => "read-only",
+        server_api::ExternalWorkdirPermission::ReadWrite => {
+            "read-write (files only; commands disabled)"
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedWorkdirShareOptions {
+    path: PathBuf,
+    workspace_id: String,
+    backend_url: String,
+    display_name: String,
+    ttl: Option<Duration>,
+    permission: server_api::ExternalWorkdirPermission,
+}
+
+pub(crate) fn parse_ttl(value: &str) -> Result<Duration, String> {
+    let (number, multiplier) = if let Some(value) = value.strip_suffix('h') {
+        (value, 60 * 60)
+    } else if let Some(value) = value.strip_suffix('m') {
+        (value, 60)
+    } else if let Some(value) = value.strip_suffix('s') {
+        (value, 1)
+    } else {
+        return Err("TTL must use an h, m, or s suffix (for example 1h)".to_string());
+    };
+    let amount = number
+        .parse::<u64>()
+        .map_err(|_| "TTL must contain a positive integer and h, m, or s suffix".to_string())?;
+    let seconds = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| "TTL is too large".to_string())?;
+    if !(60..=86_400).contains(&seconds) {
+        return Err("TTL must be between 60s and 24h".to_string());
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+fn ttl_label(ttl: Option<Duration>) -> String {
+    match ttl {
+        None => "unlimited (ends on stop, disconnect, or revoke)".to_string(),
+        Some(ttl) => format!("{}s", ttl.as_secs()),
+    }
+}
+
+fn read_prompt_line(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    prompt: &str,
+) -> Result<Option<String>, String> {
+    write!(output, "{prompt}").map_err(|error| format!("failed to write prompt: {error}"))?;
+    output
+        .flush()
+        .map_err(|error| format!("failed to flush prompt: {error}"))?;
+    let mut line = String::new();
+    let read = input
+        .read_line(&mut line)
+        .map_err(|error| format!("failed to read operator input: {error}"))?;
+    if read == 0 {
+        return Ok(None);
+    }
+    Ok(Some(line.trim().to_string()))
+}
+
+fn configure_interactively(
+    mut options: WorkdirShareOptions,
+    workspaces: &[server_api::WorkspaceSummary],
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> Result<Option<ResolvedWorkdirShareOptions>, String> {
+    if workspaces.is_empty() {
+        return Err("Backend returned no accessible Workspaces".to_string());
+    }
+    writeln!(output, "Select a Workspace:")
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    for (index, workspace) in workspaces.iter().enumerate() {
+        writeln!(
+            output,
+            "  {}) {} ({})",
+            index + 1,
+            workspace.display_name,
+            workspace.workspace_id
+        )
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    }
+    let initial_index = options
+        .workspace_id
+        .as_deref()
+        .map(|workspace_id| {
+            workspaces
+                .iter()
+                .position(|workspace| workspace.workspace_id == workspace_id)
+                .ok_or_else(|| {
+                    format!(
+                        "Workspace `{workspace_id}` is not present in the accessible Backend catalog"
+                    )
+                })
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let Some(selection) = read_prompt_line(
+        input,
+        output,
+        &format!("Workspace [{}; q to cancel]: ", initial_index + 1),
+    )?
+    else {
+        return Ok(None);
+    };
+    if matches!(selection.as_str(), "q" | "quit" | "cancel") {
+        return Ok(None);
+    }
+    let selected_index = if selection.is_empty() {
+        initial_index
+    } else {
+        selection
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| index.checked_sub(1))
+            .filter(|index| *index < workspaces.len())
+            .ok_or_else(|| "Workspace selection is invalid".to_string())?
+    };
+    options.workspace_id = Some(workspaces[selected_index].workspace_id.clone());
+
+    let current_permission = match options.permission {
+        server_api::ExternalWorkdirPermission::ReadOnly => "r",
+        server_api::ExternalWorkdirPermission::ReadWrite => "w",
+    };
+    writeln!(
+        output,
+        "Permission: read-only or read-write files. Read-write never enables Bash/command/exec."
+    )
+    .map_err(|error| format!("failed to write prompt: {error}"))?;
+    let Some(permission) = read_prompt_line(
+        input,
+        output,
+        &format!("Permission [r/w; current {current_permission}; q to cancel]: "),
+    )?
+    else {
+        return Ok(None);
+    };
+    options.permission = match permission.as_str() {
+        "" => options.permission,
+        "r" | "read-only" | "read_only" => server_api::ExternalWorkdirPermission::ReadOnly,
+        "w" | "read-write" | "read_write" => server_api::ExternalWorkdirPermission::ReadWrite,
+        "q" | "quit" | "cancel" => return Ok(None),
+        _ => return Err("Permission must be read-only (`r`) or read-write (`w`)".to_string()),
+    };
+
+    writeln!(output, "TTL: {}", ttl_label(options.ttl))
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    let Some(ttl) = read_prompt_line(
+        input,
+        output,
+        "TTL [empty keeps current; `none` is unlimited; q to cancel]: ",
+    )?
+    else {
+        return Ok(None);
+    };
+    options.ttl = match ttl.as_str() {
+        "" => options.ttl,
+        "none" | "unlimited" => None,
+        "q" | "quit" | "cancel" => return Ok(None),
+        value => Some(parse_ttl(value)?),
+    };
+
+    let workspace_id = options
+        .workspace_id
+        .clone()
+        .expect("interactive selection always assigns a Workspace");
+    writeln!(output, "Share configuration:")
+        .and_then(|()| writeln!(output, "  Workspace: {workspace_id}"))
+        .and_then(|()| {
+            writeln!(
+                output,
+                "  Permission: {}",
+                permission_label(options.permission)
+            )
+        })
+        .and_then(|()| writeln!(output, "  TTL: {}", ttl_label(options.ttl)))
+        .map_err(|error| format!("failed to write confirmation: {error}"))?;
+    let Some(confirm) = read_prompt_line(input, output, "Connect and create grant? [y/N]: ")?
+    else {
+        return Ok(None);
+    };
+    if !matches!(confirm.as_str(), "y" | "yes") {
+        return Ok(None);
+    }
+    Ok(Some(ResolvedWorkdirShareOptions {
+        path: options.path,
+        workspace_id,
+        backend_url: options.backend_url,
+        display_name: options.display_name,
+        ttl: options.ttl,
+        permission: options.permission,
+    }))
+}
+
+fn ensure_interactive_tty(stdin_is_tty: bool, stderr_is_tty: bool) -> Result<(), String> {
+    if stdin_is_tty && stderr_is_tty {
+        Ok(())
+    } else {
+        Err(
+            "interactive sharing requires a TTY; use --non-interactive with --workspace-id for automation"
+                .to_string(),
+        )
+    }
+}
+
+async fn resolve_share_options(
+    options: WorkdirShareOptions,
+) -> Result<Option<ResolvedWorkdirShareOptions>, String> {
+    if options.non_interactive {
+        let workspace_id = options.workspace_id.clone().ok_or_else(|| {
+            "non-interactive sharing requires --workspace-id; no Workspace is inferred from cwd or path"
+                .to_string()
+        })?;
+        return Ok(Some(ResolvedWorkdirShareOptions {
+            path: options.path,
+            workspace_id,
+            backend_url: options.backend_url,
+            display_name: options.display_name,
+            ttl: options.ttl,
+            permission: options.permission,
+        }));
+    }
+    ensure_interactive_tty(
+        std::io::stdin().is_terminal(),
+        std::io::stderr().is_terminal(),
+    )?;
+    let target = client::BackendWorkspaceCatalogTarget::new(options.backend_url.clone());
+    let workspaces = client::list_backend_workspaces(&target)
+        .await
+        .map_err(|error| format!("failed to query Backend Workspace catalog: {error}"))?;
+    let stdin = std::io::stdin();
+    let stderr = std::io::stderr();
+    let mut input = stdin.lock();
+    let mut output = stderr.lock();
+    configure_interactively(options, &workspaces, &mut input, &mut output)
+}
+
 pub(crate) async fn run(options: WorkdirShareOptions) -> Result<(), String> {
+    let Some(options) = resolve_share_options(options).await? else {
+        eprintln!("External Workdir share cancelled; no grant was created.");
+        return Ok(());
+    };
     // Pin before creating remote authority: the Backend grant can never outlive
     // a failed local approval/open race, and subsequent path replacement cannot
     // redirect the provider.
@@ -142,30 +391,53 @@ pub(crate) async fn run(options: WorkdirShareOptions) -> Result<(), String> {
             ExternalWorkdirGrantCreateRequest {
                 provider_instance_id: provider_instance_id.clone(),
                 display_name: options.display_name.clone(),
-                ttl_seconds: options.ttl.as_secs(),
-                read_only: true,
+                ttl_seconds: options.ttl.map(|ttl| ttl.as_secs()),
+                permission: options.permission,
             },
         )
         .await
         .map_err(|error| format!("External Workdir grant request failed: {error}"))?;
 
     let limits = BoundedReadLimits::EXTERNAL_DEFAULT;
-    let session = LocalWorkdirSession::external_read_only_pinned(
-        Workdir::new(&grant.working_directory_id),
-        pinned_root,
-        limits,
-    )
+    let session = match options.permission {
+        server_api::ExternalWorkdirPermission::ReadOnly => {
+            LocalWorkdirSession::external_read_only_pinned(
+                Workdir::new(&grant.working_directory_id),
+                pinned_root,
+                limits,
+            )
+        }
+        server_api::ExternalWorkdirPermission::ReadWrite => {
+            LocalWorkdirSession::external_read_write_pinned(
+                Workdir::new(&grant.working_directory_id),
+                pinned_root,
+                limits,
+            )
+        }
+    }
     .map_err(|error| error.to_string())?;
 
     println!("External Workdir grant: {}", grant.grant_id);
     println!("Logical Workdir: {}", grant.working_directory_id);
     println!("Display name: {}", grant.display_name);
-    println!("Permission: {}", grant.permissions);
-    println!("Expires at: {}", grant.expires_at);
+    println!("Permission: {}", permission_label(grant.permission));
+    println!(
+        "Expires at: {}",
+        grant
+            .expires_at
+            .as_deref()
+            .unwrap_or("never (until stopped or revoked)")
+    );
 
-    let expires_at = chrono::DateTime::parse_from_rfc3339(&grant.expires_at)
-        .map_err(|_| "Backend returned an invalid External Workdir expiry".to_string())?
-        .with_timezone(&Utc);
+    let expires_at = grant
+        .expires_at
+        .as_deref()
+        .map(|expires_at| {
+            chrono::DateTime::parse_from_rfc3339(expires_at)
+                .map(|expires_at| expires_at.with_timezone(&Utc))
+                .map_err(|_| "Backend returned an invalid External Workdir expiry".to_string())
+        })
+        .transpose()?;
     let mut generation = grant.generation;
     loop {
         let outcome = serve_provider_connection(
@@ -181,7 +453,7 @@ pub(crate) async fn run(options: WorkdirShareOptions) -> Result<(), String> {
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(connection_error) => {
-                if Utc::now() >= expires_at {
+                if expires_at.is_some_and(|expires_at| Utc::now() >= expires_at) {
                     return Err(format!(
                         "External Workdir grant expired after provider connection failure: {connection_error}"
                     ));
@@ -257,7 +529,7 @@ pub(crate) async fn run(options: WorkdirShareOptions) -> Result<(), String> {
                 return Ok(());
             }
             ProviderEnd::Disconnected => {
-                if Utc::now() >= expires_at {
+                if expires_at.is_some_and(|expires_at| Utc::now() >= expires_at) {
                     return Err("External Workdir grant expired while disconnected".to_string());
                 }
                 generation = generation
@@ -278,7 +550,7 @@ pub(crate) async fn run(options: WorkdirShareOptions) -> Result<(), String> {
 async fn serve_provider_connection(
     backend_client: &BackendApiClient,
     server_api_client: &ServerApiClient,
-    options: &WorkdirShareOptions,
+    options: &ResolvedWorkdirShareOptions,
     grant: &ExternalWorkdirGrantResponse,
     provider_instance_id: &str,
     session: &LocalWorkdirSession,
@@ -314,7 +586,7 @@ async fn serve_provider_connection(
                     .map_err(|error| error.to_string())?,
                 workdir_id: session.workdir().id().clone(),
                 generation,
-                capabilities: WorkdirSessionCapabilities::READ_ONLY,
+                capabilities: session.capabilities(),
                 read_limits: BoundedReadLimits::EXTERNAL_DEFAULT,
             },
         });
@@ -646,6 +918,109 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
 
+    fn share_options() -> WorkdirShareOptions {
+        WorkdirShareOptions {
+            path: PathBuf::from("."),
+            workspace_id: None,
+            backend_url: "https://backend.example".to_string(),
+            display_name: "External Workdir".to_string(),
+            ttl: None,
+            permission: server_api::ExternalWorkdirPermission::ReadOnly,
+            non_interactive: false,
+        }
+    }
+
+    fn workspace(workspace_id: &str, display_name: &str) -> server_api::WorkspaceSummary {
+        server_api::WorkspaceSummary {
+            workspace_id: workspace_id.to_string(),
+            owner_account_id: "account-a".to_string(),
+            display_name: display_name.to_string(),
+            state: "active".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn interactive_share_defaults_to_first_workspace_read_only_and_unlimited() {
+        let workspaces = [workspace("workspace-a", "Alpha")];
+        let mut input = std::io::Cursor::new(b"\n\n\nyes\n".to_vec());
+        let mut output = Vec::new();
+
+        let selected =
+            configure_interactively(share_options(), &workspaces, &mut input, &mut output)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(selected.workspace_id, "workspace-a");
+        assert_eq!(
+            selected.permission,
+            server_api::ExternalWorkdirPermission::ReadOnly
+        );
+        assert_eq!(selected.ttl, None);
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("Connect and create grant? [y/N]")
+        );
+    }
+
+    #[test]
+    fn interactive_share_requires_explicit_read_write_selection_and_confirmation() {
+        let workspaces = [
+            workspace("workspace-a", "Alpha"),
+            workspace("workspace-b", "Beta"),
+        ];
+        let mut input = std::io::Cursor::new(b"2\nw\n15m\ny\n".to_vec());
+        let mut output = Vec::new();
+
+        let selected =
+            configure_interactively(share_options(), &workspaces, &mut input, &mut output)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(selected.workspace_id, "workspace-b");
+        assert_eq!(
+            selected.permission,
+            server_api::ExternalWorkdirPermission::ReadWrite
+        );
+        assert_eq!(selected.ttl, Some(Duration::from_secs(900)));
+    }
+
+    #[test]
+    fn interactive_share_cancellation_yields_no_grant_configuration() {
+        let workspaces = [workspace("workspace-a", "Alpha")];
+        let mut declined = std::io::Cursor::new(b"\n\n\nno\n".to_vec());
+        let mut output = Vec::new();
+        assert!(
+            configure_interactively(share_options(), &workspaces, &mut declined, &mut output,)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut eof = std::io::Cursor::new(Vec::<u8>::new());
+        assert!(
+            configure_interactively(share_options(), &workspaces, &mut eof, &mut Vec::new())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn interactive_share_fails_closed_without_input_and_prompt_ttys() {
+        assert!(ensure_interactive_tty(true, true).is_ok());
+        assert!(
+            ensure_interactive_tty(false, true)
+                .unwrap_err()
+                .contains("--non-interactive")
+        );
+        assert!(
+            ensure_interactive_tty(true, false)
+                .unwrap_err()
+                .contains("--non-interactive")
+        );
+    }
+
     fn test_server_api_client(base_url: &str) -> ServerApiClient {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
@@ -726,7 +1101,7 @@ mod tests {
             "working_directory_id": "workdir-a",
             "provider_instance_id": "provider-a",
             "display_name": "Shared files",
-            "permissions": "read_only",
+            "permission": "read_only",
             "expires_at": "2026-09-23T03:00:00Z",
             "generation": 7,
             "status": "pending"
@@ -745,8 +1120,8 @@ mod tests {
                 ExternalWorkdirGrantCreateRequest {
                     provider_instance_id: "provider-a".to_string(),
                     display_name: "Shared files".to_string(),
-                    ttl_seconds: 600,
-                    read_only: true,
+                    ttl_seconds: Some(600),
+                    permission: server_api::ExternalWorkdirPermission::ReadOnly,
                 },
             )
             .await

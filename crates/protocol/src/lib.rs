@@ -83,6 +83,7 @@ impl AuthenticatedInputSource {
 /// of an accepted id must retain the same command kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct WorkerCommandEnvelope {
     pub command_id: u64,
 }
@@ -95,6 +96,7 @@ impl WorkerCommandEnvelope {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerCommandKind {
     Resume,
@@ -106,6 +108,7 @@ pub enum WorkerCommandKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerCommandDisposition {
     Accepted,
@@ -116,6 +119,7 @@ pub enum WorkerCommandDisposition {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct WorkerCommandAcknowledgement {
     pub command_id: u64,
     pub command: WorkerCommandKind,
@@ -212,6 +216,7 @@ impl From<WorkerStatus> for WorkerStateSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum Method {
     /// Durably accept typed input for immediate activation while the Worker is Idle.
@@ -228,6 +233,7 @@ pub enum Method {
     /// Authenticated transport form of Submit. Trusted adapters replace
     /// public Submit before forwarding it to the Worker.
     #[cfg_attr(feature = "typescript", ts(skip))]
+    #[cfg_attr(feature = "json-schema", schemars(skip))]
     SubmitTracked {
         submission_request_id: String,
         input: Vec<Segment>,
@@ -245,6 +251,7 @@ pub enum Method {
     },
     /// Authenticated transport form of Notify.
     #[cfg_attr(feature = "typescript", ts(skip))]
+    #[cfg_attr(feature = "json-schema", schemars(skip))]
     NotifyTracked {
         notification_request_id: String,
         message: String,
@@ -344,6 +351,7 @@ pub enum Method {
 /// child Worker).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkerEvent {
     /// Child finished one turn and is back to IDLE.
@@ -685,6 +693,7 @@ impl Method {
 /// protocol subjects.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum InternalWorkerKind {
     SubWorker,
@@ -694,6 +703,7 @@ pub enum InternalWorkerKind {
 /// Stable parent-owned lifecycle for one compaction run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct CompactionLifecycle {
     pub schema_version: u32,
     pub compaction_id: String,
@@ -715,6 +725,7 @@ pub struct CompactionLifecycle {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionLifecycleState {
     Running,
@@ -727,6 +738,7 @@ pub enum CompactionLifecycleState {
 /// `name` is display-only; `session_id` is the identity used by clients.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct InternalWorkerRef {
     pub session_id: String,
     pub name: String,
@@ -739,6 +751,7 @@ pub struct InternalWorkerRef {
 /// `Event::InternalWorker` updates that raced with parent snapshot assembly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct InternalWorkerSnapshot {
     pub worker: InternalWorkerRef,
     pub revision: u64,
@@ -755,6 +768,7 @@ pub struct InternalWorkerSnapshot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ToolResultDisposition {
     #[default]
@@ -768,6 +782,7 @@ pub enum ToolResultDisposition {
 /// Durable acceptance result for one idempotent Submit request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SubmissionDisposition {
     Started,
@@ -780,6 +795,7 @@ pub enum SubmissionDisposition {
 /// provenance remain in the session log and are intentionally not exposed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct PendingSubmissionSummary {
     pub submission_id: String,
     pub accepted_at_ms: u64,
@@ -790,6 +806,7 @@ pub struct PendingSubmissionSummary {
 /// Revisioned session-owned FIFO projection used by snapshots and live events.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct PendingSubmissionsSnapshot {
     pub revision: u64,
     #[serde(default)]
@@ -807,6 +824,7 @@ pub struct PendingSubmissionsSnapshot {
 /// to replay the durable log format.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct SessionSnapshot {
     #[serde(default)]
     pub pending_submissions: PendingSubmissionsSnapshot,
@@ -815,6 +833,7 @@ pub struct SessionSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SessionEntryProvenance {
     HumanInput,
@@ -829,6 +848,7 @@ pub enum SessionEntryProvenance {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct SessionSnapshotEntry {
     /// Stable identity from durable history metadata, or a deterministic
     /// identity derived from the legacy segment and log position.
@@ -844,6 +864,7 @@ pub struct SessionSnapshotEntry {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionSnapshotEntryData {
     UserInput {
@@ -881,6 +902,7 @@ pub enum SessionSnapshotEntryData {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SessionMessageRole {
     User,
@@ -889,6 +911,7 @@ pub enum SessionMessageRole {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionContentPart {
     Text { text: String },
@@ -897,6 +920,7 @@ pub enum SessionContentPart {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct SessionToolAttachment {
     pub media_type: String,
     /// Base64-encoded durable attachment body. Public snapshots preserve the
@@ -906,6 +930,7 @@ pub struct SessionToolAttachment {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum Event {
     /// Durable Submit acceptance. New submissions are accepted only while Idle,
@@ -1233,6 +1258,7 @@ pub enum Event {
 /// human-readable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct Alert {
     pub level: AlertLevel,
     pub source: AlertSource,
@@ -1243,6 +1269,7 @@ pub struct Alert {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct MemoryWorkerEvent {
     pub worker: String,
     pub status: String,
@@ -1257,6 +1284,7 @@ pub struct MemoryWorkerEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AlertLevel {
     Warn,
@@ -1265,6 +1293,7 @@ pub enum AlertLevel {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AlertSource {
     Worker,
@@ -1278,6 +1307,7 @@ pub enum AlertSource {
 /// Mirrors the completion prefix sigil: `@` → `File`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CompletionKind {
     File,
@@ -1288,6 +1318,7 @@ pub enum CompletionKind {
 /// `value` is a path (file kind).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct CompletionEntry {
     pub value: String,
     #[serde(default)]
@@ -1296,14 +1327,17 @@ pub struct CompletionEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct RewindTargetId {
     #[cfg_attr(feature = "typescript", ts(type = "string"))]
+    #[cfg_attr(feature = "json-schema", schemars(with = "String"))]
     pub segment_id: uuid::Uuid,
     pub user_input_entry_index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct RewindTarget {
     pub id: RewindTargetId,
     pub expected_head_entries: usize,
@@ -1320,6 +1354,7 @@ pub struct RewindTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct RewindSummary {
     pub truncated_to_entries: usize,
     pub discarded_entries: usize,
@@ -1330,6 +1365,7 @@ pub struct RewindSummary {
 /// state only and are never appended to Worker history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CommandStatus {
     Running,
@@ -1341,6 +1377,7 @@ pub enum CommandStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CommandStream {
     Stdout,
@@ -1349,6 +1386,7 @@ pub enum CommandStream {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct CommandStreamSlice {
     pub start_offset: u64,
     pub end_offset: u64,
@@ -1358,6 +1396,7 @@ pub struct CommandStreamSlice {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct CommandSnapshot {
     pub command_id: String,
     pub tool_call_id: Option<String>,
@@ -1372,6 +1411,7 @@ pub struct CommandSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommandEvent {
     Started {
@@ -1399,6 +1439,7 @@ pub enum CommandEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionPhase {
     Preparing,
@@ -1408,6 +1449,7 @@ pub enum CompactionPhase {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionTrigger {
     Manual,
@@ -1417,6 +1459,7 @@ pub enum CompactionTrigger {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct InFlightCompaction {
     pub phase: CompactionPhase,
     pub started_at_ms: u64,
@@ -1432,6 +1475,7 @@ pub struct InFlightCompaction {
 /// entries.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct InFlightSnapshot {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<InFlightBlock>,
@@ -1453,6 +1497,7 @@ impl InFlightSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InFlightBlock {
     Text {
@@ -1476,6 +1521,7 @@ pub enum InFlightBlock {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum InFlightToolCallState {
     #[default]
@@ -1497,6 +1543,7 @@ impl InFlightToolCallState {
 /// their own view of the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct Greeting {
     pub worker_name: String,
     pub cwd: String,
@@ -1518,6 +1565,7 @@ pub struct Greeting {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerStatus {
     #[default]
@@ -1529,6 +1577,7 @@ pub enum WorkerStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TurnResult {
     Finished,
@@ -1543,6 +1592,7 @@ pub enum TurnResult {
 /// following Turn entry, not by the marker itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum InvokeKind {
     /// `Method::Submit` — a user submission.
@@ -1563,6 +1613,7 @@ pub enum InvokeKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RunResult {
     Finished,
@@ -1577,6 +1628,7 @@ pub enum RunResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     AlreadyRunning,
@@ -1599,6 +1651,7 @@ pub enum ErrorCode {
 /// A single allow or deny rule inside a scope configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct ScopeRule {
     /// Target path. Must be absolute by the time a `Scope` is built from
     /// this rule — relative paths are resolved per-layer against the
@@ -1629,6 +1682,7 @@ fn default_recursive() -> bool {
 /// path as presented through the Workdir, even when it aliases another target.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum SymlinkPolicy {
     #[default]
@@ -1644,6 +1698,7 @@ pub enum SymlinkPolicy {
 /// below** the stated level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum Permission {
     Read,

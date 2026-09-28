@@ -80,6 +80,89 @@ async fn external_local_provider_is_strictly_read_only() {
 }
 
 #[tokio::test]
+async fn external_local_provider_read_write_is_filesystem_only() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("item.txt"), "original").unwrap();
+    let session = LocalWorkdirSession::external_read_write(
+        Workdir::new("external-workdir-rw"),
+        root.path(),
+        BoundedReadLimits::new(4096, 1024).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        session.capabilities(),
+        WorkdirSessionCapabilities::READ_WRITE
+    );
+    assert!(
+        !session
+            .capabilities()
+            .supports(WorkdirSessionCapability::Command)
+    );
+
+    let observed = WorkdirSession::read(
+        &session,
+        ReadRequest {
+            path: WorkdirPath::new("item.txt").unwrap(),
+            offset: 0,
+            limit: 10,
+            max_bytes: 1024,
+        },
+    )
+    .await
+    .unwrap();
+    WorkdirSession::edit(
+        &session,
+        EditRequest {
+            path: WorkdirPath::new("item.txt").unwrap(),
+            old_string: "original".to_string(),
+            new_string: "changed".to_string(),
+            replace_all: false,
+            expected_hash: observed.content_hash,
+        },
+    )
+    .await
+    .unwrap();
+    WorkdirSession::write(
+        &session,
+        WriteRequest {
+            path: WorkdirPath::new("created.txt").unwrap(),
+            content: b"created".to_vec(),
+            expected_hash: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("item.txt")).unwrap(),
+        "changed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("created.txt")).unwrap(),
+        "created"
+    );
+    let command = WorkdirSession::start_command(
+        &session,
+        CommandRequest {
+            command: "touch command-ran".to_string(),
+            timeout_secs: 1,
+            output_limit: 1024,
+            cwd: WorkdirPath::root(),
+            spill_dir: None,
+            tool_call_id: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        command,
+        WorkdirError::Unsupported(WorkdirSessionCapability::Command)
+    ));
+    assert!(!root.path().join("command-ran").exists());
+}
+
+#[tokio::test]
 async fn common_dispatcher_preserves_operation_result_pairing_and_capabilities() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("item.txt"), "visible").unwrap();
@@ -226,6 +309,51 @@ async fn external_local_provider_rejects_symlink_roots_and_traversal() {
     )
     .unwrap_err();
     assert!(matches!(error, WorkdirError::Denied(_)));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn external_read_write_provider_rejects_symlink_mutation_escape() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+    symlink(
+        outside.path().join("secret.txt"),
+        root.path().join("outside.txt"),
+    )
+    .unwrap();
+    let session = LocalWorkdirSession::external_read_write(
+        Workdir::new("external-workdir-rw-symlink"),
+        root.path(),
+        BoundedReadLimits::new(4096, 1024).unwrap(),
+    )
+    .unwrap();
+
+    let error = WorkdirSession::write(
+        &session,
+        WriteRequest {
+            path: WorkdirPath::new("outside.txt").unwrap(),
+            content: b"escaped".to_vec(),
+            expected_hash: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            WorkdirError::SymlinkOutOfScope { .. }
+                | WorkdirError::OutOfScope(_)
+                | WorkdirError::Denied(_)
+        ),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
+        "secret"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -444,6 +572,195 @@ async fn external_local_provider_keeps_pre_grant_root_when_path_changes_before_s
     .unwrap();
     assert!(grep_after_symlink_swap.output.contains("approved.txt"));
     assert!(!grep_after_symlink_swap.output.contains("secret.txt"));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn external_read_write_uses_pinned_root_for_conflict_and_commit() {
+    let parent = tempfile::tempdir().unwrap();
+    let approved = parent.path().join("shared");
+    let approved_original = parent.path().join("approved-original");
+    std::fs::create_dir(&approved).unwrap();
+    std::fs::write(approved.join("item.txt"), "approved").unwrap();
+    let session = LocalWorkdirSession::external_read_write(
+        Workdir::new("external-workdir-pinned-rw"),
+        &approved,
+        BoundedReadLimits::EXTERNAL_DEFAULT,
+    )
+    .unwrap();
+
+    std::fs::rename(&approved, &approved_original).unwrap();
+    std::fs::create_dir(&approved).unwrap();
+
+    let conflict = WorkdirSession::write(
+        &session,
+        WriteRequest {
+            path: WorkdirPath::new("item.txt").unwrap(),
+            content: b"unexpected".to_vec(),
+            expected_hash: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(conflict, WorkdirError::Conflict(_)));
+    assert_eq!(
+        std::fs::read_to_string(approved_original.join("item.txt")).unwrap(),
+        "approved"
+    );
+    assert!(!approved.join("item.txt").exists());
+
+    let observed = WorkdirSession::read(
+        &session,
+        ReadRequest {
+            path: WorkdirPath::new("item.txt").unwrap(),
+            offset: 0,
+            limit: 10,
+            max_bytes: 1024,
+        },
+    )
+    .await
+    .unwrap();
+    WorkdirSession::write(
+        &session,
+        WriteRequest {
+            path: WorkdirPath::new("item.txt").unwrap(),
+            content: b"updated".to_vec(),
+            expected_hash: Some(observed.content_hash),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(approved_original.join("item.txt")).unwrap(),
+        "updated"
+    );
+    assert!(!approved.join("item.txt").exists());
+}
+
+#[tokio::test]
+async fn external_read_write_rejects_oversized_preimages_and_edit_results_before_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let limit = crate::external::MAX_EXTERNAL_WRITE_BYTES;
+    let oversized_content = vec![b'x'; limit + 1];
+    std::fs::write(root.path().join("oversized.txt"), &oversized_content).unwrap();
+    std::fs::write(root.path().join("growth.txt"), vec![b'x'; limit]).unwrap();
+    let high_replacement_content = vec![b'x'; crate::external::MAX_EXTERNAL_RESULT_ITEMS + 1];
+    std::fs::write(
+        root.path().join("high-replacements.txt"),
+        &high_replacement_content,
+    )
+    .unwrap();
+    let session = LocalWorkdirSession::external_read_write(
+        Workdir::new("external-workdir-bounded-rw"),
+        root.path(),
+        BoundedReadLimits::EXTERNAL_DEFAULT,
+    )
+    .unwrap();
+
+    let oversized_observed = WorkdirSession::read(
+        &session,
+        ReadRequest {
+            path: WorkdirPath::new("oversized.txt").unwrap(),
+            offset: 0,
+            limit: 1,
+            max_bytes: 1,
+        },
+    )
+    .await
+    .unwrap();
+    let write_error = WorkdirSession::write(
+        &session,
+        WriteRequest {
+            path: WorkdirPath::new("oversized.txt").unwrap(),
+            content: b"small".to_vec(),
+            expected_hash: Some(oversized_observed.content_hash),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(write_error, WorkdirError::InvalidArgument(_)));
+    assert_eq!(
+        std::fs::read(root.path().join("oversized.txt")).unwrap(),
+        oversized_content
+    );
+    let edit_error = WorkdirSession::edit(
+        &session,
+        EditRequest {
+            path: WorkdirPath::new("oversized.txt").unwrap(),
+            old_string: "x".to_string(),
+            new_string: "y".to_string(),
+            replace_all: false,
+            expected_hash: oversized_observed.content_hash,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(edit_error, WorkdirError::InvalidArgument(_)));
+    assert_eq!(
+        std::fs::read(root.path().join("oversized.txt")).unwrap(),
+        oversized_content
+    );
+
+    let growth_observed = WorkdirSession::read(
+        &session,
+        ReadRequest {
+            path: WorkdirPath::new("growth.txt").unwrap(),
+            offset: 0,
+            limit: 1,
+            max_bytes: 1,
+        },
+    )
+    .await
+    .unwrap();
+    let growth_error = WorkdirSession::edit(
+        &session,
+        EditRequest {
+            path: WorkdirPath::new("growth.txt").unwrap(),
+            old_string: "x".to_string(),
+            new_string: "yy".to_string(),
+            replace_all: true,
+            expected_hash: growth_observed.content_hash,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(growth_error, WorkdirError::InvalidArgument(_)));
+    assert_eq!(
+        std::fs::read(root.path().join("growth.txt")).unwrap(),
+        vec![b'x'; limit]
+    );
+
+    let high_replacement_observed = WorkdirSession::read(
+        &session,
+        ReadRequest {
+            path: WorkdirPath::new("high-replacements.txt").unwrap(),
+            offset: 0,
+            limit: 1,
+            max_bytes: 1,
+        },
+    )
+    .await
+    .unwrap();
+    let high_replacement_error = WorkdirSession::edit(
+        &session,
+        EditRequest {
+            path: WorkdirPath::new("high-replacements.txt").unwrap(),
+            old_string: "x".to_string(),
+            new_string: "y".to_string(),
+            replace_all: true,
+            expected_hash: high_replacement_observed.content_hash,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        high_replacement_error,
+        WorkdirError::InvalidArgument(_)
+    ));
+    assert_eq!(
+        std::fs::read(root.path().join("high-replacements.txt")).unwrap(),
+        high_replacement_content
+    );
 }
 
 #[cfg(target_os = "linux")]

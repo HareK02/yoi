@@ -1,6 +1,7 @@
 <script lang="ts">
     import { tick, untrack, type SvelteComponent } from "svelte";
     import ConsoleLineItem from "$lib/workspace/console/ConsoleLineItem.svelte";
+    import ConsoleDisplayStateView from "$lib/workspace/console/ConsoleDisplayState.svelte";
     import ConsoleTasks from "$lib/workspace/console/ConsoleTasks.svelte";
     import ConsoleTimeline from "$lib/workspace/console/ConsoleTimeline.svelte";
     import ComposerInput from "$lib/workspace/console/ComposerInput.svelte";
@@ -50,6 +51,12 @@
         type ComposerAttachment,
     } from "$lib/workspace/console/composer-attachments";
     import { pushWorkspaceAlert } from "$lib/workspace/alerts/store";
+    import {
+        boundedConsoleReason,
+        displayedConsoleSource,
+        type ConsoleDisplaySource,
+        type ConsoleDisplayState,
+    } from "$lib/workspace/console/console-display-state";
     import { workspaceApiPath } from "$lib/workspace/api/http";
     import { workspaceMultiplexer, type WorkspaceMultiplexerSubscription } from "$lib/workspace/multiplexer";
     import {
@@ -165,6 +172,10 @@
     let protocolState = $state<"connecting" | "open" | "closed" | "error">(
         "connecting",
     );
+    let consoleDisplayState = $state<ConsoleDisplayState>({
+        kind: "loading",
+        stage: "session",
+    });
     let protocolSubscription: WorkspaceMultiplexerSubscription | null = null;
     let pendingSubmissions = $state<PendingSubmissionsSnapshot>({
         revision: 0,
@@ -209,6 +220,11 @@
         consoleProjector.snapshot(),
     );
     let pendingObservationEvents: ConsoleEventInput[] = [];
+    let pendingInitialSnapshotApplication: {
+        eventId: string;
+        token: number;
+        source: ConsoleDisplaySource;
+    } | null = null;
     let protocolEventSequence = 0;
     let pendingStreamDiagnostics: Diagnostic[] = [];
     let observationFlushHandle: number | null = null;
@@ -319,6 +335,79 @@
         return nextReloadToken;
     }
 
+    function beginConsoleLoad(reason = "Waiting for a fresh conversation snapshot.") {
+        const source = displayedConsoleSource(consoleDisplayState);
+        consoleDisplayState = source
+            ? {
+                kind: "stale",
+                source,
+                phase: "reconnecting",
+                reason: boundedConsoleReason(reason, "Reconnecting to live updates."),
+            }
+            : { kind: "loading", stage: "session" };
+        protocolState = "connecting";
+    }
+
+    function waitForInitialSnapshot() {
+        if (displayedConsoleSource(consoleDisplayState) === null) {
+            consoleDisplayState = { kind: "loading", stage: "snapshot" };
+        }
+    }
+
+    function completeInitialSnapshot(
+        token: number,
+        source: ConsoleDisplaySource,
+    ) {
+        if (token !== reloadToken) return;
+        consoleDisplayState = { kind: "ready", source };
+    }
+
+    function showConsoleUnavailable(message: string) {
+        const reason = boundedConsoleReason(
+            message,
+            "The Worker Session is not available.",
+        );
+        const source = displayedConsoleSource(consoleDisplayState);
+        consoleDisplayState = source
+            ? { kind: "stale", source, phase: "disconnected", reason }
+            : { kind: "unavailable", reason };
+    }
+
+    function showConsoleFailure(message?: string) {
+        const reason = boundedConsoleReason(
+            message,
+            "The Worker Session connection ended before a snapshot was received.",
+        );
+        const source = displayedConsoleSource(consoleDisplayState);
+        consoleDisplayState = source
+            ? { kind: "stale", source, phase: "disconnected", reason }
+            : { kind: "failed", reason };
+    }
+
+    function showConsoleReconnecting(message?: string) {
+        const source = displayedConsoleSource(consoleDisplayState);
+        if (!source) return;
+        consoleDisplayState = {
+            kind: "stale",
+            source,
+            phase: "reconnecting",
+            reason: boundedConsoleReason(
+                message,
+                "Waiting for a fresh conversation snapshot.",
+            ),
+        };
+    }
+
+    function retryConsoleLoad() {
+        if (displayedConsoleSource(consoleDisplayState) === null) {
+            resetObservedEvents();
+        }
+        const target = consoleTarget;
+        beginConsoleLoad();
+        const token = advanceReloadToken();
+        if (!worker) void loadWorker(target, token);
+    }
+
     function advanceEventObservedAtVersion() {
         nextEventObservedAtVersion += 1;
         eventObservedAtVersion = nextEventObservedAtVersion;
@@ -337,6 +426,7 @@
             observationFlushHandle = null;
         }
         pendingObservationEvents = [];
+        pendingInitialSnapshotApplication = null;
         pendingStreamDiagnostics = [];
     }
 
@@ -352,8 +442,10 @@
     function flushObservationBatch() {
         observationFlushHandle = null;
         const eventBatch = pendingObservationEvents;
+        const initialSnapshotApplication = pendingInitialSnapshotApplication;
         const diagnosticBatch = pendingStreamDiagnostics;
         pendingObservationEvents = [];
+        pendingInitialSnapshotApplication = null;
         pendingStreamDiagnostics = [];
 
         if (eventBatch.length > 0) {
@@ -362,6 +454,17 @@
                 ? "shutdown"
                 : workerStateFromSnapshot(consoleProjection.workerState);
             advanceEventObservedAtVersion();
+            if (
+                initialSnapshotApplication &&
+                eventBatch.some(
+                    (event) => event.eventId === initialSnapshotApplication.eventId,
+                )
+            ) {
+                completeInitialSnapshot(
+                    initialSnapshotApplication.token,
+                    initialSnapshotApplication.source,
+                );
+            }
         }
 
         if (diagnosticBatch.length > 0) {
@@ -369,7 +472,10 @@
         }
     }
 
-    function handleIncomingProtocolEvent(payload: ProtocolEvent) {
+    function handleIncomingProtocolEvent(
+        payload: ProtocolEvent,
+        initialSnapshot?: { token: number; source: ConsoleDisplaySource },
+    ) {
         handleProtocolCommandEvent(payload);
         if (payload.event === "snapshot") {
             pendingSubmissions = payload.data.session.pending_submissions;
@@ -397,6 +503,13 @@
             event: payload,
             observedAtMs,
         });
+        if (initialSnapshot && payload.event === "snapshot") {
+            pendingInitialSnapshotApplication = {
+                eventId,
+                token: initialSnapshot.token,
+                source: initialSnapshot.source,
+            };
+        }
         scheduleObservationFlush();
     }
 
@@ -960,6 +1073,7 @@
                 const action = workerSessionAction(observation);
                 if (action.kind === "show_unavailable") {
                     protocolState = "closed";
+                    showConsoleUnavailable(action.message);
                     streamDiagnostics = [
                         ...streamDiagnostics,
                         {
@@ -976,18 +1090,21 @@
                     targetWorker.state === "stopped"
                 ) {
                     protocolState = "closed";
+                    const message =
+                        "The Session is live but the Worker is stopped. Reload to refresh its state.";
+                    showConsoleFailure(message);
                     streamDiagnostics = [
                         ...streamDiagnostics,
                         {
                             code: "worker_session_state_changed",
                             severity: "warning",
-                            message:
-                                "The Session is live but the Worker is stopped. Reload to refresh its state.",
+                            message,
                         },
                     ];
                     return;
                 }
                 if (action.kind === "subscribe_live") {
+                    waitForInitialSnapshot();
                     closeLiveSubscription = connectLiveProtocolTransport(token, target);
                     return;
                 }
@@ -1009,7 +1126,7 @@
                         in_flight: { responses: [], commands: [] },
                         internal_workers: [],
                     },
-                } as ProtocolEvent);
+                } as ProtocolEvent, { token, source: "retained" });
                 protocolState = "closed";
                 streamDiagnostics = [
                     ...streamDiagnostics,
@@ -1023,12 +1140,14 @@
             .catch((error) => {
                 if (token !== reloadToken || controller.signal.aborted) return;
                 protocolState = "error";
+                const message = error instanceof Error ? error.message : String(error);
+                showConsoleFailure(message);
                 streamDiagnostics = [
                     ...streamDiagnostics,
                     {
                         code: "worker_session_observation_failed",
                         severity: "warning",
-                        message: error instanceof Error ? error.message : String(error),
+                        message,
                     },
                 ];
             });
@@ -1055,8 +1174,22 @@
                             frame.message.result === "subscribed" &&
                             frame.message.payload.snapshot.topic === "worker_protocol"
                         ) {
+                            let initialSnapshotQueued = false;
                             for (const event of frame.message.payload.snapshot.data.events) {
-                                handleIncomingProtocolEvent(event);
+                                if (!initialSnapshotQueued && event.event === "snapshot") {
+                                    handleIncomingProtocolEvent(event, {
+                                        token,
+                                        source: "live",
+                                    });
+                                    initialSnapshotQueued = true;
+                                } else {
+                                    handleIncomingProtocolEvent(event);
+                                }
+                            }
+                            if (!initialSnapshotQueued) {
+                                throw new Error(
+                                    "The live subscription did not provide an initial snapshot.",
+                                );
                             }
                             protocolState = "open";
                         } else if (
@@ -1070,6 +1203,7 @@
                             frame.message.event === "subscription_closed"
                         ) {
                             protocolState = "closed";
+                            showConsoleFailure(frame.message.data.message);
                             rejectPendingCompletion(new Error(frame.message.data.message));
                         } else if (
                             frame.frame === "response" &&
@@ -1079,20 +1213,29 @@
                             throw new Error(frame.message.payload.message);
                         }
                     } catch (error) {
+                        protocolState = "error";
+                        const message = error instanceof Error
+                            ? error.message
+                            : String(error);
+                        showConsoleFailure(message);
                         streamDiagnostics = [
                             ...streamDiagnostics,
                             {
                                 code: "worker_protocol_frame_invalid",
                                 severity: "warning",
-                                message: error instanceof Error ? error.message : String(error),
+                                message,
                             },
                         ];
                     }
                 },
-                onStatus: (status) => {
+                onStatus: (status, message) => {
                     if (token !== reloadToken) return;
                     protocolState = status === "open" ? "connecting" : status;
+                    if (status === "connecting" || status === "open") {
+                        showConsoleReconnecting(message);
+                    }
                     if (status === "closed") {
+                        showConsoleFailure(message);
                         rejectPendingCompletion(new Error("Worker protocol WebSocket closed."));
                     }
                 },
@@ -1697,6 +1840,7 @@
         liveWorkerState = targetWorker?.state ?? null;
         streamDiagnostics = [];
         protocolState = "connecting";
+        consoleDisplayState = { kind: "loading", stage: "session" };
         const token = advanceReloadToken();
         if (!targetWorker) void loadWorker(target, token);
     });
@@ -1705,7 +1849,19 @@
         return () => discardAllAttachments();
     });
 
-    $effect(() => connectProtocolTransport(worker, reloadToken, consoleTarget));
+    $effect(() => {
+        const target = consoleTarget;
+        const targetWorker = worker;
+        const token = reloadToken;
+        if (
+            targetWorker &&
+            (targetWorker.runtime_id !== target.runtimeId ||
+                targetWorker.worker_id !== target.workerId)
+        ) {
+            return;
+        }
+        return connectProtocolTransport(targetWorker, token, target);
+    });
 </script>
 
 <svelte:window onkeydown={handleWorkerControlShortcut} />
@@ -1836,9 +1992,14 @@
                     <p class="error">{workerError}</p>
                 {/if}
 
-                {#if lines.length === 0}
-                    <p>No console output is available for this Worker yet.</p>
-                {:else}
+                <ConsoleDisplayStateView
+                    state={consoleDisplayState}
+                    hasContent={lines.length > 0}
+                    hasUnfilteredContent={selectedConsoleProjection.lines.length > 0}
+                    onRetry={retryConsoleLoad}
+                />
+
+                {#if (consoleDisplayState.kind === "ready" || consoleDisplayState.kind === "stale") && lines.length > 0}
                     <ol class="console-log">
                         {#each lines as item (item.id)}
                             <ConsoleLineItem {item} />
@@ -2182,6 +2343,9 @@
     }
 
     .console-card {
+        display: grid;
+        align-content: start;
+        gap: var(--space-4);
         min-height: 100%;
     }
 

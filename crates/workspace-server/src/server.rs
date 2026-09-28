@@ -729,7 +729,7 @@ struct ExternalProviderConnection {
     workdir_id: String,
     provider_instance_id: String,
     generation: u64,
-    expires_at: chrono::DateTime<Utc>,
+    expires_at: Option<chrono::DateTime<Utc>>,
     capabilities: workdir::WorkdirSessionCapabilities,
     admission: Arc<tokio::sync::Semaphore>,
     sender: tokio::sync::mpsc::Sender<ExternalProviderCommand>,
@@ -861,7 +861,11 @@ impl ExternalProviderWorkdirSession {
         if self.closed.load(Ordering::Acquire) {
             return Err(workdir::WorkdirError::SessionClosed);
         }
-        if Utc::now() >= self.connection.expires_at {
+        if self
+            .connection
+            .expires_at
+            .is_some_and(|expires_at| Utc::now() >= expires_at)
+        {
             return Err(workdir::WorkdirError::Unavailable(
                 "External Workdir grant has expired".to_string(),
             ));
@@ -877,7 +881,11 @@ impl ExternalProviderWorkdirSession {
                     "External Workdir provider admission is closed".to_string(),
                 )
             })?;
-        if Utc::now() >= self.connection.expires_at {
+        if self
+            .connection
+            .expires_at
+            .is_some_and(|expires_at| Utc::now() >= expires_at)
+        {
             return Err(workdir::WorkdirError::Unavailable(
                 "External Workdir grant has expired".to_string(),
             ));
@@ -1020,19 +1028,42 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
     }
     async fn write(
         &self,
-        _request: workdir::WriteRequest,
+        request: workdir::WriteRequest,
     ) -> std::result::Result<workdir::WriteResult, workdir::WorkdirError> {
-        Err(workdir::WorkdirError::Unsupported(
-            workdir::WorkdirSessionCapability::Write,
-        ))
+        if !self
+            .connection
+            .capabilities
+            .supports(workdir::WorkdirSessionCapability::Write)
+        {
+            return Err(workdir::WorkdirError::Unsupported(
+                workdir::WorkdirSessionCapability::Write,
+            ));
+        }
+        match self
+            .operate(WorkdirSessionOperation::Write(request))
+            .await?
+        {
+            WorkdirSessionOperationResult::Write(value) => Ok(value),
+            _ => Err(Self::mismatch("write")),
+        }
     }
     async fn edit(
         &self,
-        _request: workdir::EditRequest,
+        request: workdir::EditRequest,
     ) -> std::result::Result<workdir::EditResult, workdir::WorkdirError> {
-        Err(workdir::WorkdirError::Unsupported(
-            workdir::WorkdirSessionCapability::Edit,
-        ))
+        if !self
+            .connection
+            .capabilities
+            .supports(workdir::WorkdirSessionCapability::Edit)
+        {
+            return Err(workdir::WorkdirError::Unsupported(
+                workdir::WorkdirSessionCapability::Edit,
+            ));
+        }
+        match self.operate(WorkdirSessionOperation::Edit(request)).await? {
+            WorkdirSessionOperationResult::Edit(value) => Ok(value),
+            _ => Err(Self::mismatch("edit")),
+        }
     }
     async fn list(
         &self,
@@ -3415,9 +3446,7 @@ impl WorkspaceApi {
                             code: "external_workdir_unavailable".to_string(),
                             message: "External Workdir grant is unavailable".to_string(),
                         })?;
-                    let grant_expired = chrono::DateTime::parse_from_rfc3339(&grant.expires_at)
-                        .map(|expires_at| expires_at.with_timezone(&Utc) <= Utc::now())
-                        .unwrap_or(true);
+                    let grant_expired = external_workdir_grant_is_expired(&grant)?;
                     let connection = self
                         .external_workdir_providers
                         .lock()
@@ -3429,7 +3458,9 @@ impl WorkspaceApi {
                             connection.generation == grant.generation
                                 && connection.provider_instance_id == grant.provider_instance_id
                                 && connection.workdir_id == link.workdir_id
-                                && connection.expires_at > Utc::now()
+                                && connection
+                                    .expires_at
+                                    .is_none_or(|expires_at| expires_at > Utc::now())
                         })
                     {
                         return Err(Error::RuntimeOperationFailed {
@@ -3519,7 +3550,7 @@ impl WorkspaceApi {
                             claim.working_directory_id
                         )))
                     })?;
-                claim.capabilities = workdir_source_capabilities(&workdir);
+                claim.capabilities = workdir_source_capabilities(self, &workdir)?;
             }
             return Ok(());
         };
@@ -3607,7 +3638,7 @@ impl WorkspaceApi {
             }
             claim.capabilities = target
                 .capabilities
-                .intersection(workdir_source_capabilities(&workdir));
+                .intersection(workdir_source_capabilities(self, &workdir)?);
         }
 
         let missing = targets
@@ -3643,14 +3674,27 @@ struct ValidatedTicketImplementationTarget {
     capabilities: workdir::WorkdirSessionCapabilities,
 }
 
+fn external_workdir_capabilities(permissions: &str) -> Result<workdir::WorkdirSessionCapabilities> {
+    match permissions {
+        "read_only" => Ok(workdir::WorkdirSessionCapabilities::READ_ONLY),
+        "read_write" => Ok(workdir::WorkdirSessionCapabilities::READ_WRITE),
+        _ => Err(Error::Store(
+            "External Workdir grant has invalid persisted permissions".to_string(),
+        )),
+    }
+}
+
 fn workdir_source_capabilities(
+    api: &WorkspaceApi,
     workdir: &WorkdirRegistryRecord,
-) -> workdir::WorkdirSessionCapabilities {
+) -> Result<workdir::WorkdirSessionCapabilities> {
     match &workdir.source {
-        WorkdirRegistrySource::Repository { .. } => workdir::WorkdirSessionCapabilities::ALL,
-        WorkdirRegistrySource::ExternalGrant { .. } => {
-            workdir::WorkdirSessionCapabilities::READ_ONLY
-        }
+        WorkdirRegistrySource::Repository { .. } => Ok(workdir::WorkdirSessionCapabilities::ALL),
+        WorkdirRegistrySource::ExternalGrant { grant_id } => api
+            .store
+            .get_external_workdir_grant(&api.config.workspace_id, grant_id)?
+            .ok_or_else(|| Error::Store("External Workdir grant is unavailable".to_string()))
+            .and_then(|grant| external_workdir_capabilities(&grant.permissions)),
     }
 }
 
@@ -3673,9 +3717,9 @@ fn validated_ticket_implementation_targets(
         .iter()
         .filter(|target| target.access == TicketTargetAccess::ReadWrite)
         .count();
-    if read_write_count != 1 {
+    if read_write_count == 0 {
         return Err(Error::InvalidInput(format!(
-            "Ticket `{ticket_id}` requires exactly one read_write target, found {read_write_count}"
+            "Ticket `{ticket_id}` requires at least one read_write target"
         ))
         .into());
     }
@@ -3732,14 +3776,16 @@ fn require_ticket_read_write_target(
 ) -> ApiResult<ValidatedTicketImplementationTarget> {
     let write_target = validated_ticket_implementation_targets(api, ticket_id)?
         .into_iter()
-        .find(|target| target.access == TicketTargetAccess::ReadWrite)
-        .expect("validated Ticket target collection has exactly one read_write target");
-    if write_target.repository_id != repository_id || write_target.ref_selector != selector {
-        return Err(Error::InvalidInput(
-            "selectors must match the authoritative Ticket read_write repository target".into(),
-        )
-        .into());
-    }
+        .find(|target| {
+            target.access == TicketTargetAccess::ReadWrite
+                && target.repository_id == repository_id
+                && target.ref_selector == selector
+        })
+        .ok_or_else(|| {
+            ApiError::from(Error::InvalidInput(
+                "repository and selector must match a declared Ticket read_write target".into(),
+            ))
+        })?;
     Ok(write_target)
 }
 
@@ -3748,7 +3794,7 @@ fn ticket_target_capabilities_for_workdir(
     worker: &RuntimeWorkerRef,
     workdir: &WorkdirRegistryRecord,
 ) -> Result<workdir::WorkdirSessionCapabilities> {
-    let source_capabilities = workdir_source_capabilities(workdir);
+    let source_capabilities = workdir_source_capabilities(api, workdir)?;
     let Some(assignment) = api
         .store
         .get_current_ticket_role_assignment_for_worker(&api.config.workspace_id, worker)?
@@ -3885,7 +3931,7 @@ fn validate_manual_ticket_coder_workdir_binding(
         }
         let capabilities = link
             .capabilities
-            .intersection(workdir_source_capabilities(&workdir))
+            .intersection(workdir_source_capabilities(api, &workdir)?)
             .intersection(target.capabilities);
         effective_links.push(WorkerWorkdirLinkRecord {
             capabilities,
@@ -4396,6 +4442,9 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
             service.clone(),
         ))
         .merge(server_api::server_api_axum::merge_request_complete(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_complete(
             service.clone(),
         ))
         .merge(server_api::server_api_axum::ticket_close_record(
@@ -7759,6 +7808,25 @@ impl server_api::ServerApi for ServerApiContractService {
         request: server_api::CompleteMergeRequestRequest,
     ) -> std::result::Result<server_api::MergeEvent, server_api::RepositoryApiError> {
         let Json(response) = scoped_complete_merge_request(
+            State(self.workspace_api()?.clone()),
+            contract_request_headers(&context)?,
+            AxumPath((workspace_id, id)),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(response)
+    }
+
+    async fn ticket_complete(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::CompleteTicketRequest,
+    ) -> std::result::Result<server_api::TicketCompletionEvent, server_api::RepositoryApiError>
+    {
+        let Json(response) = scoped_complete_ticket(
             State(self.workspace_api()?.clone()),
             contract_request_headers(&context)?,
             AxumPath((workspace_id, id)),
@@ -12053,6 +12121,43 @@ fn resolve_workspace_worker_ticket_assignment(
     Ok(())
 }
 
+fn merge_request_ticket_id(mr: &merge_request::MergeRequest) -> ApiResult<String> {
+    match mr.ticket_ids.as_slice() {
+        [ticket_id] => Ok(ticket_id.clone()),
+        [] => Err(
+            Error::MergeRequest(merge_request::MergeRequestError::Corrupt(
+                "Merge Request has no linked Ticket".into(),
+            ))
+            .into(),
+        ),
+        _ => Err(
+            Error::MergeRequest(merge_request::MergeRequestError::Conflict(
+                "Merge Request must be linked to exactly one workflow Ticket".into(),
+            ))
+            .into(),
+        ),
+    }
+}
+
+fn merged_result_source_ref(mr: &merge_request::MergeRequest) -> ApiResult<String> {
+    mr.thread
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            merge_request::MergeRequestThreadEvent::Merge(event) => {
+                Some(event.approved_source_ref.clone())
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            Error::MergeRequest(merge_request::MergeRequestError::Corrupt(format!(
+                "merged Merge Request `{}` has no MergeResult",
+                mr.merge_request_id
+            )))
+            .into()
+        })
+}
+
 fn public_merge_request_state(
     state: merge_request::MergeRequestState,
 ) -> server_api::MergeRequestState {
@@ -12124,6 +12229,15 @@ fn public_review_event(event: merge_request::ReviewEvent) -> server_api::ReviewE
         sequence: event.sequence,
         request_event_id: event.request_event_id,
         subject_ref: event.subject_ref,
+        ticket_item_revision: event.ticket_item_revision,
+        ticket_merge_request_subjects: event
+            .ticket_merge_request_subjects
+            .into_iter()
+            .map(|subject| server_api::MergeRequestReviewSubject {
+                merge_request_id: subject.merge_request_id,
+                subject_ref: subject.subject_ref,
+            })
+            .collect(),
         decision: public_review_decision(event.decision),
         body: event.body,
         findings: event
@@ -12162,6 +12276,20 @@ fn public_merge_event(event: merge_request::MergeEvent) -> server_api::MergeEven
         strategy: public_merge_strategy(event.strategy),
         resolution: public_conflict_resolution(event.resolution),
         merged_by: public_merge_request_worker_identity(event.merged_by),
+        created_at: event.created_at.to_rfc3339(),
+    }
+}
+
+fn public_ticket_completion_event(
+    event: merge_request::TicketCompletionEvent,
+) -> server_api::TicketCompletionEvent {
+    server_api::TicketCompletionEvent {
+        operation_id: event.operation_id,
+        ticket_id: event.ticket_id,
+        item_revision: event.item_revision,
+        merge_request_ids: event.merge_request_ids,
+        requirement_approval_event_id: event.requirement_approval_event_id,
+        completed_by: public_merge_request_worker_identity(event.completed_by),
         created_at: event.created_at.to_rfc3339(),
     }
 }
@@ -12213,6 +12341,15 @@ fn public_merge_request_thread_event(
                 event_id: event.event_id,
                 sequence: event.sequence,
                 subject_ref: event.subject_ref,
+                ticket_item_revision: event.ticket_item_revision,
+                ticket_merge_request_subjects: event
+                    .ticket_merge_request_subjects
+                    .into_iter()
+                    .map(|subject| server_api::MergeRequestReviewSubject {
+                        merge_request_id: subject.merge_request_id,
+                        subject_ref: subject.subject_ref,
+                    })
+                    .collect(),
                 requested_by: public_merge_request_worker_identity(event.requested_by),
                 reviewer: public_merge_request_worker_identity(event.reviewer),
                 created_at: event.created_at.to_rfc3339(),
@@ -12527,12 +12664,12 @@ async fn scoped_show_merge_request(
 
 async fn scoped_merge_request_readiness(
     State(api): State<WorkspaceApi>,
-    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
 ) -> ApiResult<Json<server_api::MergeRequestReadinessResponse>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
-    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     let store = merge_request_store(&api, &workspace_id)?;
-    let mr = store.get(&workspace_id, &ticket_id)?;
+    let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
+    let ticket_id = merge_request_ticket_id(&mr)?;
     let assignment = api
         .store
         .get_current_ticket_coder_assignment(&workspace_id, &ticket_id)?;
@@ -12555,6 +12692,7 @@ async fn scoped_merge_request_readiness(
         (None, _) => (None, None),
     };
     let mut report = store.readiness(merge_request::ReadinessCheck {
+        merge_request_id,
         ticket_id,
         current_subject_ref,
         auth: merge_request::MergeRequestAuth {
@@ -12657,14 +12795,13 @@ async fn scoped_open_merge_request(
 
 async fn scoped_merge_request_thread(
     State(api): State<WorkspaceApi>,
-    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
     Query(query): Query<server_api::MergeRequestThreadQuery>,
 ) -> ApiResult<Json<Vec<server_api::MergeRequestThreadEvent>>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
-    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
-    let events = merge_request_store(&api, &workspace_id)?.thread_page(
+    let events = merge_request_store(&api, &workspace_id)?.thread_page_by_id(
         &workspace_id,
-        &ticket_id,
+        &merge_request_id,
         query.after,
         query.limit.unwrap_or(100),
     )?;
@@ -12679,11 +12816,10 @@ async fn scoped_merge_request_thread(
 async fn scoped_repair_merge_request_selector(
     State(api): State<WorkspaceApi>,
     headers: HeaderMap,
-    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
     Json(input): Json<server_api::RepairMergeRequestSelectorRequest>,
 ) -> ApiResult<Json<server_api::PublicMergeRequest>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
-    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     require_workspace_access(&workspace_id, &api)?;
     reject_non_browser_reopen_auth(&headers)?;
     let _actor = require_actor(&ServerAuthApi::from(&api), &headers).await?;
@@ -12691,7 +12827,8 @@ async fn scoped_repair_merge_request_selector(
         return Err(Error::BrowserReopenConfirmationRequired.into());
     }
     let store = merge_request_store(&api, &workspace_id)?;
-    let mr = store.get(&workspace_id, &ticket_id)?;
+    let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
+    let ticket_id = merge_request_ticket_id(&mr)?;
     let assignment = api
         .store
         .get_current_ticket_coder_assignment(&workspace_id, &ticket_id)?
@@ -12708,6 +12845,7 @@ async fn scoped_repair_merge_request_selector(
     .revision_ref;
     let repaired = store.repair_selector_from(merge_request::RepairSelectorFrom {
         workspace_id: workspace_id.clone(),
+        merge_request_id,
         ticket_id,
         selector_from: input.selector_from,
         resolved_subject_ref,
@@ -12746,13 +12884,23 @@ async fn scoped_register_reviewer_child_session(
 async fn scoped_register_merge_request_review_capability(
     State(api): State<WorkspaceApi>,
     headers: HeaderMap,
-    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
     Json(input): Json<server_api::RegisterMergeRequestReviewCapabilityRequest>,
 ) -> ApiResult<StatusCode> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
-    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     require_workspace_access(&workspace_id, &api)?;
     let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
+    let store = merge_request_store(&api, &workspace_id)?;
+    let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
+    let ticket_id = merge_request_ticket_id(&mr)?;
+    let requested_ticket_id =
+        resolve_workspace_ticket_reference(&api, &workspace_id, &input.ticket_id)?;
+    if requested_ticket_id != ticket_id {
+        return Err(Error::TicketAssignmentConflict(
+            "Reviewer handoff Ticket does not match the addressed Merge Request".into(),
+        )
+        .into());
+    }
     let assignment = api
         .store
         .get_current_ticket_coder_assignment(&workspace_id, &ticket_id)?
@@ -12767,29 +12915,66 @@ async fn scoped_register_merge_request_review_capability(
         )
         .into());
     }
-    let store = merge_request_store(&api, &workspace_id)?;
-    let mr = store.get(&workspace_id, &ticket_id)?;
-    let selector = mr
-        .selector_from
-        .as_deref()
-        .ok_or_else(|| Error::InvalidInput("selector_from requires repair".into()))?;
-    let source_observation = observe_published_source_ref(
-        &api,
-        &workspace_id,
-        &assignment.worker.runtime_id,
-        &mr.repository_id,
-        selector,
-    )?;
-    require_assigned_workdir_source(
-        &api,
-        &assignment,
-        &mr.repository_id,
-        selector,
-        &source_observation.revision_ref,
-    )?;
-    let subject_ref = source_observation.revision_ref;
+    let subject_ref = match mr.state {
+        merge_request::MergeRequestState::Merged => merged_result_source_ref(&mr)?,
+        merge_request::MergeRequestState::Open => {
+            let selector = mr
+                .selector_from
+                .as_deref()
+                .ok_or_else(|| Error::InvalidInput("selector_from requires repair".into()))?;
+            let source_observation = observe_published_source_ref(
+                &api,
+                &workspace_id,
+                &assignment.worker.runtime_id,
+                &mr.repository_id,
+                selector,
+            )?;
+            require_assigned_workdir_source(
+                &api,
+                &assignment,
+                &mr.repository_id,
+                selector,
+                &source_observation.revision_ref,
+            )?;
+            source_observation.revision_ref
+        }
+        merge_request::MergeRequestState::Closed => {
+            return Err(
+                Error::InvalidInput("closed Merge Request is not reviewable".into()).into(),
+            );
+        }
+    };
+    let mut ticket_merge_request_subjects = Vec::new();
+    for linked in store.list_for_ticket(&workspace_id, &ticket_id)? {
+        let linked_subject_ref = if linked.state == merge_request::MergeRequestState::Merged {
+            merged_result_source_ref(&linked)?
+        } else {
+            let linked_selector = linked.selector_from.as_deref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "Merge Request `{}` selector_from requires repair",
+                    linked.merge_request_id
+                ))
+            })?;
+            observe_published_source_ref(
+                &api,
+                &workspace_id,
+                &assignment.worker.runtime_id,
+                &linked.repository_id,
+                linked_selector,
+            )?
+            .revision_ref
+        };
+        ticket_merge_request_subjects.push(merge_request::MergeRequestReviewSubject {
+            merge_request_id: linked.merge_request_id,
+            subject_ref: linked_subject_ref,
+        });
+    }
+    let ticket_item_revision = api.authority.ticket(&ticket_id)?.item_revision;
     store.request_review(merge_request::RequestMergeRequestReview {
+        merge_request_id,
         ticket_id,
+        ticket_item_revision,
+        ticket_merge_request_subjects,
         subject_ref,
         child_session_id: input.child_session_id,
         capability_token: input.capability_token,
@@ -12807,15 +12992,16 @@ async fn scoped_register_merge_request_review_capability(
 
 async fn scoped_submit_merge_request_review(
     State(api): State<WorkspaceApi>,
-    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
     Json(input): Json<server_api::SubmitMergeRequestReviewRequest>,
 ) -> ApiResult<Json<server_api::ReviewEvent>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
-    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     let store = merge_request_store(&api, &workspace_id)?;
     let review_authorization =
-        store.authorize_review_submission(&ticket_id, &input.capability_token)?;
-    if review_authorization.workspace_id != workspace_id {
+        store.authorize_review_submission(&merge_request_id, &input.capability_token)?;
+    if review_authorization.workspace_id != workspace_id
+        || review_authorization.merge_request_id != merge_request_id
+    {
         return Err(
             Error::MergeRequest(merge_request::MergeRequestError::Unauthorized(
                 "review grant invalid".into(),
@@ -12823,25 +13009,36 @@ async fn scoped_submit_merge_request_review(
             .into(),
         );
     }
-    let mr = store.get(&workspace_id, &ticket_id)?;
-    let selector = mr
-        .selector_from
-        .as_deref()
-        .ok_or_else(|| Error::InvalidInput("selector_from requires repair".into()))?;
+    let ticket_id = review_authorization.ticket_id;
+    let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
     let assignment = api
         .store
         .get_current_ticket_coder_assignment(&workspace_id, &ticket_id)?
         .ok_or_else(|| {
             Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
         })?;
-    let current_subject_ref = observe_published_source_ref(
-        &api,
-        &workspace_id,
-        &assignment.worker.runtime_id,
-        &mr.repository_id,
-        selector,
-    )?
-    .revision_ref;
+    let current_subject_ref = match mr.state {
+        merge_request::MergeRequestState::Merged => merged_result_source_ref(&mr)?,
+        merge_request::MergeRequestState::Open => {
+            let selector = mr
+                .selector_from
+                .as_deref()
+                .ok_or_else(|| Error::InvalidInput("selector_from requires repair".into()))?;
+            observe_published_source_ref(
+                &api,
+                &workspace_id,
+                &assignment.worker.runtime_id,
+                &mr.repository_id,
+                selector,
+            )?
+            .revision_ref
+        }
+        merge_request::MergeRequestState::Closed => {
+            return Err(
+                Error::InvalidInput("closed Merge Request is not reviewable".into()).into(),
+            );
+        }
+    };
     let decision = internal_review_decision(input.decision);
     let findings = input
         .findings
@@ -12849,6 +13046,7 @@ async fn scoped_submit_merge_request_review(
         .map(internal_review_finding)
         .collect();
     let event = store.submit_review(merge_request::SubmitMergeRequestReview {
+        merge_request_id,
         ticket_id,
         current_subject_ref,
         capability_token: input.capability_token,
@@ -12863,16 +13061,18 @@ async fn scoped_submit_merge_request_review(
 async fn scoped_revoke_merge_request_review(
     State(api): State<WorkspaceApi>,
     headers: HeaderMap,
-    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
     Json(input): Json<server_api::RevokeMergeRequestReviewRequest>,
 ) -> ApiResult<Json<server_api::ReviewRevokedEvent>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
-    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     require_workspace_access(&workspace_id, &api)?;
     if !input.explicit_confirmation {
         return Err(Error::BrowserReopenConfirmationRequired.into());
     }
     let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
+    let store = merge_request_store(&api, &workspace_id)?;
+    let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
+    let ticket_id = merge_request_ticket_id(&mr)?;
     let assignment = api
         .store
         .get_current_ticket_coder_assignment(&workspace_id, &ticket_id)?
@@ -12887,9 +13087,8 @@ async fn scoped_revoke_merge_request_review(
         )
         .into());
     }
-    let store = merge_request_store(&api, &workspace_id)?;
-    let mr = store.get(&workspace_id, &ticket_id)?;
     let event = store.revoke_review(merge_request::RevokeMergeRequestReview {
+        merge_request_id,
         ticket_id,
         review_event_id: input.review_event_id,
         reason: input.reason,
@@ -12908,18 +13107,19 @@ async fn scoped_revoke_merge_request_review(
 async fn scoped_complete_merge_request(
     State(api): State<WorkspaceApi>,
     headers: HeaderMap,
-    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
     Json(input): Json<server_api::CompleteMergeRequestRequest>,
 ) -> ApiResult<Json<server_api::MergeEvent>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
-    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     require_workspace_access(&workspace_id, &api)?;
     let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
     require_online_workspace_orchestrator_source(&api, &source)?;
     let store = merge_request_store(&api, &workspace_id)?;
-    let mr = store.get(&workspace_id, &ticket_id)?;
+    let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
+    let ticket_id = merge_request_ticket_id(&mr)?;
     if let Some(existing) = recorded_merge_completion(&mr.thread, &input.operation_id) {
         let replay = merge_request::CompleteMergeRequest {
+            merge_request_id,
             ticket_id,
             operation_id: input.operation_id,
             approval_event_id: input.approval_event_id,
@@ -12974,6 +13174,7 @@ async fn scoped_complete_merge_request(
         &input.target_ref_after,
     )?;
     let completion = merge_request::CompleteMergeRequest {
+        merge_request_id,
         ticket_id,
         operation_id: input.operation_id,
         approval_event_id: input.approval_event_id,
@@ -12997,6 +13198,42 @@ async fn scoped_complete_merge_request(
         .map(public_merge_event)
         .map(Json)
         .map_err(Into::into)
+}
+
+async fn scoped_complete_ticket(
+    State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    Json(input): Json<server_api::CompleteTicketRequest>,
+) -> ApiResult<Json<server_api::TicketCompletionEvent>> {
+    let workspace_id = parse_workspace_id(&workspace_id)?;
+    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
+    require_workspace_access(&workspace_id, &api)?;
+    let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
+    require_online_workspace_orchestrator_source(&api, &source)?;
+    let assignment_id = api
+        .store
+        .get_current_ticket_coder_assignment(&workspace_id, &ticket_id)?
+        .map(|assignment| assignment.assignment_id)
+        .unwrap_or_default();
+    let event = merge_request_store(&api, &workspace_id)?.complete_ticket(
+        merge_request::CompleteTicket {
+            ticket_id,
+            operation_id: input.operation_id,
+            item_revision: input.item_revision,
+            merge_request_ids: input.merge_request_ids,
+            requirement_approval_event_id: input.requirement_approval_event_id,
+            auth: merge_request::MergeRequestAuth {
+                workspace_id,
+                repository_id: String::new(),
+                runtime_id: source.runtime_id,
+                worker_id: source.worker_id,
+                assignment_id,
+            },
+            now: Utc::now(),
+        },
+    )?;
+    Ok(Json(public_ticket_completion_event(event)))
 }
 
 fn reject_non_browser_reopen_auth(headers: &HeaderMap) -> Result<()> {
@@ -13622,7 +13859,7 @@ async fn open_current_worker_workdir_session_locked(
         })?;
     let effective_capabilities = link
         .capabilities
-        .intersection(workdir_source_capabilities(&workdir))
+        .intersection(workdir_source_capabilities(api, &workdir)?)
         .intersection(ticket_target_capabilities_for_workdir(
             api, worker, &workdir,
         )?);
@@ -13636,9 +13873,7 @@ async fn open_current_worker_workdir_session_locked(
                 code: "external_workdir_grant_not_found".to_string(),
                 message: "External Workdir grant is unavailable".to_string(),
             })?;
-        let expired = chrono::DateTime::parse_from_rfc3339(&grant.expires_at)
-            .map(|expires_at| expires_at.with_timezone(&Utc) <= Utc::now())
-            .unwrap_or(true);
+        let expired = external_workdir_grant_is_expired(&grant)?;
         if expired {
             grant = fence_external_workdir_grant_expired(api, grant_id)
                 .await
@@ -13843,7 +14078,7 @@ fn sync_runtime_worker_workdir_attachments(
                 })?;
             let capabilities = link
                 .capabilities
-                .intersection(workdir_source_capabilities(&workdir))
+                .intersection(workdir_source_capabilities(api, &workdir)?)
                 .intersection(ticket_target_capabilities_for_workdir(
                     api, worker, &workdir,
                 )?);
@@ -13937,9 +14172,7 @@ async fn scoped_attach_current_worker_workdir(
                     code: "external_workdir_unavailable".to_string(),
                     message: "External Workdir grant is unavailable".to_string(),
                 })?;
-            let grant_expired = chrono::DateTime::parse_from_rfc3339(&grant.expires_at)
-                .map(|expires_at| expires_at.with_timezone(&Utc) <= Utc::now())
-                .unwrap_or(true);
+            let grant_expired = external_workdir_grant_is_expired(&grant)?;
             let online = api
                 .external_workdir_providers
                 .lock()
@@ -13949,7 +14182,9 @@ async fn scoped_attach_current_worker_workdir(
                     connection.generation == grant.generation
                         && connection.provider_instance_id == grant.provider_instance_id
                         && connection.workdir_id == workdir.workdir_id
-                        && connection.expires_at > Utc::now()
+                        && connection
+                            .expires_at
+                            .is_none_or(|expires_at| expires_at > Utc::now())
                 });
             if grant.status != "online" || grant_expired || !online {
                 return Err(Error::RuntimeOperationFailed {
@@ -16602,13 +16837,32 @@ async fn cleanup_runtime_working_directory(
     .map_err(ApiError::from)
 }
 
+fn external_workdir_expires_at(
+    grant: &ExternalWorkdirGrantRecord,
+) -> Result<Option<chrono::DateTime<Utc>>> {
+    grant
+        .expires_at
+        .as_deref()
+        .map(|value| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .map(|value| value.with_timezone(&Utc))
+                .map_err(|_| Error::Store("External Workdir grant has invalid expiry".to_string()))
+        })
+        .transpose()
+}
+
+fn external_workdir_grant_is_expired(grant: &ExternalWorkdirGrantRecord) -> Result<bool> {
+    Ok(external_workdir_expires_at(grant)?.is_some_and(|expires_at| expires_at <= Utc::now()))
+}
+
 fn schedule_external_workdir_expiry(
     api: &WorkspaceApi,
     grant: &ExternalWorkdirGrantRecord,
 ) -> Result<()> {
-    let expires_at = chrono::DateTime::parse_from_rfc3339(&grant.expires_at)
-        .map_err(|_| Error::Store("External Workdir grant has invalid expiry".to_string()))?
-        .with_timezone(&Utc);
+    let Some(expires_at) = external_workdir_expires_at(grant)? else {
+        cancel_external_workdir_expiry(api, &grant.grant_id);
+        return Ok(());
+    };
     let grant_id = grant.grant_id.clone();
     let task_api = api.clone();
     let task_grant_id = grant_id.clone();
@@ -16689,9 +16943,9 @@ async fn fence_external_workdir_grant_expired(
         if matches!(grant.status.as_str(), "revoked" | "expired") {
             return Ok(grant);
         }
-        let expires_at = chrono::DateTime::parse_from_rfc3339(&grant.expires_at)
-            .map(|value| value.with_timezone(&Utc))
-            .map_err(|_| Error::Store("External Workdir grant has invalid expiry".to_string()))?;
+        let Some(expires_at) = external_workdir_expires_at(&grant)? else {
+            return Ok(grant);
+        };
         if expires_at > Utc::now() {
             return Ok(grant);
         }
@@ -16766,15 +17020,12 @@ async fn scoped_create_external_workdir_grant(
             "External Workdir display name must be between 1 and 100 bytes and contain no control characters".to_string(),
         ).into());
     }
-    if !request.read_only {
+    if request
+        .ttl_seconds
+        .is_some_and(|ttl_seconds| !(60..=86_400).contains(&ttl_seconds))
+    {
         return Err(Error::InvalidInput(
-            "External Workdir grants currently require read_only=true".to_string(),
-        )
-        .into());
-    }
-    if !(60..=86_400).contains(&request.ttl_seconds) {
-        return Err(Error::InvalidInput(
-            "External Workdir ttl_seconds must be between 60 and 86400".to_string(),
+            "External Workdir ttl_seconds must be omitted or between 60 and 86400".to_string(),
         )
         .into());
     }
@@ -16782,8 +17033,14 @@ async fn scoped_create_external_workdir_grant(
         .map_err(Error::InvalidInput)?;
     let now = Utc::now();
     let created_at = now.to_rfc3339_opts(SecondsFormat::Nanos, true);
-    let expires_at = (now + Duration::seconds(request.ttl_seconds as i64))
-        .to_rfc3339_opts(SecondsFormat::Nanos, true);
+    let expires_at = request
+        .ttl_seconds
+        .map(|ttl_seconds| now + Duration::seconds(ttl_seconds as i64))
+        .map(|expires_at| expires_at.to_rfc3339_opts(SecondsFormat::Nanos, true));
+    let permissions = match request.permission {
+        server_api::ExternalWorkdirPermission::ReadOnly => "read_only",
+        server_api::ExternalWorkdirPermission::ReadWrite => "read_write",
+    };
     let grant_id = format!("ewg-{}", Uuid::now_v7());
     let workdir_id = format!("external-{}", Uuid::now_v7());
     let grant = ExternalWorkdirGrantRecord {
@@ -16792,7 +17049,7 @@ async fn scoped_create_external_workdir_grant(
         workdir_id: workdir_id.clone(),
         provider_instance_id: request.provider_instance_id,
         display_name: display_name.to_string(),
-        permissions: "read_only".to_string(),
+        permissions: permissions.to_string(),
         created_by: actor.account_id,
         created_at: created_at.clone(),
         expires_at: expires_at.clone(),
@@ -16836,7 +17093,10 @@ fn external_workdir_grant_response(
         working_directory_id: grant.workdir_id.clone(),
         provider_instance_id: grant.provider_instance_id.clone(),
         display_name: grant.display_name.clone(),
-        permissions: grant.permissions.clone(),
+        permission: match grant.permissions.as_str() {
+            "read_write" => server_api::ExternalWorkdirPermission::ReadWrite,
+            _ => server_api::ExternalWorkdirPermission::ReadOnly,
+        },
         expires_at: grant.expires_at.clone(),
         generation: grant.generation,
         status: grant.status.clone(),
@@ -16859,10 +17119,7 @@ async fn scoped_external_workdir_provider_ws(
             "External Workdir provider connection must use the grant creator's authenticated client".to_string(),
         ).into());
     }
-    let now = Utc::now();
-    let expired = chrono::DateTime::parse_from_rfc3339(&grant.expires_at)
-        .map(|expires_at| expires_at.with_timezone(&Utc) <= now)
-        .unwrap_or(true);
+    let expired = external_workdir_grant_is_expired(&grant)?;
     if expired {
         grant = fence_external_workdir_grant_expired(&api, &grant_id).await?;
     }
@@ -16916,10 +17173,17 @@ async fn serve_external_workdir_provider(
         let _ = socket.close().await;
         return;
     };
+    let expected_capabilities = match external_workdir_capabilities(&initial_grant.permissions) {
+        Ok(capabilities) => capabilities,
+        Err(_) => {
+            let _ = socket.close().await;
+            return;
+        }
+    };
     if registration.grant_id.as_str() != initial_grant.grant_id
         || registration.workdir_id.as_str() != initial_grant.workdir_id
         || registration.provider_instance_id.as_str() != initial_grant.provider_instance_id
-        || registration.capabilities != workdir::WorkdirSessionCapabilities::READ_ONLY
+        || registration.capabilities != expected_capabilities
         || registration.read_limits != workdir::BoundedReadLimits::EXTERNAL_DEFAULT
         || registration.generation == 0
     {
@@ -16972,8 +17236,8 @@ async fn serve_external_workdir_provider(
         let _ = socket.close().await;
         return;
     }
-    let expires_at = match chrono::DateTime::parse_from_rfc3339(&initial_grant.expires_at) {
-        Ok(value) => value.with_timezone(&Utc),
+    let expires_at = match external_workdir_expires_at(&initial_grant) {
+        Ok(value) => value,
         Err(_) => {
             let _ = socket.close().await;
             return;
@@ -17226,11 +17490,8 @@ async fn scoped_get_external_workdir_grant(
         )
         .into());
     }
-    let now = Utc::now();
     let expired = !matches!(grant.status.as_str(), "revoked" | "expired")
-        && chrono::DateTime::parse_from_rfc3339(&grant.expires_at)
-            .map(|expires_at| expires_at.with_timezone(&Utc) <= now)
-            .unwrap_or(true);
+        && external_workdir_grant_is_expired(&grant)?;
     if expired {
         grant = fence_external_workdir_grant_expired(&api, &grant_id).await?;
     }
@@ -21663,7 +21924,7 @@ fn finalize_spawned_worker_workdir_attachments(
                     worker_record,
                     attachment.alias.as_str(),
                     &summary.working_directory_id,
-                    workdir_source_capabilities(&workdir_record),
+                    workdir_source_capabilities(api, &workdir_record)?,
                     None,
                 ),
             )?;
@@ -25809,8 +26070,7 @@ mod tests {
 
     #[test]
     fn worker_projection_does_not_expose_unavailable_snapshot_as_current() {
-        let availability =
-            protocol::subscription::SubscriptionWorkerAvailability::Unavailable;
+        let availability = protocol::subscription::SubscriptionWorkerAvailability::Unavailable;
         let worker_ref = RuntimeWorkerRef::new("runtime-a", "worker-a");
         let projection = WorkerRegistryProjectionRecord {
             registry: WorkerRegistryRecord {
@@ -25860,8 +26120,7 @@ mod tests {
 
         let mut observed_stopped = projection;
         let observation = observed_stopped.observation.as_mut().unwrap();
-        observation.availability =
-            protocol::subscription::SubscriptionWorkerAvailability::Observed;
+        observation.availability = protocol::subscription::SubscriptionWorkerAvailability::Observed;
         observation.worker.availability =
             protocol::subscription::SubscriptionWorkerAvailability::Observed;
         observation.worker.state = protocol::subscription::SubscriptionWorkerState::Stopped;
@@ -25883,7 +26142,7 @@ mod tests {
             workdir_id: "external-a".to_string(),
             provider_instance_id: "provider-a".to_string(),
             generation: 4,
-            expires_at: Utc::now() + Duration::minutes(1),
+            expires_at: Some(Utc::now() + Duration::minutes(1)),
             capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
             admission: Arc::new(tokio::sync::Semaphore::new(16)),
             sender,
@@ -25940,6 +26199,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn external_provider_read_write_session_routes_files_but_never_commands() {
+        let (sender, mut commands) = tokio::sync::mpsc::channel(1);
+        let connection = Arc::new(ExternalProviderConnection {
+            grant_id: "grant-rw".to_string(),
+            workdir_id: "external-rw".to_string(),
+            provider_instance_id: "provider-rw".to_string(),
+            generation: 2,
+            expires_at: None,
+            capabilities: workdir::WorkdirSessionCapabilities::READ_WRITE,
+            admission: Arc::new(tokio::sync::Semaphore::new(16)),
+            sender,
+        });
+        let session = Arc::new(ExternalProviderWorkdirSession::new(connection, None));
+        let writer = {
+            let session = session.clone();
+            tokio::spawn(async move {
+                session
+                    .write(workdir::WriteRequest {
+                        path: workdir::WorkdirPath::new("created.txt").unwrap(),
+                        content: b"created".to_vec(),
+                        expected_hash: None,
+                    })
+                    .await
+            })
+        };
+        let Some(ExternalProviderCommand::Operation {
+            operation,
+            response,
+            ..
+        }) = commands.recv().await
+        else {
+            panic!("expected provider write operation");
+        };
+        assert!(matches!(operation, WorkdirSessionOperation::Write(_)));
+        response
+            .send(Ok(WorkdirSessionOperationResult::Write(
+                workdir::WriteResult {
+                    bytes_written: 7,
+                    created: true,
+                },
+            )))
+            .unwrap();
+        assert!(writer.await.unwrap().unwrap().created);
+
+        let command = session
+            .start_command(workdir::CommandRequest {
+                command: "touch forbidden".to_string(),
+                timeout_secs: 1,
+                output_limit: 1024,
+                cwd: workdir::WorkdirPath::root(),
+                spill_dir: None,
+                tool_call_id: None,
+            })
+            .await;
+        assert!(matches!(
+            command,
+            Err(workdir::WorkdirError::Unsupported(
+                workdir::WorkdirSessionCapability::Command
+            ))
+        ));
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn backend_expiry_fences_offline_grant_and_persists_cleanup_completion() {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
@@ -25955,8 +26278,9 @@ mod tests {
             permissions: "read_only".to_string(),
             created_by: test_browser_request_actor().account_id,
             created_at: created_at.clone(),
-            expires_at: (now + Duration::milliseconds(50))
-                .to_rfc3339_opts(SecondsFormat::Nanos, true),
+            expires_at: Some(
+                (now + Duration::milliseconds(50)).to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ),
             generation: 1,
             status: "offline".to_string(),
             updated_at: created_at.clone(),
@@ -26055,7 +26379,9 @@ mod tests {
             permissions: "read_only".to_string(),
             created_by: test_browser_request_actor().account_id,
             created_at: created_at.clone(),
-            expires_at: (now + Duration::minutes(5)).to_rfc3339_opts(SecondsFormat::Nanos, true),
+            expires_at: Some(
+                (now + Duration::minutes(5)).to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ),
             generation: 1,
             status: "online".to_string(),
             updated_at: created_at.clone(),
@@ -26260,7 +26586,7 @@ mod tests {
                 permissions: "read_only".to_string(),
                 created_by: test_browser_request_actor().account_id,
                 created_at: now.clone(),
-                expires_at: expires_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                expires_at: Some(expires_at.to_rfc3339_opts(SecondsFormat::Nanos, true)),
                 generation: 1,
                 status: "pending".to_string(),
                 updated_at: now.clone(),
@@ -26307,7 +26633,7 @@ mod tests {
                 workdir_id: grant.workdir_id.clone(),
                 provider_instance_id: grant.provider_instance_id.clone(),
                 generation: 1,
-                expires_at,
+                expires_at: Some(expires_at),
                 capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
                 admission: Arc::new(tokio::sync::Semaphore::new(16)),
                 sender,
@@ -26399,8 +26725,8 @@ mod tests {
             Json(ExternalWorkdirGrantCreateRequest {
                 provider_instance_id: "provider-a".to_string(),
                 display_name: "Session logs".to_string(),
-                ttl_seconds: 600,
-                read_only: true,
+                ttl_seconds: Some(600),
+                permission: server_api::ExternalWorkdirPermission::ReadWrite,
             }),
         )
         .await
@@ -26429,7 +26755,7 @@ mod tests {
                         .id()
                         .clone(),
                     generation,
-                    capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+                    capabilities: workdir::WorkdirSessionCapabilities::READ_WRITE,
                     read_limits: workdir::BoundedReadLimits::EXTERNAL_DEFAULT,
                 },
             })
@@ -26525,14 +26851,27 @@ mod tests {
             .list_worker_workdir_links(TEST_WORKSPACE_ID, &worker)
             .unwrap();
         assert_eq!(links.len(), 2);
-        assert!(
-            links.iter().all(|link| {
-                link.capabilities == workdir::WorkdirSessionCapabilities::READ_ONLY
-            })
+        let repository_capabilities = links
+            .iter()
+            .find(|link| link.alias == "repository")
+            .unwrap()
+            .capabilities;
+        let external_capabilities = links
+            .iter()
+            .find(|link| link.alias == "session-logs")
+            .unwrap()
+            .capabilities;
+        assert_eq!(
+            repository_capabilities,
+            workdir::WorkdirSessionCapabilities::READ_ONLY
+        );
+        assert_eq!(
+            external_capabilities,
+            workdir::WorkdirSessionCapabilities::READ_WRITE
         );
         let provider_root = tempfile::tempdir().unwrap();
         fs::write(provider_root.path().join("events.jsonl"), b"one\ntwo\n").unwrap();
-        let local_session = workdir::LocalWorkdirSession::external_read_only(
+        let local_session = workdir::LocalWorkdirSession::external_read_write(
             workdir::Workdir::new(&grant.working_directory_id),
             provider_root.path(),
             workdir::BoundedReadLimits::EXTERNAL_DEFAULT,
@@ -26546,7 +26885,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             broker_session.capabilities(),
-            workdir::WorkdirSessionCapabilities::READ_ONLY
+            workdir::WorkdirSessionCapabilities::READ_WRITE
         );
         drop(session_guard);
         let read = {
@@ -26596,7 +26935,143 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(read.await.unwrap().unwrap().bytes, b"one\ntwo\n");
+        let read_result = read.await.unwrap().unwrap();
+        assert_eq!(read_result.bytes, b"one\ntwo\n");
+
+        let edit = {
+            let broker_session = broker_session.clone();
+            let expected_hash = read_result.content_hash;
+            tokio::spawn(async move {
+                broker_session
+                    .edit(workdir::EditRequest {
+                        path: workdir::WorkdirPath::new("events.jsonl").unwrap(),
+                        old_string: "two".to_string(),
+                        new_string: "changed".to_string(),
+                        replace_all: false,
+                        expected_hash,
+                    })
+                    .await
+            })
+        };
+        let (operation_id, operation) = loop {
+            let text = second.next().await.unwrap().unwrap().into_text().unwrap();
+            let frame = serde_json::from_str::<ExternalWorkdirServerFrame>(&text).unwrap();
+            if let ExternalWorkdirServerMessage::Operation {
+                generation: 2,
+                operation_id,
+                operation,
+            } = frame.message
+            {
+                break (operation_id, operation);
+            }
+        };
+        assert!(matches!(
+            operation.as_inner(),
+            WorkdirSessionOperation::Edit(_)
+        ));
+        let result = workdir::http::dispatch_workdir_session_operation(
+            &local_session,
+            operation.into_inner(),
+        )
+        .await
+        .unwrap()
+        .try_into()
+        .unwrap();
+        second
+            .send(Message::Text(
+                serde_json::to_string(&ExternalWorkdirProviderFrame::current(
+                    ExternalWorkdirProviderMessage::OperationResult {
+                        generation: 2,
+                        operation_id,
+                        outcome: ExternalWorkdirOperationOutcome::Completed { result },
+                    },
+                ))
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(edit.await.unwrap().unwrap().replacements, 1);
+
+        let write = {
+            let broker_session = broker_session.clone();
+            tokio::spawn(async move {
+                broker_session
+                    .write(workdir::WriteRequest {
+                        path: workdir::WorkdirPath::new("created.txt").unwrap(),
+                        content: b"created".to_vec(),
+                        expected_hash: None,
+                    })
+                    .await
+            })
+        };
+        let (operation_id, operation) = loop {
+            let text = second.next().await.unwrap().unwrap().into_text().unwrap();
+            let frame = serde_json::from_str::<ExternalWorkdirServerFrame>(&text).unwrap();
+            if let ExternalWorkdirServerMessage::Operation {
+                generation: 2,
+                operation_id,
+                operation,
+            } = frame.message
+            {
+                break (operation_id, operation);
+            }
+        };
+        assert!(matches!(
+            operation.as_inner(),
+            WorkdirSessionOperation::Write(_)
+        ));
+        let result = workdir::http::dispatch_workdir_session_operation(
+            &local_session,
+            operation.into_inner(),
+        )
+        .await
+        .unwrap()
+        .try_into()
+        .unwrap();
+        second
+            .send(Message::Text(
+                serde_json::to_string(&ExternalWorkdirProviderFrame::current(
+                    ExternalWorkdirProviderMessage::OperationResult {
+                        generation: 2,
+                        operation_id,
+                        outcome: ExternalWorkdirOperationOutcome::Completed { result },
+                    },
+                ))
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert!(write.await.unwrap().unwrap().created);
+        assert_eq!(
+            fs::read_to_string(provider_root.path().join("events.jsonl")).unwrap(),
+            "one\nchanged\n"
+        );
+        assert_eq!(
+            fs::read_to_string(provider_root.path().join("created.txt")).unwrap(),
+            "created"
+        );
+        let command_error = broker_session
+            .start_command(workdir::CommandRequest {
+                command: "touch forbidden".to_string(),
+                timeout_secs: 1,
+                output_limit: 1024,
+                cwd: workdir::WorkdirPath::root(),
+                spill_dir: None,
+                tool_call_id: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                command_error,
+                workdir::WorkdirError::Unsupported(workdir::WorkdirSessionCapability::Command)
+                    | workdir::WorkdirError::UnsupportedOperation(_)
+                    | workdir::WorkdirError::Denied(_)
+            ),
+            "unexpected command error: {command_error:?}"
+        );
 
         let Json(revoked) = scoped_revoke_external_workdir_grant(
             State(api.clone()),
@@ -26638,7 +27113,7 @@ mod tests {
             workdir_id: "external-a".to_string(),
             provider_instance_id: "provider-a".to_string(),
             generation: 2,
-            expires_at: Utc::now() + Duration::minutes(1),
+            expires_at: Some(Utc::now() + Duration::minutes(1)),
             capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
             admission: Arc::new(tokio::sync::Semaphore::new(16)),
             sender,
@@ -26791,8 +27266,7 @@ mod tests {
                     identity: TEST_WORKSPACE_ID.to_string(),
                     workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
                 },
-                availability:
-                    protocol::subscription::SubscriptionWorkerAvailability::Observed,
+                availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
                 state: "idle".to_string(),
                 worker_state: None,
                 last_seen_at: None,
@@ -38590,8 +39064,7 @@ mod tests {
                     identity: "workspace-test".to_string(),
                     workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
                 },
-                availability:
-                    protocol::subscription::SubscriptionWorkerAvailability::Observed,
+                availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
                 state: "idle".to_string(),
                 worker_state: None,
                 last_seen_at: None,
@@ -38689,8 +39162,7 @@ mod tests {
                     identity: "workspace-test".to_string(),
                     workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
                 },
-                availability:
-                    protocol::subscription::SubscriptionWorkerAvailability::Observed,
+                availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
                 state: "idle".to_string(),
                 worker_state: None,
                 last_seen_at: None,

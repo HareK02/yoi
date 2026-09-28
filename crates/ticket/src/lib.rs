@@ -85,7 +85,7 @@ pub enum TicketError {
     },
     #[error("ticket target repository `{0}` appears more than once")]
     DuplicateTargetRepository(String),
-    #[error("ticket requires exactly one read_write target, found {0}")]
+    #[error("ticket requires at least one read_write target, found {0}")]
     InvalidReadWriteTargetCount(usize),
     #[error("ticket target authority is unavailable")]
     TargetAuthorityUnavailable,
@@ -649,7 +649,7 @@ fn resolve_ready_targets(
         .iter()
         .filter(|target| target.access == TicketTargetAccess::ReadWrite)
         .count();
-    if read_write_count != 1 {
+    if read_write_count == 0 {
         return Err(TicketError::InvalidReadWriteTargetCount(read_write_count));
     }
     let authority = authority.ok_or(TicketError::TargetAuthorityUnavailable)?;
@@ -6009,45 +6009,48 @@ mod tests {
             Err(TicketError::DuplicateTargetRepository(repository)) if repository == "main"
         ));
 
-        for (name, targets, expected_count) in [
-            (
-                "No write target",
-                vec![ticket_target("docs", None, TicketTargetAccess::ReadOnly)],
-                0,
-            ),
-            (
-                "Multiple write targets",
-                vec![write_target("main"), write_target("docs")],
-                2,
-            ),
-        ] {
-            let mut input = NewTicket::new(name);
-            input.targets = targets;
-            let ticket = backend.create(input).unwrap();
-            let error = backend
-                .mark_ready(
-                    TicketIdOrSlug::Id(ticket.id.clone()),
-                    TicketMarkReady {
-                        operation_key: format!("ready-{expected_count}"),
-                        reason: None,
-                        author: None,
-                        intake_summary: None,
-                    },
-                )
-                .unwrap_err();
-            assert!(matches!(
-                error,
-                TicketError::InvalidReadWriteTargetCount(count) if count == expected_count
-            ));
-            let unchanged = backend.show(TicketIdOrSlug::Id(ticket.id)).unwrap();
-            assert_eq!(unchanged.meta.workflow_state, TicketWorkflowState::Planning);
-            assert!(
-                unchanged
-                    .events
-                    .iter()
-                    .all(|event| !event.attributes.contains_key("operation_key"))
-            );
-        }
+        let mut no_write = NewTicket::new("No write target");
+        no_write.targets = vec![ticket_target("docs", None, TicketTargetAccess::ReadOnly)];
+        let ticket = backend.create(no_write).unwrap();
+        let error = backend
+            .mark_ready(
+                TicketIdOrSlug::Id(ticket.id.clone()),
+                TicketMarkReady {
+                    operation_key: "ready-no-write".into(),
+                    reason: None,
+                    author: None,
+                    intake_summary: None,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, TicketError::InvalidReadWriteTargetCount(0)));
+        let unchanged = backend.show(TicketIdOrSlug::Id(ticket.id)).unwrap();
+        assert_eq!(unchanged.meta.workflow_state, TicketWorkflowState::Planning);
+
+        let mut multiple_writes = NewTicket::new("Multiple write targets");
+        multiple_writes.targets = vec![write_target("main"), write_target("docs")];
+        let ticket = backend.create(multiple_writes).unwrap();
+        let ready = backend
+            .mark_ready(
+                TicketIdOrSlug::Id(ticket.id),
+                TicketMarkReady {
+                    operation_key: "ready-multiple-writes".into(),
+                    reason: None,
+                    author: None,
+                    intake_summary: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(ready.meta.workflow_state, TicketWorkflowState::Ready);
+        assert_eq!(
+            ready
+                .meta
+                .targets
+                .iter()
+                .filter(|target| target.access == TicketTargetAccess::ReadWrite)
+                .count(),
+            2
+        );
     }
 
     #[test]

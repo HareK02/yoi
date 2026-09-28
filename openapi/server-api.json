@@ -2015,24 +2015,26 @@
           "display_name": {
             "type": "string"
           },
+          "permission": {
+            "$ref": "#/components/schemas/ExternalWorkdirPermission"
+          },
           "provider_instance_id": {
             "type": "string"
-          },
-          "read_only": {
-            "type": "boolean"
           },
           "ttl_seconds": {
             "format": "uint64",
             "maximum": 9007199254740991,
             "minimum": 0,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
           "provider_instance_id",
           "display_name",
-          "ttl_seconds",
-          "read_only"
+          "permission"
         ],
         "type": "object"
       },
@@ -2043,7 +2045,11 @@
             "type": "string"
           },
           "expires_at": {
-            "type": "string"
+            "description": "`None` means the grant has no automatic expiry. It remains bounded by\nexplicit revoke, provider disconnect, and provider shutdown cleanup.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "generation": {
             "format": "uint64",
@@ -2054,8 +2060,8 @@
           "grant_id": {
             "type": "string"
           },
-          "permissions": {
-            "type": "string"
+          "permission": {
+            "$ref": "#/components/schemas/ExternalWorkdirPermission"
           },
           "provider_instance_id": {
             "type": "string"
@@ -2076,12 +2082,18 @@
           "working_directory_id",
           "provider_instance_id",
           "display_name",
-          "permissions",
-          "expires_at",
+          "permission",
           "generation",
           "status"
         ],
         "type": "object"
+      },
+      "ExternalWorkdirPermission": {
+        "enum": [
+          "read_only",
+          "read_write"
+        ],
+        "type": "string"
       },
       "ExtractAudit": {
         "properties": {
@@ -3808,6 +3820,22 @@
         ],
         "type": "object"
       },
+      "MergeRequestReviewSubject": {
+        "additionalProperties": false,
+        "properties": {
+          "merge_request_id": {
+            "type": "string"
+          },
+          "subject_ref": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "merge_request_id",
+          "subject_ref"
+        ],
+        "type": "object"
+      },
       "MergeRequestState": {
         "enum": [
           "open",
@@ -3845,6 +3873,15 @@
               },
               "subject_ref": {
                 "type": "string"
+              },
+              "ticket_item_revision": {
+                "type": "string"
+              },
+              "ticket_merge_request_subjects": {
+                "items": {
+                  "$ref": "#/components/schemas/MergeRequestReviewSubject"
+                },
+                "type": "array"
               }
             },
             "required": [
@@ -3852,6 +3889,8 @@
               "event_id",
               "sequence",
               "subject_ref",
+              "ticket_item_revision",
+              "ticket_merge_request_subjects",
               "requested_by",
               "reviewer",
               "created_at"
@@ -3897,6 +3936,15 @@
               },
               "subject_ref": {
                 "type": "string"
+              },
+              "ticket_item_revision": {
+                "type": "string"
+              },
+              "ticket_merge_request_subjects": {
+                "items": {
+                  "$ref": "#/components/schemas/MergeRequestReviewSubject"
+                },
+                "type": "array"
               }
             },
             "required": [
@@ -3905,6 +3953,8 @@
               "sequence",
               "request_event_id",
               "subject_ref",
+              "ticket_item_revision",
+              "ticket_merge_request_subjects",
               "decision",
               "body",
               "findings",
@@ -6303,6 +6353,15 @@
           },
           "subject_ref": {
             "type": "string"
+          },
+          "ticket_item_revision": {
+            "type": "string"
+          },
+          "ticket_merge_request_subjects": {
+            "items": {
+              "$ref": "#/components/schemas/MergeRequestReviewSubject"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -6310,6 +6369,8 @@
           "sequence",
           "request_event_id",
           "subject_ref",
+          "ticket_item_revision",
+          "ticket_merge_request_subjects",
           "decision",
           "body",
           "findings",
@@ -8955,6 +9016,12 @@
               }
             ]
           },
+          "merge_requests": {
+            "items": {
+              "$ref": "#/components/schemas/TicketMergeRequestSummary"
+            },
+            "type": "array"
+          },
           "priority": {
             "type": "string"
           },
@@ -9038,6 +9105,7 @@
           "assignments",
           "assignment_diagnostics",
           "action_eligibility",
+          "merge_requests",
           "evidence",
           "record_source"
         ],
@@ -10105,6 +10173,12 @@
               }
             ]
           },
+          "merge_requests": {
+            "items": {
+              "$ref": "#/components/schemas/TicketMergeRequestSummary"
+            },
+            "type": "array"
+          },
           "priority": {
             "type": "string"
           },
@@ -10172,7 +10246,8 @@
           "blocker_count",
           "unresolved_blocker_count",
           "unresolved_review_count",
-          "evidence"
+          "evidence",
+          "merge_requests"
         ],
         "type": "object"
       },
@@ -13919,7 +13994,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:a92b7346166ec2316878ef38b0426090cb4bdd0d5b96cae3014bef35c60df02a"
+    "x-yoi-source-digest": "sha256:845d8859bab4de95f0539969ae8c84bbf3fb4a0548638e4278d6c90f9bb6cb3a"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -19066,6 +19141,334 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/MergeRequestListResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/merge-requests/{id}/readiness": {
+      "get": {
+        "operationId": "merge_request_readiness",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeRequestReadinessResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/merge-requests/{id}/repair-source": {
+      "post": {
+        "operationId": "merge_request_selector_repair",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RepairMergeRequestSelectorRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicMergeRequest"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/merge-requests/{id}/thread": {
+      "get": {
+        "operationId": "merge_request_thread",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": true,
+            "in": "query",
+            "name": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/MergeRequestThreadQuery"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Array_of_MergeRequestThreadEvent"
                 }
               }
             },
@@ -29512,334 +29915,6 @@
             "description": "Error response"
           },
           "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          },
-          {
-            "browserSession": []
-          }
-        ]
-      }
-    },
-    "/api/w/{workspace_id}/tickets/{id}/merge-request/readiness": {
-      "get": {
-        "operationId": "merge_request_readiness",
-        "parameters": [
-          {
-            "explode": false,
-            "in": "path",
-            "name": "workspace_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          },
-          {
-            "explode": false,
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/MergeRequestReadinessResponse"
-                }
-              }
-            },
-            "description": "Successful response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          },
-          {
-            "browserSession": []
-          }
-        ]
-      }
-    },
-    "/api/w/{workspace_id}/tickets/{id}/merge-request/repair-source": {
-      "post": {
-        "operationId": "merge_request_selector_repair",
-        "parameters": [
-          {
-            "explode": false,
-            "in": "path",
-            "name": "workspace_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          },
-          {
-            "explode": false,
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/RepairMergeRequestSelectorRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PublicMergeRequest"
-                }
-              }
-            },
-            "description": "Successful response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          }
-        },
-        "security": [
-          {
-            "browserSession": []
-          }
-        ]
-      }
-    },
-    "/api/w/{workspace_id}/tickets/{id}/merge-request/thread": {
-      "get": {
-        "operationId": "merge_request_thread",
-        "parameters": [
-          {
-            "explode": false,
-            "in": "path",
-            "name": "workspace_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          },
-          {
-            "explode": false,
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          },
-          {
-            "explode": true,
-            "in": "query",
-            "name": "query",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/MergeRequestThreadQuery"
-            },
-            "style": "form"
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Array_of_MergeRequestThreadEvent"
-                }
-              }
-            },
-            "description": "Successful response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "404": {
             "content": {
               "application/json": {
                 "schema": {

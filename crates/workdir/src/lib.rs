@@ -134,6 +134,14 @@ impl WorkdirSessionCapabilities {
         bits: Self::READ | Self::GLOB | Self::GREP,
     };
 
+    /// Filesystem read/write authority without process execution.
+    ///
+    /// External Workdirs use this capability set so operator-approved file
+    /// mutation never implicitly grants command or shell authority.
+    pub const READ_WRITE: Self = Self {
+        bits: Self::READ | Self::WRITE | Self::EDIT | Self::GLOB | Self::GREP,
+    };
+
     pub const fn union(self, other: Self) -> Self {
         Self {
             bits: self.bits | other.bits,

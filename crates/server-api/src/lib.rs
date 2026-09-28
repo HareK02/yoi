@@ -245,6 +245,7 @@ impl_openapi_schema!(
     CancelTicketImplementationRequest,
     ClearTicketRoleAssignmentQuery,
     CompleteMergeRequestRequest,
+    CompleteTicketRequest,
     CreateTicketOrchestrationPlanRequest,
     CreateTicketRecordRequest,
     CreateTicketRelationRequest,
@@ -279,6 +280,7 @@ impl_openapi_schema!(
     SubmitMergeRequestReviewRequest,
     TextResponse,
     TicketCloseRecordRequest,
+    TicketCompletionEvent,
     TicketDependencyCheckResponse,
     TicketDetail,
     TicketDoctorResponse,
@@ -2616,20 +2618,20 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: OpenMergeRequestRequest,
     ) -> Result<PublicMergeRequest, RepositoryApiError>;
-    #[get("/api/w/{workspace_id}/tickets/{id}/merge-request/readiness", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    #[get("/api/w/{workspace_id}/merge-requests/{id}/readiness", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn merge_request_readiness(
         &self,
         #[path] workspace_id: String,
         #[path] id: String,
     ) -> Result<MergeRequestReadinessResponse, RepositoryApiError>;
-    #[get("/api/w/{workspace_id}/tickets/{id}/merge-request/thread", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    #[get("/api/w/{workspace_id}/merge-requests/{id}/thread", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn merge_request_thread(
         &self,
         #[path] workspace_id: String,
         #[path] id: String,
         #[query] query: MergeRequestThreadQuery,
     ) -> Result<MergeRequestThreadResponse, RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/repair-source", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], browser_auth = true)]
+    #[post("/api/w/{workspace_id}/merge-requests/{id}/repair-source", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], browser_auth = true)]
     async fn merge_request_selector_repair(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2644,7 +2646,7 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[body] request: RegisterReviewerChildSessionRequest,
     ) -> Result<(), RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/review-capabilities", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
+    #[post("/api/w/{workspace_id}/merge-requests/{id}/review-capabilities", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
     async fn merge_request_review_capability_register(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2652,14 +2654,14 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: RegisterMergeRequestReviewCapabilityRequest,
     ) -> Result<(), RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/reviews", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
+    #[post("/api/w/{workspace_id}/merge-requests/{id}/reviews", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
     async fn merge_request_review_submit(
         &self,
         #[path] workspace_id: String,
         #[path] id: String,
         #[body] request: SubmitMergeRequestReviewRequest,
     ) -> Result<ReviewEvent, RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/reviews/revoke", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
+    #[post("/api/w/{workspace_id}/merge-requests/{id}/reviews/revoke", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
     async fn merge_request_review_revoke(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2667,7 +2669,7 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: RevokeMergeRequestReviewRequest,
     ) -> Result<ReviewRevokedEvent, RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/complete", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
+    #[post("/api/w/{workspace_id}/merge-requests/{id}/complete", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
     async fn merge_request_complete(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2675,6 +2677,14 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: CompleteMergeRequestRequest,
     ) -> Result<MergeEvent, RepositoryApiError>;
+    #[post("/api/w/{workspace_id}/tickets/{id}/complete", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
+    async fn ticket_complete(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: CompleteTicketRequest,
+    ) -> Result<TicketCompletionEvent, RepositoryApiError>;
     #[post("/api/w/{workspace_id}/tickets/{id}/workflow/close", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_close_record(
         &self,
@@ -5231,19 +5241,32 @@ impl From<workdir::workspace::WorkingDirectorySummary> for WorkingDirectorySumma
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
-pub struct ExternalWorkdirGrantCreateRequest {
-    pub provider_instance_id: String,
-    pub display_name: String,
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub ttl_seconds: u64,
-    pub read_only: bool,
+#[serde(rename_all = "snake_case")]
+pub enum ExternalWorkdirPermission {
+    #[default]
+    ReadOnly,
+    ReadWrite,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "typescript", ts(optional_fields = nullable))]
+#[serde(deny_unknown_fields)]
+pub struct ExternalWorkdirGrantCreateRequest {
+    pub provider_instance_id: String,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional, type = "number | null"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub ttl_seconds: Option<u64>,
+    pub permission: ExternalWorkdirPermission,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "typescript", ts(optional_fields = nullable))]
 #[serde(deny_unknown_fields)]
 pub struct ExternalWorkdirGrantResponse {
     pub grant_id: String,
@@ -5251,8 +5274,11 @@ pub struct ExternalWorkdirGrantResponse {
     pub working_directory_id: String,
     pub provider_instance_id: String,
     pub display_name: String,
-    pub permissions: String,
-    pub expires_at: String,
+    pub permission: ExternalWorkdirPermission,
+    /// `None` means the grant has no automatic expiry. It remains bounded by
+    /// explicit revoke, provider disconnect, and provider shutdown cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub generation: u64,
     pub status: String,
@@ -5881,6 +5907,7 @@ pub struct TicketQueryItem {
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub unresolved_review_count: usize,
     pub evidence: TicketEvidenceSummary,
+    pub merge_requests: Vec<TicketMergeRequestSummary>,
     pub merge_request: Option<TicketMergeRequestSummary>,
     pub current_coder: Option<TicketAssignmentSummary>,
 }
@@ -5939,6 +5966,7 @@ pub struct TicketDetail {
     pub current_coder: Option<TicketAssignmentSummary>,
     pub assignment_diagnostics: Vec<String>,
     pub action_eligibility: TicketActionEligibility,
+    pub merge_requests: Vec<TicketMergeRequestSummary>,
     pub merge_request: Option<TicketMergeRequestSummary>,
     pub evidence: TicketEvidenceSummary,
     pub resolution: Option<String>,
@@ -6279,6 +6307,14 @@ pub struct MergeRequestWorkerIdentity {
     pub worker_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct MergeRequestReviewSubject {
+    pub merge_request_id: String,
+    pub subject_ref: String,
+}
+
 macro_rules! merge_request_event {
     ($name:ident { $($field:ident : $ty:ty),* $(,)? }) => {
         #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -6297,12 +6333,16 @@ macro_rules! merge_request_event {
 
 merge_request_event!(ReviewRequestedEvent {
     subject_ref: String,
+    ticket_item_revision: String,
+    ticket_merge_request_subjects: Vec<MergeRequestReviewSubject>,
     requested_by: MergeRequestWorkerIdentity,
     reviewer: MergeRequestWorkerIdentity,
 });
 merge_request_event!(ReviewEvent {
     request_event_id: String,
     subject_ref: String,
+    ticket_item_revision: String,
+    ticket_merge_request_subjects: Vec<MergeRequestReviewSubject>,
     decision: ReviewDecision,
     body: String,
     findings: Vec<ReviewFinding>,
@@ -6487,6 +6527,7 @@ pub struct RegisterReviewerChildSessionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RegisterMergeRequestReviewCapabilityRequest {
+    pub ticket_id: String,
     pub child_session_id: String,
     pub capability_token: String,
 }
@@ -6511,6 +6552,27 @@ pub struct CompleteMergeRequestRequest {
     pub target_ref_after: String,
     pub strategy: MergeStrategy,
     pub resolution: ConflictResolution,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CompleteTicketRequest {
+    pub operation_id: String,
+    pub item_revision: String,
+    pub merge_request_ids: Vec<String>,
+    pub requirement_approval_event_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketCompletionEvent {
+    pub operation_id: String,
+    pub ticket_id: String,
+    pub item_revision: String,
+    pub merge_request_ids: Vec<String>,
+    pub requirement_approval_event_id: String,
+    pub completed_by: MergeRequestWorkerIdentity,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -9630,7 +9692,7 @@ mod tests {
                 .iter()
                 .filter(|operation| operation.operation_id.starts_with("ticket_"))
                 .count(),
-            37
+            38
         );
         assert_eq!(
             operations
@@ -9660,7 +9722,7 @@ mod tests {
             (
                 "merge_request_complete",
                 HttpMethod::Post,
-                "/api/w/{workspace_id}/tickets/{id}/merge-request/complete",
+                "/api/w/{workspace_id}/merge-requests/{id}/complete",
             ),
             (
                 "objective_ticket_unlink",
@@ -11292,6 +11354,7 @@ mod openapi_artifact_tests {
             "merge_request_review_revoke",
             "merge_request_review_submit",
             "merge_request_reviewer_child_register",
+            "ticket_complete",
             "runtime_resource_fetch",
             "worker_control_cancel",
             "worker_control_input",

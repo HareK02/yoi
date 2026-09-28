@@ -2222,8 +2222,7 @@ impl EmbeddedWorkerRuntime {
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: summary.workspace_id.clone(),
             },
-            availability:
-                protocol::subscription::SubscriptionWorkerAvailability::Observed,
+            availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
             state: embedded_worker_state_label(
                 summary.status,
                 summary.execution_metadata_available,
@@ -2271,8 +2270,7 @@ impl EmbeddedWorkerRuntime {
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: detail.workspace_id.clone(),
             },
-            availability:
-                protocol::subscription::SubscriptionWorkerAvailability::Observed,
+            availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
             state: embedded_worker_state_label(detail.status, detail.execution_metadata_available)
                 .to_string(),
             worker_state: detail.worker_state.clone(),
@@ -4064,8 +4062,7 @@ impl RemoteWorkerRuntime {
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: summary.workspace_id.clone(),
             },
-            availability:
-                protocol::subscription::SubscriptionWorkerAvailability::Observed,
+            availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
             state: embedded_worker_state_label(
                 summary.status,
                 summary.execution_metadata_available,
@@ -4111,8 +4108,7 @@ impl RemoteWorkerRuntime {
                 identity: "runtime_registry_worker".to_string(),
                 workspace_id: detail.workspace_id.clone(),
             },
-            availability:
-                protocol::subscription::SubscriptionWorkerAvailability::Observed,
+            availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
             state: embedded_worker_state_label(detail.status, detail.execution_metadata_available)
                 .to_string(),
             worker_state: detail.worker_state.clone(),
@@ -5979,18 +5975,14 @@ mod tests {
 
     #[test]
     fn embedded_store_commit_unknown_diagnostic_is_path_free() {
-        let diagnostic = embedded_runtime_diagnostic(
-            &EmbeddedRuntimeError::StoreCommitOutcomeUnknown {
+        let diagnostic =
+            embedded_runtime_diagnostic(&EmbeddedRuntimeError::StoreCommitOutcomeUnknown {
                 operation: "sync Worker aggregate directory",
                 path: std::path::PathBuf::from("/private/runtime/workers/worker.json"),
                 source: std::io::Error::other("raw fsync failure"),
-            },
-        );
+            });
 
-        assert_eq!(
-            diagnostic.code,
-            "embedded_runtime_store_commit_unknown"
-        );
+        assert_eq!(diagnostic.code, "embedded_runtime_store_commit_unknown");
         assert_eq!(diagnostic.severity, HostDiagnosticSeverity::Error);
         assert!(!diagnostic.message.contains("/private/runtime"));
         assert!(!diagnostic.message.contains("raw fsync failure"));
@@ -6547,8 +6539,7 @@ mod tests {
                         identity: host_id.to_string(),
                         workspace_id: None,
                     },
-                    availability:
-                        protocol::subscription::SubscriptionWorkerAvailability::Observed,
+                    availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
                     state: "available".to_string(),
                     worker_state: None,
                     last_seen_at: None,

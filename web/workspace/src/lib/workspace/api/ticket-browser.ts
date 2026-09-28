@@ -6,6 +6,7 @@ import type {
   MergeRequestListResponse,
   MergeRequestRefDiagnostic,
   MergeRequestRefResponse,
+  MergeRequestReviewSubject,
   MergeRequestThreadEvent,
   MergeRequestWorkerIdentity,
   ObjectiveDetail,
@@ -712,6 +713,7 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     "item_revision",
     "linked_objectives",
     "merge_request",
+    "merge_requests",
     "priority",
     "queued_at",
     "queued_by",
@@ -768,6 +770,11 @@ export function parseTicketDetail(value: unknown): TicketDetail {
       item.linked_objectives,
       `${label}.linked_objectives`,
       parseObjectiveLink,
+    ),
+    merge_requests: array(
+      item.merge_requests,
+      `${label}.merge_requests`,
+      parseTicketMergeRequestSummary,
     ),
     merge_request: item.merge_request === undefined
       ? undefined
@@ -1049,6 +1056,21 @@ function parseMergeRequestWorker(
   };
 }
 
+function parseMergeRequestReviewSubject(
+  value: unknown,
+  label: string,
+): MergeRequestReviewSubject {
+  const item = object(value, label);
+  exact(item, ["merge_request_id", "subject_ref"], label);
+  return {
+    merge_request_id: string(
+      item.merge_request_id,
+      `${label}.merge_request_id`,
+    ),
+    subject_ref: string(item.subject_ref, `${label}.subject_ref`),
+  };
+}
+
 function parseReviewFinding(value: unknown, label: string): ReviewFinding {
   const item = object(value, label);
   exact(item, ["body", "code", "line", "path", "severity"], label);
@@ -1082,7 +1104,18 @@ function parseMergeRequestThreadEvent(
     sequence: integer(item.sequence, `${label}.sequence`),
   };
   if (kind === "review_requested") {
-    exact(item, [...base, "requested_by", "reviewer", "subject_ref"], label);
+    exact(
+      item,
+      [
+        ...base,
+        "requested_by",
+        "reviewer",
+        "subject_ref",
+        "ticket_item_revision",
+        "ticket_merge_request_subjects",
+      ],
+      label,
+    );
     return {
       ...eventBase,
       kind,
@@ -1092,6 +1125,15 @@ function parseMergeRequestThreadEvent(
       ),
       reviewer: parseMergeRequestWorker(item.reviewer, `${label}.reviewer`),
       subject_ref: string(item.subject_ref, `${label}.subject_ref`),
+      ticket_item_revision: string(
+        item.ticket_item_revision,
+        `${label}.ticket_item_revision`,
+      ),
+      ticket_merge_request_subjects: array(
+        item.ticket_merge_request_subjects,
+        `${label}.ticket_merge_request_subjects`,
+        parseMergeRequestReviewSubject,
+      ),
     };
   }
   if (kind === "review") {
@@ -1103,6 +1145,8 @@ function parseMergeRequestThreadEvent(
       "request_event_id",
       "reviewer",
       "subject_ref",
+      "ticket_item_revision",
+      "ticket_merge_request_subjects",
     ], label);
     const decision = string(item.decision, `${label}.decision`);
     if (!["approve", "request_changes"].includes(decision)) {
@@ -1120,6 +1164,15 @@ function parseMergeRequestThreadEvent(
       ),
       reviewer: parseMergeRequestWorker(item.reviewer, `${label}.reviewer`),
       subject_ref: string(item.subject_ref, `${label}.subject_ref`),
+      ticket_item_revision: string(
+        item.ticket_item_revision,
+        `${label}.ticket_item_revision`,
+      ),
+      ticket_merge_request_subjects: array(
+        item.ticket_merge_request_subjects,
+        `${label}.ticket_merge_request_subjects`,
+        parseMergeRequestReviewSubject,
+      ),
     };
   }
   if (kind === "review_revoked") {

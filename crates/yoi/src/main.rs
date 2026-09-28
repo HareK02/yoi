@@ -622,6 +622,8 @@ fn parse_workdir_args(
     let mut display_name = None;
     let mut ttl = None;
     let mut read_only = false;
+    let mut read_write = false;
+    let mut non_interactive = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -658,9 +660,10 @@ fn parse_workdir_args(
                 if ttl.is_some() {
                     return Err(ParseError("--ttl may only be provided once".to_string()));
                 }
-                ttl = Some(parse_share_ttl(required_option_value(
-                    args, index, "--ttl",
-                )?)?);
+                ttl = Some(
+                    workdir_share::parse_ttl(required_option_value(args, index, "--ttl")?)
+                        .map_err(|error| ParseError(format!("--ttl {error}")))?,
+                );
                 index += 2;
             }
             "--read-only" => {
@@ -670,6 +673,24 @@ fn parse_workdir_args(
                     ));
                 }
                 read_only = true;
+                index += 1;
+            }
+            "--read-write" => {
+                if read_write {
+                    return Err(ParseError(
+                        "--read-write may only be provided once".to_string(),
+                    ));
+                }
+                read_write = true;
+                index += 1;
+            }
+            "--non-interactive" => {
+                if non_interactive {
+                    return Err(ParseError(
+                        "--non-interactive may only be provided once".to_string(),
+                    ));
+                }
+                non_interactive = true;
                 index += 1;
             }
             "--help" | "-h" => return Ok(Mode::WorkdirHelp),
@@ -689,47 +710,31 @@ fn parse_workdir_args(
             }
         }
     }
-    if !read_only {
+    if read_only && read_write {
         return Err(ParseError(
-            "yoi workdir share requires --read-only".to_string(),
+            "--read-only conflicts with --read-write".to_string(),
         ));
     }
-    let workspace_id = workspace_id
-        .ok_or_else(|| ParseError("yoi workdir share requires --workspace-id".to_string()))?;
-    let backend_url = resolve_backend_url(backend_url, Some(&workspace_id))?;
+    if non_interactive && workspace_id.is_none() {
+        return Err(ParseError(
+            "--non-interactive requires --workspace-id".to_string(),
+        ));
+    }
+    let backend_url = resolve_backend_url(backend_url, workspace_id.as_deref())?;
     Ok(Mode::WorkdirShare(workdir_share::WorkdirShareOptions {
         path: path
             .ok_or_else(|| ParseError("yoi workdir share requires a directory path".to_string()))?,
         workspace_id,
         backend_url,
-        display_name: display_name
-            .ok_or_else(|| ParseError("yoi workdir share requires --display-name".to_string()))?,
-        ttl: ttl.ok_or_else(|| ParseError("yoi workdir share requires --ttl".to_string()))?,
+        display_name: display_name.unwrap_or_else(|| "External Workdir".to_string()),
+        ttl,
+        permission: if read_write {
+            server_api::ExternalWorkdirPermission::ReadWrite
+        } else {
+            server_api::ExternalWorkdirPermission::ReadOnly
+        },
+        non_interactive,
     }))
-}
-
-fn parse_share_ttl(value: &str) -> Result<Duration, ParseError> {
-    let (number, multiplier) = if let Some(value) = value.strip_suffix('h') {
-        (value, 60 * 60)
-    } else if let Some(value) = value.strip_suffix('m') {
-        (value, 60)
-    } else if let Some(value) = value.strip_suffix('s') {
-        (value, 1)
-    } else {
-        return Err(ParseError(
-            "--ttl must use an h, m, or s suffix (for example 1h)".to_string(),
-        ));
-    };
-    let amount = number.parse::<u64>().map_err(|_| {
-        ParseError("--ttl must contain a positive integer and h, m, or s suffix".to_string())
-    })?;
-    let seconds = amount
-        .checked_mul(multiplier)
-        .ok_or_else(|| ParseError("--ttl is too large".to_string()))?;
-    if !(60..=86_400).contains(&seconds) {
-        return Err(ParseError("--ttl must be between 60s and 24h".to_string()));
-    }
-    Ok(Duration::from_secs(seconds))
 }
 
 fn parse_init_args(
@@ -1857,7 +1862,7 @@ Usage:
   yoi --backend <URL> [--workspace-id <ID>] panel
   yoi [--backend <URL>] init --display-name <NAME> --repository-key <KEY> [--repository <PATH>] [--default-ref <REF>]
   yoi [--backend <URL>] login [--no-wait]
-  yoi [--backend <URL>] workdir share <PATH> --workspace-id <ID> --read-only --ttl <TTL> --display-name <NAME>
+  yoi [--backend <URL>] workdir share <PATH> [--workspace-id <ID>] [--read-only|--read-write] [--ttl <TTL>] [--display-name <NAME>] [--non-interactive]
   yoi <HOST_COMMAND> [OPTIONS]
 
 Target selection:
@@ -1883,7 +1888,7 @@ Console options:
 
 Host commands:
   yoi init                    Register the current Git repository as a new Backend Workspace.
-  yoi workdir share           Share a temporary read-only client-hosted External Workdir.
+  yoi workdir share           Interactively share a client-hosted External Workdir.
   keys                         Manage local model/API keys
   setup-model                  Configure a local model provider
   worker [WORKER_OPTIONS]      Run the direct Worker process entrypoint
@@ -1903,7 +1908,7 @@ Options:
 
 fn print_workdir_help() {
     println!(
-        "yoi workdir share\n\nUsage:\n  yoi [--backend <URL>] workdir share <PATH> --workspace-id <ID> --read-only --ttl <TTL> --display-name <NAME>\n\nThe foreground CLI provides one local directory over an authenticated outbound Backend connection.\nNo host path is sent to the Backend. TTL accepts s, m, or h suffixes from 60s through 24h.\nCtrl-C explicitly revokes the grant before exit.\n"
+        "yoi workdir share\n\nUsage:\n  yoi [--backend <URL>] workdir share <PATH> [OPTIONS]\n\nThe foreground CLI provides one local directory over an authenticated outbound Backend connection.\nInteractive mode is the default: choose an accessible Workspace, permission, and TTL, then explicitly confirm before any grant is created.\nRead-only is the default permission. --read-write enables the existing filesystem Write/Edit operations only; Bash, command, and exec remain disabled.\nOmitting --ttl means unlimited automatic lifetime, but stop, disconnect, Ctrl-C, and revoke still fail closed. TTL accepts s, m, or h suffixes from 60s through 24h.\nNo host path is sent to the Backend. Ctrl-C explicitly revokes the grant before exit.\n\nOptions:\n      --workspace-id <ID>  Preselect a Workspace; required with --non-interactive\n      --read-only          Explicitly select the default read-only permission\n      --read-write         Allow filesystem Write/Edit operations (never commands)\n      --ttl <TTL>          Automatic expiry; omission is unlimited\n      --display-name <NAME>  Backend-visible label (default: External Workdir)\n      --non-interactive    Never prompt; requires --workspace-id\n  -h, --help               Print help\n"
     );
 }
 
@@ -1963,11 +1968,12 @@ mod tests {
         let args = vec![
             "share".to_string(),
             "./session-log".to_string(),
-            "--read-only".to_string(),
+            "--read-write".to_string(),
             "--ttl".to_string(),
             "90m".to_string(),
             "--display-name".to_string(),
             "session-analysis".to_string(),
+            "--non-interactive".to_string(),
         ];
         let target = TargetSelection {
             backend_url: Some("https://backend.example".to_string()),
@@ -1978,56 +1984,82 @@ mod tests {
             panic!("expected Workdir share mode");
         };
         assert_eq!(options.path, PathBuf::from("./session-log"));
-        assert_eq!(options.workspace_id, "workspace-a");
+        assert_eq!(options.workspace_id.as_deref(), Some("workspace-a"));
         assert_eq!(options.backend_url, "https://backend.example");
         assert_eq!(options.display_name, "session-analysis");
-        assert_eq!(options.ttl, Duration::from_secs(5_400));
+        assert_eq!(options.ttl, Some(Duration::from_secs(5_400)));
+        assert_eq!(
+            options.permission,
+            server_api::ExternalWorkdirPermission::ReadWrite
+        );
+        assert!(options.non_interactive);
     }
 
     #[test]
-    fn workdir_share_fails_closed_without_explicit_read_only_workspace_or_valid_ttl() {
-        let base = vec![
-            "share".to_string(),
-            ".".to_string(),
-            "--ttl".to_string(),
-            "1h".to_string(),
-            "--display-name".to_string(),
-            "logs".to_string(),
-        ];
+    fn workdir_share_defaults_to_interactive_read_only_and_unlimited() {
+        let args = vec!["share".to_string(), ".".to_string()];
+        let target = TargetSelection {
+            backend_url: Some("https://backend.example".to_string()),
+            ..TargetSelection::default()
+        };
+        let Mode::WorkdirShare(options) = parse_workdir_args(&args, &target).unwrap() else {
+            panic!("expected Workdir share mode");
+        };
+        assert_eq!(options.workspace_id, None);
+        assert_eq!(options.display_name, "External Workdir");
+        assert_eq!(options.ttl, None);
+        assert_eq!(
+            options.permission,
+            server_api::ExternalWorkdirPermission::ReadOnly
+        );
+        assert!(!options.non_interactive);
+    }
+
+    #[test]
+    fn workdir_share_rejects_invalid_or_conflicting_automation_options() {
         let target = TargetSelection {
             backend_url: Some("https://backend.example".to_string()),
             workspace_id: Some("workspace-a".to_string()),
             ..TargetSelection::default()
         };
-        assert!(
-            parse_workdir_args(&base, &target)
-                .err()
-                .unwrap()
-                .0
-                .contains("--read-only")
-        );
-
-        let mut invalid_ttl = base.clone();
-        invalid_ttl.push("--read-only".to_string());
-        invalid_ttl[3] = "25h".to_string();
+        let invalid_ttl = vec![
+            "share".to_string(),
+            ".".to_string(),
+            "--ttl".to_string(),
+            "25h".to_string(),
+        ];
         assert!(
             parse_workdir_args(&invalid_ttl, &target)
-                .err()
-                .unwrap()
+                .unwrap_err()
                 .0
                 .contains("24h")
+        );
+
+        let conflict = vec![
+            "share".to_string(),
+            ".".to_string(),
+            "--read-only".to_string(),
+            "--read-write".to_string(),
+        ];
+        assert!(
+            parse_workdir_args(&conflict, &target)
+                .unwrap_err()
+                .0
+                .contains("conflicts")
         );
 
         let missing_workspace = TargetSelection {
             backend_url: Some("https://backend.example".to_string()),
             ..TargetSelection::default()
         };
-        let mut valid = base;
-        valid.push("--read-only".to_string());
+        let automation = vec![
+            "share".to_string(),
+            ".".to_string(),
+            "--non-interactive".to_string(),
+        ];
         assert!(
-            parse_workdir_args(&valid, &missing_workspace)
-                .err()
-                .unwrap()
+            parse_workdir_args(&automation, &missing_workspace)
+                .unwrap_err()
                 .0
                 .contains("--workspace-id")
         );

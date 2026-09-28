@@ -78,6 +78,7 @@ struct SubWorkerSpawnInput {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ReviewerHandoffInput {
     ticket_id: String,
+    merge_request_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -369,9 +370,9 @@ fn validate_reviewer_handoff(input: &SubWorkerSpawnInput) -> Result<(), ToolErro
     let Some(review) = &input.review else {
         return Ok(());
     };
-    if review.ticket_id.trim().is_empty() {
+    if review.ticket_id.trim().is_empty() || review.merge_request_id.trim().is_empty() {
         return Err(ToolError::InvalidArgument(
-            "reviewer handoff requires non-empty ticket_id".to_string(),
+            "reviewer handoff requires non-empty ticket_id and merge_request_id".to_string(),
         ));
     }
     if input.profile.as_deref() != Some("builtin:reviewer") {
@@ -484,6 +485,7 @@ impl Tool for SubWorkerSpawnTool {
         let reviewer_capability = input.review.as_ref().map(|review| {
             (
                 review.ticket_id.clone(),
+                review.merge_request_id.clone(),
                 format!(
                     "{}{}",
                     uuid::Uuid::now_v7().simple(),
@@ -492,7 +494,7 @@ impl Tool for SubWorkerSpawnTool {
             )
         });
         let child_workspace_context =
-            if let Some((ticket_id, capability_token)) = &reviewer_capability {
+            if let Some((ticket_id, merge_request_id, capability_token)) = &reviewer_capability {
                 let workspace_id =
                     self.workspace_context
                         .workspace_id()
@@ -513,6 +515,7 @@ impl Tool for SubWorkerSpawnTool {
                         parent_client.clone(),
                         ReviewerContext {
                             ticket_id: ticket_id.clone(),
+                            merge_request_id: merge_request_id.clone(),
                         },
                         capability_token.clone(),
                     ));
@@ -610,7 +613,7 @@ impl Tool for SubWorkerSpawnTool {
         child_registry
             .attach_parent_protocol(session.protocol_sender(), session.session_id_string());
 
-        if let Some((ticket_id, capability_token)) = &reviewer_capability {
+        if let Some((ticket_id, merge_request_id, capability_token)) = &reviewer_capability {
             let workspace_id = self.workspace_context.workspace_id().ok_or_else(|| {
                 ToolError::ExecutionFailed("review capability lost Workspace identity".to_string())
             })?;
@@ -640,15 +643,16 @@ impl Tool for SubWorkerSpawnTool {
                 )));
             }
             let body = serde_json::json!({
+                "ticket_id": ticket_id,
                 "child_session_id": child_session_id,
                 "capability_token": capability_token,
             });
             let request = WorkspaceRequest::json(
                 WorkspaceRequestMethod::Post,
                 format!(
-                    "/api/w/{}/tickets/{}/merge-request/review-capabilities",
+                    "/api/w/{}/merge-requests/{}/review-capabilities",
                     workspace_id.as_str(),
-                    ticket_id
+                    merge_request_id
                 ),
                 body.to_string(),
             );
@@ -1170,21 +1174,21 @@ mod tests {
             "name":"reviewer","task":"review","profile":"builtin:reviewer",
             "scope":[{"target":"work","permission":"write"}],
             "command":true,
-            "review":{"ticket_id":"T1"}
+            "review":{"ticket_id":"T1","merge_request_id":"MR1"}
         }))
         .unwrap();
         assert!(validate_reviewer_handoff(&valid).is_ok());
         let wrong_profile: SubWorkerSpawnInput = serde_json::from_value(serde_json::json!({
             "name":"reviewer","task":"review","profile":"builtin:coder",
             "scope":[{"target":"work","permission":"write"}],
-            "review":{"ticket_id":"T1"}
+            "review":{"ticket_id":"T1","merge_request_id":"MR1"}
         }))
         .unwrap();
         assert!(validate_reviewer_handoff(&wrong_profile).is_err());
         let read_only: SubWorkerSpawnInput = serde_json::from_value(serde_json::json!({
             "name":"reviewer","task":"review","profile":"builtin:reviewer",
             "scope":[{"target":"work","permission":"read"}],
-            "review":{"ticket_id":"T1"}
+            "review":{"ticket_id":"T1","merge_request_id":"MR1"}
         }))
         .unwrap();
         assert!(validate_reviewer_handoff(&read_only).is_err());
