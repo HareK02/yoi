@@ -11969,9 +11969,7 @@ fn apply_ticket_targets_and_workdir_capabilities_schema(conn: &Connection) -> Re
     }
 }
 
-fn migrate_external_workdir_access_and_optional_expiry_v66_to_v67(
-    conn: &Connection,
-) -> Result<()> {
+fn migrate_external_workdir_access_and_optional_expiry_v66_to_v67(conn: &Connection) -> Result<()> {
     let current = current_schema_version(conn)?;
     if current != 66 {
         return Err(Error::Store(format!(
@@ -12068,11 +12066,10 @@ fn migrate_external_workdir_access_and_optional_expiry_v66_to_v67(
             BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
             "#,
         )?;
-        let violations = tx.query_row(
-            "SELECT COUNT(*) FROM pragma_foreign_key_check",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
+        let violations =
+            tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
         if violations != 0 {
             return Err(Error::Store(format!(
                 "schema-67 migration left {violations} foreign-key violation(s)"
@@ -14368,7 +14365,9 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec![52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67]
+            vec![
+                52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67
+            ]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
         let conn = Connection::open(&path).unwrap();

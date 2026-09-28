@@ -26279,8 +26279,7 @@ mod tests {
             created_by: test_browser_request_actor().account_id,
             created_at: created_at.clone(),
             expires_at: Some(
-                (now + Duration::milliseconds(50))
-                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                (now + Duration::milliseconds(50)).to_rfc3339_opts(SecondsFormat::Nanos, true),
             ),
             generation: 1,
             status: "offline".to_string(),
@@ -26966,7 +26965,10 @@ mod tests {
                 break (operation_id, operation);
             }
         };
-        assert!(matches!(operation.as_inner(), WorkdirSessionOperation::Edit(_)));
+        assert!(matches!(
+            operation.as_inner(),
+            WorkdirSessionOperation::Edit(_)
+        ));
         let result = workdir::http::dispatch_workdir_session_operation(
             &local_session,
             operation.into_inner(),
@@ -27015,7 +27017,10 @@ mod tests {
                 break (operation_id, operation);
             }
         };
-        assert!(matches!(operation.as_inner(), WorkdirSessionOperation::Write(_)));
+        assert!(matches!(
+            operation.as_inner(),
+            WorkdirSessionOperation::Write(_)
+        ));
         let result = workdir::http::dispatch_workdir_session_operation(
             &local_session,
             operation.into_inner(),

@@ -131,7 +131,9 @@ fn authenticated_server_api_client(
 fn permission_label(permission: server_api::ExternalWorkdirPermission) -> &'static str {
     match permission {
         server_api::ExternalWorkdirPermission::ReadOnly => "read-only",
-        server_api::ExternalWorkdirPermission::ReadWrite => "read-write (files only; commands disabled)",
+        server_api::ExternalWorkdirPermission::ReadWrite => {
+            "read-write (files only; commands disabled)"
+        }
     }
 }
 
@@ -233,7 +235,8 @@ fn configure_interactively(
         input,
         output,
         &format!("Workspace [{}; q to cancel]: ", initial_index + 1),
-    )? else {
+    )?
+    else {
         return Ok(None);
     };
     if matches!(selection.as_str(), "q" | "quit" | "cancel") {
@@ -264,7 +267,8 @@ fn configure_interactively(
         input,
         output,
         &format!("Permission [r/w; current {current_permission}; q to cancel]: "),
-    )? else {
+    )?
+    else {
         return Ok(None);
     };
     options.permission = match permission.as_str() {
@@ -281,7 +285,8 @@ fn configure_interactively(
         input,
         output,
         "TTL [empty keeps current; `none` is unlimited; q to cancel]: ",
-    )? else {
+    )?
+    else {
         return Ok(None);
     };
     options.ttl = match ttl.as_str() {
@@ -418,7 +423,10 @@ pub(crate) async fn run(options: WorkdirShareOptions) -> Result<(), String> {
     println!("Permission: {}", permission_label(grant.permission));
     println!(
         "Expires at: {}",
-        grant.expires_at.as_deref().unwrap_or("never (until stopped or revoked)")
+        grant
+            .expires_at
+            .as_deref()
+            .unwrap_or("never (until stopped or revoked)")
     );
 
     let expires_at = grant
@@ -939,14 +947,10 @@ mod tests {
         let mut input = std::io::Cursor::new(b"\n\n\nyes\n".to_vec());
         let mut output = Vec::new();
 
-        let selected = configure_interactively(
-            share_options(),
-            &workspaces,
-            &mut input,
-            &mut output,
-        )
-        .unwrap()
-        .unwrap();
+        let selected =
+            configure_interactively(share_options(), &workspaces, &mut input, &mut output)
+                .unwrap()
+                .unwrap();
 
         assert_eq!(selected.workspace_id, "workspace-a");
         assert_eq!(
@@ -970,14 +974,10 @@ mod tests {
         let mut input = std::io::Cursor::new(b"2\nw\n15m\ny\n".to_vec());
         let mut output = Vec::new();
 
-        let selected = configure_interactively(
-            share_options(),
-            &workspaces,
-            &mut input,
-            &mut output,
-        )
-        .unwrap()
-        .unwrap();
+        let selected =
+            configure_interactively(share_options(), &workspaces, &mut input, &mut output)
+                .unwrap()
+                .unwrap();
 
         assert_eq!(selected.workspace_id, "workspace-b");
         assert_eq!(
@@ -993,14 +993,9 @@ mod tests {
         let mut declined = std::io::Cursor::new(b"\n\n\nno\n".to_vec());
         let mut output = Vec::new();
         assert!(
-            configure_interactively(
-                share_options(),
-                &workspaces,
-                &mut declined,
-                &mut output,
-            )
-            .unwrap()
-            .is_none()
+            configure_interactively(share_options(), &workspaces, &mut declined, &mut output,)
+                .unwrap()
+                .is_none()
         );
 
         let mut eof = std::io::Cursor::new(Vec::<u8>::new());
@@ -1014,8 +1009,16 @@ mod tests {
     #[test]
     fn interactive_share_fails_closed_without_input_and_prompt_ttys() {
         assert!(ensure_interactive_tty(true, true).is_ok());
-        assert!(ensure_interactive_tty(false, true).unwrap_err().contains("--non-interactive"));
-        assert!(ensure_interactive_tty(true, false).unwrap_err().contains("--non-interactive"));
+        assert!(
+            ensure_interactive_tty(false, true)
+                .unwrap_err()
+                .contains("--non-interactive")
+        );
+        assert!(
+            ensure_interactive_tty(true, false)
+                .unwrap_err()
+                .contains("--non-interactive")
+        );
     }
 
     fn test_server_api_client(base_url: &str) -> ServerApiClient {

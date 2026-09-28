@@ -90,8 +90,15 @@ async fn external_local_provider_read_write_is_filesystem_only() {
     )
     .unwrap();
 
-    assert_eq!(session.capabilities(), WorkdirSessionCapabilities::READ_WRITE);
-    assert!(!session.capabilities().supports(WorkdirSessionCapability::Command));
+    assert_eq!(
+        session.capabilities(),
+        WorkdirSessionCapabilities::READ_WRITE
+    );
+    assert!(
+        !session
+            .capabilities()
+            .supports(WorkdirSessionCapability::Command)
+    );
 
     let observed = WorkdirSession::read(
         &session,
