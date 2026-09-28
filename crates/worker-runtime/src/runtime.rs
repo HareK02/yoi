@@ -1775,13 +1775,12 @@ impl Runtime {
         }
 
         if !reconcile
-            && let Err(error) =
-                self.begin_restore_operation(
-                    worker_ref,
-                    operation_id,
-                    operation_mode,
-                    candidate_context.clone(),
-                )
+            && let Err(error) = self.begin_restore_operation(
+                worker_ref,
+                operation_id,
+                operation_mode,
+                candidate_context.clone(),
+            )
         {
             if matches!(error, RuntimeError::StoreCommitOutcomeUnknown { .. }) {
                 return Ok(RuntimeWorkerRestoreResult::failed(
@@ -1813,8 +1812,7 @@ impl Runtime {
                 );
                 match commit {
                     Ok(worker) => {
-                        if let Err(error) =
-                            backend.activate_restored_worker(operation_id, &handle)
+                        if let Err(error) = backend.activate_restored_worker(operation_id, &handle)
                         {
                             tracing::error!(
                                 worker_id = %worker_ref.worker_id,
@@ -1865,7 +1863,8 @@ impl Runtime {
                                     error = %error,
                                     "Worker restore commit failed and was rolled back"
                                 );
-                                if let Err(settle_error) = self.settle_restore_rollback(worker_ref) {
+                                if let Err(settle_error) = self.settle_restore_rollback(worker_ref)
+                                {
                                     tracing::error!(
                                         worker_id = %worker_ref.worker_id,
                                         error = %settle_error,
@@ -1983,11 +1982,8 @@ impl Runtime {
                             "failed to persist restore execution evidence; in-process reconciliation remains required"
                         );
                     }
-                } else if let Err(retain_error) =
-                    self.retain_restore_reconciliation_pending(
-                        worker_ref,
-                        candidate_context.clone(),
-                    )
+                } else if let Err(retain_error) = self
+                    .retain_restore_reconciliation_pending(worker_ref, candidate_context.clone())
                 {
                     tracing::error!(
                         worker_id = %worker_ref.worker_id,
@@ -2002,10 +1998,9 @@ impl Runtime {
                 ))
             }
             WorkerExecutionSpawnResult::Errored(_result) => {
-                if let Err(retain_error) = self.retain_restore_reconciliation_pending(
-                    worker_ref,
-                    candidate_context.clone(),
-                ) {
+                if let Err(retain_error) = self
+                    .retain_restore_reconciliation_pending(worker_ref, candidate_context.clone())
+                {
                     tracing::error!(
                         worker_id = %worker_ref.worker_id,
                         error = %retain_error,
@@ -3110,7 +3105,11 @@ impl Runtime {
                     message: "runtime has no execution backend".to_string(),
                 }
             })?;
-            (backend, worker.execution_handle.clone(), pending.operation_id)
+            (
+                backend,
+                worker.execution_handle.clone(),
+                pending.operation_id,
+            )
         };
         let result = backend.stop_worker_operation(WorkerExecutionStopRequest {
             operation_id,
@@ -3725,37 +3724,36 @@ impl RuntimeState {
                     None,
                     None,
                 ),
-                PersistedWorkerExecutionState::ReconciliationRequired(operation) => {
-                    match operation {
-                        PersistedWorkerLifecycleOperation::Restore(operation) => {
-                            let restore_intent =
-                                restore_intent_for_status(operation.last_settled_status);
-                            (
-                                Some(operation.request),
-                                true,
-                                operation.binding.is_some(),
-                                restore_intent,
-                                Some(PendingWorkerRestore {
-                                    operation_id: operation.operation_id,
-                                    mode: operation.mode.into(),
-                                    last_settled_status: operation.last_settled_status,
-                                }),
-                                None,
-                            )
-                        }
-                        PersistedWorkerLifecycleOperation::Stop(operation) => (
+                PersistedWorkerExecutionState::ReconciliationRequired(operation) => match operation
+                {
+                    PersistedWorkerLifecycleOperation::Restore(operation) => {
+                        let restore_intent =
+                            restore_intent_for_status(operation.last_settled_status);
+                        (
                             Some(operation.request),
                             true,
                             operation.binding.is_some(),
-                            operation.restore_intent,
-                            None,
-                            Some(PendingWorkerStop {
+                            restore_intent,
+                            Some(PendingWorkerRestore {
                                 operation_id: operation.operation_id,
+                                mode: operation.mode.into(),
                                 last_settled_status: operation.last_settled_status,
                             }),
-                        ),
+                            None,
+                        )
                     }
-                }
+                    PersistedWorkerLifecycleOperation::Stop(operation) => (
+                        Some(operation.request),
+                        true,
+                        operation.binding.is_some(),
+                        operation.restore_intent,
+                        None,
+                        Some(PendingWorkerStop {
+                            operation_id: operation.operation_id,
+                            last_settled_status: operation.last_settled_status,
+                        }),
+                    ),
+                },
                 PersistedWorkerExecutionState::Unavailable => (
                     None,
                     false,
@@ -4782,8 +4780,7 @@ impl WorkerRecord {
                     last_settled_status: pending.last_settled_status,
                 }),
             )
-        } else if let (Some(pending), Some(request)) =
-            (self.pending_restore, self.request.clone())
+        } else if let (Some(pending), Some(request)) = (self.pending_restore, self.request.clone())
         {
             PersistedWorkerExecutionState::ReconciliationRequired(
                 PersistedWorkerLifecycleOperation::Restore(PersistedWorkerRestoreOperation {
@@ -7397,11 +7394,8 @@ mod tests {
             display_name: None,
         };
         let backend = Arc::new(TestExecutionBackend::default());
-        let runtime = Runtime::with_fs_store_and_execution_backend(
-            options.clone(),
-            backend.clone(),
-        )
-        .unwrap();
+        let runtime =
+            Runtime::with_fs_store_and_execution_backend(options.clone(), backend.clone()).unwrap();
         runtime.store_config_bundle(test_bundle()).unwrap();
         let worker = runtime
             .create_worker(task_request("reconcile pending stop"))
@@ -7409,9 +7403,7 @@ mod tests {
         runtime_store(&runtime)
             .fail_next_worker_write(crate::fs_store::AtomicWriteFault::AfterRename);
 
-        let error = runtime
-            .stop_worker(&worker.worker_ref, None)
-            .unwrap_err();
+        let error = runtime.stop_worker(&worker.worker_ref, None).unwrap_err();
         assert!(matches!(
             error,
             RuntimeError::StoreCommitOutcomeUnknown { .. }
@@ -7480,11 +7472,9 @@ mod tests {
         drop(reconciled);
 
         let restarted_backend = Arc::new(TestExecutionBackend::default());
-        let restarted = Runtime::with_fs_store_and_execution_backend(
-            options,
-            restarted_backend.clone(),
-        )
-        .unwrap();
+        let restarted =
+            Runtime::with_fs_store_and_execution_backend(options, restarted_backend.clone())
+                .unwrap();
         assert_eq!(*restarted_backend.stop_count.lock().unwrap(), 0);
         assert_eq!(*restarted_backend.restore_count.lock().unwrap(), 0);
         assert_eq!(
@@ -7645,19 +7635,20 @@ mod tests {
         let cursor_before = runtime
             .worker_observation_cursor_now(&worker.worker_ref)
             .unwrap();
-        backend.restore_event.lock().unwrap().replace(
-            protocol::Event::WorkerState {
+        backend
+            .restore_event
+            .lock()
+            .unwrap()
+            .replace(protocol::Event::WorkerState {
                 snapshot: protocol::WorkerStatus::Running.into(),
-            },
-        );
+            });
         let gate = Arc::new(RestoreGate::default());
         *backend.restore_gate.lock().unwrap() = Some(gate.clone());
 
         let restoring_runtime = runtime.clone();
         let restoring_ref = worker.worker_ref.clone();
-        let restoring = std::thread::spawn(move || {
-            restoring_runtime.restore_worker_operation(&restoring_ref)
-        });
+        let restoring =
+            std::thread::spawn(move || restoring_runtime.restore_worker_operation(&restoring_ref));
         assert!(gate.wait_for_entered(1, std::time::Duration::from_secs(2)));
 
         let pending = runtime.worker_detail(&worker.worker_ref).unwrap();
@@ -8928,12 +8919,16 @@ mod tests {
             .create_worker(task_request("rolled back restore"))
             .unwrap();
         runtime.stop_worker(&worker.worker_ref, None).unwrap();
-        backend.restore_result.lock().unwrap().replace(
-            WorkerExecutionSpawnResult::RolledBack(WorkerExecutionResult::errored(
-                WorkerExecutionOperation::Restore,
-                "controller launch failed and cleanup completed",
-            )),
-        );
+        backend
+            .restore_result
+            .lock()
+            .unwrap()
+            .replace(WorkerExecutionSpawnResult::RolledBack(
+                WorkerExecutionResult::errored(
+                    WorkerExecutionOperation::Restore,
+                    "controller launch failed and cleanup completed",
+                ),
+            ));
 
         let result = runtime
             .restore_worker_operation(&worker.worker_ref)
@@ -9149,16 +9144,22 @@ mod tests {
         .unwrap();
         let workers = restored.list_workers().unwrap();
         assert_eq!(workers.len(), 1);
-        assert!(workers.iter().all(|summary| summary.worker_id != worker.worker_id));
+        assert!(
+            workers
+                .iter()
+                .all(|summary| summary.worker_id != worker.worker_id)
+        );
         assert!(matches!(
             restored.worker_detail(&worker.worker_ref),
             Err(RuntimeError::WorkerNotFound { .. })
         ));
-        assert!(restored
-            .diagnostics()
-            .unwrap()
-            .iter()
-            .any(|diagnostic| diagnostic.code == "worker_record_unavailable"));
+        assert!(
+            restored
+                .diagnostics()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic.code == "worker_record_unavailable")
+        );
 
         let restored_detail = restored
             .restore_worker(&restorable.worker_ref)

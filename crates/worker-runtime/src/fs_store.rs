@@ -134,7 +134,8 @@ impl FsRuntimeStore {
 
     #[cfg(test)]
     pub(crate) fn fail_next_worker_write(&self, fault: AtomicWriteFault) {
-        self.worker_write_fault.store(fault as u8, Ordering::Release);
+        self.worker_write_fault
+            .store(fault as u8, Ordering::Release);
     }
 
     pub(crate) fn open_or_create(
@@ -967,12 +968,13 @@ fn migrate_worker_record(
     identity_path: &Path,
 ) -> Result<WorkerAggregateRecord, RuntimeError> {
     if source_schema_version == PREVIOUS_SCHEMA_VERSION {
-        let identity: WorkerIdentityRecord = serde_json::from_value(identity_document).map_err(|error| {
-            runtime_store_corrupt(
-                identity_path,
-                format!("decode schema-v8 Worker identity: {error}"),
-            )
-        })?;
+        let identity: WorkerIdentityRecord =
+            serde_json::from_value(identity_document).map_err(|error| {
+                runtime_store_corrupt(
+                    identity_path,
+                    format!("decode schema-v8 Worker identity: {error}"),
+                )
+            })?;
         identity.validate_for_schema(identity_path, PREVIOUS_SCHEMA_VERSION)?;
         let execution_path = identity_path.with_file_name(WORKER_EXECUTION_FILE);
         let execution: WorkerExecutionRecord =
@@ -987,12 +989,13 @@ fn migrate_worker_record(
         mapping,
         identity_path,
     )?;
-    let identity: WorkerIdentityRecord = serde_json::from_value(documents.identity).map_err(|error| {
-        runtime_store_corrupt(
-            identity_path,
-            format!("decode validated schema-v8 Worker identity: {error}"),
-        )
-    })?;
+    let identity: WorkerIdentityRecord =
+        serde_json::from_value(documents.identity).map_err(|error| {
+            runtime_store_corrupt(
+                identity_path,
+                format!("decode validated schema-v8 Worker identity: {error}"),
+            )
+        })?;
     let execution_path = identity_path.with_file_name(WORKER_EXECUTION_FILE);
     let execution: WorkerExecutionRecord =
         serde_json::from_value(documents.execution).map_err(|error| {
@@ -1965,8 +1968,9 @@ impl WorkerAggregateRecord {
                     return Err(RuntimeError::StoreCorrupt {
                         operation: "read Worker lifecycle reconciliation",
                         path: path.to_path_buf(),
-                        message: "Worker reconciliation status does not match the last settled status"
-                            .to_string(),
+                        message:
+                            "Worker reconciliation status does not match the last settled status"
+                                .to_string(),
                     });
                 }
                 WorkerExecutionRecord {
@@ -2971,7 +2975,11 @@ mod tests {
         let committed: WorkerAggregateRecord =
             read_bounded_json(&aggregate_path, "read test Worker aggregate").unwrap();
         assert_eq!(committed.created_at_ms, Some(2));
-        assert!(!aggregate_path.with_file_name(WORKER_EXECUTION_FILE).exists());
+        assert!(
+            !aggregate_path
+                .with_file_name(WORKER_EXECUTION_FILE)
+                .exists()
+        );
     }
 
     #[test]
@@ -3050,10 +3058,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            migrated.identity["schema_version"],
-            PREVIOUS_SCHEMA_VERSION
-        );
+        assert_eq!(migrated.identity["schema_version"], PREVIOUS_SCHEMA_VERSION);
         assert!(migrated.identity.get("request").is_none());
         assert!(migrated.identity.get("execution").is_none());
         assert_eq!(
@@ -3158,8 +3163,11 @@ mod tests {
                 .contains_key(&worker_id)
         );
         assert!(!worker_dir.join(WORKER_EXECUTION_FILE).exists());
-        let aggregate: serde_json::Value =
-            read_json(&worker_dir.join(WORKER_FILE), "read migrated Worker aggregate").unwrap();
+        let aggregate: serde_json::Value = read_json(
+            &worker_dir.join(WORKER_FILE),
+            "read migrated Worker aggregate",
+        )
+        .unwrap();
         assert_eq!(aggregate["schema_version"], SCHEMA_VERSION);
         assert_eq!(aggregate["execution_state"]["state"], "available");
         assert_eq!(
@@ -3192,10 +3200,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            migrated.identity["schema_version"],
-            PREVIOUS_SCHEMA_VERSION
-        );
+        assert_eq!(migrated.identity["schema_version"], PREVIOUS_SCHEMA_VERSION);
         assert_eq!(migrated.identity["status"], "running");
         assert!(migrated.identity.get("request").is_none());
         assert!(migrated.identity.get("execution").is_none());

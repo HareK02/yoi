@@ -208,7 +208,9 @@ impl WorkerExecutionHandle {
 /// Runtime hooks available to an execution backend for one Worker.
 #[cfg(feature = "ws-server")]
 type WorkerObservationPublisher = Arc<
-    dyn Fn(WorkerRef, protocol::Event) -> Result<WorkerObservationEvent, RuntimeError> + Send + Sync,
+    dyn Fn(WorkerRef, protocol::Event) -> Result<WorkerObservationEvent, RuntimeError>
+        + Send
+        + Sync,
 >;
 
 #[cfg(feature = "ws-server")]
@@ -279,12 +281,10 @@ impl WorkerExecutionContext {
                 .map_err(|_| RuntimeError::StatePoisoned)?;
             match &*state {
                 WorkerExecutionPublicationState::Pending(_) => {
-                    let WorkerExecutionPublicationState::Pending(events) =
-                        std::mem::replace(
-                            &mut *state,
-                            WorkerExecutionPublicationState::Activating(VecDeque::new()),
-                        )
-                    else {
+                    let WorkerExecutionPublicationState::Pending(events) = std::mem::replace(
+                        &mut *state,
+                        WorkerExecutionPublicationState::Activating(VecDeque::new()),
+                    ) else {
                         unreachable!()
                     };
                     *state = WorkerExecutionPublicationState::Activating(events);
@@ -662,10 +662,7 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         Vec::new()
     }
 
-    fn stop_worker_operation(
-        &self,
-        request: WorkerExecutionStopRequest,
-    ) -> WorkerExecutionResult {
+    fn stop_worker_operation(&self, request: WorkerExecutionStopRequest) -> WorkerExecutionResult {
         let Some(handle) = request.handle.as_ref() else {
             return WorkerExecutionResult::unsupported(
                 WorkerExecutionOperation::Stop,

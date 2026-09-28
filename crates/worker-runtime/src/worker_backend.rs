@@ -1442,8 +1442,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         }
 
         let workspace_client = worker.workspace_client_handle();
-        let run_dir =
-            self.worker_restore_run_dir(&request.worker_ref, request.operation_id)?;
+        let run_dir = self.worker_restore_run_dir(&request.worker_ref, request.operation_id)?;
         let bash_output_dir = bash_output_dir_for_worker_id(&request.worker_ref.worker_id);
         let started = PreparedWorker::new(
             worker,
@@ -1483,11 +1482,8 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         workspace_id: Option<&str>,
         handle: &WorkerHandle,
     ) {
-        self.observation_hub.register(
-            worker_ref.clone(),
-            workspace_id.map(str::to_string),
-            handle,
-        );
+        self.observation_hub
+            .register(worker_ref.clone(), workspace_id.map(str::to_string), handle);
     }
 }
 
@@ -2953,13 +2949,10 @@ where
         self.send_method(WorkerExecutionOperation::ProtocolMethod, worker, method)
     }
 
-    fn stop_worker_operation(
-        &self,
-        request: WorkerExecutionStopRequest,
-    ) -> WorkerExecutionResult {
-        let handle = request.handle.unwrap_or_else(|| {
-            WorkerExecutionHandle::new(request.worker_ref, self.backend_id())
-        });
+    fn stop_worker_operation(&self, request: WorkerExecutionStopRequest) -> WorkerExecutionResult {
+        let handle = request
+            .handle
+            .unwrap_or_else(|| WorkerExecutionHandle::new(request.worker_ref, self.backend_id()));
         self.stop_worker(&handle)
     }
 
@@ -3865,9 +3858,7 @@ mod tests {
             worker_ref,
             Arc::new(|worker_ref, payload| {
                 Ok(crate::observation::WorkerObservationEvent::new(
-                    1,
-                    worker_ref,
-                    payload,
+                    1, worker_ref, payload,
                 ))
             }),
         )
@@ -4894,11 +4885,9 @@ mod tests {
             observed_workspace_clients: observed_workspace_clients.clone(),
         };
         let backend = Arc::new(WorkerRuntimeExecutionBackend::new(factory).unwrap());
-        let runtime = EmbeddedRuntime::with_execution_backend(
-            RuntimeOptions::default(),
-            backend.clone(),
-        )
-        .unwrap();
+        let runtime =
+            EmbeddedRuntime::with_execution_backend(RuntimeOptions::default(), backend.clone())
+                .unwrap();
         runtime.store_config_bundle(test_bundle()).unwrap();
         let request = create_request("idempotent restore reconciliation");
         let worker = runtime.create_worker(request.clone()).unwrap();
