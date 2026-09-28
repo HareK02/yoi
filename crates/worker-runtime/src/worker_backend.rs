@@ -1016,12 +1016,12 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         worker_ref: &WorkerRef,
     ) -> Result<session_store::RetainedSessionSnapshot, session_store::RetainedSnapshotReadError>
     {
-        let Some(root) = self.worker_aggregate_root.as_ref() else {
-            return Err(session_store::RetainedSnapshotReadError::RetentionMissing);
-        };
+        let aggregate_dir = self
+            .worker_aggregate_dir(worker_ref)
+            .map_err(|_| session_store::RetainedSnapshotReadError::RetentionMissing)?;
         let worker_name = Self::runtime_worker_name_for_ref(worker_ref);
         session_store::read_retained_session_snapshot(
-            &root.join(&worker_name),
+            &aggregate_dir,
             &worker_name,
             session_store::DEFAULT_RETAINED_SNAPSHOT_MAX_BYTES,
         )
@@ -3135,11 +3135,15 @@ mod tests {
     use crate::working_directory::RuntimeGitMaterializer;
     use agen::Engine;
     use agen::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
-    use agen::llm_client::{ClientError, LlmClient, Request};
+    use agen::llm_client::{ClientError, LlmClient, Request, RequestConfig};
     use async_trait::async_trait;
     use futures::{Stream, StreamExt};
     use manifest::{Scope, WorkerManifest};
-    use session_store::{LogEntry, WorkerMetadataStore};
+    use session_store::{
+        LogEntry, LoggedContentPart, LoggedHistoryEntry, LoggedItem, LoggedRole,
+        LoggedSessionHistoryEntryId, LoggedSessionHistoryMetadata, LoggedSessionHistoryOrigin,
+        Store, WorkerActiveSegmentRef, WorkerMetadata, WorkerMetadataStore,
+    };
 
     #[test]
     fn production_source_has_no_repository_derived_runtime_store() {
@@ -3153,6 +3157,217 @@ mod tests {
                 "repository-derived Runtime store returned through {forbidden}"
             );
         }
+    }
+
+    fn persisted_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn collect(root: &Path, current: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            if !current.exists() {
+                return;
+            }
+            for entry in fs::read_dir(current).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    collect(root, &path, files);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+
+        let mut files = BTreeMap::new();
+        collect(root, root, &mut files);
+        files
+    }
+
+    fn write_retained_profile_worker(
+        runtime_store_dir: &Path,
+        worker_ref: &WorkerRef,
+    ) -> (session_store::SessionId, session_store::SegmentId, String) {
+        let worker_name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(worker_ref);
+        let aggregate_dir = runtime_store_dir
+            .join("workers")
+            .join(worker_ref.worker_id.to_string());
+        let aggregate = WorkerAggregateStore::new(&aggregate_dir, &worker_name).unwrap();
+        let session_id = session_store::new_session_id();
+        let segment_id = session_store::new_segment_id();
+        aggregate
+            .write(&WorkerMetadata::new(
+                &worker_name,
+                Some(WorkerActiveSegmentRef::active_segment(
+                    session_id, segment_id,
+                )),
+            ))
+            .unwrap();
+        let entry_id = LoggedSessionHistoryEntryId::new();
+        let expected_entry_id = entry_id.0.clone();
+        let log = [LogEntry::AnnotatedSegmentStart {
+            ts: 17,
+            session_id,
+            system_prompt: None,
+            config: RequestConfig::default(),
+            history: vec![LoggedHistoryEntry {
+                item: LoggedItem::Message {
+                    role: LoggedRole::Assistant,
+                    content: vec![LoggedContentPart::Text {
+                        text: "retained response".to_string(),
+                    }],
+                },
+                metadata: LoggedSessionHistoryMetadata {
+                    entry_id,
+                    origin: LoggedSessionHistoryOrigin::LegacyUnknown,
+                    derivation: None,
+                },
+            }],
+            forked_from: None,
+            compacted_from: None,
+        }];
+        WorkerSessionStore::new(aggregate_dir.join("session"))
+            .unwrap()
+            .create_segment(session_id, segment_id, &log)
+            .unwrap();
+        (session_id, segment_id, expected_entry_id)
+    }
+
+    #[test]
+    fn profile_factory_reads_retained_session_from_canonical_worker_aggregate() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_store_dir = root.path().join("runtime");
+        let worker_ref = WorkerRef::new(WorkerId::now_v7());
+        let (session_id, segment_id, entry_id) =
+            write_retained_profile_worker(&runtime_store_dir, &worker_ref);
+        let canonical_dir = runtime_store_dir
+            .join("workers")
+            .join(worker_ref.worker_id.to_string());
+        let legacy_prefixed_dir = runtime_store_dir.join("workers").join(
+            ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&worker_ref),
+        );
+        assert!(!legacy_prefixed_dir.exists());
+        let files_before = persisted_files(&runtime_store_dir);
+        let backend = WorkerRuntimeExecutionBackend::new(
+            ProfileRuntimeWorkerFactory::new(root.path().join("profiles"))
+                .with_runtime_store_dir(&runtime_store_dir),
+        )
+        .unwrap();
+
+        let retained = backend.worker_session(WorkerSessionObservationRequest {
+            worker_ref: worker_ref.clone(),
+        });
+
+        let runtime_api::WorkerSessionAvailability::RetainedSnapshot { identity, snapshot } =
+            retained
+        else {
+            panic!("canonical aggregate must produce a retained snapshot");
+        };
+        assert_eq!(identity.session_id, session_id.to_string());
+        assert_eq!(identity.segment_id, segment_id.to_string());
+        assert_eq!(identity.entry_count, 1);
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].entry_id, entry_id);
+        assert_eq!(
+            snapshot.entries[0].data,
+            protocol::SessionSnapshotEntryData::Message {
+                role: protocol::SessionMessageRole::Assistant,
+                content: vec![protocol::SessionContentPart::Text {
+                    text: "retained response".to_string(),
+                }],
+            }
+        );
+        assert!(canonical_dir.is_dir());
+        assert!(!legacy_prefixed_dir.exists());
+        assert_eq!(persisted_files(&runtime_store_dir), files_before);
+        assert!(backend.workers.lock().unwrap().is_empty());
+        assert!(
+            backend
+                .factory
+                .observation_hub
+                .workers
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn profile_factory_retained_read_keeps_missing_aggregate_typed_and_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_store_dir = root.path().join("runtime");
+        let worker_ref = WorkerRef::new(WorkerId::now_v7());
+        let unconfigured_backend = WorkerRuntimeExecutionBackend::new(
+            ProfileRuntimeWorkerFactory::new(root.path().join("unconfigured-profiles")),
+        )
+        .unwrap();
+        assert!(matches!(
+            unconfigured_backend.worker_session(WorkerSessionObservationRequest {
+                worker_ref: worker_ref.clone(),
+            }),
+            runtime_api::WorkerSessionAvailability::Unavailable {
+                reason: runtime_api::WorkerSessionUnavailableReason::RetentionMissing,
+                ..
+            }
+        ));
+        assert!(!root.path().join("unconfigured-profiles").exists());
+        assert!(unconfigured_backend.workers.lock().unwrap().is_empty());
+
+        let canonical_dir = runtime_store_dir
+            .join("workers")
+            .join(worker_ref.worker_id.to_string());
+        let backend = WorkerRuntimeExecutionBackend::new(
+            ProfileRuntimeWorkerFactory::new(root.path().join("profiles"))
+                .with_runtime_store_dir(&runtime_store_dir),
+        )
+        .unwrap();
+
+        let unavailable = backend.worker_session(WorkerSessionObservationRequest {
+            worker_ref: worker_ref.clone(),
+        });
+
+        assert!(matches!(
+            unavailable,
+            runtime_api::WorkerSessionAvailability::Unavailable {
+                reason: runtime_api::WorkerSessionUnavailableReason::RetentionMissing,
+                ..
+            }
+        ));
+        assert!(!canonical_dir.exists());
+        assert!(!runtime_store_dir.exists());
+        assert!(backend.workers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn profile_factory_retained_read_validates_metadata_worker_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_store_dir = root.path().join("runtime");
+        let worker_ref = WorkerRef::new(WorkerId::now_v7());
+        let aggregate_dir = runtime_store_dir
+            .join("workers")
+            .join(worker_ref.worker_id.to_string());
+        fs::create_dir_all(&aggregate_dir).unwrap();
+        fs::write(
+            aggregate_dir.join("metadata.json"),
+            serde_json::to_vec(&WorkerMetadata::new("different-worker", None)).unwrap(),
+        )
+        .unwrap();
+        let files_before = persisted_files(&runtime_store_dir);
+        let backend = WorkerRuntimeExecutionBackend::new(
+            ProfileRuntimeWorkerFactory::new(root.path().join("profiles"))
+                .with_runtime_store_dir(&runtime_store_dir),
+        )
+        .unwrap();
+
+        let unavailable = backend.worker_session(WorkerSessionObservationRequest { worker_ref });
+
+        assert!(matches!(
+            unavailable,
+            runtime_api::WorkerSessionAvailability::Unavailable {
+                reason: runtime_api::WorkerSessionUnavailableReason::CorruptLog,
+                ref message,
+            } if message == "retained session log is corrupt"
+        ));
+        assert_eq!(persisted_files(&runtime_store_dir), files_before);
+        assert!(backend.workers.lock().unwrap().is_empty());
     }
 
     #[test]
