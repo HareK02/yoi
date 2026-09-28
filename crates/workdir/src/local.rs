@@ -347,6 +347,44 @@ impl fs_operation::FsAccessPolicy for ScopeAccess {
         }
     }
 
+    fn atomic_write_file(
+        &self,
+        _logical: &Path,
+        resolved: &Path,
+        content: &[u8],
+    ) -> std::io::Result<()> {
+        if !self.reject_symlinks {
+            use std::io::Write;
+
+            let parent = resolved.parent().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "file path has no parent")
+            })?;
+            std::fs::create_dir_all(parent)?;
+            let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+            temporary.write_all(content)?;
+            temporary.flush()?;
+            temporary.as_file().sync_all()?;
+            self.check_cancelled()?;
+            temporary.persist(resolved).map_err(|error| error.error)?;
+            return Ok(());
+        }
+        let root = self.pinned_root.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "External Workdir root handle is unavailable",
+            )
+        })?;
+        let relative = resolved.strip_prefix(&self.root).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "path is outside provider root",
+            )
+        })?;
+        fs_operation::atomic_write_beneath_no_symlinks_at(root, relative, content, || {
+            self.check_cancelled()
+        })
+    }
+
     fn open_read_dir(&self, _logical: &Path, resolved: &Path) -> std::io::Result<std::fs::ReadDir> {
         if !self.reject_symlinks {
             return std::fs::read_dir(resolved);
@@ -686,11 +724,6 @@ impl LocalWorkdirSession {
 
     /// Construct a strictly read-only provider session for an
     /// authority-assigned Workdir and an operator-selected local directory.
-    ///
-    /// The selected directory is atomically validated and pinned for the
-    /// session lifetime. A symlink selected as the root is rejected, and all
-    /// operation paths are confined below the pinned root without following
-    /// symbolic links. Read source and response sizes are provider-bounded.
     pub fn external_read_only(
         workdir: Workdir,
         directory: impl AsRef<Path>,
@@ -700,20 +733,66 @@ impl LocalWorkdirSession {
         Self::external_read_only_pinned(workdir, root, read_limits)
     }
 
-    /// Construct a provider session from a root pinned before remote grant
-    /// creation, preventing any later pathname replacement from changing the
-    /// approved filesystem authority.
+    /// Construct a filesystem read/write provider session without command
+    /// authority for an operator-selected local directory.
+    pub fn external_read_write(
+        workdir: Workdir,
+        directory: impl AsRef<Path>,
+        read_limits: BoundedReadLimits,
+    ) -> Result<Self, WorkdirError> {
+        let root = ExternalWorkdirRoot::pin(directory)?;
+        Self::external_read_write_pinned(workdir, root, read_limits)
+    }
+
+    /// Construct a read-only provider session from a root pinned before remote
+    /// grant creation.
     pub fn external_read_only_pinned(
         workdir: Workdir,
         pinned: ExternalWorkdirRoot,
         read_limits: BoundedReadLimits,
+    ) -> Result<Self, WorkdirError> {
+        Self::external_pinned(
+            workdir,
+            pinned,
+            read_limits,
+            Permission::Read,
+            WorkdirSessionCapabilities::READ_ONLY,
+        )
+    }
+
+    /// Construct a filesystem read/write provider session from a root pinned
+    /// before remote grant creation. Command execution remains unavailable.
+    pub fn external_read_write_pinned(
+        workdir: Workdir,
+        pinned: ExternalWorkdirRoot,
+        read_limits: BoundedReadLimits,
+    ) -> Result<Self, WorkdirError> {
+        Self::external_pinned(
+            workdir,
+            pinned,
+            read_limits,
+            Permission::Write,
+            WorkdirSessionCapabilities::READ_WRITE,
+        )
+    }
+
+    /// The selected directory is atomically validated and pinned for the
+    /// session lifetime. A symlink selected as the root is rejected, and all
+    /// operation paths are confined below the pinned root without following
+    /// symbolic links. Read source and response sizes are provider-bounded.
+    fn external_pinned(
+        workdir: Workdir,
+        pinned: ExternalWorkdirRoot,
+        read_limits: BoundedReadLimits,
+        permission: Permission,
+        capabilities: WorkdirSessionCapabilities,
     ) -> Result<Self, WorkdirError> {
         read_limits.validate().map_err(WorkdirError::from)?;
         let root = pinned.canonical_path;
         let scope = Scope::from_config(&ScopeConfig {
             allow: vec![ScopeRule {
                 target: root.clone(),
-                permission: Permission::Read,
+                permission,
                 recursive: true,
                 symlink_policy: SymlinkPolicy::Resolved,
             }],
@@ -721,7 +800,7 @@ impl LocalWorkdirSession {
         })
         .map_err(|_| {
             WorkdirError::InvalidArgument(
-                "External Workdir read scope could not be established".to_string(),
+                "External Workdir filesystem scope could not be established".to_string(),
             )
         })?;
         let scope = SharedScope::new(scope);
@@ -731,7 +810,7 @@ impl LocalWorkdirSession {
             root,
             scope.clone(),
             scope,
-            WorkdirSessionCapabilities::READ_ONLY,
+            capabilities,
             BTreeMap::new(),
             Vec::new(),
             Some(pinned.handle),

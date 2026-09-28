@@ -21,7 +21,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 66;
+const LATEST_SCHEMA_VERSION: i64 = 67;
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
@@ -48,6 +48,8 @@ const EXTERNAL_WORKDIR_CLEANUP_MIGRATION_NAME: &str =
     "durable External Workdir expiry cleanup state";
 const TICKET_TARGETS_AND_WORKDIR_CAPABILITIES_MIGRATION_NAME: &str =
     "Ticket target collection and Workdir attachment capabilities";
+const EXTERNAL_WORKDIR_ACCESS_AND_OPTIONAL_EXPIRY_MIGRATION_NAME: &str =
+    "External Workdir read-write access and optional expiry";
 const TICKET_SCHEMA_VERSION_WITH_TARGETS: i64 = 7;
 const TICKET_SCHEMA_BASELINE_NAME: &str = "ticket schema baseline";
 const WORKER_REGISTRY_PROJECTION_SCHEMA: &str = r#"
@@ -174,6 +176,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 66,
         name: TICKET_TARGETS_AND_WORKDIR_CAPABILITIES_MIGRATION_NAME,
         apply: migrate_ticket_targets_and_workdir_capabilities_v65_to_v66,
+    },
+    Migration {
+        version: 67,
+        name: EXTERNAL_WORKDIR_ACCESS_AND_OPTIONAL_EXPIRY_MIGRATION_NAME,
+        apply: migrate_external_workdir_access_and_optional_expiry_v66_to_v67,
     },
 ];
 
@@ -870,7 +877,7 @@ pub struct ExternalWorkdirGrantRecord {
     pub permissions: String,
     pub created_by: String,
     pub created_at: String,
-    pub expires_at: String,
+    pub expires_at: Option<String>,
     pub generation: u64,
     pub status: String,
     pub updated_at: String,
@@ -7754,7 +7761,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                    WHERE workspace_id = ?1 AND grant_id = ?2 AND provider_instance_id = ?3
                      AND ((status = 'pending' AND generation = ?4)
                        OR (status = 'offline' AND generation + 1 = ?4))
-                     AND expires_at > ?5"#,
+                     AND (expires_at IS NULL OR expires_at > ?5)"#,
                 params![
                     workspace_id,
                     grant_id,
@@ -7827,12 +7834,13 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                  SET status = 'expired', updated_at = ?2, cleanup_state = 'pending',
                      cleanup_error = NULL, cleanup_updated_at = ?2
                  WHERE workspace_id = ?1 AND status IN ('pending', 'online', 'offline')
-                   AND expires_at <= ?2",
+                   AND expires_at IS NOT NULL AND expires_at <= ?2",
                 params![workspace_id, now],
             )?;
             tx.execute(
                 "UPDATE external_workdir_grants SET status = 'offline', updated_at = ?2
-                 WHERE workspace_id = ?1 AND status = 'online' AND expires_at > ?2",
+                 WHERE workspace_id = ?1 AND status = 'online'
+                   AND (expires_at IS NULL OR expires_at > ?2)",
                 params![workspace_id, now],
             )?;
             tx.execute(
@@ -9130,9 +9138,12 @@ fn encode_workdir_link_capabilities(
         Ok("all")
     } else if capabilities == workdir::WorkdirSessionCapabilities::READ_ONLY {
         Ok("read_only")
+    } else if capabilities == workdir::WorkdirSessionCapabilities::READ_WRITE {
+        Ok("read_write")
     } else {
         Err(Error::InvalidInput(
-            "Workdir attachment capabilities must be exactly all or read_only".to_string(),
+            "Workdir attachment capabilities must be exactly all, read_only, or read_write"
+                .to_string(),
         ))
     }
 }
@@ -9144,6 +9155,7 @@ fn decode_workdir_link_capabilities(
     match value {
         "all" => Ok(workdir::WorkdirSessionCapabilities::ALL),
         "read_only" => Ok(workdir::WorkdirSessionCapabilities::READ_ONLY),
+        "read_write" => Ok(workdir::WorkdirSessionCapabilities::READ_WRITE),
         _ => Err(rusqlite::Error::FromSqlConversionFailure(
             column,
             rusqlite::types::Type::Text,
@@ -11957,6 +11969,122 @@ fn apply_ticket_targets_and_workdir_capabilities_schema(conn: &Connection) -> Re
     }
 }
 
+fn migrate_external_workdir_access_and_optional_expiry_v66_to_v67(
+    conn: &Connection,
+) -> Result<()> {
+    let current = current_schema_version(conn)?;
+    if current != 66 {
+        return Err(Error::Store(format!(
+            "expected schema version 66 before {EXTERNAL_WORKDIR_ACCESS_AND_OPTIONAL_EXPIRY_MIGRATION_NAME} migration, found {current}"
+        )));
+    }
+    let foreign_keys_enabled =
+        conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))? != 0;
+    if foreign_keys_enabled {
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    }
+    let result = (|| {
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+        tx.execute_batch(
+            r#"
+            CREATE TABLE external_workdir_grants_v67 (
+                grant_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                workdir_id TEXT NOT NULL,
+                provider_instance_id TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                permissions TEXT NOT NULL CHECK (permissions IN ('read_only', 'read_write')),
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT,
+                generation INTEGER NOT NULL CHECK (generation > 0),
+                status TEXT NOT NULL CHECK (status IN ('pending', 'online', 'offline', 'revoked', 'expired')),
+                updated_at TEXT NOT NULL,
+                cleanup_state TEXT NOT NULL DEFAULT 'not_required' CHECK (cleanup_state IN ('not_required', 'pending', 'retry_required', 'completed')),
+                cleanup_error TEXT,
+                cleanup_updated_at TEXT,
+                PRIMARY KEY (workspace_id, grant_id),
+                UNIQUE (workspace_id, workdir_id),
+                FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+                FOREIGN KEY (workspace_id, workdir_id)
+                    REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+            );
+            INSERT INTO external_workdir_grants_v67 (
+                grant_id, workspace_id, workdir_id, provider_instance_id, display_name,
+                permissions, created_by, created_at, expires_at, generation, status, updated_at,
+                cleanup_state, cleanup_error, cleanup_updated_at
+            ) SELECT grant_id, workspace_id, workdir_id, provider_instance_id, display_name,
+                     permissions, created_by, created_at, expires_at, generation, status, updated_at,
+                     cleanup_state, cleanup_error, cleanup_updated_at
+                FROM external_workdir_grants;
+            DROP TABLE external_workdir_grants;
+            ALTER TABLE external_workdir_grants_v67 RENAME TO external_workdir_grants;
+            CREATE INDEX idx_external_workdir_grants_status_expiry
+                ON external_workdir_grants(workspace_id, status, expires_at);
+            CREATE TABLE worker_workdir_links_v67 (
+                workspace_id TEXT NOT NULL,
+                runtime_id TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                workdir_id TEXT NOT NULL,
+                alias TEXT NOT NULL,
+                capabilities TEXT NOT NULL CHECK (capabilities IN ('all', 'read_only', 'read_write')),
+                linked_at TEXT NOT NULL,
+                unlinked_at TEXT,
+                PRIMARY KEY (workspace_id, worker_id, workdir_id, alias),
+                FOREIGN KEY (workspace_id, worker_id)
+                    REFERENCES worker_registry(workspace_id, worker_id) ON DELETE CASCADE,
+                FOREIGN KEY (workspace_id, workdir_id)
+                    REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE
+            );
+            INSERT INTO worker_workdir_links_v67 (
+                workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities,
+                linked_at, unlinked_at
+            ) SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities,
+                     linked_at, unlinked_at
+                FROM worker_workdir_links;
+            DROP TABLE worker_workdir_links;
+            ALTER TABLE worker_workdir_links_v67 RENAME TO worker_workdir_links;
+            CREATE UNIQUE INDEX worker_workdir_links_active_workdir_unique
+                ON worker_workdir_links(workspace_id, workdir_id) WHERE unlinked_at IS NULL;
+            CREATE UNIQUE INDEX worker_workdir_links_active_alias_unique
+                ON worker_workdir_links(workspace_id, worker_id, alias) WHERE unlinked_at IS NULL;
+            CREATE INDEX worker_workdir_links_workdir
+                ON worker_workdir_links(workspace_id, workdir_id);
+            "#,
+        )?;
+        let violations = tx.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_check",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if violations != 0 {
+            return Err(Error::Store(format!(
+                "schema-67 migration left {violations} foreign-key violation(s)"
+            )));
+        }
+        tx.execute(
+            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+            params![
+                67_i64,
+                EXTERNAL_WORKDIR_ACCESS_AND_OPTIONAL_EXPIRY_MIGRATION_NAME
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+    let restore = if foreign_keys_enabled {
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(Error::from)
+    } else {
+        Ok(())
+    };
+    match (result, restore) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("DROP TABLE IF EXISTS typed_ticket_targets;")?;
     conn.execute_batch(include_str!("latest_schema.sql"))?;
@@ -12019,7 +12147,7 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
             ON typed_ticket_targets(workspace_id, repository_key, ticket_id);
         ALTER TABLE worker_workdir_links
             ADD COLUMN capabilities TEXT NOT NULL
-            CHECK (capabilities IN ('all', 'read_only'));
+            CHECK (capabilities IN ('all', 'read_only', 'read_write'));
         "#,
     )?;
     ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
@@ -12745,10 +12873,10 @@ mod tests {
             workdir_id: "external-a".to_string(),
             provider_instance_id: "provider-a".to_string(),
             display_name: "Session logs".to_string(),
-            permissions: "read_only".to_string(),
+            permissions: "read_write".to_string(),
             created_by: "owner".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
-            expires_at: "2099-01-01T00:00:00Z".to_string(),
+            expires_at: None,
             generation: 1,
             status: "pending".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -12775,6 +12903,12 @@ mod tests {
         store
             .create_external_workdir_grant(&grant, &workdir)
             .unwrap();
+        let persisted_grant = store
+            .get_external_workdir_grant("workspace-a", "grant-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted_grant.permissions, "read_write");
+        assert_eq!(persisted_grant.expires_at, None);
         store
             .record_external_workdir_audit(
                 "workspace-a",
@@ -12857,6 +12991,14 @@ mod tests {
                 )
                 .unwrap()
                 .is_empty()
+        );
+        assert_eq!(
+            store
+                .get_external_workdir_grant("workspace-a", "grant-a")
+                .unwrap()
+                .unwrap()
+                .status,
+            "offline"
         );
         assert!(
             !store

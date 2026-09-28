@@ -5241,19 +5241,32 @@ impl From<workdir::workspace::WorkingDirectorySummary> for WorkingDirectorySumma
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
-pub struct ExternalWorkdirGrantCreateRequest {
-    pub provider_instance_id: String,
-    pub display_name: String,
-    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
-    pub ttl_seconds: u64,
-    pub read_only: bool,
+#[serde(rename_all = "snake_case")]
+pub enum ExternalWorkdirPermission {
+    #[default]
+    ReadOnly,
+    ReadWrite,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "typescript", ts(optional_fields = nullable))]
+#[serde(deny_unknown_fields)]
+pub struct ExternalWorkdirGrantCreateRequest {
+    pub provider_instance_id: String,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional, type = "number | null"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub ttl_seconds: Option<u64>,
+    pub permission: ExternalWorkdirPermission,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "typescript", ts(optional_fields = nullable))]
 #[serde(deny_unknown_fields)]
 pub struct ExternalWorkdirGrantResponse {
     pub grant_id: String,
@@ -5261,8 +5274,11 @@ pub struct ExternalWorkdirGrantResponse {
     pub working_directory_id: String,
     pub provider_instance_id: String,
     pub display_name: String,
-    pub permissions: String,
-    pub expires_at: String,
+    pub permission: ExternalWorkdirPermission,
+    /// `None` means the grant has no automatic expiry. It remains bounded by
+    /// explicit revoke, provider disconnect, and provider shutdown cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub generation: u64,
     pub status: String,

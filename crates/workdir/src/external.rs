@@ -25,6 +25,7 @@ const MAX_EXTERNAL_PATTERN_BYTES: usize = 4 * 1024;
 const MAX_EXTERNAL_RESULT_ITEMS: usize = 10_000;
 const MAX_EXTERNAL_GREP_CONTEXT: usize = 100;
 const MAX_EXTERNAL_SCOPE_RULES: usize = 64;
+pub const MAX_EXTERNAL_WRITE_BYTES: usize = 512 * 1024;
 
 /// Fail-closed wire version for the External Workdir provider protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -122,7 +123,10 @@ fn is_root_relative(path: &WorkdirPath) -> bool {
         })
 }
 
-fn validate_read_only_operation(operation: &WorkdirSessionOperation) -> Result<(), String> {
+/// Validate the filesystem-only subset shared by read-only and read-write
+/// External Workdirs. Capability enforcement remains a separate grant/session
+/// boundary; command operations never enter the provider protocol.
+fn validate_filesystem_operation(operation: &WorkdirSessionOperation) -> Result<(), String> {
     let path_is_valid = match operation {
         WorkdirSessionOperation::AuthorizeScope(request) => {
             is_root_relative(&request.path)
@@ -165,13 +169,24 @@ fn validate_read_only_operation(operation: &WorkdirSessionOperation) -> Result<(
                 && request.limit <= MAX_EXTERNAL_RESULT_ITEMS
                 && request.offset <= 1_000_000
         }
-        WorkdirSessionOperation::Write(_)
-        | WorkdirSessionOperation::Edit(_)
-        | WorkdirSessionOperation::CommandStart(_)
+        WorkdirSessionOperation::Write(request) => {
+            is_root_relative(&request.path) && request.content.len() <= MAX_EXTERNAL_WRITE_BYTES
+        }
+        WorkdirSessionOperation::Edit(request) => {
+            is_root_relative(&request.path)
+                && request.old_string.len() <= MAX_EXTERNAL_WRITE_BYTES
+                && request.new_string.len() <= MAX_EXTERNAL_WRITE_BYTES
+                && request
+                    .old_string
+                    .len()
+                    .checked_add(request.new_string.len())
+                    .is_some_and(|size| size <= MAX_EXTERNAL_WRITE_BYTES)
+        }
+        WorkdirSessionOperation::CommandStart(_)
         | WorkdirSessionOperation::CommandStatus(_)
         | WorkdirSessionOperation::CommandOutput(_)
         | WorkdirSessionOperation::CommandCancel(_) => {
-            return Err("operation is not available to a read-only External Workdir".to_string());
+            return Err("command operations are not available to an External Workdir".to_string());
         }
     };
     if path_is_valid {
@@ -181,7 +196,7 @@ fn validate_read_only_operation(operation: &WorkdirSessionOperation) -> Result<(
     }
 }
 
-/// Validated read-only subset of the shared Workdir operation contract.
+/// Validated filesystem-only subset of the shared Workdir operation contract.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct ExternalWorkdirOperation(WorkdirSessionOperation);
@@ -200,7 +215,7 @@ impl TryFrom<WorkdirSessionOperation> for ExternalWorkdirOperation {
     type Error = String;
 
     fn try_from(operation: WorkdirSessionOperation) -> Result<Self, Self::Error> {
-        validate_read_only_operation(&operation)?;
+        validate_filesystem_operation(&operation)?;
         Ok(Self(operation))
     }
 }
@@ -224,7 +239,7 @@ fn result_paths_fit<'a>(paths: impl IntoIterator<Item = &'a WorkdirPath>) -> boo
         .is_some_and(|retained| retained <= fs_operation::MAX_RESULT_PATH_BYTES)
 }
 
-fn validate_read_only_result(result: &WorkdirSessionOperationResult) -> Result<(), String> {
+fn validate_filesystem_result(result: &WorkdirSessionOperationResult) -> Result<(), String> {
     let result_is_valid = match result {
         WorkdirSessionOperationResult::AuthorizeScope
         | WorkdirSessionOperationResult::ScopeRulesOverlap { .. } => true,
@@ -251,14 +266,19 @@ fn validate_read_only_result(result: &WorkdirSessionOperationResult) -> Result<(
                 && result.match_count <= MAX_EXTERNAL_RESULT_ITEMS
                 && result.matched_files <= MAX_EXTERNAL_RESULT_ITEMS
         }
-        WorkdirSessionOperationResult::Write(_)
-        | WorkdirSessionOperationResult::Edit(_)
-        | WorkdirSessionOperationResult::CommandStart(_)
+        WorkdirSessionOperationResult::Write(result) => {
+            result.bytes_written <= MAX_EXTERNAL_WRITE_BYTES
+        }
+        WorkdirSessionOperationResult::Edit(result) => {
+            result.bytes_written <= MAX_EXTERNAL_WRITE_BYTES
+                && result.replacements <= MAX_EXTERNAL_RESULT_ITEMS
+        }
+        WorkdirSessionOperationResult::CommandStart(_)
         | WorkdirSessionOperationResult::CommandStatus(_)
         | WorkdirSessionOperationResult::CommandOutput(_)
         | WorkdirSessionOperationResult::CommandCancel => {
             return Err(
-                "operation result is not available to a read-only External Workdir".to_string(),
+                "command operation results are not available to an External Workdir".to_string(),
             );
         }
     };
@@ -269,7 +289,7 @@ fn validate_read_only_result(result: &WorkdirSessionOperationResult) -> Result<(
     }
 }
 
-/// Validated read-only subset of the shared Workdir operation result contract.
+/// Validated filesystem-only subset of the shared Workdir operation result contract.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct ExternalWorkdirOperationResult(WorkdirSessionOperationResult);
@@ -288,7 +308,7 @@ impl TryFrom<WorkdirSessionOperationResult> for ExternalWorkdirOperationResult {
     type Error = String;
 
     fn try_from(result: WorkdirSessionOperationResult) -> Result<Self, Self::Error> {
-        validate_read_only_result(&result)?;
+        validate_filesystem_result(&result)?;
         Ok(Self(result))
     }
 }
@@ -411,7 +431,10 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::{CommandRequest, GrepResult, ListRequest, ReadRequest, Workdir, WorkdirPath};
+    use crate::{
+        CommandRequest, EditRequest, GrepResult, ListRequest, ReadRequest, Workdir, WorkdirPath,
+        WriteRequest,
+    };
 
     fn assert_no_provider_authority(value: &Value) {
         match value {
@@ -521,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_protocol_rejects_host_paths_and_command_payloads() {
+    fn filesystem_protocol_rejects_host_paths_and_commands_but_allows_bounded_mutations() {
         let absolute = WorkdirSessionOperation::Read(ReadRequest {
             path: WorkdirPath::new_scoped("/home/operator/private/session.log").unwrap(),
             offset: 0,
@@ -539,6 +562,33 @@ mod tests {
             tool_call_id: None,
         });
         assert!(ExternalWorkdirOperation::try_from(command).is_err());
+
+        assert!(
+            ExternalWorkdirOperation::try_from(WorkdirSessionOperation::Write(WriteRequest {
+                path: WorkdirPath::new("created.txt").unwrap(),
+                content: b"bounded".to_vec(),
+                expected_hash: None,
+            }))
+            .is_ok()
+        );
+        assert!(
+            ExternalWorkdirOperation::try_from(WorkdirSessionOperation::Edit(EditRequest {
+                path: WorkdirPath::new("item.txt").unwrap(),
+                old_string: "old".to_string(),
+                new_string: "new".to_string(),
+                replace_all: false,
+                expected_hash: [0; 32],
+            }))
+            .is_ok()
+        );
+        assert!(
+            ExternalWorkdirOperation::try_from(WorkdirSessionOperation::Write(WriteRequest {
+                path: WorkdirPath::new("large.txt").unwrap(),
+                content: vec![0; MAX_EXTERNAL_WRITE_BYTES + 1],
+                expected_hash: None,
+            }))
+            .is_err()
+        );
     }
 
     #[test]

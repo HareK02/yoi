@@ -154,6 +154,105 @@ pub fn open_beneath_no_symlinks(_root: &Path, _path: &Path) -> std::io::Result<s
     ))
 }
 
+#[cfg(target_os = "linux")]
+pub fn atomic_write_beneath_no_symlinks_at(
+    root: &std::fs::File,
+    relative: &Path,
+    content: &[u8],
+    before_commit: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::ffi::{CString, OsString};
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    if relative.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "path is outside provider root",
+        ));
+    }
+    let mut components = relative.components().peekable();
+    let mut parent = root.try_clone()?;
+    let mut file_name = None::<OsString>;
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "path is outside provider root",
+            ));
+        };
+        if components.peek().is_none() {
+            file_name = Some(name.to_os_string());
+            break;
+        }
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL")
+        })?;
+        // SAFETY: `name` is a valid C string and `parent` remains open.
+        let mut fd: RawFd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error);
+            }
+            // SAFETY: same valid directory descriptor and component C string.
+            let created = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) };
+            if created < 0 {
+                let create_error = std::io::Error::last_os_error();
+                if create_error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(create_error);
+                }
+            }
+            // SAFETY: same as the first openat; a racing symlink is rejected by O_NOFOLLOW.
+            fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        // SAFETY: fd is a fresh descriptor returned by openat.
+        parent = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    let file_name = file_name.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "file path is empty")
+    })?;
+    let parent_path = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()));
+    let mut temporary = tempfile::NamedTempFile::new_in(&parent_path)?;
+    temporary.write_all(content)?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    before_commit()?;
+    temporary
+        .persist(parent_path.join(file_name))
+        .map_err(|error| error.error)?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn atomic_write_beneath_no_symlinks_at(
+    _root: &std::fs::File,
+    _relative: &Path,
+    _content: &[u8],
+    _before_commit: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "root-confined no-symlink write is unavailable on this platform",
+    ))
+}
+
 /// Keeps a descriptor-backed traversal path alive for the duration of a walk.
 #[derive(Debug)]
 pub struct FsTraversalRoot {
@@ -216,6 +315,30 @@ pub trait FsAccessPolicy: Send + Sync {
         resolved: &Path,
     ) -> std::io::Result<std::fs::Metadata> {
         std::fs::metadata(resolved)
+    }
+
+    /// Atomically replace or create an already-authorized writable file.
+    /// Capability providers override this to keep parent traversal descriptor-
+    /// confined through the final rename.
+    fn atomic_write_file(
+        &self,
+        _logical: &Path,
+        resolved: &Path,
+        content: &[u8],
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let parent = resolved.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "file path has no parent")
+        })?;
+        std::fs::create_dir_all(parent)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        temporary.write_all(content)?;
+        temporary.flush()?;
+        temporary.as_file().sync_all()?;
+        self.check_cancelled()?;
+        temporary.persist(resolved).map_err(|error| error.error)?;
+        Ok(())
     }
 
     /// Open an already-authorized directory for bounded enumeration.
@@ -1024,6 +1147,52 @@ mod tests {
             FsError::InvalidArgument(message)
                 if message.contains("must be a regular file or directory")
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_confined_atomic_write_rejects_symlinks_and_survives_root_rename() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let selected = parent.path().join("selected");
+        std::fs::create_dir(&selected).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        symlink(outside.path(), selected.join("escape")).unwrap();
+        let root = open_root_no_symlinks(&selected).unwrap();
+
+        let error = atomic_write_beneath_no_symlinks_at(
+            &root,
+            Path::new("escape/secret.txt"),
+            b"escaped",
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::NotADirectory | std::io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
+            "secret"
+        );
+
+        std::fs::rename(&selected, parent.path().join("approved-original")).unwrap();
+        std::fs::create_dir(&selected).unwrap();
+        atomic_write_beneath_no_symlinks_at(
+            &root,
+            Path::new("nested/created.txt"),
+            b"approved",
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(parent.path().join("approved-original/nested/created.txt"))
+                .unwrap(),
+            "approved"
+        );
+        assert!(!selected.join("nested/created.txt").exists());
     }
 
     #[test]

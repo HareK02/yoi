@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::fs;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -208,21 +208,32 @@ pub fn run_write(
     let created = !path.exists();
     if path.exists() {
         let target = require_access(&path, &logical, access, true, false)?;
-        let metadata = fs::metadata(&target).map_err(|error| map_io(&logical, error))?;
+        let metadata = access
+            .read_metadata(&path, &target)
+            .map_err(|error| map_io(&logical, error))?;
         if metadata.is_dir() {
             return Err(FsError::IsDirectory(PathBuf::from(logical.as_str())));
         }
-        let actual = hash_bytes(&fs::read(&target).map_err(|error| map_io(&logical, error))?);
+        let mut bytes = Vec::new();
+        access
+            .open_read_file(&path, &target)
+            .and_then(|mut file| file.read_to_end(&mut bytes))
+            .map_err(|error| map_io(&logical, error))?;
+        let actual = hash_bytes(&bytes);
         if request.expected_hash != Some(actual) {
             return Err(FsError::Conflict(logical.as_str().to_string()));
         }
-        atomic_write(&target, &request.content, &logical)?;
+        access
+            .atomic_write_file(&path, &target, &request.content)
+            .map_err(|error| map_io(&logical, error))?;
     } else {
         if request.expected_hash.is_some() {
             return Err(FsError::Conflict(logical.as_str().to_string()));
         }
         let target = require_access(&path, &logical, access, true, true)?;
-        atomic_write(&target, &request.content, &logical)?;
+        access
+            .atomic_write_file(&path, &target, &request.content)
+            .map_err(|error| map_io(&logical, error))?;
     }
     Ok(WriteResult {
         bytes_written: request.content.len(),
@@ -241,7 +252,11 @@ pub fn run_edit(
         .map_err(|error| map_io(&logical, error))?;
     let path = resolve(root, &logical)?;
     let target = require_access(&path, &logical, access, true, false)?;
-    let bytes = fs::read(&target).map_err(|error| map_io(&logical, error))?;
+    let mut bytes = Vec::new();
+    access
+        .open_read_file(&path, &target)
+        .and_then(|mut file| file.read_to_end(&mut bytes))
+        .map_err(|error| map_io(&logical, error))?;
     let actual_hash = hash_bytes(&bytes);
     if actual_hash != request.expected_hash {
         return Err(FsError::Conflict(logical.as_str().to_string()));
@@ -265,7 +280,9 @@ pub fn run_edit(
     } else {
         content.replacen(&request.old_string, &request.new_string, 1)
     };
-    atomic_write(&target, edited.as_bytes(), &logical)?;
+    access
+        .atomic_write_file(&path, &target, edited.as_bytes())
+        .map_err(|error| map_io(&logical, error))?;
     Ok(EditResult {
         replacements: if request.replace_all { occurrences } else { 1 },
         bytes_written: edited.len(),
@@ -462,23 +479,6 @@ pub fn resolve_access_path(path: &Path) -> std::io::Result<PathBuf> {
             Err(error) => return Err(error),
         }
     }
-}
-
-fn atomic_write(path: &Path, content: &[u8], logical: &FsPath) -> Result<(), FsError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| FsError::InvalidArgument(format!("{} has no parent", logical.as_str())))?;
-    fs::create_dir_all(parent).map_err(|error| map_io(logical, error))?;
-    let mut temporary =
-        tempfile::NamedTempFile::new_in(parent).map_err(|error| map_io(logical, error))?;
-    temporary
-        .write_all(content)
-        .map_err(|error| map_io(logical, error))?;
-    temporary.flush().map_err(|error| map_io(logical, error))?;
-    temporary
-        .persist(path)
-        .map_err(|error| map_io(logical, error.error))?;
-    Ok(())
 }
 
 fn hash_bytes(content: &[u8]) -> ContentHash {

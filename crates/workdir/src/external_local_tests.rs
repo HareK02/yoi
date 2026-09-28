@@ -80,6 +80,82 @@ async fn external_local_provider_is_strictly_read_only() {
 }
 
 #[tokio::test]
+async fn external_local_provider_read_write_is_filesystem_only() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("item.txt"), "original").unwrap();
+    let session = LocalWorkdirSession::external_read_write(
+        Workdir::new("external-workdir-rw"),
+        root.path(),
+        BoundedReadLimits::new(4096, 1024).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(session.capabilities(), WorkdirSessionCapabilities::READ_WRITE);
+    assert!(!session.capabilities().supports(WorkdirSessionCapability::Command));
+
+    let observed = WorkdirSession::read(
+        &session,
+        ReadRequest {
+            path: WorkdirPath::new("item.txt").unwrap(),
+            offset: 0,
+            limit: 10,
+            max_bytes: 1024,
+        },
+    )
+    .await
+    .unwrap();
+    WorkdirSession::edit(
+        &session,
+        EditRequest {
+            path: WorkdirPath::new("item.txt").unwrap(),
+            old_string: "original".to_string(),
+            new_string: "changed".to_string(),
+            replace_all: false,
+            expected_hash: observed.content_hash,
+        },
+    )
+    .await
+    .unwrap();
+    WorkdirSession::write(
+        &session,
+        WriteRequest {
+            path: WorkdirPath::new("created.txt").unwrap(),
+            content: b"created".to_vec(),
+            expected_hash: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("item.txt")).unwrap(),
+        "changed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("created.txt")).unwrap(),
+        "created"
+    );
+    let command = WorkdirSession::start_command(
+        &session,
+        CommandRequest {
+            command: "touch command-ran".to_string(),
+            timeout_secs: 1,
+            output_limit: 1024,
+            cwd: WorkdirPath::root(),
+            spill_dir: None,
+            tool_call_id: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        command,
+        WorkdirError::Unsupported(WorkdirSessionCapability::Command)
+    ));
+    assert!(!root.path().join("command-ran").exists());
+}
+
+#[tokio::test]
 async fn common_dispatcher_preserves_operation_result_pairing_and_capabilities() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("item.txt"), "visible").unwrap();
@@ -226,6 +302,51 @@ async fn external_local_provider_rejects_symlink_roots_and_traversal() {
     )
     .unwrap_err();
     assert!(matches!(error, WorkdirError::Denied(_)));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn external_read_write_provider_rejects_symlink_mutation_escape() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+    symlink(
+        outside.path().join("secret.txt"),
+        root.path().join("outside.txt"),
+    )
+    .unwrap();
+    let session = LocalWorkdirSession::external_read_write(
+        Workdir::new("external-workdir-rw-symlink"),
+        root.path(),
+        BoundedReadLimits::new(4096, 1024).unwrap(),
+    )
+    .unwrap();
+
+    let error = WorkdirSession::write(
+        &session,
+        WriteRequest {
+            path: WorkdirPath::new("outside.txt").unwrap(),
+            content: b"escaped".to_vec(),
+            expected_hash: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            WorkdirError::SymlinkOutOfScope { .. }
+                | WorkdirError::OutOfScope(_)
+                | WorkdirError::Denied(_)
+        ),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
+        "secret"
+    );
 }
 
 #[cfg(target_os = "linux")]
