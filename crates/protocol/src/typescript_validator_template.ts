@@ -21,6 +21,8 @@ const MAX_RESOURCE_ID_BYTES = __MAX_RESOURCE_ID_BYTES__;
 const MAX_WORKER_IDS_PER_SELECTOR = __MAX_WORKER_IDS_PER_SELECTOR__;
 const MAX_REJECTION_MESSAGE_BYTES = __MAX_REJECTION_MESSAGE_BYTES__;
 const subscriptionFrameSchema: unknown = __SUBSCRIPTION_FRAME_SCHEMA__;
+export const RUST_SERIALIZED_SUBSCRIPTION_FRAME_FIXTURES: readonly unknown[] =
+  __RUST_SERIALIZED_FIXTURES__;
 const utf8 = new TextEncoder();
 
 type JsonObject = Record<string, unknown>;
@@ -99,10 +101,12 @@ function withinAggregateLimits(root: unknown): boolean {
       );
     }
     if (!isObject(value)) return false;
-    const entries = Object.values(value);
+    const entries = Object.entries(value);
     return (
       entries.length <= MAX_SUBSCRIPTION_COLLECTION_ITEMS &&
-      entries.every((entry) => visit(entry, depth + 1))
+      entries.every(
+        ([key, entry]) => visit(key, depth + 1) && visit(entry, depth + 1),
+      )
     );
   };
   return visit(root, 0);

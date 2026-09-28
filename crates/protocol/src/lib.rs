@@ -757,7 +757,6 @@ pub struct InternalWorkerSnapshot {
     pub revision: u64,
     pub session: SessionSnapshot,
     #[serde(default)]
-    #[cfg_attr(feature = "json-schema", schemars(required))]
     pub status: WorkerStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -811,13 +810,10 @@ pub struct PendingSubmissionSummary {
 pub struct PendingSubmissionsSnapshot {
     pub revision: u64,
     #[serde(default)]
-    #[cfg_attr(feature = "json-schema", schemars(required))]
     pub notification_count: u32,
     #[serde(default)]
-    #[cfg_attr(feature = "json-schema", schemars(required))]
     pub head_id: Option<String>,
     #[serde(default)]
-    #[cfg_attr(feature = "json-schema", schemars(required))]
     pub submissions: Vec<PendingSubmissionSummary>,
 }
 
@@ -831,7 +827,6 @@ pub struct PendingSubmissionsSnapshot {
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct SessionSnapshot {
     #[serde(default)]
-    #[cfg_attr(feature = "json-schema", schemars(required))]
     pub pending_submissions: PendingSubmissionsSnapshot,
     pub entries: Vec<SessionSnapshotEntry>,
 }
@@ -1099,7 +1094,6 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         disposition: Option<ToolResultDisposition>,
         #[serde(default)]
-        #[cfg_attr(feature = "json-schema", schemars(required))]
         is_error: bool,
     },
     /// Token accounting for one LLM request.
@@ -1328,7 +1322,6 @@ pub enum CompletionKind {
 pub struct CompletionEntry {
     pub value: String,
     #[serde(default)]
-    #[cfg_attr(feature = "json-schema", schemars(required))]
     pub is_dir: bool,
 }
 
@@ -1560,11 +1553,9 @@ pub struct Greeting {
     pub tools: Vec<String>,
     /// Model context window in tokens. Always filled by the Worker greeting.
     #[serde(default)]
-    #[cfg_attr(feature = "json-schema", schemars(required))]
     pub context_window: u64,
     /// Estimated current session context tokens at connect time.
     #[serde(default)]
-    #[cfg_attr(feature = "json-schema", schemars(required))]
     pub context_tokens: u64,
 }
 
@@ -1677,7 +1668,6 @@ pub struct ScopeRule {
     /// Which path identity an allow rule uses when symbolic links are
     /// encountered. Deny rules always inspect both identities.
     #[serde(default)]
-    #[cfg_attr(feature = "json-schema", schemars(required))]
     pub symlink_policy: SymlinkPolicy,
 }
 

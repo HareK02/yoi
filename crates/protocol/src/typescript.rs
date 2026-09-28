@@ -156,6 +156,8 @@ pub fn generated_protocol_validator() -> String {
         .expect("SubscriptionFrame schema must serialize");
     close_object_shapes(&mut schema);
     let schema = serde_json::to_string(&schema).expect("SubscriptionFrame schema must serialize");
+    let fixtures = serde_json::to_string(&rust_serialized_subscription_frame_fixtures())
+        .expect("SubscriptionFrame fixtures must serialize");
     include_str!("typescript_validator_template.ts")
         .replace(
             "__GENERATED_PREAMBLE__",
@@ -202,6 +204,58 @@ pub fn generated_protocol_validator() -> String {
             &MAX_REJECTION_MESSAGE_BYTES.to_string(),
         )
         .replace("__SUBSCRIPTION_FRAME_SCHEMA__", &schema)
+        .replace("__RUST_SERIALIZED_FIXTURES__", &fixtures)
+}
+
+fn rust_serialized_subscription_frame_fixtures() -> Vec<SubscriptionFrame> {
+    let request_id =
+        SubscriptionRequestId::new("fixture-request").expect("fixture request id must be valid");
+    let subscription_id =
+        SubscriptionId::new("fixture-subscription").expect("fixture subscription id must be valid");
+    let worker_id =
+        SubscriptionWorkerId::new("fixture-worker").expect("fixture worker id must be valid");
+    let worker = SubscriptionWorker {
+        worker_id: worker_id.clone(),
+        runtime_id: Some("fixture-runtime".to_string()),
+        resource_key: Some("fixture-worker-resource".to_string()),
+        availability: SubscriptionWorkerAvailability::default(),
+        subject_revision: 1,
+        worker_state: None,
+        state: SubscriptionWorkerState::Idle,
+        has_running_internal_workers: false,
+        workspace_id: Some("fixture-workspace".to_string()),
+        display_name: None,
+        profile: None,
+        workdir_attachments: Vec::new(),
+    };
+    let subscribed = SubscriptionFrame::new(SubscriptionFramePayload::Response(
+        SubscriptionResponse::Subscribed {
+            request_id,
+            subscription_id: subscription_id.clone(),
+            selector: EventSubscriptionSelector::WorkspaceWorkers,
+            snapshot_revision: 1,
+            snapshot: SubscriptionSnapshot::Workers {
+                workers: vec![worker],
+            },
+        },
+    ));
+    let pending =
+        SubscriptionFrame::new(SubscriptionFramePayload::Event(SubscriptionEvent::Event {
+            subscription_id,
+            subject_revision: 2,
+            payload: SubscriptionEventPayload::WorkerProtocol {
+                worker_id,
+                event: Event::PendingSubmissionsChanged {
+                    pending: PendingSubmissionsSnapshot::default(),
+                },
+            },
+        }));
+    for fixture in [&subscribed, &pending] {
+        fixture
+            .validate()
+            .expect("Rust-serialized Browser compatibility fixture must validate");
+    }
+    vec![subscribed, pending]
 }
 
 fn close_object_shapes(schema: &mut Value) {
@@ -218,10 +272,105 @@ fn close_object_shapes(schema: &mut Value) {
     for value in object.values_mut() {
         close_object_shapes(value);
     }
+    normalize_null_default(object);
+    normalize_integer_format(object);
+    require_serialized_defaults(object);
     if object.get("type").and_then(Value::as_str) == Some("object")
         && object.contains_key("properties")
     {
         object.insert("additionalProperties".to_string(), Value::Bool(false));
+    }
+}
+
+fn normalize_null_default(schema: &mut Map<String, Value>) {
+    if schema.get("default") != Some(&Value::Null) || schema.contains_key("anyOf") {
+        return;
+    }
+    let Some(schema_type) = schema.get_mut("type") else {
+        return;
+    };
+    match schema_type {
+        Value::String(value) if value != "null" => {
+            *schema_type = Value::Array(vec![
+                Value::String(value.clone()),
+                Value::String("null".into()),
+            ]);
+        }
+        Value::Array(values) if !values.iter().any(|value| value.as_str() == Some("null")) => {
+            values.push(Value::String("null".into()));
+        }
+        _ => {}
+    }
+}
+
+fn normalize_integer_format(schema: &mut Map<String, Value>) {
+    let is_integer = match schema.get("type") {
+        Some(Value::String(value)) => value == "integer",
+        Some(Value::Array(values)) => values.iter().any(|value| value.as_str() == Some("integer")),
+        _ => false,
+    };
+    if !is_integer {
+        return;
+    }
+    let Some(format) = schema.get("format").and_then(Value::as_str) else {
+        return;
+    };
+    let (minimum, maximum) = match format {
+        "uint16" => (0.0, u16::MAX as f64),
+        "uint32" => (0.0, u32::MAX as f64),
+        "uint" | "uint64" => (0.0, 9_007_199_254_740_991.0),
+        "int32" => (i32::MIN as f64, i32::MAX as f64),
+        "int64" => (-9_007_199_254_740_991.0, 9_007_199_254_740_991.0),
+        other => panic!("unsupported integer format in SubscriptionFrame schema: {other}"),
+    };
+    tighten_numeric_bound(schema, "minimum", minimum, f64::max);
+    tighten_numeric_bound(schema, "maximum", maximum, f64::min);
+}
+
+fn tighten_numeric_bound(
+    schema: &mut Map<String, Value>,
+    keyword: &str,
+    contract_bound: f64,
+    tighten: fn(f64, f64) -> f64,
+) {
+    let bound = schema
+        .get(keyword)
+        .and_then(Value::as_f64)
+        .map_or(contract_bound, |existing| tighten(existing, contract_bound));
+    schema.insert(
+        keyword.to_string(),
+        Value::Number(serde_json::Number::from_f64(bound).expect("finite JSON Schema bound")),
+    );
+}
+
+fn require_serialized_defaults(schema: &mut Map<String, Value>) {
+    if schema.get("type").and_then(Value::as_str) != Some("object") {
+        return;
+    }
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+    let defaulted = properties
+        .iter()
+        .filter(|(_, property)| {
+            property
+                .as_object()
+                .is_some_and(|value| value.contains_key("default"))
+        })
+        .map(|(key, _)| Value::String(key.clone()))
+        .collect::<Vec<_>>();
+    if defaulted.is_empty() {
+        return;
+    }
+    let required = schema
+        .entry("required")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .expect("object required must be an array");
+    for key in defaulted {
+        if !required.contains(&key) {
+            required.push(key);
+        }
     }
 }
 
@@ -317,6 +466,41 @@ mod tests {
         assert!(!generated.contains("repository_id?:"), "{generated}");
         assert!(!generated.contains("repository_id:"), "{generated}");
         assert!(generated.contains("repository_key"), "{generated}");
+    }
+
+    #[test]
+    fn generated_schema_matches_serialized_defaults_and_rust_integer_widths() {
+        let mut schema = serde_json::to_value(schemars::schema_for!(SubscriptionFrame)).unwrap();
+        close_object_shapes(&mut schema);
+
+        let worker_required = schema
+            .pointer("/$defs/SubscriptionWorker/required")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert!(worker_required.contains(&Value::String("availability".into())));
+        assert!(worker_required.contains(&Value::String("has_running_internal_workers".into())));
+
+        let pending_required = schema
+            .pointer("/$defs/PendingSubmissionsSnapshot/required")
+            .and_then(Value::as_array)
+            .unwrap();
+        for field in ["notification_count", "head_id", "submissions"] {
+            assert!(pending_required.contains(&Value::String(field.into())));
+        }
+        assert_eq!(
+            schema.pointer("/$defs/PendingSubmissionsSnapshot/properties/head_id/type"),
+            Some(&serde_json::json!(["string", "null"]))
+        );
+        assert!(
+            generated_protocol_validator().contains("\"format\":\"uint32\",\"maximum\":4294967295")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "unsupported integer format")]
+    fn generated_schema_rejects_unknown_integer_formats() {
+        let mut unsupported = serde_json::json!({"type": "integer", "format": "uint128"});
+        close_object_shapes(&mut unsupported);
     }
 
     #[test]

@@ -645,7 +645,6 @@ pub struct SubscriptionWorker {
     /// Freshness of the Runtime-backed observation carried by this projection.
     /// `Unavailable` preserves catalog membership without claiming that execution stopped.
     #[serde(default)]
-    #[cfg_attr(feature = "json-schema", schemars(required))]
     pub availability: SubscriptionWorkerAvailability,
     /// Producer-owned monotonic revision for this Worker subject.
     pub subject_revision: u64,
@@ -656,7 +655,6 @@ pub struct SubscriptionWorker {
     /// Runtime catalog lifecycle compatibility projection; not foreground-state authority.
     pub state: SubscriptionWorkerState,
     #[serde(default)]
-    #[cfg_attr(feature = "json-schema", schemars(required))]
     pub has_running_internal_workers: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,

@@ -1,6 +1,8 @@
 import type { EventSubscriptionSelector, SubscriptionFrame } from '$lib/generated/protocol';
 import {
   decodeSubscriptionFrame,
+  MAX_SUBSCRIPTION_STRING_BYTES,
+  RUST_SERIALIZED_SUBSCRIPTION_FRAME_FIXTURES,
   subscriptionFrameMatchesSelector,
 } from '$lib/generated/protocol-validator';
 
@@ -40,6 +42,13 @@ Deno.test('generated subscription validator accepts a current exact frame', () =
   assert(result.value.frame === 'response', 'expected response frame');
 });
 
+Deno.test('Rust-serialized compatibility fixtures satisfy the generated Browser contract', () => {
+  for (const fixture of RUST_SERIALIZED_SUBSCRIPTION_FRAME_FIXTURES) {
+    const result = decode(fixture);
+    assert(result.ok, `Rust fixture was rejected: ${JSON.stringify(result)}`);
+  }
+});
+
 Deno.test('generated subscription validator rejects malformed and newer shapes', () => {
   const cases: Array<[string, unknown]> = [
     ['malformed json', '{'],
@@ -52,6 +61,19 @@ Deno.test('generated subscription validator rejects malformed and newer shapes',
     ],
     ['wrong field type', subscribedFrame({ snapshot_revision: '1' })],
     ['unsafe integer', subscribedFrame({ snapshot_revision: Number.MAX_SAFE_INTEGER + 1 })],
+    [
+      'missing serialized Worker defaults',
+      subscribedFrame({
+        snapshot: {
+          topic: 'workers',
+          data: {
+            workers: [
+              { worker_id: 'worker-1', subject_revision: 1, state: 'idle' },
+            ],
+          },
+        },
+      }),
+    ],
     ['unsupported version', { ...subscribedFrame(), protocol_version: 2 }],
     [
       'newer Worker event',
@@ -66,6 +88,37 @@ Deno.test('generated subscription validator rejects malformed and newer shapes',
             payload: {
               event: 'worker_protocol',
               data: { worker_id: 'worker-1', event: { event: 'future_event' } },
+            },
+          },
+        },
+      },
+    ],
+    [
+      'out-of-range Rust u32',
+      {
+        protocol_version: 1,
+        frame: 'event',
+        message: {
+          event: 'event',
+          data: {
+            subscription_id: 'subscription-1',
+            subject_revision: 2,
+            payload: {
+              event: 'worker_protocol',
+              data: {
+                worker_id: 'worker-1',
+                event: {
+                  event: 'llm_retry',
+                  data: {
+                    llm_call: 1,
+                    failed_attempt: 4_294_967_296,
+                    max_attempts: 2,
+                    wait_ms: 1,
+                    elapsed_ms: 1,
+                    error: 'retry',
+                  },
+                },
+              },
             },
           },
         },
@@ -159,6 +212,32 @@ Deno.test('generated subscription validator enforces Rust semantic bounds and se
     const result = decode(value);
     assert(!result.ok, `${name} unexpectedly passed`);
   }
+});
+
+Deno.test('aggregate limits include keys in unconstrained Worker JSON values', () => {
+  const oversizedKey = 'k'.repeat(MAX_SUBSCRIPTION_STRING_BYTES + 1);
+  const result = decode({
+    protocol_version: 1,
+    frame: 'event',
+    message: {
+      event: 'event',
+      data: {
+        subscription_id: 'subscription-1',
+        subject_revision: 2,
+        payload: {
+          event: 'worker_protocol',
+          data: {
+            worker_id: 'worker-1',
+            event: {
+              event: 'system_item',
+              data: { item: { [oversizedKey]: true } },
+            },
+          },
+        },
+      },
+    },
+  });
+  assert(!result.ok && result.reason === 'aggregate_limit', 'oversized object key passed');
 });
 
 Deno.test('stateful selector validation fences a routed event before projection', () => {
