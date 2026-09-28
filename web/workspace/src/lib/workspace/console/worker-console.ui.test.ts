@@ -555,6 +555,56 @@ Deno.test("Worker Console uses protocol observation events without transcript fe
   );
 });
 
+Deno.test("Worker Console models availability separately from projected lines", async () => {
+  const consolePage = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
+      import.meta.url,
+    ),
+  );
+  const displayState = await Deno.readTextFile(
+    new URL("./ConsoleDisplayState.svelte", import.meta.url),
+  );
+  const displayModel = await Deno.readTextFile(
+    new URL("./console-display-state.ts", import.meta.url),
+  );
+
+  assert(
+    consolePage.includes("consoleDisplayState") &&
+      consolePage.includes("pendingInitialSnapshotApplication") &&
+      consolePage.includes('source: "retained"') &&
+      consolePage.includes('source: "live"') &&
+      consolePage.includes("completeInitialSnapshot(") &&
+      consolePage.includes("showConsoleUnavailable(") &&
+      consolePage.includes("retryConsoleLoad") &&
+      !consolePage.includes(
+        "{#if lines.length === 0}\n                    <p>No console output",
+      ),
+    "Console availability must advance on snapshot projection rather than infer loading, failure, or empty history from line count",
+  );
+  assert(
+    displayModel.includes('kind: "loading"') &&
+      displayModel.includes('kind: "ready"') &&
+      displayModel.includes('kind: "unavailable"') &&
+      displayModel.includes('kind: "failed"') &&
+      displayModel.includes('kind: "stale"') &&
+      displayModel.includes("MAX_CONSOLE_REASON_LENGTH = 240"),
+    "Console display state must explicitly model loading, ready, unavailable, failed, and stale outcomes with bounded reasons",
+  );
+  assert(
+    displayState.includes('role="status"') &&
+      displayState.includes('role="alert"') &&
+      displayState.includes('aria-live="polite"') &&
+      displayState.includes("prefers-reduced-motion: no-preference") &&
+      displayState.includes("Read-only retained conversation") &&
+      displayState.includes(
+        "No console items match the current display mode.",
+      ) &&
+      displayState.includes(">Retry</button>"),
+    "Console state presentation must expose accessible loading/errors, retained and filtered-empty copy, retry, and reduced-motion-safe animation",
+  );
+});
+
 Deno.test("Worker Console owns its narrower centered shell width", async () => {
   const page = await Deno.readTextFile(
     new URL(
