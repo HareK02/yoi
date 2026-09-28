@@ -860,6 +860,92 @@ fn ticket_rescope_requires_fresh_review_before_merge_and_remains_recoverable() {
 }
 
 #[test]
+fn ticket_rescope_after_integration_accepts_fresh_requirement_attestation() {
+    let (dir, store) = fixture();
+    open(&store);
+    let integration_approval = approve(&store, "subject", "token-integration");
+    store
+        .complete(CompleteMergeRequest {
+            merge_request_id: "MR".into(),
+            ticket_id: "T".into(),
+            operation_id: "merge".into(),
+            approval_event_id: integration_approval.event_id,
+            current_subject_ref: "subject".into(),
+            target_ref_before: "target-before".into(),
+            target_ref_after: "target-after".into(),
+            strategy: MergeStrategy::FastForward,
+            resolution: ConflictResolution::None,
+            auth: auth(),
+            now: at(5),
+        })
+        .unwrap();
+    let connection = Connection::open(dir.path().join("db")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO typed_ticket_events VALUES('W','T',1,'item_edit','user','t2',NULL,NULL,NULL,NULL)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO typed_ticket_event_attributes VALUES('W','T',1,'event_id','t2')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    store
+        .register_reviewer_child_session(RegisterReviewerChildSession {
+            workspace_id: "W".into(),
+            parent_runtime_id: "runtime".into(),
+            parent_worker_id: "coder".into(),
+            child_session_id: "child-post-merge".into(),
+            reviewer_profile: "builtin:reviewer".into(),
+            now: at(6),
+        })
+        .unwrap();
+    store
+        .request_review(RequestMergeRequestReview {
+            merge_request_id: "MR".into(),
+            ticket_id: "T".into(),
+            ticket_item_revision: "t2".into(),
+            ticket_merge_request_subjects: vec![MergeRequestReviewSubject {
+                merge_request_id: "MR".into(),
+                subject_ref: "subject".into(),
+            }],
+            subject_ref: "subject".into(),
+            child_session_id: "child-post-merge".into(),
+            capability_token: "token-post-merge".into(),
+            auth: auth(),
+            now: at(7),
+        })
+        .unwrap();
+    let requirement_approval = store
+        .submit_review(SubmitMergeRequestReview {
+            merge_request_id: "MR".into(),
+            ticket_id: "T".into(),
+            current_subject_ref: "subject".into(),
+            capability_token: "token-post-merge".into(),
+            decision: ReviewDecision::Approve,
+            body: "rescope requirements approved against merged result".into(),
+            findings: vec![],
+            now: at(8),
+        })
+        .unwrap();
+    store
+        .complete_ticket(CompleteTicket {
+            ticket_id: "T".into(),
+            operation_id: "ticket-complete-post-rescope".into(),
+            item_revision: "t2".into(),
+            merge_request_ids: vec!["MR".into()],
+            requirement_approval_event_id: requirement_approval.event_id,
+            auth: auth(),
+            now: at(9),
+        })
+        .unwrap();
+}
+
+#[test]
 fn review_request_rejects_a_snapshot_that_omits_a_linked_merge_request() {
     let (_dir, store) = fixture();
     open_for(&store, "MR", "R");

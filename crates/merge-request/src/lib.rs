@@ -570,7 +570,9 @@ impl MergeRequestStore {
         }
         let mr = self.get_for_operation(&i.auth.workspace_id, &i.merge_request_id, &i.ticket_id)?;
         self.assigned(&i.auth, &i.ticket_id, &mr.repository_id)?;
-        if mr.state != MergeRequestState::Open || mr.selector_from.is_none() {
+        if mr.state == MergeRequestState::Closed
+            || (mr.state == MergeRequestState::Open && mr.selector_from.is_none())
+        {
             return Err(MergeRequestError::Conflict(
                 "Merge Request is not reviewable".into(),
             ));
@@ -587,7 +589,9 @@ impl MergeRequestStore {
         let current_mr = load_mr(&t, &i.auth.workspace_id, &i.merge_request_id)?
             .filter(|request| request.ticket_ids.iter().any(|id| id == &i.ticket_id))
             .ok_or(MergeRequestError::NotFound)?;
-        if current_mr.state != MergeRequestState::Open || current_mr.selector_from.is_none() {
+        if current_mr.state == MergeRequestState::Closed
+            || (current_mr.state == MergeRequestState::Open && current_mr.selector_from.is_none())
+        {
             return Err(MergeRequestError::Conflict(
                 "Merge Request changed before review request".into(),
             ));
@@ -659,7 +663,7 @@ impl MergeRequestStore {
                    JOIN merge_requests mr
                      ON mr.workspace_id=g.workspace_id AND mr.merge_request_id=g.merge_request_id
                   WHERE g.capability_token=?1 AND g.merge_request_id=?2
-                    AND g.status='issued' AND mr.state='open'",
+                    AND g.status='issued' AND mr.state IN('open','merged')",
                 params![capability_token, merge_request_id],
                 |row| {
                     Ok(ReviewSubmissionAuthorization {
@@ -695,7 +699,7 @@ impl MergeRequestStore {
                      ON mr.workspace_id=g.workspace_id AND mr.merge_request_id=g.merge_request_id
                   WHERE g.capability_token=?1 AND rel.ticket_id=?2
                     AND g.merge_request_id=?3
-                    AND g.status='issued' AND mr.state='open'",
+                    AND g.status='issued' AND mr.state IN('open','merged')",
                 params![i.capability_token, i.ticket_id, i.merge_request_id],
                 |r| {
                     Ok((
@@ -1216,18 +1220,34 @@ impl MergeRequestStore {
                     ))
                 })?;
             let review = request
-                .effective_review(&merge.approved_source_ref)
-                .filter(|review| review.event_id == merge.approval_event_id)
+                .thread
+                .iter()
+                .find_map(|event| match event {
+                    MergeRequestThreadEvent::Review(review)
+                        if review.event_id == merge.approval_event_id
+                            && review.subject_ref == merge.approved_source_ref =>
+                    {
+                        Some(review)
+                    }
+                    _ => None,
+                })
+                .filter(|review| {
+                    !request.thread.iter().any(|event| {
+                        matches!(
+                            event,
+                            MergeRequestThreadEvent::ReviewRevoked(revoked)
+                                if revoked.review_event_id == review.event_id
+                        )
+                    })
+                })
                 .ok_or_else(|| {
                     MergeRequestError::NotReady(format!(
-                        "Merge Request `{merge_request_id}` approval is no longer effective"
+                        "Merge Request `{merge_request_id}` integration approval is missing or revoked"
                     ))
                 })?;
-            if review.decision != ReviewDecision::Approve
-                || review.ticket_item_revision != input.item_revision
-            {
+            if review.decision != ReviewDecision::Approve {
                 return Err(MergeRequestError::NotReady(format!(
-                    "Merge Request `{merge_request_id}` lacks approval bound to the current Ticket revision"
+                    "Merge Request `{merge_request_id}` lacks an approved integration result"
                 )));
             }
             merged_subjects.push(MergeRequestReviewSubject {

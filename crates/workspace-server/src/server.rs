@@ -12095,6 +12095,25 @@ fn merge_request_ticket_id(mr: &merge_request::MergeRequest) -> ApiResult<String
     }
 }
 
+fn merged_result_source_ref(mr: &merge_request::MergeRequest) -> ApiResult<String> {
+    mr.thread
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            merge_request::MergeRequestThreadEvent::Merge(event) => {
+                Some(event.approved_source_ref.clone())
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            Error::MergeRequest(merge_request::MergeRequestError::Corrupt(format!(
+                "merged Merge Request `{}` has no MergeResult",
+                mr.merge_request_id
+            )))
+            .into()
+        })
+}
+
 fn public_merge_request_state(
     state: merge_request::MergeRequestState,
 ) -> server_api::MergeRequestState {
@@ -12852,44 +12871,39 @@ async fn scoped_register_merge_request_review_capability(
         )
         .into());
     }
-    let selector = mr
-        .selector_from
-        .as_deref()
-        .ok_or_else(|| Error::InvalidInput("selector_from requires repair".into()))?;
-    let source_observation = observe_published_source_ref(
-        &api,
-        &workspace_id,
-        &assignment.worker.runtime_id,
-        &mr.repository_id,
-        selector,
-    )?;
-    require_assigned_workdir_source(
-        &api,
-        &assignment,
-        &mr.repository_id,
-        selector,
-        &source_observation.revision_ref,
-    )?;
-    let subject_ref = source_observation.revision_ref;
+    let subject_ref = match mr.state {
+        merge_request::MergeRequestState::Merged => merged_result_source_ref(&mr)?,
+        merge_request::MergeRequestState::Open => {
+            let selector = mr
+                .selector_from
+                .as_deref()
+                .ok_or_else(|| Error::InvalidInput("selector_from requires repair".into()))?;
+            let source_observation = observe_published_source_ref(
+                &api,
+                &workspace_id,
+                &assignment.worker.runtime_id,
+                &mr.repository_id,
+                selector,
+            )?;
+            require_assigned_workdir_source(
+                &api,
+                &assignment,
+                &mr.repository_id,
+                selector,
+                &source_observation.revision_ref,
+            )?;
+            source_observation.revision_ref
+        }
+        merge_request::MergeRequestState::Closed => {
+            return Err(
+                Error::InvalidInput("closed Merge Request is not reviewable".into()).into(),
+            );
+        }
+    };
     let mut ticket_merge_request_subjects = Vec::new();
     for linked in store.list_for_ticket(&workspace_id, &ticket_id)? {
         let linked_subject_ref = if linked.state == merge_request::MergeRequestState::Merged {
-            linked
-                .thread
-                .iter()
-                .rev()
-                .find_map(|event| match event {
-                    merge_request::MergeRequestThreadEvent::Merge(event) => {
-                        Some(event.approved_source_ref.clone())
-                    }
-                    _ => None,
-                })
-                .ok_or_else(|| {
-                    Error::MergeRequest(merge_request::MergeRequestError::Corrupt(format!(
-                        "merged Merge Request `{}` has no MergeResult",
-                        linked.merge_request_id
-                    )))
-                })?
+            merged_result_source_ref(&linked)?
         } else {
             let linked_selector = linked.selector_from.as_deref().ok_or_else(|| {
                 Error::InvalidInput(format!(
@@ -12953,24 +12967,34 @@ async fn scoped_submit_merge_request_review(
     }
     let ticket_id = review_authorization.ticket_id;
     let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
-    let selector = mr
-        .selector_from
-        .as_deref()
-        .ok_or_else(|| Error::InvalidInput("selector_from requires repair".into()))?;
     let assignment = api
         .store
         .get_current_ticket_coder_assignment(&workspace_id, &ticket_id)?
         .ok_or_else(|| {
             Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
         })?;
-    let current_subject_ref = observe_published_source_ref(
-        &api,
-        &workspace_id,
-        &assignment.worker.runtime_id,
-        &mr.repository_id,
-        selector,
-    )?
-    .revision_ref;
+    let current_subject_ref = match mr.state {
+        merge_request::MergeRequestState::Merged => merged_result_source_ref(&mr)?,
+        merge_request::MergeRequestState::Open => {
+            let selector = mr
+                .selector_from
+                .as_deref()
+                .ok_or_else(|| Error::InvalidInput("selector_from requires repair".into()))?;
+            observe_published_source_ref(
+                &api,
+                &workspace_id,
+                &assignment.worker.runtime_id,
+                &mr.repository_id,
+                selector,
+            )?
+            .revision_ref
+        }
+        merge_request::MergeRequestState::Closed => {
+            return Err(
+                Error::InvalidInput("closed Merge Request is not reviewable".into()).into(),
+            );
+        }
+    };
     let decision = internal_review_decision(input.decision);
     let findings = input
         .findings
