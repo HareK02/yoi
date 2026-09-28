@@ -2,8 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use merge_request::{
-    MergeRequest, MergeRequestError, MergeRequestState, MergeRequestStore, MergeRequestThreadEvent,
-    ReviewDecision,
+    MergeRequest, MergeRequestState, MergeRequestStore, MergeRequestThreadEvent, ReviewDecision,
 };
 use project_record::{allocate_record_id, unix_epoch_millis_now};
 use rusqlite::{params_from_iter, types::Value as SqlValue};
@@ -856,8 +855,8 @@ impl SqliteWorkspaceAuthority {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let write_repository_key = ticket_write_target_repository_key(&targets);
-        let has_target = write_repository_key.is_some();
+        let write_repository_keys = ticket_write_target_repository_keys(&targets);
+        let has_target = !write_repository_keys.is_empty();
         let has_blockers = !ticket.relations.blockers.is_empty();
         let mut queue_assignment_blockers = Vec::new();
         for ticket_id in &dependency_check.queue_tickets {
@@ -929,8 +928,12 @@ impl SqliteWorkspaceAuthority {
             queue_tickets: dependency_check.queue_tickets.clone(),
             blockers: action_blockers,
         };
-        let merge_request = match self.merge_request_store.get(&self.workspace_id, id) {
-            Ok(request) => {
+        let merge_requests = self
+            .merge_request_store
+            .list_for_ticket(&self.workspace_id, id)
+            .map_err(|error| Error::Store(error.to_string()))?
+            .into_iter()
+            .map(|request| {
                 let current_subject_ref = request.selector_from.as_deref().and_then(|selector| {
                     self.merge_revision_source
                         .resolve_subject_ref(&request.repository_id, selector)
@@ -940,17 +943,16 @@ impl SqliteWorkspaceAuthority {
                     .get_repository(&self.workspace_id, &request.repository_id)?
                     .map(|repository| repository.repository_key)
                     .ok_or_else(|| Error::UnknownRepository(request.repository_id.clone()))?;
-                Some(merge_request_summary(
+                Ok(merge_request_summary(
                     request,
                     repository_key,
                     current_subject_ref,
                 ))
-            }
-            Err(MergeRequestError::NotFound) => None,
-            Err(error) => return Err(Error::Store(error.to_string())),
-        };
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let merge_request = (merge_requests.len() == 1).then(|| merge_requests[0].clone());
         let evidence =
-            ticket_evidence_summary(write_repository_key, &ticket.events, merge_request.as_ref());
+            ticket_evidence_summary(&write_repository_keys, &ticket.events, &merge_requests);
         let item_revision = ticket
             .events
             .iter()
@@ -1031,6 +1033,7 @@ impl SqliteWorkspaceAuthority {
             current_coder,
             assignment_diagnostics,
             action_eligibility,
+            merge_requests,
             merge_request,
             evidence,
             resolution: ticket
@@ -1850,81 +1853,93 @@ fn event_timestamp(event: &TicketEvent) -> Option<DateTime<Utc>> {
         .map(|value| value.with_timezone(&Utc))
 }
 
-fn ticket_write_target_repository_key(targets: &[ticket::TicketTarget]) -> Option<&str> {
-    let mut write_targets = targets
+fn ticket_write_target_repository_keys(targets: &[ticket::TicketTarget]) -> Vec<&str> {
+    targets
         .iter()
-        .filter(|target| target.access == ticket::TicketTargetAccess::ReadWrite);
-    let write_target = write_targets.next()?;
-    write_targets
-        .next()
-        .is_none()
-        .then_some(write_target.repository_key.as_str())
+        .filter(|target| target.access == ticket::TicketTargetAccess::ReadWrite)
+        .map(|target| target.repository_key.as_str())
+        .collect()
 }
 
 fn ticket_evidence_summary(
-    ticket_write_repository_key: Option<&str>,
+    ticket_write_repository_keys: &[&str],
     events: &[TicketEvent],
-    merge_request: Option<&TicketMergeRequestSummary>,
+    merge_requests: &[TicketMergeRequestSummary],
 ) -> TicketEvidenceSummary {
-    let linked_merge_request = merge_request.filter(|request| {
-        request.state == "open"
-            && ticket_write_repository_key
-                .is_some_and(|repository_key| repository_key == request.repository_key)
-    });
-    let has_merge_request = linked_merge_request.is_some();
-    let has_current_subject_ref = linked_merge_request.is_some_and(|request| {
-        request
-            .current_subject_ref
-            .as_deref()
-            .is_some_and(|subject_ref| !subject_ref.is_empty())
-    });
-    let has_review_request = linked_merge_request.is_some_and(|request| {
-        request
-            .review_subject_ref
-            .as_deref()
-            .is_some_and(|subject_ref| !subject_ref.is_empty())
-    });
+    let relevant = merge_requests
+        .iter()
+        .filter(|request| {
+            request.state != "closed"
+                && ticket_write_repository_keys.contains(&request.repository_key.as_str())
+        })
+        .collect::<Vec<_>>();
+    let has_merge_request = !relevant.is_empty();
+    let has_current_subject_ref = has_merge_request
+        && relevant.iter().all(|request| {
+            request.state == "merged"
+                || request
+                    .current_subject_ref
+                    .as_deref()
+                    .is_some_and(|subject_ref| !subject_ref.is_empty())
+        });
+    let has_review_request = has_merge_request
+        && relevant.iter().all(|request| {
+            request.state == "merged"
+                || request
+                    .review_subject_ref
+                    .as_deref()
+                    .is_some_and(|subject_ref| !subject_ref.is_empty())
+        });
     let has_commit = has_current_subject_ref;
-    let review_status = linked_merge_request.map(|request| request.review_status.clone());
-    let approved_current_subject = review_status.as_deref() == Some("approved");
-    let unresolved_request_changes = review_status.as_deref() == Some("changes_requested");
+    let unresolved_request_changes = relevant
+        .iter()
+        .any(|request| request.review_status == "changes_requested");
+    let approved_current_subject = has_merge_request
+        && relevant
+            .iter()
+            .all(|request| request.state == "merged" || request.review_status == "approved");
+    let review_status = if !has_merge_request {
+        None
+    } else if unresolved_request_changes {
+        Some("changes_requested".to_string())
+    } else if approved_current_subject {
+        Some("approved".to_string())
+    } else {
+        Some("pending".to_string())
+    };
     let latest_rescope = events
         .iter()
         .filter(|event| substantive_item_edit(event))
         .last();
     let review_after_rescope = approved_current_subject
-        && latest_rescope.is_none_or(|rescope| {
-            let Some(rescope_at) = event_timestamp(rescope) else {
-                return false;
-            };
-            let Some(requested_at) = linked_merge_request
-                .and_then(|request| request.review_requested_at.as_deref())
-                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-                .map(|value| value.with_timezone(&Utc))
-            else {
-                return false;
-            };
-            let Some(reviewed_at) = linked_merge_request
-                .and_then(|request| request.review_submitted_at.as_deref())
-                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-                .map(|value| value.with_timezone(&Utc))
-            else {
-                return false;
-            };
-            requested_at > rescope_at && reviewed_at > rescope_at
+        && relevant.iter().all(|request| {
+            latest_rescope.is_none_or(|rescope| {
+                let Some(rescope_at) = event_timestamp(rescope) else {
+                    return false;
+                };
+                let Some(requested_at) = request
+                    .review_requested_at
+                    .as_deref()
+                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                    .map(|value| value.with_timezone(&Utc))
+                else {
+                    return false;
+                };
+                let Some(reviewed_at) = request
+                    .review_submitted_at
+                    .as_deref()
+                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                    .map(|value| value.with_timezone(&Utc))
+                else {
+                    return false;
+                };
+                requested_at > rescope_at && reviewed_at > rescope_at
+            })
         });
 
     let mut missing = Vec::new();
-    match merge_request {
-        None => missing.push("merge_request".to_string()),
-        Some(request) if request.state != "open" => missing.push("open_merge_request".to_string()),
-        Some(request)
-            if ticket_write_repository_key
-                .is_none_or(|repository_key| repository_key != request.repository_key) =>
-        {
-            missing.push("merge_request_repository".to_string())
-        }
-        Some(_) => {}
+    if !has_merge_request {
+        missing.push("merge_request".to_string());
     }
     if !has_current_subject_ref {
         missing.push("current_subject_ref".to_string());
@@ -2349,6 +2364,7 @@ fn ticket_query_item(
         unresolved_blocker_count: detail.relations.blockers.len(),
         unresolved_review_count: usize::from(detail.evidence.unresolved_request_changes),
         evidence: detail.evidence.clone(),
+        merge_requests: detail.merge_requests.clone(),
         merge_request: detail.merge_request.clone(),
         current_coder: detail.current_coder.clone(),
     }
@@ -2789,6 +2805,7 @@ mod tests {
                 event_id: "request-1".to_string(),
                 sequence: 1,
                 subject_ref: "commit-1".to_string(),
+                ticket_item_revision: "revision-1".to_string(),
                 requested_by: reviewer.clone(),
                 reviewer: reviewer.clone(),
                 created_at: requested_at,
@@ -2798,6 +2815,7 @@ mod tests {
                 sequence: 2,
                 request_event_id: "request-1".to_string(),
                 subject_ref: "commit-1".to_string(),
+                ticket_item_revision: "revision-1".to_string(),
                 decision,
                 body: "review body".to_string(),
                 findings: Vec::new(),
@@ -2879,33 +2897,39 @@ mod tests {
     }
 
     #[test]
-    fn ticket_target_projection_requires_exactly_one_write_target() {
+    fn ticket_target_projection_accepts_multiple_write_targets() {
         let target = |repository_key: &str, access| ticket::TicketTarget {
             repository_key: repository_key.to_string(),
             ref_selector: Some("develop".to_string()),
             access,
         };
 
-        assert_eq!(ticket_write_target_repository_key(&[]), None);
-        assert_eq!(
-            ticket_write_target_repository_key(&[target(
+        assert!(ticket_write_target_repository_keys(&[]).is_empty());
+        assert!(
+            ticket_write_target_repository_keys(&[target(
                 "docs",
                 ticket::TicketTargetAccess::ReadOnly,
-            )]),
-            None,
+            )])
+            .is_empty()
         );
 
         let one_write = [
             target("main", ticket::TicketTargetAccess::ReadWrite),
             target("docs", ticket::TicketTargetAccess::ReadOnly),
         ];
-        assert_eq!(ticket_write_target_repository_key(&one_write), Some("main"),);
+        assert_eq!(
+            ticket_write_target_repository_keys(&one_write),
+            vec!["main"]
+        );
 
         let two_writes = [
             target("main", ticket::TicketTargetAccess::ReadWrite),
             target("docs", ticket::TicketTargetAccess::ReadWrite),
         ];
-        assert_eq!(ticket_write_target_repository_key(&two_writes), None);
+        assert_eq!(
+            ticket_write_target_repository_keys(&two_writes),
+            vec!["main", "docs"]
+        );
     }
 
     #[test]
@@ -2915,15 +2939,12 @@ mod tests {
             "docs".to_string(),
             Some("commit-1".to_string()),
         );
-        let evidence = ticket_evidence_summary(Some("main"), &[], Some(&read_only_request));
+        let evidence =
+            ticket_evidence_summary(&["main"], &[], std::slice::from_ref(&read_only_request));
 
         assert!(!evidence.has_merge_request);
         assert!(!evidence.complete_for_integration);
-        assert!(
-            evidence
-                .missing
-                .contains(&"merge_request_repository".to_string())
-        );
+        assert!(evidence.missing.contains(&"merge_request".to_string()));
     }
 
     #[test]
@@ -2933,19 +2954,19 @@ mod tests {
             "main".to_string(),
             Some("commit-1".to_string()),
         );
-        let evidence = ticket_evidence_summary(Some("main"), &[], Some(&approved));
+        let evidence = ticket_evidence_summary(&["main"], &[], std::slice::from_ref(&approved));
         assert!(evidence.complete_for_integration);
         assert!(evidence.approved_current_subject);
         assert!(evidence.review_after_rescope);
         assert!(evidence.has_commit);
 
         let with_audit_events = ticket_evidence_summary(
-            Some("main"),
+            &["main"],
             &[
                 ticket_event("comment", "2026-01-01T00:05:00Z", None),
                 ticket_event("implementation_report", "2026-01-01T00:06:00Z", None),
             ],
-            Some(&approved),
+            std::slice::from_ref(&approved),
         );
         assert!(with_audit_events.complete_for_integration);
 
@@ -2954,7 +2975,7 @@ mod tests {
             "main".to_string(),
             Some("commit-1".to_string()),
         );
-        let evidence = ticket_evidence_summary(Some("main"), &[], Some(&revoked));
+        let evidence = ticket_evidence_summary(&["main"], &[], std::slice::from_ref(&revoked));
         assert!(!evidence.approved_current_subject);
         assert!(!evidence.complete_for_integration);
 
@@ -2963,7 +2984,7 @@ mod tests {
             "main".to_string(),
             Some("commit-1".to_string()),
         );
-        let evidence = ticket_evidence_summary(Some("main"), &[], Some(&changes));
+        let evidence = ticket_evidence_summary(&["main"], &[], std::slice::from_ref(&changes));
         assert!(evidence.unresolved_request_changes);
         assert!(!evidence.complete_for_integration);
     }
@@ -2975,7 +2996,7 @@ mod tests {
             "main".to_string(),
             None,
         );
-        let evidence = ticket_evidence_summary(Some("main"), &[], Some(&unresolved));
+        let evidence = ticket_evidence_summary(&["main"], &[], std::slice::from_ref(&unresolved));
         assert!(!evidence.has_current_subject_ref);
         assert!(!evidence.has_commit);
         assert!(!evidence.complete_for_integration);
@@ -2987,10 +3008,10 @@ mod tests {
             "main".to_string(),
             Some("commit-1".to_string()),
         );
-        let evidence = ticket_evidence_summary(Some("main"), &[], Some(&closed));
+        let evidence = ticket_evidence_summary(&["main"], &[], std::slice::from_ref(&closed));
         assert!(!evidence.has_merge_request);
         assert!(!evidence.complete_for_integration);
-        assert!(evidence.missing.contains(&"open_merge_request".to_string()));
+        assert!(evidence.missing.contains(&"merge_request".to_string()));
     }
 
     #[test]
@@ -3001,38 +3022,38 @@ mod tests {
             Some("commit-1".to_string()),
         );
         let fresh = ticket_evidence_summary(
-            Some("main"),
+            &["main"],
             &[ticket_event(
                 "item_edit",
                 "2026-01-01T00:02:00Z",
                 Some("body"),
             )],
-            Some(&approved),
+            std::slice::from_ref(&approved),
         );
         assert!(fresh.review_after_rescope);
         assert!(fresh.complete_for_integration);
 
         let stale = ticket_evidence_summary(
-            Some("main"),
+            &["main"],
             &[ticket_event(
                 "item_edit",
                 "2026-01-01T00:05:00Z",
                 Some("title"),
             )],
-            Some(&approved),
+            std::slice::from_ref(&approved),
         );
         assert!(!stale.review_after_rescope);
         assert!(!stale.complete_for_integration);
         assert!(stale.missing.contains(&"review_after_rescope".to_string()));
 
         let metadata_only = ticket_evidence_summary(
-            Some("main"),
+            &["main"],
             &[ticket_event(
                 "item_edit",
                 "2026-01-01T00:05:00Z",
                 Some("formatter"),
             )],
-            Some(&approved),
+            std::slice::from_ref(&approved),
         );
         assert!(metadata_only.complete_for_integration);
     }
@@ -3044,7 +3065,8 @@ mod tests {
             "main".to_string(),
             Some("commit-1".to_string()),
         );
-        let approved = ticket_evidence_summary(Some("main"), &[], Some(&approved_summary));
+        let approved =
+            ticket_evidence_summary(&["main"], &[], std::slice::from_ref(&approved_summary));
         assert!(ticket_evidence_matches(&approved, "merge_request"));
         assert!(ticket_evidence_matches(&approved, "commit"));
         assert!(ticket_evidence_matches(&approved, "approved_review"));
@@ -3061,7 +3083,8 @@ mod tests {
             "main".to_string(),
             Some("commit-2".to_string()),
         );
-        let pending = ticket_evidence_summary(Some("main"), &[], Some(&pending_summary));
+        let pending =
+            ticket_evidence_summary(&["main"], &[], std::slice::from_ref(&pending_summary));
         assert!(ticket_attention_matches(
             "inprogress",
             &pending,
@@ -3076,7 +3099,11 @@ mod tests {
             "2026-01-01T00:05:00Z",
             Some("targets"),
         )];
-        let stale = ticket_evidence_summary(Some("main"), &stale_events, Some(&approved_summary));
+        let stale = ticket_evidence_summary(
+            &["main"],
+            &stale_events,
+            std::slice::from_ref(&approved_summary),
+        );
         assert!(ticket_attention_matches(
             "inprogress",
             &stale,

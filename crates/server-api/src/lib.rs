@@ -245,6 +245,7 @@ impl_openapi_schema!(
     CancelTicketImplementationRequest,
     ClearTicketRoleAssignmentQuery,
     CompleteMergeRequestRequest,
+    CompleteTicketRequest,
     CreateTicketOrchestrationPlanRequest,
     CreateTicketRecordRequest,
     CreateTicketRelationRequest,
@@ -279,6 +280,7 @@ impl_openapi_schema!(
     SubmitMergeRequestReviewRequest,
     TextResponse,
     TicketCloseRecordRequest,
+    TicketCompletionEvent,
     TicketDependencyCheckResponse,
     TicketDetail,
     TicketDoctorResponse,
@@ -2616,20 +2618,20 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: OpenMergeRequestRequest,
     ) -> Result<PublicMergeRequest, RepositoryApiError>;
-    #[get("/api/w/{workspace_id}/tickets/{id}/merge-request/readiness", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    #[get("/api/w/{workspace_id}/merge-requests/{id}/readiness", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn merge_request_readiness(
         &self,
         #[path] workspace_id: String,
         #[path] id: String,
     ) -> Result<MergeRequestReadinessResponse, RepositoryApiError>;
-    #[get("/api/w/{workspace_id}/tickets/{id}/merge-request/thread", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    #[get("/api/w/{workspace_id}/merge-requests/{id}/thread", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn merge_request_thread(
         &self,
         #[path] workspace_id: String,
         #[path] id: String,
         #[query] query: MergeRequestThreadQuery,
     ) -> Result<MergeRequestThreadResponse, RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/repair-source", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], browser_auth = true)]
+    #[post("/api/w/{workspace_id}/merge-requests/{id}/repair-source", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], browser_auth = true)]
     async fn merge_request_selector_repair(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2644,7 +2646,7 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[body] request: RegisterReviewerChildSessionRequest,
     ) -> Result<(), RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/review-capabilities", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
+    #[post("/api/w/{workspace_id}/merge-requests/{id}/review-capabilities", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
     async fn merge_request_review_capability_register(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2652,14 +2654,14 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: RegisterMergeRequestReviewCapabilityRequest,
     ) -> Result<(), RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/reviews", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
+    #[post("/api/w/{workspace_id}/merge-requests/{id}/reviews", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
     async fn merge_request_review_submit(
         &self,
         #[path] workspace_id: String,
         #[path] id: String,
         #[body] request: SubmitMergeRequestReviewRequest,
     ) -> Result<ReviewEvent, RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/reviews/revoke", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
+    #[post("/api/w/{workspace_id}/merge-requests/{id}/reviews/revoke", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
     async fn merge_request_review_revoke(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2667,7 +2669,7 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: RevokeMergeRequestReviewRequest,
     ) -> Result<ReviewRevokedEvent, RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/merge-request/complete", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
+    #[post("/api/w/{workspace_id}/merge-requests/{id}/complete", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
     async fn merge_request_complete(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2675,6 +2677,14 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: CompleteMergeRequestRequest,
     ) -> Result<MergeEvent, RepositoryApiError>;
+    #[post("/api/w/{workspace_id}/tickets/{id}/complete", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
+    async fn ticket_complete(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: CompleteTicketRequest,
+    ) -> Result<TicketCompletionEvent, RepositoryApiError>;
     #[post("/api/w/{workspace_id}/tickets/{id}/workflow/close", status = 204, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_close_record(
         &self,
@@ -5881,6 +5891,7 @@ pub struct TicketQueryItem {
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub unresolved_review_count: usize,
     pub evidence: TicketEvidenceSummary,
+    pub merge_requests: Vec<TicketMergeRequestSummary>,
     pub merge_request: Option<TicketMergeRequestSummary>,
     pub current_coder: Option<TicketAssignmentSummary>,
 }
@@ -5939,6 +5950,7 @@ pub struct TicketDetail {
     pub current_coder: Option<TicketAssignmentSummary>,
     pub assignment_diagnostics: Vec<String>,
     pub action_eligibility: TicketActionEligibility,
+    pub merge_requests: Vec<TicketMergeRequestSummary>,
     pub merge_request: Option<TicketMergeRequestSummary>,
     pub evidence: TicketEvidenceSummary,
     pub resolution: Option<String>,
@@ -6297,12 +6309,14 @@ macro_rules! merge_request_event {
 
 merge_request_event!(ReviewRequestedEvent {
     subject_ref: String,
+    ticket_item_revision: String,
     requested_by: MergeRequestWorkerIdentity,
     reviewer: MergeRequestWorkerIdentity,
 });
 merge_request_event!(ReviewEvent {
     request_event_id: String,
     subject_ref: String,
+    ticket_item_revision: String,
     decision: ReviewDecision,
     body: String,
     findings: Vec<ReviewFinding>,
@@ -6511,6 +6525,25 @@ pub struct CompleteMergeRequestRequest {
     pub target_ref_after: String,
     pub strategy: MergeStrategy,
     pub resolution: ConflictResolution,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CompleteTicketRequest {
+    pub operation_id: String,
+    pub item_revision: String,
+    pub merge_request_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketCompletionEvent {
+    pub operation_id: String,
+    pub ticket_id: String,
+    pub item_revision: String,
+    pub merge_request_ids: Vec<String>,
+    pub completed_by: MergeRequestWorkerIdentity,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -9630,7 +9663,7 @@ mod tests {
                 .iter()
                 .filter(|operation| operation.operation_id.starts_with("ticket_"))
                 .count(),
-            37
+            38
         );
         assert_eq!(
             operations
@@ -9660,7 +9693,7 @@ mod tests {
             (
                 "merge_request_complete",
                 HttpMethod::Post,
-                "/api/w/{workspace_id}/tickets/{id}/merge-request/complete",
+                "/api/w/{workspace_id}/merge-requests/{id}/complete",
             ),
             (
                 "objective_ticket_unlink",
@@ -11292,6 +11325,7 @@ mod openapi_artifact_tests {
             "merge_request_review_revoke",
             "merge_request_review_submit",
             "merge_request_reviewer_child_register",
+            "ticket_complete",
             "runtime_resource_fetch",
             "worker_control_cancel",
             "worker_control_input",

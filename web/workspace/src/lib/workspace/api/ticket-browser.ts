@@ -712,6 +712,7 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     "item_revision",
     "linked_objectives",
     "merge_request",
+    "merge_requests",
     "priority",
     "queued_at",
     "queued_by",
@@ -768,6 +769,11 @@ export function parseTicketDetail(value: unknown): TicketDetail {
       item.linked_objectives,
       `${label}.linked_objectives`,
       parseObjectiveLink,
+    ),
+    merge_requests: array(
+      item.merge_requests,
+      `${label}.merge_requests`,
+      parseTicketMergeRequestSummary,
     ),
     merge_request: item.merge_request === undefined
       ? undefined
@@ -1082,7 +1088,17 @@ function parseMergeRequestThreadEvent(
     sequence: integer(item.sequence, `${label}.sequence`),
   };
   if (kind === "review_requested") {
-    exact(item, [...base, "requested_by", "reviewer", "subject_ref"], label);
+    exact(
+      item,
+      [
+        ...base,
+        "requested_by",
+        "reviewer",
+        "subject_ref",
+        "ticket_item_revision",
+      ],
+      label,
+    );
     return {
       ...eventBase,
       kind,
@@ -1092,6 +1108,10 @@ function parseMergeRequestThreadEvent(
       ),
       reviewer: parseMergeRequestWorker(item.reviewer, `${label}.reviewer`),
       subject_ref: string(item.subject_ref, `${label}.subject_ref`),
+      ticket_item_revision: string(
+        item.ticket_item_revision,
+        `${label}.ticket_item_revision`,
+      ),
     };
   }
   if (kind === "review") {
@@ -1103,6 +1123,7 @@ function parseMergeRequestThreadEvent(
       "request_event_id",
       "reviewer",
       "subject_ref",
+      "ticket_item_revision",
     ], label);
     const decision = string(item.decision, `${label}.decision`);
     if (!["approve", "request_changes"].includes(decision)) {
@@ -1120,6 +1141,10 @@ function parseMergeRequestThreadEvent(
       ),
       reviewer: parseMergeRequestWorker(item.reviewer, `${label}.reviewer`),
       subject_ref: string(item.subject_ref, `${label}.subject_ref`),
+      ticket_item_revision: string(
+        item.ticket_item_revision,
+        `${label}.ticket_item_revision`,
+      ),
     };
   }
   if (kind === "review_revoked") {

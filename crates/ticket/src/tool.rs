@@ -134,7 +134,7 @@ const DECISION_DESCRIPTION: &str = "Append a typed Ticket decision event. `body`
 const IMPLEMENTATION_REPORT_DESCRIPTION: &str =
     "Append a typed Ticket implementation_report event. `body` is Markdown.";
 const MARK_READY_DESCRIPTION: &str = "Mark a planning Ticket ready through the typed Ticket backend. \
-The backend atomically validates and normalizes every persisted repository target, requires exactly one \
+The backend atomically validates and normalizes every persisted repository target, requires at least one \
 read_write target, records one typed state_changed event, and transitions planning -> ready. `reason` is optional.";
 const INTAKE_READY_DESCRIPTION: &str = "Record a bounded intake summary and mark a planning Ticket ready. \
 The backend applies the same targets validation and lock as TicketMarkReady and commits the summary, \

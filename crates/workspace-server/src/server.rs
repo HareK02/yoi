@@ -3673,9 +3673,9 @@ fn validated_ticket_implementation_targets(
         .iter()
         .filter(|target| target.access == TicketTargetAccess::ReadWrite)
         .count();
-    if read_write_count != 1 {
+    if read_write_count == 0 {
         return Err(Error::InvalidInput(format!(
-            "Ticket `{ticket_id}` requires exactly one read_write target, found {read_write_count}"
+            "Ticket `{ticket_id}` requires at least one read_write target"
         ))
         .into());
     }
@@ -3732,14 +3732,16 @@ fn require_ticket_read_write_target(
 ) -> ApiResult<ValidatedTicketImplementationTarget> {
     let write_target = validated_ticket_implementation_targets(api, ticket_id)?
         .into_iter()
-        .find(|target| target.access == TicketTargetAccess::ReadWrite)
-        .expect("validated Ticket target collection has exactly one read_write target");
-    if write_target.repository_id != repository_id || write_target.ref_selector != selector {
-        return Err(Error::InvalidInput(
-            "selectors must match the authoritative Ticket read_write repository target".into(),
-        )
-        .into());
-    }
+        .find(|target| {
+            target.access == TicketTargetAccess::ReadWrite
+                && target.repository_id == repository_id
+                && target.ref_selector == selector
+        })
+        .ok_or_else(|| {
+            ApiError::from(Error::InvalidInput(
+                "repository and selector must match a declared Ticket read_write target".into(),
+            ))
+        })?;
     Ok(write_target)
 }
 
@@ -4396,6 +4398,9 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
             service.clone(),
         ))
         .merge(server_api::server_api_axum::merge_request_complete(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_complete(
             service.clone(),
         ))
         .merge(server_api::server_api_axum::ticket_close_record(
@@ -7759,6 +7764,25 @@ impl server_api::ServerApi for ServerApiContractService {
         request: server_api::CompleteMergeRequestRequest,
     ) -> std::result::Result<server_api::MergeEvent, server_api::RepositoryApiError> {
         let Json(response) = scoped_complete_merge_request(
+            State(self.workspace_api()?.clone()),
+            contract_request_headers(&context)?,
+            AxumPath((workspace_id, id)),
+            Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(response)
+    }
+
+    async fn ticket_complete(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::CompleteTicketRequest,
+    ) -> std::result::Result<server_api::TicketCompletionEvent, server_api::RepositoryApiError>
+    {
+        let Json(response) = scoped_complete_ticket(
             State(self.workspace_api()?.clone()),
             contract_request_headers(&context)?,
             AxumPath((workspace_id, id)),
@@ -12053,6 +12077,24 @@ fn resolve_workspace_worker_ticket_assignment(
     Ok(())
 }
 
+fn merge_request_ticket_id(mr: &merge_request::MergeRequest) -> ApiResult<String> {
+    match mr.ticket_ids.as_slice() {
+        [ticket_id] => Ok(ticket_id.clone()),
+        [] => Err(
+            Error::MergeRequest(merge_request::MergeRequestError::Corrupt(
+                "Merge Request has no linked Ticket".into(),
+            ))
+            .into(),
+        ),
+        _ => Err(
+            Error::MergeRequest(merge_request::MergeRequestError::Conflict(
+                "Merge Request must be linked to exactly one workflow Ticket".into(),
+            ))
+            .into(),
+        ),
+    }
+}
+
 fn public_merge_request_state(
     state: merge_request::MergeRequestState,
 ) -> server_api::MergeRequestState {
@@ -12124,6 +12166,7 @@ fn public_review_event(event: merge_request::ReviewEvent) -> server_api::ReviewE
         sequence: event.sequence,
         request_event_id: event.request_event_id,
         subject_ref: event.subject_ref,
+        ticket_item_revision: event.ticket_item_revision,
         decision: public_review_decision(event.decision),
         body: event.body,
         findings: event
@@ -12162,6 +12205,19 @@ fn public_merge_event(event: merge_request::MergeEvent) -> server_api::MergeEven
         strategy: public_merge_strategy(event.strategy),
         resolution: public_conflict_resolution(event.resolution),
         merged_by: public_merge_request_worker_identity(event.merged_by),
+        created_at: event.created_at.to_rfc3339(),
+    }
+}
+
+fn public_ticket_completion_event(
+    event: merge_request::TicketCompletionEvent,
+) -> server_api::TicketCompletionEvent {
+    server_api::TicketCompletionEvent {
+        operation_id: event.operation_id,
+        ticket_id: event.ticket_id,
+        item_revision: event.item_revision,
+        merge_request_ids: event.merge_request_ids,
+        completed_by: public_merge_request_worker_identity(event.completed_by),
         created_at: event.created_at.to_rfc3339(),
     }
 }
@@ -12213,6 +12269,7 @@ fn public_merge_request_thread_event(
                 event_id: event.event_id,
                 sequence: event.sequence,
                 subject_ref: event.subject_ref,
+                ticket_item_revision: event.ticket_item_revision,
                 requested_by: public_merge_request_worker_identity(event.requested_by),
                 reviewer: public_merge_request_worker_identity(event.reviewer),
                 created_at: event.created_at.to_rfc3339(),
@@ -12527,12 +12584,12 @@ async fn scoped_show_merge_request(
 
 async fn scoped_merge_request_readiness(
     State(api): State<WorkspaceApi>,
-    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
 ) -> ApiResult<Json<server_api::MergeRequestReadinessResponse>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
-    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     let store = merge_request_store(&api, &workspace_id)?;
-    let mr = store.get(&workspace_id, &ticket_id)?;
+    let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
+    let ticket_id = merge_request_ticket_id(&mr)?;
     let assignment = api
         .store
         .get_current_ticket_coder_assignment(&workspace_id, &ticket_id)?;
@@ -12555,6 +12612,7 @@ async fn scoped_merge_request_readiness(
         (None, _) => (None, None),
     };
     let mut report = store.readiness(merge_request::ReadinessCheck {
+        merge_request_id,
         ticket_id,
         current_subject_ref,
         auth: merge_request::MergeRequestAuth {
@@ -12657,14 +12715,13 @@ async fn scoped_open_merge_request(
 
 async fn scoped_merge_request_thread(
     State(api): State<WorkspaceApi>,
-    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
     Query(query): Query<server_api::MergeRequestThreadQuery>,
 ) -> ApiResult<Json<Vec<server_api::MergeRequestThreadEvent>>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
-    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
-    let events = merge_request_store(&api, &workspace_id)?.thread_page(
+    let events = merge_request_store(&api, &workspace_id)?.thread_page_by_id(
         &workspace_id,
-        &ticket_id,
+        &merge_request_id,
         query.after,
         query.limit.unwrap_or(100),
     )?;
@@ -12679,11 +12736,10 @@ async fn scoped_merge_request_thread(
 async fn scoped_repair_merge_request_selector(
     State(api): State<WorkspaceApi>,
     headers: HeaderMap,
-    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
     Json(input): Json<server_api::RepairMergeRequestSelectorRequest>,
 ) -> ApiResult<Json<server_api::PublicMergeRequest>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
-    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     require_workspace_access(&workspace_id, &api)?;
     reject_non_browser_reopen_auth(&headers)?;
     let _actor = require_actor(&ServerAuthApi::from(&api), &headers).await?;
@@ -12691,7 +12747,8 @@ async fn scoped_repair_merge_request_selector(
         return Err(Error::BrowserReopenConfirmationRequired.into());
     }
     let store = merge_request_store(&api, &workspace_id)?;
-    let mr = store.get(&workspace_id, &ticket_id)?;
+    let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
+    let ticket_id = merge_request_ticket_id(&mr)?;
     let assignment = api
         .store
         .get_current_ticket_coder_assignment(&workspace_id, &ticket_id)?
@@ -12708,6 +12765,7 @@ async fn scoped_repair_merge_request_selector(
     .revision_ref;
     let repaired = store.repair_selector_from(merge_request::RepairSelectorFrom {
         workspace_id: workspace_id.clone(),
+        merge_request_id,
         ticket_id,
         selector_from: input.selector_from,
         resolved_subject_ref,
@@ -12746,13 +12804,15 @@ async fn scoped_register_reviewer_child_session(
 async fn scoped_register_merge_request_review_capability(
     State(api): State<WorkspaceApi>,
     headers: HeaderMap,
-    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
     Json(input): Json<server_api::RegisterMergeRequestReviewCapabilityRequest>,
 ) -> ApiResult<StatusCode> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
-    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     require_workspace_access(&workspace_id, &api)?;
     let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
+    let store = merge_request_store(&api, &workspace_id)?;
+    let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
+    let ticket_id = merge_request_ticket_id(&mr)?;
     let assignment = api
         .store
         .get_current_ticket_coder_assignment(&workspace_id, &ticket_id)?
@@ -12767,8 +12827,6 @@ async fn scoped_register_merge_request_review_capability(
         )
         .into());
     }
-    let store = merge_request_store(&api, &workspace_id)?;
-    let mr = store.get(&workspace_id, &ticket_id)?;
     let selector = mr
         .selector_from
         .as_deref()
@@ -12788,8 +12846,11 @@ async fn scoped_register_merge_request_review_capability(
         &source_observation.revision_ref,
     )?;
     let subject_ref = source_observation.revision_ref;
+    let ticket_item_revision = api.authority.ticket(&ticket_id)?.item_revision;
     store.request_review(merge_request::RequestMergeRequestReview {
+        merge_request_id,
         ticket_id,
+        ticket_item_revision,
         subject_ref,
         child_session_id: input.child_session_id,
         capability_token: input.capability_token,
@@ -12807,15 +12868,16 @@ async fn scoped_register_merge_request_review_capability(
 
 async fn scoped_submit_merge_request_review(
     State(api): State<WorkspaceApi>,
-    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
     Json(input): Json<server_api::SubmitMergeRequestReviewRequest>,
 ) -> ApiResult<Json<server_api::ReviewEvent>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
-    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     let store = merge_request_store(&api, &workspace_id)?;
     let review_authorization =
-        store.authorize_review_submission(&ticket_id, &input.capability_token)?;
-    if review_authorization.workspace_id != workspace_id {
+        store.authorize_review_submission(&merge_request_id, &input.capability_token)?;
+    if review_authorization.workspace_id != workspace_id
+        || review_authorization.merge_request_id != merge_request_id
+    {
         return Err(
             Error::MergeRequest(merge_request::MergeRequestError::Unauthorized(
                 "review grant invalid".into(),
@@ -12823,7 +12885,8 @@ async fn scoped_submit_merge_request_review(
             .into(),
         );
     }
-    let mr = store.get(&workspace_id, &ticket_id)?;
+    let ticket_id = review_authorization.ticket_id;
+    let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
     let selector = mr
         .selector_from
         .as_deref()
@@ -12849,6 +12912,7 @@ async fn scoped_submit_merge_request_review(
         .map(internal_review_finding)
         .collect();
     let event = store.submit_review(merge_request::SubmitMergeRequestReview {
+        merge_request_id,
         ticket_id,
         current_subject_ref,
         capability_token: input.capability_token,
@@ -12863,16 +12927,18 @@ async fn scoped_submit_merge_request_review(
 async fn scoped_revoke_merge_request_review(
     State(api): State<WorkspaceApi>,
     headers: HeaderMap,
-    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
     Json(input): Json<server_api::RevokeMergeRequestReviewRequest>,
 ) -> ApiResult<Json<server_api::ReviewRevokedEvent>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
-    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     require_workspace_access(&workspace_id, &api)?;
     if !input.explicit_confirmation {
         return Err(Error::BrowserReopenConfirmationRequired.into());
     }
     let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
+    let store = merge_request_store(&api, &workspace_id)?;
+    let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
+    let ticket_id = merge_request_ticket_id(&mr)?;
     let assignment = api
         .store
         .get_current_ticket_coder_assignment(&workspace_id, &ticket_id)?
@@ -12887,9 +12953,8 @@ async fn scoped_revoke_merge_request_review(
         )
         .into());
     }
-    let store = merge_request_store(&api, &workspace_id)?;
-    let mr = store.get(&workspace_id, &ticket_id)?;
     let event = store.revoke_review(merge_request::RevokeMergeRequestReview {
+        merge_request_id,
         ticket_id,
         review_event_id: input.review_event_id,
         reason: input.reason,
@@ -12908,18 +12973,19 @@ async fn scoped_revoke_merge_request_review(
 async fn scoped_complete_merge_request(
     State(api): State<WorkspaceApi>,
     headers: HeaderMap,
-    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
     Json(input): Json<server_api::CompleteMergeRequestRequest>,
 ) -> ApiResult<Json<server_api::MergeEvent>> {
     let workspace_id = parse_workspace_id(&workspace_id)?;
-    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
     require_workspace_access(&workspace_id, &api)?;
     let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
     require_online_workspace_orchestrator_source(&api, &source)?;
     let store = merge_request_store(&api, &workspace_id)?;
-    let mr = store.get(&workspace_id, &ticket_id)?;
+    let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
+    let ticket_id = merge_request_ticket_id(&mr)?;
     if let Some(existing) = recorded_merge_completion(&mr.thread, &input.operation_id) {
         let replay = merge_request::CompleteMergeRequest {
+            merge_request_id,
             ticket_id,
             operation_id: input.operation_id,
             approval_event_id: input.approval_event_id,
@@ -12974,6 +13040,7 @@ async fn scoped_complete_merge_request(
         &input.target_ref_after,
     )?;
     let completion = merge_request::CompleteMergeRequest {
+        merge_request_id,
         ticket_id,
         operation_id: input.operation_id,
         approval_event_id: input.approval_event_id,
@@ -12997,6 +13064,42 @@ async fn scoped_complete_merge_request(
         .map(public_merge_event)
         .map(Json)
         .map_err(Into::into)
+}
+
+async fn scoped_complete_ticket(
+    State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
+    AxumPath((workspace_id, ticket_id)): AxumPath<(String, String)>,
+    Json(input): Json<server_api::CompleteTicketRequest>,
+) -> ApiResult<Json<server_api::TicketCompletionEvent>> {
+    let workspace_id = parse_workspace_id(&workspace_id)?;
+    let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
+    require_workspace_access(&workspace_id, &api)?;
+    let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
+    require_online_workspace_orchestrator_source(&api, &source)?;
+    let assignment = api
+        .store
+        .get_current_ticket_coder_assignment(&workspace_id, &ticket_id)?
+        .ok_or_else(|| {
+            Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
+        })?;
+    let event = merge_request_store(&api, &workspace_id)?.complete_ticket(
+        merge_request::CompleteTicket {
+            ticket_id,
+            operation_id: input.operation_id,
+            item_revision: input.item_revision,
+            merge_request_ids: input.merge_request_ids,
+            auth: merge_request::MergeRequestAuth {
+                workspace_id,
+                repository_id: String::new(),
+                runtime_id: source.runtime_id,
+                worker_id: source.worker_id,
+                assignment_id: assignment.assignment_id,
+            },
+            now: Utc::now(),
+        },
+    )?;
+    Ok(Json(public_ticket_completion_event(event)))
 }
 
 fn reject_non_browser_reopen_auth(headers: &HeaderMap) -> Result<()> {
@@ -25809,8 +25912,7 @@ mod tests {
 
     #[test]
     fn worker_projection_does_not_expose_unavailable_snapshot_as_current() {
-        let availability =
-            protocol::subscription::SubscriptionWorkerAvailability::Unavailable;
+        let availability = protocol::subscription::SubscriptionWorkerAvailability::Unavailable;
         let worker_ref = RuntimeWorkerRef::new("runtime-a", "worker-a");
         let projection = WorkerRegistryProjectionRecord {
             registry: WorkerRegistryRecord {
@@ -25860,8 +25962,7 @@ mod tests {
 
         let mut observed_stopped = projection;
         let observation = observed_stopped.observation.as_mut().unwrap();
-        observation.availability =
-            protocol::subscription::SubscriptionWorkerAvailability::Observed;
+        observation.availability = protocol::subscription::SubscriptionWorkerAvailability::Observed;
         observation.worker.availability =
             protocol::subscription::SubscriptionWorkerAvailability::Observed;
         observation.worker.state = protocol::subscription::SubscriptionWorkerState::Stopped;
@@ -26791,8 +26892,7 @@ mod tests {
                     identity: TEST_WORKSPACE_ID.to_string(),
                     workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
                 },
-                availability:
-                    protocol::subscription::SubscriptionWorkerAvailability::Observed,
+                availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
                 state: "idle".to_string(),
                 worker_state: None,
                 last_seen_at: None,
@@ -38590,8 +38690,7 @@ mod tests {
                     identity: "workspace-test".to_string(),
                     workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
                 },
-                availability:
-                    protocol::subscription::SubscriptionWorkerAvailability::Observed,
+                availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
                 state: "idle".to_string(),
                 worker_state: None,
                 last_seen_at: None,
@@ -38689,8 +38788,7 @@ mod tests {
                     identity: "workspace-test".to_string(),
                     workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
                 },
-                availability:
-                    protocol::subscription::SubscriptionWorkerAvailability::Observed,
+                availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
                 state: "idle".to_string(),
                 worker_state: None,
                 last_seen_at: None,

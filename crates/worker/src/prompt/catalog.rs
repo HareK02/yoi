@@ -721,6 +721,7 @@ mod tests {
             "ReviewMergeRequest",
             "CheckMergeRequestReadiness",
             "CompleteMergeRequest",
+            "CompleteTicket",
         ] {
             assert!(combined.contains(operation), "missing {operation}");
         }

@@ -27,6 +27,7 @@ struct ModelTicketQueryItem {
     unresolved_blocker_count: usize,
     unresolved_review_count: usize,
     evidence: Option<ModelTicketEvidence>,
+    merge_requests: Vec<ModelMergeRequest>,
     merge_request: Option<ModelMergeRequest>,
 }
 
@@ -46,6 +47,7 @@ pub(super) struct ModelTicketDetail {
     assignments: Vec<ModelAssignment>,
     current_coder: Option<ModelWorkerSummary>,
     implementation_reports: Vec<ModelEvidenceEvent>,
+    merge_requests: Vec<ModelMergeRequest>,
     merge_request: Option<ModelMergeRequest>,
     evidence: Option<ModelTicketEvidence>,
     actions: Option<ModelTicketActions>,
@@ -162,6 +164,8 @@ struct ModelEvidenceEvent {
 
 #[derive(Debug, Serialize)]
 struct ModelMergeRequest {
+    merge_request_id: String,
+    repository_key: String,
     state: String,
     selector_from: Option<String>,
     selector_to: String,
@@ -251,6 +255,10 @@ fn project_ticket_query_item(value: &Value) -> Result<ModelTicketQueryItem, Stri
         unresolved_blocker_count: usize_field(item, "unresolved_blocker_count")?,
         unresolved_review_count: usize_field(item, "unresolved_review_count")?,
         evidence: item.get("evidence").map(project_evidence).transpose()?,
+        merge_requests: array_field(item, "merge_requests")?
+            .iter()
+            .map(project_merge_request)
+            .collect::<Result<Vec<_>, _>>()?,
         merge_request: item
             .get("merge_request")
             .filter(|value| !value.is_null())
@@ -294,6 +302,10 @@ pub(super) fn project_ticket_detail(value: Value) -> Result<ModelTicketDetail, S
         implementation_reports: array_field(root, "implementation_reports")?
             .iter()
             .map(project_evidence_event)
+            .collect::<Result<Vec<_>, _>>()?,
+        merge_requests: array_field(root, "merge_requests")?
+            .iter()
+            .map(project_merge_request)
             .collect::<Result<Vec<_>, _>>()?,
         merge_request: root
             .get("merge_request")
@@ -498,11 +510,13 @@ fn project_evidence_event(value: &Value) -> Result<ModelEvidenceEvent, String> {
 fn project_merge_request(value: &Value) -> Result<ModelMergeRequest, String> {
     let merge = object(value, "Merge Request summary")?;
     Ok(ModelMergeRequest {
+        merge_request_id: string_field(merge, "merge_request_id")?,
+        repository_key: string_field(merge, "repository_key")?,
         state: string_field(merge, "state")?,
         selector_from: optional_string(merge, "selector_from")?,
         selector_to: string_field(merge, "selector_to")?,
         review_status: string_field(merge, "review_status")?,
-        subject_ref: optional_string(merge, "subject_ref")?,
+        subject_ref: optional_string(merge, "current_subject_ref")?,
         review_excerpt: optional_string(merge, "review_excerpt")?,
     })
 }
@@ -721,6 +735,7 @@ mod tests {
                     "complete_for_integration": false,
                     "missing": ["merge_request"]
                 },
+                "merge_requests": [],
                 "merge_request": null
             }]
         })).expect("Ticket query projection");
@@ -788,6 +803,7 @@ mod tests {
             "implementation_reports": [],
             "assignments": [],
             "current_coder": null,
+            "merge_requests": [],
             "merge_request": null,
             "evidence": {
                 "has_merge_request": false,

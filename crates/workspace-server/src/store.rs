@@ -6883,9 +6883,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 params![record.workspace_id, record.ticket_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-            if target_count == 0 || read_write_count != 1 {
+            if target_count == 0 || read_write_count == 0 {
                 return Err(Error::TicketAssignmentConflict(
-                    "manual Coder assignment requires exactly one read_write repository target"
+                    "manual Coder assignment requires at least one read_write repository target"
                         .to_string(),
                 ));
             }

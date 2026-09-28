@@ -97,6 +97,8 @@ pub struct ReviewRequestedEvent {
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub sequence: u64,
     pub subject_ref: String,
+    #[serde(default)]
+    pub ticket_item_revision: String,
     pub requested_by: WorkerIdentity,
     pub reviewer: WorkerIdentity,
     pub created_at: DateTime<Utc>,
@@ -108,6 +110,8 @@ pub struct ReviewEvent {
     pub sequence: u64,
     pub request_event_id: String,
     pub subject_ref: String,
+    #[serde(default)]
+    pub ticket_item_revision: String,
     pub decision: ReviewDecision,
     pub body: String,
     pub findings: Vec<ReviewFinding>,
@@ -259,7 +263,9 @@ pub struct OpenMergeRequest {
 }
 #[derive(Debug, Clone)]
 pub struct RequestMergeRequestReview {
+    pub merge_request_id: String,
     pub ticket_id: String,
+    pub ticket_item_revision: String,
     pub subject_ref: String,
     pub child_session_id: String,
     pub capability_token: String,
@@ -282,11 +288,14 @@ pub struct RegisterReviewerChildSession {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewSubmissionAuthorization {
     pub workspace_id: String,
+    pub merge_request_id: String,
+    pub ticket_id: String,
     pub subject_ref: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct SubmitMergeRequestReview {
+    pub merge_request_id: String,
     pub ticket_id: String,
     pub current_subject_ref: String,
     pub capability_token: String,
@@ -297,6 +306,7 @@ pub struct SubmitMergeRequestReview {
 }
 #[derive(Debug, Clone)]
 pub struct RevokeMergeRequestReview {
+    pub merge_request_id: String,
     pub ticket_id: String,
     pub review_event_id: String,
     pub reason: String,
@@ -306,6 +316,7 @@ pub struct RevokeMergeRequestReview {
 #[derive(Debug, Clone)]
 pub struct RepairSelectorFrom {
     pub workspace_id: String,
+    pub merge_request_id: String,
     pub ticket_id: String,
     pub selector_from: String,
     pub resolved_subject_ref: String,
@@ -315,6 +326,7 @@ pub struct RepairSelectorFrom {
 }
 #[derive(Debug, Clone)]
 pub struct ReadinessCheck {
+    pub merge_request_id: String,
     pub ticket_id: String,
     pub current_subject_ref: Option<String>,
     pub auth: MergeRequestAuth,
@@ -330,6 +342,7 @@ pub struct ReadinessReport {
 }
 #[derive(Debug, Clone)]
 pub struct CompleteMergeRequest {
+    pub merge_request_id: String,
     pub ticket_id: String,
     pub operation_id: String,
     pub approval_event_id: String,
@@ -340,6 +353,24 @@ pub struct CompleteMergeRequest {
     pub resolution: ConflictResolution,
     pub auth: MergeRequestAuth,
     pub now: DateTime<Utc>,
+}
+#[derive(Debug, Clone)]
+pub struct CompleteTicket {
+    pub ticket_id: String,
+    pub operation_id: String,
+    pub item_revision: String,
+    pub merge_request_ids: Vec<String>,
+    pub auth: MergeRequestAuth,
+    pub now: DateTime<Utc>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TicketCompletionEvent {
+    pub operation_id: String,
+    pub ticket_id: String,
+    pub item_revision: String,
+    pub merge_request_ids: Vec<String>,
+    pub completed_by: WorkerIdentity,
+    pub created_at: DateTime<Utc>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CurrentAssignment {
@@ -421,13 +452,14 @@ impl MergeRequestStore {
                 "selectors must differ".into(),
             ));
         }
+        let merge_request_id = i.merge_request_id.clone();
         self.assigned(&i.auth, &i.ticket_id, &i.repository_id)?;
         let mut c = self.lock()?;
         let t = c.transaction()?;
-        let conflict:bool=t.query_row("SELECT EXISTS(SELECT 1 FROM merge_request_ticket_relations rel JOIN merge_requests mr ON mr.workspace_id=rel.workspace_id AND mr.merge_request_id=rel.merge_request_id WHERE rel.workspace_id=?1 AND rel.ticket_id=?2 AND mr.state='open')",params![i.auth.workspace_id,i.ticket_id],|r|r.get(0))?;
+        let conflict:bool=t.query_row("SELECT EXISTS(SELECT 1 FROM merge_request_ticket_relations rel JOIN merge_requests mr ON mr.workspace_id=rel.workspace_id AND mr.merge_request_id=rel.merge_request_id WHERE rel.workspace_id=?1 AND rel.ticket_id=?2 AND mr.repository_id=?3 AND mr.state='open')",params![i.auth.workspace_id,i.ticket_id,i.repository_id],|r|r.get(0))?;
         if conflict {
             return Err(MergeRequestError::Conflict(
-                "Ticket already has an open Merge Request; use ShowMergeRequest and advance the existing selector_from with a normal non-force push instead of opening a replacement Merge Request or adding a revision".into(),
+                "Ticket already has an open Merge Request for this repository; advance that Merge Request's existing selector_from with a normal non-force push instead of opening a replacement".into(),
             ));
         }
         let now = i.now.to_rfc3339();
@@ -469,7 +501,7 @@ impl MergeRequestStore {
         }
         t.commit()?;
         drop(c);
-        self.get(&i.auth.workspace_id, &i.ticket_id)
+        self.get_by_id(&i.auth.workspace_id, &merge_request_id)
     }
     pub fn register_reviewer_child_session(
         &self,
@@ -498,7 +530,12 @@ impl MergeRequestStore {
         i: RequestMergeRequestReview,
     ) -> Result<RequestedMergeRequestReview, MergeRequestError> {
         nonempty("subject_ref", &i.subject_ref)?;
-        let mr = self.get(&i.auth.workspace_id, &i.ticket_id)?;
+        let mr = self.get_for_operation(&i.auth.workspace_id, &i.merge_request_id, &i.ticket_id)?;
+        self.require_current_ticket_revision(
+            &i.auth.workspace_id,
+            &i.ticket_id,
+            &i.ticket_item_revision,
+        )?;
         self.assigned(&i.auth, &i.ticket_id, &mr.repository_id)?;
         if mr.state != MergeRequestState::Open || mr.selector_from.is_none() {
             return Err(MergeRequestError::Conflict(
@@ -522,6 +559,7 @@ impl MergeRequestStore {
             event_id: Uuid::now_v7().to_string(),
             sequence: next_seq(&t, &mr.workspace_id, &mr.merge_request_id)?,
             subject_ref: i.subject_ref,
+            ticket_item_revision: i.ticket_item_revision,
             requested_by: WorkerIdentity {
                 runtime_id: i.auth.runtime_id,
                 worker_id: i.auth.worker_id,
@@ -548,25 +586,27 @@ impl MergeRequestStore {
     }
     pub fn authorize_review_submission(
         &self,
-        ticket_id: &str,
+        merge_request_id: &str,
         capability_token: &str,
     ) -> Result<ReviewSubmissionAuthorization, MergeRequestError> {
         let connection = self.lock()?;
         connection
             .query_row(
-                "SELECT g.workspace_id,g.subject_ref
+                "SELECT g.workspace_id,g.merge_request_id,rel.ticket_id,g.subject_ref
                    FROM merge_request_review_grants g
                    JOIN merge_request_ticket_relations rel
                      ON rel.workspace_id=g.workspace_id AND rel.merge_request_id=g.merge_request_id
                    JOIN merge_requests mr
                      ON mr.workspace_id=g.workspace_id AND mr.merge_request_id=g.merge_request_id
-                  WHERE g.capability_token=?1 AND rel.ticket_id=?2
+                  WHERE g.capability_token=?1 AND g.merge_request_id=?2
                     AND g.status='issued' AND mr.state='open'",
-                params![capability_token, ticket_id],
+                params![capability_token, merge_request_id],
                 |row| {
                     Ok(ReviewSubmissionAuthorization {
                         workspace_id: row.get(0)?,
-                        subject_ref: row.get(1)?,
+                        merge_request_id: row.get(1)?,
+                        ticket_id: row.get(2)?,
+                        subject_ref: row.get(3)?,
                     })
                 },
             )
@@ -594,8 +634,9 @@ impl MergeRequestStore {
                    JOIN merge_requests mr
                      ON mr.workspace_id=g.workspace_id AND mr.merge_request_id=g.merge_request_id
                   WHERE g.capability_token=?1 AND rel.ticket_id=?2
+                    AND g.merge_request_id=?3
                     AND g.status='issued' AND mr.state='open'",
-                params![i.capability_token, i.ticket_id],
+                params![i.capability_token, i.ticket_id, i.merge_request_id],
                 |r| {
                     Ok((
                         r.get(0)?,
@@ -613,6 +654,16 @@ impl MergeRequestStore {
                 "review grant invalid".into(),
             ));
         };
+        let ticket_item_revision = load_mr(&t, &ws, &mr)?
+            .and_then(|request| {
+                request.thread.into_iter().find_map(|event| match event {
+                    MergeRequestThreadEvent::ReviewRequested(event) if event.event_id == req => {
+                        Some(event.ticket_item_revision)
+                    }
+                    _ => None,
+                })
+            })
+            .ok_or_else(|| MergeRequestError::Corrupt("review request event missing".into()))?;
         if subject != i.current_subject_ref {
             let reason = format!(
                 "selector_from moved from requested subject {subject} to current subject {}; fresh review of the exact current source ref is required",
@@ -638,6 +689,7 @@ impl MergeRequestStore {
             sequence: next_seq(&t, &ws, &mr)?,
             request_event_id: req,
             subject_ref: subject,
+            ticket_item_revision,
             decision: i.decision,
             body: i.body,
             findings: i.findings,
@@ -657,7 +709,7 @@ impl MergeRequestStore {
         i: RevokeMergeRequestReview,
     ) -> Result<ReviewRevokedEvent, MergeRequestError> {
         bounded_body("revocation reason", &i.reason)?;
-        let mr = self.get(&i.auth.workspace_id, &i.ticket_id)?;
+        let mr = self.get_for_operation(&i.auth.workspace_id, &i.merge_request_id, &i.ticket_id)?;
         self.assigned(&i.auth, &i.ticket_id, &mr.repository_id)?;
         let r = mr
             .thread
@@ -695,7 +747,7 @@ impl MergeRequestStore {
         Ok(e)
     }
     pub fn readiness(&self, i: ReadinessCheck) -> Result<ReadinessReport, MergeRequestError> {
-        let mr = self.get(&i.auth.workspace_id, &i.ticket_id)?;
+        let mr = self.get_for_operation(&i.auth.workspace_id, &i.merge_request_id, &i.ticket_id)?;
         let review = i
             .current_subject_ref
             .as_deref()
@@ -742,7 +794,7 @@ impl MergeRequestStore {
         })
     }
     pub fn validate_completion(&self, i: &CompleteMergeRequest) -> Result<(), MergeRequestError> {
-        let mr = self.get(&i.auth.workspace_id, &i.ticket_id)?;
+        let mr = self.get_for_operation(&i.auth.workspace_id, &i.merge_request_id, &i.ticket_id)?;
         self.repo(&i.auth, &mr.repository_id)?;
         if let Some(existing) = mr.thread.iter().find_map(|event| match event {
             MergeRequestThreadEvent::Merge(value) if value.operation_id == i.operation_id => {
@@ -808,7 +860,8 @@ impl MergeRequestStore {
         self.validate_completion(&i)?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
-        let mr = load_mr_for_ticket(&transaction, &i.auth.workspace_id, &i.ticket_id)?
+        let mr = load_mr(&transaction, &i.auth.workspace_id, &i.merge_request_id)?
+            .filter(|mr| mr.ticket_ids.iter().any(|id| id == &i.ticket_id))
             .ok_or(MergeRequestError::NotFound)?;
 
         if let Some(existing) = mr.thread.iter().find_map(|event| match event {
@@ -870,22 +923,6 @@ impl MergeRequestStore {
         if state.as_deref() != Some("inprogress") {
             return Err(MergeRequestError::Conflict(
                 "Ticket must be inprogress".into(),
-            ));
-        }
-        transaction.execute(
-            "UPDATE typed_tickets
-                SET workflow_state='done',workflow_state_explicit=1,updated_at=?3
-              WHERE workspace_id=?1 AND ticket_id=?2 AND workflow_state='inprogress'",
-            params![mr.workspace_id, i.ticket_id, i.now.to_rfc3339()],
-        )?;
-        let released_assignment = transaction.execute(
-            "DELETE FROM ticket_current_worker_assignments
-              WHERE workspace_id=?1 AND ticket_id=?2 AND assignment_id=?3",
-            params![mr.workspace_id, i.ticket_id, i.auth.assignment_id],
-        )?;
-        if released_assignment != 1 {
-            return Err(MergeRequestError::Unauthorized(
-                "completion assignment changed while closing Ticket".into(),
             ));
         }
         let issued_grants = {
@@ -965,13 +1002,195 @@ impl MergeRequestStore {
         Ok(event)
     }
 
+    pub fn complete_ticket(
+        &self,
+        mut input: CompleteTicket,
+    ) -> Result<TicketCompletionEvent, MergeRequestError> {
+        nonempty("operation_id", &input.operation_id)?;
+        nonempty("item_revision", &input.item_revision)?;
+        if input.merge_request_ids.is_empty() {
+            return Err(MergeRequestError::NotReady(
+                "Ticket completion requires at least one linked Merge Request result".into(),
+            ));
+        }
+        input.merge_request_ids.sort();
+        if input
+            .merge_request_ids
+            .windows(2)
+            .any(|ids| ids[0] == ids[1])
+        {
+            return Err(MergeRequestError::Validation(
+                "merge_request_ids must not contain duplicates".into(),
+            ));
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT payload.value
+                   FROM typed_ticket_event_attributes operation
+                   JOIN typed_ticket_event_attributes payload
+                     ON payload.workspace_id=operation.workspace_id
+                    AND payload.ticket_id=operation.ticket_id
+                    AND payload.event_index=operation.event_index
+                    AND payload.key='ticket_completion'
+                  WHERE operation.workspace_id=?1 AND operation.ticket_id=?2
+                    AND operation.key='operation_id' AND operation.value=?3",
+                params![input.auth.workspace_id, input.ticket_id, input.operation_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(payload) = existing {
+            let event: TicketCompletionEvent = json(&payload)?;
+            if event.item_revision == input.item_revision
+                && event.merge_request_ids == input.merge_request_ids
+                && event.completed_by == input.auth.actor()
+            {
+                return Ok(event);
+            }
+            return Err(MergeRequestError::Conflict(
+                "Ticket completion operation fingerprint mismatch".into(),
+            ));
+        }
+        let current_revision =
+            current_ticket_revision(&transaction, &input.auth.workspace_id, &input.ticket_id)?
+                .ok_or(MergeRequestError::NotFound)?;
+        if current_revision != input.item_revision {
+            return Err(MergeRequestError::Conflict(format!(
+                "Ticket item revision changed from `{}` to `{current_revision}`; repeat requirement review before completion",
+                input.item_revision
+            )));
+        }
+        let state: String = transaction.query_row(
+            "SELECT workflow_state FROM typed_tickets WHERE workspace_id=?1 AND ticket_id=?2",
+            params![input.auth.workspace_id, input.ticket_id],
+            |row| row.get(0),
+        )?;
+        if state != "inprogress" {
+            return Err(MergeRequestError::Conflict(
+                "Ticket must be inprogress".into(),
+            ));
+        }
+        let assignment_is_current: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM ticket_current_worker_assignments
+                 WHERE workspace_id=?1 AND ticket_id=?2 AND assignment_id=?3
+             )",
+            params![
+                input.auth.workspace_id,
+                input.ticket_id,
+                input.auth.assignment_id
+            ],
+            |row| row.get(0),
+        )?;
+        if !assignment_is_current {
+            return Err(MergeRequestError::Unauthorized(
+                "Ticket completion assignment changed before commit".into(),
+            ));
+        }
+        let actual_ids = {
+            let mut statement = transaction.prepare(
+                "SELECT merge_request_id FROM merge_request_ticket_relations
+                  WHERE workspace_id=?1 AND ticket_id=?2 AND relation_kind='implements'
+                  ORDER BY merge_request_id",
+            )?;
+            statement
+                .query_map(params![input.auth.workspace_id, input.ticket_id], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if actual_ids != input.merge_request_ids {
+            return Err(MergeRequestError::Conflict(
+                "linked Merge Request set changed; refresh Ticket completion evidence".into(),
+            ));
+        }
+        for merge_request_id in &actual_ids {
+            let request = load_mr(&transaction, &input.auth.workspace_id, merge_request_id)?
+                .ok_or(MergeRequestError::NotFound)?;
+            if request.state != MergeRequestState::Merged {
+                return Err(MergeRequestError::NotReady(format!(
+                    "Merge Request `{merge_request_id}` has no merged result"
+                )));
+            }
+            let merge = request
+                .thread
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    MergeRequestThreadEvent::Merge(event) => Some(event),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    MergeRequestError::Corrupt(format!(
+                        "merged Merge Request `{merge_request_id}` has no MergeResult"
+                    ))
+                })?;
+            let review = request
+                .effective_review(&merge.approved_source_ref)
+                .filter(|review| review.event_id == merge.approval_event_id)
+                .ok_or_else(|| {
+                    MergeRequestError::NotReady(format!(
+                        "Merge Request `{merge_request_id}` approval is no longer effective"
+                    ))
+                })?;
+            if review.decision != ReviewDecision::Approve
+                || review.ticket_item_revision != input.item_revision
+            {
+                return Err(MergeRequestError::NotReady(format!(
+                    "Merge Request `{merge_request_id}` lacks approval bound to the current Ticket revision"
+                )));
+            }
+        }
+        let updated = transaction.execute(
+            "UPDATE typed_tickets
+                SET workflow_state='done',workflow_state_explicit=1,updated_at=?3
+              WHERE workspace_id=?1 AND ticket_id=?2 AND workflow_state='inprogress'",
+            params![
+                input.auth.workspace_id,
+                input.ticket_id,
+                input.now.to_rfc3339()
+            ],
+        )?;
+        if updated != 1 {
+            return Err(MergeRequestError::Conflict(
+                "Ticket state changed during completion".into(),
+            ));
+        }
+        let released = transaction.execute(
+            "DELETE FROM ticket_current_worker_assignments
+              WHERE workspace_id=?1 AND ticket_id=?2 AND assignment_id=?3",
+            params![
+                input.auth.workspace_id,
+                input.ticket_id,
+                input.auth.assignment_id
+            ],
+        )?;
+        if released != 1 {
+            return Err(MergeRequestError::Unauthorized(
+                "Ticket completion assignment changed while releasing it".into(),
+            ));
+        }
+        let event = TicketCompletionEvent {
+            operation_id: input.operation_id,
+            ticket_id: input.ticket_id.clone(),
+            item_revision: input.item_revision,
+            merge_request_ids: input.merge_request_ids,
+            completed_by: input.auth.actor(),
+            created_at: input.now,
+        };
+        ticket_completion_event(&transaction, &input.auth.workspace_id, &event)?;
+        transaction.commit()?;
+        Ok(event)
+    }
+
     pub fn repair_selector_from(
         &self,
         i: RepairSelectorFrom,
     ) -> Result<MergeRequest, MergeRequestError> {
         nonempty("selector_from", &i.selector_from)?;
         nonempty("resolved_subject_ref", &i.resolved_subject_ref)?;
-        let mr = self.get(&i.workspace_id, &i.ticket_id)?;
+        let mr = self.get_for_operation(&i.workspace_id, &i.merge_request_id, &i.ticket_id)?;
         if mr.selector_from.is_some() {
             return Err(MergeRequestError::Conflict(
                 "selector_from is immutable after it is set".into(),
@@ -1011,7 +1230,7 @@ impl MergeRequestStore {
         )?;
         t.commit()?;
         drop(c);
-        self.get(&i.workspace_id, &i.ticket_id)
+        self.get_by_id(&i.workspace_id, &i.merge_request_id)
     }
     pub fn get(&self, ws: &str, ticket: &str) -> Result<MergeRequest, MergeRequestError> {
         let c = self.lock()?;
@@ -1021,6 +1240,21 @@ impl MergeRequestStore {
             None => Err(MergeRequestError::NotFound),
         }
     }
+    fn get_for_operation(
+        &self,
+        workspace_id: &str,
+        merge_request_id: &str,
+        ticket_id: &str,
+    ) -> Result<MergeRequest, MergeRequestError> {
+        let mr = self.get_by_id(workspace_id, merge_request_id)?;
+        if !mr.ticket_ids.iter().any(|id| id == ticket_id) {
+            return Err(MergeRequestError::Unauthorized(
+                "Merge Request is not linked to the addressed Ticket".into(),
+            ));
+        }
+        Ok(mr)
+    }
+
     pub fn get_by_id(
         &self,
         workspace_id: &str,
@@ -1029,6 +1263,23 @@ impl MergeRequestStore {
         let c = self.lock()?;
         load_mr(&c, workspace_id, merge_request_id)?.ok_or(MergeRequestError::NotFound)
     }
+    pub fn list_for_ticket(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+    ) -> Result<Vec<MergeRequest>, MergeRequestError> {
+        Ok(self
+            .list(
+                workspace_id,
+                &MergeRequestListQuery {
+                    ticket_id: Some(ticket_id.to_string()),
+                    limit: 100,
+                    ..Default::default()
+                },
+            )?
+            .items)
+    }
+
     pub fn list(
         &self,
         workspace_id: &str,
@@ -1125,6 +1376,24 @@ impl MergeRequestStore {
             limit.clamp(1, 200),
         )
     }
+    fn require_current_ticket_revision(
+        &self,
+        workspace_id: &str,
+        ticket_id: &str,
+        expected: &str,
+    ) -> Result<(), MergeRequestError> {
+        nonempty("ticket_item_revision", expected)?;
+        let connection = self.lock()?;
+        let current = current_ticket_revision(&connection, workspace_id, ticket_id)?
+            .ok_or(MergeRequestError::NotFound)?;
+        if current != expected {
+            return Err(MergeRequestError::Conflict(format!(
+                "Ticket item revision changed from `{expected}` to `{current}`; review the current requirements"
+            )));
+        }
+        Ok(())
+    }
+
     fn assigned(&self, a: &MergeRequestAuth, t: &str, r: &str) -> Result<(), MergeRequestError> {
         self.repo(a, r)?;
         let x = self
@@ -1248,29 +1517,39 @@ fn insert_event<T: Serialize>(
     )?;
     Ok(())
 }
-fn load_mr_for_ticket(
+fn current_ticket_revision(
     connection: &Connection,
     workspace_id: &str,
     ticket_id: &str,
-) -> Result<Option<MergeRequest>, MergeRequestError> {
-    let merge_request_id: Option<String> = connection
+) -> Result<Option<String>, MergeRequestError> {
+    let event_revision = connection
         .query_row(
-            "SELECT rel.merge_request_id
-               FROM merge_request_ticket_relations rel
-               JOIN merge_requests mr
-                 ON mr.workspace_id=rel.workspace_id
-                AND mr.merge_request_id=rel.merge_request_id
-              WHERE rel.workspace_id=?1 AND rel.ticket_id=?2
-              ORDER BY CASE mr.state WHEN 'open' THEN 0 ELSE 1 END,mr.created_at DESC
+            "SELECT attribute.value
+               FROM typed_ticket_events event
+               JOIN typed_ticket_event_attributes attribute
+                 ON attribute.workspace_id=event.workspace_id
+                AND attribute.ticket_id=event.ticket_id
+                AND attribute.event_index=event.event_index
+                AND attribute.key='event_id'
+              WHERE event.workspace_id=?1 AND event.ticket_id=?2
+                AND event.kind IN ('create','item_edit')
+              ORDER BY event.event_index DESC
               LIMIT 1",
             params![workspace_id, ticket_id],
             |row| row.get(0),
         )
         .optional()?;
-    match merge_request_id {
-        Some(id) => load_mr(connection, workspace_id, &id),
-        None => Ok(None),
+    if event_revision.is_some() {
+        return Ok(event_revision);
     }
+    connection
+        .query_row(
+            "SELECT updated_at FROM typed_tickets WHERE workspace_id=?1 AND ticket_id=?2",
+            params![workspace_id, ticket_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
 }
 
 fn load_mr(c: &Connection, w: &str, m: &str) -> Result<Option<MergeRequest>, MergeRequestError> {
@@ -1341,9 +1620,10 @@ fn ticket_event(
 ) -> Result<(), MergeRequestError> {
     let ticket = &mr.ticket_ids[0];
     let n:i64=t.query_row("SELECT COALESCE(MAX(event_index),-1)+1 FROM typed_ticket_events WHERE workspace_id=?1 AND ticket_id=?2",params![mr.workspace_id,ticket],|r|r.get(0))?;
-    t.execute("INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,kind,author,at,from_state,to_state,heading,body)VALUES(?1,?2,?3,'state_changed',?4,?5,'inprogress','done','Merge Request completed',?6)",params![mr.workspace_id,ticket,n,format!("worker:{}:{}",e.merged_by.runtime_id,e.merged_by.worker_id),e.created_at.to_rfc3339(),format!("Approved source ref `{}` completed implementation.",e.approved_source_ref)])?;
+    t.execute("INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,kind,author,at,from_state,to_state,heading,body)VALUES(?1,?2,?3,'comment',?4,?5,NULL,NULL,'Merge Request integrated',?6)",params![mr.workspace_id,ticket,n,format!("worker:{}:{}",e.merged_by.runtime_id,e.merged_by.worker_id),e.created_at.to_rfc3339(),format!("Merge Request `{}` integrated approved source ref `{}`; Ticket remains in progress until guarded Ticket completion.",mr.merge_request_id,e.approved_source_ref)])?;
     for (k, v) in [
         ("implementation_assignment_id", a),
+        ("merge_request_id", &mr.merge_request_id),
         ("approval_event_id", &e.approval_event_id),
         ("approved_source_ref", &e.approved_source_ref),
         ("operation_id", &e.operation_id),
@@ -1351,6 +1631,57 @@ fn ticket_event(
         t.execute(
             "INSERT INTO typed_ticket_event_attributes VALUES(?1,?2,?3,?4,?5)",
             params![mr.workspace_id, ticket, n, k, v],
+        )?;
+    }
+    Ok(())
+}
+
+fn ticket_completion_event(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    event: &TicketCompletionEvent,
+) -> Result<(), MergeRequestError> {
+    let event_index: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(event_index),-1)+1 FROM typed_ticket_events WHERE workspace_id=?1 AND ticket_id=?2",
+        params![workspace_id, event.ticket_id],
+        |row| row.get(0),
+    )?;
+    transaction.execute(
+        "INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,kind,author,at,from_state,to_state,heading,body)
+         VALUES(?1,?2,?3,'state_changed',?4,?5,'inprogress','done','Ticket requirements completed',?6)",
+        params![
+            workspace_id,
+            event.ticket_id,
+            event_index,
+            format!(
+                "worker:{}:{}",
+                event.completed_by.runtime_id, event.completed_by.worker_id
+            ),
+            event.created_at.to_rfc3339(),
+            format!(
+                "Current Ticket revision `{}` was approved and completed with Merge Requests: {}.",
+                event.item_revision,
+                event.merge_request_ids.join(", ")
+            )
+        ],
+    )?;
+    for (key, value) in [
+        ("operation_id", event.operation_id.clone()),
+        ("item_revision", event.item_revision.clone()),
+        (
+            "merge_request_ids",
+            serde_json::to_string(&event.merge_request_ids)
+                .map_err(|error| MergeRequestError::Operation(error.to_string()))?,
+        ),
+        (
+            "ticket_completion",
+            serde_json::to_string(event)
+                .map_err(|error| MergeRequestError::Operation(error.to_string()))?,
+        ),
+    ] {
+        transaction.execute(
+            "INSERT INTO typed_ticket_event_attributes VALUES(?1,?2,?3,?4,?5)",
+            params![workspace_id, event.ticket_id, event_index, key, value],
         )?;
     }
     Ok(())

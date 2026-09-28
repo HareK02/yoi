@@ -719,6 +719,7 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewerContext {
     pub ticket_id: String,
+    pub merge_request_id: String,
 }
 
 #[derive(Debug)]
@@ -771,8 +772,9 @@ impl WorkspaceClient for ReviewerChildWorkspaceClient {
         let ticket_id = &self.context.ticket_id;
         let ticket_query_path = format!("/api/w/{workspace_id}/tickets/query");
         let ticket_show_path = format!("/api/w/{workspace_id}/tickets/{ticket_id}/show");
+        let merge_request_id = &self.context.merge_request_id;
         let review_path =
-            format!("/api/w/{workspace_id}/tickets/{ticket_id}/merge-request/reviews");
+            format!("/api/w/{workspace_id}/merge-requests/{merge_request_id}/reviews");
         let read_allowed = request.method == WorkspaceRequestMethod::Get
             || (request.method == WorkspaceRequestMethod::Post
                 && (request.path == ticket_query_path || request.path == ticket_show_path));
@@ -952,6 +954,7 @@ mod reviewer_client_tests {
             inner,
             ReviewerContext {
                 ticket_id: "T1".into(),
+                merge_request_id: "MR1".into(),
             },
             "secret".into(),
         )
@@ -1015,7 +1018,7 @@ mod reviewer_client_tests {
         client
             .execute(WorkspaceRequest::json(
                 WorkspaceRequestMethod::Post,
-                "/api/w/ws/tickets/T1/merge-request/reviews",
+                "/api/w/ws/merge-requests/MR1/reviews",
                 r#"{"decision":"approve"}"#.to_string(),
             ))
             .expect("attested review should be forwarded");

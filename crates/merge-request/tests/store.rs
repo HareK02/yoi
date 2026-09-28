@@ -12,7 +12,7 @@ impl AssignmentSource for Assignments {
 struct Repositories;
 impl RepositorySource for Repositories {
     fn repository_belongs_to_workspace(&self, w: &str, r: &str) -> Result<bool, String> {
-        Ok(w == "W" && r == "R")
+        Ok(w == "W" && matches!(r, "R" | "R2"))
     }
 }
 fn at(s: u32) -> chrono::DateTime<Utc> {
@@ -29,11 +29,17 @@ fn auth() -> MergeRequestAuth {
         assignment_id: "A".into(),
     }
 }
+fn auth_repo(repository_id: &str) -> MergeRequestAuth {
+    MergeRequestAuth {
+        repository_id: repository_id.into(),
+        ..auth()
+    }
+}
 fn fixture() -> (tempfile::TempDir, MergeRequestStore) {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("db");
     let c = Connection::open(&p).unwrap();
-    c.execute_batch("CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY);CREATE TABLE repositories(workspace_id TEXT,repository_id TEXT,PRIMARY KEY(workspace_id,repository_id));CREATE TABLE ticket_current_worker_assignments(workspace_id TEXT,ticket_id TEXT,assignment_id TEXT,runtime_id TEXT,worker_id TEXT,updated_at TEXT,PRIMARY KEY(workspace_id,ticket_id));CREATE TABLE typed_tickets(workspace_id TEXT,ticket_id TEXT,workflow_state TEXT,workflow_state_explicit INTEGER,updated_at TEXT,PRIMARY KEY(workspace_id,ticket_id));CREATE TABLE typed_ticket_events(workspace_id TEXT,ticket_id TEXT,event_index INTEGER,kind TEXT,author TEXT,at TEXT,from_state TEXT,to_state TEXT,heading TEXT,body TEXT,PRIMARY KEY(workspace_id,ticket_id,event_index));CREATE TABLE typed_ticket_event_attributes(workspace_id TEXT,ticket_id TEXT,event_index INTEGER,key TEXT,value TEXT,PRIMARY KEY(workspace_id,ticket_id,event_index,key));INSERT INTO workspaces VALUES('W');INSERT INTO repositories VALUES('W','R');INSERT INTO ticket_current_worker_assignments VALUES('W','T','A','runtime','coder','t');INSERT INTO typed_tickets VALUES('W','T','inprogress',1,'t');").unwrap();
+    c.execute_batch("CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY);CREATE TABLE repositories(workspace_id TEXT,repository_id TEXT,PRIMARY KEY(workspace_id,repository_id));CREATE TABLE ticket_current_worker_assignments(workspace_id TEXT,ticket_id TEXT,assignment_id TEXT,runtime_id TEXT,worker_id TEXT,updated_at TEXT,PRIMARY KEY(workspace_id,ticket_id));CREATE TABLE typed_tickets(workspace_id TEXT,ticket_id TEXT,workflow_state TEXT,workflow_state_explicit INTEGER,updated_at TEXT,PRIMARY KEY(workspace_id,ticket_id));CREATE TABLE typed_ticket_events(workspace_id TEXT,ticket_id TEXT,event_index INTEGER,kind TEXT,author TEXT,at TEXT,from_state TEXT,to_state TEXT,heading TEXT,body TEXT,PRIMARY KEY(workspace_id,ticket_id,event_index));CREATE TABLE typed_ticket_event_attributes(workspace_id TEXT,ticket_id TEXT,event_index INTEGER,key TEXT,value TEXT,PRIMARY KEY(workspace_id,ticket_id,event_index,key));INSERT INTO workspaces VALUES('W');INSERT INTO repositories VALUES('W','R');INSERT INTO repositories VALUES('W','R2');INSERT INTO ticket_current_worker_assignments VALUES('W','T','A','runtime','coder','t');INSERT INTO typed_tickets VALUES('W','T','inprogress',1,'t');").unwrap();
     drop(c);
     let a = Assignments(Arc::new(Mutex::new(CurrentAssignment {
         assignment_id: "A".into(),
@@ -44,20 +50,33 @@ fn fixture() -> (tempfile::TempDir, MergeRequestStore) {
     let s = MergeRequestStore::open(&p, Arc::new(a), Arc::new(Repositories)).unwrap();
     (d, s)
 }
-fn open(s: &MergeRequestStore) {
+fn open_for(s: &MergeRequestStore, merge_request_id: &str, repository_id: &str) {
     s.open_merge_request(OpenMergeRequest {
-        merge_request_id: "MR".into(),
+        merge_request_id: merge_request_id.into(),
         ticket_id: "T".into(),
-        repository_id: "R".into(),
-        selector_from: "work/t".into(),
+        repository_id: repository_id.into(),
+        selector_from: if merge_request_id == "MR" {
+            "work/t".into()
+        } else {
+            format!("work/{merge_request_id}")
+        },
         selector_to: "develop".into(),
         summary: "summary".into(),
-        auth: auth(),
+        auth: auth_repo(repository_id),
         now: at(1),
     })
     .unwrap();
 }
-fn request(s: &MergeRequestStore, subject: &str, token: &str) -> ReviewRequestedEvent {
+fn open(s: &MergeRequestStore) {
+    open_for(s, "MR", "R");
+}
+fn request_for(
+    s: &MergeRequestStore,
+    merge_request_id: &str,
+    repository_id: &str,
+    subject: &str,
+    token: &str,
+) -> ReviewRequestedEvent {
     s.register_reviewer_child_session(RegisterReviewerChildSession {
         workspace_id: "W".into(),
         parent_runtime_id: "runtime".into(),
@@ -68,19 +87,31 @@ fn request(s: &MergeRequestStore, subject: &str, token: &str) -> ReviewRequested
     })
     .unwrap();
     s.request_review(RequestMergeRequestReview {
+        merge_request_id: merge_request_id.into(),
+        ticket_item_revision: "t".into(),
         ticket_id: "T".into(),
         subject_ref: subject.into(),
         child_session_id: format!("child-{token}"),
         capability_token: token.into(),
-        auth: auth(),
+        auth: auth_repo(repository_id),
         now: at(3),
     })
     .unwrap()
     .request_event
 }
-fn approve(s: &MergeRequestStore, subject: &str, token: &str) -> ReviewEvent {
-    request(s, subject, token);
+fn request(s: &MergeRequestStore, subject: &str, token: &str) -> ReviewRequestedEvent {
+    request_for(s, "MR", "R", subject, token)
+}
+fn approve_for(
+    s: &MergeRequestStore,
+    merge_request_id: &str,
+    repository_id: &str,
+    subject: &str,
+    token: &str,
+) -> ReviewEvent {
+    request_for(s, merge_request_id, repository_id, subject, token);
     s.submit_review(SubmitMergeRequestReview {
+        merge_request_id: merge_request_id.into(),
         ticket_id: "T".into(),
         current_subject_ref: subject.into(),
         capability_token: token.into(),
@@ -91,6 +122,9 @@ fn approve(s: &MergeRequestStore, subject: &str, token: &str) -> ReviewEvent {
     })
     .unwrap()
 }
+fn approve(s: &MergeRequestStore, subject: &str, token: &str) -> ReviewEvent {
+    approve_for(s, "MR", "R", subject, token)
+}
 #[test]
 fn review_submission_authorization_rejects_invalid_grants_before_side_effects() {
     let (_d, store) = fixture();
@@ -98,13 +132,15 @@ fn review_submission_authorization_rejects_invalid_grants_before_side_effects() 
     request(&store, "published-source", "valid-token");
 
     let invalid = store
-        .authorize_review_submission("T", "invalid-token")
+        .authorize_review_submission("MR", "invalid-token")
         .unwrap_err();
     assert!(matches!(invalid, MergeRequestError::Unauthorized(_)));
     let authorized = store
-        .authorize_review_submission("T", "valid-token")
+        .authorize_review_submission("MR", "valid-token")
         .unwrap();
     assert_eq!(authorized.workspace_id, "W");
+    assert_eq!(authorized.merge_request_id, "MR");
+    assert_eq!(authorized.ticket_id, "T");
     assert_eq!(authorized.subject_ref, "published-source");
 }
 
@@ -115,6 +151,7 @@ fn selectors_thread_and_completion_have_no_revision_or_commit_api() {
     let review = approve(&s, "opaque-source-ref", "token");
     let ready = s
         .readiness(ReadinessCheck {
+            merge_request_id: "MR".into(),
             ticket_id: "T".into(),
             current_subject_ref: Some("opaque-source-ref".into()),
             auth: auth(),
@@ -123,6 +160,7 @@ fn selectors_thread_and_completion_have_no_revision_or_commit_api() {
     assert!(ready.ready);
     let merged = s
         .complete(CompleteMergeRequest {
+            merge_request_id: "MR".into(),
             ticket_id: "T".into(),
             operation_id: "op".into(),
             approval_event_id: review.event_id,
@@ -150,9 +188,10 @@ fn selectors_thread_and_completion_have_no_revision_or_commit_api() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(!current_assignment);
+    assert!(current_assignment);
     let replayed = s
         .complete(CompleteMergeRequest {
+            merge_request_id: "MR".into(),
             ticket_id: "T".into(),
             operation_id: "op".into(),
             approval_event_id: merged.approval_event_id.clone(),
@@ -166,6 +205,41 @@ fn selectors_thread_and_completion_have_no_revision_or_commit_api() {
         })
         .unwrap();
     assert_eq!(replayed, merged);
+    let completed = s
+        .complete_ticket(CompleteTicket {
+            ticket_id: "T".into(),
+            operation_id: "ticket-op".into(),
+            item_revision: "t".into(),
+            merge_request_ids: vec!["MR".into()],
+            auth: auth(),
+            now: at(7),
+        })
+        .unwrap();
+    assert_eq!(completed.merge_request_ids, vec!["MR"]);
+    let connection = Connection::open(d.path().join("db")).unwrap();
+    let (state, assignment_exists): (String, bool) = connection
+        .query_row(
+            "SELECT workflow_state, EXISTS(
+                SELECT 1 FROM ticket_current_worker_assignments
+                 WHERE workspace_id='W' AND ticket_id='T'
+             ) FROM typed_tickets WHERE workspace_id='W' AND ticket_id='T'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "done");
+    assert!(!assignment_exists);
+    let replayed_completion = s
+        .complete_ticket(CompleteTicket {
+            ticket_id: "T".into(),
+            operation_id: "ticket-op".into(),
+            item_revision: "t".into(),
+            merge_request_ids: vec!["MR".into()],
+            auth: auth(),
+            now: at(8),
+        })
+        .unwrap();
+    assert_eq!(replayed_completion, completed);
     let json = serde_json::to_string(&mr).unwrap();
     for banned in [
         "revision_id",
@@ -187,6 +261,7 @@ fn source_move_cancels_submission_and_old_approval_is_reusable_when_source_retur
     request(&s, "source-b", "two");
     assert!(
         s.submit_review(SubmitMergeRequestReview {
+            merge_request_id: "MR".into(),
             ticket_id: "T".into(),
             current_subject_ref: "source-c".into(),
             capability_token: "two".into(),
@@ -221,6 +296,7 @@ fn same_selector_source_advancement_requires_fresh_review_and_preserves_target_o
 
     let stale = s
         .readiness(ReadinessCheck {
+            merge_request_id: "MR".into(),
             ticket_id: "T".into(),
             current_subject_ref: Some("source-2".into()),
             auth: auth(),
@@ -244,6 +320,7 @@ fn same_selector_source_advancement_requires_fresh_review_and_preserves_target_o
     let second = approve(&s, "source-2", "two");
     let ready = s
         .readiness(ReadinessCheck {
+            merge_request_id: "MR".into(),
             ticket_id: "T".into(),
             current_subject_ref: Some("source-2".into()),
             auth: auth(),
@@ -260,6 +337,7 @@ fn same_selector_source_advancement_requires_fresh_review_and_preserves_target_o
     // integration evidence for the current target pair.
     let merged = s
         .complete(CompleteMergeRequest {
+            merge_request_id: "MR".into(),
             operation_id: "target-moved".into(),
             ticket_id: "T".into(),
             current_subject_ref: "source-2".into(),
@@ -283,6 +361,7 @@ fn review_revocation_invalidates_readiness() {
     open(&s);
     let review = approve(&s, "source", "one");
     s.revoke_review(RevokeMergeRequestReview {
+        merge_request_id: "MR".into(),
         ticket_id: "T".into(),
         review_event_id: review.event_id,
         reason: "bad evidence".into(),
@@ -292,6 +371,7 @@ fn review_revocation_invalidates_readiness() {
     .unwrap();
     let r = s
         .readiness(ReadinessCheck {
+            merge_request_id: "MR".into(),
             ticket_id: "T".into(),
             current_subject_ref: Some("source".into()),
             auth: auth(),
@@ -366,6 +446,7 @@ fn completion_rejects_superseded_approval_for_same_subject() {
     request(&store, "subject", "changes");
     store
         .submit_review(SubmitMergeRequestReview {
+            merge_request_id: "MR".into(),
             ticket_id: "T".into(),
             current_subject_ref: "subject".into(),
             capability_token: "changes".into(),
@@ -376,6 +457,7 @@ fn completion_rejects_superseded_approval_for_same_subject() {
         })
         .unwrap();
     let result = store.complete(CompleteMergeRequest {
+        merge_request_id: "MR".into(),
         ticket_id: "T".into(),
         operation_id: "op".into(),
         approval_event_id: old_approval.event_id,
@@ -398,6 +480,7 @@ fn completion_cancels_outstanding_grants_and_late_submit_fails() {
     request(&store, "other-subject", "pending");
     store
         .complete(CompleteMergeRequest {
+            merge_request_id: "MR".into(),
             ticket_id: "T".into(),
             operation_id: "op".into(),
             approval_event_id: approval.event_id,
@@ -411,6 +494,7 @@ fn completion_cancels_outstanding_grants_and_late_submit_fails() {
         })
         .unwrap();
     let late = store.submit_review(SubmitMergeRequestReview {
+        merge_request_id: "MR".into(),
         ticket_id: "T".into(),
         current_subject_ref: "other-subject".into(),
         capability_token: "pending".into(),
@@ -436,6 +520,7 @@ fn selector_repair_requires_and_accepts_an_approved_resolved_subject() {
         .unwrap();
     let repaired = store
         .repair_selector_from(RepairSelectorFrom {
+            merge_request_id: "MR".into(),
             workspace_id: "W".into(),
             ticket_id: "T".into(),
             selector_from: "restored-work".into(),
@@ -460,6 +545,7 @@ fn selector_repair_rejects_unapproved_resolved_subject() {
         .execute("UPDATE merge_requests SET selector_from=NULL WHERE workspace_id='W' AND merge_request_id='MR'", [])
         .unwrap();
     let result = store.repair_selector_from(RepairSelectorFrom {
+        merge_request_id: "MR".into(),
         workspace_id: "W".into(),
         ticket_id: "T".into(),
         selector_from: "wrong-work".into(),
@@ -552,6 +638,7 @@ fn transactional_completion_rejects_assignment_changed_in_control_plane_db() {
         .execute("UPDATE ticket_current_worker_assignments SET assignment_id='B' WHERE workspace_id='W' AND ticket_id='T'", [])
         .unwrap();
     let result = store.complete(CompleteMergeRequest {
+        merge_request_id: "MR".into(),
         ticket_id: "T".into(),
         operation_id: "op".into(),
         approval_event_id: approval.event_id,
@@ -573,4 +660,159 @@ fn transactional_completion_rejects_assignment_changed_in_control_plane_db() {
         )
         .unwrap();
     assert_eq!(state, "inprogress");
+}
+
+#[test]
+fn ticket_can_link_parallel_open_merge_requests_in_distinct_repositories() {
+    let (_dir, store) = fixture();
+    open_for(&store, "MR", "R");
+    open_for(&store, "MR-2", "R2");
+
+    let linked = store.list_for_ticket("W", "T").unwrap();
+    assert_eq!(
+        linked
+            .iter()
+            .map(|request| request.merge_request_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["MR", "MR-2"]
+    );
+    let duplicate = store.open_merge_request(OpenMergeRequest {
+        merge_request_id: "MR-duplicate".into(),
+        ticket_id: "T".into(),
+        repository_id: "R2".into(),
+        selector_from: "work/duplicate".into(),
+        selector_to: "develop".into(),
+        summary: String::new(),
+        auth: auth_repo("R2"),
+        now: at(2),
+    });
+    assert!(matches!(duplicate, Err(MergeRequestError::Conflict(_))));
+}
+
+#[test]
+fn mr_operations_and_review_capabilities_are_bound_to_explicit_identity() {
+    let (_dir, store) = fixture();
+    open_for(&store, "MR", "R");
+    open_for(&store, "MR-2", "R2");
+    request_for(&store, "MR", "R", "subject-one", "token-one");
+
+    assert!(matches!(
+        store.authorize_review_submission("MR-2", "token-one"),
+        Err(MergeRequestError::Unauthorized(_))
+    ));
+    assert!(matches!(
+        store.submit_review(SubmitMergeRequestReview {
+            merge_request_id: "MR-2".into(),
+            ticket_id: "T".into(),
+            current_subject_ref: "subject-one".into(),
+            capability_token: "token-one".into(),
+            decision: ReviewDecision::Approve,
+            body: "wrong MR".into(),
+            findings: vec![],
+            now: at(4),
+        }),
+        Err(MergeRequestError::Unauthorized(_))
+    ));
+    assert!(
+        !store
+            .get_by_id("W", "MR-2")
+            .unwrap()
+            .thread
+            .iter()
+            .any(|event| matches!(event, MergeRequestThreadEvent::Review(_)))
+    );
+}
+
+#[test]
+fn partial_integration_retains_ticket_and_assignment_until_guarded_ticket_completion() {
+    let (dir, store) = fixture();
+    open_for(&store, "MR", "R");
+    open_for(&store, "MR-2", "R2");
+    let first = approve_for(&store, "MR", "R", "subject-one", "token-one");
+    let second = approve_for(&store, "MR-2", "R2", "subject-two", "token-two");
+
+    store
+        .complete(CompleteMergeRequest {
+            merge_request_id: "MR".into(),
+            ticket_id: "T".into(),
+            operation_id: "merge-one".into(),
+            approval_event_id: first.event_id,
+            current_subject_ref: "subject-one".into(),
+            target_ref_before: "target-one-before".into(),
+            target_ref_after: "target-one-after".into(),
+            strategy: MergeStrategy::FastForward,
+            resolution: ConflictResolution::None,
+            auth: auth_repo("R"),
+            now: at(5),
+        })
+        .unwrap();
+    let connection = Connection::open(dir.path().join("db")).unwrap();
+    let (state, assigned): (String, bool) = connection
+        .query_row(
+            "SELECT workflow_state, EXISTS(SELECT 1 FROM ticket_current_worker_assignments WHERE workspace_id='W' AND ticket_id='T') FROM typed_tickets WHERE workspace_id='W' AND ticket_id='T'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "inprogress");
+    assert!(assigned);
+    assert!(matches!(
+        store.complete_ticket(CompleteTicket {
+            ticket_id: "T".into(),
+            operation_id: "ticket-complete".into(),
+            item_revision: "t".into(),
+            merge_request_ids: vec!["MR".into(), "MR-2".into()],
+            auth: auth(),
+            now: at(6),
+        }),
+        Err(MergeRequestError::NotReady(_))
+    ));
+
+    store
+        .complete(CompleteMergeRequest {
+            merge_request_id: "MR-2".into(),
+            ticket_id: "T".into(),
+            operation_id: "merge-two".into(),
+            approval_event_id: second.event_id,
+            current_subject_ref: "subject-two".into(),
+            target_ref_before: "target-two-before".into(),
+            target_ref_after: "target-two-after".into(),
+            strategy: MergeStrategy::FastForward,
+            resolution: ConflictResolution::None,
+            auth: auth_repo("R2"),
+            now: at(7),
+        })
+        .unwrap();
+    assert!(matches!(
+        store.complete_ticket(CompleteTicket {
+            ticket_id: "T".into(),
+            operation_id: "ticket-complete".into(),
+            item_revision: "stale".into(),
+            merge_request_ids: vec!["MR".into(), "MR-2".into()],
+            auth: auth(),
+            now: at(8),
+        }),
+        Err(MergeRequestError::Conflict(_))
+    ));
+    assert!(matches!(
+        store.complete_ticket(CompleteTicket {
+            ticket_id: "T".into(),
+            operation_id: "ticket-complete".into(),
+            item_revision: "t".into(),
+            merge_request_ids: vec!["MR".into()],
+            auth: auth(),
+            now: at(8),
+        }),
+        Err(MergeRequestError::Conflict(_))
+    ));
+    store
+        .complete_ticket(CompleteTicket {
+            ticket_id: "T".into(),
+            operation_id: "ticket-complete".into(),
+            item_revision: "t".into(),
+            merge_request_ids: vec!["MR-2".into(), "MR".into()],
+            auth: auth(),
+            now: at(9),
+        })
+        .unwrap();
 }
