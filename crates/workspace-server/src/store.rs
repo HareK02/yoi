@@ -12050,6 +12050,22 @@ fn migrate_external_workdir_access_and_optional_expiry_v66_to_v67(
                 ON worker_workdir_links(workspace_id, worker_id, alias) WHERE unlinked_at IS NULL;
             CREATE INDEX worker_workdir_links_workdir
                 ON worker_workdir_links(workspace_id, workdir_id);
+            CREATE TRIGGER workdir_attachment_insert_blocked_by_runtime_removal
+            BEFORE INSERT ON worker_workdir_links FOR EACH ROW
+            WHEN EXISTS (
+                SELECT 1 FROM runtime_removal_operations operation
+                WHERE operation.runtime_id = NEW.runtime_id
+                  AND operation.state IN ('pending', 'cleanup_pending')
+            )
+            BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+            CREATE TRIGGER workdir_attachment_update_blocked_by_runtime_removal
+            BEFORE UPDATE ON worker_workdir_links FOR EACH ROW
+            WHEN EXISTS (
+                SELECT 1 FROM runtime_removal_operations operation
+                WHERE operation.runtime_id = NEW.runtime_id
+                  AND operation.state IN ('pending', 'cleanup_pending')
+            )
+            BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
             "#,
         )?;
         let violations = tx.query_row(
@@ -14216,6 +14232,10 @@ mod tests {
                     version: 66,
                     name: TICKET_TARGETS_AND_WORKDIR_CAPABILITIES_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 67,
+                    name: EXTERNAL_WORKDIR_ACCESS_AND_OPTIONAL_EXPIRY_MIGRATION_NAME.to_string(),
+                },
             ]
         );
 
@@ -14273,6 +14293,10 @@ mod tests {
                         (
                             66,
                             TICKET_TARGETS_AND_WORKDIR_CAPABILITIES_MIGRATION_NAME.to_string(),
+                        ),
+                        (
+                            67,
+                            EXTERNAL_WORKDIR_ACCESS_AND_OPTIONAL_EXPIRY_MIGRATION_NAME.to_string(),
                         ),
                     ]
                 );
@@ -14344,7 +14368,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec![52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66]
+            vec![52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
         let conn = Connection::open(&path).unwrap();
@@ -14352,7 +14376,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 17);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 18);
         assert!(column_exists(&conn, "worker_workdir_links", "alias").unwrap());
         assert!(column_exists(&conn, "worker_workdir_links", "capabilities").unwrap());
         assert!(!column_exists(&conn, "worker_workdir_links", "role").unwrap());
