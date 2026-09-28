@@ -231,7 +231,13 @@ pub fn run_write(
         }
         access
             .atomic_write_file(&path, &target, &request.content, AtomicWriteMode::CreateNew)
-            .map_err(|error| map_io(&logical, error))?;
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    FsError::Conflict(logical.as_str().to_string())
+                } else {
+                    map_io(&logical, error)
+                }
+            })?;
     }
     Ok(WriteResult {
         bytes_written: request.content.len(),
@@ -276,6 +282,14 @@ pub fn run_edit(
         )));
     }
     let replacement_count = if request.replace_all { occurrences } else { 1 };
+    if let Some(limit) = access.max_edit_replacements()
+        && replacement_count > limit
+    {
+        return Err(FsError::InvalidArgument(format!(
+            "{} exceeds provider Edit replacement limit {limit}",
+            logical.as_str()
+        )));
+    }
     let removed_bytes = request
         .old_string
         .len()

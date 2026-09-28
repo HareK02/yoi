@@ -641,8 +641,15 @@ async fn external_read_write_uses_pinned_root_for_conflict_and_commit() {
 async fn external_read_write_rejects_oversized_preimages_and_edit_results_before_commit() {
     let root = tempfile::tempdir().unwrap();
     let limit = crate::external::MAX_EXTERNAL_WRITE_BYTES;
-    std::fs::write(root.path().join("oversized.txt"), vec![b'x'; limit + 1]).unwrap();
+    let oversized_content = vec![b'x'; limit + 1];
+    std::fs::write(root.path().join("oversized.txt"), &oversized_content).unwrap();
     std::fs::write(root.path().join("growth.txt"), vec![b'x'; limit]).unwrap();
+    let high_replacement_content = vec![b'x'; crate::external::MAX_EXTERNAL_RESULT_ITEMS + 1];
+    std::fs::write(
+        root.path().join("high-replacements.txt"),
+        &high_replacement_content,
+    )
+    .unwrap();
     let session = LocalWorkdirSession::external_read_write(
         Workdir::new("external-workdir-bounded-rw"),
         root.path(),
@@ -672,6 +679,10 @@ async fn external_read_write_rejects_oversized_preimages_and_edit_results_before
     .await
     .unwrap_err();
     assert!(matches!(write_error, WorkdirError::InvalidArgument(_)));
+    assert_eq!(
+        std::fs::read(root.path().join("oversized.txt")).unwrap(),
+        oversized_content
+    );
     let edit_error = WorkdirSession::edit(
         &session,
         EditRequest {
@@ -686,10 +697,8 @@ async fn external_read_write_rejects_oversized_preimages_and_edit_results_before
     .unwrap_err();
     assert!(matches!(edit_error, WorkdirError::InvalidArgument(_)));
     assert_eq!(
-        std::fs::metadata(root.path().join("oversized.txt"))
-            .unwrap()
-            .len(),
-        (limit + 1) as u64
+        std::fs::read(root.path().join("oversized.txt")).unwrap(),
+        oversized_content
     );
 
     let growth_observed = WorkdirSession::read(
@@ -719,6 +728,38 @@ async fn external_read_write_rejects_oversized_preimages_and_edit_results_before
     assert_eq!(
         std::fs::read(root.path().join("growth.txt")).unwrap(),
         vec![b'x'; limit]
+    );
+
+    let high_replacement_observed = WorkdirSession::read(
+        &session,
+        ReadRequest {
+            path: WorkdirPath::new("high-replacements.txt").unwrap(),
+            offset: 0,
+            limit: 1,
+            max_bytes: 1,
+        },
+    )
+    .await
+    .unwrap();
+    let high_replacement_error = WorkdirSession::edit(
+        &session,
+        EditRequest {
+            path: WorkdirPath::new("high-replacements.txt").unwrap(),
+            old_string: "x".to_string(),
+            new_string: "y".to_string(),
+            replace_all: true,
+            expected_hash: high_replacement_observed.content_hash,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        high_replacement_error,
+        WorkdirError::InvalidArgument(_)
+    ));
+    assert_eq!(
+        std::fs::read(root.path().join("high-replacements.txt")).unwrap(),
+        high_replacement_content
     );
 }
 

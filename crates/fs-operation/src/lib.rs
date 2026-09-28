@@ -337,6 +337,11 @@ pub trait FsAccessPolicy: Send + Sync {
         None
     }
 
+    /// Bound provider-owned Edit result cardinality before mutation.
+    fn max_edit_replacements(&self) -> Option<usize> {
+        None
+    }
+
     /// Atomically replace or create an already-authorized writable file.
     /// Capability providers override this to keep parent traversal descriptor-
     /// confined through the final rename.
@@ -518,6 +523,33 @@ mod tests {
 
         fn is_writable(&self, path: &Path) -> bool {
             path.starts_with(&self.0)
+        }
+    }
+
+    struct CreateRaceAccess {
+        root: PathBuf,
+        destination: PathBuf,
+    }
+
+    impl FsAccessPolicy for CreateRaceAccess {
+        fn is_readable(&self, path: &Path) -> bool {
+            path.starts_with(&self.root)
+        }
+
+        fn is_writable(&self, path: &Path) -> bool {
+            path.starts_with(&self.root)
+        }
+
+        fn read_metadata(
+            &self,
+            _logical: &Path,
+            _resolved: &Path,
+        ) -> std::io::Result<std::fs::Metadata> {
+            std::fs::write(&self.destination, b"created concurrently")?;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "simulated absence before create race",
+            ))
         }
     }
 
@@ -1173,6 +1205,34 @@ mod tests {
             FsError::InvalidArgument(message)
                 if message.contains("must be a regular file or directory")
         ));
+    }
+
+    #[test]
+    fn no_clobber_create_race_is_reported_as_conflict() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("race.txt");
+        let root_path = root.path().canonicalize().unwrap();
+        let access = CreateRaceAccess {
+            root: root_path.clone(),
+            destination: destination.clone(),
+        };
+
+        let error = run_write(
+            &root_path,
+            WriteRequest {
+                path: FsPath::new("race.txt").unwrap(),
+                content: b"worker content".to_vec(),
+                expected_hash: None,
+            },
+            &access,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, FsError::Conflict(path) if path == "race.txt"));
+        assert_eq!(
+            std::fs::read_to_string(destination).unwrap(),
+            "created concurrently"
+        );
     }
 
     #[cfg(target_os = "linux")]

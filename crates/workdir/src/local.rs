@@ -352,6 +352,11 @@ impl fs_operation::FsAccessPolicy for ScopeAccess {
             .then_some(crate::external::MAX_EXTERNAL_WRITE_BYTES)
     }
 
+    fn max_edit_replacements(&self) -> Option<usize> {
+        self.reject_symlinks
+            .then_some(crate::external::MAX_EXTERNAL_RESULT_ITEMS)
+    }
+
     fn atomic_write_file(
         &self,
         _logical: &Path,
