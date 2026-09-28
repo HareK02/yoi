@@ -154,11 +154,18 @@ pub fn open_beneath_no_symlinks(_root: &Path, _path: &Path) -> std::io::Result<s
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomicWriteMode {
+    CreateNew,
+    Replace,
+}
+
 #[cfg(target_os = "linux")]
 pub fn atomic_write_beneath_no_symlinks_at(
     root: &std::fs::File,
     relative: &Path,
     content: &[u8],
+    mode: AtomicWriteMode,
     before_commit: impl FnOnce() -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     use std::ffi::{CString, OsString};
@@ -234,9 +241,15 @@ pub fn atomic_write_beneath_no_symlinks_at(
     temporary.flush()?;
     temporary.as_file().sync_all()?;
     before_commit()?;
-    temporary
-        .persist(parent_path.join(file_name))
-        .map_err(|error| error.error)?;
+    let destination = parent_path.join(file_name);
+    match mode {
+        AtomicWriteMode::CreateNew => temporary
+            .persist_noclobber(destination)
+            .map_err(|error| error.error)?,
+        AtomicWriteMode::Replace => temporary
+            .persist(destination)
+            .map_err(|error| error.error)?,
+    };
     Ok(())
 }
 
@@ -245,6 +258,7 @@ pub fn atomic_write_beneath_no_symlinks_at(
     _root: &std::fs::File,
     _relative: &Path,
     _content: &[u8],
+    _mode: AtomicWriteMode,
     _before_commit: impl FnOnce() -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     Err(std::io::Error::new(
@@ -317,6 +331,12 @@ pub trait FsAccessPolicy: Send + Sync {
         std::fs::metadata(resolved)
     }
 
+    /// Bound provider-owned mutation preimages and results before allocation or
+    /// commit. `None` retains the provider's ordinary filesystem behavior.
+    fn max_write_bytes(&self) -> Option<usize> {
+        None
+    }
+
     /// Atomically replace or create an already-authorized writable file.
     /// Capability providers override this to keep parent traversal descriptor-
     /// confined through the final rename.
@@ -325,6 +345,7 @@ pub trait FsAccessPolicy: Send + Sync {
         _logical: &Path,
         resolved: &Path,
         content: &[u8],
+        mode: AtomicWriteMode,
     ) -> std::io::Result<()> {
         use std::io::Write;
 
@@ -337,7 +358,12 @@ pub trait FsAccessPolicy: Send + Sync {
         temporary.flush()?;
         temporary.as_file().sync_all()?;
         self.check_cancelled()?;
-        temporary.persist(resolved).map_err(|error| error.error)?;
+        match mode {
+            AtomicWriteMode::CreateNew => temporary
+                .persist_noclobber(resolved)
+                .map_err(|error| error.error)?,
+            AtomicWriteMode::Replace => temporary.persist(resolved).map_err(|error| error.error)?,
+        };
         Ok(())
     }
 
@@ -1166,6 +1192,7 @@ mod tests {
             &root,
             Path::new("escape/secret.txt"),
             b"escaped",
+            AtomicWriteMode::Replace,
             || Ok(()),
         )
         .unwrap_err();
@@ -1184,6 +1211,7 @@ mod tests {
             &root,
             Path::new("nested/created.txt"),
             b"approved",
+            AtomicWriteMode::CreateNew,
             || Ok(()),
         )
         .unwrap();

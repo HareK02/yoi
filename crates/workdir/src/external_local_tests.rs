@@ -576,6 +576,154 @@ async fn external_local_provider_keeps_pre_grant_root_when_path_changes_before_s
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+async fn external_read_write_uses_pinned_root_for_conflict_and_commit() {
+    let parent = tempfile::tempdir().unwrap();
+    let approved = parent.path().join("shared");
+    let approved_original = parent.path().join("approved-original");
+    std::fs::create_dir(&approved).unwrap();
+    std::fs::write(approved.join("item.txt"), "approved").unwrap();
+    let session = LocalWorkdirSession::external_read_write(
+        Workdir::new("external-workdir-pinned-rw"),
+        &approved,
+        BoundedReadLimits::EXTERNAL_DEFAULT,
+    )
+    .unwrap();
+
+    std::fs::rename(&approved, &approved_original).unwrap();
+    std::fs::create_dir(&approved).unwrap();
+
+    let conflict = WorkdirSession::write(
+        &session,
+        WriteRequest {
+            path: WorkdirPath::new("item.txt").unwrap(),
+            content: b"unexpected".to_vec(),
+            expected_hash: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(conflict, WorkdirError::Conflict(_)));
+    assert_eq!(
+        std::fs::read_to_string(approved_original.join("item.txt")).unwrap(),
+        "approved"
+    );
+    assert!(!approved.join("item.txt").exists());
+
+    let observed = WorkdirSession::read(
+        &session,
+        ReadRequest {
+            path: WorkdirPath::new("item.txt").unwrap(),
+            offset: 0,
+            limit: 10,
+            max_bytes: 1024,
+        },
+    )
+    .await
+    .unwrap();
+    WorkdirSession::write(
+        &session,
+        WriteRequest {
+            path: WorkdirPath::new("item.txt").unwrap(),
+            content: b"updated".to_vec(),
+            expected_hash: Some(observed.content_hash),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(approved_original.join("item.txt")).unwrap(),
+        "updated"
+    );
+    assert!(!approved.join("item.txt").exists());
+}
+
+#[tokio::test]
+async fn external_read_write_rejects_oversized_preimages_and_edit_results_before_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let limit = crate::external::MAX_EXTERNAL_WRITE_BYTES;
+    std::fs::write(root.path().join("oversized.txt"), vec![b'x'; limit + 1]).unwrap();
+    std::fs::write(root.path().join("growth.txt"), vec![b'x'; limit]).unwrap();
+    let session = LocalWorkdirSession::external_read_write(
+        Workdir::new("external-workdir-bounded-rw"),
+        root.path(),
+        BoundedReadLimits::EXTERNAL_DEFAULT,
+    )
+    .unwrap();
+
+    let oversized_observed = WorkdirSession::read(
+        &session,
+        ReadRequest {
+            path: WorkdirPath::new("oversized.txt").unwrap(),
+            offset: 0,
+            limit: 1,
+            max_bytes: 1,
+        },
+    )
+    .await
+    .unwrap();
+    let write_error = WorkdirSession::write(
+        &session,
+        WriteRequest {
+            path: WorkdirPath::new("oversized.txt").unwrap(),
+            content: b"small".to_vec(),
+            expected_hash: Some(oversized_observed.content_hash),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(write_error, WorkdirError::InvalidArgument(_)));
+    let edit_error = WorkdirSession::edit(
+        &session,
+        EditRequest {
+            path: WorkdirPath::new("oversized.txt").unwrap(),
+            old_string: "x".to_string(),
+            new_string: "y".to_string(),
+            replace_all: false,
+            expected_hash: oversized_observed.content_hash,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(edit_error, WorkdirError::InvalidArgument(_)));
+    assert_eq!(
+        std::fs::metadata(root.path().join("oversized.txt"))
+            .unwrap()
+            .len(),
+        (limit + 1) as u64
+    );
+
+    let growth_observed = WorkdirSession::read(
+        &session,
+        ReadRequest {
+            path: WorkdirPath::new("growth.txt").unwrap(),
+            offset: 0,
+            limit: 1,
+            max_bytes: 1,
+        },
+    )
+    .await
+    .unwrap();
+    let growth_error = WorkdirSession::edit(
+        &session,
+        EditRequest {
+            path: WorkdirPath::new("growth.txt").unwrap(),
+            old_string: "x".to_string(),
+            new_string: "yy".to_string(),
+            replace_all: true,
+            expected_hash: growth_observed.content_hash,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(growth_error, WorkdirError::InvalidArgument(_)));
+    assert_eq!(
+        std::fs::read(root.path().join("growth.txt")).unwrap(),
+        vec![b'x'; limit]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn external_local_provider_pins_the_approved_root_across_directory_replacement() {
     let parent = tempfile::tempdir().unwrap();
     let approved = parent.path().join("shared");

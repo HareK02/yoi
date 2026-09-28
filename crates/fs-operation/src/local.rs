@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    BoundedReadLimits, ContentHash, EditRequest, EditResult, EntryKind, FsAccessPolicy, FsError,
-    FsPath, ListEntry, ListRequest, ListResult, ReadRequest, ReadResult, StatRequest, StatResult,
-    WriteRequest, WriteResult, direct_symlink,
+    AtomicWriteMode, BoundedReadLimits, ContentHash, EditRequest, EditResult, EntryKind,
+    FsAccessPolicy, FsError, FsPath, ListEntry, ListRequest, ListResult, ReadRequest, ReadResult,
+    StatRequest, StatResult, WriteRequest, WriteResult, direct_symlink,
 };
 
 const READ_BUFFER_BYTES: usize = 16 * 1024;
@@ -204,35 +204,33 @@ pub fn run_write(
     access
         .check_cancelled()
         .map_err(|error| map_io(&logical, error))?;
+    enforce_write_bound(&logical, request.content.len(), access)?;
     let path = resolve(root, &logical)?;
-    let created = !path.exists();
-    if path.exists() {
-        let target = require_access(&path, &logical, access, true, false)?;
-        let metadata = access
-            .read_metadata(&path, &target)
-            .map_err(|error| map_io(&logical, error))?;
+    let target = require_access(&path, &logical, access, true, false)?;
+    let metadata = match access.read_metadata(&path, &target) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(map_io(&logical, error)),
+    };
+    let created = metadata.is_none();
+    if let Some(metadata) = metadata {
         if metadata.is_dir() {
             return Err(FsError::IsDirectory(PathBuf::from(logical.as_str())));
         }
-        let mut bytes = Vec::new();
-        access
-            .open_read_file(&path, &target)
-            .and_then(|mut file| file.read_to_end(&mut bytes))
-            .map_err(|error| map_io(&logical, error))?;
+        let bytes = read_mutation_preimage(&logical, &path, &target, metadata, access)?;
         let actual = hash_bytes(&bytes);
         if request.expected_hash != Some(actual) {
             return Err(FsError::Conflict(logical.as_str().to_string()));
         }
         access
-            .atomic_write_file(&path, &target, &request.content)
+            .atomic_write_file(&path, &target, &request.content, AtomicWriteMode::Replace)
             .map_err(|error| map_io(&logical, error))?;
     } else {
         if request.expected_hash.is_some() {
             return Err(FsError::Conflict(logical.as_str().to_string()));
         }
-        let target = require_access(&path, &logical, access, true, true)?;
         access
-            .atomic_write_file(&path, &target, &request.content)
+            .atomic_write_file(&path, &target, &request.content, AtomicWriteMode::CreateNew)
             .map_err(|error| map_io(&logical, error))?;
     }
     Ok(WriteResult {
@@ -252,11 +250,13 @@ pub fn run_edit(
         .map_err(|error| map_io(&logical, error))?;
     let path = resolve(root, &logical)?;
     let target = require_access(&path, &logical, access, true, false)?;
-    let mut bytes = Vec::new();
-    access
-        .open_read_file(&path, &target)
-        .and_then(|mut file| file.read_to_end(&mut bytes))
+    let metadata = access
+        .read_metadata(&path, &target)
         .map_err(|error| map_io(&logical, error))?;
+    if metadata.is_dir() {
+        return Err(FsError::IsDirectory(PathBuf::from(logical.as_str())));
+    }
+    let bytes = read_mutation_preimage(&logical, &path, &target, metadata, access)?;
     let actual_hash = hash_bytes(&bytes);
     if actual_hash != request.expected_hash {
         return Err(FsError::Conflict(logical.as_str().to_string()));
@@ -275,13 +275,31 @@ pub fn run_edit(
             "old_string matched {occurrences} times; set replace_all=true or provide a unique string"
         )));
     }
+    let replacement_count = if request.replace_all { occurrences } else { 1 };
+    let removed_bytes = request
+        .old_string
+        .len()
+        .checked_mul(replacement_count)
+        .ok_or_else(|| FsError::InvalidArgument("edited content size overflowed".to_string()))?;
+    let added_bytes = request
+        .new_string
+        .len()
+        .checked_mul(replacement_count)
+        .ok_or_else(|| FsError::InvalidArgument("edited content size overflowed".to_string()))?;
+    let edited_len = content
+        .len()
+        .checked_sub(removed_bytes)
+        .and_then(|size| size.checked_add(added_bytes))
+        .ok_or_else(|| FsError::InvalidArgument("edited content size overflowed".to_string()))?;
+    enforce_write_bound(&logical, edited_len, access)?;
     let edited = if request.replace_all {
         content.replace(&request.old_string, &request.new_string)
     } else {
         content.replacen(&request.old_string, &request.new_string, 1)
     };
+    debug_assert_eq!(edited.len(), edited_len);
     access
-        .atomic_write_file(&path, &target, edited.as_bytes())
+        .atomic_write_file(&path, &target, edited.as_bytes(), AtomicWriteMode::Replace)
         .map_err(|error| map_io(&logical, error))?;
     Ok(EditResult {
         replacements: if request.replace_all { occurrences } else { 1 },
@@ -379,6 +397,53 @@ pub fn run_list(
         total_bytes,
         truncated,
     })
+}
+
+fn enforce_write_bound(
+    logical: &FsPath,
+    bytes: usize,
+    access: &dyn FsAccessPolicy,
+) -> Result<(), FsError> {
+    if let Some(limit) = access.max_write_bytes()
+        && bytes > limit
+    {
+        return Err(FsError::InvalidArgument(format!(
+            "{} exceeds provider write limit {limit}",
+            logical.as_str()
+        )));
+    }
+    Ok(())
+}
+
+fn read_mutation_preimage(
+    logical: &FsPath,
+    path: &Path,
+    target: &Path,
+    metadata: std::fs::Metadata,
+    access: &dyn FsAccessPolicy,
+) -> Result<Vec<u8>, FsError> {
+    if let Some(limit) = access.max_write_bytes()
+        && metadata.len() > limit as u64
+    {
+        return Err(FsError::InvalidArgument(format!(
+            "{} exceeds provider write limit {limit}",
+            logical.as_str()
+        )));
+    }
+    let mut file = access
+        .open_read_file(path, target)
+        .map_err(|error| map_io(logical, error))?;
+    let mut bytes = Vec::new();
+    if let Some(limit) = access.max_write_bytes() {
+        file.take(limit.saturating_add(1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| map_io(logical, error))?;
+        enforce_write_bound(logical, bytes.len(), access)?;
+    } else {
+        file.read_to_end(&mut bytes)
+            .map_err(|error| map_io(logical, error))?;
+    }
+    Ok(bytes)
 }
 
 fn resolve(root: &Path, logical: &FsPath) -> Result<PathBuf, FsError> {

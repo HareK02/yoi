@@ -347,11 +347,17 @@ impl fs_operation::FsAccessPolicy for ScopeAccess {
         }
     }
 
+    fn max_write_bytes(&self) -> Option<usize> {
+        self.reject_symlinks
+            .then_some(crate::external::MAX_EXTERNAL_WRITE_BYTES)
+    }
+
     fn atomic_write_file(
         &self,
         _logical: &Path,
         resolved: &Path,
         content: &[u8],
+        mode: fs_operation::AtomicWriteMode,
     ) -> std::io::Result<()> {
         if !self.reject_symlinks {
             use std::io::Write;
@@ -365,7 +371,14 @@ impl fs_operation::FsAccessPolicy for ScopeAccess {
             temporary.flush()?;
             temporary.as_file().sync_all()?;
             self.check_cancelled()?;
-            temporary.persist(resolved).map_err(|error| error.error)?;
+            match mode {
+                fs_operation::AtomicWriteMode::CreateNew => temporary
+                    .persist_noclobber(resolved)
+                    .map_err(|error| error.error)?,
+                fs_operation::AtomicWriteMode::Replace => {
+                    temporary.persist(resolved).map_err(|error| error.error)?
+                }
+            };
             return Ok(());
         }
         let root = self.pinned_root.as_ref().ok_or_else(|| {
@@ -380,7 +393,7 @@ impl fs_operation::FsAccessPolicy for ScopeAccess {
                 "path is outside provider root",
             )
         })?;
-        fs_operation::atomic_write_beneath_no_symlinks_at(root, relative, content, || {
+        fs_operation::atomic_write_beneath_no_symlinks_at(root, relative, content, mode, || {
             self.check_cancelled()
         })
     }
