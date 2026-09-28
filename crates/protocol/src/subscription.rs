@@ -13,6 +13,13 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::Event as WorkerProtocolEvent;
 
 pub const SUBSCRIPTION_PROTOCOL_VERSION: u16 = 1;
+/// Browser/runtime wire guardrails. These bounds are generated into the Workspace
+/// Browser validator so aggregate limits remain part of the Rust-owned contract.
+pub const MAX_SUBSCRIPTION_FRAME_JSON_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_SUBSCRIPTION_STRING_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_SUBSCRIPTION_COLLECTION_ITEMS: usize = 100_000;
+pub const MAX_SUBSCRIPTION_VALUE_DEPTH: usize = 64;
+pub const MAX_SUBSCRIPTION_VALUE_NODES: usize = 250_000;
 pub const MAX_CORRELATION_ID_BYTES: usize = 128;
 pub const MAX_RESOURCE_ID_BYTES: usize = 256;
 pub const MAX_WORKER_IDS_PER_SELECTOR: usize = 256;
@@ -104,6 +111,7 @@ macro_rules! bounded_identifier {
     ($name:ident, $field:literal, $max:expr) => {
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+        #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
         pub struct $name(String);
 
         impl $name {
@@ -203,6 +211,7 @@ fn validate_rejection_message(message: &str) -> Result<(), SubscriptionValidatio
 /// semantics is lexical, so equivalent selectors aggregate to one upstream key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct SubscriptionWorkerIds(Vec<SubscriptionWorkerId>);
 
 impl SubscriptionWorkerIds {
@@ -257,6 +266,7 @@ impl<'de> Deserialize<'de> for SubscriptionWorkerIds {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "topic", rename_all = "snake_case")]
 pub enum EventSubscriptionSelector {
     RuntimeWorkers,
@@ -308,6 +318,7 @@ impl EventSubscriptionSelector {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct SubscriptionFrame {
     pub protocol_version: u16,
     #[serde(flatten)]
@@ -336,6 +347,7 @@ impl SubscriptionFrame {
 /// remain typed within each lane.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "frame", content = "message", rename_all = "snake_case")]
 pub enum SubscriptionFramePayload {
     Request(SubscriptionRequest),
@@ -357,6 +369,7 @@ impl SubscriptionFramePayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct SubscriptionWorkerProtocolMethod {
     pub subscription_id: SubscriptionId,
     pub method: crate::Method,
@@ -370,6 +383,7 @@ impl SubscriptionWorkerProtocolMethod {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum SubscriptionRequest {
     SubscribeEvents {
@@ -405,6 +419,7 @@ impl SubscriptionRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "result", content = "payload", rename_all = "snake_case")]
 pub enum SubscriptionResponse {
     Subscribed {
@@ -467,6 +482,7 @@ impl SubscriptionResponse {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SubscriptionRejectionCode {
     InvalidRequest,
@@ -480,6 +496,7 @@ pub enum SubscriptionRejectionCode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SubscriptionTerminationCode {
     Lagged,
@@ -490,6 +507,7 @@ pub enum SubscriptionTerminationCode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum SubscriptionEvent {
     Event {
@@ -551,6 +569,7 @@ impl SubscriptionEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SubscriptionWorkerState {
     Idle,
@@ -564,8 +583,8 @@ pub enum SubscriptionWorkerState {
 /// `Unavailable` deliberately does not imply `Stopped`: it means the last observed
 /// lifecycle state is retained while the Runtime observation source is unavailable.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SubscriptionWorkerAvailability {
     #[default]
@@ -575,6 +594,7 @@ pub enum SubscriptionWorkerAvailability {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct SubscriptionWorkerWorkdirAttachment {
     /// Stable Worker-local routing alias.
     pub alias: String,
@@ -582,6 +602,7 @@ pub struct SubscriptionWorkerWorkdirAttachment {
     /// omit this field and require `repository_key` from the Server projection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(skip))]
+    #[cfg_attr(feature = "json-schema", schemars(skip))]
     pub repository_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_key: Option<String>,
@@ -610,6 +631,7 @@ impl SubscriptionWorkerWorkdirAttachment {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct SubscriptionWorker {
     pub worker_id: SubscriptionWorkerId,
     /// Set by the Workspace Server when projecting a Runtime-owned Worker to clients.
@@ -623,6 +645,7 @@ pub struct SubscriptionWorker {
     /// Freshness of the Runtime-backed observation carried by this projection.
     /// `Unavailable` preserves catalog membership without claiming that execution stopped.
     #[serde(default)]
+    #[cfg_attr(feature = "json-schema", schemars(required))]
     pub availability: SubscriptionWorkerAvailability,
     /// Producer-owned monotonic revision for this Worker subject.
     pub subject_revision: u64,
@@ -633,6 +656,7 @@ pub struct SubscriptionWorker {
     /// Runtime catalog lifecycle compatibility projection; not foreground-state authority.
     pub state: SubscriptionWorkerState,
     #[serde(default)]
+    #[cfg_attr(feature = "json-schema", schemars(required))]
     pub has_running_internal_workers: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
@@ -674,12 +698,14 @@ impl SubscriptionWorker {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct SubscriptionWorkdir {
     pub working_directory_id: SubscriptionWorkdirId,
     /// Runtime-internal Repository id. Workspace-facing TypeScript contracts
     /// omit this field and require `repository_key` from the Server projection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(skip))]
+    #[cfg_attr(feature = "json-schema", schemars(skip))]
     pub repository_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_key: Option<String>,
@@ -709,6 +735,7 @@ impl SubscriptionWorkdir {
 /// enter this DTO; Workspace Server must resolve the required Repository key.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct WorkspaceSubscriptionWorkdir {
     pub working_directory_id: SubscriptionWorkdirId,
     pub repository_key: String,
@@ -726,6 +753,7 @@ impl WorkspaceSubscriptionWorkdir {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "topic", content = "data", rename_all = "snake_case")]
 pub enum SubscriptionSnapshot {
     Workers {
@@ -789,6 +817,7 @@ impl SubscriptionSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum SubscriptionEventPayload {
     WorkerUpserted {
