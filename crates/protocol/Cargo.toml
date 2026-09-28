@@ -7,7 +7,7 @@ license.workspace = true
 [features]
 default = ["stream"]
 stream = ["dep:tokio"]
-typescript = ["dep:ts-rs"]
+typescript = ["dep:ts-rs", "json-schema"]
 json-schema = ["dep:schemars"]
 
 [dependencies]
