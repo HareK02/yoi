@@ -40,6 +40,10 @@ function reviewRequested(
     event_id: eventId,
     sequence: 1,
     subject_ref: subjectRef,
+    ticket_item_revision: "ticket-revision",
+    ticket_merge_request_subjects: [
+      { merge_request_id: "MR-1", subject_ref: subjectRef },
+    ],
     requested_by: worker,
     reviewer: worker,
     created_at: createdAt,
@@ -57,6 +61,10 @@ function review(
     sequence: 1,
     request_event_id: requestEventId,
     subject_ref: subjectRef,
+    ticket_item_revision: "ticket-revision",
+    ticket_merge_request_subjects: [
+      { merge_request_id: "MR-1", subject_ref: subjectRef },
+    ],
     decision: "approve",
     body: "approved",
     findings: [],
