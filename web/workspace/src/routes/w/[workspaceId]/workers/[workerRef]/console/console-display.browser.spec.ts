@@ -167,6 +167,29 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+test("does not call Runtime APIs before the Worker execution target resolves", async () => {
+  const request = vi.fn();
+  vi.stubGlobal("fetch", request);
+  render(ConsolePage, {
+    data: {
+      workspaceId: "workspace-a",
+      runtimeId: null,
+      workerId: null,
+      worker: null,
+      workerError: "Worker API request failed with HTTP 404",
+    },
+  });
+
+  const unavailable = await screen.findByRole("alert");
+  expect(unavailable.textContent).toContain("Conversation unavailable");
+  expect(unavailable.textContent).toContain(
+    "Worker API request failed with HTTP 404",
+  );
+  await settleMicrotasks();
+  expect(request).not.toHaveBeenCalled();
+  expect(multiplexer.subscribe).not.toHaveBeenCalled();
+});
+
 test("keeps delayed Session and live initial snapshot work in loading state until projection applies", async () => {
   const sessionResponse = deferred<Response>();
   vi.stubGlobal("fetch", vi.fn(() => sessionResponse.promise));

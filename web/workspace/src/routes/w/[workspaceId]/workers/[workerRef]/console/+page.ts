@@ -27,15 +27,17 @@ export const load = (async ({ fetch, params }) => {
     if (params.workerRef !== canonical) {
       redirect(
         308,
-        `/w/${encodeURIComponent(params.workspaceId)}/workers/${encodeURIComponent(canonical)}/console`,
+        `/w/${encodeURIComponent(params.workspaceId)}/workers/${
+          encodeURIComponent(canonical)
+        }/console`,
       );
     }
   }
 
   return {
     workspaceId: params.workspaceId,
-    runtimeId: result.data?.runtime_id ?? "",
-    workerId: result.data?.worker_id ?? "",
+    runtimeId: result.data?.runtime_id ?? null,
+    workerId: result.data?.worker_id ?? null,
     worker: result.data,
     workerError: result.error,
   };

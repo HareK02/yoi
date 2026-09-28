@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { invalidateAll } from "$app/navigation";
     import { tick, untrack, type SvelteComponent } from "svelte";
     import ConsoleLineItem from "$lib/workspace/console/ConsoleLineItem.svelte";
     import ConsoleDisplayStateView from "$lib/workspace/console/ConsoleDisplayState.svelte";
@@ -61,18 +62,20 @@
     import { workspaceMultiplexer, type WorkspaceMultiplexerSubscription } from "$lib/workspace/multiplexer";
     import {
         isCurrentWorkerSessionRequest,
+        resolveWorkerSessionTarget,
         workerSessionAction,
         workerSessionRequestInit,
         type WorkerSessionObservation,
         type WorkerSessionRequestIdentity,
+        type WorkerSessionTarget,
     } from "$lib/workspace/session-observation";
     import type { Diagnostic, Worker } from "$lib/workspace/sidebar/types";
 
     type Props = {
         data: {
             workspaceId: string;
-            runtimeId: string;
-            workerId: string;
+            runtimeId: string | null;
+            workerId: string | null;
             worker: Worker | null;
             workerError: string | null;
         };
@@ -201,8 +204,8 @@
         (SvelteComponent & ComposerInputHandle) | null
     >(null);
     const composerDrafts = new Map<string, ComposerDraftCache>();
-    let activeComposerTargetKey = untrack(
-        () => `${workspaceId}:${runtimeId}:${workerId}`,
+    let activeComposerTargetKey = untrack(() =>
+        runtimeId && workerId ? `${workspaceId}:${runtimeId}:${workerId}` : "",
     );
     let timelineRailDragCleanup: (() => void) | null = null;
     let autoFollowConsole = $state(true);
@@ -231,15 +234,13 @@
     let nextReloadToken = 0;
     let reloadToken = $state(0);
 
-    type ConsoleTarget = {
-        workspaceId: string;
-        runtimeId: string;
-        workerId: string;
-    };
+    type ConsoleTarget = WorkerSessionTarget;
 
-    const consoleTarget = $derived({ workspaceId, runtimeId, workerId });
+    const consoleTarget = $derived(
+        resolveWorkerSessionTarget(workspaceId, runtimeId, workerId),
+    );
     const controlAlertId = $derived(
-        `worker-console-control:${runtimeId}:${workerId}`,
+        `worker-console-control:${runtimeId ?? "unresolved"}:${workerId ?? "unresolved"}`,
     );
 
     const workerViews = $derived(consoleWorkerViews(consoleProjection));
@@ -405,6 +406,10 @@
         const target = consoleTarget;
         beginConsoleLoad();
         const token = advanceReloadToken();
+        if (!target) {
+            void invalidateAll();
+            return;
+        }
         if (!worker) void loadWorker(target, token);
     }
 
@@ -837,7 +842,11 @@
     }
 
     function attachmentPath(): string {
-        return `/api/w/${encodeURIComponent(workspaceId)}/runtimes/${encodeURIComponent(runtimeId)}/workers/${encodeURIComponent(workerId)}`;
+        const target = consoleTarget;
+        if (!target) {
+            throw new Error("Worker execution target is unavailable.");
+        }
+        return `/api/w/${encodeURIComponent(target.workspaceId)}/runtimes/${encodeURIComponent(target.runtimeId)}/workers/${encodeURIComponent(target.workerId)}`;
     }
 
     function updateAttachment(id: number, update: Partial<ComposerAttachment>): void {
@@ -1059,11 +1068,11 @@
                 return (await response.json()) as WorkerSessionObservation;
             })
             .then((observation) => {
+                const currentTarget = consoleTarget;
+                if (!currentTarget) return;
                 const currentIdentity: WorkerSessionRequestIdentity = {
                     token: reloadToken,
-                    workspaceId,
-                    runtimeId,
-                    workerId,
+                    ...currentTarget,
                 };
                 if (
                     !isCurrentWorkerSessionRequest(requestIdentity, currentIdentity) ||
@@ -1826,7 +1835,6 @@
 
     $effect(() => {
         const target = consoleTarget;
-        switchComposerTarget(target);
         const targetWorker = data.worker;
         const targetWorkerError = data.workerError;
         workerViewSelectionGeneration += 1;
@@ -1839,9 +1847,22 @@
         workerError = targetWorkerError;
         liveWorkerState = targetWorker?.state ?? null;
         streamDiagnostics = [];
-        protocolState = "connecting";
         consoleDisplayState = { kind: "loading", stage: "session" };
         const token = advanceReloadToken();
+        if (!target) {
+            untrack(discardAllAttachments);
+            protocolState = "error";
+            consoleDisplayState = {
+                kind: "unavailable",
+                reason: boundedConsoleReason(
+                    targetWorkerError,
+                    "Worker execution target is unavailable.",
+                ),
+            };
+            return;
+        }
+        switchComposerTarget(target);
+        protocolState = "connecting";
         if (!targetWorker) void loadWorker(target, token);
     });
 
@@ -1853,6 +1874,7 @@
         const target = consoleTarget;
         const targetWorker = worker;
         const token = reloadToken;
+        if (!target) return;
         if (
             targetWorker &&
             (targetWorker.runtime_id !== target.runtimeId ||

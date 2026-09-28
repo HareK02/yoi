@@ -1,5 +1,6 @@
 import {
   isCurrentWorkerSessionRequest,
+  resolveWorkerSessionTarget,
   workerSessionAction,
   type WorkerSessionRequestIdentity,
   workerSessionRequestInit,
@@ -23,6 +24,30 @@ const snapshot: SessionSnapshot = {
   },
   entries: [],
 };
+
+Deno.test("worker session target requires every routing identity", () => {
+  const target = resolveWorkerSessionTarget(
+    "workspace-a",
+    "runtime-a",
+    "worker-a",
+  );
+  assert(
+    target?.runtimeId === "runtime-a" && target.workerId === "worker-a",
+    "resolved identities must produce an API target",
+  );
+  for (
+    const unresolved of [
+      resolveWorkerSessionTarget("", "runtime-a", "worker-a"),
+      resolveWorkerSessionTarget("workspace-a", "", "worker-a"),
+      resolveWorkerSessionTarget("workspace-a", "runtime-a", ""),
+      resolveWorkerSessionTarget("workspace-a", null, "worker-a"),
+      resolveWorkerSessionTarget("workspace-a", "runtime-a", undefined),
+      resolveWorkerSessionTarget("workspace-a", "  ", "worker-a"),
+    ]
+  ) {
+    assert(unresolved === null, "incomplete identities must fail closed");
+  }
+});
 
 Deno.test("worker session request includes same-origin credentials", () => {
   const controller = new AbortController();
