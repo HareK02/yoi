@@ -6291,6 +6291,14 @@ pub struct MergeRequestWorkerIdentity {
     pub worker_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct MergeRequestReviewSubject {
+    pub merge_request_id: String,
+    pub subject_ref: String,
+}
+
 macro_rules! merge_request_event {
     ($name:ident { $($field:ident : $ty:ty),* $(,)? }) => {
         #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -6310,6 +6318,7 @@ macro_rules! merge_request_event {
 merge_request_event!(ReviewRequestedEvent {
     subject_ref: String,
     ticket_item_revision: String,
+    ticket_merge_request_subjects: Vec<MergeRequestReviewSubject>,
     requested_by: MergeRequestWorkerIdentity,
     reviewer: MergeRequestWorkerIdentity,
 });
@@ -6317,6 +6326,7 @@ merge_request_event!(ReviewEvent {
     request_event_id: String,
     subject_ref: String,
     ticket_item_revision: String,
+    ticket_merge_request_subjects: Vec<MergeRequestReviewSubject>,
     decision: ReviewDecision,
     body: String,
     findings: Vec<ReviewFinding>,
@@ -6501,6 +6511,7 @@ pub struct RegisterReviewerChildSessionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RegisterMergeRequestReviewCapabilityRequest {
+    pub ticket_id: String,
     pub child_session_id: String,
     pub capability_token: String,
 }
@@ -6533,6 +6544,7 @@ pub struct CompleteTicketRequest {
     pub operation_id: String,
     pub item_revision: String,
     pub merge_request_ids: Vec<String>,
+    pub requirement_approval_event_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -6542,6 +6554,7 @@ pub struct TicketCompletionEvent {
     pub ticket_id: String,
     pub item_revision: String,
     pub merge_request_ids: Vec<String>,
+    pub requirement_approval_event_id: String,
     pub completed_by: MergeRequestWorkerIdentity,
     pub created_at: String,
 }

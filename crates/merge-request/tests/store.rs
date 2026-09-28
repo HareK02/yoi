@@ -86,9 +86,30 @@ fn request_for(
         now: at(2),
     })
     .unwrap();
+    let ticket_merge_request_subjects = s
+        .list_for_ticket("W", "T")
+        .unwrap()
+        .into_iter()
+        .map(|request| {
+            let other_subject = match request.merge_request_id.as_str() {
+                "MR" => "subject-one",
+                "MR-2" => "subject-two",
+                _ => subject,
+            };
+            MergeRequestReviewSubject {
+                subject_ref: if request.merge_request_id == merge_request_id {
+                    subject.into()
+                } else {
+                    other_subject.into()
+                },
+                merge_request_id: request.merge_request_id,
+            }
+        })
+        .collect();
     s.request_review(RequestMergeRequestReview {
         merge_request_id: merge_request_id.into(),
         ticket_item_revision: "t".into(),
+        ticket_merge_request_subjects,
         ticket_id: "T".into(),
         subject_ref: subject.into(),
         child_session_id: format!("child-{token}"),
@@ -211,6 +232,7 @@ fn selectors_thread_and_completion_have_no_revision_or_commit_api() {
             operation_id: "ticket-op".into(),
             item_revision: "t".into(),
             merge_request_ids: vec!["MR".into()],
+            requirement_approval_event_id: merged.approval_event_id.clone(),
             auth: auth(),
             now: at(7),
         })
@@ -235,6 +257,7 @@ fn selectors_thread_and_completion_have_no_revision_or_commit_api() {
             operation_id: "ticket-op".into(),
             item_revision: "t".into(),
             merge_request_ids: vec!["MR".into()],
+            requirement_approval_event_id: merged.approval_event_id.clone(),
             auth: auth(),
             now: at(8),
         })
@@ -343,7 +366,7 @@ fn same_selector_source_advancement_requires_fresh_review_and_preserves_target_o
             current_subject_ref: "source-2".into(),
             target_ref_before: "target-2".into(),
             target_ref_after: "integrated-target-2".into(),
-            approval_event_id: second.event_id,
+            approval_event_id: second.event_id.clone(),
             strategy: MergeStrategy::FastForward,
             resolution: ConflictResolution::None,
             auth: auth(),
@@ -724,6 +747,151 @@ fn mr_operations_and_review_capabilities_are_bound_to_explicit_identity() {
 }
 
 #[test]
+fn ticket_rescope_requires_fresh_review_before_merge_and_remains_recoverable() {
+    let (dir, store) = fixture();
+    open(&store);
+    let stale = approve(&store, "subject", "token-stale");
+    let connection = Connection::open(dir.path().join("db")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO typed_ticket_events VALUES('W','T',1,'item_edit','user','t2',NULL,NULL,NULL,NULL)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO typed_ticket_event_attributes VALUES('W','T',1,'event_id','t2')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let readiness = store
+        .readiness(ReadinessCheck {
+            merge_request_id: "MR".into(),
+            ticket_id: "T".into(),
+            current_subject_ref: Some("subject".into()),
+            auth: auth(),
+        })
+        .unwrap();
+    assert!(!readiness.ready);
+    assert!(
+        readiness
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("Ticket revision"))
+    );
+
+    let stale_completion = CompleteMergeRequest {
+        merge_request_id: "MR".into(),
+        ticket_id: "T".into(),
+        operation_id: "merge-stale".into(),
+        approval_event_id: stale.event_id,
+        current_subject_ref: "subject".into(),
+        target_ref_before: "target-before".into(),
+        target_ref_after: "target-after".into(),
+        strategy: MergeStrategy::FastForward,
+        resolution: ConflictResolution::None,
+        auth: auth(),
+        now: at(5),
+    };
+    assert!(matches!(
+        store.validate_completion(&stale_completion),
+        Err(MergeRequestError::NotReady(_))
+    ));
+    assert!(matches!(
+        store.complete(stale_completion),
+        Err(MergeRequestError::NotReady(_))
+    ));
+
+    store
+        .register_reviewer_child_session(RegisterReviewerChildSession {
+            workspace_id: "W".into(),
+            parent_runtime_id: "runtime".into(),
+            parent_worker_id: "coder".into(),
+            child_session_id: "child-fresh".into(),
+            reviewer_profile: "builtin:reviewer".into(),
+            now: at(6),
+        })
+        .unwrap();
+    store
+        .request_review(RequestMergeRequestReview {
+            merge_request_id: "MR".into(),
+            ticket_id: "T".into(),
+            ticket_item_revision: "t2".into(),
+            ticket_merge_request_subjects: vec![MergeRequestReviewSubject {
+                merge_request_id: "MR".into(),
+                subject_ref: "subject".into(),
+            }],
+            subject_ref: "subject".into(),
+            child_session_id: "child-fresh".into(),
+            capability_token: "token-fresh".into(),
+            auth: auth(),
+            now: at(7),
+        })
+        .unwrap();
+    let fresh = store
+        .submit_review(SubmitMergeRequestReview {
+            merge_request_id: "MR".into(),
+            ticket_id: "T".into(),
+            current_subject_ref: "subject".into(),
+            capability_token: "token-fresh".into(),
+            decision: ReviewDecision::Approve,
+            body: "fresh requirements approved".into(),
+            findings: vec![],
+            now: at(8),
+        })
+        .unwrap();
+    store
+        .complete(CompleteMergeRequest {
+            merge_request_id: "MR".into(),
+            ticket_id: "T".into(),
+            operation_id: "merge-fresh".into(),
+            approval_event_id: fresh.event_id,
+            current_subject_ref: "subject".into(),
+            target_ref_before: "target-before".into(),
+            target_ref_after: "target-after".into(),
+            strategy: MergeStrategy::FastForward,
+            resolution: ConflictResolution::None,
+            auth: auth(),
+            now: at(9),
+        })
+        .unwrap();
+}
+
+#[test]
+fn review_request_rejects_a_snapshot_that_omits_a_linked_merge_request() {
+    let (_dir, store) = fixture();
+    open_for(&store, "MR", "R");
+    open_for(&store, "MR-2", "R2");
+    store
+        .register_reviewer_child_session(RegisterReviewerChildSession {
+            workspace_id: "W".into(),
+            parent_runtime_id: "runtime".into(),
+            parent_worker_id: "coder".into(),
+            child_session_id: "child-incomplete".into(),
+            reviewer_profile: "builtin:reviewer".into(),
+            now: at(3),
+        })
+        .unwrap();
+    let result = store.request_review(RequestMergeRequestReview {
+        merge_request_id: "MR".into(),
+        ticket_id: "T".into(),
+        ticket_item_revision: "t".into(),
+        ticket_merge_request_subjects: vec![MergeRequestReviewSubject {
+            merge_request_id: "MR".into(),
+            subject_ref: "subject-one".into(),
+        }],
+        subject_ref: "subject-one".into(),
+        child_session_id: "child-incomplete".into(),
+        capability_token: "token-incomplete".into(),
+        auth: auth(),
+        now: at(4),
+    });
+    assert!(matches!(result, Err(MergeRequestError::Conflict(_))));
+}
+
+#[test]
 fn partial_integration_retains_ticket_and_assignment_until_guarded_ticket_completion() {
     let (dir, store) = fixture();
     open_for(&store, "MR", "R");
@@ -762,6 +930,7 @@ fn partial_integration_retains_ticket_and_assignment_until_guarded_ticket_comple
             operation_id: "ticket-complete".into(),
             item_revision: "t".into(),
             merge_request_ids: vec!["MR".into(), "MR-2".into()],
+            requirement_approval_event_id: second.event_id.clone(),
             auth: auth(),
             now: at(6),
         }),
@@ -773,7 +942,7 @@ fn partial_integration_retains_ticket_and_assignment_until_guarded_ticket_comple
             merge_request_id: "MR-2".into(),
             ticket_id: "T".into(),
             operation_id: "merge-two".into(),
-            approval_event_id: second.event_id,
+            approval_event_id: second.event_id.clone(),
             current_subject_ref: "subject-two".into(),
             target_ref_before: "target-two-before".into(),
             target_ref_after: "target-two-after".into(),
@@ -789,6 +958,7 @@ fn partial_integration_retains_ticket_and_assignment_until_guarded_ticket_comple
             operation_id: "ticket-complete".into(),
             item_revision: "stale".into(),
             merge_request_ids: vec!["MR".into(), "MR-2".into()],
+            requirement_approval_event_id: second.event_id.clone(),
             auth: auth(),
             now: at(8),
         }),
@@ -797,22 +967,48 @@ fn partial_integration_retains_ticket_and_assignment_until_guarded_ticket_comple
     assert!(matches!(
         store.complete_ticket(CompleteTicket {
             ticket_id: "T".into(),
+            operation_id: "ticket-complete-missing-attestation".into(),
+            item_revision: "t".into(),
+            merge_request_ids: vec!["MR".into(), "MR-2".into()],
+            requirement_approval_event_id: "missing-review".into(),
+            auth: auth(),
+            now: at(8),
+        }),
+        Err(MergeRequestError::NotReady(_))
+    ));
+    assert!(matches!(
+        store.complete_ticket(CompleteTicket {
+            ticket_id: "T".into(),
             operation_id: "ticket-complete".into(),
             item_revision: "t".into(),
             merge_request_ids: vec!["MR".into()],
+            requirement_approval_event_id: second.event_id.clone(),
             auth: auth(),
             now: at(8),
         }),
         Err(MergeRequestError::Conflict(_))
     ));
-    store
+    let completed = store
         .complete_ticket(CompleteTicket {
             ticket_id: "T".into(),
             operation_id: "ticket-complete".into(),
             item_revision: "t".into(),
             merge_request_ids: vec!["MR-2".into(), "MR".into()],
+            requirement_approval_event_id: second.event_id.clone(),
             auth: auth(),
             now: at(9),
         })
         .unwrap();
+    let replay = store
+        .complete_ticket(CompleteTicket {
+            ticket_id: "T".into(),
+            operation_id: "ticket-complete".into(),
+            item_revision: "t".into(),
+            merge_request_ids: vec!["MR".into(), "MR-2".into()],
+            requirement_approval_event_id: second.event_id.clone(),
+            auth: auth(),
+            now: at(10),
+        })
+        .unwrap();
+    assert_eq!(replay, completed);
 }

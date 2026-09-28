@@ -613,7 +613,7 @@ impl Tool for SubWorkerSpawnTool {
         child_registry
             .attach_parent_protocol(session.protocol_sender(), session.session_id_string());
 
-        if let Some((_ticket_id, merge_request_id, capability_token)) = &reviewer_capability {
+        if let Some((ticket_id, merge_request_id, capability_token)) = &reviewer_capability {
             let workspace_id = self.workspace_context.workspace_id().ok_or_else(|| {
                 ToolError::ExecutionFailed("review capability lost Workspace identity".to_string())
             })?;
@@ -643,6 +643,7 @@ impl Tool for SubWorkerSpawnTool {
                 )));
             }
             let body = serde_json::json!({
+                "ticket_id": ticket_id,
                 "child_session_id": child_session_id,
                 "capability_token": capability_token,
             });

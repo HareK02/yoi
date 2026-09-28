@@ -80,6 +80,7 @@ struct CompleteTicketInput {
     operation_id: String,
     item_revision: String,
     merge_request_ids: Vec<String>,
+    requirement_approval_event_id: String,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -213,6 +214,7 @@ impl Tool for MergeRequestTool {
                         "operation_id": v.operation_id,
                         "item_revision": v.item_revision,
                         "merge_request_ids": v.merge_request_ids,
+                        "requirement_approval_event_id": v.requirement_approval_event_id,
                     })),
                 )
             }

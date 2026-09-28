@@ -12167,6 +12167,14 @@ fn public_review_event(event: merge_request::ReviewEvent) -> server_api::ReviewE
         request_event_id: event.request_event_id,
         subject_ref: event.subject_ref,
         ticket_item_revision: event.ticket_item_revision,
+        ticket_merge_request_subjects: event
+            .ticket_merge_request_subjects
+            .into_iter()
+            .map(|subject| server_api::MergeRequestReviewSubject {
+                merge_request_id: subject.merge_request_id,
+                subject_ref: subject.subject_ref,
+            })
+            .collect(),
         decision: public_review_decision(event.decision),
         body: event.body,
         findings: event
@@ -12217,6 +12225,7 @@ fn public_ticket_completion_event(
         ticket_id: event.ticket_id,
         item_revision: event.item_revision,
         merge_request_ids: event.merge_request_ids,
+        requirement_approval_event_id: event.requirement_approval_event_id,
         completed_by: public_merge_request_worker_identity(event.completed_by),
         created_at: event.created_at.to_rfc3339(),
     }
@@ -12270,6 +12279,14 @@ fn public_merge_request_thread_event(
                 sequence: event.sequence,
                 subject_ref: event.subject_ref,
                 ticket_item_revision: event.ticket_item_revision,
+                ticket_merge_request_subjects: event
+                    .ticket_merge_request_subjects
+                    .into_iter()
+                    .map(|subject| server_api::MergeRequestReviewSubject {
+                        merge_request_id: subject.merge_request_id,
+                        subject_ref: subject.subject_ref,
+                    })
+                    .collect(),
                 requested_by: public_merge_request_worker_identity(event.requested_by),
                 reviewer: public_merge_request_worker_identity(event.reviewer),
                 created_at: event.created_at.to_rfc3339(),
@@ -12813,6 +12830,14 @@ async fn scoped_register_merge_request_review_capability(
     let store = merge_request_store(&api, &workspace_id)?;
     let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
     let ticket_id = merge_request_ticket_id(&mr)?;
+    let requested_ticket_id =
+        resolve_workspace_ticket_reference(&api, &workspace_id, &input.ticket_id)?;
+    if requested_ticket_id != ticket_id {
+        return Err(Error::TicketAssignmentConflict(
+            "Reviewer handoff Ticket does not match the addressed Merge Request".into(),
+        )
+        .into());
+    }
     let assignment = api
         .store
         .get_current_ticket_coder_assignment(&workspace_id, &ticket_id)?
@@ -12846,11 +12871,52 @@ async fn scoped_register_merge_request_review_capability(
         &source_observation.revision_ref,
     )?;
     let subject_ref = source_observation.revision_ref;
+    let mut ticket_merge_request_subjects = Vec::new();
+    for linked in store.list_for_ticket(&workspace_id, &ticket_id)? {
+        let linked_subject_ref = if linked.state == merge_request::MergeRequestState::Merged {
+            linked
+                .thread
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    merge_request::MergeRequestThreadEvent::Merge(event) => {
+                        Some(event.approved_source_ref.clone())
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    Error::MergeRequest(merge_request::MergeRequestError::Corrupt(format!(
+                        "merged Merge Request `{}` has no MergeResult",
+                        linked.merge_request_id
+                    )))
+                })?
+        } else {
+            let linked_selector = linked.selector_from.as_deref().ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "Merge Request `{}` selector_from requires repair",
+                    linked.merge_request_id
+                ))
+            })?;
+            observe_published_source_ref(
+                &api,
+                &workspace_id,
+                &assignment.worker.runtime_id,
+                &linked.repository_id,
+                linked_selector,
+            )?
+            .revision_ref
+        };
+        ticket_merge_request_subjects.push(merge_request::MergeRequestReviewSubject {
+            merge_request_id: linked.merge_request_id,
+            subject_ref: linked_subject_ref,
+        });
+    }
     let ticket_item_revision = api.authority.ticket(&ticket_id)?.item_revision;
     store.request_review(merge_request::RequestMergeRequestReview {
         merge_request_id,
         ticket_id,
         ticket_item_revision,
+        ticket_merge_request_subjects,
         subject_ref,
         child_session_id: input.child_session_id,
         capability_token: input.capability_token,
@@ -13077,24 +13143,24 @@ async fn scoped_complete_ticket(
     require_workspace_access(&workspace_id, &api)?;
     let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
     require_online_workspace_orchestrator_source(&api, &source)?;
-    let assignment = api
+    let assignment_id = api
         .store
         .get_current_ticket_coder_assignment(&workspace_id, &ticket_id)?
-        .ok_or_else(|| {
-            Error::TicketAssignmentConflict("Ticket has no current assigned Coder".into())
-        })?;
+        .map(|assignment| assignment.assignment_id)
+        .unwrap_or_default();
     let event = merge_request_store(&api, &workspace_id)?.complete_ticket(
         merge_request::CompleteTicket {
             ticket_id,
             operation_id: input.operation_id,
             item_revision: input.item_revision,
             merge_request_ids: input.merge_request_ids,
+            requirement_approval_event_id: input.requirement_approval_event_id,
             auth: merge_request::MergeRequestAuth {
                 workspace_id,
                 repository_id: String::new(),
                 runtime_id: source.runtime_id,
                 worker_id: source.worker_id,
-                assignment_id: assignment.assignment_id,
+                assignment_id,
             },
             now: Utc::now(),
         },

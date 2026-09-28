@@ -6,6 +6,7 @@ import type {
   MergeRequestListResponse,
   MergeRequestRefDiagnostic,
   MergeRequestRefResponse,
+  MergeRequestReviewSubject,
   MergeRequestThreadEvent,
   MergeRequestWorkerIdentity,
   ObjectiveDetail,
@@ -1055,6 +1056,21 @@ function parseMergeRequestWorker(
   };
 }
 
+function parseMergeRequestReviewSubject(
+  value: unknown,
+  label: string,
+): MergeRequestReviewSubject {
+  const item = object(value, label);
+  exact(item, ["merge_request_id", "subject_ref"], label);
+  return {
+    merge_request_id: string(
+      item.merge_request_id,
+      `${label}.merge_request_id`,
+    ),
+    subject_ref: string(item.subject_ref, `${label}.subject_ref`),
+  };
+}
+
 function parseReviewFinding(value: unknown, label: string): ReviewFinding {
   const item = object(value, label);
   exact(item, ["body", "code", "line", "path", "severity"], label);
@@ -1096,6 +1112,7 @@ function parseMergeRequestThreadEvent(
         "reviewer",
         "subject_ref",
         "ticket_item_revision",
+        "ticket_merge_request_subjects",
       ],
       label,
     );
@@ -1112,6 +1129,11 @@ function parseMergeRequestThreadEvent(
         item.ticket_item_revision,
         `${label}.ticket_item_revision`,
       ),
+      ticket_merge_request_subjects: array(
+        item.ticket_merge_request_subjects,
+        `${label}.ticket_merge_request_subjects`,
+        parseMergeRequestReviewSubject,
+      ),
     };
   }
   if (kind === "review") {
@@ -1124,6 +1146,7 @@ function parseMergeRequestThreadEvent(
       "reviewer",
       "subject_ref",
       "ticket_item_revision",
+      "ticket_merge_request_subjects",
     ], label);
     const decision = string(item.decision, `${label}.decision`);
     if (!["approve", "request_changes"].includes(decision)) {
@@ -1144,6 +1167,11 @@ function parseMergeRequestThreadEvent(
       ticket_item_revision: string(
         item.ticket_item_revision,
         `${label}.ticket_item_revision`,
+      ),
+      ticket_merge_request_subjects: array(
+        item.ticket_merge_request_subjects,
+        `${label}.ticket_merge_request_subjects`,
+        parseMergeRequestReviewSubject,
       ),
     };
   }

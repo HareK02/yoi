@@ -3808,6 +3808,22 @@
         ],
         "type": "object"
       },
+      "MergeRequestReviewSubject": {
+        "additionalProperties": false,
+        "properties": {
+          "merge_request_id": {
+            "type": "string"
+          },
+          "subject_ref": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "merge_request_id",
+          "subject_ref"
+        ],
+        "type": "object"
+      },
       "MergeRequestState": {
         "enum": [
           "open",
@@ -3848,6 +3864,12 @@
               },
               "ticket_item_revision": {
                 "type": "string"
+              },
+              "ticket_merge_request_subjects": {
+                "items": {
+                  "$ref": "#/components/schemas/MergeRequestReviewSubject"
+                },
+                "type": "array"
               }
             },
             "required": [
@@ -3856,6 +3878,7 @@
               "sequence",
               "subject_ref",
               "ticket_item_revision",
+              "ticket_merge_request_subjects",
               "requested_by",
               "reviewer",
               "created_at"
@@ -3904,6 +3927,12 @@
               },
               "ticket_item_revision": {
                 "type": "string"
+              },
+              "ticket_merge_request_subjects": {
+                "items": {
+                  "$ref": "#/components/schemas/MergeRequestReviewSubject"
+                },
+                "type": "array"
               }
             },
             "required": [
@@ -3913,6 +3942,7 @@
               "request_event_id",
               "subject_ref",
               "ticket_item_revision",
+              "ticket_merge_request_subjects",
               "decision",
               "body",
               "findings",
@@ -6314,6 +6344,12 @@
           },
           "ticket_item_revision": {
             "type": "string"
+          },
+          "ticket_merge_request_subjects": {
+            "items": {
+              "$ref": "#/components/schemas/MergeRequestReviewSubject"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -6322,6 +6358,7 @@
           "request_event_id",
           "subject_ref",
           "ticket_item_revision",
+          "ticket_merge_request_subjects",
           "decision",
           "body",
           "findings",
@@ -13945,7 +13982,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:fbaf40391d4ab81b9ffb558ff4c055efb8c58e26b6a88d3eefbbbeefc6ea0822"
+    "x-yoi-source-digest": "sha256:7b14311c0ae7d40c3e1b423890c890b1b73de321ed199c223b771711effcd280"
   },
   "openapi": "3.1.0",
   "paths": {

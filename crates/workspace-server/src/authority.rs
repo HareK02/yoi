@@ -2806,6 +2806,10 @@ mod tests {
                 sequence: 1,
                 subject_ref: "commit-1".to_string(),
                 ticket_item_revision: "revision-1".to_string(),
+                ticket_merge_request_subjects: vec![merge_request::MergeRequestReviewSubject {
+                    merge_request_id: "mr-1".to_string(),
+                    subject_ref: "commit-1".to_string(),
+                }],
                 requested_by: reviewer.clone(),
                 reviewer: reviewer.clone(),
                 created_at: requested_at,
@@ -2816,6 +2820,10 @@ mod tests {
                 request_event_id: "request-1".to_string(),
                 subject_ref: "commit-1".to_string(),
                 ticket_item_revision: "revision-1".to_string(),
+                ticket_merge_request_subjects: vec![merge_request::MergeRequestReviewSubject {
+                    merge_request_id: "mr-1".to_string(),
+                    subject_ref: "commit-1".to_string(),
+                }],
                 decision,
                 body: "review body".to_string(),
                 findings: Vec::new(),
