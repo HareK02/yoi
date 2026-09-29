@@ -1074,6 +1074,7 @@ fn external_workdir_operation_kind(operation: &WorkdirSessionOperation) -> &'sta
         WorkdirSessionOperation::ScopeRulesOverlap(_) => "scope_rules_overlap",
         WorkdirSessionOperation::Stat(_) => "stat",
         WorkdirSessionOperation::Read(_) => "read",
+        WorkdirSessionOperation::ReadBytes(_) => "read_bytes",
         WorkdirSessionOperation::Write(_) => "write",
         WorkdirSessionOperation::Edit(_) => "edit",
         WorkdirSessionOperation::List(_) => "list",
@@ -1139,6 +1140,19 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
         match self.operate(WorkdirSessionOperation::Read(request)).await? {
             WorkdirSessionOperationResult::Read(value) => Ok(value),
             _ => Err(Self::mismatch("read")),
+        }
+    }
+    async fn read_bytes(
+        &self,
+        request: workdir::ReadBytesRequest,
+    ) -> std::result::Result<workdir::ReadBytesResult, workdir::WorkdirError> {
+        self.ensure_capability(workdir::WorkdirSessionCapability::Read)?;
+        match self
+            .operate(WorkdirSessionOperation::ReadBytes(request))
+            .await?
+        {
+            WorkdirSessionOperationResult::ReadBytes(value) => Ok(value),
+            _ => Err(Self::mismatch("read_bytes")),
         }
     }
     async fn write(
@@ -14824,6 +14838,7 @@ async fn scoped_execute_current_worker_workdir_operation(
         | WorkdirSessionOperation::ScopeRulesOverlap(_)
         | WorkdirSessionOperation::Stat(_)
         | WorkdirSessionOperation::Read(_)
+        | WorkdirSessionOperation::ReadBytes(_)
         | WorkdirSessionOperation::Write(_)
         | WorkdirSessionOperation::Edit(_)
         | WorkdirSessionOperation::List(_)
@@ -14890,6 +14905,10 @@ async fn execute_workdir_session_operation(
             .read(request)
             .await
             .map(WorkdirSessionOperationResult::Read),
+        WorkdirSessionOperation::ReadBytes(request) => session
+            .read_bytes(request)
+            .await
+            .map(WorkdirSessionOperationResult::ReadBytes),
         WorkdirSessionOperation::Write(request) => session
             .write(request)
             .await
@@ -17642,7 +17661,7 @@ async fn serve_external_workdir_provider(
                         Ok(operation) => operation,
                         Err(message) => {
                             let _ = response.send(Err(WorkdirTransportError {
-                                code: workdir::http::WorkdirTransportErrorCode::Unsupported,
+                                code: workdir::http::WorkdirTransportErrorCode::InvalidRequest,
                                 message,
                             }));
                             continue;
@@ -28109,6 +28128,8 @@ mod tests {
         );
         let provider_root = tempfile::tempdir().unwrap();
         fs::write(provider_root.path().join("events.jsonl"), b"one\ntwo\n").unwrap();
+        let image_bytes = b"\x89PNG\r\n\x1a\nexternal\0image\n\xff";
+        fs::write(provider_root.path().join("image.png"), image_bytes).unwrap();
         let pinned_provider_root = workdir::ExternalWorkdirRoot::pin(provider_root.path()).unwrap();
         let local_session = workdir::LocalWorkdirSession::external_with_capabilities_pinned(
             workdir::Workdir::new(&grant.working_directory_id),
@@ -28177,6 +28198,61 @@ mod tests {
             .unwrap();
         let read_result = read.await.unwrap().unwrap();
         assert_eq!(read_result.bytes, b"one\ntwo\n");
+
+        let read_bytes = {
+            let broker_session = broker_session.clone();
+            tokio::spawn(async move {
+                broker_session
+                    .read_bytes(workdir::ReadBytesRequest {
+                        path: workdir::WorkdirPath::new("image.png").unwrap(),
+                        offset: 0,
+                        max_bytes: 1024,
+                        expected_hash: None,
+                    })
+                    .await
+            })
+        };
+        let (operation_id, operation) = loop {
+            let text = second.next().await.unwrap().unwrap().into_text().unwrap();
+            let frame = serde_json::from_str::<ExternalWorkdirServerFrame>(&text).unwrap();
+            if let ExternalWorkdirServerMessage::Operation {
+                generation: 2,
+                operation_id,
+                operation,
+            } = frame.message
+            {
+                break (operation_id, operation);
+            }
+        };
+        assert!(matches!(
+            operation.as_inner(),
+            WorkdirSessionOperation::ReadBytes(_)
+        ));
+        let result = workdir::http::dispatch_workdir_session_operation(
+            &local_session,
+            operation.into_inner(),
+        )
+        .await
+        .unwrap()
+        .try_into()
+        .unwrap();
+        second
+            .send(Message::Text(
+                serde_json::to_string(&ExternalWorkdirProviderFrame::current(
+                    ExternalWorkdirProviderMessage::OperationResult {
+                        generation: 2,
+                        operation_id,
+                        outcome: ExternalWorkdirOperationOutcome::Completed { result },
+                    },
+                ))
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let read_bytes_result = read_bytes.await.unwrap().unwrap();
+        assert_eq!(read_bytes_result.bytes, image_bytes);
+        assert!(read_bytes_result.eof);
 
         let edit = {
             let broker_session = broker_session.clone();

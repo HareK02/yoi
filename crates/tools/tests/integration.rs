@@ -399,6 +399,224 @@ async fn detach_and_reattach_same_alias_requires_a_fresh_read() {
     router.close_all().await.unwrap();
 }
 
+#[derive(Debug)]
+struct ExternalValidatingSession {
+    inner: LocalWorkdirSession,
+    truncate_first_binary_response: bool,
+    mutate_after_first_binary_response: Option<std::path::PathBuf>,
+}
+
+#[async_trait::async_trait]
+impl workdir::WorkdirSession for ExternalValidatingSession {
+    fn workdir(&self) -> &workdir::Workdir {
+        self.inner.workdir()
+    }
+
+    fn capabilities(&self) -> workdir::WorkdirSessionCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn stat(
+        &self,
+        request: workdir::StatRequest,
+    ) -> Result<workdir::StatResult, workdir::WorkdirError> {
+        self.inner.stat(request).await
+    }
+
+    async fn read(
+        &self,
+        request: workdir::ReadRequest,
+    ) -> Result<workdir::ReadResult, workdir::WorkdirError> {
+        let operation = workdir::http::WorkdirSessionOperation::Read(request);
+        let operation = workdir::external::ExternalWorkdirOperation::try_from(operation)
+            .map_err(workdir::WorkdirError::UnsupportedOperation)?;
+        let workdir::http::WorkdirSessionOperation::Read(request) = operation.into_inner() else {
+            unreachable!("validated Read changed operation kind")
+        };
+        self.inner.read(request).await
+    }
+
+    async fn read_bytes(
+        &self,
+        request: workdir::ReadBytesRequest,
+    ) -> Result<workdir::ReadBytesResult, workdir::WorkdirError> {
+        let operation = workdir::http::WorkdirSessionOperation::ReadBytes(request);
+        let operation = workdir::external::ExternalWorkdirOperation::try_from(operation)
+            .map_err(workdir::WorkdirError::UnsupportedOperation)?;
+        let workdir::http::WorkdirSessionOperation::ReadBytes(request) = operation.into_inner()
+        else {
+            unreachable!("validated ReadBytes changed operation kind")
+        };
+        let result = self.inner.read_bytes(request).await?;
+        let result = workdir::external::ExternalWorkdirOperationResult::try_from(
+            workdir::http::WorkdirSessionOperationResult::ReadBytes(result),
+        )
+        .map_err(workdir::WorkdirError::UnsupportedOperation)?;
+        let workdir::http::WorkdirSessionOperationResult::ReadBytes(mut result) =
+            result.into_inner()
+        else {
+            unreachable!("validated ReadBytes result changed operation kind")
+        };
+        if result.offset == 0 {
+            if let Some(path) = &self.mutate_after_first_binary_response {
+                std::fs::write(path, vec![b'z'; result.total_bytes as usize]).unwrap();
+            }
+            if self.truncate_first_binary_response {
+                result.bytes.pop();
+            }
+        }
+        Ok(result)
+    }
+
+    async fn write(
+        &self,
+        request: workdir::WriteRequest,
+    ) -> Result<workdir::WriteResult, workdir::WorkdirError> {
+        self.inner.write(request).await
+    }
+
+    async fn edit(
+        &self,
+        request: workdir::EditRequest,
+    ) -> Result<workdir::EditResult, workdir::WorkdirError> {
+        self.inner.edit(request).await
+    }
+
+    async fn list(
+        &self,
+        request: workdir::ListRequest,
+    ) -> Result<workdir::ListResult, workdir::WorkdirError> {
+        self.inner.list(request).await
+    }
+
+    async fn glob(
+        &self,
+        request: workdir::GlobRequest,
+    ) -> Result<workdir::GlobResult, workdir::WorkdirError> {
+        self.inner.glob(request).await
+    }
+
+    async fn grep(
+        &self,
+        request: workdir::GrepRequest,
+    ) -> Result<workdir::GrepResult, workdir::WorkdirError> {
+        self.inner.grep(request).await
+    }
+
+    async fn start_command(
+        &self,
+        request: workdir::CommandRequest,
+    ) -> Result<workdir::CommandHandle, workdir::WorkdirError> {
+        self.inner.start_command(request).await
+    }
+
+    async fn command_status(
+        &self,
+        handle: workdir::CommandHandle,
+    ) -> Result<workdir::CommandStatus, workdir::WorkdirError> {
+        self.inner.command_status(handle).await
+    }
+
+    async fn command_output(
+        &self,
+        request: workdir::CommandOutputRequest,
+    ) -> Result<workdir::CommandOutput, workdir::WorkdirError> {
+        self.inner.command_output(request).await
+    }
+
+    async fn cancel_command(
+        &self,
+        handle: workdir::CommandHandle,
+    ) -> Result<(), workdir::WorkdirError> {
+        self.inner.cancel_command(handle).await
+    }
+
+    async fn close(&self) -> Result<(), workdir::WorkdirError> {
+        self.inner.close().await
+    }
+}
+
+#[tokio::test]
+async fn external_view_image_uses_a_protocol_bounded_request() {
+    let dir = TempDir::new().unwrap();
+    let spill = TempDir::new().unwrap();
+    let scope = scope_with_spill(dir.path(), spill.path());
+    let session: WorkdirSessionHandle = Arc::new(ExternalValidatingSession {
+        inner: LocalWorkdirSession::new(scope, dir.path().to_path_buf()),
+        truncate_first_binary_response: false,
+        mutate_after_first_binary_response: None,
+    });
+    let png = b"\x89PNG\r\n\x1a\nexternal\0image\nbody\xff";
+    std::fs::write(dir.path().join("image.png"), png).unwrap();
+    let (_meta, tool) = view_image_tool(session)();
+
+    let output = call(&tool, json!({ "path": "image.png" })).await;
+    let agen::tool::Attachment::Image(image) = &output.attachments[0];
+    assert_eq!(image.mime_type(), "image/png");
+    assert_eq!(image.data(), png);
+}
+
+#[tokio::test]
+async fn external_view_image_rejects_truncated_and_cross_version_chunks() {
+    let dir = TempDir::new().unwrap();
+    let spill = TempDir::new().unwrap();
+    let image_path = dir.path().join("image.png");
+    let scope = scope_with_spill(dir.path(), spill.path());
+    std::fs::write(&image_path, b"\x89PNG\r\n\x1a\npartial").unwrap();
+    let truncated: WorkdirSessionHandle = Arc::new(ExternalValidatingSession {
+        inner: LocalWorkdirSession::new(scope.clone(), dir.path().to_path_buf()),
+        truncate_first_binary_response: true,
+        mutate_after_first_binary_response: None,
+    });
+    let (_meta, tool) = view_image_tool(truncated)();
+    let error = call_err(&tool, json!({ "path": "image.png" }))
+        .await
+        .to_string();
+    assert!(
+        error.contains("truncated") || error.contains("partial"),
+        "{error}"
+    );
+
+    let mut large = vec![b'x'; 1024 * 1024 + 32];
+    large[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+    std::fs::write(&image_path, large).unwrap();
+    let changing: WorkdirSessionHandle = Arc::new(ExternalValidatingSession {
+        inner: LocalWorkdirSession::new(scope, dir.path().to_path_buf()),
+        truncate_first_binary_response: false,
+        mutate_after_first_binary_response: Some(image_path),
+    });
+    let (_meta, tool) = view_image_tool(changing)();
+    let error = call_err(&tool, json!({ "path": "image.png" }))
+        .await
+        .to_string();
+    assert!(error.contains("changed"), "{error}");
+}
+
+#[tokio::test]
+async fn view_image_enforces_the_ten_mib_boundary_without_partial_attachments() {
+    const LIMIT: usize = 10 * 1024 * 1024;
+    let dir = TempDir::new().unwrap();
+    let spill = TempDir::new().unwrap();
+    let scope = scope_with_spill(dir.path(), spill.path());
+    let session: WorkdirSessionHandle =
+        Arc::new(LocalWorkdirSession::new(scope, dir.path().to_path_buf()));
+    let (_meta, tool) = view_image_tool(session)();
+    let mut png = vec![0xff; LIMIT];
+    png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+    std::fs::write(dir.path().join("boundary.png"), &png).unwrap();
+
+    let output = call(&tool, json!({ "path": "boundary.png" })).await;
+    let agen::tool::Attachment::Image(image) = &output.attachments[0];
+    assert_eq!(image.data(), png);
+
+    png.push(0);
+    std::fs::write(dir.path().join("boundary.png"), png).unwrap();
+    let error = call_err(&tool, json!({ "path": "boundary.png" }))
+        .await
+        .to_string();
+    assert!(error.contains("10485760-byte limit"), "{error}");
+}
+
 #[tokio::test]
 async fn view_image_reads_scoped_bytes_into_durable_tool_detail() {
     let dir = TempDir::new().unwrap();

@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest, CommandStatus, EditRequest,
     EditResult, GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest, ListResult,
-    ReadRequest, ReadResult, StatRequest, StatResult, WorkdirError, WorkdirId,
-    WorkdirScopeAuthorizationRequest, WorkdirScopeOverlapRequest, WorkdirSession,
-    WorkdirSessionCapabilities, WriteRequest, WriteResult,
+    ReadBytesRequest, ReadBytesResult, ReadRequest, ReadResult, StatRequest, StatResult,
+    WorkdirError, WorkdirId, WorkdirScopeAuthorizationRequest, WorkdirScopeOverlapRequest,
+    WorkdirSession, WorkdirSessionCapabilities, WriteRequest, WriteResult,
 };
 
 /// Opaque Runtime-owned identifier for one ephemeral Workdir session.
@@ -66,6 +66,7 @@ pub enum WorkdirSessionOperation {
     ScopeRulesOverlap(WorkdirScopeOverlapRequest),
     Stat(StatRequest),
     Read(ReadRequest),
+    ReadBytes(ReadBytesRequest),
     Write(WriteRequest),
     Edit(EditRequest),
     List(ListRequest),
@@ -97,6 +98,7 @@ pub enum WorkdirSessionOperationResult {
     ScopeRulesOverlap { overlaps: bool },
     Stat(StatResult),
     Read(ReadResult),
+    ReadBytes(ReadBytesResult),
     Write(WriteResult),
     Edit(EditResult),
     List(ListResult),
@@ -135,6 +137,10 @@ pub async fn dispatch_workdir_session_operation(
             .read(request)
             .await
             .map(WorkdirSessionOperationResult::Read),
+        WorkdirSessionOperation::ReadBytes(request) => session
+            .read_bytes(request)
+            .await
+            .map(WorkdirSessionOperationResult::ReadBytes),
         WorkdirSessionOperation::Write(request) => session
             .write(request)
             .await
@@ -569,6 +575,19 @@ mod client {
             match self.operate(WorkdirSessionOperation::Read(request)).await? {
                 WorkdirSessionOperationResult::Read(result) => Ok(result),
                 _ => Err(Self::mismatch("read")),
+            }
+        }
+
+        async fn read_bytes(
+            &self,
+            request: ReadBytesRequest,
+        ) -> Result<ReadBytesResult, WorkdirError> {
+            match self
+                .operate(WorkdirSessionOperation::ReadBytes(request))
+                .await?
+            {
+                WorkdirSessionOperationResult::ReadBytes(result) => Ok(result),
+                _ => Err(Self::mismatch("read_bytes")),
             }
         }
 

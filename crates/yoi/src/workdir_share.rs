@@ -903,7 +903,7 @@ async fn execute_operation(
             Ok(result) => ExternalWorkdirOperationOutcome::Completed { result },
             Err(message) => ExternalWorkdirOperationOutcome::Failed {
                 error: ExternalWorkdirOperationError::from_transport_error(WorkdirTransportError {
-                    code: workdir::http::WorkdirTransportErrorCode::Unsupported,
+                    code: workdir::http::WorkdirTransportErrorCode::InvalidRequest,
                     message,
                 }),
             },
