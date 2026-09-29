@@ -599,7 +599,8 @@ pub struct SubscriptionWorkerWorkdirAttachment {
     /// Stable Worker-local routing alias.
     pub alias: String,
     /// Runtime-internal Repository id. Workspace-facing TypeScript contracts
-    /// omit this field and require `repository_key` from the Server projection.
+    /// omit this field and use `repository_key` for Repository Workdirs. Both
+    /// Repository fields are absent for non-Repository Workdirs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(skip))]
     #[cfg_attr(feature = "json-schema", schemars(skip))]
@@ -622,7 +623,8 @@ impl SubscriptionWorkerWorkdirAttachment {
                 validate_identifier("repository_id", repository_id, MAX_RESOURCE_ID_BYTES)
             }
             (None, Some(repository_key)) => validate_repository_key(repository_key),
-            _ => Err(SubscriptionValidationError::InvalidIdentifier {
+            (None, None) => Ok(()),
+            (Some(_), Some(_)) => Err(SubscriptionValidationError::InvalidIdentifier {
                 field: "repository_authority",
             }),
         }
@@ -1007,6 +1009,43 @@ mod tests {
         let workdir_json = serde_json::to_value(&workspace_workdir).unwrap();
         assert_eq!(workdir_json["repository_key"], "main");
         assert!(workdir_json.get("repository_id").is_none());
+    }
+
+    #[test]
+    fn external_worker_attachment_has_no_repository_authority() {
+        let mut external_worker = worker("worker-1");
+        external_worker
+            .workdir_attachments
+            .push(SubscriptionWorkerWorkdirAttachment {
+                alias: "external".to_string(),
+                repository_id: None,
+                repository_key: None,
+                working_directory_id: SubscriptionWorkdirId::new("external-workdir-1").unwrap(),
+            });
+
+        external_worker.validate().unwrap();
+        let json = serde_json::to_value(&external_worker).unwrap();
+        let attachment = &json["workdir_attachments"][0];
+        assert!(attachment.get("repository_id").is_none());
+        assert!(attachment.get("repository_key").is_none());
+        assert_eq!(attachment["working_directory_id"], "external-workdir-1");
+    }
+
+    #[test]
+    fn worker_attachment_rejects_ambiguous_repository_authority() {
+        let attachment = SubscriptionWorkerWorkdirAttachment {
+            alias: "checkout".to_string(),
+            repository_id: Some("repository-id".to_string()),
+            repository_key: Some("repository-key".to_string()),
+            working_directory_id: SubscriptionWorkdirId::new("workdir-1").unwrap(),
+        };
+
+        assert!(matches!(
+            attachment.validate(),
+            Err(SubscriptionValidationError::InvalidIdentifier {
+                field: "repository_authority"
+            })
+        ));
     }
 
     #[test]

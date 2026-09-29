@@ -513,20 +513,29 @@ fn project_working_directory(
 }
 
 fn project_repository_keys(api: &WorkspaceApi, worker: &mut SubscriptionWorker) -> bool {
+    project_repository_keys_with(worker, |repository_id| {
+        api.store
+            .get_repository(&api.config.workspace_id, repository_id)
+            .ok()
+            .flatten()
+            .map(|repository| repository.repository_key)
+    })
+}
+
+fn project_repository_keys_with(
+    worker: &mut SubscriptionWorker,
+    mut resolve_repository_key: impl FnMut(&str) -> Option<String>,
+) -> bool {
     for attachment in &mut worker.workdir_attachments {
         let Some(repository_id) = attachment.repository_id.take() else {
-            if attachment.repository_key.is_none() {
-                return false;
-            }
+            // External Workdirs have no Repository identity. Their stable
+            // working_directory_id joins against the Workspace Workdir projection.
             continue;
         };
-        let Ok(Some(repository)) = api
-            .store
-            .get_repository(&api.config.workspace_id, &repository_id)
-        else {
+        let Some(repository_key) = resolve_repository_key(&repository_id) else {
             return false;
         };
-        attachment.repository_key = Some(repository.repository_key);
+        attachment.repository_key = Some(repository_key);
     }
     true
 }
@@ -591,6 +600,44 @@ mod tests {
 
     fn worker_id() -> protocol::subscription::SubscriptionWorkerId {
         protocol::subscription::SubscriptionWorkerId::new("worker-1").unwrap()
+    }
+
+    #[test]
+    fn external_workdir_attachment_does_not_remove_workspace_worker() {
+        let mut worker = SubscriptionWorker {
+            worker_id: worker_id(),
+            runtime_id: Some("runtime-1".to_string()),
+            resource_key: Some("W-1".to_string()),
+            availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
+            subject_revision: 1,
+            worker_state: None,
+            state: protocol::subscription::SubscriptionWorkerState::Idle,
+            has_running_internal_workers: false,
+            workspace_id: Some("workspace-1".to_string()),
+            display_name: Some("Companion".to_string()),
+            profile: Some("builtin:companion".to_string()),
+            workdir_attachments: vec![
+                protocol::subscription::SubscriptionWorkerWorkdirAttachment {
+                    alias: "external".to_string(),
+                    repository_id: None,
+                    repository_key: None,
+                    working_directory_id: protocol::subscription::SubscriptionWorkdirId::new(
+                        "external-workdir-1",
+                    )
+                    .unwrap(),
+                },
+            ],
+        };
+
+        assert!(project_repository_keys_with(&mut worker, |_| {
+            panic!("External Workdir must not require Repository projection")
+        }));
+        worker.validate().unwrap();
+        assert_eq!(worker.workdir_attachments.len(), 1);
+        assert_eq!(
+            worker.workdir_attachments[0].working_directory_id.as_str(),
+            "external-workdir-1"
+        );
     }
 
     async fn run_with_events(events: mpsc::Receiver<protocol::Event>) -> SubscriptionResponse {
