@@ -1694,8 +1694,8 @@ mod tests {
         assert!(connection.awaiting_attachment_acceptance.is_empty());
     }
 
-    #[test]
-    fn running_attachment_submit_is_rejected_without_consuming_the_draft() {
+    #[tokio::test]
+    async fn running_attachment_submit_failure_restores_draft_without_exiting_console() {
         let file = UploadedFileRef {
             artifact_id: "artifact-queued".into(),
             file_name: "queued.txt".into(),
@@ -1706,7 +1706,7 @@ mod tests {
             sha256: "a".repeat(64),
             source_entry_id: None,
         };
-        let connection = ConsoleConnection {
+        let mut connection = ConsoleConnection {
             client: Client::new(FailOnceSocket {
                 fail_next_send: true,
             }),
@@ -1721,10 +1721,13 @@ mod tests {
         let mut app = App::new("worker".into());
         app.set_worker_status(WorkerStatus::Running);
         app.input.insert_str("queued inspect");
-        assert!(
-            app.submit_input().is_none(),
-            "running Submit must be rejected before transport"
-        );
+        let method = app
+            .submit_input()
+            .expect("running Submit is sent immediately");
+
+        send_console_method(&mut app, &mut connection, &method)
+            .await
+            .unwrap();
 
         assert_eq!(app.input.plain_text(), "queued inspect");
         assert_eq!(connection.pending_attachments, vec![file]);
@@ -2044,7 +2047,7 @@ mod tests {
     }
 
     #[test]
-    fn running_enter_rejects_submit_and_preserves_the_draft() {
+    fn running_enter_sends_submit_to_worker() {
         let mut app = App::new("agent".to_string());
         app.set_worker_status(WorkerStatus::Running);
         for c in "queued".chars() {
@@ -2057,10 +2060,13 @@ mod tests {
             );
         }
 
-        assert!(handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).is_none());
+        assert!(matches!(
+            handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Method::Submit { .. })
+        ));
 
         assert_eq!(app.queued_input_count(), 0);
-        assert_eq!(input_text(&app), "queued");
+        assert_eq!(input_text(&app), "");
     }
 
     #[test]

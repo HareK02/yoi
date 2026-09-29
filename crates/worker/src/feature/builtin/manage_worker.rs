@@ -850,7 +850,7 @@ impl WorkerOperation {
                 "Spawn a Backend/Runtime Worker session in one existing Workspace Workdir. The model-facing input remains singular and the shared lifecycle wraps it as the canonical attachment collection under the stable `workdir` alias. The Workdir id is authority; filesystem paths and Runtime URLs are not accepted. `initial_submit` carries the normal typed user submission. After the Orchestrator has committed a Ticket to `inprogress`, set `ticket_id` with a Flow segment in `initial_submit` to atomically assign the new Coder Worker; the operation id is derived from the durable tool call rather than model input."
             }
             Self::SendInput => {
-                "Start a fresh turn by sending user input to a known Idle Worker. Running or Paused targets reject Submit; use WorkerNotify for advisory information during work already in progress."
+                "Send user input to a known Runtime Worker. Idle Workers can start a fresh turn; Running or Paused Workers durably queue it for a later turn. Use WorkerNotify for advisory information during work already in progress. Direct SubWorkers require Idle."
             }
             Self::Notify => {
                 "Send an advisory notification to a known Runtime Worker so information can be incorporated into work already in progress without creating a queued Submit."

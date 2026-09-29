@@ -4980,7 +4980,7 @@ mod tests {
     }
 
     #[test]
-    fn running_worker_replays_retry_but_rejects_a_new_submit() {
+    fn running_worker_replays_retry_and_queues_a_new_submit() {
         let client = MockClient::sequential(vec![MockResponse::Hang(vec![])]);
         let runtime_base = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
@@ -5024,11 +5024,15 @@ mod tests {
 
         let mut second_input = WorkerInput::user("second");
         second_input.submission_request_id = Some("request-second".into());
-        let error = runtime
-            .send_input(&detail.worker_ref, second_input)
-            .expect_err("a new Submit must be rejected while the Worker is running");
-        assert!(error.to_string().contains("requires an idle Worker"));
-        assert!(error.to_string().contains("use Notify"));
+        let second = runtime
+            .send_input(&detail.worker_ref, second_input.clone())
+            .expect("a new Submit must queue while the Worker is running");
+        assert_eq!(
+            second.submission.as_ref().map(|ack| ack.disposition),
+            Some(protocol::SubmissionDisposition::Queued)
+        );
+        let retry = runtime.send_input(&detail.worker_ref, second_input).unwrap();
+        assert_eq!(retry.submission, second.submission);
     }
 
     #[test]

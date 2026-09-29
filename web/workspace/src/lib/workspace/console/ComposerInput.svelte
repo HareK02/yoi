@@ -24,6 +24,7 @@
   import { onMount } from "svelte";
   import type { Segment } from "$lib/generated/protocol.ts";
   import {
+    handleComposerImagePaste,
     measureComposerPaste,
     type ComposerPasteMeasurement,
   } from "$lib/workspace/console/composer-paste.ts";
@@ -55,6 +56,7 @@
     onchange?: (snapshot: ComposerDraftSnapshot) => void;
     onkeydown?: (event: KeyboardEvent) => void;
     onsubmit?: () => void;
+    onpasteimages?: (files: File[]) => void;
   }
 
   let {
@@ -65,6 +67,7 @@
     onchange,
     onkeydown,
     onsubmit,
+    onpasteimages,
   }: Props = $props();
 
   let mountElement: HTMLDivElement;
@@ -265,6 +268,7 @@
 
   function handlePasteEvent(event: ClipboardEvent): boolean {
     if (disabled || view?.state.readOnly) return false;
+    if (handleComposerImagePaste(event, onpasteimages)) return true;
     const content = event.clipboardData?.getData("text/plain");
     if (!content) return false;
     const measurement = measureComposerPaste(content);
@@ -557,7 +561,7 @@
   }
 
   .composer-input :global(.cm-editor) {
-    min-height: 5.35rem;
+    min-height: 2.65rem;
     max-height: 10rem;
   }
 
@@ -566,8 +570,8 @@
   }
 
   .composer-input :global(.cm-content) {
-    min-height: 5.35rem;
-    padding: 0.55rem 3.4rem 3rem 0.65rem;
+    min-height: 2.65rem;
+    padding: 0.55rem 0.65rem 0.35rem;
     line-height: 1.45;
   }
 

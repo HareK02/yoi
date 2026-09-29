@@ -5,6 +5,7 @@
     import ConsoleDisplayStateView from "$lib/workspace/console/ConsoleDisplayState.svelte";
     import ConsoleTasks from "$lib/workspace/console/ConsoleTasks.svelte";
     import ConsoleTimeline from "$lib/workspace/console/ConsoleTimeline.svelte";
+    import { namePastedImage } from "$lib/workspace/console/composer-paste";
     import ComposerInput from "$lib/workspace/console/ComposerInput.svelte";
     import type { ComposerDraftSnapshot } from "$lib/workspace/console/composer-draft";
     import {
@@ -171,7 +172,6 @@
     let sendError = $state<string | null>(null);
     let rewindTargets = $state<RewindTarget[]>([]);
     let rewindHeadEntries = $state(0);
-    let composerNotice = $state<string | null>(null);
     let protocolState = $state<"connecting" | "open" | "closed" | "error">(
         "connecting",
     );
@@ -279,6 +279,16 @@
     const canSubmitDraft = $derived(
         canDeliverComposerDraft({
             delivery: "submit",
+            workerState,
+            protocolOpen: protocolState === "open",
+            sending,
+            hasText: draftHasText,
+            hasAttachments: draftHasAttachments,
+        }),
+    );
+    const canQueueDraft = $derived(
+        canDeliverComposerDraft({
+            delivery: "queue",
             workerState,
             protocolOpen: protocolState === "open",
             sending,
@@ -560,10 +570,6 @@
                 token.end,
                 `${entries[0].value} `,
             );
-            composerNotice =
-                entries.length > 1
-                    ? `Completed ${token.sigil}${entries[0].value}; ${entries.length - 1} more candidate(s)`
-                    : null;
         } catch (error) {
             completionError =
                 error instanceof Error ? error.message : String(error);
@@ -837,6 +843,10 @@
         void submitDraft(composerInputElement?.snapshot() ?? draft);
     }
 
+    function handleQueueSubmit() {
+        void submitDraft(composerInputElement?.snapshot() ?? draft, "queue");
+    }
+
     function handleNotifySubmit() {
         void submitDraft(composerInputElement?.snapshot() ?? draft, "notify");
     }
@@ -892,7 +902,12 @@
         updateAttachment(attachment.id, { request });
     }
 
+    function addPastedImages(files: File[]): void {
+        addAttachmentFiles(files.map(namePastedImage));
+    }
+
     function addAttachmentFiles(files: Iterable<File>): void {
+        if (!composerEditable) return;
         const available = Math.max(0, MAX_FILES_PER_SUBMISSION - attachments.length);
         for (const file of Array.from(files).slice(0, available)) {
             const attachment: ComposerAttachment = {
@@ -949,15 +964,13 @@
         delivery: ComposerDelivery = "submit",
     ) {
         if (delivery === "notify" && attachments.length > 0) {
-            composerNotice = null;
-            sendError = "Notify accepts text only; remove attachments or wait until the Worker is idle to Submit.";
+            sendError = "Notify accepts text only; remove attachments or queue a Submit.";
             return;
         }
         const incompleteAttachment = attachments.find((attachment) =>
             attachment.state !== "uploaded" || !attachment.reference
         );
         if (incompleteAttachment) {
-            composerNotice = null;
             sendError = incompleteAttachment.state === "uploading"
                 ? "Wait for file uploads to finish before sending."
                 : incompleteAttachment.error ?? "Retry or remove the failed attachment.";
@@ -973,11 +986,9 @@
             preserveExactText: value.textPastes.length > 0,
         });
         if (!command.ok) {
-            composerNotice = null;
             sendError = command.message;
             return;
         }
-        composerNotice = command.notice ?? null;
         if (!command.request) {
             composerInputElement?.clear();
             return;
@@ -995,9 +1006,12 @@
         }
 
         let request: WorkerConsoleInputRequest = command.request;
+        if (delivery === "queue" && request.kind !== "user") {
+            sendError = "Queue accepts ordinary input, not a Composer command.";
+            return;
+        }
         if (delivery === "notify") {
             if (request.kind !== "user") {
-                composerNotice = null;
                 sendError = "Notify accepts ordinary text, not a Composer command.";
                 return;
             }
@@ -1013,10 +1027,9 @@
             composerInputElement?.recordHistory(value);
             composerInputElement?.clear();
             attachments = [];
-            if (method.method === "submit" || method.method === "notify") {
+            if (method.method === "submit" && delivery === "submit") {
                 liveWorkerState = "running";
             }
-            composerNotice = "Sent through Worker protocol.";
         } catch (error) {
             sendError = error instanceof Error ? error.message : String(error);
         } finally {
@@ -2236,6 +2249,7 @@
                 onchange={handleComposerChange}
                 onkeydown={handleComposerKeydown}
                 onsubmit={handleComposerSubmit}
+                onpasteimages={addPastedImages}
             />
             {#if attachments.length > 0}
                 <div class="composer-attachments" aria-live="polite">
@@ -2265,9 +2279,19 @@
                     <button
                         class="composer-attach-button"
                         type="button"
+                        aria-label="Attach file"
+                        title="Attach file"
                         disabled={!composerEditable || attachments.length >= MAX_FILES_PER_SUBMISSION}
                         onclick={() => fileInput?.click()}
-                    >Attach file</button>
+                    >
+                        <svg
+                            class="composer-attach-icon"
+                            aria-hidden="true"
+                            viewBox="0 0 24 24"
+                        >
+                            <path d="M12 5V19M5 12H19" />
+                        </svg>
+                    </button>
                     {#if completionBusy || completionError || completionEntries.length > 0}
                         <div class="composer-completions" aria-live="polite">
                             {#if completionBusy}
@@ -2286,51 +2310,78 @@
                         </div>
                     {/if}
                 </div>
-                <button
-                    class="composer-send-button"
-                    class:stop={workerRunning}
-                    type="submit"
-                    aria-label={workerRunning
-                        ? "Stop Worker"
-                        : sending
-                          ? "Sending message"
-                          : "Send message"}
-                    disabled={composerSubmitDisabled}
-                >
-                    {#if workerRunning}
-                        <svg
-                            class="composer-send-icon"
-                            aria-hidden="true"
-                            viewBox="0 0 24 24"
+                <div class="composer-submit-actions">
+                    {#if workerRunning || workerPaused}
+                        <button
+                            class="composer-queue-button"
+                            type="button"
+                            aria-label="Queue Submit"
+                            title="Queue Submit"
+                            disabled={!canQueueDraft}
+                            onclick={handleQueueSubmit}
                         >
-                            <path d="M7 7H17V17H7Z" />
-                        </svg>
-                    {:else}
-                        <svg
-                            class="composer-send-icon"
-                            aria-hidden="true"
-                            viewBox="0 0 24 24"
-                        >
-                            <path d="M8 6L12 2L16 6" />
-                            <path d="M12 2V22" />
-                        </svg>
+                            <svg
+                                class="composer-queue-icon"
+                                aria-hidden="true"
+                                viewBox="0 0 24 24"
+                            >
+                                <path d="M4 6H20M4 12H14M4 18H10M18 14V22M14 18H22" />
+                            </svg>
+                        </button>
                     {/if}
-                </button>
+                    {#if workerRunning}
+                        <button
+                            class="composer-notify-button"
+                            type="button"
+                            aria-label="Notify Worker"
+                            title="Notify Worker"
+                            disabled={!canNotifyDraft}
+                            onclick={handleNotifySubmit}
+                        >
+                            <svg
+                                class="composer-notify-icon"
+                                aria-hidden="true"
+                                viewBox="0 0 24 24"
+                            >
+                                <path d="M18 8A6 6 0 0 0 6 8C6 15 3 15 3 17H21C21 15 18 15 18 8Z" />
+                                <path d="M10 21H14" />
+                            </svg>
+                        </button>
+                    {/if}
+                    <button
+                        class="composer-send-button"
+                        class:stop={workerRunning}
+                        type="submit"
+                        aria-label={workerRunning
+                            ? "Stop Worker"
+                            : sending
+                              ? "Sending message"
+                              : "Send message"}
+                        disabled={composerSubmitDisabled}
+                    >
+                        {#if workerRunning}
+                            <svg
+                                class="composer-send-icon"
+                                aria-hidden="true"
+                                viewBox="0 0 24 24"
+                            >
+                                <path d="M7 7H17V17H7Z" />
+                            </svg>
+                        {:else}
+                            <svg
+                                class="composer-send-icon"
+                                aria-hidden="true"
+                                viewBox="0 0 24 24"
+                            >
+                                <path d="M8 6L12 2L16 6" />
+                                <path d="M12 2V22" />
+                            </svg>
+                        {/if}
+                    </button>
+                </div>
             </div>
         </div>
-        <div class="composer-actions">
-            {#if workerRunning}
-                <button
-                    type="button"
-                    disabled={!canNotifyDraft}
-                    onclick={handleNotifySubmit}
-                >Notify</button>
-            {/if}
-            {#if composerNotice}
-                <span class="composer-notice">{composerNotice}</span>
-            {/if}
-            {#if sendError}<p class="error">{sendError}</p>{/if}
-        </div>
+        {#if sendError}<p class="error" role="alert">{sendError}</p>{/if}
     </form>
 </div>
 
@@ -2642,7 +2693,7 @@
         display: flex;
         flex-wrap: wrap;
         gap: var(--space-2);
-        padding: 0 var(--space-3) 3rem;
+        padding: 0 var(--space-3) var(--space-2);
     }
 
     .composer-attachment {
@@ -2672,7 +2723,9 @@
     }
 
     .composer-attachment button,
-    .composer-attach-button {
+    .composer-attach-button,
+    .composer-queue-button,
+    .composer-notify-button {
         border: 0;
         background: transparent;
         color: var(--text-muted);
@@ -2681,24 +2734,45 @@
         font: inherit;
     }
 
-    .composer-attach-button {
-        padding: 0.35rem 0;
+    .composer-attach-button,
+    .composer-queue-button,
+    .composer-notify-button {
+        display: inline-grid;
+        flex: 0 0 auto;
+        width: 2.35rem;
+        height: 2.35rem;
+        place-items: center;
+        border-radius: 999px;
+        padding: 0;
+    }
+
+    .composer-attach-button:hover:not(:disabled),
+    .composer-queue-button:hover:not(:disabled),
+    .composer-notify-button:hover:not(:disabled) {
+        background: var(--bg-subtle);
+        color: var(--text-strong);
+    }
+
+    .composer-attach-button:disabled,
+    .composer-queue-button:disabled,
+    .composer-notify-button:disabled {
+        cursor: not-allowed;
+        opacity: 0.55;
     }
 
     .composer-input-footer {
-        position: absolute;
-        right: 0.7rem;
-        bottom: 0.7rem;
-        left: 1rem;
         display: grid;
         grid-template-columns: minmax(0, 1fr) auto;
         gap: var(--space-2);
         align-items: end;
         min-height: 2.35rem;
-        pointer-events: none;
+        padding: 0 0.35rem 0.35rem 0.65rem;
     }
 
     .composer-footer-slot {
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
         min-width: 0;
     }
 
@@ -2726,6 +2800,9 @@
         opacity: 0.55;
     }
 
+    .composer-attach-icon,
+    .composer-queue-icon,
+    .composer-notify-icon,
     .composer-send-icon {
         width: 1.2rem;
         height: 1.2rem;
@@ -2745,21 +2822,10 @@
         font-size: var(--font-size-compact);
     }
 
-    .composer-notice {
-        color: var(--text-muted);
-        font-size: var(--font-size-compact);
-    }
-
-    .composer-actions {
+    .composer-submit-actions {
         display: flex;
-        flex-wrap: wrap;
         align-items: center;
-        justify-content: flex-end;
-        gap: 0.7rem;
-    }
-
-    .composer-actions .composer-notice {
-        margin-right: auto;
+        gap: var(--space-2);
     }
 
     @media (max-width: 960px) {

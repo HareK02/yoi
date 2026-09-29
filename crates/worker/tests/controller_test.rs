@@ -319,6 +319,95 @@ async fn spawn_controller(worker: Worker<MockClient, TestStore>) -> WorkerHandle
 }
 
 #[tokio::test]
+async fn canonical_worker_handle_uploads_and_submits_attachment() {
+    let root = tempfile::tempdir().unwrap();
+    let manifest = WorkerManifest::from_toml(MANIFEST_TOML).unwrap();
+    let session = session_store::WorkerSessionStore::new(root.path().join("session")).unwrap();
+    let store = CombinedStore::new(
+        session.clone(),
+        session_store::WorkerAggregateStore::new(root.path(), manifest.worker.name.clone())
+            .unwrap(),
+    );
+    let client = MockClient::new(simple_text_events());
+    let engine = Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(
+        client.clone(),
+    );
+    let worker = Worker::new(
+        manifest,
+        engine,
+        store,
+        WorkerWorkspaceContext::local_filesystem(None),
+        WorkerFilesystemAuthority::local(root.path().to_owned(), root.path().to_owned()),
+        manifest::Scope::writable(root.path()).unwrap(),
+    )
+    .await
+    .unwrap();
+    let (handle, shutdown_rx) = WorkerController::spawn(
+        worker,
+        &root.path().join("runtime"),
+        &root.path().join("bash-output"),
+    )
+    .await
+    .unwrap();
+    let mut rx = handle.subscribe();
+    let file = handle
+        .upload_file_with_context(
+            "notes.txt",
+            "text/plain",
+            b"attached context",
+            &session_store::UploadedFileUploadContext {
+                upload_id: "upload-1".into(),
+                principal_id: "account-1".into(),
+                workspace_id: "workspace-1".into(),
+                runtime_id: "runtime-1".into(),
+                worker_id: "worker-1".into(),
+            },
+        )
+        .unwrap();
+    handle
+        .send(Method::Submit {
+            submission_request_id: "attachment-submit".into(),
+            input: vec![protocol::Segment::UploadedFile { file: file.clone() }],
+        })
+        .await
+        .unwrap();
+    assert!(
+        drain_until(&mut rx, std::time::Duration::from_secs(2), |event| {
+            matches!(
+                event,
+                Event::RunEnd {
+                    result: protocol::RunResult::Finished
+                }
+            )
+        })
+        .await
+    );
+    let requests = client.captured_requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].items.iter().any(|item| {
+        item.as_text()
+            .is_some_and(|text| text.contains("notes.txt") && text.contains(&file.artifact_id))
+    }));
+    assert_eq!(handle.delete_uncommitted_uploaded_files().unwrap(), 0);
+    use session_store::Store;
+    let (bound, content) = session
+        .read_uploaded_file_by_id(session.session_id().unwrap().unwrap(), &file.artifact_id)
+        .unwrap();
+    assert!(bound.source_entry_id.is_some());
+    assert_eq!(content, b"attached context");
+    handle
+        .send(Method::Shutdown {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), shutdown_rx)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn controller_grants_read_scope_for_exact_bash_output_directory() {
     let worker = make_worker(MockClient::new(simple_text_events())).await;
     let shared_scope = worker.scope().clone();
@@ -1446,7 +1535,7 @@ async fn events_are_broadcast() {
 }
 
 #[tokio::test]
-async fn submit_requires_an_idle_worker() {
+async fn submit_while_running_or_paused_is_durably_queued() {
     async fn wait_for_rejection(
         rx: &mut tokio::sync::broadcast::Receiver<Event>,
         expected_request_id: &str,
@@ -1492,7 +1581,13 @@ async fn submit_requires_an_idle_worker() {
         LlmEvent::text_block_start(0),
         LlmEvent::text_delta(0, "slow..."),
     ];
-    let client = MockClient::sequential(vec![MockResponse::Hang(events)]);
+    let client = MockClient::sequential(vec![
+        MockResponse::Hang(events),
+        MockResponse::Complete(simple_text_events()),
+        MockResponse::Complete(simple_text_events()),
+        MockResponse::Complete(simple_text_events()),
+    ]);
+    let captured = client.clone();
     let worker = make_worker(client).await;
     let handle = spawn_controller(worker).await;
     let mut rx = handle.subscribe();
@@ -1517,9 +1612,27 @@ async fn submit_requires_an_idle_worker() {
         .await
         .unwrap();
 
-    let running_rejection = wait_for_rejection(&mut rx, "request-running").await;
-    assert!(running_rejection.contains("requires an idle Worker"));
-    assert!(running_rejection.contains("use Notify"));
+    assert_eq!(
+        wait_for_acceptance(&mut rx, "request-running").await,
+        protocol::SubmissionDisposition::Queued
+    );
+    handle
+        .send(Method::submit_text("request-running", "second"))
+        .await
+        .unwrap();
+    assert_eq!(
+        wait_for_acceptance(&mut rx, "request-running").await,
+        protocol::SubmissionDisposition::Queued
+    );
+    handle
+        .send(Method::submit_text("request-running", "conflict"))
+        .await
+        .unwrap();
+    assert!(
+        wait_for_rejection(&mut rx, "request-running")
+            .await
+            .contains("different payload")
+    );
 
     handle.send(Method::ListPendingSubmissions).await.unwrap();
     let pending = tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -1531,7 +1644,7 @@ async fn submit_requires_an_idle_worker() {
     })
     .await
     .expect("pending snapshot");
-    assert!(pending.submissions.is_empty());
+    assert_eq!(pending.submissions.len(), 1);
 
     handle
         .send(Method::Pause {
@@ -1545,10 +1658,86 @@ async fn submit_requires_an_idle_worker() {
         .await
         .unwrap();
 
-    let paused_rejection = wait_for_rejection(&mut rx, "request-paused").await;
-    assert!(paused_rejection.contains("requires an idle Worker"));
-    assert!(paused_rejection.contains("use Notify"));
+    assert_eq!(
+        wait_for_acceptance(&mut rx, "request-paused").await,
+        protocol::SubmissionDisposition::Queued
+    );
     assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Paused);
+    handle.send(Method::ListPendingSubmissions).await.unwrap();
+    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if let Ok(Event::PendingSubmissionsChanged { pending }) = rx.recv().await {
+                break pending;
+            }
+        }
+    })
+    .await
+    .expect("paused pending snapshot");
+    assert_eq!(snapshot.submissions.len(), 2);
+    assert_eq!(snapshot.head_id, pending.head_id);
+    handle
+        .send(Method::ContinuePending {
+            expected_revision: snapshot.revision,
+            expected_head_id: snapshot.head_id.unwrap(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        drain_until(&mut rx, std::time::Duration::from_secs(1), |event| {
+            matches!(event, Event::Error { message, .. } if message.contains("Resume or Cancel"))
+        })
+        .await
+    );
+    assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Paused);
+
+    // Resume completes the original run, then normal completion drains each
+    // queued input exactly once and in acceptance order.
+    handle
+        .send(Method::Resume {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        assert!(
+            drain_until(&mut rx, std::time::Duration::from_secs(2), |event| {
+                matches!(
+                    event,
+                    Event::RunEnd {
+                        result: protocol::RunResult::Finished
+                    }
+                )
+            })
+            .await
+        );
+    }
+    wait_for_status(&handle, WorkerStatus::Idle).await;
+    let requests = captured.captured_requests();
+    assert_eq!(requests.len(), 4);
+    let last_inputs: Vec<_> = requests[1..]
+        .iter()
+        .map(|request| {
+            request
+                .items
+                .iter()
+                .rev()
+                .find_map(|item| match item {
+                    Item::Message {
+                        role: agen::Role::User,
+                        content,
+                        ..
+                    } => Some(
+                        content
+                            .iter()
+                            .map(|part| part.as_text())
+                            .collect::<String>(),
+                    ),
+                    _ => None,
+                })
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(last_inputs, vec!["first", "second", "third"]);
 }
 
 #[tokio::test]
@@ -2879,12 +3068,12 @@ async fn pause_then_resume_preserves_notifications_and_history_consistency() {
     assert!(!has_tool_call, "no orphan tool_call in history");
 }
 
-/// Paused with an orphan `tool_use` in history must reject a fresh Submit.
-/// After explicit Cancel returns the Worker to Idle, a new Submit must produce
+/// Paused with an orphan `tool_use` in history must queue a fresh Submit.
+/// After explicit Cancel and ContinuePending, the queued Submit must produce
 /// a wire-valid next LLM request: the orphan is closed with a synthetic
 /// `tool_result`, a system note is inserted, and the new user input is appended.
 #[tokio::test]
-async fn paused_submit_is_rejected_before_cancel_and_fresh_run() {
+async fn paused_submit_waits_for_cancel_and_continue_pending() {
     // Response 1: emit a tool_use block (complete with stop) targeting
     // our hanging tool. The Engine commits the ToolCall to history,
     // then parks inside `execute_tools` waiting on the tool — which is
@@ -2966,20 +3155,20 @@ async fn paused_submit_is_rejected_before_cancel_and_fresh_run() {
         drain_until(&mut rx, std::time::Duration::from_secs(2), |event| {
             matches!(
                 event,
-                Event::SubmissionRejected {
+                Event::SubmissionAccepted {
                     submission_request_id,
-                    message,
+                    disposition: protocol::SubmissionDisposition::Queued,
+                    ..
                 } if submission_request_id == &paused_request_id
-                    && message.contains("requires an idle Worker")
             )
         })
         .await,
-        "Paused Submit must be rejected"
+        "Paused Submit must be queued"
     );
     assert_eq!(
         client_for_assert.captured_requests().len(),
         1,
-        "rejected Paused Submit must not start another LLM request"
+        "queued Paused Submit must not start another LLM request"
     );
 
     handle
@@ -2990,13 +3179,25 @@ async fn paused_submit_is_rejected_before_cancel_and_fresh_run() {
         .unwrap();
     wait_for_status(&handle, WorkerStatus::Idle).await;
 
-    // Once explicitly returned to Idle, fresh user input runs interrupt prep,
-    // which closes the orphan and inserts a system note before the user message.
+    // Cancel must not start the queued turn. Explicit ContinuePending runs
+    // interrupt prep, closing the orphan before committing the queued input.
+    assert_eq!(client_for_assert.captured_requests().len(), 1);
+    handle.send(Method::ListPendingSubmissions).await.unwrap();
+    let pending = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if let Ok(Event::PendingSubmissionsChanged { pending }) = rx.recv().await {
+                break pending;
+            }
+        }
+    })
+    .await
+    .expect("pending input retained after Cancel");
+    assert_eq!(pending.submissions.len(), 1);
     handle
-        .send(Method::submit_text(
-            protocol::new_submission_request_id(),
-            "new request",
-        ))
+        .send(Method::ContinuePending {
+            expected_revision: pending.revision,
+            expected_head_id: pending.head_id.unwrap(),
+        })
         .await
         .unwrap();
     assert!(
@@ -3007,7 +3208,7 @@ async fn paused_submit_is_rejected_before_cancel_and_fresh_run() {
             }
         ))
         .await,
-        "expected RunEnd::Finished after Cancel→Submit"
+        "expected RunEnd::Finished after Cancel→ContinuePending"
     );
 
     // The second LLM request carries the closure chain. Walk its items

@@ -805,7 +805,6 @@ Deno.test("Worker Console composer keeps a compact bounded chip editor", async (
       ) &&
       consolePage.includes("scrollConsoleByPage") &&
       consolePage.includes('class="composer-input-footer"') &&
-      consolePage.includes("pointer-events: none") &&
       consolePage.includes('class="composer-footer-slot"') &&
       consolePage.includes('class="composer-send-button"') &&
       consolePage.includes("pointer-events: auto") &&
@@ -815,6 +814,78 @@ Deno.test("Worker Console composer keeps a compact bounded chip editor", async (
       composerInput.includes("EditorView.lineWrapping") &&
       composerInput.includes("overflow-y: auto"),
     "Console composer should use the bounded chip-capable editor with wrapping, page scrolling, and the icon send button",
+  );
+});
+
+Deno.test("Worker Console composer separates the editor from its icon toolbar", async () => {
+  const consolePage = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
+      import.meta.url,
+    ),
+  );
+  const composerInput = await Deno.readTextFile(
+    new URL("./ComposerInput.svelte", import.meta.url),
+  );
+  const footerStyle = consolePage.match(/\.composer-input-footer\s*\{([^}]+)\}/)?.[1];
+  assert(
+    footerStyle?.includes("display: grid") &&
+      !/position:\s*(absolute|fixed)/.test(footerStyle) &&
+      !footerStyle.includes("pointer-events: none"),
+    "Composer toolbar must stay in normal flow below the scrollable editor",
+  );
+  assert(
+    composerInput.includes("min-height: 2.65rem") &&
+      composerInput.includes("padding: 0.55rem 0.65rem 0.35rem") &&
+      !composerInput.includes("padding: 0.55rem 3.4rem 3rem 0.65rem"),
+    "Editor must not reserve an overlapping toolbar inside its scrolling content",
+  );
+  const attachButton = consolePage.match(
+    /<button\s+class="composer-attach-button"[\s\S]*?<\/button>/,
+  )?.[0];
+  assert(
+    attachButton?.includes('aria-label="Attach file"') &&
+      attachButton.includes('title="Attach file"') &&
+      attachButton.includes('class="composer-attach-icon"') &&
+      attachButton.includes('aria-hidden="true"') &&
+      attachButton.includes('d="M12 5V19M5 12H19"') &&
+      attachButton.includes("fileInput?.click()") &&
+      !attachButton.includes(">Attach file</button>"),
+    "Attach file must remain an accessible file-picker button with a plus icon",
+  );
+});
+
+Deno.test("Worker Console keeps Notify beside Submit without persistent notices", async () => {
+  const consolePage = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
+      import.meta.url,
+    ),
+  );
+  const actions = consolePage.match(
+    /<div class="composer-submit-actions">([\s\S]*?)<\/div>/,
+  )?.[1];
+  assert(
+    actions?.includes("{#if workerRunning}") &&
+      actions.includes('class="composer-notify-button"') &&
+      actions.includes('type="button"') &&
+      actions.includes('aria-label="Notify Worker"') &&
+      actions.includes('aria-hidden="true"') &&
+      actions.includes('class="composer-notify-icon"') &&
+      actions.includes("disabled={!canNotifyDraft}") &&
+      actions.includes("onclick={handleNotifySubmit}") &&
+      actions.includes('class="composer-send-button"') &&
+      actions.indexOf('class="composer-notify-button"') <
+        actions.indexOf('class="composer-send-button"'),
+    "Running Worker Notify must be an accessible bell button beside Submit/Stop",
+  );
+  assert(
+    !consolePage.includes("composerNotice") &&
+      !consolePage.includes("composer-notice") &&
+      !consolePage.includes('class="composer-actions"') &&
+      !consolePage.includes("Sent through Worker protocol.") &&
+      consolePage.includes('{#if sendError}<p class="error" role="alert">'),
+    "Composer must remove persistent notices and empty action rows but retain send errors",
   );
 });
 
@@ -851,6 +922,29 @@ Deno.test("Worker Console paste chips preserve typed draft and target authority"
       consolePage.includes("switchComposerTarget(target)") &&
       consolePage.includes('sendWorkerControl("cancel")'),
     "Paste chips should use shared threshold classification, atomic keyboard behavior, accessible labels, typed restore, and per-Worker draft authority",
+  );
+});
+
+Deno.test("Worker Console routes image paste through the existing attachment upload", async () => {
+  const consolePage = await Deno.readTextFile(new URL(
+    "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte", import.meta.url,
+  ));
+  const input = await Deno.readTextFile(new URL("./ComposerInput.svelte", import.meta.url));
+  const paste = input.slice(input.indexOf("function handlePasteEvent"), input.indexOf("function selectedClipboardContent"));
+  assert(
+    paste.indexOf("if (disabled || view?.state.readOnly)") < paste.indexOf("handleComposerImagePaste(event, onpasteimages)") &&
+      paste.indexOf("handleComposerImagePaste(event, onpasteimages)") < paste.indexOf('getData("text/plain")') &&
+      consolePage.includes("onpasteimages={addPastedImages}") &&
+      consolePage.includes("addAttachmentFiles(files.map(namePastedImage))"),
+    "image paste must respect editability and take priority over text before using the attachment callback",
+  );
+  const attach = consolePage.slice(consolePage.indexOf("function addAttachmentFiles"), consolePage.indexOf("async function removeAttachment"));
+  assert(
+    attach.includes("if (!composerEditable) return") &&
+      attach.includes("MAX_FILES_PER_SUBMISSION - attachments.length") &&
+      attach.includes(".slice(0, available)") &&
+      attach.includes("startAttachmentUpload(attachment)"),
+    "pasted images must share upload validation, lifecycle gating and the attachment count limit",
   );
 });
 
@@ -1342,7 +1436,9 @@ Deno.test("Web Console uses Notify while running and keeps recovery pending cont
       'method: "continue_pending"',
       "handleNotifySubmit",
       "disabled={!canNotifyDraft}",
-      ">Notify</button>",
+      'class="composer-notify-button"',
+      'aria-label="Notify Worker"',
+      'class="composer-notify-icon"',
     ]
   ) {
     assert(
@@ -1352,10 +1448,21 @@ Deno.test("Web Console uses Notify while running and keeps recovery pending cont
   }
 
   assert(
-    !consolePage.includes("handleQueueSubmit") &&
-      !consolePage.includes(">Queue Submit</button>") &&
-      !consolePage.includes('delivery: "queue"'),
-    "running Console must not offer Submit queueing; callers should use Notify",
+    consolePage.includes("handleQueueSubmit") &&
+      consolePage.includes('delivery: "queue"') &&
+      consolePage.includes('disabled={!canQueueDraft}') &&
+      consolePage.includes('aria-label="Queue Submit"') &&
+      consolePage.includes('class="composer-queue-icon"') &&
+      consolePage.includes('{#if workerRunning || workerPaused}') &&
+      consolePage.includes('delivery === "queue" && request.kind !== "user"') &&
+      consolePage.includes('method.method === "submit" && delivery === "submit"'),
+    "busy Console must offer explicit Queue without changing paused state or queueing commands",
+  );
+  const actions = consolePage.slice(consolePage.indexOf('class="composer-submit-actions"'));
+  assert(
+    actions.indexOf('class="composer-queue-button"') < actions.indexOf('class="composer-notify-button"') &&
+      actions.indexOf('class="composer-notify-button"') < actions.indexOf('class="composer-send-button"'),
+    "Queue must sit beside Notify and Submit/Stop",
   );
 
   const userCase = consolePage.slice(

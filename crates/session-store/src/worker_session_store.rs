@@ -13,8 +13,16 @@ use crate::event_trace::TraceEntry;
 use crate::paste_artifact::{read_from_dir, write_to_dir};
 use crate::segment_log::LogEntry;
 use crate::store::{Store, StoreError};
-use crate::{PasteArtifactLimits, SegmentId, SessionId};
-use protocol::PasteArtifactRef;
+use crate::uploaded_file::{
+    bind_uploaded_file, clear_uploaded_file_binding, delete_uncommitted_uploaded_files,
+    delete_uploaded_file, finalize_uploaded_file_binding, list_uploaded_file_refs,
+    pin_uploaded_file, read_uploaded_file, read_uploaded_file_by_id, reconcile_uploaded_file_pins,
+    release_uploaded_file_pin, uploaded_file_has_pending_owner, write_uploaded_file,
+};
+use crate::{
+    PasteArtifactLimits, SegmentId, SessionId, UploadedFileLimits, UploadedFileUploadContext,
+};
+use protocol::{PasteArtifactRef, UploadedFileRef};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -205,6 +213,40 @@ impl WorkerSessionStore {
         self.root
             .join(SEGMENTS_DIR)
             .join(format!("{segment_id}.trace.jsonl"))
+    }
+
+    fn uploaded_file_is_referenced(
+        &self,
+        session_id: SessionId,
+        artifact_id: &str,
+    ) -> Result<bool, StoreError> {
+        fn segments_contain(segments: &[protocol::Segment], artifact_id: &str) -> bool {
+            segments.iter().any(|segment| {
+                matches!(
+                    segment,
+                    protocol::Segment::UploadedFile { file }
+                        if file.artifact_id == artifact_id
+                )
+            })
+        }
+
+        for segment_id in self.list_segments(session_id)? {
+            for entry in self.read_all(session_id, segment_id)? {
+                let referenced = match entry {
+                    LogEntry::AnnotatedUserInput { segments, .. } => {
+                        segments_contain(&segments, artifact_id)
+                    }
+                    LogEntry::InputSegmentsCheckpoint { user_segments, .. } => user_segments
+                        .iter()
+                        .any(|segments| segments_contain(segments, artifact_id)),
+                    _ => false,
+                };
+                if referenced {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn append_log_entry(&self, path: &Path, entry: &LogEntry) -> Result<(), StoreError> {
@@ -400,6 +442,200 @@ impl Store for WorkerSessionStore {
     ) -> Result<(PasteArtifactRef, String), StoreError> {
         self.ensure_session(session_id, false)?;
         read_from_dir(&self.root.join(PASTE_ARTIFACTS_DIR), artifact_id)
+    }
+
+    fn write_uploaded_file(
+        &self,
+        session_id: SessionId,
+        file_name: &str,
+        media_type: &str,
+        content: &[u8],
+        limits: UploadedFileLimits,
+    ) -> Result<UploadedFileRef, StoreError> {
+        self.ensure_session(session_id, true)?;
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| std::io::Error::other("Worker Session append lock was poisoned"))?;
+        write_uploaded_file(
+            &self.root.join(PASTE_ARTIFACTS_DIR),
+            file_name,
+            media_type,
+            content,
+            None,
+            limits,
+        )
+    }
+
+    fn write_uploaded_file_with_context(
+        &self,
+        session_id: SessionId,
+        file_name: &str,
+        media_type: &str,
+        content: &[u8],
+        context: &UploadedFileUploadContext,
+        limits: UploadedFileLimits,
+    ) -> Result<UploadedFileRef, StoreError> {
+        self.ensure_session(session_id, true)?;
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| std::io::Error::other("Worker Session append lock was poisoned"))?;
+        write_uploaded_file(
+            &self.root.join(PASTE_ARTIFACTS_DIR),
+            file_name,
+            media_type,
+            content,
+            Some(context),
+            limits,
+        )
+    }
+
+    fn read_uploaded_file(
+        &self,
+        session_id: SessionId,
+        reference: &UploadedFileRef,
+    ) -> Result<Vec<u8>, StoreError> {
+        self.ensure_session(session_id, false)?;
+        read_uploaded_file(&self.root.join(PASTE_ARTIFACTS_DIR), reference)
+    }
+
+    fn read_uploaded_file_by_id(
+        &self,
+        session_id: SessionId,
+        artifact_id: &str,
+    ) -> Result<(UploadedFileRef, Vec<u8>), StoreError> {
+        self.ensure_session(session_id, false)?;
+        read_uploaded_file_by_id(&self.root.join(PASTE_ARTIFACTS_DIR), artifact_id)
+    }
+
+    fn bind_uploaded_file(
+        &self,
+        session_id: SessionId,
+        reference: &UploadedFileRef,
+        source_entry_id: &str,
+    ) -> Result<UploadedFileRef, StoreError> {
+        self.ensure_session(session_id, false)?;
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| std::io::Error::other("Worker Session append lock was poisoned"))?;
+        let dir = self.root.join(PASTE_ARTIFACTS_DIR);
+        match bind_uploaded_file(&dir, reference, source_entry_id) {
+            Err(StoreError::ArtifactAlreadyCommitted) => {
+                let (stored, _) = read_uploaded_file_by_id(&dir, &reference.artifact_id)?;
+                let previous_source = stored
+                    .source_entry_id
+                    .ok_or(StoreError::ArtifactIntegrityMismatch)?;
+                if self.uploaded_file_is_referenced(session_id, &reference.artifact_id)? {
+                    return Err(StoreError::ArtifactAlreadyCommitted);
+                }
+                clear_uploaded_file_binding(&dir, &reference.artifact_id, &previous_source)?;
+                bind_uploaded_file(&dir, reference, source_entry_id)
+            }
+            result => result,
+        }
+    }
+
+    fn pin_uploaded_file(
+        &self,
+        session_id: SessionId,
+        reference: &UploadedFileRef,
+        owner_id: &str,
+    ) -> Result<(), StoreError> {
+        self.ensure_session(session_id, false)?;
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| std::io::Error::other("Worker Session append lock was poisoned"))?;
+        pin_uploaded_file(&self.root.join(PASTE_ARTIFACTS_DIR), reference, owner_id)
+    }
+
+    fn release_uploaded_file_pin(
+        &self,
+        session_id: SessionId,
+        artifact_id: &str,
+        owner_id: &str,
+    ) -> Result<(), StoreError> {
+        self.ensure_session(session_id, false)?;
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| std::io::Error::other("Worker Session append lock was poisoned"))?;
+        release_uploaded_file_pin(&self.root.join(PASTE_ARTIFACTS_DIR), artifact_id, owner_id)
+    }
+
+    fn finalize_uploaded_file_binding(
+        &self,
+        session_id: SessionId,
+        artifact_id: &str,
+        source_entry_id: &str,
+    ) -> Result<(), StoreError> {
+        self.ensure_session(session_id, false)?;
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| std::io::Error::other("Worker Session append lock was poisoned"))?;
+        finalize_uploaded_file_binding(
+            &self.root.join(PASTE_ARTIFACTS_DIR),
+            artifact_id,
+            source_entry_id,
+        )
+    }
+
+    fn reconcile_uploaded_file_pins(
+        &self,
+        session_id: SessionId,
+        live_owner_ids: &[String],
+    ) -> Result<u64, StoreError> {
+        self.ensure_session(session_id, false)?;
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| std::io::Error::other("Worker Session append lock was poisoned"))?;
+        reconcile_uploaded_file_pins(&self.root.join(PASTE_ARTIFACTS_DIR), live_owner_ids)
+    }
+
+    fn delete_uploaded_file(
+        &self,
+        session_id: SessionId,
+        artifact_id: &str,
+    ) -> Result<bool, StoreError> {
+        self.ensure_session(session_id, false)?;
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| std::io::Error::other("Worker Session append lock was poisoned"))?;
+        delete_uploaded_file(&self.root.join(PASTE_ARTIFACTS_DIR), artifact_id)
+    }
+
+    fn delete_uncommitted_uploaded_files(&self, session_id: SessionId) -> Result<u64, StoreError> {
+        self.ensure_session(session_id, false)?;
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| std::io::Error::other("Worker Session append lock was poisoned"))?;
+        let dir = self.root.join(PASTE_ARTIFACTS_DIR);
+        let mut removed = delete_uncommitted_uploaded_files(&dir)?;
+        for reference in list_uploaded_file_refs(&dir)? {
+            let Some(source_entry_id) = reference.source_entry_id.as_deref() else {
+                continue;
+            };
+            if self.uploaded_file_is_referenced(session_id, &reference.artifact_id)? {
+                finalize_uploaded_file_binding(&dir, &reference.artifact_id, source_entry_id)?;
+                continue;
+            }
+            if uploaded_file_has_pending_owner(&dir, &reference.artifact_id)? {
+                continue;
+            }
+            clear_uploaded_file_binding(&dir, &reference.artifact_id, source_entry_id)?;
+            if delete_uploaded_file(&dir, &reference.artifact_id)? {
+                removed = removed
+                    .checked_add(1)
+                    .ok_or(StoreError::ArtifactQuotaExceeded)?;
+            }
+        }
+        Ok(removed)
     }
 
     fn append_trace(
@@ -660,6 +896,212 @@ mod tests {
                 derivation: None,
             },
         }
+    }
+
+    #[test]
+    fn canonical_combined_store_supports_attachment_uploads() {
+        let root = tempfile::tempdir().unwrap();
+        let session = WorkerSessionStore::new(root.path().join("session")).unwrap();
+        let store = crate::CombinedStore::new(session.clone(), ());
+        let session_id = new_session_id();
+        store
+            .create_segment(session_id, new_segment_id(), &[])
+            .unwrap();
+        let context = crate::UploadedFileUploadContext {
+            upload_id: "upload-1".into(),
+            principal_id: "account-1".into(),
+            workspace_id: "workspace-1".into(),
+            runtime_id: "runtime-1".into(),
+            worker_id: "worker-1".into(),
+        };
+        let file = store
+            .write_uploaded_file_with_context(
+                session_id,
+                "image.png",
+                "image/png",
+                b"\x89PNG\r\n\x1a\n",
+                &context,
+                crate::UploadedFileLimits::default(),
+            )
+            .expect("canonical Runtime store must support attachment upload");
+        assert_eq!(
+            store.read_uploaded_file(session_id, &file).unwrap(),
+            b"\x89PNG\r\n\x1a\n"
+        );
+        assert_eq!(
+            session.read_uploaded_file(session_id, &file).unwrap(),
+            b"\x89PNG\r\n\x1a\n"
+        );
+        assert_eq!(
+            store
+                .write_uploaded_file_with_context(
+                    session_id,
+                    "image.png",
+                    "image/png",
+                    b"\x89PNG\r\n\x1a\n",
+                    &context,
+                    crate::UploadedFileLimits::default(),
+                )
+                .unwrap(),
+            file
+        );
+        assert!(
+            store
+                .write_uploaded_file_with_context(
+                    session_id,
+                    "image.png",
+                    "image/png",
+                    b"\x89PNG\r\n\x1a\n",
+                    &crate::UploadedFileUploadContext {
+                        principal_id: "different-account".into(),
+                        ..context
+                    },
+                    crate::UploadedFileLimits::default(),
+                )
+                .is_err(),
+            "CombinedStore must not discard authenticated upload context"
+        );
+        let reopened = WorkerSessionStore::new(root.path().join("session")).unwrap();
+        assert_eq!(
+            reopened
+                .read_uploaded_file_by_id(session_id, &file.artifact_id)
+                .unwrap()
+                .0,
+            file
+        );
+        assert!(matches!(
+            store.read_uploaded_file(new_session_id(), &file),
+            Err(StoreError::Corrupt { .. })
+        ));
+        assert!(
+            store
+                .delete_uploaded_file(session_id, &file.artifact_id)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn canonical_attachment_pins_binding_and_cleanup_survive_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::CombinedStore::new(WorkerSessionStore::new(root.path()).unwrap(), ());
+        let id = new_session_id();
+        let limits = UploadedFileLimits::default();
+        store.create_segment(id, new_segment_id(), &[]).unwrap();
+        let file = store
+            .write_uploaded_file(id, "pending.txt", "text/plain", b"pending", limits)
+            .unwrap();
+        store.pin_uploaded_file(id, &file, "submit-1").unwrap();
+        assert!(store.delete_uploaded_file(id, &file.artifact_id).is_err());
+        drop(store);
+        let store = crate::CombinedStore::new(WorkerSessionStore::new(root.path()).unwrap(), ());
+        assert_eq!(
+            store
+                .reconcile_uploaded_file_pins(id, &["submit-1".into()])
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.delete_uncommitted_uploaded_files(id).unwrap(), 0);
+        let bound = store.bind_uploaded_file(id, &file, "entry-1").unwrap();
+        store
+            .create_segment(
+                id,
+                new_segment_id(),
+                &[LogEntry::InputSegmentsCheckpoint {
+                    ts: 1,
+                    user_segments: vec![vec![protocol::Segment::UploadedFile {
+                        file: bound.clone(),
+                    }]],
+                }],
+            )
+            .unwrap();
+        store
+            .finalize_uploaded_file_binding(id, &file.artifact_id, "entry-1")
+            .unwrap();
+        assert_eq!(store.delete_uncommitted_uploaded_files(id).unwrap(), 0);
+        assert_eq!(store.read_uploaded_file(id, &bound).unwrap(), b"pending");
+        assert!(
+            store
+                .bind_uploaded_file(id, &file, "different-entry")
+                .is_err()
+        );
+        assert!(store.delete_uploaded_file(id, &file.artifact_id).is_err());
+
+        let cancelled = store
+            .write_uploaded_file(id, "cancelled.txt", "text/plain", b"cancelled", limits)
+            .unwrap();
+        store.pin_uploaded_file(id, &cancelled, "submit-2").unwrap();
+        store
+            .release_uploaded_file_pin(id, &cancelled.artifact_id, "submit-2")
+            .unwrap();
+        assert_eq!(store.delete_uncommitted_uploaded_files(id).unwrap(), 1);
+        let orphan = store
+            .write_uploaded_file(id, "orphan.txt", "text/plain", b"orphan", limits)
+            .unwrap();
+        store.pin_uploaded_file(id, &orphan, "lost-owner").unwrap();
+        assert_eq!(store.reconcile_uploaded_file_pins(id, &[]).unwrap(), 1);
+        assert_eq!(store.delete_uncommitted_uploaded_files(id).unwrap(), 1);
+
+        let retry = store
+            .write_uploaded_file(id, "retry.txt", "text/plain", b"retry", limits)
+            .unwrap();
+        store
+            .bind_uploaded_file(id, &retry, "failed-entry")
+            .unwrap();
+        store.bind_uploaded_file(id, &retry, "retry-entry").unwrap();
+        assert_eq!(store.delete_uncommitted_uploaded_files(id).unwrap(), 1);
+        assert_eq!(store.read_uploaded_file(id, &bound).unwrap(), b"pending");
+    }
+
+    #[test]
+    fn canonical_attachment_limits_integrity_and_session_fences_are_preserved() {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::CombinedStore::new(WorkerSessionStore::new(root.path()).unwrap(), ());
+        let id = new_session_id();
+        let limits = UploadedFileLimits {
+            max_file_bytes: 8,
+            max_session_bytes: 8,
+        };
+        store.create_segment(id, new_segment_id(), &[]).unwrap();
+        assert!(matches!(
+            store.write_uploaded_file(id, "../escape", "text/plain", b"x", limits),
+            Err(StoreError::InvalidUploadedFileName)
+        ));
+        assert!(matches!(
+            store.write_uploaded_file(id, "image.png", "image/png", b"invalid", limits),
+            Err(StoreError::ArtifactIntegrityMismatch)
+        ));
+        assert!(matches!(
+            store.write_uploaded_file(id, "large.txt", "text/plain", b"123456789", limits),
+            Err(StoreError::ArtifactTooLarge)
+        ));
+        let file = store
+            .write_uploaded_file(id, "notes.txt", "text/plain", b"1234", limits)
+            .unwrap();
+        let mut forged = file.clone();
+        forged.sha256 = "invalid".into();
+        assert!(matches!(
+            store.read_uploaded_file(id, &forged),
+            Err(StoreError::ArtifactIntegrityMismatch)
+        ));
+        let other = new_session_id();
+        assert!(
+            store
+                .write_uploaded_file(other, "other.txt", "text/plain", b"x", limits)
+                .is_err()
+        );
+        assert!(store.pin_uploaded_file(other, &file, "owner").is_err());
+        assert!(
+            store
+                .delete_uploaded_file(other, &file.artifact_id)
+                .is_err()
+        );
+        store
+            .write_paste_artifact(id, "paste-entry", "1234", PasteArtifactLimits::default())
+            .unwrap();
+        assert!(matches!(
+            store.write_uploaded_file(id, "overflow.txt", "text/plain", b"x", limits),
+            Err(StoreError::ArtifactQuotaExceeded)
+        ));
     }
 
     #[test]

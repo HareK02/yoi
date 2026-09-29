@@ -20,6 +20,77 @@ const base = {
   hasAttachments: false,
 };
 
+Deno.test("Queue accepts text and attachments while running or paused", () => {
+  for (const workerState of ["running", "paused"]) {
+    for (
+      const payload of [
+        { hasText: true, hasAttachments: false },
+        { hasText: false, hasAttachments: true },
+        { hasText: true, hasAttachments: true },
+      ]
+    ) {
+      assertEquals(
+        canDeliverComposerDraft({
+          ...base,
+          ...payload,
+          workerState,
+          delivery: "queue",
+        }),
+        true,
+      );
+    }
+  }
+});
+
+Deno.test("Queue respects lifecycle, transport, send and empty-input fences", () => {
+  for (const workerState of ["idle", "stopped", "loading", "unknown"]) {
+    assertEquals(
+      canDeliverComposerDraft({
+        ...base,
+        workerState,
+        delivery: "queue",
+      }),
+      false,
+    );
+  }
+  for (
+    const fence of [
+      { protocolOpen: false },
+      { sending: true },
+      { hasText: false, hasAttachments: false },
+    ]
+  ) {
+    const state = {
+      ...base,
+      ...fence,
+      workerState: "running",
+      delivery: "queue" as const,
+    };
+    assertEquals(canDeliverComposerDraft(state), false);
+    let sent = false;
+    assertEquals(
+      sendComposerDelivery(state, "submit", () => {
+        sent = true;
+      }),
+      false,
+    );
+    assertEquals(sent, false);
+  }
+});
+
+Deno.test("Queue dispatches Submit, not Notify", () => {
+  const sent: string[] = [];
+  assertEquals(
+    sendComposerDelivery(
+      { ...base, workerState: "running", delivery: "queue" },
+      "submit",
+      (method) => sent.push(method),
+    ),
+    true,
+  );
+  assertEquals(sent.join(","), "submit");
+});
+
 Deno.test("running Composer enables Notify but not Submit", () => {
   assertEquals(
     canDeliverComposerDraft({

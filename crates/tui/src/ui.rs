@@ -1868,7 +1868,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
-            " — Enter to resume, Ctrl-X to cancel, Alt-n to notify",
+            " — Enter on empty input to resume, type + Enter to queue, Ctrl-X to cancel",
             Style::default().fg(Color::DarkGray),
         ));
     } else if !app.running {

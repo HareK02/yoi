@@ -810,6 +810,112 @@ where
         self.session_store
             .read_paste_artifact(session_id, artifact_id)
     }
+    fn write_uploaded_file(
+        &self,
+        session_id: SessionId,
+        file_name: &str,
+        media_type: &str,
+        content: &[u8],
+        limits: crate::UploadedFileLimits,
+    ) -> Result<protocol::UploadedFileRef, crate::StoreError> {
+        self.session_store
+            .write_uploaded_file(session_id, file_name, media_type, content, limits)
+    }
+    fn write_uploaded_file_with_context(
+        &self,
+        session_id: SessionId,
+        file_name: &str,
+        media_type: &str,
+        content: &[u8],
+        context: &crate::UploadedFileUploadContext,
+        limits: crate::UploadedFileLimits,
+    ) -> Result<protocol::UploadedFileRef, crate::StoreError> {
+        self.session_store.write_uploaded_file_with_context(
+            session_id, file_name, media_type, content, context, limits,
+        )
+    }
+    fn read_uploaded_file(
+        &self,
+        session_id: SessionId,
+        reference: &protocol::UploadedFileRef,
+    ) -> Result<Vec<u8>, crate::StoreError> {
+        self.session_store.read_uploaded_file(session_id, reference)
+    }
+    fn read_uploaded_file_by_id(
+        &self,
+        session_id: SessionId,
+        artifact_id: &str,
+    ) -> Result<(protocol::UploadedFileRef, Vec<u8>), crate::StoreError> {
+        self.session_store
+            .read_uploaded_file_by_id(session_id, artifact_id)
+    }
+    fn bind_uploaded_file(
+        &self,
+        session_id: SessionId,
+        reference: &protocol::UploadedFileRef,
+        source_entry_id: &str,
+    ) -> Result<protocol::UploadedFileRef, crate::StoreError> {
+        self.session_store
+            .bind_uploaded_file(session_id, reference, source_entry_id)
+    }
+    fn pin_uploaded_file(
+        &self,
+        session_id: SessionId,
+        reference: &protocol::UploadedFileRef,
+        owner_id: &str,
+    ) -> Result<(), crate::StoreError> {
+        self.session_store
+            .pin_uploaded_file(session_id, reference, owner_id)
+    }
+    fn release_uploaded_file_pin(
+        &self,
+        session_id: SessionId,
+        artifact_id: &str,
+        owner_id: &str,
+    ) -> Result<(), crate::StoreError> {
+        self.session_store
+            .release_uploaded_file_pin(session_id, artifact_id, owner_id)
+    }
+    fn finalize_uploaded_file_binding(
+        &self,
+        session_id: SessionId,
+        artifact_id: &str,
+        source_entry_id: &str,
+    ) -> Result<(), crate::StoreError> {
+        self.session_store
+            .finalize_uploaded_file_binding(session_id, artifact_id, source_entry_id)
+    }
+    fn reconcile_uploaded_file_pins(
+        &self,
+        session_id: SessionId,
+        live_owner_ids: &[String],
+    ) -> Result<u64, crate::StoreError> {
+        self.session_store
+            .reconcile_uploaded_file_pins(session_id, live_owner_ids)
+    }
+    fn delete_uploaded_file(
+        &self,
+        session_id: SessionId,
+        artifact_id: &str,
+    ) -> Result<bool, crate::StoreError> {
+        self.session_store
+            .delete_uploaded_file(session_id, artifact_id)
+    }
+    fn delete_uncommitted_uploaded_files(
+        &self,
+        session_id: SessionId,
+    ) -> Result<u64, crate::StoreError> {
+        self.session_store
+            .delete_uncommitted_uploaded_files(session_id)
+    }
+    fn copy_committed_uploaded_files(
+        &self,
+        source_session_id: SessionId,
+        target_session_id: SessionId,
+    ) -> Result<u64, crate::StoreError> {
+        self.session_store
+            .copy_committed_uploaded_files(source_session_id, target_session_id)
+    }
     fn append_trace(
         &self,
         session_id: SessionId,

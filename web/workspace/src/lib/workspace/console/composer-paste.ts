@@ -10,8 +10,56 @@ export interface ComposerPasteMeasurement {
 }
 
 export interface ComposerPasteEvent {
-  clipboardData: { getData(format: string): string } | null;
+  clipboardData: {
+    getData(format: string): string;
+    files?: ArrayLike<File>;
+    items?: ArrayLike<{
+      kind: string;
+      type: string;
+      getAsFile(): File | null;
+    }>;
+  } | null;
   preventDefault(): void;
+}
+
+/** Keep repeated screenshots from colliding with unsubmitted image.png uploads. */
+export function namePastedImage(file: File): File {
+  return new File(
+    [file],
+    `pasted-${crypto.randomUUID()}-${file.name || "image"}`,
+    {
+      type: file.type,
+      lastModified: file.lastModified,
+    },
+  );
+}
+
+/**
+ * Prefer image files over alternate text/HTML clipboard representations.
+ * Use items only as a fallback: browsers can expose the same image in both
+ * collections. Validation and upload remain the attachment handler's job.
+ */
+export function handleComposerImagePaste(
+  event: ComposerPasteEvent,
+  attachImages: ((files: File[]) => void) | undefined,
+  enabled = true,
+): boolean {
+  if (!enabled || !attachImages || !event.clipboardData) return false;
+  const clipboard = event.clipboardData;
+  let images = Array.from(clipboard.files ?? []).filter((file) =>
+    file.type.startsWith("image/")
+  );
+  if (images.length === 0) {
+    images = Array.from(clipboard.items ?? []).flatMap((item) => {
+      if (item.kind !== "file" || !item.type.startsWith("image/")) return [];
+      const file = item.getAsFile();
+      return file ? [file] : [];
+    });
+  }
+  if (images.length === 0) return false;
+  event.preventDefault();
+  attachImages(images);
+  return true;
 }
 
 /**
