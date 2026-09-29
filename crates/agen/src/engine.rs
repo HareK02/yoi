@@ -1,7 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc, time::Instant};
 
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::time::Instant as TokioInstant;
@@ -25,7 +26,7 @@ use crate::{
     llm_client::{
         ClientError, ConfigWarning, LlmClient, Request, RequestConfig, ResponseStream,
         ToolDefinition, error::is_retryable, event::Event, retry::RetryPolicy,
-        transport::DEFAULT_FIRST_STREAM_EVENT_TIMEOUT, types::parse_tool_arguments,
+        transport::DEFAULT_FIRST_STREAM_EVENT_TIMEOUT,
     },
     state::{EngineState, Locked, Mutable},
     timeline::event::{ErrorEvent, StatusEvent, UsageEvent},
@@ -78,11 +79,20 @@ pub enum ToolRegistryError {
     DuplicateName(String),
 }
 
+/// When provider-confirmed tool calls may begin execution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolCallDispatchMode {
+    /// Wait for the complete assistant response before starting any tools.
+    #[default]
+    AfterResponse,
+    /// Start calls at trustworthy provider per-call completion boundaries.
+    OnToolCallComplete,
+}
+
 /// Engine configuration
 #[derive(Debug, Clone, Default)]
 pub struct EngineConfig {
-    // Reserved for future extensions (currently empty)
-    _private: (),
+    pub tool_call_dispatch: ToolCallDispatchMode,
 }
 
 /// Project terminal tool outputs into the assistant's original ToolCall order.
@@ -196,6 +206,7 @@ pub struct EngineRunOutput<C: LlmClient, A: Send + Sync = ()> {
 }
 
 /// Internal: tool execution result
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolExecutionResult {
     Completed,
     Paused,
@@ -205,6 +216,56 @@ enum ToolExecutionResult {
 struct ToolExecutionAttempt {
     attempt_id: String,
     terminal: bool,
+}
+
+type ToolTerminalTask = Pin<Box<dyn Future<Output = (String, ToolResult)> + Send>>;
+type ToolCallExecutionInfo = (
+    ToolCall,
+    crate::tool::ToolMeta,
+    Arc<dyn crate::tool::Tool>,
+    ToolExecutionContext,
+);
+
+/// One response-scoped execution batch whose calls are admitted as their
+/// provider-confirmed blocks complete.
+struct EarlyToolExecutionBatch {
+    batch_id: String,
+    next_call_index: usize,
+    calls: Vec<ToolCall>,
+    seen_call_ids: HashSet<String>,
+    call_info_map: HashMap<String, ToolCallExecutionInfo>,
+    started_calls: Vec<(String, String)>,
+    attempt_fence: ToolExecutionAttemptFence,
+    futures: FuturesUnordered<ToolTerminalTask>,
+    execution_handles: HashMap<String, ToolExecutionHandle>,
+    synthetic_results: VecDeque<ToolResult>,
+    terminal_call_ids: HashSet<String>,
+    dispatched_any: bool,
+}
+
+impl EarlyToolExecutionBatch {
+    fn new(batch_id: String) -> Self {
+        Self {
+            batch_id,
+            next_call_index: 0,
+            calls: Vec::new(),
+            seen_call_ids: HashSet::new(),
+            call_info_map: HashMap::new(),
+            started_calls: Vec::new(),
+            attempt_fence: ToolExecutionAttemptFence::default(),
+            futures: FuturesUnordered::new(),
+            execution_handles: HashMap::new(),
+            synthetic_results: VecDeque::new(),
+            terminal_call_ids: HashSet::new(),
+            dispatched_any: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EarlyToolAdmission {
+    Continue,
+    Pause,
 }
 
 /// Per-batch compare-and-set fence for terminal ToolResult commits.
@@ -312,6 +373,11 @@ enum StreamCompletion {
     Interrupted { reason: String },
 }
 
+struct StreamResponseOutput {
+    completion: StreamCompletion,
+    early_tools: Option<EarlyToolExecutionBatch>,
+}
+
 pub struct Engine<C: LlmClient, S: EngineState = Mutable, A: Send + Sync = ()> {
     /// LLM client
     client: C,
@@ -362,6 +428,8 @@ pub struct Engine<C: LlmClient, S: EngineState = Mutable, A: Send + Sync = ()> {
     tool_execution_batch_count: usize,
     /// Maximum number of AgentTurns (None = unlimited)
     max_turns: Option<u32>,
+    /// Selected tool-call execution start boundary.
+    tool_call_dispatch_mode: ToolCallDispatchMode,
     /// Caller-selected policy for interrupting started provider operations.
     tool_execution_policy: ToolExecutionPolicy,
     /// AgentTurn-start callbacks (1:1 with LlmCall today)
@@ -1184,7 +1252,10 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
             } = item
             {
                 if !answered_call_ids.contains(call_id) {
-                    let input = parse_tool_arguments(arguments);
+                    let input = serde_json::from_str::<Value>(arguments)
+                        .ok()
+                        .filter(Value::is_object)
+                        .unwrap_or(Value::Null);
                     pending_calls.push(ToolCall {
                         id: call_id.clone(),
                         name: name.clone(),
@@ -1199,6 +1270,342 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         } else {
             Some(pending_calls)
         }
+    }
+
+    async fn admit_early_tool_calls(
+        &mut self,
+        history: &History<A>,
+        batch: &mut EarlyToolExecutionBatch,
+        tool_calls: Vec<ToolCall>,
+    ) -> Result<EarlyToolAdmission, EngineError> {
+        for mut tool_call in tool_calls {
+            if !batch.seen_call_ids.insert(tool_call.id.clone()) {
+                warn!(call_id = %tool_call.id, "Ignoring duplicate completed tool-call event");
+                continue;
+            }
+            let call_index = batch.next_call_index;
+            batch.next_call_index += 1;
+            batch.calls.push(tool_call.clone());
+            let expected_tool_use_id = tool_call.id.clone();
+            let context = ToolExecutionContext::new(&tool_call.id, &batch.batch_id, call_index);
+
+            if !tool_call.input.is_object() {
+                batch.synthetic_results.push_back(ToolResult::error(
+                    &tool_call.id,
+                    "Tool arguments must be one complete JSON object",
+                ));
+                batch.dispatched_any = true;
+                continue;
+            }
+
+            let Some((meta, tool)) = self.tool_server.get_tool(&tool_call.name) else {
+                let attempt_id = context.batch_id.clone();
+                batch
+                    .attempt_fence
+                    .register(tool_call.id.clone(), attempt_id.clone());
+                batch
+                    .started_calls
+                    .push((tool_call.id.clone(), attempt_id.clone()));
+                let call_id = tool_call.id.clone();
+                let name = tool_call.name.clone();
+                batch.futures.push(Box::pin(async move {
+                    (
+                        attempt_id,
+                        ToolResult::error(&call_id, format!("Tool not found: {name}")),
+                    )
+                }));
+                batch.dispatched_any = true;
+                continue;
+            };
+
+            let invocation = self.interceptor_invocation(
+                InterceptorPhase::PreToolCall,
+                Some(self.turn_count),
+                Some(InterceptorCallId::Tool(expected_tool_use_id.clone())),
+                call_index,
+            );
+            let mut info = ToolCallInfo {
+                invocation,
+                history: history.entries(),
+                call: tool_call.clone(),
+                meta,
+                tool,
+                context,
+            };
+            let action = self
+                .interceptor
+                .pre_tool_call(&mut info)
+                .await
+                .map_err(|error| {
+                    EngineError::from(InterceptorFailure::new(
+                        InterceptorPhase::PreToolCall,
+                        error,
+                    ))
+                })?;
+            if info.call.id != expected_tool_use_id {
+                return Err(InterceptorFailure::new(
+                    InterceptorPhase::PreToolCall,
+                    InterceptorError::new(
+                        InterceptorErrorCategory::ContractViolation,
+                        "pre-tool interceptor changed immutable tool call identity",
+                    ),
+                )
+                .into());
+            }
+            tool_call = info.call;
+            let mut context = info.context;
+            context.call_id = tool_call.id.clone();
+            batch.call_info_map.insert(
+                tool_call.id.clone(),
+                (
+                    tool_call.clone(),
+                    info.meta.clone(),
+                    info.tool.clone(),
+                    context.clone(),
+                ),
+            );
+
+            match action {
+                PreToolAction::Continue => {
+                    let attempt_id = context.batch_id.clone();
+                    batch
+                        .attempt_fence
+                        .register(tool_call.id.clone(), attempt_id.clone());
+                    batch
+                        .started_calls
+                        .push((tool_call.id.clone(), attempt_id.clone()));
+                    let input_json = serde_json::to_string(&tool_call.input).unwrap_or_default();
+                    let call_id = tool_call.id.clone();
+                    let (handle, terminal) =
+                        ToolExecutionHandle::start(info.tool, input_json, context);
+                    batch.execution_handles.insert(call_id.clone(), handle);
+                    batch.futures.push(Box::pin(async move {
+                        let result = match terminal.await {
+                            ToolExecutionTerminal::Confirmed(Ok(output)) => {
+                                ToolResult::from_output(&call_id, output)
+                            }
+                            ToolExecutionTerminal::Confirmed(Err(ToolError::Cancelled(output))) => {
+                                ToolResult::from_output_with_disposition(
+                                    &call_id,
+                                    output,
+                                    ToolResultDisposition::Cancelled,
+                                )
+                            }
+                            ToolExecutionTerminal::Confirmed(Err(ToolError::Interrupted(
+                                output,
+                            ))) => ToolResult::from_output_with_disposition(
+                                &call_id,
+                                output,
+                                ToolResultDisposition::Interrupted,
+                            ),
+                            ToolExecutionTerminal::Confirmed(Err(error)) => {
+                                ToolResult::error(&call_id, error.to_string())
+                            }
+                            ToolExecutionTerminal::OutcomeUnknown => {
+                                ToolResult::outcome_unknown(&call_id)
+                            }
+                        };
+                        (attempt_id, result)
+                    }));
+                    batch.dispatched_any = true;
+                }
+                PreToolAction::SyntheticResult(result) => {
+                    if result.tool_use_id != expected_tool_use_id {
+                        return Err(InterceptorFailure::new(
+                            InterceptorPhase::PreToolCall,
+                            InterceptorError::new(
+                                InterceptorErrorCategory::ContractViolation,
+                                "synthetic tool result changed immutable tool call identity",
+                            ),
+                        )
+                        .into());
+                    }
+                    batch.synthetic_results.push_back(result);
+                    batch.dispatched_any = true;
+                }
+                PreToolAction::Skip => {}
+                PreToolAction::Abort(reason) => return Err(EngineError::Aborted(reason)),
+                PreToolAction::Pause => return Ok(EarlyToolAdmission::Pause),
+            }
+        }
+        Ok(EarlyToolAdmission::Continue)
+    }
+
+    async fn cancel_and_terminalize_early_batch(
+        &mut self,
+        history: &mut History<A>,
+        annotate: &mut impl FnMut(&Item) -> Result<A, String>,
+        batch: &mut EarlyToolExecutionBatch,
+    ) -> Option<EngineError> {
+        use futures::StreamExt as _;
+
+        let cancellation_request_deadline =
+            TokioInstant::now() + self.tool_execution_policy.cancellation_request_timeout;
+        let cancellation_requests = batch
+            .execution_handles
+            .iter()
+            .filter(|(call_id, _)| !batch.terminal_call_ids.contains(*call_id))
+            .map(|(call_id, handle)| {
+                let call_id = call_id.clone();
+                let handle = handle.clone();
+                async move {
+                    (
+                        call_id,
+                        handle.cancel_before(cancellation_request_deadline).await,
+                    )
+                }
+            });
+        let cancellation_requests: FuturesUnordered<_> = cancellation_requests.collect();
+        for (call_id, result) in cancellation_requests.collect::<Vec<_>>().await {
+            if let Err(error) = result {
+                warn!(%call_id, error = %error, "Tool cooperative cancellation request failed");
+            }
+        }
+
+        let mut batch_error = None;
+        let deadline =
+            TokioInstant::now() + self.tool_execution_policy.terminal_confirmation_timeout;
+        while !batch.futures.is_empty() {
+            tokio::select! {
+                biased;
+                result = batch.futures.next() => {
+                    let (attempt_id, result) = result.expect("non-empty FuturesUnordered");
+                    if let Err(error) = self.finalize_and_commit_tool_result(
+                        history,
+                        annotate,
+                        result,
+                        Some(&attempt_id),
+                        &batch.call_info_map,
+                        &mut batch.attempt_fence,
+                        &mut batch.terminal_call_ids,
+                    ).await && batch_error.is_none() {
+                        batch_error = Some(error);
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => break,
+            }
+        }
+        for (call_id, attempt_id) in &batch.started_calls {
+            if !batch.attempt_fence.is_terminal(call_id) {
+                if let Some(handle) = batch.execution_handles.get(call_id) {
+                    handle.force_close();
+                }
+                if let Err(error) = self
+                    .finalize_and_commit_tool_result(
+                        history,
+                        annotate,
+                        ToolResult::outcome_unknown(call_id),
+                        Some(attempt_id),
+                        &batch.call_info_map,
+                        &mut batch.attempt_fence,
+                        &mut batch.terminal_call_ids,
+                    )
+                    .await
+                    && batch_error.is_none()
+                {
+                    batch_error = Some(error);
+                }
+            }
+        }
+        batch_error
+    }
+
+    async fn drain_early_tool_batch(
+        &mut self,
+        history: &mut History<A>,
+        annotate: &mut impl FnMut(&Item) -> Result<A, String>,
+        mut batch: EarlyToolExecutionBatch,
+        force_cancel: bool,
+        initial_pause_requested: bool,
+    ) -> Result<ToolExecutionResult, EngineError> {
+        while let Some(result) = batch.synthetic_results.pop_front() {
+            if let Err(error) = self
+                .finalize_and_commit_tool_result(
+                    history,
+                    annotate,
+                    result,
+                    None,
+                    &batch.call_info_map,
+                    &mut batch.attempt_fence,
+                    &mut batch.terminal_call_ids,
+                )
+                .await
+            {
+                let cleanup_error = self
+                    .cancel_and_terminalize_early_batch(history, annotate, &mut batch)
+                    .await;
+                return Err(cleanup_error.unwrap_or(error));
+            }
+        }
+
+        if force_cancel {
+            if let Some(error) = self
+                .cancel_and_terminalize_early_batch(history, annotate, &mut batch)
+                .await
+            {
+                return Err(error);
+            }
+            return Ok(ToolExecutionResult::Completed);
+        }
+
+        let mut pause_requested = initial_pause_requested;
+        let mut pause_deadline = initial_pause_requested
+            .then(|| TokioInstant::now() + self.tool_execution_policy.pause_safe_boundary_timeout);
+        while !batch.futures.is_empty() {
+            tokio::select! {
+                biased;
+                result = batch.futures.next() => {
+                    let (attempt_id, result) = result.expect("non-empty FuturesUnordered");
+                    if let Err(error) = self.finalize_and_commit_tool_result(
+                        history,
+                        annotate,
+                        result,
+                        Some(&attempt_id),
+                        &batch.call_info_map,
+                        &mut batch.attempt_fence,
+                        &mut batch.terminal_call_ids,
+                    ).await {
+                        let cleanup_error = self
+                            .cancel_and_terminalize_early_batch(history, annotate, &mut batch)
+                            .await;
+                        return Err(cleanup_error.unwrap_or(error));
+                    }
+                }
+                pause = self.pause_rx.recv(), if !pause_requested => {
+                    if pause.is_some() {
+                        pause_requested = true;
+                        pause_deadline = Some(
+                            TokioInstant::now()
+                                + self.tool_execution_policy.pause_safe_boundary_timeout,
+                        );
+                    }
+                }
+                _ = tokio::time::sleep_until(pause_deadline.unwrap_or_else(TokioInstant::now)), if pause_deadline.is_some() => {
+                    if let Some(error) = self
+                        .cancel_and_terminalize_early_batch(history, annotate, &mut batch)
+                        .await {
+                        return Err(error);
+                    }
+                    return Ok(ToolExecutionResult::Paused);
+                }
+                cancel = self.cancel_rx.recv() => {
+                    if cancel.is_some() {
+                        info!("Tool execution cancellation requested");
+                    }
+                    if let Some(error) = self
+                        .cancel_and_terminalize_early_batch(history, annotate, &mut batch)
+                        .await {
+                        return Err(error);
+                    }
+                    return Err(EngineError::Cancelled);
+                }
+            }
+        }
+        Ok(if pause_requested {
+            ToolExecutionResult::Paused
+        } else {
+            ToolExecutionResult::Completed
+        })
     }
 
     /// Execute tools in parallel
@@ -1231,6 +1638,13 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         for (call_index, mut tool_call) in tool_calls.into_iter().enumerate() {
             let expected_tool_use_id = tool_call.id.clone();
             let context = ToolExecutionContext::new(&tool_call.id, &batch_id, call_index);
+            if !tool_call.input.is_object() {
+                synthetic_results.push(ToolResult::error(
+                    &tool_call.id,
+                    "Tool arguments must be one complete JSON object",
+                ));
+                continue;
+            }
             if let Some((meta, tool)) = self.tool_server.get_tool(&tool_call.name) {
                 let invocation = self.interceptor_invocation(
                     InterceptorPhase::PreToolCall,
@@ -1934,8 +2348,30 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                 self.request_trace_payload(&request),
             );
             let request = self.attach_transport_trace(request, current_turn, current_llm_call);
-            let stream_outcome = self
-                .stream_response(request, current_turn, current_llm_call)
+            let early_dispatch = self.tool_call_dispatch_mode
+                == ToolCallDispatchMode::OnToolCallComplete
+                && self.client.tool_call_completion_support()
+                    == crate::llm_client::ToolCallCompletionSupport::PerBlock;
+            if self.tool_call_dispatch_mode == ToolCallDispatchMode::OnToolCallComplete
+                && !early_dispatch
+            {
+                self.emit_warning(
+                    "tool-call early dispatch deferred until response completion: provider does not expose a trustworthy per-call completion boundary",
+                );
+            }
+            let assistant_start = history.len();
+            let StreamResponseOutput {
+                completion: stream_outcome,
+                mut early_tools,
+            } = self
+                .stream_response(
+                    request,
+                    current_turn,
+                    current_llm_call,
+                    history,
+                    annotate,
+                    early_dispatch,
+                )
                 .await?;
 
             for cb in &self.llm_call_end_cbs {
@@ -1944,6 +2380,47 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
             self.llm_call_count += 1;
 
             if let StreamCompletion::Interrupted { reason } = stream_outcome {
+                if early_tools
+                    .as_ref()
+                    .is_some_and(|batch| batch.dispatched_any)
+                {
+                    // Once a side effect may have started, automatic stream
+                    // continuation would allow the model to regenerate the same
+                    // operation under a fresh call id. Close every owned attempt
+                    // and stop this run instead.
+                    self.timeline.abort_current_block();
+                    self.timeline.flush_usage();
+                    let reasoning_items = self.thinking_block_collector.take_collected();
+                    let text_blocks = self.text_block_collector.take_collected();
+                    let _partial_tool_calls = self.tool_call_collector.take_collected();
+                    let assistant_items =
+                        self.build_assistant_items(&reasoning_items, &text_blocks, &[]);
+                    if !assistant_items.is_empty()
+                        && let Err(error) =
+                            self.append_history_items(history, assistant_items, annotate)
+                    {
+                        if let Some(batch) = early_tools.take()
+                            && let Err(cleanup_error) = self
+                                .drain_early_tool_batch(history, annotate, batch, true, false)
+                                .await
+                        {
+                            return Err(cleanup_error);
+                        }
+                        return Err(error);
+                    }
+                    if let Some(batch) = early_tools.take() {
+                        self.drain_early_tool_batch(history, annotate, batch, true, false)
+                            .await?;
+                    }
+                    return Err(EngineError::Client(ClientError::Api {
+                        status: None,
+                        code: Some("early_tool_stream_interrupted".to_string()),
+                        message: format!(
+                            "LLM stream interrupted after early tool execution started: {reason}"
+                        ),
+                        retry_after: None,
+                    }));
+                }
                 stream_continuations += 1;
                 if stream_continuations > MAX_STREAM_CONTINUATIONS {
                     return Err(EngineError::Client(ClientError::Api {
@@ -1989,11 +2466,61 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
             // `append_history_items` so observers see each item as it lands.
             let reasoning_items = self.thinking_block_collector.take_collected();
             let text_blocks = self.text_block_collector.take_collected();
-            let tool_calls = self.tool_call_collector.take_collected();
+            let remaining_tool_calls = self.tool_call_collector.take_collected();
             let assistant_items =
-                self.build_assistant_items(&reasoning_items, &text_blocks, &tool_calls);
-            let assistant_start = history.len();
-            self.append_history_items(history, assistant_items, annotate)?;
+                self.build_assistant_items(&reasoning_items, &text_blocks, &remaining_tool_calls);
+            if let Err(error) = self.append_history_items(history, assistant_items, annotate) {
+                if let Some(batch) = early_tools.take()
+                    && let Err(cleanup_error) = self
+                        .drain_early_tool_batch(history, annotate, batch, true, false)
+                        .await
+                {
+                    return Err(cleanup_error);
+                }
+                return Err(error);
+            }
+
+            if early_dispatch && !remaining_tool_calls.is_empty() {
+                if early_tools.is_none() {
+                    let batch_id = format!("tool-batch-{}", self.tool_execution_batch_count);
+                    self.tool_execution_batch_count += 1;
+                    early_tools = Some(EarlyToolExecutionBatch::new(batch_id));
+                }
+                let admission = self
+                    .admit_early_tool_calls(
+                        history,
+                        early_tools.as_mut().expect("batch initialized"),
+                        remaining_tool_calls.clone(),
+                    )
+                    .await;
+                let admission = match admission {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        if let Some(batch) = early_tools.take()
+                            && let Err(cleanup_error) = self
+                                .drain_early_tool_batch(history, annotate, batch, true, false)
+                                .await
+                        {
+                            return Err(cleanup_error);
+                        }
+                        return Err(error);
+                    }
+                };
+                if admission == EarlyToolAdmission::Pause {
+                    if let Some(batch) = early_tools.take() {
+                        self.drain_early_tool_batch(history, annotate, batch, false, true)
+                            .await?;
+                    }
+                    return Ok(EngineResult::Paused);
+                }
+            }
+            let mut tool_calls = early_tools
+                .as_ref()
+                .map(|batch| batch.calls.clone())
+                .unwrap_or_default();
+            if !early_dispatch {
+                tool_calls = remaining_tool_calls;
+            }
 
             let assistant_invocation = self.interceptor_invocation(
                 InterceptorPhase::AssistantTurnEnd,
@@ -2011,27 +2538,62 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                     history: history.entries(),
                     tool_calls: &tool_calls,
                 })
-                .await
-                .map_err(|error| {
-                    EngineError::from(InterceptorFailure::new(
+                .await;
+            let assistant_turn_action = match assistant_turn_action {
+                Ok(action) => action,
+                Err(error) => {
+                    let error = EngineError::from(InterceptorFailure::new(
                         InterceptorPhase::AssistantTurnEnd,
                         error,
-                    ))
-                })?;
+                    ));
+                    if let Some(batch) = early_tools.take()
+                        && let Err(cleanup_error) = self
+                            .drain_early_tool_batch(history, annotate, batch, true, false)
+                            .await
+                    {
+                        return Err(cleanup_error);
+                    }
+                    return Err(error);
+                }
+            };
             match assistant_turn_action {
                 TurnEndAction::Finish if tool_calls.is_empty() => {
                     return Ok(EngineResult::Finished);
                 }
                 TurnEndAction::Finish => {}
                 TurnEndAction::ContinueWithMessages(additional) => {
-                    self.append_history_items(history, additional, annotate)?;
+                    if let Err(error) = self.append_history_items(history, additional, annotate) {
+                        if let Some(batch) = early_tools.take()
+                            && let Err(cleanup_error) = self
+                                .drain_early_tool_batch(history, annotate, batch, true, false)
+                                .await
+                        {
+                            return Err(cleanup_error);
+                        }
+                        return Err(error);
+                    }
                     if tool_calls.is_empty() {
                         continue;
                     }
                 }
                 TurnEndAction::Pause => {
+                    if let Some(batch) = early_tools.take() {
+                        self.drain_early_tool_batch(history, annotate, batch, false, true)
+                            .await?;
+                    }
                     return Ok(EngineResult::Paused);
                 }
+            }
+
+            if let Some(batch) = early_tools.take() {
+                if self
+                    .drain_early_tool_batch(history, annotate, batch, false, false)
+                    .await?
+                    == ToolExecutionResult::Paused
+                {
+                    return Ok(EngineResult::Paused);
+                }
+                continue;
             }
 
             if let Some(result) = self
@@ -2224,7 +2786,10 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         request: Request,
         turn: usize,
         llm_call: usize,
-    ) -> Result<StreamCompletion, EngineError> {
+        history: &mut History<A>,
+        annotate: &mut impl FnMut(&Item) -> Result<A, String>,
+        early_dispatch: bool,
+    ) -> Result<StreamResponseOutput, EngineError> {
         debug!(
             item_count = request.items.len(),
             tool_count = request.tools.len(),
@@ -2233,6 +2798,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         );
 
         let mut stream = self.open_stream_with_retry(request, turn, llm_call).await?;
+        let mut early_tools: Option<EarlyToolExecutionBatch> = None;
 
         let mut event_count: usize = 0;
         loop {
@@ -2254,8 +2820,11 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                                 Err(err) => {
                                     // 部分情報でも発火しておく（料金会計用）
                                     self.timeline.flush_usage();
-                                    return Ok(StreamCompletion::Interrupted {
-                                        reason: err.to_string(),
+                                    return Ok(StreamResponseOutput {
+                                        completion: StreamCompletion::Interrupted {
+                                            reason: err.to_string(),
+                                        },
+                                        early_tools,
                                     });
                                 }
                             };
@@ -2269,9 +2838,116 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                             }
                             self.emit_stream_event(turn, llm_call, &event);
                             self.timeline.dispatch(&event);
+                            if early_dispatch {
+                                let collected = self.tool_call_collector.take_collected();
+                                if !collected.is_empty() {
+                                    if early_tools.is_none() {
+                                        let batch_id = format!(
+                                            "tool-batch-{}",
+                                            self.tool_execution_batch_count
+                                        );
+                                        self.tool_execution_batch_count += 1;
+                                        early_tools =
+                                            Some(EarlyToolExecutionBatch::new(batch_id));
+                                    }
+                                    let fresh_calls = {
+                                        let batch = early_tools.as_ref().expect("batch initialized");
+                                        collected
+                                            .into_iter()
+                                            .filter(|call| {
+                                                !batch.seen_call_ids.contains(&call.id)
+                                            })
+                                            .collect::<Vec<_>>()
+                                    };
+                                    if !fresh_calls.is_empty() {
+                                        // Commit every completed assistant block observed so far,
+                                        // including the ToolCall itself, before provider ownership
+                                        // can start. This is the durable fail-closed gate.
+                                        let reasoning =
+                                            self.thinking_block_collector.take_collected();
+                                        let text = self.text_block_collector.take_collected();
+                                        let assistant_items = self.build_assistant_items(
+                                            &reasoning,
+                                            &text,
+                                            &fresh_calls,
+                                        );
+                                        if let Err(error) = self.append_history_items(
+                                            history,
+                                            assistant_items,
+                                            annotate,
+                                        ) {
+                                            if let Some(mut batch) = early_tools.take() {
+                                                let _ = self
+                                                    .cancel_and_terminalize_early_batch(
+                                                        history,
+                                                        annotate,
+                                                        &mut batch,
+                                                    )
+                                                    .await;
+                                            }
+                                            return Err(error);
+                                        }
+                                        let admission = {
+                                            let batch =
+                                                early_tools.as_mut().expect("batch initialized");
+                                            self.admit_early_tool_calls(
+                                                history,
+                                                batch,
+                                                fresh_calls,
+                                            )
+                                            .await
+                                        };
+                                        match admission {
+                                            Ok(EarlyToolAdmission::Continue) => {}
+                                            Ok(EarlyToolAdmission::Pause) => {
+                                                self.timeline.abort_current_block();
+                                                self.timeline.flush_usage();
+                                                if let Some(batch) = early_tools.take() {
+                                                    self.drain_early_tool_batch(
+                                                        history,
+                                                        annotate,
+                                                        batch,
+                                                        false,
+                                                        true,
+                                                    )
+                                                    .await?;
+                                                }
+                                                return Err(EngineError::PauseRequested);
+                                            }
+                                            Err(error) => {
+                                                self.timeline.abort_current_block();
+                                                self.timeline.flush_usage();
+                                                if let Some(mut batch) = early_tools.take() {
+                                                    let cleanup_error = self
+                                                        .cancel_and_terminalize_early_batch(
+                                                            history,
+                                                            annotate,
+                                                            &mut batch,
+                                                        )
+                                                        .await;
+                                                    return Err(cleanup_error.unwrap_or(error));
+                                                }
+                                                return Err(error);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if let Event::Error(err) = &event {
                                 self.timeline.abort_current_block();
                                 self.timeline.flush_usage();
+                                if let Some(mut batch) = early_tools.take() {
+                                    if let Some(error) = self
+                                        .cancel_and_terminalize_early_batch(
+                                            history,
+                                            annotate,
+                                            &mut batch,
+                                        )
+                                        .await
+                                    {
+                                        return Err(error);
+                                    }
+                                }
                                 return Err(EngineError::Client(ClientError::Api {
                                     status: None,
                                     code: err.code.clone(),
@@ -2291,6 +2967,10 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                     // Preserve any UsageEvent already received for billing, but
                     // do not treat this paused request as a normal completion.
                     self.timeline.flush_usage();
+                    if let Some(batch) = early_tools.take() {
+                        self.drain_early_tool_batch(history, annotate, batch, false, true)
+                            .await?;
+                    }
                     return Err(EngineError::PauseRequested);
                 }
                 cancel = self.cancel_rx.recv() => {
@@ -2299,6 +2979,14 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                     }
                     self.timeline.abort_current_block();
                     self.timeline.flush_usage();
+                    if let Some(mut batch) = early_tools.take() {
+                        if let Some(error) = self
+                            .cancel_and_terminalize_early_batch(history, annotate, &mut batch)
+                            .await
+                        {
+                            return Err(error);
+                        }
+                    }
                     return Err(EngineError::Cancelled);
                 }
             }
@@ -2306,7 +2994,10 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         // ストリーム完了時に集約済み Usage を 1 度だけ発火
         self.timeline.flush_usage();
         debug!(event_count = event_count, "Stream completed");
-        Ok(StreamCompletion::Complete)
+        Ok(StreamResponseOutput {
+            completion: StreamCompletion::Complete,
+            early_tools,
+        })
     }
 
     /// Execute tools and push results to history.
@@ -2361,6 +3052,7 @@ impl<C: LlmClient, A: Send + Sync> Engine<C, Mutable, A> {
             llm_call_count: 0,
             tool_execution_batch_count: 0,
             max_turns: None,
+            tool_call_dispatch_mode: ToolCallDispatchMode::default(),
             tool_execution_policy: ToolExecutionPolicy::default(),
             turn_start_cbs: Vec::new(),
             turn_end_cbs: Vec::new(),
@@ -2561,9 +3253,18 @@ impl<C: LlmClient, A: Send + Sync> Engine<C, Mutable, A> {
         self.max_turns = max_turns;
     }
 
-    /// Apply configuration (reserved for future extensions)
-    #[allow(dead_code)]
-    pub fn config(self, _config: EngineConfig) -> Self {
+    /// Select when provider-confirmed tool calls may begin execution.
+    pub fn set_tool_call_dispatch_mode(&mut self, mode: ToolCallDispatchMode) {
+        self.tool_call_dispatch_mode = mode;
+    }
+
+    pub fn tool_call_dispatch_mode(&self) -> ToolCallDispatchMode {
+        self.tool_call_dispatch_mode
+    }
+
+    /// Apply configuration.
+    pub fn config(mut self, config: EngineConfig) -> Self {
+        self.tool_call_dispatch_mode = config.tool_call_dispatch;
         self
     }
 
@@ -2640,6 +3341,7 @@ impl<C: LlmClient, A: Send + Sync> Engine<C, Mutable, A> {
             llm_call_count: self.llm_call_count,
             tool_execution_batch_count: self.tool_execution_batch_count,
             max_turns: self.max_turns,
+            tool_call_dispatch_mode: self.tool_call_dispatch_mode,
             tool_execution_policy: self.tool_execution_policy,
             turn_start_cbs: self.turn_start_cbs,
             turn_end_cbs: self.turn_end_cbs,
@@ -2823,6 +3525,7 @@ impl<C: LlmClient, A: Send + Sync> Engine<C, Locked, A> {
             llm_call_count: self.llm_call_count,
             tool_execution_batch_count: self.tool_execution_batch_count,
             max_turns: self.max_turns,
+            tool_call_dispatch_mode: self.tool_call_dispatch_mode,
             tool_execution_policy: self.tool_execution_policy,
             turn_start_cbs: self.turn_start_cbs,
             turn_end_cbs: self.turn_end_cbs,

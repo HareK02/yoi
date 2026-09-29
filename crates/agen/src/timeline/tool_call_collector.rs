@@ -5,7 +5,6 @@
 
 use crate::{
     handler::{Handler, ToolUseBlockEvent, ToolUseBlockKind},
-    llm_client::types::parse_tool_arguments,
     tool::ToolCall,
 };
 use std::sync::{Arc, Mutex};
@@ -85,7 +84,18 @@ impl Handler<ToolUseBlockKind> for ToolCallCollector {
                 // ブロック完了時にToolCallを確定
                 if let (Some(id), Some(name)) = (scope.current_id.take(), scope.current_name.take())
                 {
-                    let input = parse_tool_arguments(&scope.input_json_buffer);
+                    // A Stop event proves the provider finished the block, but
+                    // malformed/non-object arguments are still not executable.
+                    // Preserve an explicit null sentinel so the engine can commit
+                    // a terminal validation error without guessing `{}`.
+                    let input = if scope.input_json_buffer.trim().is_empty() {
+                        serde_json::Value::Object(serde_json::Map::new())
+                    } else {
+                        serde_json::from_str::<serde_json::Value>(&scope.input_json_buffer)
+                            .ok()
+                            .filter(serde_json::Value::is_object)
+                            .unwrap_or(serde_json::Value::Null)
+                    };
 
                     let tool_call = ToolCall { id, name, input };
 
@@ -142,6 +152,43 @@ mod tests {
             calls[0].input,
             serde_json::Value::Object(serde_json::Map::new())
         );
+    }
+
+    #[test]
+    fn test_collect_interleaved_tool_call_indexes_and_ignore_duplicate_stop() {
+        let collector = ToolCallCollector::new();
+        let mut timeline = Timeline::new();
+        timeline.on_tool_use_block(collector.clone());
+
+        timeline.dispatch(&Event::tool_use_start(0, "call_0", "tool_0"));
+        timeline.dispatch(&Event::tool_input_delta(0, r#"{"a":"#));
+        timeline.dispatch(&Event::tool_use_start(1, "call_1", "tool_1"));
+        timeline.dispatch(&Event::tool_input_delta(1, r#"{"b":2}"#));
+        timeline.dispatch(&Event::tool_input_delta(0, r#"1}"#));
+        timeline.dispatch(&Event::tool_use_stop(1));
+        timeline.dispatch(&Event::tool_use_stop(1));
+        timeline.dispatch(&Event::tool_use_stop(0));
+
+        let calls = collector.take_collected();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].input, serde_json::json!({"b": 2}));
+        assert_eq!(calls[1].id, "call_0");
+        assert_eq!(calls[1].input, serde_json::json!({"a": 1}));
+    }
+
+    #[test]
+    fn malformed_completed_arguments_are_not_normalized_to_executable_object() {
+        let collector = ToolCallCollector::new();
+        let mut timeline = Timeline::new();
+        timeline.on_tool_use_block(collector.clone());
+        timeline.dispatch(&Event::tool_use_start(0, "bad", "mutate"));
+        timeline.dispatch(&Event::tool_input_delta(0, r#"{"unterminated":"#));
+        timeline.dispatch(&Event::tool_use_stop(0));
+
+        let calls = collector.take_collected();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].input.is_null());
     }
 
     #[test]

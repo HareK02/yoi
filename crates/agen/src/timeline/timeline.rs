@@ -256,8 +256,8 @@ where
     H: Handler<ToolUseBlockKind>,
 {
     handler: H,
-    scope: Option<H::Scope>,
-    current_tool: Option<(String, String)>, // (id, name)
+    scopes: HashMap<usize, H::Scope>,
+    tools: HashMap<usize, (String, String)>, // index -> (id, name)
 }
 
 impl<H> ToolUseBlockHandlerWrapper<H>
@@ -267,8 +267,8 @@ where
     fn new(handler: H) -> Self {
         Self {
             handler,
-            scope: None,
-            current_tool: None,
+            scopes: HashMap::new(),
+            tools: HashMap::new(),
         }
     }
 }
@@ -279,60 +279,55 @@ where
     H::Scope: Send + Sync,
 {
     fn dispatch_start(&mut self, start: &BlockStart) {
-        if let Some(scope) = &mut self.scope {
-            if let BlockMetadata::ToolUse { id, name } = &start.metadata {
-                self.current_tool = Some((id.clone(), name.clone()));
-                self.handler.on_event(
-                    scope,
-                    &ToolUseBlockEvent::Start(ToolUseBlockStart {
-                        index: start.index,
-                        id: id.clone(),
-                        name: name.clone(),
-                    }),
-                );
-            }
+        if let BlockMetadata::ToolUse { id, name } = &start.metadata {
+            let scope = self.scopes.entry(start.index).or_default();
+            self.tools.insert(start.index, (id.clone(), name.clone()));
+            self.handler.on_event(
+                scope,
+                &ToolUseBlockEvent::Start(ToolUseBlockStart {
+                    index: start.index,
+                    id: id.clone(),
+                    name: name.clone(),
+                }),
+            );
         }
     }
 
     fn dispatch_delta(&mut self, delta: &BlockDelta) {
-        if let Some(scope) = &mut self.scope {
-            if let DeltaContent::InputJson(json) = &delta.delta {
-                self.handler
-                    .on_event(scope, &ToolUseBlockEvent::InputJsonDelta(json.clone()));
-            }
+        if let DeltaContent::InputJson(json) = &delta.delta {
+            let scope = self.scopes.entry(delta.index).or_default();
+            self.handler
+                .on_event(scope, &ToolUseBlockEvent::InputJsonDelta(json.clone()));
         }
     }
 
     fn dispatch_stop(&mut self, stop: &BlockStop) {
-        if let Some(scope) = &mut self.scope {
-            if let Some((id, name)) = self.current_tool.take() {
-                self.handler.on_event(
-                    scope,
-                    &ToolUseBlockEvent::Stop(ToolUseBlockStop {
-                        index: stop.index,
-                        id,
-                        name,
-                    }),
-                );
-            }
+        if let (Some(mut scope), Some((id, name))) = (
+            self.scopes.remove(&stop.index),
+            self.tools.remove(&stop.index),
+        ) {
+            self.handler.on_event(
+                &mut scope,
+                &ToolUseBlockEvent::Stop(ToolUseBlockStop {
+                    index: stop.index,
+                    id,
+                    name,
+                }),
+            );
         }
     }
 
-    fn dispatch_abort(&mut self, _abort: &BlockAbort) {
-        self.current_tool = None;
+    fn dispatch_abort(&mut self, abort: &BlockAbort) {
+        self.scopes.remove(&abort.index);
+        self.tools.remove(&abort.index);
     }
 
-    fn start_scope(&mut self) {
-        self.scope = Some(H::Scope::default());
-    }
+    fn start_scope(&mut self) {}
 
-    fn end_scope(&mut self) {
-        self.scope = None;
-        self.current_tool = None;
-    }
+    fn end_scope(&mut self) {}
 
     fn has_scope(&self) -> bool {
-        self.scope.is_some()
+        !self.scopes.is_empty()
     }
 }
 

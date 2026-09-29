@@ -7138,6 +7138,12 @@ pub fn apply_worker_manifest<C: LlmClient + 'static, A: Send + Sync>(
 ) {
     worker.set_request_config(request_config_from_engine_manifest(wm));
     worker.set_max_turns(wm.max_turns.map(|n| n.get()));
+    worker.set_tool_call_dispatch_mode(match wm.tool_call_dispatch {
+        manifest::ToolCallDispatchMode::AfterResponse => agen::ToolCallDispatchMode::AfterResponse,
+        manifest::ToolCallDispatchMode::OnToolCallComplete => {
+            agen::ToolCallDispatchMode::OnToolCallComplete
+        }
+    });
     // Worker owns the lifecycle strategy for already-started tool operations.
     // The provider must first accept cooperative cancellation, then confirm a
     // terminal result before this bounded deadline; Agen handles only the
@@ -8721,6 +8727,7 @@ mod build_summary_prompt_tests {
             top_k: Some(40),
             stop_sequences: vec!["\n\n".into(), "</stop>".into()],
             reasoning: None,
+            tool_call_dispatch: manifest::ToolCallDispatchMode::OnToolCallComplete,
             tool_output: manifest::ToolOutputLimits::default(),
             file_upload: manifest::FileUploadLimits::default(),
         };
@@ -8732,6 +8739,13 @@ mod build_summary_prompt_tests {
         assert_eq!(config.top_p, Some(0.9));
         assert_eq!(config.top_k, Some(40));
         assert_eq!(config.stop_sequences, vec!["\n\n", "</stop>"]);
+
+        let mut engine = Engine::new(NoopClient);
+        apply_worker_manifest(&mut engine, &manifest);
+        assert_eq!(
+            engine.tool_call_dispatch_mode(),
+            agen::ToolCallDispatchMode::OnToolCallComplete
+        );
     }
 
     #[test]
