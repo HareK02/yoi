@@ -119,12 +119,12 @@ use workdir::workspace::{
     WorkspaceWorkdirSessionOperationRequest,
 };
 use workdir::{CommandHandle, WorkdirSessionHandle};
+#[cfg(test)]
+use worker_runtime::catalog::WorkingDirectoryAttachmentStatus;
 use worker_runtime::http_server::{
     RUNTIME_HTTP_PROTOCOL_MAX_VERSION, RUNTIME_HTTP_PROTOCOL_MIN_VERSION,
     RUNTIME_HTTP_PROTOCOL_VERSION,
 };
-#[cfg(test)]
-use worker_runtime::catalog::WorkingDirectoryAttachmentStatus;
 #[cfg(test)]
 use worker_runtime::resource::BackendResourceError;
 use worker_runtime::resource::BackendResourceFetchRequest;
@@ -22519,13 +22519,8 @@ async fn get_runtime_worker(
         .store
         .list_workdir_registry(&api.config.workspace_id, 500)?;
     let updated_at = record.updated_at.clone();
-    let worker = project_worker_registry_projection(
-        &api,
-        Some(&worker),
-        &record,
-        links,
-        &workdirs,
-    )?;
+    let worker =
+        project_worker_registry_projection(&api, Some(&worker), &record, links, &workdirs)?;
     Ok(Json(server_api::RuntimeWorkerShowResponse {
         worker,
         updated_at,
@@ -29729,8 +29724,7 @@ mod tests {
                         .unwrap(),
                     runtime_id: Some(EMBEDDED_WORKER_RUNTIME_ID.to_string()),
                     resource_key: None,
-                    availability:
-                        protocol::subscription::SubscriptionWorkerAvailability::Observed,
+                    availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
                     subject_revision: 1,
                     worker_state: None,
                     state: protocol::subscription::SubscriptionWorkerState::Paused,
@@ -43454,10 +43448,7 @@ mod tests {
                     selector:
                         protocol::subscription::EventSubscriptionSelector::WorkerProtocol { .. },
                     snapshot:
-                        protocol::subscription::SubscriptionSnapshot::WorkerProtocol {
-                            events,
-                            ..
-                        },
+                        protocol::subscription::SubscriptionSnapshot::WorkerProtocol { events, .. },
                     ..
                 },
             ) = frame.payload
