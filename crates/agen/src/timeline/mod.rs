@@ -21,6 +21,7 @@ pub use event::*;
 pub use text_block_collector::TextBlockCollector;
 pub use thinking_block_collector::ThinkingBlockCollector;
 pub use timeline::Timeline;
+pub(crate) use tool_call_collector::CollectedToolCall;
 pub use tool_call_collector::ToolCallCollector;
 
 // 型定義からのre-export

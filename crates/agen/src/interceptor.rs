@@ -336,6 +336,14 @@ pub struct ToolResultInfo<'a, A = ()> {
 /// flows, permission checks, and other trusted host adaptation.
 #[async_trait]
 pub trait Interceptor<A: Send + Sync = ()>: Send + Sync {
+    /// Whether side effects may start before [`Self::on_assistant_turn_end`].
+    ///
+    /// The conservative default preserves the historical whole-response gate.
+    /// Interceptors that do not use turn-end policy may opt in explicitly.
+    fn supports_early_tool_dispatch(&self) -> bool {
+        false
+    }
+
     /// Called after receiving user input, before adding it to Engine history.
     async fn on_prompt_submit(
         &self,
@@ -420,4 +428,8 @@ pub trait Interceptor<A: Send + Sync = ()>: Send + Sync {
 pub(crate) struct DefaultInterceptor;
 
 #[async_trait]
-impl<A: Send + Sync> Interceptor<A> for DefaultInterceptor {}
+impl<A: Send + Sync> Interceptor<A> for DefaultInterceptor {
+    fn supports_early_tool_dispatch(&self) -> bool {
+        true
+    }
+}

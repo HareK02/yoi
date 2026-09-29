@@ -587,6 +587,20 @@ pub struct WorkerMeta {
     pub name: String,
 }
 
+/// When the engine may begin executing provider-confirmed tool calls.
+///
+/// `OnToolCallComplete` advances only the start time: calls may still overlap,
+/// so completion order and externally allocated identifiers are not ordered.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallDispatchMode {
+    /// Preserve the historical behavior: wait for the whole response stream.
+    #[default]
+    AfterResponse,
+    /// Start each call once the provider emits a trustworthy per-call completion.
+    OnToolCallComplete,
+}
+
 /// Worker-level configuration embedded in the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineManifest {
@@ -614,6 +628,9 @@ pub struct EngineManifest {
     pub stop_sequences: Vec<String>,
     #[serde(default)]
     pub reasoning: Option<ReasoningControl>,
+    /// Tool-call start timing. Omitted manifests preserve `after_response`.
+    #[serde(default)]
+    pub tool_call_dispatch: ToolCallDispatchMode,
     /// Byte-size caps applied to tool `content` before it reaches the
     /// conversation history. The section is optional in TOML — when
     /// omitted, `ToolOutputLimits::default()` (64 KiB default cap, no

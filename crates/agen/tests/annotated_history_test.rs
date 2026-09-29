@@ -36,6 +36,7 @@ async fn run_preserves_item_annotations_without_projecting_them() {
                 Role::Assistant => "assistant",
                 Role::System => "system",
             },
+            Item::AssistantResponseBoundary { .. } => "assistant_response_boundary",
             Item::ToolCall { .. } => "tool_call",
             Item::ToolResult { .. } => "tool_result",
             Item::Reasoning { .. } => "reasoning",

@@ -356,6 +356,7 @@ fn project_item(item: &LoggedItem) -> Option<SessionSnapshotEntryData> {
             call_id,
             name,
             arguments,
+            ..
         } => Some(SessionSnapshotEntryData::ToolCall {
             call_id: call_id.clone(),
             name: name.clone(),
@@ -385,8 +386,8 @@ fn project_item(item: &LoggedItem) -> Option<SessionSnapshotEntryData> {
                 })
                 .collect(),
         }),
-        // Hidden model reasoning is never observable.
-        LoggedItem::Reasoning { .. } => None,
+        // Internal response grouping and hidden model reasoning are never observable.
+        LoggedItem::AssistantResponseBoundary { .. } | LoggedItem::Reasoning { .. } => None,
     }
 }
 

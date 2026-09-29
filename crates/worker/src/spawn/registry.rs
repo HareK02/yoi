@@ -1371,6 +1371,9 @@ mod tests {
                             call_id: format!("call-{index}"),
                             name: name.to_string(),
                             arguments: "{}".to_string(),
+                            call_index: None,
+                            execution_id: None,
+                            status: None,
                         },
                     ),
                 });

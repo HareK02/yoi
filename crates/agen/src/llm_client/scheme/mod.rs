@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use super::auth::AuthRequirement;
 use super::capability::ModelCapability;
-use super::client::ConfigWarning;
+use super::client::{ConfigWarning, ToolCallCompletionSupport};
 use super::error::ClientError;
 use super::event::Event;
 use super::types::{Request, RequestConfig};
@@ -81,11 +81,42 @@ pub trait Scheme: Clone + Send + Sync + 'static {
     /// 高レベルの client 構築層の責務で、scheme はここには関与しない。
     fn default_capability(&self) -> ModelCapability;
 
+    /// Strongest safe completion boundary for streamed tool calls.
+    fn tool_call_completion_support(&self) -> ToolCallCompletionSupport {
+        ToolCallCompletionSupport::ResponseComplete
+    }
+
     /// scheme 側でサポートしていない `RequestConfig` フィールドを
     /// 警告として返す（例: OpenAI Chat は `top_k` 非対応）。
     /// デフォルトは空 Vec。
     fn validate_config(&self, config: &RequestConfig) -> Vec<ConfigWarning> {
         let _ = config;
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod completion_support_tests {
+    use super::*;
+    use crate::llm_client::ToolCallCompletionSupport;
+
+    #[test]
+    fn only_schemes_with_authoritative_per_call_done_events_enable_early_dispatch() {
+        assert_eq!(
+            anthropic::AnthropicScheme::new().tool_call_completion_support(),
+            ToolCallCompletionSupport::PerBlock
+        );
+        assert_eq!(
+            openai_responses::OpenAIResponsesScheme::new().tool_call_completion_support(),
+            ToolCallCompletionSupport::PerBlock
+        );
+        assert_eq!(
+            openai_chat::OpenAIScheme::new().tool_call_completion_support(),
+            ToolCallCompletionSupport::ResponseComplete
+        );
+        assert_eq!(
+            gemini::GeminiScheme::new().tool_call_completion_support(),
+            ToolCallCompletionSupport::ResponseComplete
+        );
     }
 }

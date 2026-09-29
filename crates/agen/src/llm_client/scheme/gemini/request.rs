@@ -242,6 +242,7 @@ impl GeminiScheme {
 
         for item in items {
             match item {
+                Item::AssistantResponseBoundary { .. } => {}
                 Item::Message { role, content, .. } => {
                     // Flush pending parts
                     self.flush_pending_parts(
