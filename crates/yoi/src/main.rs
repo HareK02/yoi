@@ -623,7 +623,7 @@ fn parse_workdir_args(
     let mut ttl = None;
     let mut read_only = false;
     let mut read_write = false;
-    let mut explicit_permissions: Option<server_api::ExternalWorkdirPermissions> = None;
+    let mut explicit_permission_level = None;
     let mut non_interactive = false;
     let mut index = 0;
     while index < args.len() {
@@ -668,29 +668,22 @@ fn parse_workdir_args(
                 index += 2;
             }
             "--permission" => {
-                let category = required_option_value(args, index, "--permission")?;
-                let permissions =
-                    explicit_permissions.get_or_insert(server_api::ExternalWorkdirPermissions {
-                        read: false,
-                        write: false,
-                        command: false,
-                    });
-                let enabled = match category.to_ascii_lowercase().as_str() {
-                    "read" => &mut permissions.read,
-                    "write" => &mut permissions.write,
-                    "command" => &mut permissions.command,
+                let level = required_option_value(args, index, "--permission")?;
+                if explicit_permission_level.is_some() {
+                    return Err(ParseError(
+                        "--permission selects one level and may only be provided once".to_string(),
+                    ));
+                }
+                explicit_permission_level = Some(match level.to_ascii_lowercase().as_str() {
+                    "read" => server_api::ExternalWorkdirPermissionLevel::Read,
+                    "write" => server_api::ExternalWorkdirPermissionLevel::Write,
+                    "command" => server_api::ExternalWorkdirPermissionLevel::Command,
                     _ => {
                         return Err(ParseError(format!(
-                            "unknown --permission category `{category}`; expected read, write, or command"
+                            "unknown --permission level `{level}`; expected read, write, or command"
                         )));
                     }
-                };
-                if *enabled {
-                    return Err(ParseError(format!(
-                        "--permission {category} may only be provided once"
-                    )));
-                }
-                *enabled = true;
+                });
                 index += 2;
             }
             "--read-only" => {
@@ -742,21 +735,18 @@ fn parse_workdir_args(
             "--read-only conflicts with --read-write".to_string(),
         ));
     }
-    if explicit_permissions.is_some() && (read_only || read_write) {
+    if explicit_permission_level.is_some() && (read_only || read_write) {
         return Err(ParseError(
             "--permission conflicts with legacy --read-only/--read-write".to_string(),
         ));
     }
-    let permissions = explicit_permissions.unwrap_or(server_api::ExternalWorkdirPermissions {
-        read: true,
-        write: read_write,
-        command: false,
-    });
-    if permissions.write && !permissions.read {
-        return Err(ParseError(
-            "--permission write requires --permission read for read-before-write".to_string(),
-        ));
-    }
+    let permissions = explicit_permission_level
+        .map(server_api::ExternalWorkdirPermissionLevel::permissions)
+        .unwrap_or(if read_write {
+            server_api::ExternalWorkdirPermissions::WRITE
+        } else {
+            server_api::ExternalWorkdirPermissions::READ
+        });
     if non_interactive && workspace_id.is_none() {
         return Err(ParseError(
             "--non-interactive requires --workspace-id".to_string(),
@@ -1900,7 +1890,7 @@ Usage:
   yoi --backend <URL> [--workspace-id <ID>] panel
   yoi [--backend <URL>] init --display-name <NAME> --repository-key <KEY> [--repository <PATH>] [--default-ref <REF>]
   yoi [--backend <URL>] login [--no-wait]
-  yoi [--backend <URL>] workdir share <PATH> [--workspace-id <ID>] [--permission <read|write|command>]... [--read-only|--read-write] [--ttl <TTL>] [--display-name <NAME>] [--non-interactive]
+  yoi [--backend <URL>] workdir share <PATH> [--workspace-id <ID>] [--permission <read|write|command>] [--read-only|--read-write] [--ttl <TTL>] [--display-name <NAME>] [--non-interactive]
   yoi <HOST_COMMAND> [OPTIONS]
 
 Target selection:
@@ -1946,7 +1936,7 @@ Options:
 
 fn print_workdir_help() {
     println!(
-        "yoi workdir share\n\nUsage:\n  yoi [--backend <URL>] workdir share <PATH> [OPTIONS]\n\nThe foreground CLI provides one local directory over an authenticated outbound Backend connection.\nInteractive mode is the default: choose an accessible Workspace, READ/WRITE/COMMAND categories, and TTL, then explicitly confirm before any grant is created.\nREAD enables Read/Glob/Grep and related observation operations. WRITE enables Write/Edit and requires READ for read-before-write. COMMAND is independent, disabled by default, and runs with the sharing CLI user's host authority; it is not sandboxed.\nRepeat --permission to choose explicit categories in automation. Legacy --read-only and --read-write remain file-only aliases and conflict with --permission.\nOmitting --ttl means unlimited automatic lifetime, but stop, disconnect, Ctrl-C, and revoke still fail closed. TTL accepts s, m, or h suffixes from 60s through 24h.\nNo host path is sent to the Backend. Ctrl-C explicitly revokes the grant before exit.\n\nOptions:\n      --workspace-id <ID>  Preselect a Workspace; required with --non-interactive\n      --permission <CATEGORY>  Enable read, write, or command; repeat per category\n      --read-only          Legacy alias for --permission read\n      --read-write         Legacy alias for read + write (commands remain disabled)\n      --ttl <TTL>          Automatic expiry; omission is unlimited\n      --display-name <NAME>  Backend-visible label (default: External Workdir)\n      --non-interactive    Never prompt; requires --workspace-id\n  -h, --help               Print help\n"
+        "yoi workdir share\n\nUsage:\n  yoi [--backend <URL>] workdir share <PATH> [OPTIONS]\n\nThe foreground CLI provides one local directory over an authenticated outbound Backend connection.\nInteractive mode is the default: choose an accessible Workspace, one READ/WRITE/COMMAND permission level, and TTL, then explicitly confirm before any grant is created.\nREAD enables Read/Glob/Grep and related observation operations. WRITE includes READ and adds Write/Edit. COMMAND includes WRITE and READ, adds command start/status/output/cancel, and runs with the sharing CLI user's host authority; it is not sandboxed.\nUse --permission once to choose the level in automation. Legacy --read-only and --read-write retain the READ and WRITE meanings and conflict with --permission.\nOmitting --ttl means unlimited automatic lifetime, but stop, disconnect, Ctrl-C, and revoke still fail closed. TTL accepts s, m, or h suffixes from 60s through 24h.\nNo host path is sent to the Backend. Ctrl-C explicitly revokes the grant before exit.\n\nOptions:\n      --workspace-id <ID>  Preselect a Workspace; required with --non-interactive\n      --permission <LEVEL>  Grant read, write (includes read), or command (includes write + read)\n      --read-only          Legacy alias for --permission read\n      --read-write         Legacy alias for --permission write\n      --ttl <TTL>          Automatic expiry; omission is unlimited\n      --display-name <NAME>  Backend-visible label (default: External Workdir)\n      --non-interactive    Never prompt; requires --workspace-id\n  -h, --help               Print help\n"
     );
 }
 
@@ -2038,7 +2028,7 @@ mod tests {
     }
 
     #[test]
-    fn workdir_share_parses_independent_command_permission() {
+    fn workdir_share_parses_command_as_the_full_hierarchical_level() {
         let args = vec![
             "share".to_string(),
             ".".to_string(),
@@ -2056,11 +2046,7 @@ mod tests {
         };
         assert_eq!(
             options.permissions,
-            server_api::ExternalWorkdirPermissions {
-                read: false,
-                write: false,
-                command: true,
-            }
+            server_api::ExternalWorkdirPermissions::COMMAND
         );
     }
 
@@ -2131,17 +2117,19 @@ mod tests {
                 .contains("conflicts")
         );
 
-        let write_without_read = vec![
+        let multiple_levels = vec![
             "share".to_string(),
             ".".to_string(),
             "--permission".to_string(),
             "write".to_string(),
+            "--permission".to_string(),
+            "command".to_string(),
         ];
         assert!(
-            parse_workdir_args(&write_without_read, &target)
+            parse_workdir_args(&multiple_levels, &target)
                 .unwrap_err()
                 .0
-                .contains("requires --permission read")
+                .contains("selects one level")
         );
 
         let missing_workspace = TargetSelection {

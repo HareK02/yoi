@@ -3905,72 +3905,47 @@ struct ValidatedTicketImplementationTarget {
 }
 
 fn external_workdir_permissions(persisted: &str) -> Result<server_api::ExternalWorkdirPermissions> {
-    let permissions = match persisted {
-        "read_only" => server_api::ExternalWorkdirPermissions {
-            read: true,
-            write: false,
-            command: false,
-        },
-        "read_write" => server_api::ExternalWorkdirPermissions {
-            read: true,
-            write: true,
-            command: false,
-        },
-        "command_only" => server_api::ExternalWorkdirPermissions {
-            read: false,
-            write: false,
-            command: true,
-        },
-        "read_command" => server_api::ExternalWorkdirPermissions {
-            read: true,
-            write: false,
-            command: true,
-        },
-        "read_write_command" => server_api::ExternalWorkdirPermissions {
-            read: true,
-            write: true,
-            command: true,
-        },
-        _ => {
-            return Err(Error::Store(
-                "External Workdir grant has invalid persisted permissions".to_string(),
-            ));
-        }
-    };
-    Ok(permissions)
+    match persisted {
+        "read_only" => Ok(server_api::ExternalWorkdirPermissions::READ),
+        "read_write" => Ok(server_api::ExternalWorkdirPermissions::WRITE),
+        "read_write_command" => Ok(server_api::ExternalWorkdirPermissions::COMMAND),
+        "command_only" | "read_command" => Err(Error::InvalidInput(
+            "External Workdir grant uses a legacy non-hierarchical permission combination; revoke it and share the directory again with READ, WRITE, or COMMAND"
+                .to_string(),
+        )),
+        _ => Err(Error::Store(
+            "External Workdir grant has invalid persisted permissions".to_string(),
+        )),
+    }
 }
 
 fn persist_external_workdir_permissions(
     permissions: server_api::ExternalWorkdirPermissions,
 ) -> Result<&'static str> {
-    match (permissions.read, permissions.write, permissions.command) {
-        (true, false, false) => Ok("read_only"),
-        (true, true, false) => Ok("read_write"),
-        (false, false, true) => Ok("command_only"),
-        (true, false, true) => Ok("read_command"),
-        (true, true, true) => Ok("read_write_command"),
-        (false, true, _) => Err(Error::InvalidInput(
-            "External Workdir WRITE permission requires READ for read-before-write".to_string(),
-        )),
-        (false, false, false) => Err(Error::InvalidInput(
-            "External Workdir sharing requires at least one of READ or COMMAND".to_string(),
+    match permissions.grant_level() {
+        Some(server_api::ExternalWorkdirPermissionLevel::Read) => Ok("read_only"),
+        Some(server_api::ExternalWorkdirPermissionLevel::Write) => Ok("read_write"),
+        Some(server_api::ExternalWorkdirPermissionLevel::Command) => Ok("read_write_command"),
+        None => Err(Error::InvalidInput(
+            "External Workdir permissions must select exactly one level: READ=(true,false,false), WRITE=(true,true,false), or COMMAND=(true,true,true)"
+                .to_string(),
         )),
     }
 }
 
 fn external_workdir_capabilities(permissions: &str) -> Result<workdir::WorkdirSessionCapabilities> {
-    let permissions = external_workdir_permissions(permissions)?;
-    let mut capabilities = workdir::WorkdirSessionCapabilities::EMPTY;
-    if permissions.read {
-        capabilities = capabilities.union(workdir::WorkdirSessionCapabilities::READ_ONLY);
+    match external_workdir_permissions(permissions)?.grant_level() {
+        Some(server_api::ExternalWorkdirPermissionLevel::Read) => {
+            Ok(workdir::WorkdirSessionCapabilities::READ_ONLY)
+        }
+        Some(server_api::ExternalWorkdirPermissionLevel::Write) => {
+            Ok(workdir::WorkdirSessionCapabilities::READ_WRITE)
+        }
+        Some(server_api::ExternalWorkdirPermissionLevel::Command) => {
+            Ok(workdir::WorkdirSessionCapabilities::ALL)
+        }
+        None => unreachable!("persisted External grant permissions were already validated"),
     }
-    if permissions.write {
-        capabilities = capabilities.union(workdir::WorkdirSessionCapabilities::WRITE_ONLY);
-    }
-    if permissions.command {
-        capabilities = capabilities.union(workdir::WorkdirSessionCapabilities::COMMAND_ONLY);
-    }
-    Ok(capabilities)
 }
 
 fn workdir_permission_summary(
@@ -26480,36 +26455,49 @@ mod tests {
     };
 
     #[test]
-    fn external_permission_categories_map_to_existing_capability_bits_without_escalation() {
+    fn external_permission_levels_map_to_existing_bits_and_reject_legacy_partial_grants() {
+        let bits = |capabilities| {
+            serde_json::to_value(capabilities).unwrap()["bits"]
+                .as_u64()
+                .unwrap()
+        };
         assert_eq!(
-            external_workdir_capabilities("read_only").unwrap(),
-            workdir::WorkdirSessionCapabilities::READ_ONLY
+            bits(external_workdir_capabilities("read_only").unwrap()),
+            25
         );
         assert_eq!(
-            external_workdir_capabilities("read_write").unwrap(),
-            workdir::WorkdirSessionCapabilities::READ_WRITE
+            bits(external_workdir_capabilities("read_write").unwrap()),
+            31
         );
         assert_eq!(
-            external_workdir_capabilities("command_only").unwrap(),
-            workdir::WorkdirSessionCapabilities::COMMAND_ONLY
+            bits(external_workdir_capabilities("read_write_command").unwrap()),
+            63
         );
-        assert_eq!(
-            external_workdir_capabilities("read_command").unwrap(),
-            workdir::WorkdirSessionCapabilities::READ_ONLY
-                .union(workdir::WorkdirSessionCapabilities::COMMAND_ONLY)
-        );
-        assert_eq!(
-            external_workdir_capabilities("read_write_command").unwrap(),
-            workdir::WorkdirSessionCapabilities::ALL
-        );
-        assert!(
-            persist_external_workdir_permissions(server_api::ExternalWorkdirPermissions {
+
+        for legacy in ["command_only", "read_command"] {
+            let error = external_workdir_capabilities(legacy).unwrap_err();
+            assert!(error.to_string().contains("revoke it and share"));
+        }
+        for invalid in [
+            server_api::ExternalWorkdirPermissions {
+                read: false,
+                write: false,
+                command: true,
+            },
+            server_api::ExternalWorkdirPermissions {
                 read: false,
                 write: true,
                 command: false,
-            })
-            .is_err()
-        );
+            },
+            server_api::ExternalWorkdirPermissions {
+                read: true,
+                write: false,
+                command: true,
+            },
+        ] {
+            let error = persist_external_workdir_permissions(invalid).unwrap_err();
+            assert!(error.to_string().contains("exactly one level"));
+        }
     }
 
     #[test]
@@ -26736,7 +26724,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_provider_command_only_session_denies_read_and_routes_bounded_lifecycle() {
+    async fn external_provider_write_level_denies_command_without_provider_fallback() {
+        let (sender, mut commands) = tokio::sync::mpsc::channel(1);
+        let connection = Arc::new(ExternalProviderConnection {
+            grant_id: "grant-write".to_string(),
+            workdir_id: "external-write".to_string(),
+            provider_instance_id: "provider-write".to_string(),
+            generation: 1,
+            expires_at: None,
+            capabilities: workdir::WorkdirSessionCapabilities::READ_WRITE,
+            admission: Arc::new(tokio::sync::Semaphore::new(16)),
+            shutdown_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sender,
+        });
+        let session = ExternalProviderWorkdirSession::new(connection, None);
+        let denied = session
+            .start_command(workdir::CommandRequest {
+                command: "printf forbidden".to_string(),
+                timeout_secs: 30,
+                output_limit: 1024,
+                cwd: workdir::WorkdirPath::root(),
+                spill_dir: None,
+                tool_call_id: None,
+            })
+            .await;
+        assert!(matches!(
+            denied,
+            Err(workdir::WorkdirError::Unsupported(
+                workdir::WorkdirSessionCapability::Command
+            ))
+        ));
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn external_provider_partial_session_capabilities_remain_supported() {
         let (sender, mut commands) = tokio::sync::mpsc::channel(4);
         let capabilities = workdir::WorkdirSessionCapabilities::COMMAND_ONLY;
         let connection = Arc::new(ExternalProviderConnection {
@@ -27446,6 +27468,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn external_grant_api_persists_only_hierarchical_levels_with_exact_bits() {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let api = test_api(dir.path()).await;
+        let levels = [
+            (
+                server_api::ExternalWorkdirPermissions::READ,
+                "read_only",
+                25,
+            ),
+            (
+                server_api::ExternalWorkdirPermissions::WRITE,
+                "read_write",
+                31,
+            ),
+            (
+                server_api::ExternalWorkdirPermissions::COMMAND,
+                "read_write_command",
+                63,
+            ),
+        ];
+        for (index, (permissions, persisted, expected_bits)) in levels.into_iter().enumerate() {
+            let (_, Json(grant)) = scoped_create_external_workdir_grant(
+                State(api.clone()),
+                AxumPath(ScopedWorkspacePath {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                }),
+                Extension(test_browser_request_actor()),
+                Json(ExternalWorkdirGrantCreateRequest {
+                    provider_instance_id: format!("provider-{index}"),
+                    display_name: format!("Level {index}"),
+                    ttl_seconds: None,
+                    permissions,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(grant.permissions, permissions);
+            let stored = api
+                .store
+                .get_external_workdir_grant(TEST_WORKSPACE_ID, &grant.grant_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.permissions, persisted);
+            let bits =
+                serde_json::to_value(external_workdir_capabilities(&stored.permissions).unwrap())
+                    .unwrap()["bits"]
+                    .as_u64()
+                    .unwrap();
+            assert_eq!(bits, expected_bits);
+        }
+
+        for (index, permissions) in [
+            server_api::ExternalWorkdirPermissions {
+                read: false,
+                write: false,
+                command: true,
+            },
+            server_api::ExternalWorkdirPermissions {
+                read: false,
+                write: true,
+                command: false,
+            },
+            server_api::ExternalWorkdirPermissions {
+                read: true,
+                write: false,
+                command: true,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let error = scoped_create_external_workdir_grant(
+                State(api.clone()),
+                AxumPath(ScopedWorkspacePath {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                }),
+                Extension(test_browser_request_actor()),
+                Json(ExternalWorkdirGrantCreateRequest {
+                    provider_instance_id: format!("invalid-provider-{index}"),
+                    display_name: format!("Invalid {index}"),
+                    ttl_seconds: None,
+                    permissions,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.error.to_string().contains("exactly one level"));
+        }
+        assert_eq!(
+            api.store
+                .list_external_workdir_grants(TEST_WORKSPACE_ID)
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[tokio::test]
     async fn external_workdirs_are_launchable_with_real_multiple_attachments() {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
@@ -27460,15 +27581,11 @@ mod tests {
 
         for index in 1..=2 {
             let (permissions, capabilities) = if index == 1 {
-                (
-                    "command_only",
-                    workdir::WorkdirSessionCapabilities::COMMAND_ONLY,
-                )
+                ("read_only", workdir::WorkdirSessionCapabilities::READ_ONLY)
             } else {
                 (
-                    "read_command",
-                    workdir::WorkdirSessionCapabilities::READ_ONLY
-                        .union(workdir::WorkdirSessionCapabilities::COMMAND_ONLY),
+                    "read_write_command",
+                    workdir::WorkdirSessionCapabilities::ALL,
                 )
             };
             let grant = ExternalWorkdirGrantRecord {
@@ -27557,17 +27674,9 @@ mod tests {
                 .find(|summary| summary.working_directory_id == *workdir_id)
                 .unwrap();
             let expected_permissions = if index == 0 {
-                server_api::ExternalWorkdirPermissions {
-                    read: false,
-                    write: false,
-                    command: true,
-                }
+                server_api::ExternalWorkdirPermissions::READ
             } else {
-                server_api::ExternalWorkdirPermissions {
-                    read: true,
-                    write: false,
-                    command: true,
-                }
+                server_api::ExternalWorkdirPermissions::COMMAND
             };
             assert!(matches!(
                 &summary.source,
@@ -27628,10 +27737,9 @@ mod tests {
             .unwrap();
         for (index, receiver) in receivers.iter_mut().enumerate() {
             let expected_capabilities = if index == 0 {
-                workdir::WorkdirSessionCapabilities::COMMAND_ONLY
-            } else {
                 workdir::WorkdirSessionCapabilities::READ_ONLY
-                    .union(workdir::WorkdirSessionCapabilities::COMMAND_ONLY)
+            } else {
+                workdir::WorkdirSessionCapabilities::ALL
             };
             let link = links
                 .iter()
@@ -27658,20 +27766,37 @@ mod tests {
             drop(session_guard);
             assert_eq!(session.capabilities(), expected_capabilities);
             if index == 0 {
-                let denied = session
-                    .read(workdir::ReadRequest {
+                let denied_write = session
+                    .write(workdir::WriteRequest {
                         path: workdir::WorkdirPath::new("forbidden.txt").unwrap(),
-                        offset: 0,
-                        limit: 1,
-                        max_bytes: 1,
+                        content: b"no fallback".to_vec(),
+                        expected_hash: None,
                     })
                     .await;
                 assert!(matches!(
-                    denied,
+                    denied_write,
                     Err(workdir::WorkdirError::Unsupported(
-                        workdir::WorkdirSessionCapability::Read
+                        workdir::WorkdirSessionCapability::Write
                     )) | Err(workdir::WorkdirError::Denied(_))
                 ));
+                let denied_command = session
+                    .start_command(workdir::CommandRequest {
+                        command: "printf forbidden".to_string(),
+                        timeout_secs: 30,
+                        output_limit: 1024,
+                        cwd: workdir::WorkdirPath::root(),
+                        spill_dir: None,
+                        tool_call_id: None,
+                    })
+                    .await;
+                assert!(matches!(
+                    denied_command,
+                    Err(workdir::WorkdirError::Unsupported(
+                        workdir::WorkdirSessionCapability::Command
+                    )) | Err(workdir::WorkdirError::Denied(_))
+                ));
+                assert!(receiver.try_recv().is_err());
+                continue;
             }
 
             let mut starter = {

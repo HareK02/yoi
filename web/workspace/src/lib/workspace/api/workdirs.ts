@@ -182,7 +182,9 @@ function parseWorkingDirectorySource(value: unknown): WorkingDirectorySource {
   );
   const kind = stringField(source, "kind");
   if (kind === "repository") {
-    if (source.grant_id !== undefined || source.grant_permissions !== undefined) {
+    if (
+      source.grant_id !== undefined || source.grant_permissions !== undefined
+    ) {
       throw new Error(
         "Repository Workdir source must not contain External grant authority",
       );
@@ -201,7 +203,7 @@ function parseWorkingDirectorySource(value: unknown): WorkingDirectorySource {
     return {
       kind,
       grant_id: stringField(source, "grant_id"),
-      grant_permissions: parseExternalWorkdirPermissions(
+      grant_permissions: parseExternalWorkdirGrantPermissions(
         source.grant_permissions,
         "External Workdir grant permissions",
       ),
@@ -224,6 +226,21 @@ export function parseExternalWorkdirPermissions(
     write: booleanField(permissions, "write", label),
     command: booleanField(permissions, "command", label),
   };
+}
+
+export function parseExternalWorkdirGrantPermissions(
+  value: unknown,
+  label = "External Workdir grant permissions",
+): ExternalWorkdirPermissions {
+  const permissions = parseExternalWorkdirPermissions(value, label);
+  const hierarchical = permissions.read &&
+    (!permissions.command || permissions.write);
+  if (!hierarchical) {
+    throw new Error(
+      `${label} must be READ=(true,false,false), WRITE=(true,true,false), or COMMAND=(true,true,true)`,
+    );
+  }
+  return permissions;
 }
 
 function parseCleanupTarget(value: unknown): WorkingDirectoryCleanupTarget {

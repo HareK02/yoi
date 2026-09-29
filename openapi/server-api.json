@@ -2092,15 +2092,15 @@
         "additionalProperties": false,
         "properties": {
           "command": {
-            "description": "Execute commands as the sharing CLI user on the provider host. This is\nexplicit authority and does not imply either filesystem category.",
+            "description": "Execute commands as the sharing CLI user on the provider host. COMMAND\nincludes WRITE and READ, remains explicit, and is not sandboxed.",
             "type": "boolean"
           },
           "read": {
-            "description": "Read files and use read-only discovery operations such as Glob and Grep.",
+            "description": "Read files and use read-only discovery operations such as Glob and Grep.\nEvery supported External Workdir permission level enables this field.",
             "type": "boolean"
           },
           "write": {
-            "description": "Create or update files with Write and Edit. Existing-file mutation also\nrequires `read` so callers can satisfy the read-before-write contract.",
+            "description": "Create or update files with Write and Edit. WRITE includes READ so callers\ncan satisfy the read-before-write contract.",
             "type": "boolean"
           }
         },
@@ -14020,7 +14020,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:3a298734fd19f3a224e4f1503385fb8a823b612d328224f45f677ebaca28b96c"
+    "x-yoi-source-digest": "sha256:7b06d005d3436758c96fc4cfd462df76460f89620fd1b58fdf05009d96bb9052"
   },
   "openapi": "3.1.0",
   "paths": {

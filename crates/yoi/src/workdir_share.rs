@@ -140,29 +140,23 @@ fn authenticated_server_api_client(
     Ok(ServerApiClient::with_client(base_url, http_client))
 }
 
-fn permissions_label(permissions: server_api::ExternalWorkdirPermissions) -> String {
-    let mut enabled = Vec::new();
-    if permissions.read {
-        enabled.push("READ");
+fn permissions_label(permissions: server_api::ExternalWorkdirPermissions) -> &'static str {
+    match permissions.grant_level() {
+        Some(server_api::ExternalWorkdirPermissionLevel::Read) => "READ",
+        Some(server_api::ExternalWorkdirPermissionLevel::Write) => "WRITE (includes READ)",
+        Some(server_api::ExternalWorkdirPermissionLevel::Command) => {
+            "COMMAND (includes WRITE + READ)"
+        }
+        None => "INVALID",
     }
-    if permissions.write {
-        enabled.push("WRITE");
-    }
-    if permissions.command {
-        enabled.push("COMMAND");
-    }
-    enabled.join(", ")
 }
 
 fn validate_permissions(permissions: server_api::ExternalWorkdirPermissions) -> Result<(), String> {
-    if permissions.write && !permissions.read {
+    if permissions.grant_level().is_none() {
         return Err(
-            "WRITE requires READ so existing files can satisfy read-before-write; select both categories"
+            "select exactly one permission level: READ, WRITE (includes READ), or COMMAND (includes WRITE + READ)"
                 .to_string(),
         );
-    }
-    if !permissions.read && !permissions.command {
-        return Err("select at least one of READ or COMMAND".to_string());
     }
     Ok(())
 }
@@ -170,17 +164,18 @@ fn validate_permissions(permissions: server_api::ExternalWorkdirPermissions) -> 
 fn workdir_capabilities(
     permissions: server_api::ExternalWorkdirPermissions,
 ) -> workdir::WorkdirSessionCapabilities {
-    let mut capabilities = workdir::WorkdirSessionCapabilities::EMPTY;
-    if permissions.read {
-        capabilities = capabilities.union(workdir::WorkdirSessionCapabilities::READ_ONLY);
+    match permissions.grant_level() {
+        Some(server_api::ExternalWorkdirPermissionLevel::Read) => {
+            workdir::WorkdirSessionCapabilities::READ_ONLY
+        }
+        Some(server_api::ExternalWorkdirPermissionLevel::Write) => {
+            workdir::WorkdirSessionCapabilities::READ_WRITE
+        }
+        Some(server_api::ExternalWorkdirPermissionLevel::Command) => {
+            workdir::WorkdirSessionCapabilities::ALL
+        }
+        None => workdir::WorkdirSessionCapabilities::EMPTY,
     }
-    if permissions.write {
-        capabilities = capabilities.union(workdir::WorkdirSessionCapabilities::WRITE_ONLY);
-    }
-    if permissions.command {
-        capabilities = capabilities.union(workdir::WorkdirSessionCapabilities::COMMAND_ONLY);
-    }
-    capabilities
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,14 +297,14 @@ fn configure_interactively(
 
     writeln!(
         output,
-        "Permissions are independent categories: READ (Read/Glob/Grep), WRITE (Write/Edit), and COMMAND (host command lifecycle). WRITE requires READ for read-before-write. COMMAND runs with this CLI user's host authority and is not sandboxed."
+        "Permission levels: READ (Read/Glob/Grep), WRITE (includes READ + Write/Edit), or COMMAND (includes WRITE + READ + host command lifecycle). COMMAND runs with this CLI user's host authority and is not sandboxed."
     )
     .map_err(|error| format!("failed to write prompt: {error}"))?;
     let Some(permission_input) = read_prompt_line(
         input,
         output,
         &format!(
-            "Permissions [comma-separated READ/WRITE/COMMAND; current {}; q to cancel]: ",
+            "Permission level [READ/WRITE/COMMAND; current {}; q to cancel]: ",
             permissions_label(options.permissions)
         ),
     )?
@@ -320,28 +315,20 @@ fn configure_interactively(
         return Ok(None);
     }
     if !permission_input.is_empty() {
-        let mut permissions = server_api::ExternalWorkdirPermissions {
-            read: false,
-            write: false,
-            command: false,
-        };
-        for category in permission_input
-            .split([',', ' '])
-            .filter(|category| !category.is_empty())
-        {
-            match category.to_ascii_lowercase().as_str() {
-                "r" | "read" | "read-only" | "read_only" => permissions.read = true,
-                "w" | "write" | "read-write" | "read_write" => permissions.write = true,
-                "c" | "command" => permissions.command = true,
-                _ => {
-                    return Err(format!(
-                        "unknown permission category `{category}`; use READ, WRITE, or COMMAND"
-                    ));
-                }
+        options.permissions = match permission_input.to_ascii_lowercase().as_str() {
+            "r" | "read" | "read-only" | "read_only" => {
+                server_api::ExternalWorkdirPermissions::READ
             }
-        }
-        validate_permissions(permissions)?;
-        options.permissions = permissions;
+            "w" | "write" | "read-write" | "read_write" => {
+                server_api::ExternalWorkdirPermissions::WRITE
+            }
+            "c" | "command" => server_api::ExternalWorkdirPermissions::COMMAND,
+            _ => {
+                return Err(format!(
+                    "unknown permission level `{permission_input}`; use READ, WRITE, or COMMAND"
+                ));
+            }
+        };
     }
 
     writeln!(output, "TTL: {}", ttl_label(options.ttl))
@@ -1085,12 +1072,12 @@ mod tests {
     }
 
     #[test]
-    fn interactive_share_requires_explicit_write_and_command_selection_and_confirmation() {
+    fn interactive_share_selects_one_hierarchical_level_and_requires_confirmation() {
         let workspaces = [
             workspace("workspace-a", "Alpha"),
             workspace("workspace-b", "Beta"),
         ];
-        let mut input = std::io::Cursor::new(b"2\nREAD,WRITE,COMMAND\n15m\ny\n".to_vec());
+        let mut input = std::io::Cursor::new(b"2\nCOMMAND\n15m\ny\n".to_vec());
         let mut output = Vec::new();
 
         let selected =
@@ -1110,7 +1097,39 @@ mod tests {
         assert_eq!(selected.ttl, Some(Duration::from_secs(900)));
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("not sandboxed"));
-        assert!(output.contains("Permissions: READ, WRITE, COMMAND"));
+        assert!(output.contains("Permissions: COMMAND (includes WRITE + READ)"));
+    }
+
+    #[test]
+    fn share_permission_levels_map_to_exact_existing_capability_bits() {
+        let bits = |permissions| {
+            serde_json::to_value(workdir_capabilities(permissions)).unwrap()["bits"]
+                .as_u64()
+                .unwrap()
+        };
+        assert_eq!(bits(server_api::ExternalWorkdirPermissions::READ), 25);
+        assert_eq!(bits(server_api::ExternalWorkdirPermissions::WRITE), 31);
+        assert_eq!(bits(server_api::ExternalWorkdirPermissions::COMMAND), 63);
+
+        for invalid in [
+            server_api::ExternalWorkdirPermissions {
+                read: false,
+                write: false,
+                command: true,
+            },
+            server_api::ExternalWorkdirPermissions {
+                read: false,
+                write: true,
+                command: false,
+            },
+            server_api::ExternalWorkdirPermissions {
+                read: true,
+                write: false,
+                command: true,
+            },
+        ] {
+            assert!(validate_permissions(invalid).is_err());
+        }
     }
 
     #[test]

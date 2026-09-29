@@ -5262,27 +5262,71 @@ impl From<workdir::workspace::WorkingDirectorySummary> for WorkingDirectorySumma
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalWorkdirPermissionLevel {
+    Read,
+    Write,
+    Command,
+}
+
+impl ExternalWorkdirPermissionLevel {
+    pub const fn permissions(self) -> ExternalWorkdirPermissions {
+        match self {
+            Self::Read => ExternalWorkdirPermissions::READ,
+            Self::Write => ExternalWorkdirPermissions::WRITE,
+            Self::Command => ExternalWorkdirPermissions::COMMAND,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct ExternalWorkdirPermissions {
     /// Read files and use read-only discovery operations such as Glob and Grep.
+    /// Every supported External Workdir permission level enables this field.
     pub read: bool,
-    /// Create or update files with Write and Edit. Existing-file mutation also
-    /// requires `read` so callers can satisfy the read-before-write contract.
+    /// Create or update files with Write and Edit. WRITE includes READ so callers
+    /// can satisfy the read-before-write contract.
     pub write: bool,
-    /// Execute commands as the sharing CLI user on the provider host. This is
-    /// explicit authority and does not imply either filesystem category.
+    /// Execute commands as the sharing CLI user on the provider host. COMMAND
+    /// includes WRITE and READ, remains explicit, and is not sandboxed.
     pub command: bool,
+}
+
+impl ExternalWorkdirPermissions {
+    pub const READ: Self = Self {
+        read: true,
+        write: false,
+        command: false,
+    };
+    pub const WRITE: Self = Self {
+        read: true,
+        write: true,
+        command: false,
+    };
+    pub const COMMAND: Self = Self {
+        read: true,
+        write: true,
+        command: true,
+    };
+
+    /// Returns the single hierarchical level represented by a grant permission
+    /// object. Partial combinations remain valid for attachment/session
+    /// projections, but are not valid authority for creating an External grant.
+    pub const fn grant_level(self) -> Option<ExternalWorkdirPermissionLevel> {
+        match (self.read, self.write, self.command) {
+            (true, false, false) => Some(ExternalWorkdirPermissionLevel::Read),
+            (true, true, false) => Some(ExternalWorkdirPermissionLevel::Write),
+            (true, true, true) => Some(ExternalWorkdirPermissionLevel::Command),
+            _ => None,
+        }
+    }
 }
 
 impl Default for ExternalWorkdirPermissions {
     fn default() -> Self {
-        Self {
-            read: true,
-            write: false,
-            command: false,
-        }
+        Self::READ
     }
 }
 
