@@ -16,6 +16,7 @@ use crate::server::{
 };
 
 const OUTBOUND_CAPACITY: usize = 256;
+const WORKER_PROTOCOL_SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 struct ActiveSubscription {
     task: tokio::task::JoinHandle<()>,
@@ -225,6 +226,41 @@ async fn run_worker_protocol(
     control_outbound: mpsc::Sender<WsMessage>,
     protocol_outbound: mpsc::Sender<WsMessage>,
 ) {
+    let initial_event_result =
+        tokio::time::timeout(WORKER_PROTOCOL_SNAPSHOT_TIMEOUT, events.recv()).await;
+    let initial_event = match initial_event_result {
+        Ok(Some(event @ protocol::Event::Snapshot { .. })) => event,
+        Ok(Some(_)) => {
+            let _ = send_rejected(
+                &control_outbound,
+                request_id,
+                SubscriptionRejectionCode::Internal,
+                "Worker protocol did not begin with a session snapshot".to_string(),
+            )
+            .await;
+            return;
+        }
+        Ok(None) => {
+            let _ = send_rejected(
+                &control_outbound,
+                request_id,
+                SubscriptionRejectionCode::ResourceNotFound,
+                "Worker protocol closed before the session snapshot".to_string(),
+            )
+            .await;
+            return;
+        }
+        Err(_) => {
+            let _ = send_rejected(
+                &control_outbound,
+                request_id,
+                SubscriptionRejectionCode::Internal,
+                "Timed out waiting for the Worker protocol session snapshot".to_string(),
+            )
+            .await;
+            return;
+        }
+    };
     if send_frame(
         &control_outbound,
         SubscriptionFrame::new(SubscriptionFramePayload::Response(
@@ -238,7 +274,7 @@ async fn run_worker_protocol(
                 snapshot_revision: 0,
                 snapshot: SubscriptionSnapshot::WorkerProtocol {
                     worker_id: worker_id.clone(),
-                    events: Vec::new(),
+                    events: vec![initial_event],
                 },
             },
         )),
@@ -539,4 +575,78 @@ async fn send_frame(
         ))
         .await
         .map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request_id() -> protocol::subscription::SubscriptionRequestId {
+        protocol::subscription::SubscriptionRequestId::new("request-1").unwrap()
+    }
+
+    fn subscription_id() -> SubscriptionId {
+        SubscriptionId::new("subscription-1").unwrap()
+    }
+
+    fn worker_id() -> protocol::subscription::SubscriptionWorkerId {
+        protocol::subscription::SubscriptionWorkerId::new("worker-1").unwrap()
+    }
+
+    async fn run_with_events(events: mpsc::Receiver<protocol::Event>) -> SubscriptionResponse {
+        let (control_outbound, mut control_receiver) = mpsc::channel(1);
+        let (protocol_outbound, _protocol_receiver) = mpsc::channel(1);
+        run_worker_protocol(
+            request_id(),
+            subscription_id(),
+            "runtime-1".to_string(),
+            worker_id(),
+            events,
+            control_outbound,
+            protocol_outbound,
+        )
+        .await;
+        let WsMessage::Text(text) = control_receiver.recv().await.unwrap() else {
+            panic!("expected text response");
+        };
+        let frame: SubscriptionFrame = serde_json::from_str(text.as_str()).unwrap();
+        let SubscriptionFramePayload::Response(response) = frame.payload else {
+            panic!("expected subscription response");
+        };
+        response
+    }
+
+    #[tokio::test]
+    async fn worker_protocol_rejects_a_non_snapshot_initial_event() {
+        let (event_sender, events) = mpsc::channel(1);
+        event_sender
+            .send(protocol::Event::Error {
+                code: protocol::ErrorCode::Internal,
+                message: "not a snapshot".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            run_with_events(events).await,
+            SubscriptionResponse::SubscriptionRejected {
+                code: SubscriptionRejectionCode::Internal,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn worker_protocol_rejects_a_stream_closed_before_snapshot() {
+        let (event_sender, events) = mpsc::channel(1);
+        drop(event_sender);
+
+        assert!(matches!(
+            run_with_events(events).await,
+            SubscriptionResponse::SubscriptionRejected {
+                code: SubscriptionRejectionCode::ResourceNotFound,
+                ..
+            }
+        ));
+    }
 }

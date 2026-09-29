@@ -10,11 +10,31 @@ export type WorkerSessionAction =
   | { kind: "apply_retained"; snapshot: SessionSnapshot }
   | { kind: "show_unavailable"; message: string };
 
-export interface WorkerSessionRequestIdentity {
-  token: number;
+export interface WorkerSessionTarget {
   workspaceId: string;
   runtimeId: string;
   workerId: string;
+}
+
+export interface WorkerSessionRequestIdentity extends WorkerSessionTarget {
+  token: number;
+}
+
+export function resolveWorkerSessionTarget(
+  workspaceId: string,
+  runtimeId: string | null | undefined,
+  workerId: string | null | undefined,
+): WorkerSessionTarget | null {
+  if (
+    workspaceId.trim().length === 0 ||
+    runtimeId?.trim().length === 0 ||
+    workerId?.trim().length === 0 ||
+    runtimeId == null ||
+    workerId == null
+  ) {
+    return null;
+  }
+  return { workspaceId, runtimeId, workerId };
 }
 
 export function workerSessionRequestInit(signal: AbortSignal): RequestInit {

@@ -972,9 +972,14 @@ Deno.test("Worker Console route resolves logical Worker authority before Runtime
       routeLoad.includes("resourceKey(params.workerRef)") &&
       routeLoad.includes("/workers/${encodeURIComponent(reference)}") &&
       routeLoad.includes("canonicalResourceReference") &&
-      routeLoad.includes("runtimeId: result.data?.runtime_id") &&
-      routeLoad.includes("workerId: result.data?.worker_id"),
-    "route load should resolve the logical Worker reference before exposing its execution target",
+      routeLoad.includes("runtimeId: result.data?.runtime_id ?? null") &&
+      routeLoad.includes("workerId: result.data?.worker_id ?? null") &&
+      !routeLoad.includes('result.data?.runtime_id ?? ""') &&
+      consolePage.includes(
+        "resolveWorkerSessionTarget(workspaceId, runtimeId, workerId)",
+      ) &&
+      consolePage.includes("if (!target) return;"),
+    "route load should retain an unresolved Worker target as null and the Console must fail closed before Runtime APIs",
   );
   assert(
     consolePage.includes("workspaceApiPath(workspaceId, path)") &&
@@ -1228,9 +1233,9 @@ Deno.test("Workspace Worker list and Console share the multiplexed connection", 
       consolePage.includes("const targetWorker = data.worker") &&
       consolePage.includes("worker = targetWorker") &&
       consolePage.includes(
-        "const consoleTarget = $derived({ workspaceId, runtimeId, workerId })",
+        "resolveWorkerSessionTarget(workspaceId, runtimeId, workerId)",
       ),
-    "A reused Console route should subscribe immediately on the live Workspace socket and install the new route Worker",
+    "A reused Console route should subscribe immediately only after resolving the new route Worker execution target",
   );
 });
 

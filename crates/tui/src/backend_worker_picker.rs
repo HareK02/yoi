@@ -153,7 +153,7 @@ async fn prepare_selected_worker(
     }
 
     let observation = lifecycle.observe(&target).await?;
-    apply_worker_session_observation(&mut target, observation.observation);
+    apply_worker_session_observation(&mut target, observation.observation)?;
     Ok(target)
 }
 
@@ -217,21 +217,19 @@ enum WorkerPickerResult {
 fn apply_worker_session_observation(
     target: &mut client::BackendRuntimeTarget,
     observation: WorkerSessionAvailability,
-) {
+) -> Result<(), io::Error> {
     match observation {
-        WorkerSessionAvailability::LiveProtocol => {}
+        WorkerSessionAvailability::LiveProtocol => Ok(()),
         WorkerSessionAvailability::RetainedSnapshot { snapshot, .. } => {
             target.initial_snapshot = Some(snapshot);
             target.initial_notice = Some("read-only retained Session snapshot".to_string());
+            Ok(())
         }
-        WorkerSessionAvailability::Unavailable { message, .. } => {
-            let bounded_message: String = message.chars().take(512).collect();
-            target.initial_snapshot = Some(protocol::SessionSnapshot {
-                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
-                entries: Vec::new(),
-            });
-            target.initial_notice =
-                Some(format!("retained Session unavailable: {bounded_message}"));
+        WorkerSessionAvailability::Unavailable { reason, message } => {
+            let message = message.chars().take(512).collect::<String>();
+            Err(io::Error::other(format!(
+                "Backend Worker Session is unavailable: {reason:?}: {message}"
+            )))
         }
     }
 }
@@ -770,14 +768,15 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_observation_selects_live_retained_and_unavailable_detail_modes() {
+    fn authoritative_observation_opens_only_live_or_retained_sessions() {
         let mut live = client::BackendRuntimeTarget::new(
             "http://127.0.0.1:3000",
             "workspace-a",
             "runtime-a",
             "worker-a",
         );
-        apply_worker_session_observation(&mut live, WorkerSessionAvailability::LiveProtocol);
+        apply_worker_session_observation(&mut live, WorkerSessionAvailability::LiveProtocol)
+            .unwrap();
         assert!(live.initial_snapshot.is_none());
 
         let snapshot = protocol::SessionSnapshot {
@@ -795,25 +794,25 @@ mod tests {
                 },
                 snapshot: snapshot.clone(),
             },
-        );
+        )
+        .unwrap();
         assert_eq!(retained.initial_snapshot, Some(snapshot));
         assert!(retained.initial_notice.unwrap().contains("read-only"));
 
         let mut unavailable = live;
-        apply_worker_session_observation(
+        let error = apply_worker_session_observation(
             &mut unavailable,
             WorkerSessionAvailability::Unavailable {
                 reason: client::WorkerSessionUnavailableReason::RetentionMissing,
                 message: "retention expired".to_string(),
             },
-        );
-        assert!(unavailable.initial_snapshot.is_some());
-        assert!(
-            unavailable
-                .initial_notice
-                .unwrap()
-                .contains("retention expired")
-        );
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(unavailable.initial_snapshot.is_none());
+        assert!(unavailable.initial_notice.is_none());
+        assert!(error.contains("RetentionMissing"));
+        assert!(error.contains("retention expired"));
     }
 
     #[test]
