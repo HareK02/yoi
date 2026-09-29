@@ -30,6 +30,7 @@ export type WorkspaceMultiplexerSubscription = {
 };
 
 const multiplexers = new Map<string, WorkspaceMultiplexer>();
+const INVALID_PROTOCOL_CLOSE_CODE = 4002;
 let nextMultiplexerSequence = 0;
 
 function nextMultiplexerId(kind: 'client' | 'request'): string {
@@ -205,7 +206,7 @@ export class WorkspaceMultiplexer {
 
   #rejectInboundFrame(): void {
     this.#disconnectMessage = 'Workspace protocol frame rejected';
-    this.#socket?.close(1002, 'Invalid workspace protocol frame');
+    this.#socket?.close(INVALID_PROTOCOL_CLOSE_CODE, 'Invalid workspace protocol frame');
   }
 
   #sendWorkerMethod(clientId: string, method: Method): void {

@@ -32,6 +32,13 @@ class FakeWebSocket {
   }
 
   close(code?: number, reason?: string): void {
+    if (
+      code !== undefined &&
+      code !== 1000 &&
+      (code < 3000 || code > 4999)
+    ) {
+      throw new DOMException('Invalid WebSocket close code', 'InvalidAccessError');
+    }
     this.closes.push([code, reason]);
     if (this.readyState === FakeWebSocket.CLOSED) return;
     this.readyState = FakeWebSocket.CLOSED;
@@ -91,7 +98,7 @@ test('invalid inbound frame closes before dispatch and reconnects for a fresh sn
   );
 
   expect(onFrame).not.toHaveBeenCalled();
-  expect(first.closes).toEqual([[1002, 'Invalid workspace protocol frame']]);
+  expect(first.closes).toEqual([[4002, 'Invalid workspace protocol frame']]);
   expect(onStatus).toHaveBeenLastCalledWith('closed', 'Workspace protocol frame rejected');
   expect(JSON.stringify(onStatus.mock.calls)).not.toContain('untrusted detail');
 
