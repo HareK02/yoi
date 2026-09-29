@@ -124,6 +124,8 @@ use worker_runtime::http_server::{
     RUNTIME_HTTP_PROTOCOL_VERSION,
 };
 #[cfg(test)]
+use worker_runtime::catalog::WorkingDirectoryAttachmentStatus;
+#[cfg(test)]
 use worker_runtime::resource::BackendResourceError;
 use worker_runtime::resource::BackendResourceFetchRequest;
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
@@ -217,8 +219,8 @@ use worker_runtime::catalog::{
     RepositoryRefObservation, RepositoryRefObservationRequest,
     RepositorySelector as RuntimeRepositorySelector, RepositorySshCredentialCandidate,
     RepositorySshMaterializationAccess, SensitiveString, WorkingDirectoryAttachmentClaim,
-    WorkingDirectoryAttachmentRequest, WorkingDirectoryAttachmentStatus,
-    WorkingDirectoryRepository, WorkingDirectoryRequest, WorkspaceApiRef,
+    WorkingDirectoryAttachmentRequest, WorkingDirectoryRepository, WorkingDirectoryRequest,
+    WorkspaceApiRef,
 };
 use worker_runtime::config_bundle::ConfigBundle;
 use worker_runtime::http_server::MAX_WORKER_FILE_UPLOAD_BYTES;
@@ -22205,8 +22207,13 @@ async fn get_runtime_worker(
         .store
         .list_workdir_registry(&api.config.workspace_id, 500)?;
     let updated_at = record.updated_at.clone();
-    let worker = merge_worker_registry_projection(Some(&worker), &record, links, &workdirs);
-    let worker = project_workspace_worker(&api, worker)?;
+    let worker = project_worker_registry_projection(
+        &api,
+        Some(&worker),
+        &record,
+        links,
+        &workdirs,
+    )?;
     Ok(Json(server_api::RuntimeWorkerShowResponse {
         worker,
         updated_at,
@@ -22227,8 +22234,13 @@ async fn restore_runtime_worker(
         let workdirs = api
             .store
             .list_workdir_registry(&api.config.workspace_id, 500)?;
-        let summary = merge_worker_registry_projection(Some(worker), &record, links, &workdirs);
-        Some(project_workspace_worker(&api, summary)?)
+        Some(project_worker_registry_projection(
+            &api,
+            Some(worker),
+            &record,
+            links,
+            &workdirs,
+        )?)
     } else {
         None
     };
@@ -23433,19 +23445,6 @@ fn project_workspace_worker(
     api: &WorkspaceApi,
     summary: InternalWorkerSummary,
 ) -> ApiResult<server_api::WorkerSummary> {
-    let resource_key = api
-        .store
-        .resource_key(
-            &api.config.workspace_id,
-            WorkspaceResourceKind::Worker,
-            &summary.worker.worker_id,
-        )?
-        .ok_or_else(|| {
-            Error::Store(format!(
-                "Workspace Worker `{}` has no resource key",
-                summary.worker.worker_id
-            ))
-        })?;
     let workdir_attachments = summary
         .workdir_attachments
         .iter()
@@ -23461,6 +23460,27 @@ fn project_workspace_worker(
             })
         })
         .collect::<ApiResult<Vec<_>>>()?;
+    project_workspace_worker_with_attachments(api, summary, workdir_attachments)
+}
+
+fn project_workspace_worker_with_attachments(
+    api: &WorkspaceApi,
+    summary: InternalWorkerSummary,
+    workdir_attachments: Vec<server_api::WorkerWorkdirAttachmentSummary>,
+) -> ApiResult<server_api::WorkerSummary> {
+    let resource_key = api
+        .store
+        .resource_key(
+            &api.config.workspace_id,
+            WorkspaceResourceKind::Worker,
+            &summary.worker.worker_id,
+        )?
+        .ok_or_else(|| {
+            Error::Store(format!(
+                "Workspace Worker `{}` has no resource key",
+                summary.worker.worker_id
+            ))
+        })?;
     Ok(workspace_worker_summary(
         summary,
         resource_key,
@@ -23482,9 +23502,7 @@ fn project_observed_workspace_workers(
             let links = api
                 .store
                 .list_worker_workdir_links(&api.config.workspace_id, &record.worker)?;
-            let summary =
-                merge_worker_registry_projection(Some(&worker), &record, links, &workdirs);
-            project_workspace_worker(api, summary)
+            project_worker_registry_projection(api, Some(&worker), &record, links, &workdirs)
         })
         .collect()
 }
@@ -23503,13 +23521,13 @@ fn workers_response(api: WorkspaceApi) -> ApiResult<server_api::WorkerListRespon
             .store
             .list_worker_workdir_links(&api.config.workspace_id, &projection.registry.worker)?;
         let observed = worker_summary_from_projection(&projection);
-        let summary = merge_worker_registry_projection(
+        items.push(project_worker_registry_projection(
+            &api,
             observed.as_ref(),
             &projection.registry,
             links,
             &workdir_records,
-        );
-        items.push(project_workspace_worker(&api, summary)?);
+        )?);
     }
     Ok(server_api::WorkerListResponse {
         workspace_id: api.config.workspace_id,
@@ -24379,11 +24397,35 @@ fn worker_summary_from_projection(
     Some(summary)
 }
 
-fn merge_worker_registry_projection(
+fn project_worker_registry_projection(
+    api: &WorkspaceApi,
     live: Option<&InternalWorkerSummary>,
     record: &WorkerRegistryRecord,
     links: Vec<WorkerWorkdirLinkRecord>,
     workdirs: &[WorkdirRegistryRecord],
+) -> ApiResult<server_api::WorkerSummary> {
+    let summary = merge_worker_registry_summary(live, record);
+    let mut workdir_attachments = Vec::with_capacity(links.len());
+    for link in links {
+        let Some(workdir) = workdirs
+            .iter()
+            .find(|workdir| workdir.workdir_id == link.workdir_id)
+        else {
+            continue;
+        };
+        workdir_attachments.push(server_api::WorkerWorkdirAttachmentSummary {
+            alias: workdir::WorkdirAttachmentAlias::new(link.alias)
+                .expect("persisted attachment aliases are validated on write")
+                .to_string(),
+            working_directory: projected_workdir_summary_from_record(api, workdir)?.into(),
+        });
+    }
+    project_workspace_worker_with_attachments(api, summary, workdir_attachments)
+}
+
+fn merge_worker_registry_summary(
+    live: Option<&InternalWorkerSummary>,
+    record: &WorkerRegistryRecord,
 ) -> InternalWorkerSummary {
     let mut summary = live
         .cloned()
@@ -24392,30 +24434,7 @@ fn merge_worker_registry_projection(
     summary.profile = record.profile.clone();
     summary.pinned = record.retention_state == "pinned";
     summary.retention_state = record.retention_state.clone();
-    summary.workdir_attachments = links
-        .iter()
-        .filter_map(|link| {
-            workdirs
-                .iter()
-                .find(|workdir| workdir.workdir_id == link.workdir_id)
-                .map(|workdir| {
-                    let mut workdir_summary = runtime_workdir_summary_from_record(workdir);
-                    workdir_summary.occupied_by = Some(WorkingDirectoryOccupancy {
-                        runtime_id: record.worker.runtime_id.clone(),
-                        worker_id: record.worker.worker_id.clone(),
-                        display_name: record.display_name.clone(),
-                        linked_at: link.linked_at.clone(),
-                    });
-                    WorkingDirectoryAttachmentStatus {
-                        alias: workdir::WorkdirAttachmentAlias::new(link.alias.clone())
-                            .expect("persisted attachment aliases are validated on write"),
-                        working_directory: worker_runtime::catalog::WorkingDirectoryStatus {
-                            summary: workdir_summary,
-                        },
-                    }
-                })
-        })
-        .collect();
+    summary.workdir_attachments.clear();
     summary
 }
 
@@ -24738,6 +24757,7 @@ fn preserve_workdir_identity_for_corrupted_summary(
     }
 }
 
+#[cfg(test)]
 fn runtime_workdir_summary_from_record(
     record: &WorkdirRegistryRecord,
 ) -> worker_runtime::catalog::WorkingDirectorySummary {
@@ -28550,28 +28570,33 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    #[test]
-    fn backend_worker_projection_preserves_missing_rows_links_and_redacts_paths() {
+    #[tokio::test]
+    async fn backend_worker_projection_preserves_missing_rows_links_and_redacts_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
         let worker = WorkerRegistryRecord {
-            workspace_id: "workspace-1".to_string(),
-            worker: RuntimeWorkerRef::new("embedded", "1"),
+            workspace_id: TEST_WORKSPACE_ID.to_string(),
+            worker: RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, "missing-worker"),
             display_name: "Missing Worker".to_string(),
             profile: Some("builtin:coder".to_string()),
             retention_state: "pinned".to_string(),
-            transcript_ref: Some("runtime://embedded/workers/worker-1/transcript".to_string()),
+            transcript_ref: Some(
+                "runtime://embedded-worker-runtime/workers/missing-worker/transcript".to_string(),
+            ),
             session_ref: None,
             summary_ref: None,
             diagnostics_ref: None,
             created_at: "1".to_string(),
             updated_at: "2".to_string(),
         };
+        api.store.upsert_worker_registry(&worker).unwrap();
         let workdir = WorkdirRegistryRecord {
-            workspace_id: "workspace-1".to_string(),
-            workdir_id: "0000019a00000000000".to_string(),
+            workspace_id: TEST_WORKSPACE_ID.to_string(),
+            workdir_id: "missing-workdir".to_string(),
             display_name: None,
             source: WorkdirRegistrySource::Repository {
-                runtime_id: "embedded".to_string(),
-                repository_id: "repo".to_string(),
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                repository_id: test_repository_id(&api),
             },
             creation_selector: Some("develop".to_string()),
             creation_ref: Some("abcdef".to_string()),
@@ -28580,13 +28605,14 @@ mod tests {
             current_ref: Some("fedcba".to_string()),
             current_tree: Some("tree-current".to_string()),
             observed_at_epoch_seconds: Some(3),
-            materialization_status: "missing".to_string(),
+            materialization_status: "not_found".to_string(),
             cleanliness: "clean".to_string(),
             created_at: "1".to_string(),
             updated_at: "3".to_string(),
         };
+        api.store.upsert_workdir_registry(&workdir).unwrap();
         let link = WorkerWorkdirLinkRecord {
-            workspace_id: "workspace-1".to_string(),
+            workspace_id: TEST_WORKSPACE_ID.to_string(),
             worker: worker.worker.clone(),
             workdir_id: workdir.workdir_id.clone(),
             alias: "attachment".to_string(),
@@ -28594,14 +28620,22 @@ mod tests {
             linked_at: "4".to_string(),
             unlinked_at: None,
         };
+        api.store.attach_worker_workdir(&link).unwrap();
 
-        let projected = merge_worker_registry_projection(None, &worker, vec![link], &[workdir]);
+        let projected = project_worker_registry_projection(
+            &api,
+            None,
+            &worker,
+            vec![link],
+            std::slice::from_ref(&workdir),
+        )
+        .unwrap();
 
         assert_eq!(projected.state, "missing");
-        let working_directory = &projected.workdir_attachments[0].working_directory.summary;
+        let working_directory = &projected.workdir_attachments[0].working_directory;
         assert_eq!(
             working_directory.status,
-            WorkingDirectoryStatusKind::NotFound
+            server_api::WorkingDirectoryStatusKind::NotFound
         );
         assert_eq!(
             working_directory.creation_selector.as_deref(),
@@ -28611,17 +28645,130 @@ mod tests {
         assert_eq!(working_directory.current_selector, None);
         assert_eq!(working_directory.current_ref.as_deref(), Some("fedcba"));
         let occupied_by = working_directory.occupied_by.as_ref().unwrap();
-        assert_eq!(occupied_by.runtime_id, "embedded");
-        assert_eq!(occupied_by.worker_id, "1");
+        assert_eq!(occupied_by.runtime_id, EMBEDDED_WORKER_RUNTIME_ID);
+        assert_eq!(occupied_by.worker_id, "missing-worker");
         let occupancy = serde_json::to_value(occupied_by).unwrap();
-        assert_eq!(occupancy["runtime_id"], "embedded");
-        assert_eq!(occupancy["worker_id"], "1");
+        assert_eq!(
+            occupancy["runtime_id"],
+            serde_json::Value::String(EMBEDDED_WORKER_RUNTIME_ID.to_string())
+        );
+        assert_eq!(occupancy["worker_id"], "missing-worker");
         assert!(occupancy.get("runtime_worker_id").is_none());
         assert_eq!(occupied_by.display_name, "Missing Worker");
         assert_eq!(occupied_by.linked_at, "4");
         let serialized = serde_json::to_string(&projected).unwrap();
         assert!(!serialized.contains("/tmp/"));
         assert!(!serialized.contains("materialized_path"));
+    }
+
+    #[tokio::test]
+    async fn paused_worker_projection_preserves_external_workdir_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let worker = WorkerRegistryRecord {
+            workspace_id: TEST_WORKSPACE_ID.to_string(),
+            worker: RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, "paused-worker"),
+            display_name: "Paused Worker".to_string(),
+            profile: Some("builtin:coder".to_string()),
+            retention_state: "normal".to_string(),
+            transcript_ref: None,
+            session_ref: None,
+            summary_ref: None,
+            diagnostics_ref: None,
+            created_at: "1".to_string(),
+            updated_at: "2".to_string(),
+        };
+        api.store.upsert_worker_registry(&worker).unwrap();
+        let grant = ExternalWorkdirGrantRecord {
+            grant_id: "external-grant".to_string(),
+            workspace_id: TEST_WORKSPACE_ID.to_string(),
+            workdir_id: "external-workdir".to_string(),
+            provider_instance_id: "external-provider".to_string(),
+            display_name: "External Workdir".to_string(),
+            permissions: "read_only".to_string(),
+            created_by: test_browser_request_actor().account_id,
+            created_at: "1".to_string(),
+            expires_at: None,
+            generation: 1,
+            status: "online".to_string(),
+            updated_at: "3".to_string(),
+        };
+        let workdir = WorkdirRegistryRecord {
+            workspace_id: TEST_WORKSPACE_ID.to_string(),
+            workdir_id: "external-workdir".to_string(),
+            display_name: Some("External Workdir".to_string()),
+            source: WorkdirRegistrySource::ExternalGrant {
+                grant_id: "external-grant".to_string(),
+            },
+            creation_selector: None,
+            creation_ref: None,
+            creation_tree: None,
+            current_selector: None,
+            current_ref: None,
+            current_tree: None,
+            observed_at_epoch_seconds: Some(3),
+            materialization_status: "present".to_string(),
+            cleanliness: "clean".to_string(),
+            created_at: "1".to_string(),
+            updated_at: "3".to_string(),
+        };
+        api.store
+            .create_external_workdir_grant(&grant, &workdir)
+            .unwrap();
+        let link = WorkerWorkdirLinkRecord {
+            workspace_id: TEST_WORKSPACE_ID.to_string(),
+            worker: worker.worker.clone(),
+            workdir_id: workdir.workdir_id.clone(),
+            alias: "attachment".to_string(),
+            capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+            linked_at: "4".to_string(),
+            unlinked_at: None,
+        };
+        api.store.attach_worker_workdir(&link).unwrap();
+        api.worker_projection
+            .seed_observation(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                &protocol::subscription::SubscriptionWorker {
+                    worker_id: protocol::subscription::SubscriptionWorkerId::new("paused-worker")
+                        .unwrap(),
+                    runtime_id: Some(EMBEDDED_WORKER_RUNTIME_ID.to_string()),
+                    resource_key: None,
+                    availability:
+                        protocol::subscription::SubscriptionWorkerAvailability::Observed,
+                    subject_revision: 1,
+                    worker_state: None,
+                    state: protocol::subscription::SubscriptionWorkerState::Paused,
+                    has_running_internal_workers: false,
+                    workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
+                    display_name: Some("Paused Worker".to_string()),
+                    profile: Some("builtin:coder".to_string()),
+                    workdir_attachments: Vec::new(),
+                },
+                "4",
+            )
+            .unwrap();
+
+        let workers = workers_response(api.clone()).unwrap();
+        let projected = workers
+            .items
+            .iter()
+            .find(|worker| worker.worker_id == "paused-worker")
+            .unwrap();
+
+        assert_eq!(projected.state, "paused");
+        assert_eq!(projected.workdir_attachments.len(), 1);
+        let attachment = &projected.workdir_attachments[0];
+        assert_eq!(attachment.alias, "attachment");
+        assert!(matches!(
+            &attachment.working_directory.source,
+            server_api::WorkingDirectorySource::ExternalGrant { grant_id }
+                if grant_id == "external-grant"
+        ));
+        assert_eq!(
+            attachment.working_directory.materializer_kind,
+            server_api::WorkingDirectoryMaterializerKind::ClientHostedExternal
+        );
+        assert!(attachment.working_directory.cleanup_target.is_none());
     }
 
     #[tokio::test]
