@@ -25,7 +25,7 @@ use workdir::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WorkdirShareOptions {
+pub struct WorkdirShareOptions {
     pub path: PathBuf,
     pub workspace_id: Option<String>,
     pub backend_url: String,
@@ -82,7 +82,7 @@ fn provider_operation_timeout(operation: &workdir::http::WorkdirSessionOperation
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProviderEnd {
+pub enum ProviderEnd {
     Disconnected,
     Revoked,
     Interrupted,
@@ -221,7 +221,7 @@ struct ResolvedWorkdirShareOptions {
     permissions: server_api::ExternalWorkdirPermissions,
 }
 
-pub(crate) fn parse_ttl(value: &str) -> Result<Duration, String> {
+pub fn parse_ttl(value: &str) -> Result<Duration, String> {
     let (number, multiplier) = if let Some(value) = value.strip_suffix('h') {
         (value, 60 * 60)
     } else if let Some(value) = value.strip_suffix('m') {
@@ -457,7 +457,7 @@ async fn resolve_share_options(
     configure_interactively(options, &workspaces, &mut input, &mut output)
 }
 
-pub(crate) async fn run(options: WorkdirShareOptions) -> Result<(), String> {
+pub async fn run(options: WorkdirShareOptions) -> Result<(), String> {
     let Some(options) = resolve_share_options(options).await? else {
         eprintln!("External Workdir share cancelled; no grant was created.");
         return Ok(());
@@ -669,7 +669,7 @@ async fn serve_provider_connection(
         .max_message_size(Some(workdir::external::MAX_EXTERNAL_SERVER_FRAME_BYTES))
         .max_frame_size(Some(workdir::external::MAX_EXTERNAL_SERVER_FRAME_BYTES));
     let connection = connect_async_with_config(request, Some(websocket_config), false);
-    let (mut socket, _) = tokio::select! {
+    let (socket, _) = tokio::select! {
         signal = tokio::signal::ctrl_c() => {
             signal.map_err(|error| format!("failed to wait for Ctrl-C: {error}"))?;
             revoke(server_api_client, &options.workspace_id, &grant.grant_id).await?;
@@ -691,11 +691,40 @@ async fn serve_provider_connection(
                 read_limits: BoundedReadLimits::EXTERNAL_DEFAULT,
             },
         });
+    let end =
+        serve_external_workdir_provider_socket(socket, registration, session, generation, async {
+            tokio::signal::ctrl_c()
+                .await
+                .map_err(|error| format!("failed to wait for Ctrl-C: {error}"))
+        })
+        .await?;
+    if end == ProviderEnd::Interrupted {
+        revoke(server_api_client, &options.workspace_id, &grant.grant_id).await?;
+    }
+    Ok(end)
+}
+
+/// Run the production External Workdir provider protocol over an established WebSocket.
+///
+/// The CLI uses this pump after opening its authenticated Backend connection. Keeping the
+/// protocol pump separate lets composed tests exercise the same registration, operation,
+/// cancellation, and result-forwarding implementation without spawning a second CLI process.
+pub async fn serve_external_workdir_provider_socket<S, I>(
+    mut socket: tokio_tungstenite::WebSocketStream<S>,
+    registration: ExternalWorkdirProviderFrame,
+    session: &LocalWorkdirSession,
+    generation: u64,
+    interrupt: I,
+) -> Result<ProviderEnd, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    I: std::future::Future<Output = Result<(), String>>,
+{
+    tokio::pin!(interrupt);
     send_provider_frame(&mut socket, &registration).await?;
     let registered = tokio::select! {
-        signal = tokio::signal::ctrl_c() => {
-            signal.map_err(|error| format!("failed to wait for Ctrl-C: {error}"))?;
-            revoke(server_api_client, &options.workspace_id, &grant.grant_id).await?;
+        signal = &mut interrupt => {
+            signal?;
             return Ok(ProviderEnd::Interrupted);
         }
         registered = tokio::time::timeout(Duration::from_secs(10), socket.next()) => {
@@ -713,10 +742,9 @@ async fn serve_provider_connection(
     let mut operations = HashMap::<String, OperationTask>::new();
     loop {
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal.map_err(|error| format!("failed to wait for Ctrl-C: {error}"))?;
+            signal = &mut interrupt => {
+                signal?;
                 stop_provider_operations(session, &mut operations, &mut completions).await?;
-                revoke(server_api_client, &options.workspace_id, &grant.grant_id).await?;
                 return Ok(ProviderEnd::Interrupted);
             }
             completion = completions.recv() => {

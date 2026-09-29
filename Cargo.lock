@@ -6423,6 +6423,7 @@ dependencies = [
  "workdir",
  "worker",
  "worker-runtime",
+ "yoi",
  "zeroize",
 ]
 
