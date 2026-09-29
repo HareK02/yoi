@@ -21,7 +21,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 68;
+const LATEST_SCHEMA_VERSION: i64 = 69;
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
@@ -52,6 +52,8 @@ const EXTERNAL_WORKDIR_ACCESS_AND_OPTIONAL_EXPIRY_MIGRATION_NAME: &str =
     "External Workdir read-write access and optional expiry";
 const EXTERNAL_WORKDIR_COMMAND_PERMISSION_MIGRATION_NAME: &str =
     "External Workdir explicit command permission";
+const WORKDIR_COMMAND_ATTACHMENT_CAPABILITIES_MIGRATION_NAME: &str =
+    "External Workdir command attachment capabilities";
 const TICKET_SCHEMA_VERSION_WITH_TARGETS: i64 = 7;
 const TICKET_SCHEMA_BASELINE_NAME: &str = "ticket schema baseline";
 const WORKER_REGISTRY_PROJECTION_SCHEMA: &str = r#"
@@ -188,6 +190,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 68,
         name: EXTERNAL_WORKDIR_COMMAND_PERMISSION_MIGRATION_NAME,
         apply: migrate_external_workdir_command_permission_v67_to_v68,
+    },
+    Migration {
+        version: 69,
+        name: WORKDIR_COMMAND_ATTACHMENT_CAPABILITIES_MIGRATION_NAME,
+        apply: migrate_workdir_command_attachment_capabilities_v68_to_v69,
     },
 ];
 
@@ -9138,37 +9145,52 @@ fn read_device_login_flow_record(
     })
 }
 
+const WORKDIR_LINK_CAPABILITY_ENCODINGS: &[(workdir::WorkdirSessionCapabilities, &str)] = &[
+    (workdir::WorkdirSessionCapabilities::ALL, "all"),
+    (workdir::WorkdirSessionCapabilities::READ_ONLY, "read_only"),
+    (
+        workdir::WorkdirSessionCapabilities::READ_WRITE,
+        "read_write",
+    ),
+    (
+        workdir::WorkdirSessionCapabilities::COMMAND_ONLY,
+        "command_only",
+    ),
+    (
+        workdir::WorkdirSessionCapabilities::READ_ONLY
+            .union(workdir::WorkdirSessionCapabilities::COMMAND_ONLY),
+        "read_command",
+    ),
+];
+
 fn encode_workdir_link_capabilities(
     capabilities: workdir::WorkdirSessionCapabilities,
 ) -> Result<&'static str> {
-    if capabilities == workdir::WorkdirSessionCapabilities::ALL {
-        Ok("all")
-    } else if capabilities == workdir::WorkdirSessionCapabilities::READ_ONLY {
-        Ok("read_only")
-    } else if capabilities == workdir::WorkdirSessionCapabilities::READ_WRITE {
-        Ok("read_write")
-    } else {
-        Err(Error::InvalidInput(
-            "Workdir attachment capabilities must be exactly all, read_only, or read_write"
-                .to_string(),
-        ))
-    }
+    WORKDIR_LINK_CAPABILITY_ENCODINGS
+        .iter()
+        .find_map(|(candidate, encoded)| (*candidate == capabilities).then_some(*encoded))
+        .ok_or_else(|| {
+            Error::InvalidInput(
+                "Workdir attachment capabilities must be exactly all, read_only, read_write, command_only, or read_command"
+                    .to_string(),
+            )
+        })
 }
 
 fn decode_workdir_link_capabilities(
     value: &str,
     column: usize,
 ) -> rusqlite::Result<workdir::WorkdirSessionCapabilities> {
-    match value {
-        "all" => Ok(workdir::WorkdirSessionCapabilities::ALL),
-        "read_only" => Ok(workdir::WorkdirSessionCapabilities::READ_ONLY),
-        "read_write" => Ok(workdir::WorkdirSessionCapabilities::READ_WRITE),
-        _ => Err(rusqlite::Error::FromSqlConversionFailure(
-            column,
-            rusqlite::types::Type::Text,
-            format!("invalid Worker Workdir link capabilities {value:?}").into(),
-        )),
-    }
+    WORKDIR_LINK_CAPABILITY_ENCODINGS
+        .iter()
+        .find_map(|(capabilities, encoded)| (*encoded == value).then_some(*capabilities))
+        .ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                column,
+                rusqlite::types::Type::Text,
+                format!("invalid Worker Workdir link capabilities {value:?}").into(),
+            )
+        })
 }
 
 fn read_worker_workdir_link_record(
@@ -12189,6 +12211,103 @@ fn migrate_external_workdir_command_permission_v67_to_v68(conn: &Connection) -> 
     }
 }
 
+fn migrate_workdir_command_attachment_capabilities_v68_to_v69(conn: &Connection) -> Result<()> {
+    let current = current_schema_version(conn)?;
+    if current != 68 {
+        return Err(Error::Store(format!(
+            "expected schema version 68 before {WORKDIR_COMMAND_ATTACHMENT_CAPABILITIES_MIGRATION_NAME} migration, found {current}"
+        )));
+    }
+    let foreign_keys_enabled =
+        conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))? != 0;
+    if foreign_keys_enabled {
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    }
+    let result = (|| {
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+        tx.execute_batch(
+            r#"
+            CREATE TABLE worker_workdir_links_v69 (
+                workspace_id TEXT NOT NULL,
+                runtime_id TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                workdir_id TEXT NOT NULL,
+                alias TEXT NOT NULL,
+                capabilities TEXT NOT NULL CHECK (capabilities IN (
+                    'all', 'read_only', 'read_write', 'command_only', 'read_command'
+                )),
+                linked_at TEXT NOT NULL,
+                unlinked_at TEXT,
+                PRIMARY KEY (workspace_id, worker_id, workdir_id, alias),
+                FOREIGN KEY (workspace_id, worker_id)
+                    REFERENCES worker_registry(workspace_id, worker_id) ON DELETE CASCADE,
+                FOREIGN KEY (workspace_id, workdir_id)
+                    REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE
+            );
+            INSERT INTO worker_workdir_links_v69 (
+                workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities,
+                linked_at, unlinked_at
+            ) SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities,
+                     linked_at, unlinked_at
+                FROM worker_workdir_links;
+            DROP TABLE worker_workdir_links;
+            ALTER TABLE worker_workdir_links_v69 RENAME TO worker_workdir_links;
+            CREATE UNIQUE INDEX worker_workdir_links_active_workdir_unique
+                ON worker_workdir_links(workspace_id, workdir_id) WHERE unlinked_at IS NULL;
+            CREATE UNIQUE INDEX worker_workdir_links_active_alias_unique
+                ON worker_workdir_links(workspace_id, worker_id, alias) WHERE unlinked_at IS NULL;
+            CREATE INDEX worker_workdir_links_workdir
+                ON worker_workdir_links(workspace_id, workdir_id);
+            CREATE TRIGGER workdir_attachment_insert_blocked_by_runtime_removal
+            BEFORE INSERT ON worker_workdir_links FOR EACH ROW
+            WHEN EXISTS (
+                SELECT 1 FROM runtime_removal_operations operation
+                WHERE operation.runtime_id = NEW.runtime_id
+                  AND operation.state IN ('pending', 'cleanup_pending')
+            )
+            BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+            CREATE TRIGGER workdir_attachment_update_blocked_by_runtime_removal
+            BEFORE UPDATE ON worker_workdir_links FOR EACH ROW
+            WHEN EXISTS (
+                SELECT 1 FROM runtime_removal_operations operation
+                WHERE operation.runtime_id = NEW.runtime_id
+                  AND operation.state IN ('pending', 'cleanup_pending')
+            )
+            BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+            "#,
+        )?;
+        let violations =
+            tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        if violations != 0 {
+            return Err(Error::Store(format!(
+                "schema-69 migration left {violations} foreign-key violation(s)"
+            )));
+        }
+        tx.execute(
+            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+            params![
+                69_i64,
+                WORKDIR_COMMAND_ATTACHMENT_CAPABILITIES_MIGRATION_NAME
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+    let restore = if foreign_keys_enabled {
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(Error::from)
+    } else {
+        Ok(())
+    };
+    match (result, restore) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("DROP TABLE IF EXISTS typed_ticket_targets;")?;
     conn.execute_batch(include_str!("latest_schema.sql"))?;
@@ -12251,7 +12370,9 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
             ON typed_ticket_targets(workspace_id, repository_key, ticket_id);
         ALTER TABLE worker_workdir_links
             ADD COLUMN capabilities TEXT NOT NULL
-            CHECK (capabilities IN ('all', 'read_only', 'read_write'));
+            CHECK (capabilities IN (
+                'all', 'read_only', 'read_write', 'command_only', 'read_command'
+            ));
         "#,
     )?;
     ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
@@ -12945,6 +13066,29 @@ mod tests {
              VALUES (6, 'ticket schema baseline', CURRENT_TIMESTAMP);",
         )?;
         Ok(())
+    }
+
+    #[test]
+    fn worker_workdir_link_capability_codec_round_trips_only_canonical_sets() {
+        for (capabilities, encoded) in WORKDIR_LINK_CAPABILITY_ENCODINGS {
+            assert_eq!(
+                encode_workdir_link_capabilities(*capabilities).unwrap(),
+                *encoded
+            );
+            assert_eq!(
+                decode_workdir_link_capabilities(encoded, 0).unwrap(),
+                *capabilities
+            );
+        }
+        assert!(
+            encode_workdir_link_capabilities(workdir::WorkdirSessionCapabilities::EMPTY).is_err()
+        );
+        assert!(
+            encode_workdir_link_capabilities(workdir::WorkdirSessionCapabilities::WRITE_ONLY)
+                .is_err()
+        );
+        assert!(decode_workdir_link_capabilities("write_only", 0).is_err());
+        assert!(decode_workdir_link_capabilities("future_authority", 0).is_err());
     }
 
     #[tokio::test]
@@ -14328,6 +14472,10 @@ mod tests {
                     version: 68,
                     name: EXTERNAL_WORKDIR_COMMAND_PERMISSION_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 69,
+                    name: WORKDIR_COMMAND_ATTACHMENT_CAPABILITIES_MIGRATION_NAME.to_string(),
+                },
             ]
         );
 
@@ -14393,6 +14541,10 @@ mod tests {
                         (
                             68,
                             EXTERNAL_WORKDIR_COMMAND_PERMISSION_MIGRATION_NAME.to_string(),
+                        ),
+                        (
+                            69,
+                            WORKDIR_COMMAND_ATTACHMENT_CAPABILITIES_MIGRATION_NAME.to_string(),
                         ),
                     ]
                 );
@@ -14510,6 +14662,89 @@ mod tests {
     }
 
     #[test]
+    fn schema_v69_preserves_legacy_attachment_capabilities_and_allows_command_subsets() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        prepare_schema_v50(&path, Some("workspace-a"));
+        let mut conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 68)
+        {
+            (migration.apply)(&conn).unwrap();
+        }
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(
+            r#"
+            INSERT INTO worker_registry (
+                workspace_id, runtime_id, worker_id, display_name, retention_state,
+                created_at, updated_at
+            ) VALUES ('workspace-a', 'runtime-a', 'worker-a', 'Worker A', 'normal', '1', '1');
+            INSERT INTO external_workdir_grants (
+                grant_id, workspace_id, workdir_id, provider_instance_id, display_name,
+                permissions, created_by, created_at, expires_at, generation, status, updated_at
+            ) VALUES
+                ('grant-ro', 'workspace-a', 'external-ro', 'provider-ro', 'Read only',
+                 'read_only', 'owner', '1', NULL, 1, 'pending', '1'),
+                ('grant-rw', 'workspace-a', 'external-rw', 'provider-rw', 'Read write',
+                 'read_write', 'owner', '1', NULL, 1, 'pending', '1');
+            INSERT INTO workdir_registry (
+                workspace_id, workdir_id, display_name, source_kind, runtime_id,
+                repository_id, external_grant_id, creation_selector, creation_ref,
+                materialization_status, cleanliness, created_at, updated_at
+            ) VALUES
+                ('workspace-a', 'external-ro', 'Read only', 'external_grant', NULL,
+                 NULL, 'grant-ro', NULL, NULL, 'pending', 'unknown', '1', '1'),
+                ('workspace-a', 'external-rw', 'Read write', 'external_grant', NULL,
+                 NULL, 'grant-rw', NULL, NULL, 'pending', 'unknown', '1', '1');
+            INSERT INTO worker_workdir_links (
+                workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities,
+                linked_at, unlinked_at
+            ) VALUES
+                ('workspace-a', 'runtime-a', 'worker-a', 'external-ro', 'readonly',
+                 'read_only', '1', '2'),
+                ('workspace-a', 'runtime-a', 'worker-a', 'external-rw', 'readwrite',
+                 'read_write', '1', '2');
+            "#,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        migrate_workdir_command_attachment_capabilities_v68_to_v69(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 69);
+        let capabilities = conn
+            .prepare("SELECT capabilities FROM worker_workdir_links ORDER BY alias")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(capabilities, vec!["read_only", "read_write"]);
+        assert!(
+            conn.execute(
+                "UPDATE worker_workdir_links SET capabilities = 'command_only' WHERE alias = 'readonly'",
+                [],
+            )
+            .is_ok()
+        );
+        assert!(
+            conn.execute(
+                "UPDATE worker_workdir_links SET capabilities = 'read_command' WHERE alias = 'readwrite'",
+                [],
+            )
+            .is_ok()
+        );
+        assert!(
+            conn.execute(
+                "UPDATE worker_workdir_links SET capabilities = 'write_only' WHERE alias = 'readonly'",
+                [],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn migration_resumes_from_a_valid_partially_applied_chain() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("server.db");
@@ -14527,7 +14762,7 @@ mod tests {
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
             vec![
-                52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68
+                52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69
             ]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
@@ -14536,7 +14771,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 19);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 20);
         assert!(column_exists(&conn, "worker_workdir_links", "alias").unwrap());
         assert!(column_exists(&conn, "worker_workdir_links", "capabilities").unwrap());
         assert!(!column_exists(&conn, "worker_workdir_links", "role").unwrap());

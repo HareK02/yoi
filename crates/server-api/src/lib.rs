@@ -5083,8 +5083,15 @@ pub struct RuntimeWorkingDirectorySummary {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkingDirectorySource {
-    Repository { repository_key: String },
-    ExternalGrant { grant_id: String },
+    Repository {
+        repository_key: String,
+    },
+    ExternalGrant {
+        grant_id: String,
+        /// Operator-approved ceiling for this External Workdir grant. Worker
+        /// attachment authority is projected separately after attenuation.
+        grant_permissions: ExternalWorkdirPermissions,
+    },
 }
 
 /// Public, provider-neutral Workdir inventory projection.
@@ -5212,6 +5219,16 @@ impl From<workdir::workspace::RuntimeWorkingDirectorySummary> for RuntimeWorking
     }
 }
 
+impl From<workdir::workspace::WorkdirPermissionSummary> for ExternalWorkdirPermissions {
+    fn from(value: workdir::workspace::WorkdirPermissionSummary) -> Self {
+        Self {
+            read: value.read,
+            write: value.write,
+            command: value.command,
+        }
+    }
+}
+
 impl From<workdir::workspace::WorkingDirectorySummary> for WorkingDirectorySummary {
     fn from(value: workdir::workspace::WorkingDirectorySummary) -> Self {
         Self {
@@ -5221,9 +5238,13 @@ impl From<workdir::workspace::WorkingDirectorySummary> for WorkingDirectorySumma
                 workdir::workspace::WorkingDirectorySource::Repository { repository_key } => {
                     WorkingDirectorySource::Repository { repository_key }
                 }
-                workdir::workspace::WorkingDirectorySource::ExternalGrant { grant_id } => {
-                    WorkingDirectorySource::ExternalGrant { grant_id }
-                }
+                workdir::workspace::WorkingDirectorySource::ExternalGrant {
+                    grant_id,
+                    grant_permissions,
+                } => WorkingDirectorySource::ExternalGrant {
+                    grant_id,
+                    grant_permissions: grant_permissions.into(),
+                },
             },
             creation_selector: value.creation_selector,
             creation_ref: value.creation_ref,
@@ -7977,6 +7998,10 @@ pub struct WorkspaceWorkerDiscoveryPage {
 #[serde(deny_unknown_fields)]
 pub struct WorkerWorkdirAttachmentSummary {
     pub alias: String,
+    /// Current effective category authority after intersecting the durable link,
+    /// source grant, and Ticket target ceilings. This is independent from
+    /// provider liveness and may be narrower than the grant ceiling.
+    pub effective_permissions: ExternalWorkdirPermissions,
     pub working_directory: WorkingDirectorySummary,
 }
 
@@ -11267,6 +11292,59 @@ mod tests {
                 "absent field {key} must be omitted"
             );
         }
+    }
+
+    #[test]
+    fn external_workdir_summary_separates_grant_and_attachment_effective_permissions() {
+        let summary = WorkingDirectorySummary {
+            working_directory_id: "external-1".into(),
+            display_name: Some("Session data".into()),
+            source: WorkingDirectorySource::ExternalGrant {
+                grant_id: "grant-1".into(),
+                grant_permissions: ExternalWorkdirPermissions {
+                    read: true,
+                    write: false,
+                    command: true,
+                },
+            },
+            creation_selector: None,
+            creation_ref: None,
+            creation_tree: None,
+            current_selector: None,
+            current_ref: None,
+            current_tree: None,
+            observed_at_epoch_seconds: None,
+            materializer_kind: WorkingDirectoryMaterializerKind::ClientHostedExternal,
+            cleanup_target: None,
+            status: WorkingDirectoryStatusKind::Active,
+            cleanliness: Some("unknown".into()),
+            occupied_by: None,
+        };
+        let value = serde_json::to_value(WorkerWorkdirAttachmentSummary {
+            alias: "sessions".into(),
+            effective_permissions: ExternalWorkdirPermissions {
+                read: false,
+                write: false,
+                command: true,
+            },
+            working_directory: summary,
+        })
+        .unwrap();
+
+        assert_eq!(
+            value["working_directory"]["source"]["grant_permissions"],
+            serde_json::json!({"read": true, "write": false, "command": true})
+        );
+        assert_eq!(
+            value["effective_permissions"],
+            serde_json::json!({"read": false, "write": false, "command": true})
+        );
+        let mut missing = value;
+        missing["working_directory"]["source"]
+            .as_object_mut()
+            .unwrap()
+            .remove("grant_permissions");
+        assert!(serde_json::from_value::<WorkerWorkdirAttachmentSummary>(missing).is_err());
     }
 
     #[test]

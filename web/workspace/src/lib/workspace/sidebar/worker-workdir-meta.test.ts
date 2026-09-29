@@ -111,7 +111,11 @@ Deno.test("Worker sidebar Workdir label uses an External Workdir display name wi
   const meta = sidebarWorkdirMeta([
     attachment("sessions", {
       display_name: "Session analysis",
-      source: { kind: "external_grant", grant_id: "grant-1" },
+      source: {
+        kind: "external_grant",
+        grant_id: "grant-1",
+        grant_permissions: { read: true, write: false, command: false },
+      },
       materializer_kind: "client_hosted_external",
       cleanliness: "unknown",
     }),

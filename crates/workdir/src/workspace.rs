@@ -100,11 +100,24 @@ pub struct RuntimeWorkingDirectorySummary {
     pub occupied_by: Option<WorkingDirectoryOccupancy>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkdirPermissionSummary {
+    pub read: bool,
+    pub write: bool,
+    pub command: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkingDirectorySource {
-    Repository { repository_key: String },
-    ExternalGrant { grant_id: String },
+    Repository {
+        repository_key: String,
+    },
+    ExternalGrant {
+        grant_id: String,
+        grant_permissions: WorkdirPermissionSummary,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

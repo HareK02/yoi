@@ -3973,6 +3973,21 @@ fn external_workdir_capabilities(permissions: &str) -> Result<workdir::WorkdirSe
     Ok(capabilities)
 }
 
+fn workdir_permission_summary(
+    capabilities: workdir::WorkdirSessionCapabilities,
+) -> server_api::ExternalWorkdirPermissions {
+    let read = capabilities.supports(workdir::WorkdirSessionCapability::Read)
+        && capabilities.supports(workdir::WorkdirSessionCapability::Glob)
+        && capabilities.supports(workdir::WorkdirSessionCapability::Grep);
+    server_api::ExternalWorkdirPermissions {
+        read,
+        write: read
+            && capabilities.supports(workdir::WorkdirSessionCapability::Write)
+            && capabilities.supports(workdir::WorkdirSessionCapability::Edit),
+        command: capabilities.supports(workdir::WorkdirSessionCapability::Command),
+    }
+}
+
 fn workdir_source_capabilities(
     api: &WorkspaceApi,
     workdir: &WorkdirRegistryRecord,
@@ -4115,6 +4130,19 @@ fn ticket_target_capabilities_for_workdir(
         )));
     }
     Ok(target.capabilities.intersection(source_capabilities))
+}
+
+fn effective_worker_workdir_capabilities(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    workdir: &WorkdirRegistryRecord,
+    link_capabilities: workdir::WorkdirSessionCapabilities,
+) -> Result<workdir::WorkdirSessionCapabilities> {
+    Ok(link_capabilities
+        .intersection(workdir_source_capabilities(api, workdir)?)
+        .intersection(ticket_target_capabilities_for_workdir(
+            api, worker, workdir,
+        )?))
 }
 
 #[derive(Clone, Debug)]
@@ -14146,12 +14174,8 @@ async fn open_current_worker_workdir_session_locked(
                 link.workdir_id
             ),
         })?;
-    let effective_capabilities = link
-        .capabilities
-        .intersection(workdir_source_capabilities(api, &workdir)?)
-        .intersection(ticket_target_capabilities_for_workdir(
-            api, worker, &workdir,
-        )?);
+    let effective_capabilities =
+        effective_worker_workdir_capabilities(api, worker, &workdir, link.capabilities)?;
     if let WorkdirRegistrySource::ExternalGrant { grant_id } = &workdir.source {
         close_current_worker_attachment_session_locked(api, worker).await?;
         let mut grant = api
@@ -23752,6 +23776,9 @@ fn project_workspace_worker(
     api: &WorkspaceApi,
     summary: InternalWorkerSummary,
 ) -> ApiResult<server_api::WorkerSummary> {
+    let links = api
+        .store
+        .list_worker_workdir_links(&api.config.workspace_id, &summary.worker)?;
     let workdir_attachments = summary
         .workdir_attachments
         .iter()
@@ -23761,8 +23788,29 @@ fn project_workspace_worker(
                 &summary.worker.runtime_id,
                 &attachment.working_directory.summary,
             );
+            let link = links
+                .iter()
+                .find(|link| {
+                    link.unlinked_at.is_none()
+                        && link.alias == attachment.alias.as_str()
+                        && link.workdir_id == record.workdir_id
+                })
+                .ok_or_else(|| {
+                    Error::RegistryInconsistency(format!(
+                        "Worker {}:{} attachment `{}` has no active durable Workdir link",
+                        summary.worker.runtime_id, summary.worker.worker_id, attachment.alias
+                    ))
+                })?;
             Ok(server_api::WorkerWorkdirAttachmentSummary {
                 alias: attachment.alias.to_string(),
+                effective_permissions: workdir_permission_summary(
+                    effective_worker_workdir_capabilities(
+                        api,
+                        &summary.worker,
+                        &record,
+                        link.capabilities,
+                    )?,
+                ),
                 working_directory: projected_workdir_summary_from_record(api, &record)?.into(),
             })
         })
@@ -24720,10 +24768,14 @@ fn project_worker_registry_projection(
         else {
             continue;
         };
+        let effective_permissions = workdir_permission_summary(
+            effective_worker_workdir_capabilities(api, &record.worker, workdir, link.capabilities)?,
+        );
         workdir_attachments.push(server_api::WorkerWorkdirAttachmentSummary {
             alias: workdir::WorkdirAttachmentAlias::new(link.alias)
                 .expect("persisted attachment aliases are validated on write")
                 .to_string(),
+            effective_permissions,
             working_directory: projected_workdir_summary_from_record(api, workdir)?.into(),
         });
     }
@@ -25106,6 +25158,7 @@ fn runtime_workdir_summary_from_record(
 fn workdir_summary_from_record(
     record: &WorkdirRegistryRecord,
     repository_key: Option<&str>,
+    external_grant_permissions: Option<workdir::workspace::WorkdirPermissionSummary>,
 ) -> WorkingDirectorySummary {
     let status = match record.materialization_status.as_str() {
         "present" => WorkingDirectoryStatusKind::Active,
@@ -25134,6 +25187,8 @@ fn workdir_summary_from_record(
         WorkdirRegistrySource::ExternalGrant { grant_id } => (
             WorkingDirectorySource::ExternalGrant {
                 grant_id: grant_id.clone(),
+                grant_permissions: external_grant_permissions
+                    .expect("External Workdir projection requires grant permissions"),
             },
             MaterializerKind::ClientHostedExternal,
             None,
@@ -25192,16 +25247,39 @@ fn projected_workdir_summary_from_record(
     api: &WorkspaceApi,
     record: &WorkdirRegistryRecord,
 ) -> Result<WorkingDirectorySummary> {
-    let repository_key = match &record.source {
-        WorkdirRegistrySource::Repository { repository_id, .. } => Some(
-            api.store
-                .get_repository(&record.workspace_id, repository_id)?
-                .ok_or_else(|| Error::UnknownRepository(repository_id.clone()))?
-                .repository_key,
+    let (repository_key, external_grant_permissions) = match &record.source {
+        WorkdirRegistrySource::Repository { repository_id, .. } => (
+            Some(
+                api.store
+                    .get_repository(&record.workspace_id, repository_id)?
+                    .ok_or_else(|| Error::UnknownRepository(repository_id.clone()))?
+                    .repository_key,
+            ),
+            None,
         ),
-        WorkdirRegistrySource::ExternalGrant { .. } => None,
+        WorkdirRegistrySource::ExternalGrant { grant_id } => (
+            None,
+            Some({
+                let permissions = api
+                    .store
+                    .get_external_workdir_grant(&record.workspace_id, grant_id)?
+                    .ok_or_else(|| {
+                        Error::Store("External Workdir grant is unavailable".to_string())
+                    })
+                    .and_then(|grant| external_workdir_permissions(&grant.permissions))?;
+                workdir::workspace::WorkdirPermissionSummary {
+                    read: permissions.read,
+                    write: permissions.write,
+                    command: permissions.command,
+                }
+            }),
+        ),
     };
-    let mut summary = workdir_summary_from_record(record, repository_key.as_deref());
+    let mut summary = workdir_summary_from_record(
+        record,
+        repository_key.as_deref(),
+        external_grant_permissions,
+    );
     apply_workdir_occupancy_projection(api, &mut summary)?;
     Ok(summary)
 }
@@ -27375,13 +27453,25 @@ mod tests {
         let mut workdir_ids = Vec::new();
 
         for index in 1..=2 {
+            let (permissions, capabilities) = if index == 1 {
+                (
+                    "command_only",
+                    workdir::WorkdirSessionCapabilities::COMMAND_ONLY,
+                )
+            } else {
+                (
+                    "read_command",
+                    workdir::WorkdirSessionCapabilities::READ_ONLY
+                        .union(workdir::WorkdirSessionCapabilities::COMMAND_ONLY),
+                )
+            };
             let grant = ExternalWorkdirGrantRecord {
                 grant_id: format!("launch-grant-{index}"),
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 workdir_id: format!("launch-external-{index}"),
                 provider_instance_id: format!("launch-provider-{index}"),
                 display_name: format!("External launch {index}"),
-                permissions: "read_only".to_string(),
+                permissions: permissions.to_string(),
                 created_by: test_browser_request_actor().account_id,
                 created_at: now.clone(),
                 expires_at: Some(expires_at.to_rfc3339_opts(SecondsFormat::Nanos, true)),
@@ -27432,7 +27522,7 @@ mod tests {
                 provider_instance_id: grant.provider_instance_id.clone(),
                 generation: 1,
                 expires_at: Some(expires_at),
-                capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+                capabilities,
                 admission: Arc::new(tokio::sync::Semaphore::new(16)),
                 shutdown_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 sender,
@@ -27454,6 +27544,33 @@ mod tests {
             .map(|summary| summary.working_directory_id.as_str())
             .collect::<HashSet<_>>();
         assert!(workdir_ids.iter().all(|id| available.contains(id.as_str())));
+        for (index, workdir_id) in workdir_ids.iter().enumerate() {
+            let summary = options
+                .working_directories
+                .iter()
+                .find(|summary| summary.working_directory_id == *workdir_id)
+                .unwrap();
+            let expected_permissions = if index == 0 {
+                server_api::ExternalWorkdirPermissions {
+                    read: false,
+                    write: false,
+                    command: true,
+                }
+            } else {
+                server_api::ExternalWorkdirPermissions {
+                    read: true,
+                    write: false,
+                    command: true,
+                }
+            };
+            assert!(matches!(
+                &summary.source,
+                server_api::WorkingDirectorySource::ExternalGrant {
+                    grant_permissions,
+                    ..
+                } if *grant_permissions == expected_permissions
+            ));
+        }
 
         let Json(worker) = create_workspace_worker(
             State(api.clone()),
@@ -27491,7 +27608,194 @@ mod tests {
                 .collect::<HashSet<_>>(),
             HashSet::from(["primary", "reference"]),
         );
-        drop(receivers);
+
+        let worker_ref = RuntimeWorkerRef::new(&worker.runtime_id, &worker.worker_id);
+        let links = api
+            .store
+            .list_worker_workdir_links(TEST_WORKSPACE_ID, &worker_ref)
+            .unwrap();
+        let projected_worker = workers_response(api.clone())
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|candidate| candidate.worker_id == worker.worker_id)
+            .unwrap();
+        for (index, receiver) in receivers.iter_mut().enumerate() {
+            let expected_capabilities = if index == 0 {
+                workdir::WorkdirSessionCapabilities::COMMAND_ONLY
+            } else {
+                workdir::WorkdirSessionCapabilities::READ_ONLY
+                    .union(workdir::WorkdirSessionCapabilities::COMMAND_ONLY)
+            };
+            let link = links
+                .iter()
+                .find(|link| link.workdir_id == workdir_ids[index])
+                .unwrap();
+            assert_eq!(link.capabilities, expected_capabilities);
+            let projected_attachment = projected_worker
+                .workdir_attachments
+                .iter()
+                .find(|attachment| {
+                    attachment.working_directory.working_directory_id == workdir_ids[index]
+                })
+                .unwrap();
+            assert_eq!(
+                projected_attachment.effective_permissions,
+                workdir_permission_summary(expected_capabilities)
+            );
+
+            let session_lock = current_worker_session_lock(&api, &worker_ref);
+            let session_guard = session_lock.lock().await;
+            let session = open_current_worker_workdir_session_locked(&api, &worker_ref, link)
+                .await
+                .unwrap();
+            drop(session_guard);
+            assert_eq!(session.capabilities(), expected_capabilities);
+            if index == 0 {
+                let denied = session
+                    .read(workdir::ReadRequest {
+                        path: workdir::WorkdirPath::new("forbidden.txt").unwrap(),
+                        offset: 0,
+                        limit: 1,
+                        max_bytes: 1,
+                    })
+                    .await;
+                assert!(matches!(
+                    denied,
+                    Err(workdir::WorkdirError::Unsupported(
+                        workdir::WorkdirSessionCapability::Read
+                    )) | Err(workdir::WorkdirError::Denied(_))
+                ));
+            }
+
+            let mut starter = {
+                let session = session.clone();
+                tokio::spawn(async move {
+                    session
+                        .start_command(workdir::CommandRequest {
+                            command: "printf attached".to_string(),
+                            timeout_secs: 30,
+                            output_limit: 1024,
+                            cwd: workdir::WorkdirPath::root(),
+                            spill_dir: None,
+                            tool_call_id: None,
+                        })
+                        .await
+                })
+            };
+            let provider_handle = workdir::CommandHandle(format!("provider-command-{index}"));
+            let provider_operation = tokio::select! {
+                result = &mut starter => panic!("attached command ended before provider routing: {result:?}"),
+                operation = receiver.recv() => operation,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                    panic!("attached command was not routed to the provider")
+                }
+            };
+            let Some(ExternalProviderCommand::Operation {
+                operation,
+                response,
+                ..
+            }) = provider_operation
+            else {
+                panic!("expected attached command start operation");
+            };
+            assert!(matches!(
+                operation,
+                WorkdirSessionOperation::CommandStart(_)
+            ));
+            response
+                .send(Ok(WorkdirSessionOperationResult::CommandStart(
+                    provider_handle.clone(),
+                )))
+                .unwrap();
+            let external_handle = tokio::time::timeout(std::time::Duration::from_secs(2), starter)
+                .await
+                .expect("attached command start response timed out")
+                .unwrap()
+                .unwrap();
+
+            let output_handle = external_handle.clone();
+            let mut canceler = {
+                let session = session.clone();
+                tokio::spawn(async move { session.cancel_command(external_handle).await })
+            };
+            let provider_cancellation = tokio::select! {
+                result = &mut canceler => panic!("attached cancellation ended before provider routing: {result:?}"),
+                operation = receiver.recv() => operation,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                    panic!("attached cancellation was not routed to the provider")
+                }
+            };
+            let Some(ExternalProviderCommand::Operation {
+                operation,
+                response,
+                ..
+            }) = provider_cancellation
+            else {
+                panic!("expected attached command cancellation");
+            };
+            assert!(matches!(
+                operation,
+                WorkdirSessionOperation::CommandCancel(ref handle) if handle == &provider_handle
+            ));
+            response
+                .send(Ok(WorkdirSessionOperationResult::CommandCancel))
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), canceler)
+                .await
+                .expect("attached command cancellation response timed out")
+                .unwrap()
+                .unwrap();
+
+            let output = {
+                let session = session.clone();
+                tokio::spawn(async move {
+                    session
+                        .command_output(workdir::CommandOutputRequest {
+                            handle: output_handle,
+                            cursor: 0,
+                            limit: 1024,
+                            wait: true,
+                        })
+                        .await
+                })
+            };
+            let Some(ExternalProviderCommand::Operation {
+                operation,
+                response,
+                ..
+            }) = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+                .await
+                .expect("attached terminal output was not routed to the provider")
+            else {
+                panic!("expected attached terminal command output");
+            };
+            assert!(matches!(
+                operation,
+                WorkdirSessionOperation::CommandOutput(workdir::CommandOutputRequest {
+                    wait: true,
+                    ..
+                })
+            ));
+            response
+                .send(Ok(WorkdirSessionOperationResult::CommandOutput(
+                    workdir::CommandOutput {
+                        status: workdir::CommandStatus::Cancelled,
+                        exit_code: None,
+                        timed_out: false,
+                        content: String::new(),
+                        next_cursor: None,
+                        truncated: false,
+                        output_path: None,
+                    },
+                )))
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), output)
+                .await
+                .expect("attached terminal output response timed out")
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[tokio::test]
@@ -29751,7 +30055,7 @@ mod tests {
         assert_eq!(attachment.alias, "attachment");
         assert!(matches!(
             &attachment.working_directory.source,
-            server_api::WorkingDirectorySource::ExternalGrant { grant_id }
+            server_api::WorkingDirectorySource::ExternalGrant { grant_id, .. }
                 if grant_id == "external-grant"
         ));
         assert_eq!(
@@ -32031,7 +32335,7 @@ mod tests {
             updated_at: "2".to_string(),
         };
 
-        let projected = workdir_summary_from_record(&workdir, Some("main"));
+        let projected = workdir_summary_from_record(&workdir, Some("main"), None);
 
         assert_eq!(projected.status, WorkingDirectoryStatusKind::Active);
         let serialized = serde_json::to_string(&projected).unwrap();

@@ -53,7 +53,11 @@ Deno.test("Workdir REST validation accepts External grant sources without Runtim
     item: {
       working_directory_id: "external-1",
       display_name: "Session analysis",
-      source: { kind: "external_grant", grant_id: "grant-1" },
+      source: {
+        kind: "external_grant",
+        grant_id: "grant-1",
+        grant_permissions: { read: true, write: false, command: true },
+      },
       materializer_kind: "client_hosted_external",
       status: "active",
       cleanliness: "unknown",
@@ -65,6 +69,52 @@ Deno.test("Workdir REST validation accepts External grant sources without Runtim
   }
   if (detail.item.source.kind !== "external_grant") {
     throw new Error("External Workdir source was not preserved");
+  }
+  if (
+    !detail.item.source.grant_permissions.read ||
+    detail.item.source.grant_permissions.write ||
+    !detail.item.source.grant_permissions.command
+  ) {
+    throw new Error("External Workdir grant permissions were not preserved");
+  }
+});
+
+Deno.test("Workdir REST validation rejects missing or misplaced External grant permissions", () => {
+  for (
+    const source of [
+      { kind: "external_grant", grant_id: "grant-1" },
+      {
+        kind: "external_grant",
+        grant_id: "grant-1",
+        grant_permissions: { read: true, write: false, command: "yes" },
+      },
+      {
+        kind: "repository",
+        repository_key: "main",
+        grant_permissions: { read: true, write: false, command: false },
+      },
+    ]
+  ) {
+    let rejected = false;
+    try {
+      parseWorkingDirectoryDetailResponse({
+        workspace_id: "workspace-a",
+        item: {
+          working_directory_id: "invalid-1",
+          source,
+          materializer_kind: source.kind === "repository"
+            ? "runtime_git_clone"
+            : "client_hosted_external",
+          status: "active",
+        },
+        diagnostics: [],
+      });
+    } catch {
+      rejected = true;
+    }
+    if (!rejected) {
+      throw new Error(`invalid External permission projection was accepted: ${JSON.stringify(source)}`);
+    }
   }
 });
 

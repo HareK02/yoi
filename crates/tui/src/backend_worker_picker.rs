@@ -522,14 +522,29 @@ fn working_directory_text(worker: &BackendWorkerSummary) -> String {
     }
     let attachment = &worker.workdir_attachments[0];
     let directory = &attachment.working_directory;
-    let source_label = match &directory.source {
-        BackendWorkingDirectorySource::Repository { repository_key } => repository_key.as_str(),
-        BackendWorkingDirectorySource::ExternalGrant { .. } => "external",
+    let (source_label, permission_label) = match &directory.source {
+        BackendWorkingDirectorySource::Repository { repository_key } => {
+            (repository_key.as_str(), String::new())
+        }
+        BackendWorkingDirectorySource::ExternalGrant { .. } => {
+            let permissions = &attachment.effective_permissions;
+            let mut categories = Vec::new();
+            if permissions.read {
+                categories.push("READ");
+            }
+            if permissions.write {
+                categories.push("WRITE");
+            }
+            if permissions.command {
+                categories.push("COMMAND");
+            }
+            ("external", format!("・{}", categories.join("・")))
+        }
     };
     let label = directory.display_name.as_deref().unwrap_or(source_label);
     format!(
-        "wd:{}:{}・{}",
-        attachment.alias, label, directory.working_directory_id
+        "wd:{}:{}{}・{}",
+        attachment.alias, label, permission_label, directory.working_directory_id
     )
 }
 
@@ -826,6 +841,7 @@ mod tests {
         worker.workdir_attachments = vec![
             serde_json::from_value(serde_json::json!({
                 "alias": "checkout",
+                "effective_permissions": {"read": true, "write": true, "command": true},
                 "working_directory": {
                     "working_directory_id": "001a06a9f0202000000",
                     "display_name": "Checkout",
@@ -871,6 +887,7 @@ mod tests {
             worker.workdir_attachments = vec![
                 serde_json::from_value(serde_json::json!({
                     "alias": "checkout",
+                    "effective_permissions": {"read": true, "write": true, "command": true},
                     "working_directory": {
                         "working_directory_id": "workdir-1",
                         "source": {"kind": "repository", "repository_key": "main"},
@@ -898,6 +915,34 @@ mod tests {
         assert_eq!(
             display_column(&first, "wd:checkout:main"),
             display_column(&second, "wd:checkout:main")
+        );
+    }
+
+    #[test]
+    fn worker_row_shows_external_attachment_effective_permissions() {
+        let mut worker = worker("runtime-a", "worker-a", None);
+        worker.workdir_attachments = vec![
+            serde_json::from_value(serde_json::json!({
+                "alias": "sessions",
+                "effective_permissions": {"read": false, "write": false, "command": true},
+                "working_directory": {
+                    "working_directory_id": "external-1",
+                    "display_name": "Session data",
+                    "source": {
+                        "kind": "external_grant",
+                        "grant_id": "grant-1",
+                        "grant_permissions": {"read": true, "write": false, "command": true}
+                    },
+                    "materializer_kind": "client_hosted_external",
+                    "status": "active"
+                }
+            }))
+            .unwrap(),
+        ];
+
+        assert_eq!(
+            working_directory_text(&worker),
+            "wd:sessions:Session data・COMMAND・external-1"
         );
     }
 

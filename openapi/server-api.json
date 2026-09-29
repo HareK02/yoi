@@ -11940,12 +11940,17 @@
           "alias": {
             "type": "string"
           },
+          "effective_permissions": {
+            "$ref": "#/components/schemas/ExternalWorkdirPermissions",
+            "description": "Current effective category authority after intersecting the durable link,\nsource grant, and Ticket target ceilings. This is independent from\nprovider liveness and may be narrower than the grant ceiling."
+          },
           "working_directory": {
             "$ref": "#/components/schemas/WorkingDirectorySummary"
           }
         },
         "required": [
           "alias",
+          "effective_permissions",
           "working_directory"
         ],
         "type": "object"
@@ -12235,6 +12240,10 @@
               "grant_id": {
                 "type": "string"
               },
+              "grant_permissions": {
+                "$ref": "#/components/schemas/ExternalWorkdirPermissions",
+                "description": "Operator-approved ceiling for this External Workdir grant. Worker\nattachment authority is projected separately after attenuation."
+              },
               "kind": {
                 "const": "external_grant",
                 "type": "string"
@@ -12242,7 +12251,8 @@
             },
             "required": [
               "kind",
-              "grant_id"
+              "grant_id",
+              "grant_permissions"
             ],
             "type": "object"
           }
@@ -14010,7 +14020,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:e0407f2ae3f1d454d05543627b87eff8eb001b5a90a900ca5af91d7bb492c3be"
+    "x-yoi-source-digest": "sha256:3a298734fd19f3a224e4f1503385fb8a823b612d328224f45f677ebaca28b96c"
   },
   "openapi": "3.1.0",
   "paths": {

@@ -1,5 +1,6 @@
 import type {
   Diagnostic,
+  ExternalWorkdirPermissions,
   WorkingDirectoryCleanupTarget,
   WorkingDirectoryCreateRequest,
   WorkingDirectoryCreateResponse,
@@ -176,13 +177,15 @@ export function parseWorkingDirectorySummary(
 function parseWorkingDirectorySource(value: unknown): WorkingDirectorySource {
   const source = exactRecord(
     value,
-    new Set(["kind", "repository_key", "grant_id"]),
+    new Set(["kind", "repository_key", "grant_id", "grant_permissions"]),
     "Workdir source",
   );
   const kind = stringField(source, "kind");
   if (kind === "repository") {
-    if (source.grant_id !== undefined) {
-      throw new Error("Repository Workdir source must not contain grant_id");
+    if (source.grant_id !== undefined || source.grant_permissions !== undefined) {
+      throw new Error(
+        "Repository Workdir source must not contain External grant authority",
+      );
     }
     return {
       kind,
@@ -198,9 +201,29 @@ function parseWorkingDirectorySource(value: unknown): WorkingDirectorySource {
     return {
       kind,
       grant_id: stringField(source, "grant_id"),
+      grant_permissions: parseExternalWorkdirPermissions(
+        source.grant_permissions,
+        "External Workdir grant permissions",
+      ),
     };
   }
   throw new Error("Workdir source.kind has an unsupported value");
+}
+
+export function parseExternalWorkdirPermissions(
+  value: unknown,
+  label = "External Workdir permissions",
+): ExternalWorkdirPermissions {
+  const permissions = exactRecord(
+    value,
+    new Set(["read", "write", "command"]),
+    label,
+  );
+  return {
+    read: booleanField(permissions, "read", label),
+    write: booleanField(permissions, "write", label),
+    command: booleanField(permissions, "command", label),
+  };
 }
 
 function parseCleanupTarget(value: unknown): WorkingDirectoryCleanupTarget {
@@ -256,6 +279,18 @@ function stringField(record: Record<string, unknown>, key: string): string {
   const value = record[key];
   if (typeof value !== "string" || value.length === 0) {
     throw new Error(`${key} must be a non-empty string`);
+  }
+  return value;
+}
+
+function booleanField(
+  record: Record<string, unknown>,
+  key: string,
+  label: string,
+): boolean {
+  const value = record[key];
+  if (typeof value !== "boolean") {
+    throw new Error(`${label}.${key} must be a boolean`);
   }
   return value;
 }
