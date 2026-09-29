@@ -260,6 +260,7 @@ impl Tool for ContextRecordingTool {
 struct ControlledStreamClient {
     receiver: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Result<Event, ClientError>>>>>,
     completion_support: ToolCallCompletionSupport,
+    stream_calls: Arc<AtomicUsize>,
 }
 
 impl ControlledStreamClient {
@@ -274,15 +275,21 @@ impl ControlledStreamClient {
             Self {
                 receiver: Arc::new(Mutex::new(Some(rx))),
                 completion_support,
+                stream_calls: Arc::new(AtomicUsize::new(0)),
             },
             tx,
         )
+    }
+
+    fn stream_count(&self) -> usize {
+        self.stream_calls.load(Ordering::SeqCst)
     }
 }
 
 #[async_trait]
 impl LlmClient for ControlledStreamClient {
     async fn stream(&self, _request: Request) -> Result<ResponseStream, ClientError> {
+        self.stream_calls.fetch_add(1, Ordering::SeqCst);
         let mut rx = self
             .receiver
             .lock()
@@ -633,9 +640,29 @@ async fn blocking_pre_tool_policy_keeps_receiving_stream_and_services_pause() {
     pause.send(()).await.unwrap();
     drop(tx);
 
-    let (output, _history) = run.await.unwrap();
+    let (output, mut history) = run.await.unwrap();
     assert!(matches!(output.result, EngineRunExit::Paused));
     assert_eq!(probe.call_count(), 0);
+    assert!(history.items().any(|item| matches!(
+        item,
+        Item::ToolCall {
+            call_id,
+            execution_id: None,
+            status: Some(agen::llm_client::ItemStatus::Completed),
+            ..
+        } if call_id == "call_blocked_policy"
+    )));
+
+    let mut restored = Engine::new(MockLlmClient::new(vec![Event::Status(StatusEvent {
+        status: ResponseStatus::Completed,
+    })]));
+    restored.register_tool(probe.definition());
+    let _ = restored.resume(&mut history).await;
+    assert_eq!(probe.call_count(), 1);
+    assert!(history.items().any(|item| matches!(
+        item,
+        Item::ToolResult { call_id, .. } if call_id == "call_blocked_policy"
+    )));
 }
 
 #[tokio::test]
@@ -703,7 +730,7 @@ async fn blocking_pre_tool_policy_keeps_receiving_stream_and_services_cancel() {
     cancel.send(()).await.unwrap();
     drop(tx);
 
-    let (output, _history) = tokio::time::timeout(Duration::from_secs(1), run)
+    let (output, mut history) = tokio::time::timeout(Duration::from_secs(1), run)
         .await
         .expect("cancel does not deadlock the bounded stream pump")
         .unwrap();
@@ -712,6 +739,26 @@ async fn blocking_pre_tool_policy_keeps_receiving_stream_and_services_cancel() {
         EngineRunExit::Interrupted(RunInterruptionReason::Cancelled)
     ));
     assert_eq!(probe.call_count(), 0);
+    assert!(history.items().any(|item| matches!(
+        item,
+        Item::ToolCall {
+            call_id,
+            execution_id: None,
+            status: Some(agen::llm_client::ItemStatus::Completed),
+            ..
+        } if call_id == "call_cancelled_policy"
+    )));
+
+    let mut restored = Engine::new(MockLlmClient::new(vec![Event::Status(StatusEvent {
+        status: ResponseStatus::Completed,
+    })]));
+    restored.register_tool(probe.definition());
+    let _ = restored.resume(&mut history).await;
+    assert_eq!(probe.call_count(), 1);
+    assert!(history.items().any(|item| matches!(
+        item,
+        Item::ToolResult { call_id, .. } if call_id == "call_cancelled_policy"
+    )));
 }
 
 #[tokio::test]
@@ -1536,6 +1583,60 @@ async fn interrupted_stream_after_early_start_terminalizes_without_continuation_
         probe.starts.load(Ordering::SeqCst),
         1,
         "terminalized early calls must not be resumed"
+    );
+}
+
+#[tokio::test]
+async fn clean_eof_without_provider_completion_after_early_start_stops_without_continuation() {
+    let (client, tx) = ControlledStreamClient::new(ToolCallCompletionSupport::PerBlock);
+    let client_probe = client.clone();
+    let tool = BarrierTool::new("barrier_clean_eof");
+    let probe = tool.clone();
+    let mut engine = Engine::new(client);
+    engine.set_tool_call_dispatch_mode(ToolCallDispatchMode::OnToolCallComplete);
+    engine.register_tool(tool.definition());
+
+    let run = tokio::spawn(async move {
+        let mut history = History::new();
+        let output = engine.run(&mut history, "run").await;
+        (output, history)
+    });
+    tx.send(Ok(Event::tool_use_start(
+        0,
+        "call_clean_eof",
+        "barrier_clean_eof",
+    )))
+    .unwrap();
+    tx.send(Ok(Event::tool_input_delta(0, r#"{}"#))).unwrap();
+    tx.send(Ok(Event::tool_use_stop(0))).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), probe.started.notified())
+        .await
+        .expect("tool starts before clean transport EOF");
+    probe.release.notify_one();
+    drop(tx);
+
+    let (output, history) = run.await.unwrap();
+    assert!(matches!(
+        output.result,
+        EngineRunExit::Interrupted(RunInterruptionReason::Unexpected(EngineError::Client(
+            ClientError::Api {
+                code: Some(ref code),
+                ..
+            }
+        ))) if code == "early_tool_stream_interrupted"
+    ));
+    assert_eq!(
+        client_probe.stream_count(),
+        1,
+        "must not open a continuation request"
+    );
+    assert_eq!(probe.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        history
+            .items()
+            .filter(|item| matches!(item, Item::ToolResult { call_id, .. } if call_id == "call_clean_eof"))
+            .count(),
+        1
     );
 }
 

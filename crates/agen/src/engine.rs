@@ -1529,12 +1529,28 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                     if pause.is_some() {
                         info!(call_id = %expected_tool_use_id, "Paused while awaiting pre-tool policy");
                     }
+                    self.append_early_tool_call(
+                        history,
+                        annotate,
+                        &tool_call,
+                        call_index,
+                        None,
+                    )?;
+                    batch.dispatched_any = true;
                     return Ok(EarlyToolAdmission::Pause);
                 }
                 cancel = self.cancel_rx.recv() => {
                     if cancel.is_some() {
                         info!(call_id = %expected_tool_use_id, "Cancelled while awaiting pre-tool policy");
                     }
+                    self.append_early_tool_call(
+                        history,
+                        annotate,
+                        &tool_call,
+                        call_index,
+                        None,
+                    )?;
+                    batch.dispatched_any = true;
                     return Err(EngineError::Cancelled);
                 }
             };
@@ -1664,6 +1680,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                 }
                 PreToolAction::Pause => {
                     self.append_early_tool_call(history, annotate, &tool_call, call_index, None)?;
+                    batch.dispatched_any = true;
                     return Ok(EarlyToolAdmission::Pause);
                 }
             }
@@ -3192,6 +3209,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         self.tool_call_collector.begin_response();
         let mut stream = ResponseStreamPump::start(stream);
         let mut early_tools: Option<EarlyToolExecutionBatch> = None;
+        let mut response_completed = false;
 
         let mut event_count: usize = 0;
         loop {
@@ -3228,6 +3246,14 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                                     "stream_first_event",
                                     json!({}),
                                 );
+                            }
+                            if matches!(
+                                &event,
+                                Event::Status(StatusEvent {
+                                    status: crate::llm_client::event::ResponseStatus::Completed,
+                                })
+                            ) {
+                                response_completed = true;
                             }
                             self.emit_stream_event(turn, llm_call, &event);
                             self.timeline.dispatch(&event);
@@ -3375,7 +3401,21 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                                 }));
                             }
                         }
-                        None => break,
+                        None if response_completed => break,
+                        None => {
+                            // A clean transport EOF is not an authoritative provider
+                            // response boundary. Treat it exactly like an interrupted
+                            // stream so any early side effect is terminalized and never
+                            // followed by automatic continuation/regeneration.
+                            self.timeline.flush_usage();
+                            return Ok(StreamResponseOutput {
+                                completion: StreamCompletion::Interrupted {
+                                    reason: "LLM stream ended before provider completion status"
+                                        .to_string(),
+                                },
+                                early_tools,
+                            });
+                        }
                     }
                 }
                 terminal = async {
