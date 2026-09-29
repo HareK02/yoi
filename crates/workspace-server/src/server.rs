@@ -119,12 +119,12 @@ use workdir::workspace::{
     WorkspaceWorkdirSessionOperationRequest,
 };
 use workdir::{CommandHandle, WorkdirSessionHandle};
+#[cfg(test)]
+use worker_runtime::catalog::WorkingDirectoryAttachmentStatus;
 use worker_runtime::http_server::{
     RUNTIME_HTTP_PROTOCOL_MAX_VERSION, RUNTIME_HTTP_PROTOCOL_MIN_VERSION,
     RUNTIME_HTTP_PROTOCOL_VERSION,
 };
-#[cfg(test)]
-use worker_runtime::catalog::WorkingDirectoryAttachmentStatus;
 #[cfg(test)]
 use worker_runtime::resource::BackendResourceError;
 use worker_runtime::resource::BackendResourceFetchRequest;
@@ -16765,13 +16765,19 @@ fn workdir_removal_source_actor(
 fn contract_workdir_removal_source_actor(
     context: &server_api::ServerRequestContext,
 ) -> ApiResult<String> {
-    workdir_removal_source_actor(
-        context
-            .worker_source
-            .as_ref()
-            .map(|source| (source.runtime_id.as_str(), source.worker_id.as_str())),
-        context.actor.as_ref(),
-    )
+    let worker_source = context
+        .worker_source
+        .as_ref()
+        .map(|source| (source.runtime_id.as_str(), source.worker_id.as_str()))
+        .or_else(|| {
+            context.runtime_source.as_ref().and_then(|source| {
+                source
+                    .worker_id
+                    .as_deref()
+                    .map(|worker_id| (source.runtime_id.as_str(), worker_id))
+            })
+        });
+    workdir_removal_source_actor(worker_source, context.actor.as_ref())
 }
 
 async fn cleanup_runtime_working_directory_contract(
@@ -22207,13 +22213,8 @@ async fn get_runtime_worker(
         .store
         .list_workdir_registry(&api.config.workspace_id, 500)?;
     let updated_at = record.updated_at.clone();
-    let worker = project_worker_registry_projection(
-        &api,
-        Some(&worker),
-        &record,
-        links,
-        &workdirs,
-    )?;
+    let worker =
+        project_worker_registry_projection(&api, Some(&worker), &record, links, &workdirs)?;
     Ok(Json(server_api::RuntimeWorkerShowResponse {
         worker,
         updated_at,
@@ -28232,6 +28233,36 @@ mod tests {
             .unwrap();
     }
 
+    fn runtime_source_request(
+        identity: &worker_runtime::auth::RuntimeIdentityMaterial,
+        worker_id: Option<&str>,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+    ) -> Request<Body> {
+        let proof = worker_runtime::auth::RuntimeRequestSourceSigner::from_identity(identity)
+            .issue(
+                "server-test",
+                TEST_WORKSPACE_ID,
+                worker_id,
+                worker_runtime::auth::WORKSPACE_REQUEST_PERMISSION,
+                method,
+                path,
+                &body,
+                i64::try_from(worker_runtime::auth::unix_now_seconds()).unwrap_or(i64::MAX),
+                30,
+            )
+            .unwrap();
+        let mut request = Request::builder().method(method).uri(path).header(
+            worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER,
+            proof,
+        );
+        if !body.is_empty() {
+            request = request.header(CONTENT_TYPE, "application/json");
+        }
+        request.body(Body::from(body)).unwrap()
+    }
+
     fn runtime_resource_fetch_request(
         api: &WorkspaceApi,
         identity: &worker_runtime::auth::RuntimeIdentityMaterial,
@@ -28733,8 +28764,7 @@ mod tests {
                         .unwrap(),
                     runtime_id: Some(EMBEDDED_WORKER_RUNTIME_ID.to_string()),
                     resource_key: None,
-                    availability:
-                        protocol::subscription::SubscriptionWorkerAvailability::Observed,
+                    availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
                     subject_revision: 1,
                     worker_state: None,
                     state: protocol::subscription::SubscriptionWorkerState::Paused,
@@ -37674,6 +37704,390 @@ mod tests {
     }
 
     #[test]
+    fn workdir_removal_source_actor_preserves_verified_worker_and_account_sources() {
+        let actor = RequestActor {
+            user_id: "account-user".to_string(),
+            account_id: "account-test".to_string(),
+            handle: "account".to_string(),
+            display_name: "Account".to_string(),
+            auth_method: ActorAuthMethod::ApiToken,
+        };
+        let context = |worker_source, runtime_source, actor| server_api::ServerRequestContext {
+            actor,
+            worker_source,
+            runtime_source,
+            origin: None,
+            transport_headers: Vec::new(),
+        };
+
+        assert_eq!(
+            contract_workdir_removal_source_actor(&context(
+                Some(server_api::ServerWorkerSource {
+                    runtime_id: "legacy-runtime".to_string(),
+                    worker_id: "legacy-worker".to_string(),
+                }),
+                Some(server_api::ServerRuntimeSource {
+                    runtime_id: "runtime-source".to_string(),
+                    worker_id: Some("runtime-worker".to_string()),
+                }),
+                Some(actor.clone()),
+            ))
+            .unwrap(),
+            "worker:legacy-runtime:legacy-worker"
+        );
+        assert_eq!(
+            contract_workdir_removal_source_actor(&context(
+                None,
+                Some(server_api::ServerRuntimeSource {
+                    runtime_id: "runtime-source".to_string(),
+                    worker_id: Some("runtime-worker".to_string()),
+                }),
+                Some(actor.clone()),
+            ))
+            .unwrap(),
+            "worker:runtime-source:runtime-worker"
+        );
+        assert_eq!(
+            contract_workdir_removal_source_actor(&context(
+                None,
+                Some(server_api::ServerRuntimeSource {
+                    runtime_id: "runtime-only".to_string(),
+                    worker_id: None,
+                }),
+                Some(actor.clone()),
+            ))
+            .unwrap(),
+            "account:account-test"
+        );
+        let error = contract_workdir_removal_source_actor(&context(
+            None,
+            Some(server_api::ServerRuntimeSource {
+                runtime_id: "runtime-only".to_string(),
+                worker_id: None,
+            }),
+            None,
+        ))
+        .unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signed_worker_workdir_removal_reaches_both_generated_routes_and_records_actor() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let mut api = test_api(workspace.path()).await;
+        let identity =
+            worker_runtime::auth::RuntimeIdentityMaterial::generate("runtime-source").unwrap();
+        configure_runtime_request_auth(&mut api, &identity, "runtime-source");
+        seed_worker_source_member(&api, "runtime-source", "worker-source");
+        let provider_runtime_id = "runtime-provider";
+        let fixtures = [
+            (
+                "workspace-route-workdir",
+                format!("/api/w/{TEST_WORKSPACE_ID}/working-directories/workspace-route-workdir"),
+                "remove through workspace route",
+            ),
+            (
+                "runtime-route-workdir",
+                format!(
+                    "/api/w/{TEST_WORKSPACE_ID}/runtimes/{provider_runtime_id}/working-directories/runtime-route-workdir"
+                ),
+                "remove through Runtime route",
+            ),
+        ];
+        let runtime = worker_runtime::Runtime::with_execution_backend(
+            worker_runtime::RuntimeOptions::default(),
+            Arc::new(DeterministicExecutionBackend::default()),
+        )
+        .unwrap();
+        let repository_source = server_api::RepositorySource {
+            kind: server_api::RepositorySourceKind::LocalPath,
+            uri: workspace.path().display().to_string(),
+        };
+        let source_fingerprint = repository_source_fingerprint(&repository_source);
+        for (workdir_id, _, _) in &fixtures {
+            runtime
+                .create_working_directory(WorkingDirectoryRequest {
+                    repository: WorkingDirectoryRepository {
+                        id: "repo-test".to_string(),
+                        provider: "git".to_string(),
+                        source: repository_source.clone(),
+                        source_revision: 1,
+                        source_fingerprint: source_fingerprint.clone(),
+                        selector: Some(RuntimeRepositorySelector("HEAD".to_string())),
+                    },
+                    display_name: None,
+                    materializer: Default::default(),
+                    backend_workdir_id: Some((*workdir_id).to_string()),
+                    materialization: None,
+                })
+                .unwrap();
+            seed_cleanup_workdir_for_runtime(
+                &api,
+                workdir_id,
+                provider_runtime_id,
+                "present",
+                "clean",
+            );
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider_base_url = format!("http://{}", listener.local_addr().unwrap());
+        let provider_server = tokio::spawn(serve_runtime_http_with_injected_test_auth(
+            runtime, listener,
+        ));
+        let now = now_registry_timestamp();
+        let provider_identity = RuntimeIdentityMaterial::generate(provider_runtime_id).unwrap();
+        let provider_binding = WorkspaceRuntimeBinding {
+            workspace_id: TEST_WORKSPACE_ID.to_string(),
+            runtime_id: provider_runtime_id.to_string(),
+            display_name: "Runtime Provider".to_string(),
+            base_url: provider_base_url.clone(),
+            public_key: provider_identity.public_key,
+            public_key_fingerprint: String::new(),
+            binding_revision: 1,
+            state: StoredRuntimeBindingState::Verified,
+            authentication_mode: StoredRuntimeAuthenticationMode::LegacyServerIssuer,
+            workspace_key_id: None,
+            workspace_key_generation: None,
+            created_at: now.clone(),
+            updated_at: now,
+            revoked_at: None,
+        };
+        api.store
+            .upsert_workspace_runtime_binding_record(provider_binding.clone(), false)
+            .await
+            .unwrap();
+        api.runtime.register_or_replace(
+            RemoteWorkerRuntime::new(
+                RemoteRuntimeConfig {
+                    runtime_id: provider_runtime_id.to_string(),
+                    workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
+                    display_name: "Runtime Provider".to_string(),
+                    base_url: provider_base_url,
+                    bearer_token: Some(TEST_RUNTIME_HTTP_TOKEN.to_string()),
+                    workspace_authorization: None,
+                    strict_public_egress: false,
+                    cached_worker_creation_available: true,
+                    cached_os: "linux".to_string(),
+                    cached_arch: "x86_64".to_string(),
+                    cached_status: "active".to_string(),
+                    timeout: std::time::Duration::from_secs(2),
+                },
+                TEST_WORKSPACE_ID.to_string(),
+                "http://127.0.0.1:1".to_string(),
+            )
+            .unwrap(),
+        );
+        let observed = api
+            .runtime
+            .working_directory(provider_runtime_id, fixtures[0].0)
+            .unwrap();
+        assert_eq!(
+            observed.state,
+            InternalWorkerOperationState::Accepted,
+            "{observed:?}"
+        );
+        let app = build_router(api.clone());
+
+        for (workdir_id, path, reason) in fixtures {
+            let body = serde_json::to_vec(&json!({ "reason": reason })).unwrap();
+            let response = app
+                .clone()
+                .oneshot(runtime_source_request(
+                    &identity,
+                    Some("worker-source"),
+                    "DELETE",
+                    &path,
+                    body,
+                ))
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{path}: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+            let response: WorkingDirectoryRemovalResponse = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                response.disposition,
+                WorkingDirectoryRemovalDisposition::Removed,
+                "{response:?}"
+            );
+            assert!(
+                api.store
+                    .get_workdir_registry(TEST_WORKSPACE_ID, workdir_id)
+                    .unwrap()
+                    .is_none()
+            );
+            let operation = api
+                .config_store
+                .find_workdir_removal_operation_by_intent(
+                    TEST_WORKSPACE_ID,
+                    workdir_id,
+                    "worker:runtime-source:worker-source",
+                    reason,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                operation.source_actor,
+                "worker:runtime-source:worker-source"
+            );
+            assert_eq!(operation.state, WorkdirRemovalOperationState::Completed);
+            assert_eq!(
+                operation.disposition,
+                Some(WorkdirRemovalDisposition::Removed)
+            );
+        }
+        provider_server.abort();
+    }
+
+    #[tokio::test]
+    async fn workdir_removal_rejects_unverified_or_runtime_only_sources_before_removal() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let mut api = test_api(workspace.path()).await;
+        let identity =
+            worker_runtime::auth::RuntimeIdentityMaterial::generate("runtime-source").unwrap();
+        configure_runtime_request_auth(&mut api, &identity, "runtime-source");
+        let fixtures = [
+            ("runtime-only-workdir", "runtime only"),
+            ("invalid-proof-workdir", "invalid proof"),
+            ("unauthenticated-workdir", "unauthenticated"),
+        ];
+        for (workdir_id, _) in fixtures {
+            seed_cleanup_workdir_for_runtime(
+                &api,
+                workdir_id,
+                EMBEDDED_WORKER_RUNTIME_ID,
+                "present",
+                "clean",
+            );
+        }
+        let app = build_router(api.clone());
+
+        let runtime_only_path =
+            format!("/api/w/{TEST_WORKSPACE_ID}/working-directories/runtime-only-workdir");
+        let runtime_only = app
+            .clone()
+            .oneshot(runtime_source_request(
+                &identity,
+                None,
+                "DELETE",
+                &runtime_only_path,
+                serde_json::to_vec(&json!({ "reason": "runtime only" })).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(runtime_only.status(), StatusCode::FORBIDDEN);
+
+        let invalid_path =
+            format!("/api/w/{TEST_WORKSPACE_ID}/working-directories/invalid-proof-workdir");
+        let invalid = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(&invalid_path)
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(
+                        worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER,
+                        "not-a-valid-proof",
+                    )
+                    .body(Body::from(json!({ "reason": "invalid proof" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
+
+        let unauthenticated_path =
+            format!("/api/w/{TEST_WORKSPACE_ID}/working-directories/unauthenticated-workdir");
+        let unauthenticated = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(&unauthenticated_path)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "reason": "unauthenticated" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        for (workdir_id, _) in fixtures {
+            assert!(
+                api.store
+                    .get_workdir_registry(TEST_WORKSPACE_ID, workdir_id)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn account_workdir_removal_still_records_account_actor_and_preserves_guards() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let token = seed_test_api_token(api.store.as_ref(), "workdir-removal");
+        let workdir_id = "account-occupied-workdir";
+        seed_cleanup_workdir_for_runtime(
+            &api,
+            workdir_id,
+            EMBEDDED_WORKER_RUNTIME_ID,
+            "present",
+            "clean",
+        );
+        let occupant = seed_cleanup_worker(&api, 27, "pinned");
+        seed_cleanup_link(&api, &occupant, workdir_id);
+        let reason = "retain occupied Workdir";
+        let path = format!("/api/w/{TEST_WORKSPACE_ID}/working-directories/{workdir_id}");
+
+        let response = request_json_authenticated(
+            build_router(api.clone()),
+            "DELETE",
+            &path,
+            Some(json!({ "reason": reason })),
+            &token,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(response["disposition"], "retained");
+        assert!(
+            api.store
+                .get_workdir_registry(TEST_WORKSPACE_ID, workdir_id)
+                .unwrap()
+                .is_some()
+        );
+        let operation = api
+            .config_store
+            .find_workdir_removal_operation_by_intent(
+                TEST_WORKSPACE_ID,
+                workdir_id,
+                "account:account-workdir-removal",
+                reason,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.source_actor, "account:account-workdir-removal");
+        assert_eq!(
+            operation.disposition,
+            Some(WorkdirRemovalDisposition::Retained)
+        );
+        assert_eq!(
+            operation.failure_category.as_deref(),
+            Some("blocked_by_live_authority")
+        );
+    }
+
+    #[test]
     fn workdir_session_owner_is_only_sent_for_same_runtime_worker() {
         let embedded_worker = RuntimeWorkerRef::new("embedded-worker-runtime", "5");
         assert_eq!(
@@ -42458,10 +42872,7 @@ mod tests {
                     selector:
                         protocol::subscription::EventSubscriptionSelector::WorkerProtocol { .. },
                     snapshot:
-                        protocol::subscription::SubscriptionSnapshot::WorkerProtocol {
-                            events,
-                            ..
-                        },
+                        protocol::subscription::SubscriptionSnapshot::WorkerProtocol { events, .. },
                     ..
                 },
             ) = frame.payload
