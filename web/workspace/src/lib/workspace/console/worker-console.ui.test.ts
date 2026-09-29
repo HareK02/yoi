@@ -496,11 +496,13 @@ Deno.test("workspace Memory surfaces use read-only scoped memory APIs", async ()
   assert(
     memoryDocumentLoad.includes("workspaceApiPath(params.workspaceId") &&
       memoryDocumentLoad.includes('"/memory"') &&
-      memoryDocumentPage.includes("Memory Document") &&
-      memoryDocumentPage.includes("This view is read-only") &&
+      memoryDocumentPage.includes("DocumentMarkdown from") &&
+      memoryDocumentPage.includes("Read-only") &&
       memoryDocumentPage.includes("data.memory.data.body_md") &&
-      memoryDocumentPage.includes("data.memory.data.updated_at"),
-    "Memory Document page should read the scoped API and expose the durable document without mutation controls",
+      memoryDocumentPage.includes("data.memory.data.updated_at") &&
+      memoryDocumentPage.includes('role="alert"') &&
+      !memoryDocumentPage.includes('<pre class="memory-document-body"'),
+    "Memory Document page should read the scoped API and expose safe Markdown states without mutation controls",
   );
   assert(
     memoryStagingLoad.includes("workspaceApiPath(params.workspaceId") &&
