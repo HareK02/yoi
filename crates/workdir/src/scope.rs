@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex, Weak};
 use async_trait::async_trait;
 use fs_operation::{
     EditRequest, EditResult, FsPath, GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest,
-    ListResult, ReadRequest, ReadResult, StatRequest, StatResult, WriteRequest, WriteResult,
+    ListResult, ReadBytesRequest, ReadBytesResult, ReadRequest, ReadResult, StatRequest,
+    StatResult, WriteRequest, WriteResult,
 };
 use manifest::SymlinkPolicy;
 use schemars::JsonSchema;
@@ -1011,6 +1012,21 @@ impl WorkdirSession for ScopedWorkdirSession {
         self.source.read(request).await
     }
 
+    async fn read_bytes(
+        &self,
+        mut request: ReadBytesRequest,
+    ) -> Result<ReadBytesResult, WorkdirError> {
+        let caller_path = request.path.clone();
+        let path = self
+            .resolve_operation_path(&request.path, WorkdirToolScopePermission::Read)
+            .await?;
+        self.ensure_read(&path, WorkdirSessionCapability::Read)?;
+        request.path = path;
+        let mut result = self.source.read_bytes(request).await?;
+        result.path = caller_path;
+        Ok(result)
+    }
+
     async fn write(&self, mut request: WriteRequest) -> Result<WriteResult, WorkdirError> {
         let _scope_guard = self.scope_lock.lock().await;
         let path = self
@@ -1274,6 +1290,10 @@ impl WorkdirSession for ReadOnlyWorkdirSession {
 
     async fn read(&self, request: ReadRequest) -> Result<ReadResult, WorkdirError> {
         self.inner.read(request).await
+    }
+
+    async fn read_bytes(&self, request: ReadBytesRequest) -> Result<ReadBytesResult, WorkdirError> {
+        self.inner.read_bytes(request).await
     }
 
     async fn write(&self, _request: WriteRequest) -> Result<WriteResult, WorkdirError> {
@@ -1656,6 +1676,15 @@ mod tests {
         }
     }
 
+    fn read_bytes(path: &str) -> ReadBytesRequest {
+        ReadBytesRequest {
+            path: fs_path(path),
+            offset: 0,
+            max_bytes: 1024,
+            expected_hash: None,
+        }
+    }
+
     fn write(path: &str, content: &str) -> WriteRequest {
         WriteRequest {
             path: fs_path(path),
@@ -1887,6 +1916,9 @@ mod tests {
             child.read(read("readme.md")).await.unwrap().bytes,
             b"visible"
         );
+        let binary = child.read_bytes(read_bytes("readme.md")).await.unwrap();
+        assert_eq!(binary.path, fs_path("readme.md"));
+        assert_eq!(binary.bytes, b"visible");
         assert!(matches!(
             child.write(write("new.md", "no")).await,
             Err(WorkdirError::Denied(_))

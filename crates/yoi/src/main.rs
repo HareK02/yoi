@@ -4,9 +4,10 @@ mod objective_cli;
 mod plugin_cli;
 mod session_cli;
 mod ticket_cli;
-mod workdir_share;
 mod worker_cleanup_cli;
 mod workspace_bootstrap;
+
+use yoi::workdir_share;
 
 use std::collections::BTreeMap;
 use std::fmt;

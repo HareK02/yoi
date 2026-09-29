@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::http::{WorkdirSessionOperation, WorkdirSessionOperationResult, WorkdirTransportError};
 use crate::{BoundedReadLimits, WorkdirId, WorkdirPath, WorkdirSessionCapabilities};
 
-pub const EXTERNAL_WORKDIR_PROVIDER_PROTOCOL_VERSION: u16 = 1;
+pub const EXTERNAL_WORKDIR_PROVIDER_PROTOCOL_VERSION: u16 = 2;
 /// Maximum serialized Backend-to-provider command frame size.
 pub const MAX_EXTERNAL_SERVER_FRAME_BYTES: usize = 1024 * 1024;
 /// Maximum serialized provider-to-Backend result frame size. Read bytes are
@@ -155,6 +155,12 @@ fn validate_external_operation(operation: &WorkdirSessionOperation) -> Result<()
                 && request.limit <= 1_000_000
                 && request.max_bytes <= BoundedReadLimits::EXTERNAL_DEFAULT.max_response_bytes
         }
+        WorkdirSessionOperation::ReadBytes(request) => {
+            is_root_relative(&request.path)
+                && request.offset <= BoundedReadLimits::EXTERNAL_DEFAULT.max_source_bytes
+                && (1..=BoundedReadLimits::EXTERNAL_DEFAULT.max_response_bytes)
+                    .contains(&request.max_bytes)
+        }
         WorkdirSessionOperation::List(request) => {
             is_root_relative(&request.path) && request.limit <= MAX_EXTERNAL_RESULT_ITEMS
         }
@@ -274,6 +280,15 @@ fn validate_external_result(result: &WorkdirSessionOperationResult) -> Result<()
         WorkdirSessionOperationResult::Read(result) => {
             is_root_relative(&result.path)
                 && result.bytes.len() <= BoundedReadLimits::EXTERNAL_DEFAULT.max_response_bytes
+        }
+        WorkdirSessionOperationResult::ReadBytes(result) => {
+            let returned_end = result.offset.checked_add(result.bytes.len() as u64);
+            is_root_relative(&result.path)
+                && result.bytes.len() <= BoundedReadLimits::EXTERNAL_DEFAULT.max_response_bytes
+                && result.total_bytes <= BoundedReadLimits::EXTERNAL_DEFAULT.max_source_bytes
+                && returned_end.is_some_and(|end| {
+                    end <= result.total_bytes && result.eof == (end == result.total_bytes)
+                })
         }
         WorkdirSessionOperationResult::List(result) => {
             result.entries.len() <= MAX_EXTERNAL_RESULT_ITEMS
@@ -482,8 +497,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        CommandRequest, EditRequest, GrepResult, ListRequest, ReadRequest, Workdir, WorkdirPath,
-        WriteRequest,
+        CommandRequest, EditRequest, GrepResult, ListRequest, ReadBytesRequest, ReadBytesResult,
+        ReadRequest, Workdir, WorkdirPath, WriteRequest,
     };
 
     fn assert_no_provider_authority(value: &Value) {
@@ -614,7 +629,7 @@ mod tests {
     #[test]
     fn unsupported_protocol_versions_and_invalid_read_limits_fail_closed() {
         let future = r#"{
-            "version": 2,
+            "version": 3,
             "message": {"kind": "heartbeat", "generation": 1, "sequence": 1}
         }"#;
         assert!(serde_json::from_str::<ExternalWorkdirServerFrame>(future).is_err());
@@ -727,9 +742,50 @@ mod tests {
     }
 
     #[test]
+    fn protocol_bounds_binary_read_requests_and_rejects_partial_results() {
+        let path = WorkdirPath::new("image.png").unwrap();
+        let bounded = WorkdirSessionOperation::ReadBytes(ReadBytesRequest {
+            path: path.clone(),
+            offset: 0,
+            max_bytes: BoundedReadLimits::EXTERNAL_DEFAULT.max_response_bytes,
+            expected_hash: None,
+        });
+        assert!(ExternalWorkdirOperation::try_from(bounded).is_ok());
+
+        let oversized = WorkdirSessionOperation::ReadBytes(ReadBytesRequest {
+            path: path.clone(),
+            offset: 0,
+            max_bytes: BoundedReadLimits::EXTERNAL_DEFAULT.max_response_bytes + 1,
+            expected_hash: None,
+        });
+        assert!(ExternalWorkdirOperation::try_from(oversized).is_err());
+
+        let hash = [7; 32];
+        let complete = WorkdirSessionOperationResult::ReadBytes(ReadBytesResult {
+            path: path.clone(),
+            bytes: vec![1, 2, 3],
+            offset: 0,
+            total_bytes: 3,
+            content_hash: hash,
+            eof: true,
+        });
+        assert!(ExternalWorkdirOperationResult::try_from(complete).is_ok());
+
+        let partial_marked_complete = WorkdirSessionOperationResult::ReadBytes(ReadBytesResult {
+            path,
+            bytes: vec![1, 2],
+            offset: 0,
+            total_bytes: 3,
+            content_hash: hash,
+            eof: true,
+        });
+        assert!(ExternalWorkdirOperationResult::try_from(partial_marked_complete).is_err());
+    }
+
+    #[test]
     fn protocol_rejects_unknown_nested_fields_and_unbounded_requests() {
         let unknown = r#"{
-            "version": 1,
+            "version": 2,
             "message": {
                 "kind": "heartbeat",
                 "generation": 1,

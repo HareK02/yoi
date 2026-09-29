@@ -207,6 +207,36 @@ pub struct ReadResult {
     pub truncated: bool,
 }
 
+/// Binary-safe byte range read with an optional whole-file version fence.
+///
+/// Unlike [`ReadRequest`], offsets and limits are bytes rather than lines. The
+/// provider still hashes the complete bounded source so callers can reject
+/// chunks from different file versions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReadBytesRequest {
+    pub path: FsPath,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub offset: u64,
+    #[schemars(range(min = 1, max = 9_007_199_254_740_991_usize))]
+    pub max_bytes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_hash: Option<ContentHash>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReadBytesResult {
+    pub path: FsPath,
+    pub bytes: Vec<u8>,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub offset: u64,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub total_bytes: u64,
+    pub content_hash: ContentHash,
+    pub eof: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WriteRequest {
