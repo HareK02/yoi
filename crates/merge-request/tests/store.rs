@@ -818,7 +818,7 @@ fn ticket_rescope_requires_fresh_review_before_merge_and_remains_recoverable() {
         .request_review(RequestMergeRequestReview {
             merge_request_id: "MR".into(),
             ticket_id: "T".into(),
-            ticket_item_revision: "t2".into(),
+            ticket_item_revision: "T:1".into(),
             ticket_merge_request_subjects: vec![MergeRequestReviewSubject {
                 merge_request_id: "MR".into(),
                 subject_ref: "subject".into(),
@@ -908,7 +908,7 @@ fn ticket_rescope_after_integration_accepts_fresh_requirement_attestation() {
         .request_review(RequestMergeRequestReview {
             merge_request_id: "MR".into(),
             ticket_id: "T".into(),
-            ticket_item_revision: "t2".into(),
+            ticket_item_revision: "T:1".into(),
             ticket_merge_request_subjects: vec![MergeRequestReviewSubject {
                 merge_request_id: "MR".into(),
                 subject_ref: "subject".into(),
@@ -936,7 +936,7 @@ fn ticket_rescope_after_integration_accepts_fresh_requirement_attestation() {
         .complete_ticket(CompleteTicket {
             ticket_id: "T".into(),
             operation_id: "ticket-complete-post-rescope".into(),
-            item_revision: "t2".into(),
+            item_revision: "T:1".into(),
             merge_request_ids: vec!["MR".into()],
             requirement_approval_event_id: requirement_approval.event_id,
             auth: auth(),

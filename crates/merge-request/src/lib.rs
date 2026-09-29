@@ -1655,25 +1655,20 @@ fn current_ticket_revision(
     workspace_id: &str,
     ticket_id: &str,
 ) -> Result<Option<String>, MergeRequestError> {
-    let event_revision = connection
+    let event_index = connection
         .query_row(
-            "SELECT attribute.value
-               FROM typed_ticket_events event
-               JOIN typed_ticket_event_attributes attribute
-                 ON attribute.workspace_id=event.workspace_id
-                AND attribute.ticket_id=event.ticket_id
-                AND attribute.event_index=event.event_index
-                AND attribute.key='event_id'
-              WHERE event.workspace_id=?1 AND event.ticket_id=?2
-                AND event.kind IN ('create','item_edit')
-              ORDER BY event.event_index DESC
+            "SELECT event_index
+               FROM typed_ticket_events
+              WHERE workspace_id=?1 AND ticket_id=?2
+                AND kind IN ('create','item_edit')
+              ORDER BY event_index DESC
               LIMIT 1",
             params![workspace_id, ticket_id],
-            |row| row.get(0),
+            |row| row.get::<_, i64>(0),
         )
         .optional()?;
-    if event_revision.is_some() {
-        return Ok(event_revision);
+    if let Some(event_index) = event_index {
+        return Ok(Some(format!("{ticket_id}:{event_index}")));
     }
     connection
         .query_row(
