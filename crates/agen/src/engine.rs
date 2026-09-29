@@ -3401,12 +3401,14 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                                 }));
                             }
                         }
-                        None if response_completed => break,
+                        None if !early_dispatch || response_completed => break,
                         None => {
-                            // A clean transport EOF is not an authoritative provider
-                            // response boundary. Treat it exactly like an interrupted
-                            // stream so any early side effect is terminalized and never
-                            // followed by automatic continuation/regeneration.
+                            // Providers that support only response-complete tool calls use
+                            // stream EOF as their established completion boundary. Early
+                            // dispatch is never enabled for them. Once per-block dispatch is
+                            // active, however, transport EOF alone cannot prove that the
+                            // assistant response completed after a side effect may have begun.
+                            // Require the provider's explicit terminal status in that mode.
                             self.timeline.flush_usage();
                             return Ok(StreamResponseOutput {
                                 completion: StreamCompletion::Interrupted {

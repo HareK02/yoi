@@ -1679,10 +1679,6 @@ async fn unsupported_provider_visibly_defers_opt_in_dispatch() {
         warning.contains("provider does not expose a trustworthy per-call completion boundary")
     }));
 
-    tx.send(Ok(Event::Status(StatusEvent {
-        status: ResponseStatus::Completed,
-    })))
-    .unwrap();
     drop(tx);
     tokio::time::timeout(Duration::from_secs(1), probe.started.notified())
         .await
