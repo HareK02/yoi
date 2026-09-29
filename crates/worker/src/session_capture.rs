@@ -415,7 +415,7 @@ impl SessionCapture {
                         search_text: text,
                     });
                 }
-                Item::Reasoning { .. } => {}
+                Item::AssistantResponseBoundary { .. } | Item::Reasoning { .. } => {}
             }
         }
 
@@ -712,6 +712,9 @@ fn render_item(
                     content.as_deref().unwrap_or_default(),
                 ),
             }
+        }
+        Item::AssistantResponseBoundary { .. } => {
+            format!("[{} Assistant response boundary omitted]", entry.id)
         }
         Item::Reasoning { .. } => format!("[{} Reasoning omitted]", entry.id),
     };

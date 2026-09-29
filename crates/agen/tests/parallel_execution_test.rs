@@ -309,6 +309,68 @@ impl LlmClient for ControlledStreamClient {
 }
 
 #[derive(Clone)]
+struct MultiControlledStreamClient {
+    receivers: Arc<
+        Mutex<
+            std::collections::VecDeque<
+                tokio::sync::mpsc::UnboundedReceiver<Result<Event, ClientError>>,
+            >,
+        >,
+    >,
+}
+
+impl MultiControlledStreamClient {
+    fn new(
+        response_count: usize,
+    ) -> (
+        Self,
+        Vec<tokio::sync::mpsc::UnboundedSender<Result<Event, ClientError>>>,
+    ) {
+        let mut senders = Vec::with_capacity(response_count);
+        let mut receivers = std::collections::VecDeque::with_capacity(response_count);
+        for _ in 0..response_count {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            senders.push(tx);
+            receivers.push_back(rx);
+        }
+        (
+            Self {
+                receivers: Arc::new(Mutex::new(receivers)),
+            },
+            senders,
+        )
+    }
+}
+
+#[async_trait]
+impl LlmClient for MultiControlledStreamClient {
+    async fn stream(&self, _request: Request) -> Result<ResponseStream, ClientError> {
+        let mut rx =
+            self.receivers
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| ClientError::Api {
+                    status: Some(500),
+                    code: Some("multi_controlled_stream_exhausted".to_string()),
+                    message: "controlled responses exhausted".to_string(),
+                    retry_after: None,
+                })?;
+        Ok(Box::pin(futures::stream::poll_fn(move |cx| {
+            rx.poll_recv(cx)
+        })))
+    }
+
+    fn clone_boxed(&self) -> Box<dyn LlmClient> {
+        Box::new(self.clone())
+    }
+
+    fn tool_call_completion_support(&self) -> ToolCallCompletionSupport {
+        ToolCallCompletionSupport::PerBlock
+    }
+}
+
+#[derive(Clone)]
 struct BoundedStreamClient {
     receiver: Arc<Mutex<Option<tokio::sync::mpsc::Receiver<Result<Event, ClientError>>>>>,
 }
@@ -577,6 +639,82 @@ async fn blocking_pre_tool_policy_keeps_receiving_stream_and_services_pause() {
 }
 
 #[tokio::test]
+async fn blocking_pre_tool_policy_keeps_receiving_stream_and_services_cancel() {
+    struct BlockingEarlyPolicy {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Interceptor for BlockingEarlyPolicy {
+        fn supports_early_tool_dispatch(&self) -> bool {
+            true
+        }
+
+        async fn pre_tool_call(
+            &self,
+            _info: &mut ToolCallInfo<'_>,
+        ) -> InterceptorResult<PreToolAction> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(PreToolAction::Continue)
+        }
+    }
+
+    let (client, tx) = BoundedStreamClient::new(1);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let tool = SlowTool::new("cancelled_policy_tool", 0);
+    let probe = tool.clone();
+    let mut engine = Engine::new(client);
+    engine.set_tool_call_dispatch_mode(ToolCallDispatchMode::OnToolCallComplete);
+    engine.set_interceptor(BlockingEarlyPolicy {
+        entered: entered.clone(),
+        release,
+    });
+    engine.register_tool(tool.definition());
+    let cancel = engine.cancel_sender();
+    let run = tokio::spawn(async move {
+        let mut history = History::new();
+        let output = engine.run(&mut history, "run").await;
+        (output, history)
+    });
+
+    tx.send(Ok(Event::tool_use_start(
+        0,
+        "call_cancelled_policy",
+        "cancelled_policy_tool",
+    )))
+    .await
+    .unwrap();
+    tx.send(Ok(Event::tool_input_delta(0, r#"{}"#)))
+        .await
+        .unwrap();
+    tx.send(Ok(Event::tool_use_stop(0))).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .expect("pre-tool policy entered");
+
+    tx.send(Ok(Event::ping())).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), tx.send(Ok(Event::ping())))
+        .await
+        .expect("background pump continues draining the bounded provider stream")
+        .unwrap();
+    cancel.send(()).await.unwrap();
+    drop(tx);
+
+    let (output, _history) = tokio::time::timeout(Duration::from_secs(1), run)
+        .await
+        .expect("cancel does not deadlock the bounded stream pump")
+        .unwrap();
+    assert!(matches!(
+        output.result,
+        EngineRunExit::Interrupted(RunInterruptionReason::Cancelled)
+    ));
+    assert_eq!(probe.call_count(), 0);
+}
+
+#[tokio::test]
 async fn per_block_dispatch_starts_siblings_without_waiting_for_stream_or_prior_result() {
     let (client, tx) = ControlledStreamClient::new(ToolCallCompletionSupport::PerBlock);
     let first = BarrierTool::new("barrier_a");
@@ -680,6 +818,106 @@ async fn early_terminal_result_commits_while_response_stream_is_open() {
     let _ = run.await.unwrap();
 }
 
+#[derive(Clone, Copy)]
+enum BlockingPostControl {
+    Pause,
+    Cancel,
+}
+
+async fn assert_blocking_post_hook_services_control(control: BlockingPostControl) {
+    struct BlockingPostPolicy {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Interceptor for BlockingPostPolicy {
+        fn supports_early_tool_dispatch(&self) -> bool {
+            true
+        }
+
+        async fn post_tool_call(
+            &self,
+            _info: &ToolResultInfo<'_>,
+        ) -> InterceptorResult<PostToolAction> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(PostToolAction::Continue)
+        }
+    }
+
+    let (client, tx) = BoundedStreamClient::new(1);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let tool = SlowTool::new("blocking_post_tool", 0);
+    let mut engine = Engine::new(client);
+    engine.set_tool_call_dispatch_mode(ToolCallDispatchMode::OnToolCallComplete);
+    engine.set_interceptor(BlockingPostPolicy {
+        entered: entered.clone(),
+        release,
+    });
+    engine.register_tool(tool.definition());
+    let pause = engine.pause_sender();
+    let cancel = engine.cancel_sender();
+    let run = tokio::spawn(async move {
+        let mut history = History::new();
+        let output = engine.run(&mut history, "run").await;
+        (output, history)
+    });
+
+    tx.send(Ok(Event::tool_use_start(
+        0,
+        "call_blocking_post",
+        "blocking_post_tool",
+    )))
+    .await
+    .unwrap();
+    tx.send(Ok(Event::tool_input_delta(0, r#"{}"#)))
+        .await
+        .unwrap();
+    tx.send(Ok(Event::tool_use_stop(0))).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .expect("post-tool policy entered after the terminal result was committed");
+
+    tx.send(Ok(Event::ping())).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), tx.send(Ok(Event::ping())))
+        .await
+        .expect("background pump continues draining while post-tool policy blocks")
+        .unwrap();
+    match control {
+        BlockingPostControl::Pause => pause.send(()).await.unwrap(),
+        BlockingPostControl::Cancel => cancel.send(()).await.unwrap(),
+    }
+    drop(tx);
+
+    let (output, history) = tokio::time::timeout(Duration::from_secs(1), run)
+        .await
+        .expect("control request interrupts the blocked post-tool policy")
+        .unwrap();
+    match control {
+        BlockingPostControl::Pause => assert!(matches!(output.result, EngineRunExit::Paused)),
+        BlockingPostControl::Cancel => assert!(matches!(
+            output.result,
+            EngineRunExit::Interrupted(RunInterruptionReason::Cancelled)
+        )),
+    }
+    assert!(history.items().any(|item| matches!(
+        item,
+        Item::ToolResult { call_id, .. } if call_id == "call_blocking_post"
+    )));
+}
+
+#[tokio::test]
+async fn blocking_post_tool_policy_services_pause_after_result_commit() {
+    assert_blocking_post_hook_services_control(BlockingPostControl::Pause).await;
+}
+
+#[tokio::test]
+async fn blocking_post_tool_policy_services_cancel_after_result_commit() {
+    assert_blocking_post_hook_services_control(BlockingPostControl::Cancel).await;
+}
+
 #[tokio::test]
 async fn reverse_stop_order_preserves_model_call_indexes() {
     let (client, tx) = ControlledStreamClient::new(ToolCallCompletionSupport::PerBlock);
@@ -718,6 +956,119 @@ async fn reverse_stop_order_preserves_model_call_indexes() {
         .collect::<std::collections::HashMap<_, _>>();
     assert_eq!(by_id.get("call_order_a"), Some(&0));
     assert_eq!(by_id.get("call_order_b"), Some(&1));
+}
+
+#[tokio::test]
+async fn early_pre_and_post_hooks_share_the_exact_response_turn_identity() {
+    struct TurnRecordingPolicy {
+        events: tokio::sync::mpsc::UnboundedSender<(InterceptorPhase, String, u64)>,
+    }
+
+    #[async_trait]
+    impl Interceptor for TurnRecordingPolicy {
+        fn supports_early_tool_dispatch(&self) -> bool {
+            true
+        }
+
+        async fn pre_tool_call(
+            &self,
+            info: &mut ToolCallInfo<'_>,
+        ) -> InterceptorResult<PreToolAction> {
+            self.events
+                .send((
+                    InterceptorPhase::PreToolCall,
+                    info.call.id.clone(),
+                    info.invocation.turn_id.expect("pre hook turn").0,
+                ))
+                .unwrap();
+            Ok(PreToolAction::Continue)
+        }
+
+        async fn post_tool_call(
+            &self,
+            info: &ToolResultInfo<'_>,
+        ) -> InterceptorResult<PostToolAction> {
+            self.events
+                .send((
+                    InterceptorPhase::PostToolCall,
+                    info.call.id.clone(),
+                    info.invocation.turn_id.expect("post hook turn").0,
+                ))
+                .unwrap();
+            Ok(PostToolAction::Continue)
+        }
+    }
+
+    let (client, mut responses) = MultiControlledStreamClient::new(3);
+    let first = responses.remove(0);
+    let second = responses.remove(0);
+    let third = responses.remove(0);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut engine = Engine::new(client);
+    engine.set_tool_call_dispatch_mode(ToolCallDispatchMode::OnToolCallComplete);
+    engine.set_interceptor(TurnRecordingPolicy { events: event_tx });
+    engine.register_tool(SlowTool::new("turn_identity", 0).definition());
+    let run = tokio::spawn(async move {
+        let mut history = History::new();
+        let output = engine.run(&mut history, "run").await;
+        (output, history)
+    });
+
+    first
+        .send(Ok(Event::tool_use_start(0, "call_turn_0", "turn_identity")))
+        .unwrap();
+    first.send(Ok(Event::tool_input_delta(0, r#"{}"#))).unwrap();
+    first.send(Ok(Event::tool_use_stop(0))).unwrap();
+    let pre_0 = event_rx.recv().await.unwrap();
+    let post_0 = event_rx.recv().await.unwrap();
+    assert_eq!(
+        pre_0,
+        (InterceptorPhase::PreToolCall, "call_turn_0".into(), 0)
+    );
+    assert_eq!(
+        post_0,
+        (InterceptorPhase::PostToolCall, "call_turn_0".into(), 0)
+    );
+    first
+        .send(Ok(Event::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        })))
+        .unwrap();
+    drop(first);
+
+    second
+        .send(Ok(Event::tool_use_start(0, "call_turn_1", "turn_identity")))
+        .unwrap();
+    second
+        .send(Ok(Event::tool_input_delta(0, r#"{}"#)))
+        .unwrap();
+    second.send(Ok(Event::tool_use_stop(0))).unwrap();
+    let pre_1 = event_rx.recv().await.unwrap();
+    let post_1 = event_rx.recv().await.unwrap();
+    assert_eq!(
+        pre_1,
+        (InterceptorPhase::PreToolCall, "call_turn_1".into(), 1)
+    );
+    assert_eq!(
+        post_1,
+        (InterceptorPhase::PostToolCall, "call_turn_1".into(), 1)
+    );
+    second
+        .send(Ok(Event::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        })))
+        .unwrap();
+    drop(second);
+
+    third.send(Ok(Event::text_delta(0, "done"))).unwrap();
+    third
+        .send(Ok(Event::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        })))
+        .unwrap();
+    drop(third);
+    let (output, _) = run.await.unwrap();
+    assert!(matches!(output.result, EngineRunExit::Finished));
 }
 
 #[tokio::test]
@@ -882,6 +1233,102 @@ async fn persisted_started_call_is_closed_unknown_and_never_resumed() {
             disposition: ToolResultDisposition::OutcomeUnknown,
             ..
         } if call_id == "call_started_before_restore"
+    )));
+}
+
+#[tokio::test]
+async fn rejected_synthetic_result_commit_restores_as_non_runnable() {
+    struct SyntheticDenial;
+
+    #[async_trait]
+    impl Interceptor for SyntheticDenial {
+        fn supports_early_tool_dispatch(&self) -> bool {
+            true
+        }
+
+        async fn pre_tool_call(
+            &self,
+            info: &mut ToolCallInfo<'_>,
+        ) -> InterceptorResult<PreToolAction> {
+            Ok(PreToolAction::SyntheticResult(ToolResult::error(
+                &info.call.id,
+                "permission denied",
+            )))
+        }
+    }
+
+    let client = MockLlmClient::with_responses(vec![
+        vec![
+            Event::tool_use_start(0, "call_denied_restore", "denied_restore"),
+            Event::tool_input_delta(0, r#"{}"#),
+            Event::tool_use_stop(0),
+            Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ],
+        vec![
+            Event::text_delta(0, "restored safely"),
+            Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ],
+    ])
+    .with_completion_support(ToolCallCompletionSupport::PerBlock);
+    let tool = SlowTool::new("denied_restore", 0);
+    let probe = tool.clone();
+    let reject_once = Arc::new(AtomicUsize::new(1));
+    let mut engine = Engine::new(client);
+    engine.set_tool_call_dispatch_mode(ToolCallDispatchMode::OnToolCallComplete);
+    engine.set_interceptor(SyntheticDenial);
+    engine.register_tool(tool.definition());
+    let reject_result = reject_once.clone();
+    engine.on_history_append(move |item| {
+        if matches!(item, Item::ToolResult { call_id, .. } if call_id == "call_denied_restore")
+            && reject_result.swap(0, Ordering::SeqCst) == 1
+        {
+            return Err("injected synthetic result commit failure".to_string());
+        }
+        Ok(())
+    });
+    let mut history = History::new();
+
+    let output = engine.run(&mut history, "run denied tool").await;
+    assert!(matches!(
+        output.result,
+        EngineRunExit::Interrupted(RunInterruptionReason::Unexpected(
+            EngineError::HistoryAppend(ref message)
+        )) if message == "injected synthetic result commit failure"
+    ));
+    assert_eq!(probe.call_count(), 0);
+    assert!(history.items().any(|item| matches!(
+        item,
+        Item::ToolCall {
+            call_id,
+            execution_id: Some(_),
+            status: Some(agen::llm_client::ItemStatus::InProgress),
+            ..
+        } if call_id == "call_denied_restore"
+    )));
+    assert!(!history.items().any(|item| matches!(
+        item,
+        Item::ToolResult { call_id, .. } if call_id == "call_denied_restore"
+    )));
+
+    let mut engine = output.engine;
+    let resumed = engine.resume(&mut history).await;
+    assert!(matches!(resumed, EngineRunExit::Finished));
+    assert_eq!(
+        probe.call_count(),
+        0,
+        "denied side effect must never run on restore"
+    );
+    assert!(history.items().any(|item| matches!(
+        item,
+        Item::ToolResult {
+            call_id,
+            disposition: ToolResultDisposition::OutcomeUnknown,
+            ..
+        } if call_id == "call_denied_restore"
     )));
 }
 

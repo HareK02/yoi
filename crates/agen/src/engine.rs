@@ -98,31 +98,39 @@ pub struct EngineConfig {
 /// Project terminal tool outputs into the assistant's original ToolCall order.
 ///
 /// Runtime history intentionally retains completion order so every result can
-/// be committed without waiting for slower siblings. The provider projection
-/// is deterministic within each contiguous result batch and does not rewrite
-/// the committed transcript.
+/// be committed without waiting for slower siblings. An internal durable
+/// response boundary lets this projection move every early result after the
+/// complete assistant response, even when trailing text/reasoning arrived after
+/// a fast result. Boundaries are never exposed to providers.
 struct ProviderHistoryProjection {
     items: Vec<Item>,
     original_to_projected_index: Vec<usize>,
 }
 
-fn materialize_provider_history(items: &[Item]) -> ProviderHistoryProjection {
-    let mut materialized: Vec<_> = items.iter().cloned().enumerate().collect();
-    let mut call_order = HashMap::<String, usize>::new();
-    let mut next_call_order = 0usize;
-
-    for (_, item) in &materialized {
-        if let Item::ToolCall {
+fn normalize_tool_run(run: &mut [(usize, Item)], call_order: &HashMap<String, usize>) {
+    run.sort_by_key(|(_, item)| match item {
+        Item::ToolCall {
             call_id,
             call_index,
             ..
-        } = item
-        {
-            call_order.insert(call_id.clone(), call_index.unwrap_or(next_call_order));
-            next_call_order += 1;
-        }
-    }
+        } => (
+            0usize,
+            call_index
+                .or_else(|| call_order.get(call_id).copied())
+                .unwrap_or(usize::MAX),
+        ),
+        Item::ToolResult { call_id, .. } => (
+            1usize,
+            call_order.get(call_id).copied().unwrap_or(usize::MAX),
+        ),
+        _ => unreachable!("tool run contains only calls and results"),
+    });
+}
 
+fn normalize_legacy_history(
+    materialized: &mut [(usize, Item)],
+    call_order: &HashMap<String, usize>,
+) {
     let mut index = 0usize;
     while index < materialized.len() {
         if !matches!(
@@ -141,28 +149,127 @@ fn materialize_provider_history(items: &[Item]) -> ProviderHistoryProjection {
         {
             index += 1;
         }
-        materialized[start..index].sort_by_key(|(_, item)| match item {
-            Item::ToolCall {
-                call_id,
-                call_index,
-                ..
-            } => (
-                0usize,
-                call_index
-                    .or_else(|| call_order.get(call_id).copied())
-                    .unwrap_or(usize::MAX),
-            ),
-            Item::ToolResult { call_id, .. } => (
-                1usize,
-                call_order.get(call_id).copied().unwrap_or(usize::MAX),
-            ),
-            _ => unreachable!("tool run contains only calls and results"),
-        });
+        normalize_tool_run(&mut materialized[start..index], call_order);
+    }
+}
+
+fn normalize_response_history(response: &mut [(usize, Item)], call_order: &HashMap<String, usize>) {
+    // Provider-confirmed call completions can be observed out of index order.
+    // Reorder only the values occupying ToolCall slots so surrounding assistant
+    // text/reasoning retains its streamed order.
+    let mut calls = response
+        .iter()
+        .filter_map(|(_, item)| match item {
+            Item::ToolCall { .. } => Some(item.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    calls.sort_by_key(|item| match item {
+        Item::ToolCall {
+            call_id,
+            call_index,
+            ..
+        } => call_index
+            .or_else(|| call_order.get(call_id).copied())
+            .unwrap_or(usize::MAX),
+        _ => unreachable!("filtered ToolCall list"),
+    });
+    let mut calls = calls.into_iter();
+    for (_, item) in response.iter_mut() {
+        if matches!(item, Item::ToolCall { .. }) {
+            *item = calls.next().expect("one replacement per ToolCall slot");
+        }
     }
 
-    let mut original_to_projected_index = vec![0; materialized.len()];
+    // A host-injected user/system item is a hard provider turn boundary. Do not
+    // move a result across it; normalize each assistant-side region separately.
+    let mut start = 0usize;
+    for index in 0..=response.len() {
+        let at_boundary = index == response.len()
+            || matches!(
+                response[index].1,
+                Item::Message {
+                    role: crate::llm_client::types::Role::User
+                        | crate::llm_client::types::Role::System,
+                    ..
+                }
+            );
+        if at_boundary {
+            response[start..index].sort_by_key(|(_, item)| match item {
+                Item::ToolResult { call_id, .. } => (
+                    1usize,
+                    call_order.get(call_id).copied().unwrap_or(usize::MAX),
+                ),
+                _ => (0usize, 0usize),
+            });
+            start = index.saturating_add(1);
+        }
+    }
+}
+
+fn materialize_provider_history(items: &[Item]) -> ProviderHistoryProjection {
+    let mut call_order = HashMap::<String, usize>::new();
+    let mut next_call_order = 0usize;
+    for item in items {
+        if let Item::ToolCall {
+            call_id,
+            call_index,
+            ..
+        } = item
+        {
+            call_order.insert(call_id.clone(), call_index.unwrap_or(next_call_order));
+            next_call_order += 1;
+        }
+    }
+
+    let first_boundary = items
+        .iter()
+        .position(|item| matches!(item, Item::AssistantResponseBoundary { .. }));
+    let legacy_end = first_boundary.unwrap_or(items.len());
+    let mut legacy = items[..legacy_end]
+        .iter()
+        .cloned()
+        .enumerate()
+        .collect::<Vec<_>>();
+    normalize_legacy_history(&mut legacy, &call_order);
+
+    let mut materialized = legacy;
+    let mut boundary_indices = Vec::new();
+    let mut index = legacy_end;
+    while index < items.len() {
+        debug_assert!(matches!(
+            items[index],
+            Item::AssistantResponseBoundary { .. }
+        ));
+        boundary_indices.push(index);
+        let start = index + 1;
+        let end = items[start..]
+            .iter()
+            .position(|item| matches!(item, Item::AssistantResponseBoundary { .. }))
+            .map(|offset| start + offset)
+            .unwrap_or(items.len());
+        let mut response = items[start..end]
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(offset, item)| (start + offset, item))
+            .collect::<Vec<_>>();
+        normalize_response_history(&mut response, &call_order);
+        materialized.extend(response);
+        index = end;
+    }
+
+    let mut original_to_projected_index = vec![0; items.len()];
     for (projected_index, (original_index, _)) in materialized.iter().enumerate() {
         original_to_projected_index[*original_index] = projected_index;
+    }
+    for boundary_index in boundary_indices {
+        let preceding_projected = materialized
+            .iter()
+            .take_while(|(original_index, _)| *original_index < boundary_index)
+            .count()
+            .saturating_sub(1);
+        original_to_projected_index[boundary_index] = preceding_projected;
     }
 
     ProviderHistoryProjection {
@@ -253,6 +360,7 @@ type ToolCallExecutionInfo = (
 /// provider-confirmed blocks complete.
 struct EarlyToolExecutionBatch {
     batch_id: String,
+    turn_id: usize,
     calls: Vec<(usize, ToolCall)>,
     seen_call_ids: HashSet<String>,
     call_info_map: HashMap<String, ToolCallExecutionInfo>,
@@ -266,9 +374,10 @@ struct EarlyToolExecutionBatch {
 }
 
 impl EarlyToolExecutionBatch {
-    fn new(batch_id: String) -> Self {
+    fn new(batch_id: String, turn_id: usize) -> Self {
         Self {
             batch_id,
+            turn_id,
             calls: Vec::new(),
             seen_call_ids: HashSet::new(),
             call_info_map: HashMap::new(),
@@ -1362,7 +1471,13 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
             let context = ToolExecutionContext::new(&tool_call.id, &batch.batch_id, call_index);
 
             if !tool_call.input.is_object() {
-                self.append_early_tool_call(history, annotate, &tool_call, call_index, None)?;
+                self.append_early_tool_call(
+                    history,
+                    annotate,
+                    &tool_call,
+                    call_index,
+                    Some(context.execution_id()),
+                )?;
                 batch.synthetic_results.push_back(ToolResult::error(
                     &tool_call.id,
                     "Tool arguments must be one complete JSON object",
@@ -1372,7 +1487,13 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
             }
 
             let Some((meta, tool)) = self.tool_server.get_tool(&tool_call.name) else {
-                self.append_early_tool_call(history, annotate, &tool_call, call_index, None)?;
+                self.append_early_tool_call(
+                    history,
+                    annotate,
+                    &tool_call,
+                    call_index,
+                    Some(context.execution_id()),
+                )?;
                 batch.synthetic_results.push_back(ToolResult::error(
                     &tool_call.id,
                     format!("Tool not found: {}", tool_call.name),
@@ -1502,12 +1623,24 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                         )
                         .into());
                     }
-                    self.append_early_tool_call(history, annotate, &tool_call, call_index, None)?;
+                    self.append_early_tool_call(
+                        history,
+                        annotate,
+                        &tool_call,
+                        call_index,
+                        Some(context.execution_id()),
+                    )?;
                     batch.synthetic_results.push_back(result);
                     batch.dispatched_any = true;
                 }
                 PreToolAction::Skip => {
-                    self.append_early_tool_call(history, annotate, &tool_call, call_index, None)?;
+                    self.append_early_tool_call(
+                        history,
+                        annotate,
+                        &tool_call,
+                        call_index,
+                        Some(context.execution_id()),
+                    )?;
                     batch.synthetic_results.push_back(ToolResult::error(
                         &tool_call.id,
                         "Tool execution skipped by interceptor",
@@ -1515,7 +1648,13 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                     batch.dispatched_any = true;
                 }
                 PreToolAction::Abort(reason) => {
-                    self.append_early_tool_call(history, annotate, &tool_call, call_index, None)?;
+                    self.append_early_tool_call(
+                        history,
+                        annotate,
+                        &tool_call,
+                        call_index,
+                        Some(context.execution_id()),
+                    )?;
                     batch.synthetic_results.push_back(ToolResult::error(
                         &tool_call.id,
                         format!("Tool execution aborted: {reason}"),
@@ -1544,6 +1683,8 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                 annotate,
                 result,
                 None,
+                batch.turn_id,
+                true,
                 &batch.call_info_map,
                 &mut batch.attempt_fence,
                 &mut batch.terminal_call_ids,
@@ -1569,6 +1710,8 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                     annotate,
                     result,
                     None,
+                    batch.turn_id,
+                    false,
                     &batch.call_info_map,
                     &mut batch.attempt_fence,
                     &mut batch.terminal_call_ids,
@@ -1615,6 +1758,8 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                         annotate,
                         result,
                         Some(&attempt_id),
+                        batch.turn_id,
+                        false,
                         &batch.call_info_map,
                         &mut batch.attempt_fence,
                         &mut batch.terminal_call_ids,
@@ -1636,6 +1781,8 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                         annotate,
                         ToolResult::outcome_unknown(call_id),
                         Some(attempt_id),
+                        batch.turn_id,
+                        false,
                         &batch.call_info_map,
                         &mut batch.attempt_fence,
                         &mut batch.terminal_call_ids,
@@ -1665,6 +1812,8 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                     annotate,
                     result,
                     None,
+                    batch.turn_id,
+                    true,
                     &batch.call_info_map,
                     &mut batch.attempt_fence,
                     &mut batch.terminal_call_ids,
@@ -1701,6 +1850,8 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                         annotate,
                         result,
                         Some(&attempt_id),
+                        batch.turn_id,
+                        true,
                         &batch.call_info_map,
                         &mut batch.attempt_fence,
                         &mut batch.terminal_call_ids,
@@ -1768,6 +1919,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
 
         // Map from tool call ID to (ToolCall, Meta, Tool, Context)
         // Retained because it's needed for PostToolCall hooks
+        let turn_id = self.turn_count.saturating_sub(1);
         let mut call_info_map = HashMap::new();
         let mut synthetic_results = Vec::new();
         let batch_id = format!("tool-batch-{}", self.tool_execution_batch_count);
@@ -1952,6 +2104,8 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                     annotate,
                     result,
                     None,
+                    turn_id,
+                    true,
                     &call_info_map,
                     &mut attempt_fence,
                     &mut terminal_call_ids,
@@ -1982,6 +2136,8 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                         annotate,
                         result,
                         Some(&attempt_id),
+                        turn_id,
+                        true,
                         &call_info_map,
                         &mut attempt_fence,
                         &mut terminal_call_ids,
@@ -2061,6 +2217,8 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                                     annotate,
                                     result,
                                     Some(&attempt_id),
+                                    turn_id,
+                                    false,
                                     &call_info_map,
                                     &mut attempt_fence,
                                     &mut terminal_call_ids,
@@ -2087,6 +2245,8 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                                 annotate,
                                 ToolResult::outcome_unknown(call_id),
                                 Some(attempt_id),
+                                turn_id,
+                                false,
                                 &call_info_map,
                                 &mut attempt_fence,
                                 &mut terminal_call_ids,
@@ -2135,6 +2295,8 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         annotate: &mut impl FnMut(&Item) -> Result<A, String>,
         mut tool_result: ToolResult,
         execution_attempt_id: Option<&str>,
+        turn_id: usize,
+        invoke_post_hook: bool,
         call_info_map: &HashMap<
             String,
             (
@@ -2223,10 +2385,10 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         );
         self.emit_tool_result(&tool_result);
 
-        if let Some((tool_call, meta, tool, context)) = call_info {
+        if invoke_post_hook && let Some((tool_call, meta, tool, context)) = call_info {
             let invocation = self.interceptor_invocation(
                 InterceptorPhase::PostToolCall,
-                Some(self.turn_count.saturating_sub(1)),
+                Some(turn_id),
                 Some(InterceptorCallId::Tool(tool_call.id.clone())),
                 context.call_index,
             );
@@ -2239,16 +2401,28 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                 tool: tool.clone(),
                 context: context.clone(),
             };
-            let post_tool_action =
-                self.interceptor
-                    .post_tool_call(&info)
-                    .await
-                    .map_err(|error| {
+            let post_tool_action = tokio::select! {
+                result = self.interceptor.post_tool_call(&info) => {
+                    result.map_err(|error| {
                         EngineError::from(InterceptorFailure::new(
                             InterceptorPhase::PostToolCall,
                             error,
                         ))
-                    })?;
+                    })?
+                }
+                pause = self.pause_rx.recv() => {
+                    if pause.is_some() {
+                        info!(call_id = %tool_call.id, "Paused while awaiting post-tool policy");
+                    }
+                    return Err(EngineError::PauseRequested);
+                }
+                cancel = self.cancel_rx.recv() => {
+                    if cancel.is_some() {
+                        info!(call_id = %tool_call.id, "Cancelled while awaiting post-tool policy");
+                    }
+                    return Err(EngineError::Cancelled);
+                }
+            };
             if let PostToolAction::Abort(reason) = post_tool_action {
                 return Err(EngineError::Aborted(reason));
             }
@@ -2284,6 +2458,8 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                     annotate,
                     ToolResult::outcome_unknown(&call_id),
                     None,
+                    self.turn_count,
+                    false,
                     &call_info_map,
                     &mut attempt_fence,
                     &mut terminal_call_ids,
@@ -2532,6 +2708,14 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                     "tool-call early dispatch deferred until response completion: interceptor requires the whole-response turn-end gate",
                 );
             }
+            if early_dispatch {
+                let response_id = format!("assistant-response-{current_turn}-{current_llm_call}");
+                self.append_history_items(
+                    history,
+                    std::iter::once(Item::assistant_response_boundary(response_id)),
+                    annotate,
+                )?;
+            }
             let assistant_start = history.len();
             let StreamResponseOutput {
                 completion: stream_outcome,
@@ -2673,7 +2857,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                 if early_tools.is_none() {
                     let batch_id = format!("tool-batch-{}", self.tool_execution_batch_count);
                     self.tool_execution_batch_count += 1;
-                    early_tools = Some(EarlyToolExecutionBatch::new(batch_id));
+                    early_tools = Some(EarlyToolExecutionBatch::new(batch_id, current_turn));
                 }
                 let admission = self
                     .admit_early_tool_calls(
@@ -3057,7 +3241,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                                         );
                                         self.tool_execution_batch_count += 1;
                                         early_tools =
-                                            Some(EarlyToolExecutionBatch::new(batch_id));
+                                            Some(EarlyToolExecutionBatch::new(batch_id, turn));
                                     }
                                     let fresh_calls = {
                                         let batch = early_tools.as_ref().expect("batch initialized");
@@ -3211,6 +3395,8 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                             annotate,
                             result,
                             Some(&attempt_id),
+                            batch.turn_id,
+                            true,
                             &batch.call_info_map,
                             &mut batch.attempt_fence,
                             &mut batch.terminal_call_ids,
@@ -3941,6 +4127,7 @@ fn items_trace_payload(
 fn item_kind(item: &Item) -> &'static str {
     match item {
         Item::Message { .. } => "message",
+        Item::AssistantResponseBoundary { .. } => "assistant_response_boundary",
         Item::ToolCall { .. } => "tool_call",
         Item::ToolResult { .. } => "tool_result",
         Item::Reasoning { .. } => "reasoning",
@@ -4023,6 +4210,51 @@ mod tests {
             ]
         );
         assert_eq!(projection.original_to_projected_index, [1, 3, 0, 2]);
+    }
+
+    #[test]
+    fn provider_projection_keeps_complete_response_before_early_results() {
+        let items = vec![
+            Item::assistant_response_boundary("response-1"),
+            Item::tool_call_json("call_second", "second", serde_json::json!({}))
+                .with_tool_execution_metadata(1, Some("batch:call_second".to_string()))
+                .with_status(ItemStatus::InProgress),
+            Item::tool_result("call_second", "second result"),
+            Item::assistant_message("trailing text"),
+            Item::reasoning("trailing reasoning"),
+            Item::tool_call_json("call_first", "first", serde_json::json!({}))
+                .with_tool_execution_metadata(0, Some("batch:call_first".to_string()))
+                .with_status(ItemStatus::InProgress),
+            Item::tool_result("call_first", "first result"),
+        ];
+
+        let projection = materialize_provider_history(&items);
+        let order = projection
+            .items
+            .iter()
+            .map(|item| match item {
+                Item::Message { .. } => "text".to_string(),
+                Item::Reasoning { .. } => "reasoning".to_string(),
+                Item::ToolCall { call_id, .. } => format!("call:{call_id}"),
+                Item::ToolResult { call_id, .. } => format!("result:{call_id}"),
+                Item::AssistantResponseBoundary { .. } => panic!("boundary leaked"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            [
+                "call:call_first",
+                "text",
+                "reasoning",
+                "call:call_second",
+                "result:call_first",
+                "result:call_second",
+            ]
+        );
+        assert_eq!(
+            projection.original_to_projected_index,
+            [0, 0, 5, 1, 2, 3, 4]
+        );
     }
 
     #[test]

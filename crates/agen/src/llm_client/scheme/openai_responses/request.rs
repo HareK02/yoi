@@ -254,6 +254,7 @@ fn convert_items_to_input(items: &[Item], supports_images: bool) -> Vec<InputIte
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         match item {
+            Item::AssistantResponseBoundary { .. } => {}
             Item::Message { role, content, .. } => {
                 let (role_str, text_variant): (&'static str, fn(String) -> InputContent) =
                     match role {

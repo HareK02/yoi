@@ -93,6 +93,12 @@ pub enum Item {
         status: Option<ItemStatus>,
     },
 
+    /// Internal durable boundary used to reconstruct one assistant response when
+    /// early ToolResults are committed before the response stream has ended.
+    /// Provider request projections remove this item before serialization.
+    #[doc(hidden)]
+    AssistantResponseBoundary { response_id: String },
+
     /// Tool call from the assistant
     ToolCall {
         /// Optional item ID
@@ -107,11 +113,12 @@ pub enum Item {
         /// Provider/model order among tool calls in this assistant response.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         call_index: Option<usize>,
-        /// Durable identity of a tool execution attempt that has started.
+        /// Durable identity of an execution or synthetic terminalization that
+        /// owns this call. Once present, restore must never infer the call pending.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         execution_id: Option<String>,
-        /// Item status. `InProgress` on a persisted ToolCall means provider
-        /// execution ownership was transferred and must never be inferred pending.
+        /// Item status. `InProgress` on a persisted ToolCall means execution or
+        /// terminalization ownership was transferred and must never be inferred pending.
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<ItemStatus>,
     },
@@ -223,6 +230,14 @@ impl Item {
             role: Role::Assistant,
             content: parts,
             status: None,
+        }
+    }
+
+    /// Create an internal durable assistant-response boundary.
+    #[doc(hidden)]
+    pub fn assistant_response_boundary(response_id: impl Into<String>) -> Self {
+        Self::AssistantResponseBoundary {
+            response_id: response_id.into(),
         }
     }
 
@@ -405,6 +420,7 @@ impl Item {
     pub fn with_id(mut self, id: impl Into<String>) -> Self {
         match &mut self {
             Self::Message { id: item_id, .. } => *item_id = Some(id.into()),
+            Self::AssistantResponseBoundary { .. } => {}
             Self::ToolCall { id: item_id, .. } => *item_id = Some(id.into()),
             Self::ToolResult { id: item_id, .. } => *item_id = Some(id.into()),
             Self::Reasoning { id: item_id, .. } => *item_id = Some(id.into()),
@@ -416,6 +432,7 @@ impl Item {
     pub fn with_status(mut self, new_status: ItemStatus) -> Self {
         match &mut self {
             Self::Message { status, .. } => *status = Some(new_status),
+            Self::AssistantResponseBoundary { .. } => {}
             Self::ToolCall { status, .. } => *status = Some(new_status),
             Self::ToolResult { .. } => {} // Result items don't have status
             Self::Reasoning { status, .. } => *status = Some(new_status),
@@ -431,6 +448,7 @@ impl Item {
     pub fn id(&self) -> Option<&str> {
         match self {
             Self::Message { id, .. } => id.as_deref(),
+            Self::AssistantResponseBoundary { .. } => None,
             Self::ToolCall { id, .. } => id.as_deref(),
             Self::ToolResult { id, .. } => id.as_deref(),
             Self::Reasoning { id, .. } => id.as_deref(),
@@ -441,6 +459,7 @@ impl Item {
     pub fn item_type(&self) -> &'static str {
         match self {
             Self::Message { .. } => "message",
+            Self::AssistantResponseBoundary { .. } => "assistant_response_boundary",
             Self::ToolCall { .. } => "tool_call",
             Self::ToolResult { .. } => "tool_result",
             Self::Reasoning { .. } => "reasoning",

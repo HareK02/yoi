@@ -50,6 +50,9 @@ pub enum LoggedItem {
         role: LoggedRole,
         content: Vec<LoggedContentPart>,
     },
+    AssistantResponseBoundary {
+        response_id: String,
+    },
     ToolCall {
         call_id: String,
         name: String,
@@ -122,6 +125,9 @@ impl From<&Item> for LoggedItem {
                 role: (*role).into(),
                 content: content.iter().map(LoggedContentPart::from).collect(),
             },
+            Item::AssistantResponseBoundary { response_id } => Self::AssistantResponseBoundary {
+                response_id: response_id.clone(),
+            },
             Item::ToolCall {
                 call_id,
                 name,
@@ -185,6 +191,9 @@ impl From<LoggedItem> for Item {
                 content: content.into_iter().map(Into::into).collect(),
                 status: None,
             },
+            LoggedItem::AssistantResponseBoundary { response_id } => {
+                Item::assistant_response_boundary(response_id)
+            }
             LoggedItem::ToolCall {
                 call_id,
                 name,
@@ -341,6 +350,18 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn assistant_response_boundary_round_trips_for_provider_projection() {
+        let original = Item::assistant_response_boundary("response-7");
+        let logged: LoggedItem = (&original).into();
+        let json = serde_json::to_string(&logged).unwrap();
+        assert!(json.contains(r#""kind":"assistant_response_boundary""#));
+        assert_eq!(
+            Item::from(serde_json::from_str::<LoggedItem>(&json).unwrap()),
+            original
+        );
     }
 
     #[test]

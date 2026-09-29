@@ -386,8 +386,8 @@ fn project_item(item: &LoggedItem) -> Option<SessionSnapshotEntryData> {
                 })
                 .collect(),
         }),
-        // Hidden model reasoning is never observable.
-        LoggedItem::Reasoning { .. } => None,
+        // Internal response grouping and hidden model reasoning are never observable.
+        LoggedItem::AssistantResponseBoundary { .. } | LoggedItem::Reasoning { .. } => None,
     }
 }
 

@@ -1264,7 +1264,10 @@ fn active_run_checkpoint_entry(
 fn is_ai_materialized_item(item: &Item) -> bool {
     match item {
         Item::Message { role, .. } => *role == Role::Assistant,
-        Item::ToolCall { .. } | Item::ToolResult { .. } | Item::Reasoning { .. } => true,
+        Item::AssistantResponseBoundary { .. }
+        | Item::ToolCall { .. }
+        | Item::ToolResult { .. }
+        | Item::Reasoning { .. } => true,
     }
 }
 
@@ -1302,7 +1305,11 @@ where
         let subject = worker_subject(annotation_writer.state.location().session_id);
         let origin = if item.is_tool_result() {
             WorkerHistoryProvenance::ToolOutput { worker: subject }
-        } else if item.is_assistant_message() || item.is_tool_call() || item.is_reasoning() {
+        } else if item.is_assistant_message()
+            || matches!(item, Item::AssistantResponseBoundary { .. })
+            || item.is_tool_call()
+            || item.is_reasoning()
+        {
             WorkerHistoryProvenance::ModelOutput { worker: subject }
         } else {
             // Unknown user/system append paths fail closed. Trusted system
@@ -7557,6 +7564,7 @@ fn write_overview_header(items: &[Item], out: &mut String) {
     for item in items {
         match item {
             Item::Message { .. } => messages += 1,
+            Item::AssistantResponseBoundary { .. } => {}
             Item::ToolCall { .. } => tool_calls += 1,
             Item::ToolResult { .. } => tool_results += 1,
             Item::Reasoning { .. } => reasoning += 1,
