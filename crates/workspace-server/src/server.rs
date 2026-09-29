@@ -42310,10 +42310,19 @@ mod tests {
                     subscription_id,
                     selector:
                         protocol::subscription::EventSubscriptionSelector::WorkerProtocol { .. },
+                    snapshot:
+                        protocol::subscription::SubscriptionSnapshot::WorkerProtocol {
+                            events,
+                            ..
+                        },
                     ..
                 },
             ) = frame.payload
             {
+                assert!(
+                    matches!(events.as_slice(), [protocol::Event::Snapshot { .. }]),
+                    "Worker protocol subscription must atomically include its initial snapshot: {events:?}"
+                );
                 break subscription_id;
             }
         };
