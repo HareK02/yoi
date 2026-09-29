@@ -965,6 +965,7 @@ fn manifest_to_reusable_config(manifest: &WorkerManifest) -> WorkerManifestConfi
             stop_sequences: (!manifest.engine.stop_sequences.is_empty())
                 .then_some(manifest.engine.stop_sequences.clone()),
             reasoning: manifest.engine.reasoning.clone(),
+            tool_call_dispatch: Some(manifest.engine.tool_call_dispatch),
             tool_output: ToolOutputLimitsPartial {
                 default_max_bytes: Some(manifest.engine.tool_output.default_max_bytes),
                 per_tool: manifest.engine.tool_output.per_tool.clone(),
@@ -2226,7 +2227,8 @@ max_tokens = 3333
             Some("reviewer"),
             &[("reviewer", "reviewer.toml", REVIEWER_PROFILE)],
         );
-        let parent = parent_manifest(&parent_root, Some(&parent_root.join("deny")));
+        let mut parent = parent_manifest(&parent_root, Some(&parent_root.join("deny")));
+        parent.engine.tool_call_dispatch = manifest::ToolCallDispatchMode::OnToolCallComplete;
         let scope = vec![abs_rule(&delegated, Permission::Read)];
 
         let profile_config = child_config_from_profile(
@@ -2248,6 +2250,10 @@ max_tokens = 3333
             SpawnProfileSelector::Inherit,
         );
 
+        assert_eq!(
+            inherit_config.engine.tool_call_dispatch,
+            Some(manifest::ToolCallDispatchMode::OnToolCallComplete)
+        );
         for config in [profile_config, inherit_config] {
             assert_eq!(config.scope.allow, scope);
             assert!(config.scope.deny.is_empty());

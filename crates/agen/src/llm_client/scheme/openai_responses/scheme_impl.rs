@@ -6,7 +6,7 @@ use crate::llm_client::{
     ClientError,
     auth::AuthRequirement,
     capability::ModelCapability,
-    client::ConfigWarning,
+    client::{ConfigWarning, ToolCallCompletionSupport},
     event::Event,
     scheme::Scheme,
     types::{Request, RequestConfig},
@@ -54,6 +54,10 @@ impl Scheme for OpenAIResponsesScheme {
 
     fn default_capability(&self) -> ModelCapability {
         super::capability::default_capability()
+    }
+
+    fn tool_call_completion_support(&self) -> ToolCallCompletionSupport {
+        ToolCallCompletionSupport::PerBlock
     }
 
     fn validate_config(&self, config: &RequestConfig) -> Vec<ConfigWarning> {

@@ -542,6 +542,8 @@ pub struct EngineManifestConfig {
     #[serde(default)]
     pub reasoning: Option<ReasoningControl>,
     #[serde(default)]
+    pub tool_call_dispatch: Option<crate::ToolCallDispatchMode>,
+    #[serde(default)]
     pub tool_output: ToolOutputLimitsPartial,
     #[serde(default)]
     pub file_upload: FileUploadLimitsPartial,
@@ -868,6 +870,7 @@ impl EngineManifestConfig {
             top_k: upper.top_k.or(self.top_k),
             stop_sequences: upper.stop_sequences.or(self.stop_sequences),
             reasoning: upper.reasoning.or(self.reasoning),
+            tool_call_dispatch: upper.tool_call_dispatch.or(self.tool_call_dispatch),
             tool_output: self.tool_output.merge(upper.tool_output),
             file_upload: self.file_upload.merge(upper.file_upload),
         }
@@ -1171,6 +1174,7 @@ impl TryFrom<WorkerManifestConfig> for WorkerManifest {
             top_k: cfg.engine.top_k,
             stop_sequences: cfg.engine.stop_sequences.unwrap_or_default(),
             reasoning: cfg.engine.reasoning,
+            tool_call_dispatch: cfg.engine.tool_call_dispatch.unwrap_or_default(),
             tool_output: ToolOutputLimits {
                 default_max_bytes: cfg
                     .engine
@@ -1341,6 +1345,39 @@ mod tests {
             web: None,
             skills: None,
         }
+    }
+
+    #[test]
+    fn tool_call_dispatch_defaults_merges_and_round_trips() {
+        let manifest: WorkerManifest = minimal_valid().try_into().unwrap();
+        assert_eq!(
+            manifest.engine.tool_call_dispatch,
+            crate::ToolCallDispatchMode::AfterResponse
+        );
+
+        let lower = WorkerManifestConfig {
+            engine: EngineManifestConfig {
+                tool_call_dispatch: Some(crate::ToolCallDispatchMode::OnToolCallComplete),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let upper = WorkerManifestConfig::default();
+        assert_eq!(
+            lower.merge(upper).engine.tool_call_dispatch,
+            Some(crate::ToolCallDispatchMode::OnToolCallComplete)
+        );
+
+        let mut configured = minimal_valid();
+        configured.engine.tool_call_dispatch =
+            Some(crate::ToolCallDispatchMode::OnToolCallComplete);
+        let manifest: WorkerManifest = configured.try_into().unwrap();
+        let snapshot = serde_json::to_value(&manifest).unwrap();
+        let restored: WorkerManifest = serde_json::from_value(snapshot).unwrap();
+        assert_eq!(
+            restored.engine.tool_call_dispatch,
+            crate::ToolCallDispatchMode::OnToolCallComplete
+        );
     }
 
     #[test]

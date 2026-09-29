@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use agen::llm_client::event::{BlockType, DeltaContent, Event};
-use agen::llm_client::{ClientError, LlmClient, Request};
+use agen::llm_client::{ClientError, LlmClient, Request, ToolCallCompletionSupport};
 use agen::timeline::{Handler, TextBlockEvent, TextBlockKind, Timeline};
 use async_trait::async_trait;
 use futures::Stream;
@@ -20,6 +20,7 @@ pub struct MockLlmClient {
     responses: Arc<Vec<Vec<Event>>>,
     call_count: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<Request>>>,
+    completion_support: ToolCallCompletionSupport,
 }
 
 impl MockLlmClient {
@@ -32,6 +33,7 @@ impl MockLlmClient {
             responses: Arc::new(responses),
             call_count: Arc::new(AtomicUsize::new(0)),
             requests: Arc::new(Mutex::new(Vec::new())),
+            completion_support: ToolCallCompletionSupport::ResponseComplete,
         }
     }
 
@@ -47,12 +49,21 @@ impl MockLlmClient {
     pub fn requests(&self) -> Vec<Request> {
         self.requests.lock().unwrap().clone()
     }
+
+    pub fn with_completion_support(mut self, support: ToolCallCompletionSupport) -> Self {
+        self.completion_support = support;
+        self
+    }
 }
 
 #[async_trait]
 impl LlmClient for MockLlmClient {
     fn clone_boxed(&self) -> Box<dyn LlmClient> {
         Box::new(self.clone())
+    }
+
+    fn tool_call_completion_support(&self) -> ToolCallCompletionSupport {
+        self.completion_support
     }
 
     async fn stream(

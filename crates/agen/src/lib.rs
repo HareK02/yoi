@@ -22,7 +22,7 @@ pub use agen_macros::{description, tool, tool_registry};
 pub use callback::{TextBlockScope, ThinkingBlockScope, ToolUseBlockScope};
 pub use engine::{
     Engine, EngineConfig, EngineError, EngineResult, EngineRunExit, EngineRunOutput,
-    LlmRetryNotice, RunInterruptionReason, ToolRegistryError,
+    LlmRetryNotice, RunInterruptionReason, ToolCallDispatchMode, ToolRegistryError,
 };
 pub use handler::ToolUseBlockStart;
 pub use history::{History, HistoryEntry};

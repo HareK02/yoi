@@ -363,6 +363,10 @@ impl WorkerInterceptor {
 
 #[async_trait]
 impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
+    fn supports_early_tool_dispatch(&self) -> bool {
+        self.registry.on_turn_end.is_empty()
+    }
+
     async fn on_prompt_submit(
         &self,
         context: PromptSubmitContext<'_, SessionHistoryMetadata>,

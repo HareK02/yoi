@@ -1264,7 +1264,10 @@ fn active_run_checkpoint_entry(
 fn is_ai_materialized_item(item: &Item) -> bool {
     match item {
         Item::Message { role, .. } => *role == Role::Assistant,
-        Item::ToolCall { .. } | Item::ToolResult { .. } | Item::Reasoning { .. } => true,
+        Item::AssistantResponseBoundary { .. }
+        | Item::ToolCall { .. }
+        | Item::ToolResult { .. }
+        | Item::Reasoning { .. } => true,
     }
 }
 
@@ -1302,7 +1305,11 @@ where
         let subject = worker_subject(annotation_writer.state.location().session_id);
         let origin = if item.is_tool_result() {
             WorkerHistoryProvenance::ToolOutput { worker: subject }
-        } else if item.is_assistant_message() || item.is_tool_call() || item.is_reasoning() {
+        } else if item.is_assistant_message()
+            || matches!(item, Item::AssistantResponseBoundary { .. })
+            || item.is_tool_call()
+            || item.is_reasoning()
+        {
             WorkerHistoryProvenance::ModelOutput { worker: subject }
         } else {
             // Unknown user/system append paths fail closed. Trusted system
@@ -7138,6 +7145,12 @@ pub fn apply_worker_manifest<C: LlmClient + 'static, A: Send + Sync>(
 ) {
     worker.set_request_config(request_config_from_engine_manifest(wm));
     worker.set_max_turns(wm.max_turns.map(|n| n.get()));
+    worker.set_tool_call_dispatch_mode(match wm.tool_call_dispatch {
+        manifest::ToolCallDispatchMode::AfterResponse => agen::ToolCallDispatchMode::AfterResponse,
+        manifest::ToolCallDispatchMode::OnToolCallComplete => {
+            agen::ToolCallDispatchMode::OnToolCallComplete
+        }
+    });
     // Worker owns the lifecycle strategy for already-started tool operations.
     // The provider must first accept cooperative cancellation, then confirm a
     // terminal result before this bounded deadline; Agen handles only the
@@ -7551,6 +7564,7 @@ fn write_overview_header(items: &[Item], out: &mut String) {
     for item in items {
         match item {
             Item::Message { .. } => messages += 1,
+            Item::AssistantResponseBoundary { .. } => {}
             Item::ToolCall { .. } => tool_calls += 1,
             Item::ToolResult { .. } => tool_results += 1,
             Item::Reasoning { .. } => reasoning += 1,
@@ -8721,6 +8735,7 @@ mod build_summary_prompt_tests {
             top_k: Some(40),
             stop_sequences: vec!["\n\n".into(), "</stop>".into()],
             reasoning: None,
+            tool_call_dispatch: manifest::ToolCallDispatchMode::OnToolCallComplete,
             tool_output: manifest::ToolOutputLimits::default(),
             file_upload: manifest::FileUploadLimits::default(),
         };
@@ -8732,6 +8747,13 @@ mod build_summary_prompt_tests {
         assert_eq!(config.top_p, Some(0.9));
         assert_eq!(config.top_k, Some(40));
         assert_eq!(config.stop_sequences, vec!["\n\n", "</stop>"]);
+
+        let mut engine = Engine::new(NoopClient);
+        apply_worker_manifest(&mut engine, &manifest);
+        assert_eq!(
+            engine.tool_call_dispatch_mode(),
+            agen::ToolCallDispatchMode::OnToolCallComplete
+        );
     }
 
     #[test]

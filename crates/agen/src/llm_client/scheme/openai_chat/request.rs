@@ -221,6 +221,7 @@ impl OpenAIScheme {
                 );
             }
             match item {
+                Item::AssistantResponseBoundary { .. } => {}
                 Item::Message { role, content, .. } => {
                     // Flush pending tool calls
                     self.flush_pending_assistant(

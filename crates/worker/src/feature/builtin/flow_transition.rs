@@ -636,7 +636,7 @@ mod tests {
     use agen::llm_client::error::ClientError;
     use agen::llm_client::event::{
         BlockDelta, BlockMetadata, BlockStart, BlockStop, BlockType, DeltaContent,
-        Event as LlmEvent, StopReason,
+        Event as LlmEvent, ResponseStatus, StatusEvent, StopReason,
     };
     use agen::llm_client::types::Request;
     use agen::tool::ToolExecutionContext;
@@ -906,6 +906,9 @@ mod tests {
                         reasoning: None,
                         stop_reason: Some(StopReason::ToolUse),
                     })),
+                    Ok(LlmEvent::Status(StatusEvent {
+                        status: ResponseStatus::Completed,
+                    })),
                 ])))
             } else {
                 Ok(Box::pin(stream::iter(vec![
@@ -923,6 +926,9 @@ mod tests {
                         block_type: BlockType::Text,
                         reasoning: None,
                         stop_reason: Some(StopReason::EndTurn),
+                    })),
+                    Ok(LlmEvent::Status(StatusEvent {
+                        status: ResponseStatus::Completed,
                     })),
                 ])))
             }
