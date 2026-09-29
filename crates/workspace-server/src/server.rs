@@ -758,6 +758,7 @@ struct ExternalProviderConnection {
     expires_at: Option<chrono::DateTime<Utc>>,
     capabilities: workdir::WorkdirSessionCapabilities,
     admission: Arc<tokio::sync::Semaphore>,
+    shutdown_confirmed: Arc<std::sync::atomic::AtomicBool>,
     sender: tokio::sync::mpsc::Sender<ExternalProviderCommand>,
 }
 
@@ -985,6 +986,68 @@ impl ExternalProviderWorkdirSession {
         }
     }
 
+    async fn provider_command_handle(
+        &self,
+        external_handle: &workdir::CommandHandle,
+    ) -> std::result::Result<workdir::CommandHandle, workdir::WorkdirError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(workdir::WorkdirError::SessionClosed);
+        }
+        self.active_commands
+            .lock()
+            .await
+            .get(&external_handle.0)
+            .cloned()
+            .ok_or_else(|| workdir::WorkdirError::UnknownCommand(external_handle.0.clone()))
+    }
+
+    async fn remove_active_command_if_matches(
+        &self,
+        external_handle: &workdir::CommandHandle,
+        provider_handle: &workdir::CommandHandle,
+    ) {
+        let mut commands = self.active_commands.lock().await;
+        if commands.get(&external_handle.0) == Some(provider_handle) {
+            commands.remove(&external_handle.0);
+        }
+    }
+
+    async fn terminate_provider_command(
+        &self,
+        provider_handle: workdir::CommandHandle,
+    ) -> std::result::Result<(), workdir::WorkdirError> {
+        // Cancellation is best effort because the command may already be terminal.
+        // Terminal output is the proof that the provider reaped the process.
+        let _ = self
+            .operate(WorkdirSessionOperation::CommandCancel(
+                provider_handle.clone(),
+            ))
+            .await;
+        match self
+            .operate(WorkdirSessionOperation::CommandOutput(
+                workdir::CommandOutputRequest {
+                    handle: provider_handle,
+                    cursor: 0,
+                    limit: workdir::external::MAX_EXTERNAL_COMMAND_OUTPUT_BYTES,
+                    wait: true,
+                },
+            ))
+            .await?
+        {
+            WorkdirSessionOperationResult::CommandOutput(output)
+                if output.status != workdir::CommandStatus::Running =>
+            {
+                Ok(())
+            }
+            WorkdirSessionOperationResult::CommandOutput(_) => {
+                Err(workdir::WorkdirError::Unavailable(
+                    "External Workdir provider did not confirm command termination".to_string(),
+                ))
+            }
+            _ => Err(Self::mismatch("command_output")),
+        }
+    }
+
     fn mismatch(expected: &str) -> workdir::WorkdirError {
         workdir::WorkdirError::Unavailable(format!(
             "External Workdir provider returned a mismatched result; expected {expected}"
@@ -1146,23 +1209,58 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
             .operate(WorkdirSessionOperation::CommandStart(request))
             .await?
         {
-            WorkdirSessionOperationResult::CommandStart(handle) => {
+            WorkdirSessionOperationResult::CommandStart(provider_handle) => {
+                let duplicate_handles = {
+                    let commands = self.active_commands.lock().await;
+                    commands
+                        .iter()
+                        .filter(|(_, active)| *active == &provider_handle)
+                        .map(|(external, _)| external.clone())
+                        .collect::<Vec<_>>()
+                };
+                if !duplicate_handles.is_empty() {
+                    // A provider handle must identify exactly one command in one
+                    // generation. Remove every ambiguous route before attempting
+                    // cleanup so no caller can address the wrong process.
+                    let mut commands = self.active_commands.lock().await;
+                    for external_handle in duplicate_handles {
+                        commands.remove(&external_handle);
+                    }
+                    let quarantine_handle =
+                        workdir::CommandHandle(format!("quarantined-command-{}", Uuid::now_v7()));
+                    commands.insert(quarantine_handle.0.clone(), provider_handle.clone());
+                    drop(commands);
+                    if self
+                        .terminate_provider_command(provider_handle.clone())
+                        .await
+                        .is_ok()
+                    {
+                        self.remove_active_command_if_matches(&quarantine_handle, &provider_handle)
+                            .await;
+                    }
+                    return Err(workdir::WorkdirError::Unavailable(
+                        "External Workdir provider reused an active command handle".to_string(),
+                    ));
+                }
+                let external_handle =
+                    workdir::CommandHandle(format!("external-command-{}", Uuid::now_v7()));
                 self.active_commands
                     .lock()
                     .await
-                    .insert(handle.0.clone(), handle.clone());
-                Ok(handle)
+                    .insert(external_handle.0.clone(), provider_handle);
+                Ok(external_handle)
             }
             _ => Err(Self::mismatch("command_start")),
         }
     }
     async fn command_status(
         &self,
-        handle: workdir::CommandHandle,
+        external_handle: workdir::CommandHandle,
     ) -> std::result::Result<workdir::CommandStatus, workdir::WorkdirError> {
         self.ensure_capability(workdir::WorkdirSessionCapability::Command)?;
+        let provider_handle = self.provider_command_handle(&external_handle).await?;
         match self
-            .operate(WorkdirSessionOperation::CommandStatus(handle))
+            .operate(WorkdirSessionOperation::CommandStatus(provider_handle))
             .await?
         {
             WorkdirSessionOperationResult::CommandStatus(status) => Ok(status),
@@ -1171,10 +1269,12 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
     }
     async fn command_output(
         &self,
-        request: workdir::CommandOutputRequest,
+        mut request: workdir::CommandOutputRequest,
     ) -> std::result::Result<workdir::CommandOutput, workdir::WorkdirError> {
         self.ensure_capability(workdir::WorkdirSessionCapability::Command)?;
-        let command_id = request.handle.0.clone();
+        let external_handle = request.handle.clone();
+        let provider_handle = self.provider_command_handle(&external_handle).await?;
+        request.handle = provider_handle.clone();
         match self
             .operate(WorkdirSessionOperation::CommandOutput(request))
             .await?
@@ -1182,7 +1282,8 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
             WorkdirSessionOperationResult::CommandOutput(output) => {
                 if output.status != workdir::CommandStatus::Running && output.next_cursor.is_none()
                 {
-                    self.active_commands.lock().await.remove(&command_id);
+                    self.remove_active_command_if_matches(&external_handle, &provider_handle)
+                        .await;
                 }
                 Ok(output)
             }
@@ -1191,11 +1292,12 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
     }
     async fn cancel_command(
         &self,
-        handle: workdir::CommandHandle,
+        external_handle: workdir::CommandHandle,
     ) -> std::result::Result<(), workdir::WorkdirError> {
         self.ensure_capability(workdir::WorkdirSessionCapability::Command)?;
+        let provider_handle = self.provider_command_handle(&external_handle).await?;
         match self
-            .operate(WorkdirSessionOperation::CommandCancel(handle))
+            .operate(WorkdirSessionOperation::CommandCancel(provider_handle))
             .await?
         {
             WorkdirSessionOperationResult::CommandCancel => Ok(()),
@@ -1207,31 +1309,50 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
         if self.closed.load(Ordering::Acquire) {
             return Ok(());
         }
+        if self.connection.shutdown_confirmed.load(Ordering::Acquire) {
+            self.active_commands.lock().await.clear();
+            self.closed.store(true, Ordering::Release);
+            return Ok(());
+        }
         let commands = self
             .active_commands
             .lock()
             .await
-            .drain()
-            .map(|(_, handle)| handle)
+            .iter()
+            .map(|(external, provider)| {
+                (workdir::CommandHandle(external.clone()), provider.clone())
+            })
             .collect::<Vec<_>>();
-        for handle in commands {
+        let mut cleanup_errors = Vec::new();
+        for (external_handle, provider_handle) in commands {
             // Detach/session replacement is terminal authority for commands
-            // started through this exact provider generation. Request cancel,
-            // then wait for provider-owned process reaping before closing.
-            let _ = self
-                .operate(WorkdirSessionOperation::CommandCancel(handle.clone()))
-                .await;
-            let _ = self
-                .operate(WorkdirSessionOperation::CommandOutput(
-                    workdir::CommandOutputRequest {
-                        handle,
-                        cursor: 0,
-                        limit: workdir::external::MAX_EXTERNAL_COMMAND_OUTPUT_BYTES,
-                        wait: true,
-                    },
-                ))
-                .await;
+            // started through this exact provider generation. Do not report a
+            // successful close until the provider confirms terminal output.
+            match self
+                .terminate_provider_command(provider_handle.clone())
+                .await
+            {
+                Ok(()) => {
+                    self.remove_active_command_if_matches(&external_handle, &provider_handle)
+                        .await;
+                }
+                Err(error) => {
+                    let still_active = self.active_commands.lock().await.get(&external_handle.0)
+                        == Some(&provider_handle);
+                    if still_active {
+                        cleanup_errors.push(error.to_string());
+                    }
+                }
+            }
         }
+        if !cleanup_errors.is_empty() && !self.connection.shutdown_confirmed.load(Ordering::Acquire)
+        {
+            return Err(workdir::WorkdirError::Unavailable(format!(
+                "External Workdir command cleanup was not confirmed: {}",
+                cleanup_errors.join("; ")
+            )));
+        }
+        self.active_commands.lock().await.clear();
         self.closed.store(true, Ordering::Release);
         Ok(())
     }
@@ -17097,6 +17218,25 @@ fn cancel_external_workdir_expiry(api: &WorkspaceApi, grant_id: &str) {
     }
 }
 
+async fn stop_external_workdir_provider(
+    api: &WorkspaceApi,
+    grant: &ExternalWorkdirGrantRecord,
+    reason: workdir::external::ExternalWorkdirRevokeReason,
+) {
+    let connection = {
+        api.external_workdir_providers
+            .lock()
+            .expect("External Workdir provider registry poisoned")
+            .disconnect(&grant.grant_id, grant.generation)
+    };
+    if let Some(connection) = connection {
+        let _ = connection
+            .sender
+            .send(ExternalProviderCommand::Revoke { reason })
+            .await;
+    }
+}
+
 async fn fence_external_workdir_grant_expired(
     api: &WorkspaceApi,
     grant_id: &str,
@@ -17127,20 +17267,6 @@ async fn fence_external_workdir_grant_expired(
             // A reconnect may advance generation between the read and fence.
             continue;
         }
-        let connection = {
-            api.external_workdir_providers
-                .lock()
-                .expect("External Workdir provider registry poisoned")
-                .disconnect(&grant.grant_id, grant.generation)
-        };
-        if let Some(connection) = connection {
-            let _ = connection
-                .sender
-                .send(ExternalProviderCommand::Revoke {
-                    reason: workdir::external::ExternalWorkdirRevokeReason::Expired,
-                })
-                .await;
-        }
         api.store.record_external_workdir_audit(
             &grant.workspace_id,
             "system",
@@ -17166,7 +17292,14 @@ async fn expire_external_workdir_grant(api: &WorkspaceApi, grant_id: &str) -> Ap
     if !matches!(grant.status.as_str(), "revoked" | "expired") {
         return Ok(false);
     }
-    cleanup_external_workdir_attachments(api, &grant.workdir_id).await?;
+    let cleanup = cleanup_external_workdir_attachments(api, &grant.workdir_id).await;
+    stop_external_workdir_provider(
+        api,
+        &grant,
+        workdir::external::ExternalWorkdirRevokeReason::Expired,
+    )
+    .await;
+    cleanup?;
     Ok(true)
 }
 
@@ -17412,6 +17545,7 @@ async fn serve_external_workdir_provider(
         expires_at,
         capabilities: registration.capabilities,
         admission: Arc::new(tokio::sync::Semaphore::new(16)),
+        shutdown_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         sender,
     });
     if api
@@ -17464,6 +17598,7 @@ async fn serve_external_workdir_provider(
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut heartbeat_sequence = 0_u64;
     let mut last_heartbeat_ack = tokio::time::Instant::now();
+    let mut revoking = false;
     let terminal_status = loop {
         tokio::select! {
             _ = heartbeat.tick() => {
@@ -17481,6 +17616,13 @@ async fn serve_external_workdir_provider(
             }
             command = commands.recv() => match command {
                 Some(ExternalProviderCommand::Operation { operation_id, operation, response }) => {
+                    if revoking {
+                        let _ = response.send(Err(WorkdirTransportError {
+                            code: workdir::http::WorkdirTransportErrorCode::Unavailable,
+                            message: "External Workdir provider shutdown is in progress".to_string(),
+                        }));
+                        continue;
+                    }
                     if pending.len() >= 16 {
                         let _ = response.send(Err(WorkdirTransportError {
                             code: workdir::http::WorkdirTransportErrorCode::Unavailable,
@@ -17521,12 +17663,17 @@ async fn serve_external_workdir_provider(
                     }
                 }
                 Some(ExternalProviderCommand::Revoke { reason }) => {
+                    if revoking {
+                        continue;
+                    }
                     let frame = ExternalWorkdirServerFrame::current(ExternalWorkdirServerMessage::Revoke {
                         generation: connection.generation,
                         reason,
                     });
-                    let _ = send_external_workdir_server_frame(&mut socket, &frame).await;
-                    break "revoked";
+                    if !send_external_workdir_server_frame(&mut socket, &frame).await {
+                        break "offline";
+                    }
+                    revoking = true;
                 }
                 None => break "offline",
             },
@@ -17540,7 +17687,9 @@ async fn serve_external_workdir_provider(
                                 if let Some(response) = pending.remove(operation_id.as_str()) {
                                     let result = match outcome {
                                         ExternalWorkdirOperationOutcome::Completed { result } => Ok(result.into_inner()),
-                                        ExternalWorkdirOperationOutcome::Failed { error } => Err(error),
+                                        ExternalWorkdirOperationOutcome::Failed { error } => {
+                                            Err(error.into_transport_error())
+                                        }
                                         ExternalWorkdirOperationOutcome::Cancelled => Err(WorkdirTransportError {
                                             code: workdir::http::WorkdirTransportErrorCode::Unavailable,
                                             message: "External Workdir operation was cancelled".to_string(),
@@ -17554,7 +17703,10 @@ async fn serve_external_workdir_provider(
                                 last_heartbeat_ack = tokio::time::Instant::now();
                             }
                         ExternalWorkdirProviderMessage::RevokeAcknowledged { generation }
-                            if generation == connection.generation => break "revoked",
+                            if revoking && generation == connection.generation => {
+                                connection.shutdown_confirmed.store(true, Ordering::Release);
+                                break "revoked";
+                            }
                         _ => break "offline",
                     }
                 }
@@ -17658,7 +17810,14 @@ async fn scoped_get_external_workdir_grant(
     // Terminal cleanup is retryable: a prior expiry/revoke may have committed
     // its fence before Runtime/session projection completed.
     if matches!(grant.status.as_str(), "expired" | "revoked") {
-        cleanup_external_workdir_attachments(&api, &grant.workdir_id).await?;
+        let cleanup = cleanup_external_workdir_attachments(&api, &grant.workdir_id).await;
+        let reason = if grant.status == "expired" {
+            workdir::external::ExternalWorkdirRevokeReason::Expired
+        } else {
+            workdir::external::ExternalWorkdirRevokeReason::UserRequested
+        };
+        stop_external_workdir_provider(&api, &grant, reason).await;
+        cleanup?;
         cancel_external_workdir_expiry(&api, &grant_id);
     }
     Ok(Json(external_workdir_grant_response(&grant)?))
@@ -17690,20 +17849,6 @@ async fn scoped_revoke_external_workdir_grant(
             "revoked",
             &updated_at,
         )?;
-        let connection = {
-            api.external_workdir_providers
-                .lock()
-                .expect("External Workdir provider registry poisoned")
-                .disconnect(&grant_id, grant.generation)
-        };
-        if let Some(connection) = connection {
-            let _ = connection
-                .sender
-                .send(ExternalProviderCommand::Revoke {
-                    reason: workdir::external::ExternalWorkdirRevokeReason::UserRequested,
-                })
-                .await;
-        }
         grant.status = "revoked".to_string();
         grant.updated_at = updated_at;
         api.store.record_external_workdir_audit(
@@ -17723,7 +17868,14 @@ async fn scoped_revoke_external_workdir_grant(
     }
     // Cleanup is deliberately retried for terminal grants. A prior revoke may
     // have committed its fence before a Runtime/session projection failure.
-    cleanup_external_workdir_attachments(&api, &grant.workdir_id).await?;
+    let cleanup = cleanup_external_workdir_attachments(&api, &grant.workdir_id).await;
+    stop_external_workdir_provider(
+        &api,
+        &grant,
+        workdir::external::ExternalWorkdirRevokeReason::UserRequested,
+    )
+    .await;
+    cleanup?;
     cancel_external_workdir_expiry(&api, &grant_id);
     Ok(Json(external_workdir_grant_response(&grant)?))
 }
@@ -26338,6 +26490,7 @@ mod tests {
             expires_at: Some(Utc::now() + Duration::minutes(1)),
             capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
             admission: Arc::new(tokio::sync::Semaphore::new(16)),
+            shutdown_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sender,
         });
         let session = Arc::new(ExternalProviderWorkdirSession::new(connection, None));
@@ -26402,6 +26555,7 @@ mod tests {
             expires_at: None,
             capabilities: workdir::WorkdirSessionCapabilities::READ_WRITE,
             admission: Arc::new(tokio::sync::Semaphore::new(16)),
+            shutdown_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sender,
         });
         let session = Arc::new(ExternalProviderWorkdirSession::new(connection, None));
@@ -26494,6 +26648,7 @@ mod tests {
             expires_at: None,
             capabilities,
             admission: Arc::new(tokio::sync::Semaphore::new(16)),
+            shutdown_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sender,
         });
         let session = Arc::new(ExternalProviderWorkdirSession::new(connection, None));
@@ -26543,13 +26698,19 @@ mod tests {
                 ..
             })
         ));
-        let handle = workdir::CommandHandle("command-1".to_string());
+        let provider_handle = workdir::CommandHandle("command-1".to_string());
         response
             .send(Ok(WorkdirSessionOperationResult::CommandStart(
-                handle.clone(),
+                provider_handle.clone(),
             )))
             .unwrap();
-        assert_eq!(starter.await.unwrap().unwrap(), handle);
+        let external_handle = starter.await.unwrap().unwrap();
+        assert_ne!(external_handle, provider_handle);
+        assert!(matches!(
+            session.command_status(provider_handle.clone()).await,
+            Err(workdir::WorkdirError::UnknownCommand(_))
+        ));
+        assert!(commands.try_recv().is_err());
 
         let closer = {
             let session = session.clone();
@@ -26565,7 +26726,7 @@ mod tests {
         };
         assert!(matches!(
             operation,
-            WorkdirSessionOperation::CommandCancel(ref current) if current == &handle
+            WorkdirSessionOperation::CommandCancel(ref current) if current == &provider_handle
         ));
         response
             .send(Ok(WorkdirSessionOperationResult::CommandCancel))
@@ -26577,6 +26738,85 @@ mod tests {
         }) = commands.recv().await
         else {
             panic!("expected terminal command output during close");
+        };
+        assert!(matches!(
+            operation,
+            WorkdirSessionOperation::CommandOutput(workdir::CommandOutputRequest {
+                wait: true,
+                ..
+            })
+        ));
+        response
+            .send(Ok(WorkdirSessionOperationResult::CommandOutput(
+                workdir::CommandOutput {
+                    status: workdir::CommandStatus::Running,
+                    exit_code: None,
+                    timed_out: false,
+                    content: String::new(),
+                    next_cursor: None,
+                    truncated: false,
+                    output_path: None,
+                },
+            )))
+            .unwrap();
+        assert!(matches!(
+            closer.await.unwrap(),
+            Err(workdir::WorkdirError::Unavailable(_))
+        ));
+
+        let status = {
+            let session = session.clone();
+            let handle = external_handle.clone();
+            tokio::spawn(async move { session.command_status(handle).await })
+        };
+        let Some(ExternalProviderCommand::Operation {
+            operation,
+            response,
+            ..
+        }) = commands.recv().await
+        else {
+            panic!("expected retained command status after failed close");
+        };
+        assert!(matches!(
+            operation,
+            WorkdirSessionOperation::CommandStatus(ref current) if current == &provider_handle
+        ));
+        response
+            .send(Ok(WorkdirSessionOperationResult::CommandStatus(
+                workdir::CommandStatus::Running,
+            )))
+            .unwrap();
+        assert_eq!(
+            status.await.unwrap().unwrap(),
+            workdir::CommandStatus::Running
+        );
+
+        let closer = {
+            let session = session.clone();
+            tokio::spawn(async move { session.close().await })
+        };
+        let Some(ExternalProviderCommand::Operation {
+            operation,
+            response,
+            ..
+        }) = commands.recv().await
+        else {
+            panic!("expected retried command cancellation");
+        };
+        assert!(matches!(
+            operation,
+            WorkdirSessionOperation::CommandCancel(ref current) if current == &provider_handle
+        ));
+        response
+            .send(Ok(WorkdirSessionOperationResult::CommandCancel))
+            .unwrap();
+        let Some(ExternalProviderCommand::Operation {
+            operation,
+            response,
+            ..
+        }) = commands.recv().await
+        else {
+            panic!("expected retried terminal command output");
         };
         assert!(matches!(
             operation,
@@ -26600,9 +26840,209 @@ mod tests {
             .unwrap();
         closer.await.unwrap().unwrap();
         assert!(matches!(
-            session.command_status(handle).await,
+            session.command_status(external_handle).await,
             Err(workdir::WorkdirError::SessionClosed)
         ));
+    }
+
+    #[tokio::test]
+    async fn external_provider_reused_command_handle_invalidates_ambiguous_routes() {
+        let (sender, mut commands) = tokio::sync::mpsc::channel(8);
+        let connection = Arc::new(ExternalProviderConnection {
+            grant_id: "grant-duplicate-command".to_string(),
+            workdir_id: "external-duplicate-command".to_string(),
+            provider_instance_id: "provider-duplicate-command".to_string(),
+            generation: 3,
+            expires_at: None,
+            capabilities: workdir::WorkdirSessionCapabilities::COMMAND_ONLY,
+            admission: Arc::new(tokio::sync::Semaphore::new(16)),
+            shutdown_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sender,
+        });
+        let session = Arc::new(ExternalProviderWorkdirSession::new(connection, None));
+        let request = || workdir::CommandRequest {
+            command: "sleep 30".to_string(),
+            timeout_secs: 30,
+            output_limit: 1024,
+            cwd: workdir::WorkdirPath::root(),
+            spill_dir: None,
+            tool_call_id: None,
+        };
+        let provider_handle = workdir::CommandHandle("command-reused".to_string());
+
+        let first = {
+            let session = session.clone();
+            let request = request();
+            tokio::spawn(async move { session.start_command(request).await })
+        };
+        let Some(ExternalProviderCommand::Operation { response, .. }) = commands.recv().await
+        else {
+            panic!("expected first command start");
+        };
+        response
+            .send(Ok(WorkdirSessionOperationResult::CommandStart(
+                provider_handle.clone(),
+            )))
+            .unwrap();
+        let first_external = first.await.unwrap().unwrap();
+
+        let duplicate = {
+            let session = session.clone();
+            let request = request();
+            tokio::spawn(async move { session.start_command(request).await })
+        };
+        let Some(ExternalProviderCommand::Operation { response, .. }) = commands.recv().await
+        else {
+            panic!("expected duplicate command start");
+        };
+        response
+            .send(Ok(WorkdirSessionOperationResult::CommandStart(
+                provider_handle.clone(),
+            )))
+            .unwrap();
+        let Some(ExternalProviderCommand::Operation {
+            operation,
+            response,
+            ..
+        }) = commands.recv().await
+        else {
+            panic!("expected ambiguous command cancellation");
+        };
+        assert!(matches!(
+            operation,
+            WorkdirSessionOperation::CommandCancel(ref current) if current == &provider_handle
+        ));
+        response
+            .send(Ok(WorkdirSessionOperationResult::CommandCancel))
+            .unwrap();
+        let Some(ExternalProviderCommand::Operation { response, .. }) = commands.recv().await
+        else {
+            panic!("expected ambiguous command terminal output");
+        };
+        response
+            .send(Ok(WorkdirSessionOperationResult::CommandOutput(
+                workdir::CommandOutput {
+                    status: workdir::CommandStatus::Cancelled,
+                    exit_code: None,
+                    timed_out: false,
+                    content: String::new(),
+                    next_cursor: None,
+                    truncated: false,
+                    output_path: None,
+                },
+            )))
+            .unwrap();
+        assert!(matches!(
+            duplicate.await.unwrap(),
+            Err(workdir::WorkdirError::Unavailable(_))
+        ));
+        assert!(matches!(
+            session.command_status(first_external).await,
+            Err(workdir::WorkdirError::UnknownCommand(_))
+        ));
+        assert!(commands.try_recv().is_err());
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_provider_generation_sessions_reject_each_others_command_handles() {
+        let (first_sender, mut first_commands) = tokio::sync::mpsc::channel(4);
+        let first = Arc::new(ExternalProviderWorkdirSession::new(
+            Arc::new(ExternalProviderConnection {
+                grant_id: "grant-generation-command".to_string(),
+                workdir_id: "external-generation-command".to_string(),
+                provider_instance_id: "provider-generation-command".to_string(),
+                generation: 1,
+                expires_at: None,
+                capabilities: workdir::WorkdirSessionCapabilities::COMMAND_ONLY,
+                admission: Arc::new(tokio::sync::Semaphore::new(16)),
+                shutdown_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                sender: first_sender,
+            }),
+            None,
+        ));
+        let (second_sender, mut second_commands) = tokio::sync::mpsc::channel(4);
+        let second = Arc::new(ExternalProviderWorkdirSession::new(
+            Arc::new(ExternalProviderConnection {
+                grant_id: "grant-generation-command".to_string(),
+                workdir_id: "external-generation-command".to_string(),
+                provider_instance_id: "provider-generation-command".to_string(),
+                generation: 2,
+                expires_at: None,
+                capabilities: workdir::WorkdirSessionCapabilities::COMMAND_ONLY,
+                admission: Arc::new(tokio::sync::Semaphore::new(16)),
+                shutdown_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                sender: second_sender,
+            }),
+            None,
+        ));
+        let request = || workdir::CommandRequest {
+            command: "sleep 30".to_string(),
+            timeout_secs: 30,
+            output_limit: 1024,
+            cwd: workdir::WorkdirPath::root(),
+            spill_dir: None,
+            tool_call_id: None,
+        };
+        let provider_handle = workdir::CommandHandle("command-1".to_string());
+
+        let first_start = {
+            let first = first.clone();
+            let request = request();
+            tokio::spawn(async move { first.start_command(request).await })
+        };
+        let Some(ExternalProviderCommand::Operation { response, .. }) = first_commands.recv().await
+        else {
+            panic!("expected generation-one command start");
+        };
+        response
+            .send(Ok(WorkdirSessionOperationResult::CommandStart(
+                provider_handle.clone(),
+            )))
+            .unwrap();
+        let stale_handle = first_start.await.unwrap().unwrap();
+
+        let second_start = {
+            let second = second.clone();
+            let request = request();
+            tokio::spawn(async move { second.start_command(request).await })
+        };
+        let Some(ExternalProviderCommand::Operation { response, .. }) =
+            second_commands.recv().await
+        else {
+            panic!("expected generation-two command start");
+        };
+        response
+            .send(Ok(WorkdirSessionOperationResult::CommandStart(
+                provider_handle,
+            )))
+            .unwrap();
+        let current_handle = second_start.await.unwrap().unwrap();
+        assert_ne!(stale_handle, current_handle);
+        assert!(matches!(
+            second.command_status(stale_handle).await,
+            Err(workdir::WorkdirError::UnknownCommand(_))
+        ));
+        assert!(second_commands.try_recv().is_err());
+
+        let status = {
+            let second = second.clone();
+            tokio::spawn(async move { second.command_status(current_handle).await })
+        };
+        let Some(ExternalProviderCommand::Operation { response, .. }) =
+            second_commands.recv().await
+        else {
+            panic!("expected current-generation command status");
+        };
+        response
+            .send(Ok(WorkdirSessionOperationResult::CommandStatus(
+                workdir::CommandStatus::Running,
+            )))
+            .unwrap();
+        assert_eq!(
+            status.await.unwrap().unwrap(),
+            workdir::CommandStatus::Running
+        );
     }
 
     #[tokio::test]
@@ -26979,6 +27419,7 @@ mod tests {
                 expires_at: Some(expires_at),
                 capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
                 admission: Arc::new(tokio::sync::Semaphore::new(16)),
+                shutdown_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 sender,
             });
             assert!(
@@ -27406,7 +27847,8 @@ mod tests {
             tokio::spawn(async move {
                 broker_session
                     .start_command(workdir::CommandRequest {
-                        command: "printf command-ok".to_string(),
+                        command: "sleep 30 & child=$!; echo $child > child.pid; wait $child"
+                            .to_string(),
                         timeout_secs: 30,
                         output_limit: 1024,
                         cwd: workdir::WorkdirPath::root(),
@@ -27459,6 +27901,14 @@ mod tests {
             .unwrap();
         let command_handle = command_start.await.unwrap().unwrap();
 
+        for _ in 0..100 {
+            if provider_root.path().join("child.pid").is_file() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(provider_root.path().join("child.pid").is_file());
+
         let command_output = {
             let broker_session = broker_session.clone();
             let handle = command_handle.clone();
@@ -27468,7 +27918,7 @@ mod tests {
                         handle,
                         cursor: 0,
                         limit: 1024,
-                        wait: true,
+                        wait: false,
                     })
                     .await
             })
@@ -27487,7 +27937,10 @@ mod tests {
         };
         assert!(matches!(
             operation.as_inner(),
-            WorkdirSessionOperation::CommandOutput(_)
+            WorkdirSessionOperation::CommandOutput(workdir::CommandOutputRequest {
+                wait: false,
+                ..
+            })
         ));
         let result = workdir::http::dispatch_workdir_session_operation(
             &local_session,
@@ -27512,17 +27965,106 @@ mod tests {
             .await
             .unwrap();
         let command_output = command_output.await.unwrap().unwrap();
-        assert_eq!(command_output.content, "command-ok");
-        assert_eq!(command_output.exit_code, Some(0));
+        assert_eq!(command_output.status, workdir::CommandStatus::Running);
         assert_eq!(command_output.output_path, None);
 
-        let Json(revoked) = scoped_revoke_external_workdir_grant(
-            State(api.clone()),
-            Extension(test_browser_request_actor()),
-            AxumPath((TEST_WORKSPACE_ID.to_string(), grant.grant_id.clone())),
+        let revoker = {
+            let api = api.clone();
+            let grant_id = grant.grant_id.clone();
+            tokio::spawn(async move {
+                scoped_revoke_external_workdir_grant(
+                    State(api),
+                    Extension(test_browser_request_actor()),
+                    AxumPath((TEST_WORKSPACE_ID.to_string(), grant_id)),
+                )
+                .await
+            })
+        };
+        let (operation_id, operation) = loop {
+            let text = second.next().await.unwrap().unwrap().into_text().unwrap();
+            let frame = serde_json::from_str::<ExternalWorkdirServerFrame>(&text).unwrap();
+            if let ExternalWorkdirServerMessage::Operation {
+                generation: 2,
+                operation_id,
+                operation,
+            } = frame.message
+            {
+                break (operation_id, operation);
+            }
+        };
+        assert!(matches!(
+            operation.as_inner(),
+            WorkdirSessionOperation::CommandCancel(_)
+        ));
+        let result = workdir::http::dispatch_workdir_session_operation(
+            &local_session,
+            operation.into_inner(),
+        )
+        .await
+        .unwrap()
+        .try_into()
+        .unwrap();
+        second
+            .send(Message::Text(
+                serde_json::to_string(&ExternalWorkdirProviderFrame::current(
+                    ExternalWorkdirProviderMessage::OperationResult {
+                        generation: 2,
+                        operation_id,
+                        outcome: ExternalWorkdirOperationOutcome::Completed { result },
+                    },
+                ))
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+        let (operation_id, operation) = loop {
+            let text = second.next().await.unwrap().unwrap().into_text().unwrap();
+            let frame = serde_json::from_str::<ExternalWorkdirServerFrame>(&text).unwrap();
+            if let ExternalWorkdirServerMessage::Operation {
+                generation: 2,
+                operation_id,
+                operation,
+            } = frame.message
+            {
+                break (operation_id, operation);
+            }
+        };
+        assert!(matches!(
+            operation.as_inner(),
+            WorkdirSessionOperation::CommandOutput(workdir::CommandOutputRequest {
+                wait: true,
+                ..
+            })
+        ));
+        let provider_result = workdir::http::dispatch_workdir_session_operation(
+            &local_session,
+            operation.into_inner(),
         )
         .await
         .unwrap();
+        assert!(matches!(
+            provider_result,
+            WorkdirSessionOperationResult::CommandOutput(ref output)
+                if output.status != workdir::CommandStatus::Running
+        ));
+        let result = provider_result.try_into().unwrap();
+        second
+            .send(Message::Text(
+                serde_json::to_string(&ExternalWorkdirProviderFrame::current(
+                    ExternalWorkdirProviderMessage::OperationResult {
+                        generation: 2,
+                        operation_id,
+                        outcome: ExternalWorkdirOperationOutcome::Completed { result },
+                    },
+                ))
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let Json(revoked) = revoker.await.unwrap().unwrap();
         assert_eq!(revoked.status, "revoked");
         let active_links = api
             .store
@@ -27545,6 +28087,16 @@ mod tests {
             revoke.message,
             ExternalWorkdirServerMessage::Revoke { generation: 2, .. }
         ));
+        second
+            .send(Message::Text(
+                serde_json::to_string(&ExternalWorkdirProviderFrame::current(
+                    ExternalWorkdirProviderMessage::RevokeAcknowledged { generation: 2 },
+                ))
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
         server.abort();
     }
 
@@ -27559,6 +28111,7 @@ mod tests {
             expires_at: Some(Utc::now() + Duration::minutes(1)),
             capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
             admission: Arc::new(tokio::sync::Semaphore::new(16)),
+            shutdown_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sender,
         });
         let (sender, _) = tokio::sync::mpsc::channel(1);

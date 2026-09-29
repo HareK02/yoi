@@ -353,13 +353,34 @@ impl<'de> Deserialize<'de> for ExternalWorkdirOperationResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalWorkdirOperationError {
+    code: crate::http::WorkdirTransportErrorCode,
+}
+
+impl ExternalWorkdirOperationError {
+    /// Collapse provider failures to a closed error code. Provider-authored
+    /// diagnostics never cross the External Workdir trust boundary.
+    pub fn from_transport_error(error: WorkdirTransportError) -> Self {
+        Self { code: error.code }
+    }
+
+    pub fn into_transport_error(self) -> WorkdirTransportError {
+        WorkdirTransportError {
+            code: self.code,
+            message: format!("External Workdir provider reported {}", self.code.as_str()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExternalWorkdirOperationOutcome {
     Completed {
         result: ExternalWorkdirOperationResult,
     },
     Failed {
-        error: WorkdirTransportError,
+        error: ExternalWorkdirOperationError,
     },
     Cancelled,
 }
@@ -555,6 +576,39 @@ mod tests {
             );
             assert_no_provider_authority(&value);
         }
+    }
+
+    #[test]
+    fn provider_failures_are_closed_and_drop_provider_authored_diagnostics() {
+        let error = ExternalWorkdirOperationError::from_transport_error(WorkdirTransportError {
+            code: crate::http::WorkdirTransportErrorCode::Internal,
+            message: "/home/operator/private provider-secret\ncontrol".to_string(),
+        });
+        let frame = ExternalWorkdirProviderFrame::current(
+            ExternalWorkdirProviderMessage::OperationResult {
+                generation: 1,
+                operation_id: ExternalWorkdirOperationId::new("operation-failed").unwrap(),
+                outcome: ExternalWorkdirOperationOutcome::Failed {
+                    error: error.clone(),
+                },
+            },
+        );
+        let value = serde_json::to_value(&frame).unwrap();
+        assert_no_provider_authority(&value);
+        assert!(value.to_string().len() < 512);
+        assert_eq!(
+            error.into_transport_error().message,
+            "External Workdir provider reported internal"
+        );
+
+        let provider_message = serde_json::to_string(&frame).unwrap().replace(
+            r#""code":"internal""#,
+            r#""code":"internal","message":"provider-secret""#,
+        );
+        assert!(
+            serde_json::from_str::<ExternalWorkdirProviderFrame>(&provider_message).is_err(),
+            "provider-authored diagnostics must not be accepted"
+        );
     }
 
     #[test]

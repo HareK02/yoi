@@ -14,9 +14,10 @@ use server_api::{
 use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
 use workdir::external::{
-    ExternalProviderInstanceId, ExternalWorkdirGrantId, ExternalWorkdirOperationId,
-    ExternalWorkdirOperationOutcome, ExternalWorkdirProviderFrame, ExternalWorkdirProviderMessage,
-    ExternalWorkdirProviderRegistration, ExternalWorkdirServerFrame, ExternalWorkdirServerMessage,
+    ExternalProviderInstanceId, ExternalWorkdirGrantId, ExternalWorkdirOperationError,
+    ExternalWorkdirOperationId, ExternalWorkdirOperationOutcome, ExternalWorkdirProviderFrame,
+    ExternalWorkdirProviderMessage, ExternalWorkdirProviderRegistration,
+    ExternalWorkdirServerFrame, ExternalWorkdirServerMessage,
 };
 use workdir::http::{WorkdirTransportError, dispatch_workdir_session_operation};
 use workdir::{
@@ -796,10 +797,12 @@ async fn serve_provider_connection(
                                             }),
                                         )
                                         .unwrap_or_else(|_| ExternalWorkdirOperationOutcome::Failed {
-                                            error: WorkdirTransportError {
-                                                code: workdir::http::WorkdirTransportErrorCode::Internal,
-                                                message: "External Workdir operation executor failed".to_string(),
-                                            },
+                                            error: ExternalWorkdirOperationError::from_transport_error(
+                                                WorkdirTransportError {
+                                                    code: workdir::http::WorkdirTransportErrorCode::Internal,
+                                                    message: "External Workdir operation executor failed".to_string(),
+                                                },
+                                            ),
                                         });
                                         let _ = completion_sender.blocking_send(OperationCompletion {
                                             operation_id: task_operation_id,
@@ -912,14 +915,16 @@ async fn execute_operation(
         Ok(result) => match result.try_into() {
             Ok(result) => ExternalWorkdirOperationOutcome::Completed { result },
             Err(message) => ExternalWorkdirOperationOutcome::Failed {
-                error: WorkdirTransportError {
+                error: ExternalWorkdirOperationError::from_transport_error(WorkdirTransportError {
                     code: workdir::http::WorkdirTransportErrorCode::Unsupported,
                     message,
-                },
+                }),
             },
         },
         Err(error) => ExternalWorkdirOperationOutcome::Failed {
-            error: WorkdirTransportError::from_workdir_error(&error),
+            error: ExternalWorkdirOperationError::from_transport_error(
+                WorkdirTransportError::from_workdir_error(&error),
+            ),
         },
     }
 }
