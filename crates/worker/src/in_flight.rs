@@ -284,11 +284,11 @@ impl InFlightInner {
             CommandEvent::Started {
                 tool_call_id: None, ..
             } => false,
-            CommandEvent::Output { command_id, .. }
-            | CommandEvent::Terminal { command_id, .. } => self
-                .commands
-                .iter()
-                .any(|command| command.command_id == *command_id),
+            CommandEvent::Output { command_id, .. } | CommandEvent::Terminal { command_id, .. } => {
+                self.commands
+                    .iter()
+                    .any(|command| command.command_id == *command_id)
+            }
         }
     }
 
@@ -433,9 +433,7 @@ impl InFlightInner {
     }
 
     fn clear(&mut self) -> bool {
-        if self.blocks.is_empty()
-            && self.known_tool_call_ids.is_empty()
-            && self.commands.is_empty()
+        if self.blocks.is_empty() && self.known_tool_call_ids.is_empty() && self.commands.is_empty()
         {
             false
         } else {
@@ -764,7 +762,10 @@ mod tests {
         let mut rx = working_event_tx.subscribe();
         let in_flight = InFlightEvents::new(working_event_tx);
         in_flight.tool_call_start("tool-1".into(), "Bash".into());
-        assert!(matches!(rx.try_recv().unwrap(), Event::ToolCallStart { .. }));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Event::ToolCallStart { .. }
+        ));
         in_flight.publish_command_event(CommandEvent::Started {
             command_id: "command-1".into(),
             tool_call_id: Some("tool-1".into()),
@@ -817,7 +818,10 @@ mod tests {
         let mut rx = working_event_tx.subscribe();
         let in_flight = InFlightEvents::new(working_event_tx);
         in_flight.tool_call_start("own-tool".into(), "Bash".into());
-        assert!(matches!(rx.try_recv().unwrap(), Event::ToolCallStart { .. }));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Event::ToolCallStart { .. }
+        ));
 
         in_flight.publish_command_event(CommandEvent::Started {
             command_id: "foreign-command".into(),
@@ -842,7 +846,11 @@ mod tests {
         });
 
         assert!(rx.try_recv().is_err());
-        assert!(snapshot_from_guard(&in_flight.snapshot_guard()).commands.is_empty());
+        assert!(
+            snapshot_from_guard(&in_flight.snapshot_guard())
+                .commands
+                .is_empty()
+        );
 
         in_flight.replace_command_snapshot(vec![
             command_snapshot("own-command", Some("own-tool")),
