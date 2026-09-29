@@ -510,6 +510,10 @@ impl<S: Scheme + Clone + 'static> LlmClient for HttpTransport<S> {
         self.scheme.validate_config(config)
     }
 
+    fn tool_call_completion_support(&self) -> super::ToolCallCompletionSupport {
+        self.scheme.tool_call_completion_support()
+    }
+
     async fn stream(&self, request: Request) -> Result<ResponseStream, ClientError> {
         let total_started = Instant::now();
         let path = self.scheme.path(&self.model_id);

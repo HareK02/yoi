@@ -43,7 +43,7 @@ fn render_items(items: &[Item]) -> String {
             Item::ToolResult { summary, .. } => {
                 lines.push(format!("[ToolResult] {summary}"));
             }
-            Item::Reasoning { .. } => {}
+            Item::AssistantResponseBoundary { .. } | Item::Reasoning { .. } => {}
         }
     }
     lines.join("\n\n")

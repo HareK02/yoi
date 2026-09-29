@@ -24,7 +24,10 @@ import type {
   WorkingDirectoryRepositoryOption,
 } from "$lib/generated/worker-launch-api";
 import type { Segment } from "$lib/generated/protocol";
-import { parseWorkingDirectorySummary } from "$lib/workspace/api/workdirs";
+import {
+  parseExternalWorkdirPermissions,
+  parseWorkingDirectorySummary,
+} from "$lib/workspace/api/workdirs";
 
 const DIAGNOSTIC_SEVERITIES = new Set<DiagnosticSeverity>([
   "info",
@@ -316,9 +319,13 @@ function workerWorkdirAttachment(
   label: string,
 ): WorkerWorkdirAttachmentSummary {
   const item = record(value, label);
-  exact(item, ["alias", "working_directory"], label);
+  exact(item, ["alias", "effective_permissions", "working_directory"], label);
   return {
     alias: string(item.alias, `${label}.alias`),
+    effective_permissions: parseExternalWorkdirPermissions(
+      item.effective_permissions,
+      `${label}.effective_permissions`,
+    ),
     working_directory: parseWorkingDirectorySummary(item.working_directory),
   };
 }

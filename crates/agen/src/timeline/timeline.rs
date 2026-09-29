@@ -256,8 +256,8 @@ where
     H: Handler<ToolUseBlockKind>,
 {
     handler: H,
-    scope: Option<H::Scope>,
-    current_tool: Option<(String, String)>, // (id, name)
+    scopes: HashMap<usize, H::Scope>,
+    tools: HashMap<usize, (String, String)>, // index -> (id, name)
 }
 
 impl<H> ToolUseBlockHandlerWrapper<H>
@@ -267,8 +267,8 @@ where
     fn new(handler: H) -> Self {
         Self {
             handler,
-            scope: None,
-            current_tool: None,
+            scopes: HashMap::new(),
+            tools: HashMap::new(),
         }
     }
 }
@@ -279,60 +279,55 @@ where
     H::Scope: Send + Sync,
 {
     fn dispatch_start(&mut self, start: &BlockStart) {
-        if let Some(scope) = &mut self.scope {
-            if let BlockMetadata::ToolUse { id, name } = &start.metadata {
-                self.current_tool = Some((id.clone(), name.clone()));
-                self.handler.on_event(
-                    scope,
-                    &ToolUseBlockEvent::Start(ToolUseBlockStart {
-                        index: start.index,
-                        id: id.clone(),
-                        name: name.clone(),
-                    }),
-                );
-            }
+        if let BlockMetadata::ToolUse { id, name } = &start.metadata {
+            let scope = self.scopes.entry(start.index).or_default();
+            self.tools.insert(start.index, (id.clone(), name.clone()));
+            self.handler.on_event(
+                scope,
+                &ToolUseBlockEvent::Start(ToolUseBlockStart {
+                    index: start.index,
+                    id: id.clone(),
+                    name: name.clone(),
+                }),
+            );
         }
     }
 
     fn dispatch_delta(&mut self, delta: &BlockDelta) {
-        if let Some(scope) = &mut self.scope {
-            if let DeltaContent::InputJson(json) = &delta.delta {
-                self.handler
-                    .on_event(scope, &ToolUseBlockEvent::InputJsonDelta(json.clone()));
-            }
+        if let DeltaContent::InputJson(json) = &delta.delta {
+            let scope = self.scopes.entry(delta.index).or_default();
+            self.handler
+                .on_event(scope, &ToolUseBlockEvent::InputJsonDelta(json.clone()));
         }
     }
 
     fn dispatch_stop(&mut self, stop: &BlockStop) {
-        if let Some(scope) = &mut self.scope {
-            if let Some((id, name)) = self.current_tool.take() {
-                self.handler.on_event(
-                    scope,
-                    &ToolUseBlockEvent::Stop(ToolUseBlockStop {
-                        index: stop.index,
-                        id,
-                        name,
-                    }),
-                );
-            }
+        if let (Some(mut scope), Some((id, name))) = (
+            self.scopes.remove(&stop.index),
+            self.tools.remove(&stop.index),
+        ) {
+            self.handler.on_event(
+                &mut scope,
+                &ToolUseBlockEvent::Stop(ToolUseBlockStop {
+                    index: stop.index,
+                    id,
+                    name,
+                }),
+            );
         }
     }
 
-    fn dispatch_abort(&mut self, _abort: &BlockAbort) {
-        self.current_tool = None;
+    fn dispatch_abort(&mut self, abort: &BlockAbort) {
+        self.scopes.remove(&abort.index);
+        self.tools.remove(&abort.index);
     }
 
-    fn start_scope(&mut self) {
-        self.scope = Some(H::Scope::default());
-    }
+    fn start_scope(&mut self) {}
 
-    fn end_scope(&mut self) {
-        self.scope = None;
-        self.current_tool = None;
-    }
+    fn end_scope(&mut self) {}
 
     fn has_scope(&self) -> bool {
-        self.scope.is_some()
+        !self.scopes.is_empty()
     }
 }
 
@@ -379,7 +374,9 @@ pub struct Timeline {
     thinking_block_handlers: Vec<Box<dyn ErasedBlockHandler>>,
     tool_use_block_handlers: Vec<Box<dyn ErasedBlockHandler>>,
 
-    // 現在アクティブなブロック
+    // 現在アクティブなブロック。provider は index ごとに複数 scope を
+    // interleave できるため、単一の current block ではなく全 scope を追跡する。
+    active_blocks: HashMap<(BlockType, usize), ()>,
     current_block: Option<BlockType>,
 
     // 1リクエスト内で受信した Usage event の集約バッファ。
@@ -405,6 +402,7 @@ impl Timeline {
             text_block_handlers: Vec::new(),
             thinking_block_handlers: Vec::new(),
             tool_use_block_handlers: Vec::new(),
+            active_blocks: HashMap::new(),
             current_block: None,
             pending_usage: None,
         }
@@ -559,6 +557,8 @@ impl Timeline {
     }
 
     fn handle_block_start(&mut self, start: &BlockStart) {
+        self.active_blocks
+            .insert((start.block_type, start.index), ());
         self.current_block = Some(start.block_type);
 
         let handlers = self.get_block_handlers_mut(start.block_type);
@@ -572,10 +572,11 @@ impl Timeline {
         let block_type = delta.delta.block_type();
 
         // OpenAIなどのプロバイダはBlockStartを送らない場合があるため、
-        // Deltaが来たときにスコープがなければ暗黙的に開始する
-        if self.current_block.is_none() {
-            self.current_block = Some(block_type);
-        }
+        // Deltaが来たときにその index のスコープがなければ暗黙的に開始する
+        self.active_blocks
+            .entry((block_type, delta.index))
+            .or_insert(());
+        self.current_block = Some(block_type);
 
         let handlers = self.get_block_handlers_mut(block_type);
         for handler in handlers {
@@ -593,7 +594,12 @@ impl Timeline {
             handler.dispatch_stop(stop);
             handler.end_scope();
         }
-        self.current_block = None;
+        self.active_blocks.remove(&(stop.block_type, stop.index));
+        self.current_block = self
+            .active_blocks
+            .keys()
+            .next()
+            .map(|(block_type, _)| *block_type);
     }
 
     fn handle_block_abort(&mut self, abort: &BlockAbort) {
@@ -602,7 +608,12 @@ impl Timeline {
             handler.dispatch_abort(abort);
             handler.end_scope();
         }
-        self.current_block = None;
+        self.active_blocks.remove(&(abort.block_type, abort.index));
+        self.current_block = self
+            .active_blocks
+            .keys()
+            .next()
+            .map(|(block_type, _)| *block_type);
     }
 
     fn get_block_handlers_mut(
@@ -622,19 +633,22 @@ impl Timeline {
         self.current_block
     }
 
-    /// 現在アクティブなブロックを中断する
+    /// 現在アクティブな全ブロックを中断する
     ///
-    /// キャンセルやエラー時に呼び出し、進行中のブロックに対して
+    /// キャンセルやエラー時に呼び出し、index ごとに進行中の全ブロックへ
     /// BlockAbortイベントを発火してスコープをクリーンアップする。
     pub fn abort_current_block(&mut self) {
-        if let Some(block_type) = self.current_block {
+        let active = self.active_blocks.keys().copied().collect::<Vec<_>>();
+        for (block_type, index) in active {
             let abort = crate::timeline::event::BlockAbort {
-                index: 0, // インデックスは不明なので0
+                index,
                 block_type,
                 reason: "Cancelled".to_string(),
             };
             self.handle_block_abort(&abort);
         }
+        self.active_blocks.clear();
+        self.current_block = None;
     }
 }
 
@@ -677,6 +691,50 @@ mod tests {
 
         assert!(timeline.current_block().is_none());
         assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn abort_clears_every_indexed_scope_before_indices_are_reused() {
+        #[derive(Default)]
+        struct Scope {
+            started: bool,
+        }
+        struct IndexedToolHandler {
+            reused_cleanly: Arc<Mutex<Vec<bool>>>,
+        }
+        impl Handler<ToolUseBlockKind> for IndexedToolHandler {
+            type Scope = Scope;
+
+            fn on_event(&mut self, scope: &mut Scope, event: &ToolUseBlockEvent) {
+                if matches!(event, ToolUseBlockEvent::Start(_)) {
+                    self.reused_cleanly.lock().unwrap().push(!scope.started);
+                    scope.started = true;
+                }
+            }
+        }
+
+        let reused_cleanly = Arc::new(Mutex::new(Vec::new()));
+        let mut timeline = Timeline::new();
+        timeline.on_tool_use_block(IndexedToolHandler {
+            reused_cleanly: reused_cleanly.clone(),
+        });
+
+        timeline.dispatch(&Event::tool_use_start(0, "first", "tool"));
+        timeline.dispatch(&Event::tool_use_start(1, "second", "tool"));
+        // Stopping one interleaved block must not hide its still-active sibling.
+        timeline.dispatch(&Event::tool_use_stop(0));
+        assert_eq!(timeline.current_block(), Some(BlockType::ToolUse));
+        timeline.abort_current_block();
+        assert!(timeline.current_block().is_none());
+
+        // A later provider response may reuse the same content-block index.
+        timeline.dispatch(&Event::tool_use_start(1, "replacement", "tool"));
+        timeline.dispatch(&Event::tool_use_stop(1));
+
+        assert_eq!(
+            reused_cleanly.lock().unwrap().as_slice(),
+            [true, true, true]
+        );
     }
 
     #[test]

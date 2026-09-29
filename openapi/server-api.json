@@ -2015,8 +2015,8 @@
           "display_name": {
             "type": "string"
           },
-          "permission": {
-            "$ref": "#/components/schemas/ExternalWorkdirPermission"
+          "permissions": {
+            "$ref": "#/components/schemas/ExternalWorkdirPermissions"
           },
           "provider_instance_id": {
             "type": "string"
@@ -2034,7 +2034,7 @@
         "required": [
           "provider_instance_id",
           "display_name",
-          "permission"
+          "permissions"
         ],
         "type": "object"
       },
@@ -2060,8 +2060,8 @@
           "grant_id": {
             "type": "string"
           },
-          "permission": {
-            "$ref": "#/components/schemas/ExternalWorkdirPermission"
+          "permissions": {
+            "$ref": "#/components/schemas/ExternalWorkdirPermissions"
           },
           "provider_instance_id": {
             "type": "string"
@@ -2082,18 +2082,34 @@
           "working_directory_id",
           "provider_instance_id",
           "display_name",
-          "permission",
+          "permissions",
           "generation",
           "status"
         ],
         "type": "object"
       },
-      "ExternalWorkdirPermission": {
-        "enum": [
-          "read_only",
-          "read_write"
+      "ExternalWorkdirPermissions": {
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "description": "Execute commands as the sharing CLI user on the provider host. This is\nexplicit authority and does not imply either filesystem category.",
+            "type": "boolean"
+          },
+          "read": {
+            "description": "Read files and use read-only discovery operations such as Glob and Grep.",
+            "type": "boolean"
+          },
+          "write": {
+            "description": "Create or update files with Write and Edit. Existing-file mutation also\nrequires `read` so callers can satisfy the read-before-write contract.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "read",
+          "write",
+          "command"
         ],
-        "type": "string"
+        "type": "object"
       },
       "ExtractAudit": {
         "properties": {
@@ -11924,12 +11940,17 @@
           "alias": {
             "type": "string"
           },
+          "effective_permissions": {
+            "$ref": "#/components/schemas/ExternalWorkdirPermissions",
+            "description": "Current effective category authority after intersecting the durable link,\nsource grant, and Ticket target ceilings. This is independent from\nprovider liveness and may be narrower than the grant ceiling."
+          },
           "working_directory": {
             "$ref": "#/components/schemas/WorkingDirectorySummary"
           }
         },
         "required": [
           "alias",
+          "effective_permissions",
           "working_directory"
         ],
         "type": "object"
@@ -12219,6 +12240,10 @@
               "grant_id": {
                 "type": "string"
               },
+              "grant_permissions": {
+                "$ref": "#/components/schemas/ExternalWorkdirPermissions",
+                "description": "Operator-approved ceiling for this External Workdir grant. Worker\nattachment authority is projected separately after attenuation."
+              },
               "kind": {
                 "const": "external_grant",
                 "type": "string"
@@ -12226,7 +12251,8 @@
             },
             "required": [
               "kind",
-              "grant_id"
+              "grant_id",
+              "grant_permissions"
             ],
             "type": "object"
           }
@@ -13994,7 +14020,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:845d8859bab4de95f0539969ae8c84bbf3fb4a0548638e4278d6c90f9bb6cb3a"
+    "x-yoi-source-digest": "sha256:3a298734fd19f3a224e4f1503385fb8a823b612d328224f45f677ebaca28b96c"
   },
   "openapi": "3.1.0",
   "paths": {

@@ -1,7 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc, time::Instant};
 
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::time::Instant as TokioInstant;
@@ -23,9 +24,9 @@ use crate::{
         ToolCallInfo, ToolResultInfo, TurnEndAction,
     },
     llm_client::{
-        ClientError, ConfigWarning, LlmClient, Request, RequestConfig, ResponseStream,
+        ClientError, ConfigWarning, ItemStatus, LlmClient, Request, RequestConfig, ResponseStream,
         ToolDefinition, error::is_retryable, event::Event, retry::RetryPolicy,
-        transport::DEFAULT_FIRST_STREAM_EVENT_TIMEOUT, types::parse_tool_arguments,
+        transport::DEFAULT_FIRST_STREAM_EVENT_TIMEOUT,
     },
     state::{EngineState, Locked, Mutable},
     timeline::event::{ErrorEvent, StatusEvent, UsageEvent},
@@ -78,58 +79,197 @@ pub enum ToolRegistryError {
     DuplicateName(String),
 }
 
+/// When provider-confirmed tool calls may begin execution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolCallDispatchMode {
+    /// Wait for the complete assistant response before starting any tools.
+    #[default]
+    AfterResponse,
+    /// Start calls at trustworthy provider per-call completion boundaries.
+    OnToolCallComplete,
+}
+
 /// Engine configuration
 #[derive(Debug, Clone, Default)]
 pub struct EngineConfig {
-    // Reserved for future extensions (currently empty)
-    _private: (),
+    pub tool_call_dispatch: ToolCallDispatchMode,
 }
 
 /// Project terminal tool outputs into the assistant's original ToolCall order.
 ///
 /// Runtime history intentionally retains completion order so every result can
-/// be committed without waiting for slower siblings. The provider projection
-/// is deterministic within each contiguous result batch and does not rewrite
-/// the committed transcript.
+/// be committed without waiting for slower siblings. An internal durable
+/// response boundary lets this projection move every early result after the
+/// complete assistant response, even when trailing text/reasoning arrived after
+/// a fast result. Boundaries are never exposed to providers.
 struct ProviderHistoryProjection {
     items: Vec<Item>,
     original_to_projected_index: Vec<usize>,
 }
 
-fn materialize_provider_history(items: &[Item]) -> ProviderHistoryProjection {
-    let mut materialized: Vec<_> = items.iter().cloned().enumerate().collect();
-    let mut call_order = HashMap::<String, usize>::new();
-    let mut next_call_order = 0usize;
-    let mut index = 0usize;
+fn normalize_tool_run(run: &mut [(usize, Item)], call_order: &HashMap<String, usize>) {
+    run.sort_by_key(|(_, item)| match item {
+        Item::ToolCall {
+            call_id,
+            call_index,
+            ..
+        } => (
+            0usize,
+            call_index
+                .or_else(|| call_order.get(call_id).copied())
+                .unwrap_or(usize::MAX),
+        ),
+        Item::ToolResult { call_id, .. } => (
+            1usize,
+            call_order.get(call_id).copied().unwrap_or(usize::MAX),
+        ),
+        _ => unreachable!("tool run contains only calls and results"),
+    });
+}
 
+fn normalize_legacy_history(
+    materialized: &mut [(usize, Item)],
+    call_order: &HashMap<String, usize>,
+) {
+    let mut index = 0usize;
     while index < materialized.len() {
-        match &materialized[index].1 {
-            Item::ToolCall { call_id, .. } => {
-                call_order.insert(call_id.clone(), next_call_order);
-                next_call_order += 1;
-                index += 1;
-            }
-            Item::ToolResult { .. } => {
-                let start = index;
-                while index < materialized.len()
-                    && matches!(materialized[index].1, Item::ToolResult { .. })
-                {
-                    index += 1;
-                }
-                materialized[start..index].sort_by_key(|(_, item)| match item {
-                    Item::ToolResult { call_id, .. } => {
-                        call_order.get(call_id).copied().unwrap_or(usize::MAX)
-                    }
-                    _ => unreachable!("tool-result run contains only ToolResult items"),
-                });
-            }
-            _ => index += 1,
+        if !matches!(
+            materialized[index].1,
+            Item::ToolCall { .. } | Item::ToolResult { .. }
+        ) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < materialized.len()
+            && matches!(
+                materialized[index].1,
+                Item::ToolCall { .. } | Item::ToolResult { .. }
+            )
+        {
+            index += 1;
+        }
+        normalize_tool_run(&mut materialized[start..index], call_order);
+    }
+}
+
+fn normalize_response_history(response: &mut [(usize, Item)], call_order: &HashMap<String, usize>) {
+    // Provider-confirmed call completions can be observed out of index order.
+    // Reorder only the values occupying ToolCall slots so surrounding assistant
+    // text/reasoning retains its streamed order.
+    let mut calls = response
+        .iter()
+        .filter_map(|(_, item)| match item {
+            Item::ToolCall { .. } => Some(item.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    calls.sort_by_key(|item| match item {
+        Item::ToolCall {
+            call_id,
+            call_index,
+            ..
+        } => call_index
+            .or_else(|| call_order.get(call_id).copied())
+            .unwrap_or(usize::MAX),
+        _ => unreachable!("filtered ToolCall list"),
+    });
+    let mut calls = calls.into_iter();
+    for (_, item) in response.iter_mut() {
+        if matches!(item, Item::ToolCall { .. }) {
+            *item = calls.next().expect("one replacement per ToolCall slot");
         }
     }
 
-    let mut original_to_projected_index = vec![0; materialized.len()];
+    // A host-injected user/system item is a hard provider turn boundary. Do not
+    // move a result across it; normalize each assistant-side region separately.
+    let mut start = 0usize;
+    for index in 0..=response.len() {
+        let at_boundary = index == response.len()
+            || matches!(
+                response[index].1,
+                Item::Message {
+                    role: crate::llm_client::types::Role::User
+                        | crate::llm_client::types::Role::System,
+                    ..
+                }
+            );
+        if at_boundary {
+            response[start..index].sort_by_key(|(_, item)| match item {
+                Item::ToolResult { call_id, .. } => (
+                    1usize,
+                    call_order.get(call_id).copied().unwrap_or(usize::MAX),
+                ),
+                _ => (0usize, 0usize),
+            });
+            start = index.saturating_add(1);
+        }
+    }
+}
+
+fn materialize_provider_history(items: &[Item]) -> ProviderHistoryProjection {
+    let mut call_order = HashMap::<String, usize>::new();
+    let mut next_call_order = 0usize;
+    for item in items {
+        if let Item::ToolCall {
+            call_id,
+            call_index,
+            ..
+        } = item
+        {
+            call_order.insert(call_id.clone(), call_index.unwrap_or(next_call_order));
+            next_call_order += 1;
+        }
+    }
+
+    let first_boundary = items
+        .iter()
+        .position(|item| matches!(item, Item::AssistantResponseBoundary { .. }));
+    let legacy_end = first_boundary.unwrap_or(items.len());
+    let mut legacy = items[..legacy_end]
+        .iter()
+        .cloned()
+        .enumerate()
+        .collect::<Vec<_>>();
+    normalize_legacy_history(&mut legacy, &call_order);
+
+    let mut materialized = legacy;
+    let mut boundary_indices = Vec::new();
+    let mut index = legacy_end;
+    while index < items.len() {
+        debug_assert!(matches!(
+            items[index],
+            Item::AssistantResponseBoundary { .. }
+        ));
+        boundary_indices.push(index);
+        let start = index + 1;
+        let end = items[start..]
+            .iter()
+            .position(|item| matches!(item, Item::AssistantResponseBoundary { .. }))
+            .map(|offset| start + offset)
+            .unwrap_or(items.len());
+        let mut response = items[start..end]
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(offset, item)| (start + offset, item))
+            .collect::<Vec<_>>();
+        normalize_response_history(&mut response, &call_order);
+        materialized.extend(response);
+        index = end;
+    }
+
+    let mut original_to_projected_index = vec![0; items.len()];
     for (projected_index, (original_index, _)) in materialized.iter().enumerate() {
         original_to_projected_index[*original_index] = projected_index;
+    }
+    for boundary_index in boundary_indices {
+        let preceding_projected = materialized
+            .iter()
+            .take_while(|(original_index, _)| *original_index < boundary_index)
+            .count()
+            .saturating_sub(1);
+        original_to_projected_index[boundary_index] = preceding_projected;
     }
 
     ProviderHistoryProjection {
@@ -196,6 +336,7 @@ pub struct EngineRunOutput<C: LlmClient, A: Send + Sync = ()> {
 }
 
 /// Internal: tool execution result
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolExecutionResult {
     Completed,
     Paused,
@@ -205,6 +346,56 @@ enum ToolExecutionResult {
 struct ToolExecutionAttempt {
     attempt_id: String,
     terminal: bool,
+}
+
+type ToolTerminalTask = Pin<Box<dyn Future<Output = (String, ToolResult)> + Send>>;
+type ToolCallExecutionInfo = (
+    ToolCall,
+    crate::tool::ToolMeta,
+    Arc<dyn crate::tool::Tool>,
+    ToolExecutionContext,
+);
+
+/// One response-scoped execution batch whose calls are admitted as their
+/// provider-confirmed blocks complete.
+struct EarlyToolExecutionBatch {
+    batch_id: String,
+    turn_id: usize,
+    calls: Vec<(usize, ToolCall)>,
+    seen_call_ids: HashSet<String>,
+    call_info_map: HashMap<String, ToolCallExecutionInfo>,
+    started_calls: Vec<(String, String)>,
+    attempt_fence: ToolExecutionAttemptFence,
+    futures: FuturesUnordered<ToolTerminalTask>,
+    execution_handles: HashMap<String, ToolExecutionHandle>,
+    synthetic_results: VecDeque<ToolResult>,
+    terminal_call_ids: HashSet<String>,
+    dispatched_any: bool,
+}
+
+impl EarlyToolExecutionBatch {
+    fn new(batch_id: String, turn_id: usize) -> Self {
+        Self {
+            batch_id,
+            turn_id,
+            calls: Vec::new(),
+            seen_call_ids: HashSet::new(),
+            call_info_map: HashMap::new(),
+            started_calls: Vec::new(),
+            attempt_fence: ToolExecutionAttemptFence::default(),
+            futures: FuturesUnordered::new(),
+            execution_handles: HashMap::new(),
+            synthetic_results: VecDeque::new(),
+            terminal_call_ids: HashSet::new(),
+            dispatched_any: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EarlyToolAdmission {
+    Continue,
+    Pause,
 }
 
 /// Per-batch compare-and-set fence for terminal ToolResult commits.
@@ -312,6 +503,42 @@ enum StreamCompletion {
     Interrupted { reason: String },
 }
 
+struct StreamResponseOutput {
+    completion: StreamCompletion,
+    early_tools: Option<EarlyToolExecutionBatch>,
+}
+
+const RESPONSE_STREAM_PUMP_CAPACITY: usize = 64;
+
+struct ResponseStreamPump {
+    receiver: mpsc::Receiver<Result<Event, ClientError>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ResponseStreamPump {
+    fn start(mut stream: ResponseStream) -> Self {
+        let (sender, receiver) = mpsc::channel(RESPONSE_STREAM_PUMP_CAPACITY);
+        let task = tokio::spawn(async move {
+            while let Some(event) = stream.next().await {
+                if sender.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Self { receiver, task }
+    }
+
+    async fn recv(&mut self) -> Option<Result<Event, ClientError>> {
+        self.receiver.recv().await
+    }
+}
+
+impl Drop for ResponseStreamPump {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 pub struct Engine<C: LlmClient, S: EngineState = Mutable, A: Send + Sync = ()> {
     /// LLM client
     client: C,
@@ -362,6 +589,8 @@ pub struct Engine<C: LlmClient, S: EngineState = Mutable, A: Send + Sync = ()> {
     tool_execution_batch_count: usize,
     /// Maximum number of AgentTurns (None = unlimited)
     max_turns: Option<u32>,
+    /// Selected tool-call execution start boundary.
+    tool_call_dispatch_mode: ToolCallDispatchMode,
     /// Caller-selected policy for interrupting started provider operations.
     tool_execution_policy: ToolExecutionPolicy,
     /// AgentTurn-start callbacks (1:1 with LlmCall today)
@@ -1161,44 +1390,530 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         exit
     }
 
-    /// Check for pending tool calls (for resuming from Pause)
-    fn get_pending_tool_calls(&self, history: &History<A>) -> Option<Vec<ToolCall>> {
-        // Find the last ToolCall items that don't have corresponding ToolResult
+    /// Classify unanswered tool calls for safe resume. Calls with a persisted
+    /// execution identity were already handed to a provider and are never rerun.
+    fn get_unanswered_tool_calls(&self, history: &History<A>) -> (Vec<ToolCall>, Vec<String>) {
         let mut pending_calls = Vec::new();
+        let mut started_call_ids = Vec::new();
         let mut answered_call_ids = std::collections::HashSet::new();
 
-        // First pass: collect all answered call IDs
         for item in history.items() {
             if let Item::ToolResult { call_id, .. } = item {
                 answered_call_ids.insert(call_id.clone());
             }
         }
 
-        // Second pass: find unanswered tool calls
         for item in history.items() {
             if let Item::ToolCall {
                 call_id,
                 name,
                 arguments,
+                execution_id,
+                status,
                 ..
             } = item
+                && !answered_call_ids.contains(call_id)
             {
-                if !answered_call_ids.contains(call_id) {
-                    let input = parse_tool_arguments(arguments);
-                    pending_calls.push(ToolCall {
-                        id: call_id.clone(),
-                        name: name.clone(),
-                        input,
-                    });
+                if execution_id.is_some() || *status == Some(ItemStatus::InProgress) {
+                    started_call_ids.push(call_id.clone());
+                    continue;
                 }
+                let input = serde_json::from_str::<Value>(arguments)
+                    .ok()
+                    .filter(Value::is_object)
+                    .unwrap_or(Value::Null);
+                pending_calls.push(ToolCall {
+                    id: call_id.clone(),
+                    name: name.clone(),
+                    input,
+                });
             }
         }
 
-        if pending_calls.is_empty() {
-            None
+        (pending_calls, started_call_ids)
+    }
+
+    fn append_early_tool_call(
+        &mut self,
+        history: &mut History<A>,
+        annotate: &mut impl FnMut(&Item) -> Result<A, String>,
+        call: &ToolCall,
+        call_index: usize,
+        execution_id: Option<String>,
+    ) -> Result<(), EngineError> {
+        let status = if execution_id.is_some() {
+            ItemStatus::InProgress
         } else {
-            Some(pending_calls)
+            ItemStatus::Completed
+        };
+        let item = Item::tool_call_json(&call.id, &call.name, call.input.clone())
+            .with_tool_execution_metadata(call_index, execution_id)
+            .with_status(status);
+        self.append_history_items(history, std::iter::once(item), annotate)
+    }
+
+    async fn admit_early_tool_calls(
+        &mut self,
+        history: &mut History<A>,
+        annotate: &mut impl FnMut(&Item) -> Result<A, String>,
+        batch: &mut EarlyToolExecutionBatch,
+        tool_calls: Vec<crate::timeline::CollectedToolCall>,
+    ) -> Result<EarlyToolAdmission, EngineError> {
+        for collected in tool_calls {
+            let call_index = collected.call_index;
+            let mut tool_call = collected.call;
+            if !batch.seen_call_ids.insert(tool_call.id.clone()) {
+                warn!(call_id = %tool_call.id, "Ignoring duplicate completed tool-call event");
+                continue;
+            }
+            batch.calls.push((call_index, tool_call.clone()));
+            let expected_tool_use_id = tool_call.id.clone();
+            let context = ToolExecutionContext::new(&tool_call.id, &batch.batch_id, call_index);
+
+            if !tool_call.input.is_object() {
+                self.append_early_tool_call(
+                    history,
+                    annotate,
+                    &tool_call,
+                    call_index,
+                    Some(context.execution_id()),
+                )?;
+                batch.synthetic_results.push_back(ToolResult::error(
+                    &tool_call.id,
+                    "Tool arguments must be one complete JSON object",
+                ));
+                batch.dispatched_any = true;
+                continue;
+            }
+
+            let Some((meta, tool)) = self.tool_server.get_tool(&tool_call.name) else {
+                self.append_early_tool_call(
+                    history,
+                    annotate,
+                    &tool_call,
+                    call_index,
+                    Some(context.execution_id()),
+                )?;
+                batch.synthetic_results.push_back(ToolResult::error(
+                    &tool_call.id,
+                    format!("Tool not found: {}", tool_call.name),
+                ));
+                batch.dispatched_any = true;
+                continue;
+            };
+
+            let invocation = self.interceptor_invocation(
+                InterceptorPhase::PreToolCall,
+                Some(self.turn_count),
+                Some(InterceptorCallId::Tool(expected_tool_use_id.clone())),
+                call_index,
+            );
+            let mut info = ToolCallInfo {
+                invocation,
+                history: history.entries(),
+                call: tool_call.clone(),
+                meta,
+                tool,
+                context,
+            };
+            let action = tokio::select! {
+                result = self.interceptor.pre_tool_call(&mut info) => {
+                    result.map_err(|error| {
+                        EngineError::from(InterceptorFailure::new(
+                            InterceptorPhase::PreToolCall,
+                            error,
+                        ))
+                    })?
+                }
+                pause = self.pause_rx.recv() => {
+                    if pause.is_some() {
+                        info!(call_id = %expected_tool_use_id, "Paused while awaiting pre-tool policy");
+                    }
+                    self.append_early_tool_call(
+                        history,
+                        annotate,
+                        &tool_call,
+                        call_index,
+                        None,
+                    )?;
+                    batch.dispatched_any = true;
+                    return Ok(EarlyToolAdmission::Pause);
+                }
+                cancel = self.cancel_rx.recv() => {
+                    if cancel.is_some() {
+                        info!(call_id = %expected_tool_use_id, "Cancelled while awaiting pre-tool policy");
+                    }
+                    self.append_early_tool_call(
+                        history,
+                        annotate,
+                        &tool_call,
+                        call_index,
+                        None,
+                    )?;
+                    batch.dispatched_any = true;
+                    return Err(EngineError::Cancelled);
+                }
+            };
+            if info.call.id != expected_tool_use_id {
+                return Err(InterceptorFailure::new(
+                    InterceptorPhase::PreToolCall,
+                    InterceptorError::new(
+                        InterceptorErrorCategory::ContractViolation,
+                        "pre-tool interceptor changed immutable tool call identity",
+                    ),
+                )
+                .into());
+            }
+            let ToolCallInfo {
+                call,
+                meta,
+                tool,
+                mut context,
+                ..
+            } = info;
+            tool_call = call;
+            context.call_id = tool_call.id.clone();
+            batch.call_info_map.insert(
+                tool_call.id.clone(),
+                (tool_call.clone(), meta, tool.clone(), context.clone()),
+            );
+
+            match action {
+                PreToolAction::Continue => {
+                    let attempt_id = context.execution_id();
+                    self.append_early_tool_call(
+                        history,
+                        annotate,
+                        &tool_call,
+                        call_index,
+                        Some(attempt_id.clone()),
+                    )?;
+                    batch
+                        .attempt_fence
+                        .register(tool_call.id.clone(), attempt_id.clone());
+                    batch
+                        .started_calls
+                        .push((tool_call.id.clone(), attempt_id.clone()));
+                    let input_json = serde_json::to_string(&tool_call.input).unwrap_or_default();
+                    let call_id = tool_call.id.clone();
+                    let (handle, terminal) = ToolExecutionHandle::start(tool, input_json, context);
+                    batch.execution_handles.insert(call_id.clone(), handle);
+                    batch.futures.push(Box::pin(async move {
+                        let result = match terminal.await {
+                            ToolExecutionTerminal::Confirmed(Ok(output)) => {
+                                ToolResult::from_output(&call_id, output)
+                            }
+                            ToolExecutionTerminal::Confirmed(Err(ToolError::Cancelled(output))) => {
+                                ToolResult::from_output_with_disposition(
+                                    &call_id,
+                                    output,
+                                    ToolResultDisposition::Cancelled,
+                                )
+                            }
+                            ToolExecutionTerminal::Confirmed(Err(ToolError::Interrupted(
+                                output,
+                            ))) => ToolResult::from_output_with_disposition(
+                                &call_id,
+                                output,
+                                ToolResultDisposition::Interrupted,
+                            ),
+                            ToolExecutionTerminal::Confirmed(Err(error)) => {
+                                ToolResult::error(&call_id, error.to_string())
+                            }
+                            ToolExecutionTerminal::OutcomeUnknown => {
+                                ToolResult::outcome_unknown(&call_id)
+                            }
+                        };
+                        (attempt_id, result)
+                    }));
+                    batch.dispatched_any = true;
+                }
+                PreToolAction::SyntheticResult(result) => {
+                    if result.tool_use_id != expected_tool_use_id {
+                        return Err(InterceptorFailure::new(
+                            InterceptorPhase::PreToolCall,
+                            InterceptorError::new(
+                                InterceptorErrorCategory::ContractViolation,
+                                "synthetic tool result changed immutable tool call identity",
+                            ),
+                        )
+                        .into());
+                    }
+                    self.append_early_tool_call(
+                        history,
+                        annotate,
+                        &tool_call,
+                        call_index,
+                        Some(context.execution_id()),
+                    )?;
+                    batch.synthetic_results.push_back(result);
+                    batch.dispatched_any = true;
+                }
+                PreToolAction::Skip => {
+                    self.append_early_tool_call(
+                        history,
+                        annotate,
+                        &tool_call,
+                        call_index,
+                        Some(context.execution_id()),
+                    )?;
+                    batch.synthetic_results.push_back(ToolResult::error(
+                        &tool_call.id,
+                        "Tool execution skipped by interceptor",
+                    ));
+                    batch.dispatched_any = true;
+                }
+                PreToolAction::Abort(reason) => {
+                    self.append_early_tool_call(
+                        history,
+                        annotate,
+                        &tool_call,
+                        call_index,
+                        Some(context.execution_id()),
+                    )?;
+                    batch.synthetic_results.push_back(ToolResult::error(
+                        &tool_call.id,
+                        format!("Tool execution aborted: {reason}"),
+                    ));
+                    batch.dispatched_any = true;
+                    return Err(EngineError::Aborted(reason));
+                }
+                PreToolAction::Pause => {
+                    self.append_early_tool_call(history, annotate, &tool_call, call_index, None)?;
+                    batch.dispatched_any = true;
+                    return Ok(EarlyToolAdmission::Pause);
+                }
+            }
         }
+        Ok(EarlyToolAdmission::Continue)
+    }
+
+    async fn commit_early_synthetic_results(
+        &mut self,
+        history: &mut History<A>,
+        annotate: &mut impl FnMut(&Item) -> Result<A, String>,
+        batch: &mut EarlyToolExecutionBatch,
+    ) -> Result<(), EngineError> {
+        while let Some(result) = batch.synthetic_results.pop_front() {
+            self.finalize_and_commit_tool_result(
+                history,
+                annotate,
+                result,
+                None,
+                batch.turn_id,
+                true,
+                &batch.call_info_map,
+                &mut batch.attempt_fence,
+                &mut batch.terminal_call_ids,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn cancel_and_terminalize_early_batch(
+        &mut self,
+        history: &mut History<A>,
+        annotate: &mut impl FnMut(&Item) -> Result<A, String>,
+        batch: &mut EarlyToolExecutionBatch,
+    ) -> Option<EngineError> {
+        use futures::StreamExt as _;
+
+        let mut batch_error = None;
+        while let Some(result) = batch.synthetic_results.pop_front() {
+            if let Err(error) = self
+                .finalize_and_commit_tool_result(
+                    history,
+                    annotate,
+                    result,
+                    None,
+                    batch.turn_id,
+                    false,
+                    &batch.call_info_map,
+                    &mut batch.attempt_fence,
+                    &mut batch.terminal_call_ids,
+                )
+                .await
+                && batch_error.is_none()
+            {
+                batch_error = Some(error);
+            }
+        }
+
+        let cancellation_request_deadline =
+            TokioInstant::now() + self.tool_execution_policy.cancellation_request_timeout;
+        let cancellation_requests = batch
+            .execution_handles
+            .iter()
+            .filter(|(call_id, _)| !batch.terminal_call_ids.contains(*call_id))
+            .map(|(call_id, handle)| {
+                let call_id = call_id.clone();
+                let handle = handle.clone();
+                async move {
+                    (
+                        call_id,
+                        handle.cancel_before(cancellation_request_deadline).await,
+                    )
+                }
+            });
+        let cancellation_requests: FuturesUnordered<_> = cancellation_requests.collect();
+        for (call_id, result) in cancellation_requests.collect::<Vec<_>>().await {
+            if let Err(error) = result {
+                warn!(%call_id, error = %error, "Tool cooperative cancellation request failed");
+            }
+        }
+
+        let deadline =
+            TokioInstant::now() + self.tool_execution_policy.terminal_confirmation_timeout;
+        while !batch.futures.is_empty() {
+            tokio::select! {
+                biased;
+                result = batch.futures.next() => {
+                    let (attempt_id, result) = result.expect("non-empty FuturesUnordered");
+                    if let Err(error) = self.finalize_and_commit_tool_result(
+                        history,
+                        annotate,
+                        result,
+                        Some(&attempt_id),
+                        batch.turn_id,
+                        false,
+                        &batch.call_info_map,
+                        &mut batch.attempt_fence,
+                        &mut batch.terminal_call_ids,
+                    ).await && batch_error.is_none() {
+                        batch_error = Some(error);
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => break,
+            }
+        }
+        for (call_id, attempt_id) in &batch.started_calls {
+            if !batch.attempt_fence.is_terminal(call_id) {
+                if let Some(handle) = batch.execution_handles.get(call_id) {
+                    handle.force_close();
+                }
+                if let Err(error) = self
+                    .finalize_and_commit_tool_result(
+                        history,
+                        annotate,
+                        ToolResult::outcome_unknown(call_id),
+                        Some(attempt_id),
+                        batch.turn_id,
+                        false,
+                        &batch.call_info_map,
+                        &mut batch.attempt_fence,
+                        &mut batch.terminal_call_ids,
+                    )
+                    .await
+                    && batch_error.is_none()
+                {
+                    batch_error = Some(error);
+                }
+            }
+        }
+        batch_error
+    }
+
+    async fn drain_early_tool_batch(
+        &mut self,
+        history: &mut History<A>,
+        annotate: &mut impl FnMut(&Item) -> Result<A, String>,
+        mut batch: EarlyToolExecutionBatch,
+        force_cancel: bool,
+        initial_pause_requested: bool,
+    ) -> Result<ToolExecutionResult, EngineError> {
+        while let Some(result) = batch.synthetic_results.pop_front() {
+            if let Err(error) = self
+                .finalize_and_commit_tool_result(
+                    history,
+                    annotate,
+                    result,
+                    None,
+                    batch.turn_id,
+                    true,
+                    &batch.call_info_map,
+                    &mut batch.attempt_fence,
+                    &mut batch.terminal_call_ids,
+                )
+                .await
+            {
+                let cleanup_error = self
+                    .cancel_and_terminalize_early_batch(history, annotate, &mut batch)
+                    .await;
+                return Err(cleanup_error.unwrap_or(error));
+            }
+        }
+
+        if force_cancel {
+            if let Some(error) = self
+                .cancel_and_terminalize_early_batch(history, annotate, &mut batch)
+                .await
+            {
+                return Err(error);
+            }
+            return Ok(ToolExecutionResult::Completed);
+        }
+
+        let mut pause_requested = initial_pause_requested;
+        let mut pause_deadline = initial_pause_requested
+            .then(|| TokioInstant::now() + self.tool_execution_policy.pause_safe_boundary_timeout);
+        while !batch.futures.is_empty() {
+            tokio::select! {
+                biased;
+                result = batch.futures.next() => {
+                    let (attempt_id, result) = result.expect("non-empty FuturesUnordered");
+                    if let Err(error) = self.finalize_and_commit_tool_result(
+                        history,
+                        annotate,
+                        result,
+                        Some(&attempt_id),
+                        batch.turn_id,
+                        true,
+                        &batch.call_info_map,
+                        &mut batch.attempt_fence,
+                        &mut batch.terminal_call_ids,
+                    ).await {
+                        let cleanup_error = self
+                            .cancel_and_terminalize_early_batch(history, annotate, &mut batch)
+                            .await;
+                        return Err(cleanup_error.unwrap_or(error));
+                    }
+                }
+                pause = self.pause_rx.recv(), if !pause_requested => {
+                    if pause.is_some() {
+                        pause_requested = true;
+                        pause_deadline = Some(
+                            TokioInstant::now()
+                                + self.tool_execution_policy.pause_safe_boundary_timeout,
+                        );
+                    }
+                }
+                _ = tokio::time::sleep_until(pause_deadline.unwrap_or_else(TokioInstant::now)), if pause_deadline.is_some() => {
+                    if let Some(error) = self
+                        .cancel_and_terminalize_early_batch(history, annotate, &mut batch)
+                        .await {
+                        return Err(error);
+                    }
+                    return Ok(ToolExecutionResult::Paused);
+                }
+                cancel = self.cancel_rx.recv() => {
+                    if cancel.is_some() {
+                        info!("Tool execution cancellation requested");
+                    }
+                    if let Some(error) = self
+                        .cancel_and_terminalize_early_batch(history, annotate, &mut batch)
+                        .await {
+                        return Err(error);
+                    }
+                    return Err(EngineError::Cancelled);
+                }
+            }
+        }
+        Ok(if pause_requested {
+            ToolExecutionResult::Paused
+        } else {
+            ToolExecutionResult::Completed
+        })
     }
 
     /// Execute tools in parallel
@@ -1221,6 +1936,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
 
         // Map from tool call ID to (ToolCall, Meta, Tool, Context)
         // Retained because it's needed for PostToolCall hooks
+        let turn_id = self.turn_count.saturating_sub(1);
         let mut call_info_map = HashMap::new();
         let mut synthetic_results = Vec::new();
         let batch_id = format!("tool-batch-{}", self.tool_execution_batch_count);
@@ -1231,6 +1947,13 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         for (call_index, mut tool_call) in tool_calls.into_iter().enumerate() {
             let expected_tool_use_id = tool_call.id.clone();
             let context = ToolExecutionContext::new(&tool_call.id, &batch_id, call_index);
+            if !tool_call.input.is_object() {
+                synthetic_results.push(ToolResult::error(
+                    &tool_call.id,
+                    "Tool arguments must be one complete JSON object",
+                ));
+                continue;
+            }
             if let Some((meta, tool)) = self.tool_server.get_tool(&tool_call.name) {
                 let invocation = self.interceptor_invocation(
                     InterceptorPhase::PreToolCall,
@@ -1398,6 +2121,8 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                     annotate,
                     result,
                     None,
+                    turn_id,
+                    true,
                     &call_info_map,
                     &mut attempt_fence,
                     &mut terminal_call_ids,
@@ -1428,6 +2153,8 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                         annotate,
                         result,
                         Some(&attempt_id),
+                        turn_id,
+                        true,
                         &call_info_map,
                         &mut attempt_fence,
                         &mut terminal_call_ids,
@@ -1507,6 +2234,8 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                                     annotate,
                                     result,
                                     Some(&attempt_id),
+                                    turn_id,
+                                    false,
                                     &call_info_map,
                                     &mut attempt_fence,
                                     &mut terminal_call_ids,
@@ -1533,6 +2262,8 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                                 annotate,
                                 ToolResult::outcome_unknown(call_id),
                                 Some(attempt_id),
+                                turn_id,
+                                false,
                                 &call_info_map,
                                 &mut attempt_fence,
                                 &mut terminal_call_ids,
@@ -1581,6 +2312,8 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         annotate: &mut impl FnMut(&Item) -> Result<A, String>,
         mut tool_result: ToolResult,
         execution_attempt_id: Option<&str>,
+        turn_id: usize,
+        invoke_post_hook: bool,
         call_info_map: &HashMap<
             String,
             (
@@ -1669,10 +2402,10 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         );
         self.emit_tool_result(&tool_result);
 
-        if let Some((tool_call, meta, tool, context)) = call_info {
+        if invoke_post_hook && let Some((tool_call, meta, tool, context)) = call_info {
             let invocation = self.interceptor_invocation(
                 InterceptorPhase::PostToolCall,
-                Some(self.turn_count.saturating_sub(1)),
+                Some(turn_id),
                 Some(InterceptorCallId::Tool(tool_call.id.clone())),
                 context.call_index,
             );
@@ -1685,16 +2418,28 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                 tool: tool.clone(),
                 context: context.clone(),
             };
-            let post_tool_action =
-                self.interceptor
-                    .post_tool_call(&info)
-                    .await
-                    .map_err(|error| {
+            let post_tool_action = tokio::select! {
+                result = self.interceptor.post_tool_call(&info) => {
+                    result.map_err(|error| {
                         EngineError::from(InterceptorFailure::new(
                             InterceptorPhase::PostToolCall,
                             error,
                         ))
-                    })?;
+                    })?
+                }
+                pause = self.pause_rx.recv() => {
+                    if pause.is_some() {
+                        info!(call_id = %tool_call.id, "Paused while awaiting post-tool policy");
+                    }
+                    return Err(EngineError::PauseRequested);
+                }
+                cancel = self.cancel_rx.recv() => {
+                    if cancel.is_some() {
+                        info!(call_id = %tool_call.id, "Cancelled while awaiting post-tool policy");
+                    }
+                    return Err(EngineError::Cancelled);
+                }
+            };
             if let PostToolAction::Abort(reason) = post_tool_action {
                 return Err(EngineError::Aborted(reason));
             }
@@ -1717,11 +2462,35 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
             "Starting engine run"
         );
 
-        // Resume pending tool calls from a previous Pause
-        if let Some(tool_calls) = self.get_pending_tool_calls(history) {
-            info!("Resuming pending tool calls");
+        // Resume only calls durably proven not started. A persisted started
+        // attempt without a terminal result is closed as OutcomeUnknown first.
+        let (pending_tool_calls, started_call_ids) = self.get_unanswered_tool_calls(history);
+        if !started_call_ids.is_empty() {
+            let call_info_map = HashMap::new();
+            let mut attempt_fence = ToolExecutionAttemptFence::default();
+            let mut terminal_call_ids = HashSet::new();
+            for call_id in started_call_ids {
+                self.finalize_and_commit_tool_result(
+                    history,
+                    annotate,
+                    ToolResult::outcome_unknown(&call_id),
+                    None,
+                    self.turn_count,
+                    false,
+                    &call_info_map,
+                    &mut attempt_fence,
+                    &mut terminal_call_ids,
+                )
+                .await?;
+            }
+        }
+        if !pending_tool_calls.is_empty() {
+            info!(
+                count = pending_tool_calls.len(),
+                "Resuming pending tool calls"
+            );
             if let Some(result) = self
-                .execute_and_commit_tools(history, annotate, tool_calls)
+                .execute_and_commit_tools(history, annotate, pending_tool_calls)
                 .await?
             {
                 return Ok(result);
@@ -1934,8 +2703,49 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                 self.request_trace_payload(&request),
             );
             let request = self.attach_transport_trace(request, current_turn, current_llm_call);
-            let stream_outcome = self
-                .stream_response(request, current_turn, current_llm_call)
+            let provider_supports_early = self.client.tool_call_completion_support()
+                == crate::llm_client::ToolCallCompletionSupport::PerBlock;
+            let interceptor_supports_early = self.interceptor.supports_early_tool_dispatch();
+            let early_dispatch = self.tool_call_dispatch_mode
+                == ToolCallDispatchMode::OnToolCallComplete
+                && provider_supports_early
+                && interceptor_supports_early;
+            if self.tool_call_dispatch_mode == ToolCallDispatchMode::OnToolCallComplete
+                && !provider_supports_early
+            {
+                self.emit_warning(
+                    "tool-call early dispatch deferred until response completion: provider does not expose a trustworthy per-call completion boundary",
+                );
+            }
+            if self.tool_call_dispatch_mode == ToolCallDispatchMode::OnToolCallComplete
+                && provider_supports_early
+                && !interceptor_supports_early
+            {
+                self.emit_warning(
+                    "tool-call early dispatch deferred until response completion: interceptor requires the whole-response turn-end gate",
+                );
+            }
+            if early_dispatch {
+                let response_id = format!("assistant-response-{current_turn}-{current_llm_call}");
+                self.append_history_items(
+                    history,
+                    std::iter::once(Item::assistant_response_boundary(response_id)),
+                    annotate,
+                )?;
+            }
+            let assistant_start = history.len();
+            let StreamResponseOutput {
+                completion: stream_outcome,
+                mut early_tools,
+            } = self
+                .stream_response(
+                    request,
+                    current_turn,
+                    current_llm_call,
+                    history,
+                    annotate,
+                    early_dispatch,
+                )
                 .await?;
 
             for cb in &self.llm_call_end_cbs {
@@ -1944,6 +2754,47 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
             self.llm_call_count += 1;
 
             if let StreamCompletion::Interrupted { reason } = stream_outcome {
+                if early_tools
+                    .as_ref()
+                    .is_some_and(|batch| batch.dispatched_any)
+                {
+                    // Once a side effect may have started, automatic stream
+                    // continuation would allow the model to regenerate the same
+                    // operation under a fresh call id. Close every owned attempt
+                    // and stop this run instead.
+                    self.timeline.abort_current_block();
+                    self.timeline.flush_usage();
+                    let reasoning_items = self.thinking_block_collector.take_collected();
+                    let text_blocks = self.text_block_collector.take_collected();
+                    let _partial_tool_calls = self.tool_call_collector.take_collected();
+                    let assistant_items =
+                        self.build_assistant_items(&reasoning_items, &text_blocks, &[]);
+                    if !assistant_items.is_empty()
+                        && let Err(error) =
+                            self.append_history_items(history, assistant_items, annotate)
+                    {
+                        if let Some(batch) = early_tools.take()
+                            && let Err(cleanup_error) = self
+                                .drain_early_tool_batch(history, annotate, batch, true, false)
+                                .await
+                        {
+                            return Err(cleanup_error);
+                        }
+                        return Err(error);
+                    }
+                    if let Some(batch) = early_tools.take() {
+                        self.drain_early_tool_batch(history, annotate, batch, true, false)
+                            .await?;
+                    }
+                    return Err(EngineError::Client(ClientError::Api {
+                        status: None,
+                        code: Some("early_tool_stream_interrupted".to_string()),
+                        message: format!(
+                            "LLM stream interrupted after early tool execution started: {reason}"
+                        ),
+                        retry_after: None,
+                    }));
+                }
                 stream_continuations += 1;
                 if stream_continuations > MAX_STREAM_CONTINUATIONS {
                     return Err(EngineError::Client(ClientError::Api {
@@ -1989,11 +2840,95 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
             // `append_history_items` so observers see each item as it lands.
             let reasoning_items = self.thinking_block_collector.take_collected();
             let text_blocks = self.text_block_collector.take_collected();
-            let tool_calls = self.tool_call_collector.take_collected();
-            let assistant_items =
-                self.build_assistant_items(&reasoning_items, &text_blocks, &tool_calls);
-            let assistant_start = history.len();
-            self.append_history_items(history, assistant_items, annotate)?;
+            let remaining_collected_calls = self.tool_call_collector.take_collected_with_index();
+            let mut remaining_tool_calls = remaining_collected_calls
+                .iter()
+                .map(|collected| (collected.call_index, collected.call.clone()))
+                .collect::<Vec<_>>();
+            remaining_tool_calls.sort_by_key(|(call_index, _)| *call_index);
+            let remaining_tool_calls = remaining_tool_calls
+                .into_iter()
+                .map(|(_, call)| call)
+                .collect::<Vec<_>>();
+            let assistant_items = self.build_assistant_items(
+                &reasoning_items,
+                &text_blocks,
+                if early_dispatch {
+                    &[]
+                } else {
+                    &remaining_tool_calls
+                },
+            );
+            if let Err(error) = self.append_history_items(history, assistant_items, annotate) {
+                if let Some(batch) = early_tools.take()
+                    && let Err(cleanup_error) = self
+                        .drain_early_tool_batch(history, annotate, batch, true, false)
+                        .await
+                {
+                    return Err(cleanup_error);
+                }
+                return Err(error);
+            }
+
+            if early_dispatch && !remaining_tool_calls.is_empty() {
+                if early_tools.is_none() {
+                    let batch_id = format!("tool-batch-{}", self.tool_execution_batch_count);
+                    self.tool_execution_batch_count += 1;
+                    early_tools = Some(EarlyToolExecutionBatch::new(batch_id, current_turn));
+                }
+                let admission = self
+                    .admit_early_tool_calls(
+                        history,
+                        annotate,
+                        early_tools.as_mut().expect("batch initialized"),
+                        remaining_collected_calls,
+                    )
+                    .await;
+                let admission = match admission {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        if let Some(batch) = early_tools.take()
+                            && let Err(cleanup_error) = self
+                                .drain_early_tool_batch(history, annotate, batch, true, false)
+                                .await
+                        {
+                            return Err(cleanup_error);
+                        }
+                        return Err(error);
+                    }
+                };
+                if admission == EarlyToolAdmission::Pause {
+                    if let Some(batch) = early_tools.take() {
+                        self.drain_early_tool_batch(history, annotate, batch, false, true)
+                            .await?;
+                    }
+                    return Ok(EngineResult::Paused);
+                }
+                if let Some(batch) = early_tools.as_mut()
+                    && let Err(error) = self
+                        .commit_early_synthetic_results(history, annotate, batch)
+                        .await
+                {
+                    if let Some(mut batch) = early_tools.take() {
+                        let cleanup_error = self
+                            .cancel_and_terminalize_early_batch(history, annotate, &mut batch)
+                            .await;
+                        return Err(cleanup_error.unwrap_or(error));
+                    }
+                    return Err(error);
+                }
+            }
+            let mut tool_calls = early_tools
+                .as_ref()
+                .map(|batch| {
+                    let mut calls = batch.calls.clone();
+                    calls.sort_by_key(|(call_index, _)| *call_index);
+                    calls.into_iter().map(|(_, call)| call).collect()
+                })
+                .unwrap_or_default();
+            if !early_dispatch {
+                tool_calls = remaining_tool_calls;
+            }
 
             let assistant_invocation = self.interceptor_invocation(
                 InterceptorPhase::AssistantTurnEnd,
@@ -2011,27 +2946,62 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                     history: history.entries(),
                     tool_calls: &tool_calls,
                 })
-                .await
-                .map_err(|error| {
-                    EngineError::from(InterceptorFailure::new(
+                .await;
+            let assistant_turn_action = match assistant_turn_action {
+                Ok(action) => action,
+                Err(error) => {
+                    let error = EngineError::from(InterceptorFailure::new(
                         InterceptorPhase::AssistantTurnEnd,
                         error,
-                    ))
-                })?;
+                    ));
+                    if let Some(batch) = early_tools.take()
+                        && let Err(cleanup_error) = self
+                            .drain_early_tool_batch(history, annotate, batch, true, false)
+                            .await
+                    {
+                        return Err(cleanup_error);
+                    }
+                    return Err(error);
+                }
+            };
             match assistant_turn_action {
                 TurnEndAction::Finish if tool_calls.is_empty() => {
                     return Ok(EngineResult::Finished);
                 }
                 TurnEndAction::Finish => {}
                 TurnEndAction::ContinueWithMessages(additional) => {
-                    self.append_history_items(history, additional, annotate)?;
+                    if let Err(error) = self.append_history_items(history, additional, annotate) {
+                        if let Some(batch) = early_tools.take()
+                            && let Err(cleanup_error) = self
+                                .drain_early_tool_batch(history, annotate, batch, true, false)
+                                .await
+                        {
+                            return Err(cleanup_error);
+                        }
+                        return Err(error);
+                    }
                     if tool_calls.is_empty() {
                         continue;
                     }
                 }
                 TurnEndAction::Pause => {
+                    if let Some(batch) = early_tools.take() {
+                        self.drain_early_tool_batch(history, annotate, batch, false, true)
+                            .await?;
+                    }
                     return Ok(EngineResult::Paused);
                 }
+            }
+
+            if let Some(batch) = early_tools.take() {
+                if self
+                    .drain_early_tool_batch(history, annotate, batch, false, false)
+                    .await?
+                    == ToolExecutionResult::Paused
+                {
+                    return Ok(EngineResult::Paused);
+                }
+                continue;
             }
 
             if let Some(result) = self
@@ -2224,7 +3194,10 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         request: Request,
         turn: usize,
         llm_call: usize,
-    ) -> Result<StreamCompletion, EngineError> {
+        history: &mut History<A>,
+        annotate: &mut impl FnMut(&Item) -> Result<A, String>,
+        early_dispatch: bool,
+    ) -> Result<StreamResponseOutput, EngineError> {
         debug!(
             item_count = request.items.len(),
             tool_count = request.tools.len(),
@@ -2232,12 +3205,16 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
             "Sending request to LLM"
         );
 
-        let mut stream = self.open_stream_with_retry(request, turn, llm_call).await?;
+        let stream = self.open_stream_with_retry(request, turn, llm_call).await?;
+        self.tool_call_collector.begin_response();
+        let mut stream = ResponseStreamPump::start(stream);
+        let mut early_tools: Option<EarlyToolExecutionBatch> = None;
+        let mut response_completed = false;
 
         let mut event_count: usize = 0;
         loop {
             tokio::select! {
-                event_result = stream.next() => {
+                event_result = stream.recv() => {
                     match event_result {
                         Some(result) => {
                             match &result {
@@ -2254,8 +3231,11 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                                 Err(err) => {
                                     // 部分情報でも発火しておく（料金会計用）
                                     self.timeline.flush_usage();
-                                    return Ok(StreamCompletion::Interrupted {
-                                        reason: err.to_string(),
+                                    return Ok(StreamResponseOutput {
+                                        completion: StreamCompletion::Interrupted {
+                                            reason: err.to_string(),
+                                        },
+                                        early_tools,
                                     });
                                 }
                             };
@@ -2267,11 +3247,152 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                                     json!({}),
                                 );
                             }
+                            if matches!(
+                                &event,
+                                Event::Status(StatusEvent {
+                                    status: crate::llm_client::event::ResponseStatus::Completed,
+                                })
+                            ) {
+                                response_completed = true;
+                            }
                             self.emit_stream_event(turn, llm_call, &event);
                             self.timeline.dispatch(&event);
+                            if early_dispatch {
+                                let collected = self.tool_call_collector.take_collected_with_index();
+                                if !collected.is_empty() {
+                                    if early_tools.is_none() {
+                                        let batch_id = format!(
+                                            "tool-batch-{}",
+                                            self.tool_execution_batch_count
+                                        );
+                                        self.tool_execution_batch_count += 1;
+                                        early_tools =
+                                            Some(EarlyToolExecutionBatch::new(batch_id, turn));
+                                    }
+                                    let fresh_calls = {
+                                        let batch = early_tools.as_ref().expect("batch initialized");
+                                        collected
+                                            .into_iter()
+                                            .filter(|collected| {
+                                                !batch.seen_call_ids.contains(&collected.call.id)
+                                            })
+                                            .collect::<Vec<_>>()
+                                    };
+                                    if !fresh_calls.is_empty() {
+                                        // Commit every completed reasoning/text block observed so
+                                        // far. Admission durably commits each ToolCall with its
+                                        // started/not-started state immediately before ownership
+                                        // can transfer to a provider.
+                                        let reasoning =
+                                            self.thinking_block_collector.take_collected();
+                                        let text = self.text_block_collector.take_collected();
+                                        let assistant_items = self.build_assistant_items(
+                                            &reasoning,
+                                            &text,
+                                            &[],
+                                        );
+                                        if let Err(error) = self.append_history_items(
+                                            history,
+                                            assistant_items,
+                                            annotate,
+                                        ) {
+                                            if let Some(mut batch) = early_tools.take() {
+                                                let _ = self
+                                                    .cancel_and_terminalize_early_batch(
+                                                        history,
+                                                        annotate,
+                                                        &mut batch,
+                                                    )
+                                                    .await;
+                                            }
+                                            return Err(error);
+                                        }
+                                        let admission = {
+                                            let batch =
+                                                early_tools.as_mut().expect("batch initialized");
+                                            self.admit_early_tool_calls(
+                                                history,
+                                                annotate,
+                                                batch,
+                                                fresh_calls,
+                                            )
+                                            .await
+                                        };
+                                        match admission {
+                                            Ok(EarlyToolAdmission::Continue) => {
+                                                let batch = early_tools
+                                                    .as_mut()
+                                                    .expect("batch initialized");
+                                                if let Err(error) = self
+                                                    .commit_early_synthetic_results(
+                                                        history,
+                                                        annotate,
+                                                        batch,
+                                                    )
+                                                    .await
+                                                {
+                                                    if let Some(mut batch) = early_tools.take() {
+                                                        let cleanup_error = self
+                                                            .cancel_and_terminalize_early_batch(
+                                                                history,
+                                                                annotate,
+                                                                &mut batch,
+                                                            )
+                                                            .await;
+                                                        return Err(cleanup_error.unwrap_or(error));
+                                                    }
+                                                    return Err(error);
+                                                }
+                                            }
+                                            Ok(EarlyToolAdmission::Pause) => {
+                                                self.timeline.abort_current_block();
+                                                self.timeline.flush_usage();
+                                                if let Some(batch) = early_tools.take() {
+                                                    self.drain_early_tool_batch(
+                                                        history,
+                                                        annotate,
+                                                        batch,
+                                                        false,
+                                                        true,
+                                                    )
+                                                    .await?;
+                                                }
+                                                return Err(EngineError::PauseRequested);
+                                            }
+                                            Err(error) => {
+                                                self.timeline.abort_current_block();
+                                                self.timeline.flush_usage();
+                                                if let Some(mut batch) = early_tools.take() {
+                                                    let cleanup_error = self
+                                                        .cancel_and_terminalize_early_batch(
+                                                            history,
+                                                            annotate,
+                                                            &mut batch,
+                                                        )
+                                                        .await;
+                                                    return Err(cleanup_error.unwrap_or(error));
+                                                }
+                                                return Err(error);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if let Event::Error(err) = &event {
                                 self.timeline.abort_current_block();
                                 self.timeline.flush_usage();
+                                if let Some(mut batch) = early_tools.take() {
+                                    if let Some(error) = self
+                                        .cancel_and_terminalize_early_batch(
+                                            history,
+                                            annotate,
+                                            &mut batch,
+                                        )
+                                        .await
+                                    {
+                                        return Err(error);
+                                    }
+                                }
                                 return Err(EngineError::Client(ClientError::Api {
                                     status: None,
                                     code: err.code.clone(),
@@ -2280,7 +3401,64 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                                 }));
                             }
                         }
-                        None => break,
+                        None if !early_dispatch || response_completed => break,
+                        None => {
+                            // Providers that support only response-complete tool calls use
+                            // stream EOF as their established completion boundary. Early
+                            // dispatch is never enabled for them. Once per-block dispatch is
+                            // active, however, transport EOF alone cannot prove that the
+                            // assistant response completed after a side effect may have begun.
+                            // Require the provider's explicit terminal status in that mode.
+                            self.timeline.flush_usage();
+                            return Ok(StreamResponseOutput {
+                                completion: StreamCompletion::Interrupted {
+                                    reason: "LLM stream ended before provider completion status"
+                                        .to_string(),
+                                },
+                                early_tools,
+                            });
+                        }
+                    }
+                }
+                terminal = async {
+                    early_tools
+                        .as_mut()
+                        .expect("terminal branch requires early batch")
+                        .futures
+                        .next()
+                        .await
+                }, if early_tools.as_ref().is_some_and(|batch| !batch.futures.is_empty()) => {
+                    let (attempt_id, result) =
+                        terminal.expect("non-empty early terminal queue returns a result");
+                    let commit = {
+                        let batch = early_tools.as_mut().expect("batch initialized");
+                        self.finalize_and_commit_tool_result(
+                            history,
+                            annotate,
+                            result,
+                            Some(&attempt_id),
+                            batch.turn_id,
+                            true,
+                            &batch.call_info_map,
+                            &mut batch.attempt_fence,
+                            &mut batch.terminal_call_ids,
+                        )
+                        .await
+                    };
+                    if let Err(error) = commit {
+                        self.timeline.abort_current_block();
+                        self.timeline.flush_usage();
+                        if let Some(mut batch) = early_tools.take() {
+                            let cleanup_error = self
+                                .cancel_and_terminalize_early_batch(
+                                    history,
+                                    annotate,
+                                    &mut batch,
+                                )
+                                .await;
+                            return Err(cleanup_error.unwrap_or(error));
+                        }
+                        return Err(error);
                     }
                 }
                 pause = self.pause_rx.recv() => {
@@ -2291,6 +3469,10 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                     // Preserve any UsageEvent already received for billing, but
                     // do not treat this paused request as a normal completion.
                     self.timeline.flush_usage();
+                    if let Some(batch) = early_tools.take() {
+                        self.drain_early_tool_batch(history, annotate, batch, false, true)
+                            .await?;
+                    }
                     return Err(EngineError::PauseRequested);
                 }
                 cancel = self.cancel_rx.recv() => {
@@ -2299,6 +3481,14 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                     }
                     self.timeline.abort_current_block();
                     self.timeline.flush_usage();
+                    if let Some(mut batch) = early_tools.take() {
+                        if let Some(error) = self
+                            .cancel_and_terminalize_early_batch(history, annotate, &mut batch)
+                            .await
+                        {
+                            return Err(error);
+                        }
+                    }
                     return Err(EngineError::Cancelled);
                 }
             }
@@ -2306,7 +3496,10 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         // ストリーム完了時に集約済み Usage を 1 度だけ発火
         self.timeline.flush_usage();
         debug!(event_count = event_count, "Stream completed");
-        Ok(StreamCompletion::Complete)
+        Ok(StreamResponseOutput {
+            completion: StreamCompletion::Complete,
+            early_tools,
+        })
     }
 
     /// Execute tools and push results to history.
@@ -2361,6 +3554,7 @@ impl<C: LlmClient, A: Send + Sync> Engine<C, Mutable, A> {
             llm_call_count: 0,
             tool_execution_batch_count: 0,
             max_turns: None,
+            tool_call_dispatch_mode: ToolCallDispatchMode::default(),
             tool_execution_policy: ToolExecutionPolicy::default(),
             turn_start_cbs: Vec::new(),
             turn_end_cbs: Vec::new(),
@@ -2561,9 +3755,18 @@ impl<C: LlmClient, A: Send + Sync> Engine<C, Mutable, A> {
         self.max_turns = max_turns;
     }
 
-    /// Apply configuration (reserved for future extensions)
-    #[allow(dead_code)]
-    pub fn config(self, _config: EngineConfig) -> Self {
+    /// Select when provider-confirmed tool calls may begin execution.
+    pub fn set_tool_call_dispatch_mode(&mut self, mode: ToolCallDispatchMode) {
+        self.tool_call_dispatch_mode = mode;
+    }
+
+    pub fn tool_call_dispatch_mode(&self) -> ToolCallDispatchMode {
+        self.tool_call_dispatch_mode
+    }
+
+    /// Apply configuration.
+    pub fn config(mut self, config: EngineConfig) -> Self {
+        self.tool_call_dispatch_mode = config.tool_call_dispatch;
         self
     }
 
@@ -2640,6 +3843,7 @@ impl<C: LlmClient, A: Send + Sync> Engine<C, Mutable, A> {
             llm_call_count: self.llm_call_count,
             tool_execution_batch_count: self.tool_execution_batch_count,
             max_turns: self.max_turns,
+            tool_call_dispatch_mode: self.tool_call_dispatch_mode,
             tool_execution_policy: self.tool_execution_policy,
             turn_start_cbs: self.turn_start_cbs,
             turn_end_cbs: self.turn_end_cbs,
@@ -2823,6 +4027,7 @@ impl<C: LlmClient, A: Send + Sync> Engine<C, Locked, A> {
             llm_call_count: self.llm_call_count,
             tool_execution_batch_count: self.tool_execution_batch_count,
             max_turns: self.max_turns,
+            tool_call_dispatch_mode: self.tool_call_dispatch_mode,
             tool_execution_policy: self.tool_execution_policy,
             turn_start_cbs: self.turn_start_cbs,
             turn_end_cbs: self.turn_end_cbs,
@@ -2964,6 +4169,7 @@ fn items_trace_payload(
 fn item_kind(item: &Item) -> &'static str {
     match item {
         Item::Message { .. } => "message",
+        Item::AssistantResponseBoundary { .. } => "assistant_response_boundary",
         Item::ToolCall { .. } => "tool_call",
         Item::ToolResult { .. } => "tool_result",
         Item::Reasoning { .. } => "reasoning",
@@ -3011,6 +4217,86 @@ mod tests {
             .collect();
         assert_eq!(result_order, ["call_slow", "call_fast"]);
         assert_eq!(projection.original_to_projected_index, [0, 1, 3, 2]);
+    }
+
+    #[test]
+    fn provider_projection_groups_interleaved_calls_and_results_in_model_order() {
+        let items = vec![
+            Item::tool_call_json("call_second", "second", serde_json::json!({}))
+                .with_tool_execution_metadata(1, Some("batch:call_second".to_string()))
+                .with_status(ItemStatus::InProgress),
+            Item::tool_result("call_second", "second result"),
+            Item::tool_call_json("call_first", "first", serde_json::json!({}))
+                .with_tool_execution_metadata(0, Some("batch:call_first".to_string()))
+                .with_status(ItemStatus::InProgress),
+            Item::tool_result("call_first", "first result"),
+        ];
+
+        let projection = materialize_provider_history(&items);
+        let order = projection
+            .items
+            .iter()
+            .map(|item| match item {
+                Item::ToolCall { call_id, .. } => format!("call:{call_id}"),
+                Item::ToolResult { call_id, .. } => format!("result:{call_id}"),
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            [
+                "call:call_first",
+                "call:call_second",
+                "result:call_first",
+                "result:call_second",
+            ]
+        );
+        assert_eq!(projection.original_to_projected_index, [1, 3, 0, 2]);
+    }
+
+    #[test]
+    fn provider_projection_keeps_complete_response_before_early_results() {
+        let items = vec![
+            Item::assistant_response_boundary("response-1"),
+            Item::tool_call_json("call_second", "second", serde_json::json!({}))
+                .with_tool_execution_metadata(1, Some("batch:call_second".to_string()))
+                .with_status(ItemStatus::InProgress),
+            Item::tool_result("call_second", "second result"),
+            Item::assistant_message("trailing text"),
+            Item::reasoning("trailing reasoning"),
+            Item::tool_call_json("call_first", "first", serde_json::json!({}))
+                .with_tool_execution_metadata(0, Some("batch:call_first".to_string()))
+                .with_status(ItemStatus::InProgress),
+            Item::tool_result("call_first", "first result"),
+        ];
+
+        let projection = materialize_provider_history(&items);
+        let order = projection
+            .items
+            .iter()
+            .map(|item| match item {
+                Item::Message { .. } => "text".to_string(),
+                Item::Reasoning { .. } => "reasoning".to_string(),
+                Item::ToolCall { call_id, .. } => format!("call:{call_id}"),
+                Item::ToolResult { call_id, .. } => format!("result:{call_id}"),
+                Item::AssistantResponseBoundary { .. } => panic!("boundary leaked"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            [
+                "call:call_first",
+                "text",
+                "reasoning",
+                "call:call_second",
+                "result:call_first",
+                "result:call_second",
+            ]
+        );
+        assert_eq!(
+            projection.original_to_projected_index,
+            [0, 0, 5, 1, 2, 3, 4]
+        );
     }
 
     #[test]

@@ -38,6 +38,16 @@ impl std::fmt::Display for ConfigWarning {
 
 pub type ResponseStream = Pin<Box<dyn Stream<Item = Result<Event, ClientError>> + Send>>;
 
+/// Whether normalized `BlockStop(ToolUse)` events prove one call is complete.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolCallCompletionSupport {
+    /// Individual tool-call completion events are provider-authoritative.
+    PerBlock,
+    /// Tool calls are complete only once the response stream itself completes.
+    #[default]
+    ResponseComplete,
+}
+
 /// LLMクライアントのtrait
 ///
 /// 各プロバイダはこのtraitを実装し、統一されたインターフェースを提供する。
@@ -58,6 +68,11 @@ pub trait LlmClient: Send + Sync {
     /// Used when a second client instance is needed (e.g. for context
     /// compaction) without access to the original construction parameters.
     fn clone_boxed(&self) -> Box<dyn LlmClient>;
+
+    /// Describe the strongest safe tool-call completion boundary.
+    fn tool_call_completion_support(&self) -> ToolCallCompletionSupport {
+        ToolCallCompletionSupport::ResponseComplete
+    }
 
     /// 設定をバリデーションし、未サポートの設定があれば警告を返す
     ///
@@ -90,6 +105,10 @@ impl LlmClient for Box<dyn LlmClient> {
 
     fn clone_boxed(&self) -> Box<dyn LlmClient> {
         (**self).clone_boxed()
+    }
+
+    fn tool_call_completion_support(&self) -> ToolCallCompletionSupport {
+        (**self).tool_call_completion_support()
     }
 
     fn validate_config(&self, config: &RequestConfig) -> Vec<ConfigWarning> {

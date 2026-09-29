@@ -32,7 +32,11 @@ Deno.test("defaultWorkerLaunchForm preserves an available read-only External Wor
   const external = {
     working_directory_id: "external-1",
     display_name: "Session analysis",
-    source: { kind: "external_grant" as const, grant_id: "grant-1" },
+    source: {
+      kind: "external_grant" as const,
+      grant_id: "grant-1",
+      grant_permissions: { read: true, write: false, command: false },
+    },
     materializer_kind: "client_hosted_external" as const,
     status: "active" as const,
     cleanliness: "unknown",

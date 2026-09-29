@@ -14,9 +14,10 @@ use server_api::{
 use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
 use workdir::external::{
-    ExternalProviderInstanceId, ExternalWorkdirGrantId, ExternalWorkdirOperationId,
-    ExternalWorkdirOperationOutcome, ExternalWorkdirProviderFrame, ExternalWorkdirProviderMessage,
-    ExternalWorkdirProviderRegistration, ExternalWorkdirServerFrame, ExternalWorkdirServerMessage,
+    ExternalProviderInstanceId, ExternalWorkdirGrantId, ExternalWorkdirOperationError,
+    ExternalWorkdirOperationId, ExternalWorkdirOperationOutcome, ExternalWorkdirProviderFrame,
+    ExternalWorkdirProviderMessage, ExternalWorkdirProviderRegistration,
+    ExternalWorkdirServerFrame, ExternalWorkdirServerMessage,
 };
 use workdir::http::{WorkdirTransportError, dispatch_workdir_session_operation};
 use workdir::{
@@ -30,11 +31,22 @@ pub(crate) struct WorkdirShareOptions {
     pub backend_url: String,
     pub display_name: String,
     pub ttl: Option<Duration>,
-    pub permission: server_api::ExternalWorkdirPermission,
+    pub permissions: server_api::ExternalWorkdirPermissions,
     pub non_interactive: bool,
 }
 
 const PROVIDER_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn provider_operation_timeout(operation: &workdir::http::WorkdirSessionOperation) -> Duration {
+    if matches!(
+        operation,
+        workdir::http::WorkdirSessionOperation::CommandOutput(request) if request.wait
+    ) {
+        Duration::from_secs(workdir::external::MAX_EXTERNAL_COMMAND_TIMEOUT_SECS + 10)
+    } else {
+        PROVIDER_OPERATION_TIMEOUT
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderEnd {
@@ -128,13 +140,47 @@ fn authenticated_server_api_client(
     Ok(ServerApiClient::with_client(base_url, http_client))
 }
 
-fn permission_label(permission: server_api::ExternalWorkdirPermission) -> &'static str {
-    match permission {
-        server_api::ExternalWorkdirPermission::ReadOnly => "read-only",
-        server_api::ExternalWorkdirPermission::ReadWrite => {
-            "read-write (files only; commands disabled)"
-        }
+fn permissions_label(permissions: server_api::ExternalWorkdirPermissions) -> String {
+    let mut enabled = Vec::new();
+    if permissions.read {
+        enabled.push("READ");
     }
+    if permissions.write {
+        enabled.push("WRITE");
+    }
+    if permissions.command {
+        enabled.push("COMMAND");
+    }
+    enabled.join(", ")
+}
+
+fn validate_permissions(permissions: server_api::ExternalWorkdirPermissions) -> Result<(), String> {
+    if permissions.write && !permissions.read {
+        return Err(
+            "WRITE requires READ so existing files can satisfy read-before-write; select both categories"
+                .to_string(),
+        );
+    }
+    if !permissions.read && !permissions.command {
+        return Err("select at least one of READ or COMMAND".to_string());
+    }
+    Ok(())
+}
+
+fn workdir_capabilities(
+    permissions: server_api::ExternalWorkdirPermissions,
+) -> workdir::WorkdirSessionCapabilities {
+    let mut capabilities = workdir::WorkdirSessionCapabilities::EMPTY;
+    if permissions.read {
+        capabilities = capabilities.union(workdir::WorkdirSessionCapabilities::READ_ONLY);
+    }
+    if permissions.write {
+        capabilities = capabilities.union(workdir::WorkdirSessionCapabilities::WRITE_ONLY);
+    }
+    if permissions.command {
+        capabilities = capabilities.union(workdir::WorkdirSessionCapabilities::COMMAND_ONLY);
+    }
+    capabilities
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,7 +190,7 @@ struct ResolvedWorkdirShareOptions {
     backend_url: String,
     display_name: String,
     ttl: Option<Duration>,
-    permission: server_api::ExternalWorkdirPermission,
+    permissions: server_api::ExternalWorkdirPermissions,
 }
 
 pub(crate) fn parse_ttl(value: &str) -> Result<Duration, String> {
@@ -254,30 +300,49 @@ fn configure_interactively(
     };
     options.workspace_id = Some(workspaces[selected_index].workspace_id.clone());
 
-    let current_permission = match options.permission {
-        server_api::ExternalWorkdirPermission::ReadOnly => "r",
-        server_api::ExternalWorkdirPermission::ReadWrite => "w",
-    };
     writeln!(
         output,
-        "Permission: read-only or read-write files. Read-write never enables Bash/command/exec."
+        "Permissions are independent categories: READ (Read/Glob/Grep), WRITE (Write/Edit), and COMMAND (host command lifecycle). WRITE requires READ for read-before-write. COMMAND runs with this CLI user's host authority and is not sandboxed."
     )
     .map_err(|error| format!("failed to write prompt: {error}"))?;
-    let Some(permission) = read_prompt_line(
+    let Some(permission_input) = read_prompt_line(
         input,
         output,
-        &format!("Permission [r/w; current {current_permission}; q to cancel]: "),
+        &format!(
+            "Permissions [comma-separated READ/WRITE/COMMAND; current {}; q to cancel]: ",
+            permissions_label(options.permissions)
+        ),
     )?
     else {
         return Ok(None);
     };
-    options.permission = match permission.as_str() {
-        "" => options.permission,
-        "r" | "read-only" | "read_only" => server_api::ExternalWorkdirPermission::ReadOnly,
-        "w" | "read-write" | "read_write" => server_api::ExternalWorkdirPermission::ReadWrite,
-        "q" | "quit" | "cancel" => return Ok(None),
-        _ => return Err("Permission must be read-only (`r`) or read-write (`w`)".to_string()),
-    };
+    if matches!(permission_input.as_str(), "q" | "quit" | "cancel") {
+        return Ok(None);
+    }
+    if !permission_input.is_empty() {
+        let mut permissions = server_api::ExternalWorkdirPermissions {
+            read: false,
+            write: false,
+            command: false,
+        };
+        for category in permission_input
+            .split([',', ' '])
+            .filter(|category| !category.is_empty())
+        {
+            match category.to_ascii_lowercase().as_str() {
+                "r" | "read" | "read-only" | "read_only" => permissions.read = true,
+                "w" | "write" | "read-write" | "read_write" => permissions.write = true,
+                "c" | "command" => permissions.command = true,
+                _ => {
+                    return Err(format!(
+                        "unknown permission category `{category}`; use READ, WRITE, or COMMAND"
+                    ));
+                }
+            }
+        }
+        validate_permissions(permissions)?;
+        options.permissions = permissions;
+    }
 
     writeln!(output, "TTL: {}", ttl_label(options.ttl))
         .map_err(|error| format!("failed to write prompt: {error}"))?;
@@ -305,8 +370,8 @@ fn configure_interactively(
         .and_then(|()| {
             writeln!(
                 output,
-                "  Permission: {}",
-                permission_label(options.permission)
+                "  Permissions: {}",
+                permissions_label(options.permissions)
             )
         })
         .and_then(|()| writeln!(output, "  TTL: {}", ttl_label(options.ttl)))
@@ -324,7 +389,7 @@ fn configure_interactively(
         backend_url: options.backend_url,
         display_name: options.display_name,
         ttl: options.ttl,
-        permission: options.permission,
+        permissions: options.permissions,
     }))
 }
 
@@ -342,6 +407,7 @@ fn ensure_interactive_tty(stdin_is_tty: bool, stderr_is_tty: bool) -> Result<(),
 async fn resolve_share_options(
     options: WorkdirShareOptions,
 ) -> Result<Option<ResolvedWorkdirShareOptions>, String> {
+    validate_permissions(options.permissions)?;
     if options.non_interactive {
         let workspace_id = options.workspace_id.clone().ok_or_else(|| {
             "non-interactive sharing requires --workspace-id; no Workspace is inferred from cwd or path"
@@ -353,7 +419,7 @@ async fn resolve_share_options(
             backend_url: options.backend_url,
             display_name: options.display_name,
             ttl: options.ttl,
-            permission: options.permission,
+            permissions: options.permissions,
         }));
     }
     ensure_interactive_tty(
@@ -392,35 +458,29 @@ pub(crate) async fn run(options: WorkdirShareOptions) -> Result<(), String> {
                 provider_instance_id: provider_instance_id.clone(),
                 display_name: options.display_name.clone(),
                 ttl_seconds: options.ttl.map(|ttl| ttl.as_secs()),
-                permission: options.permission,
+                permissions: options.permissions,
             },
         )
         .await
         .map_err(|error| format!("External Workdir grant request failed: {error}"))?;
 
-    let limits = BoundedReadLimits::EXTERNAL_DEFAULT;
-    let session = match options.permission {
-        server_api::ExternalWorkdirPermission::ReadOnly => {
-            LocalWorkdirSession::external_read_only_pinned(
-                Workdir::new(&grant.working_directory_id),
-                pinned_root,
-                limits,
-            )
-        }
-        server_api::ExternalWorkdirPermission::ReadWrite => {
-            LocalWorkdirSession::external_read_write_pinned(
-                Workdir::new(&grant.working_directory_id),
-                pinned_root,
-                limits,
-            )
-        }
+    if grant.permissions != options.permissions {
+        return Err(
+            "Backend returned permissions that differ from the requested grant".to_string(),
+        );
     }
-    .map_err(|error| error.to_string())?;
+    let capabilities = workdir_capabilities(grant.permissions);
+    let limits = BoundedReadLimits::EXTERNAL_DEFAULT;
 
     println!("External Workdir grant: {}", grant.grant_id);
     println!("Logical Workdir: {}", grant.working_directory_id);
     println!("Display name: {}", grant.display_name);
-    println!("Permission: {}", permission_label(grant.permission));
+    println!("Permissions: {}", permissions_label(grant.permissions));
+    if grant.permissions.command {
+        println!(
+            "COMMAND executes with this sharing CLI user's host authority; it is not sandboxed."
+        );
+    }
     println!(
         "Expires at: {}",
         grant
@@ -440,6 +500,16 @@ pub(crate) async fn run(options: WorkdirShareOptions) -> Result<(), String> {
         .transpose()?;
     let mut generation = grant.generation;
     loop {
+        // Command handles and results are generation-owned. A reconnect always
+        // gets a fresh LocalWorkdirSession, and closing the old one kills and
+        // reaps every process before the next generation can register.
+        let session = LocalWorkdirSession::external_with_capabilities_pinned(
+            Workdir::new(&grant.working_directory_id),
+            pinned_root.clone(),
+            limits,
+            capabilities,
+        )
+        .map_err(|error| error.to_string())?;
         let outcome = serve_provider_connection(
             &backend_client,
             &server_api_client,
@@ -450,6 +520,17 @@ pub(crate) async fn run(options: WorkdirShareOptions) -> Result<(), String> {
             generation,
         )
         .await;
+        let close_result = session.close().await.map_err(|error| error.to_string());
+        let outcome = match (outcome, close_result) {
+            (Ok(outcome), Ok(())) => Ok(outcome),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(format!(
+                "External Workdir provider session cleanup failed: {error}"
+            )),
+            (Err(connection_error), Err(close_error)) => Err(format!(
+                "{connection_error}; provider session cleanup failed: {close_error}"
+            )),
+        };
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(connection_error) => {
@@ -625,7 +706,7 @@ async fn serve_provider_connection(
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
                 signal.map_err(|error| format!("failed to wait for Ctrl-C: {error}"))?;
-                stop_operations(&mut operations, &mut completions).await?;
+                stop_provider_operations(session, &mut operations, &mut completions).await?;
                 revoke(server_api_client, &options.workspace_id, &grant.grant_id).await?;
                 return Ok(ProviderEnd::Interrupted);
             }
@@ -640,11 +721,12 @@ async fn serve_provider_connection(
                 let cancelled = match operation.join() {
                     Ok(cancelled) => cancelled,
                     Err(error) => {
-                        stop_operations(&mut operations, &mut completions).await?;
+                        stop_provider_operations(session, &mut operations, &mut completions).await?;
                         return Err(error);
                     }
                 };
                 let outcome = if cancelled {
+                    cancel_completed_command(session, &completion.outcome).await;
                     ExternalWorkdirOperationOutcome::Cancelled
                 } else {
                     completion.outcome
@@ -657,19 +739,19 @@ async fn serve_provider_connection(
                     },
                 );
                 if send_provider_frame(&mut socket, &result).await.is_err() {
-                    stop_operations(&mut operations, &mut completions).await?;
+                    stop_provider_operations(session, &mut operations, &mut completions).await?;
                     return Ok(ProviderEnd::Disconnected);
                 }
             }
             incoming = socket.next() => {
                 let Some(incoming) = incoming else {
-                    stop_operations(&mut operations, &mut completions).await?;
+                    stop_provider_operations(session, &mut operations, &mut completions).await?;
                     return Ok(ProviderEnd::Disconnected);
                 };
                 let incoming = match incoming {
                     Ok(incoming) => incoming,
                     Err(_) => {
-                        stop_operations(&mut operations, &mut completions).await?;
+                        stop_provider_operations(session, &mut operations, &mut completions).await?;
                         return Ok(ProviderEnd::Disconnected);
                     }
                 };
@@ -678,7 +760,7 @@ async fn serve_provider_connection(
                         let frame = match serde_json::from_str::<ExternalWorkdirServerFrame>(&text) {
                             Ok(frame) => frame,
                             Err(error) => {
-                                stop_operations(&mut operations, &mut completions).await?;
+                                stop_provider_operations(session, &mut operations, &mut completions).await?;
                                 return Err(format!("Backend returned an invalid External Workdir frame: {error}"));
                             }
                         };
@@ -689,34 +771,38 @@ async fn serve_provider_connection(
                                 operation,
                             } if frame_generation == generation => {
                                 if operations.len() >= 16 || operations.contains_key(operation_id.as_str()) {
-                                    stop_operations(&mut operations, &mut completions).await?;
+                                    stop_provider_operations(session, &mut operations, &mut completions).await?;
                                     return Err("Backend exceeded External Workdir operation bounds".to_string());
                                 }
                                 let key = operation_id.as_str().to_string();
                                 let completion_sender = completion_sender.clone();
                                 let task_operation_id = operation_id.clone();
                                 let cancelled = Arc::new(AtomicBool::new(false));
+                                let operation_timeout = provider_operation_timeout(operation.as_inner());
                                 let guarded_session = session.with_operation_guard(
                                     cancelled.clone(),
-                                    Instant::now() + PROVIDER_OPERATION_TIMEOUT,
+                                    Instant::now() + operation_timeout,
                                 );
                                 let operation = operation.into_inner();
+                                let runtime = tokio::runtime::Handle::current();
                                 let spawned = std::thread::Builder::new()
                                     .name("external-workdir-operation".to_string())
                                     .spawn(move || {
                                         let outcome = std::panic::catch_unwind(
                                             std::panic::AssertUnwindSafe(|| {
-                                                futures::executor::block_on(execute_operation(
+                                                runtime.block_on(execute_operation(
                                                     &guarded_session,
                                                     operation,
                                                 ))
                                             }),
                                         )
                                         .unwrap_or_else(|_| ExternalWorkdirOperationOutcome::Failed {
-                                            error: WorkdirTransportError {
-                                                code: workdir::http::WorkdirTransportErrorCode::Internal,
-                                                message: "External Workdir operation executor failed".to_string(),
-                                            },
+                                            error: ExternalWorkdirOperationError::from_transport_error(
+                                                WorkdirTransportError {
+                                                    code: workdir::http::WorkdirTransportErrorCode::Internal,
+                                                    message: "External Workdir operation executor failed".to_string(),
+                                                },
+                                            ),
                                         });
                                         let _ = completion_sender.blocking_send(OperationCompletion {
                                             operation_id: task_operation_id,
@@ -726,7 +812,7 @@ async fn serve_provider_connection(
                                 let thread = match spawned {
                                     Ok(thread) => thread,
                                     Err(error) => {
-                                        stop_operations(&mut operations, &mut completions).await?;
+                                        stop_provider_operations(session, &mut operations, &mut completions).await?;
                                         return Err(format!("failed to start External Workdir operation: {error}"));
                                     }
                                 };
@@ -746,7 +832,7 @@ async fn serve_provider_connection(
                                     ExternalWorkdirProviderMessage::Heartbeat { generation, sequence },
                                 );
                                 if send_provider_frame(&mut socket, &heartbeat).await.is_err() {
-                                    stop_operations(&mut operations, &mut completions).await?;
+                                    stop_provider_operations(session, &mut operations, &mut completions).await?;
                                     return Ok(ProviderEnd::Disconnected);
                                 }
                             }
@@ -764,7 +850,7 @@ async fn serve_provider_connection(
                                 generation: frame_generation,
                                 ..
                             } if frame_generation == generation => {
-                                stop_operations(&mut operations, &mut completions).await?;
+                                stop_provider_operations(session, &mut operations, &mut completions).await?;
                                 let acknowledged = ExternalWorkdirProviderFrame::current(
                                     ExternalWorkdirProviderMessage::RevokeAcknowledged { generation },
                                 );
@@ -772,7 +858,7 @@ async fn serve_provider_connection(
                                 return Ok(ProviderEnd::Revoked);
                             }
                             _ => {
-                                stop_operations(&mut operations, &mut completions).await?;
+                                stop_provider_operations(session, &mut operations, &mut completions).await?;
                                 return Err("stale or unexpected External Workdir provider frame".to_string());
                             }
                         }
@@ -784,12 +870,12 @@ async fn serve_provider_connection(
                         )
                         .await;
                         if !matches!(pong, Ok(Ok(()))) {
-                            stop_operations(&mut operations, &mut completions).await?;
+                            stop_provider_operations(session, &mut operations, &mut completions).await?;
                             return Ok(ProviderEnd::Disconnected);
                         }
                     }
                     Message::Close(_) => {
-                        stop_operations(&mut operations, &mut completions).await?;
+                        stop_provider_operations(session, &mut operations, &mut completions).await?;
                         return Ok(ProviderEnd::Disconnected);
                     }
                     _ => {}
@@ -797,6 +883,28 @@ async fn serve_provider_connection(
             }
         }
     }
+}
+
+async fn cancel_completed_command(
+    session: &LocalWorkdirSession,
+    outcome: &ExternalWorkdirOperationOutcome,
+) {
+    let ExternalWorkdirOperationOutcome::Completed { result } = outcome else {
+        return;
+    };
+    let workdir::http::WorkdirSessionOperationResult::CommandStart(handle) = result.as_inner()
+    else {
+        return;
+    };
+    let _ = session.cancel_command(handle.clone()).await;
+    let _ = session
+        .command_output(workdir::CommandOutputRequest {
+            handle: handle.clone(),
+            cursor: 0,
+            limit: workdir::external::MAX_EXTERNAL_COMMAND_OUTPUT_BYTES,
+            wait: true,
+        })
+        .await;
 }
 
 async fn execute_operation(
@@ -807,14 +915,16 @@ async fn execute_operation(
         Ok(result) => match result.try_into() {
             Ok(result) => ExternalWorkdirOperationOutcome::Completed { result },
             Err(message) => ExternalWorkdirOperationOutcome::Failed {
-                error: WorkdirTransportError {
+                error: ExternalWorkdirOperationError::from_transport_error(WorkdirTransportError {
                     code: workdir::http::WorkdirTransportErrorCode::Unsupported,
                     message,
-                },
+                }),
             },
         },
         Err(error) => ExternalWorkdirOperationOutcome::Failed {
-            error: WorkdirTransportError::from_workdir_error(&error),
+            error: ExternalWorkdirOperationError::from_transport_error(
+                WorkdirTransportError::from_workdir_error(&error),
+            ),
         },
     }
 }
@@ -823,6 +933,15 @@ fn cancel_operations(operations: &HashMap<String, OperationTask>) {
     for operation in operations.values() {
         operation.cancel();
     }
+}
+
+async fn stop_provider_operations(
+    session: &LocalWorkdirSession,
+    operations: &mut HashMap<String, OperationTask>,
+    completions: &mut tokio::sync::mpsc::Receiver<OperationCompletion>,
+) -> Result<(), String> {
+    session.close().await.map_err(|error| error.to_string())?;
+    stop_operations(operations, completions).await
 }
 
 async fn stop_operations(
@@ -925,7 +1044,7 @@ mod tests {
             backend_url: "https://backend.example".to_string(),
             display_name: "External Workdir".to_string(),
             ttl: None,
-            permission: server_api::ExternalWorkdirPermission::ReadOnly,
+            permissions: server_api::ExternalWorkdirPermissions::default(),
             non_interactive: false,
         }
     }
@@ -954,8 +1073,8 @@ mod tests {
 
         assert_eq!(selected.workspace_id, "workspace-a");
         assert_eq!(
-            selected.permission,
-            server_api::ExternalWorkdirPermission::ReadOnly
+            selected.permissions,
+            server_api::ExternalWorkdirPermissions::default()
         );
         assert_eq!(selected.ttl, None);
         assert!(
@@ -966,12 +1085,12 @@ mod tests {
     }
 
     #[test]
-    fn interactive_share_requires_explicit_read_write_selection_and_confirmation() {
+    fn interactive_share_requires_explicit_write_and_command_selection_and_confirmation() {
         let workspaces = [
             workspace("workspace-a", "Alpha"),
             workspace("workspace-b", "Beta"),
         ];
-        let mut input = std::io::Cursor::new(b"2\nw\n15m\ny\n".to_vec());
+        let mut input = std::io::Cursor::new(b"2\nREAD,WRITE,COMMAND\n15m\ny\n".to_vec());
         let mut output = Vec::new();
 
         let selected =
@@ -981,10 +1100,17 @@ mod tests {
 
         assert_eq!(selected.workspace_id, "workspace-b");
         assert_eq!(
-            selected.permission,
-            server_api::ExternalWorkdirPermission::ReadWrite
+            selected.permissions,
+            server_api::ExternalWorkdirPermissions {
+                read: true,
+                write: true,
+                command: true,
+            }
         );
         assert_eq!(selected.ttl, Some(Duration::from_secs(900)));
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("not sandboxed"));
+        assert!(output.contains("Permissions: READ, WRITE, COMMAND"));
     }
 
     #[test]
@@ -1101,7 +1227,7 @@ mod tests {
             "working_directory_id": "workdir-a",
             "provider_instance_id": "provider-a",
             "display_name": "Shared files",
-            "permission": "read_only",
+            "permissions": {"read": true, "write": false, "command": false},
             "expires_at": "2026-09-23T03:00:00Z",
             "generation": 7,
             "status": "pending"
@@ -1121,7 +1247,7 @@ mod tests {
                     provider_instance_id: "provider-a".to_string(),
                     display_name: "Shared files".to_string(),
                     ttl_seconds: Some(600),
-                    permission: server_api::ExternalWorkdirPermission::ReadOnly,
+                    permissions: server_api::ExternalWorkdirPermissions::default(),
                 },
             )
             .await

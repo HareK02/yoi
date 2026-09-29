@@ -7,6 +7,7 @@
     parseWorkerRetentionResponse,
   } from '$lib/workspace/api/runtime-workers';
   import { workerHref } from '$lib/workspace/resource-links';
+  import { formatWorkdirPermissions } from '$lib/workspace/settings/workdir-permissions';
   import { formatCurrentWorkdirRevision } from '$lib/workspace/settings/workdir-revision';
   import { canOpenWorkerConsole } from '$lib/workspace/sidebar/workers';
   import { liveWorkerState } from '$lib/workspace/sidebar/worker-state';
@@ -149,7 +150,7 @@
   function workerDirectory(worker: Worker): string {
     const attachments = worker.workdir_attachments ?? [];
     if (attachments.length === 0) return '—';
-    return attachments.map(({ alias, working_directory: directory }) => {
+    return attachments.map(({ alias, effective_permissions, working_directory: directory }) => {
       const repositoryKey = directory.source.kind === 'repository'
         ? directory.source.repository_key
         : null;
@@ -157,6 +158,9 @@
         ? data.repositories?.items.find((repository) => repository.repository_key === repositoryKey)?.provider
         : null;
       const label = directory.display_name ?? repositoryKey ?? 'External Workdir';
+      if (directory.source.kind === 'external_grant') {
+        return `${alias}: ${label} · ${formatWorkdirPermissions(effective_permissions)}`;
+      }
       return `${alias}: ${label} · ${formatCurrentWorkdirRevision(directory, provider)}`;
     }).join(', ');
   }

@@ -2,10 +2,10 @@ use crate::http::{
     WorkdirSessionOperation, WorkdirSessionOperationResult, dispatch_workdir_session_operation,
 };
 use crate::{
-    BoundedReadLimits, CommandRequest, EditRequest, ExternalWorkdirRoot, GlobRequest,
-    GrepOutputMode, GrepRequest, LocalWorkdirSession, ReadRequest, Workdir, WorkdirError,
-    WorkdirPath, WorkdirSession, WorkdirSessionCapabilities, WorkdirSessionCapability,
-    WriteRequest,
+    BoundedReadLimits, CommandOutputRequest, CommandRequest, EditRequest, ExternalWorkdirRoot,
+    GlobRequest, GrepOutputMode, GrepRequest, LocalWorkdirSession, ReadRequest, Workdir,
+    WorkdirError, WorkdirPath, WorkdirSession, WorkdirSessionCapabilities,
+    WorkdirSessionCapability, WriteRequest,
 };
 
 fn external_session(root: &tempfile::TempDir, limits: BoundedReadLimits) -> LocalWorkdirSession {
@@ -160,6 +160,73 @@ async fn external_local_provider_read_write_is_filesystem_only() {
         WorkdirError::Unsupported(WorkdirSessionCapability::Command)
     ));
     assert!(!root.path().join("command-ran").exists());
+}
+
+#[tokio::test]
+async fn external_command_permission_is_explicit_and_independent_from_file_access() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("item.txt"), "private").unwrap();
+    let pinned = ExternalWorkdirRoot::pin(root.path()).unwrap();
+    let session = LocalWorkdirSession::external_with_capabilities_pinned(
+        Workdir::new("external-workdir-command"),
+        pinned,
+        BoundedReadLimits::new(4096, 1024).unwrap(),
+        WorkdirSessionCapabilities::COMMAND_ONLY,
+    )
+    .unwrap();
+
+    assert_eq!(
+        session.capabilities(),
+        WorkdirSessionCapabilities::COMMAND_ONLY
+    );
+    assert!(matches!(
+        session
+            .read(ReadRequest {
+                path: WorkdirPath::new("item.txt").unwrap(),
+                offset: 0,
+                limit: 10,
+                max_bytes: 1024,
+            })
+            .await,
+        Err(WorkdirError::Unsupported(WorkdirSessionCapability::Read))
+    ));
+
+    let handle = session
+        .start_command(CommandRequest {
+            command: "printf command-ok".to_string(),
+            timeout_secs: 5,
+            output_limit: 1024,
+            cwd: WorkdirPath::root(),
+            spill_dir: None,
+            tool_call_id: None,
+        })
+        .await
+        .unwrap();
+    let output = session
+        .command_output(CommandOutputRequest {
+            handle,
+            cursor: 0,
+            limit: 1024,
+            wait: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(output.content, "command-ok");
+    assert_eq!(output.exit_code, Some(0));
+}
+
+#[test]
+fn external_write_category_never_implicitly_enables_read() {
+    let root = tempfile::tempdir().unwrap();
+    let pinned = ExternalWorkdirRoot::pin(root.path()).unwrap();
+    let error = LocalWorkdirSession::external_with_capabilities_pinned(
+        Workdir::new("external-workdir-invalid-write"),
+        pinned,
+        BoundedReadLimits::new(4096, 1024).unwrap(),
+        WorkdirSessionCapabilities::WRITE_ONLY,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("WRITE requires READ"));
 }
 
 #[tokio::test]

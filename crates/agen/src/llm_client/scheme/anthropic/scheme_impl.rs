@@ -9,6 +9,7 @@ use crate::llm_client::{
     ClientError,
     auth::AuthRequirement,
     capability::ModelCapability,
+    client::ToolCallCompletionSupport,
     event::{BlockType, Event, ReasoningBlockData},
     scheme::Scheme,
     types::Request,
@@ -103,5 +104,9 @@ impl Scheme for AnthropicScheme {
 
     fn default_capability(&self) -> ModelCapability {
         super::capability::default_capability()
+    }
+
+    fn tool_call_completion_support(&self) -> ToolCallCompletionSupport {
+        ToolCallCompletionSupport::PerBlock
     }
 }

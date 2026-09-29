@@ -263,6 +263,7 @@ impl AnthropicScheme {
 
         for (i, item) in items.iter().enumerate() {
             match item {
+                Item::AssistantResponseBoundary { .. } => {}
                 Item::Message { role, content, .. } => {
                     let parts: Vec<AnthropicContentPart> = content
                         .iter()

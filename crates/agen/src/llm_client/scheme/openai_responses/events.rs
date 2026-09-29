@@ -28,6 +28,43 @@ pub struct OpenAIResponsesState {
     /// 蓄積、`output_item.done`(Reasoning) で既存 reasoning_text block または
     /// metadata-only Thinking block に reasoning persistence material を載せる。
     pending_reasoning: HashMap<usize, PendingReasoning>,
+    /// Tool input deltas and authoritative final values, keyed by output index.
+    pending_tool_inputs: HashMap<usize, PendingToolInput>,
+}
+
+/// A tool input stream accumulated until an authoritative done payload arrives.
+#[derive(Debug)]
+struct PendingToolInput {
+    kind: ToolInputKind,
+    streamed: String,
+    saw_delta: bool,
+    final_value: Option<String>,
+}
+
+impl PendingToolInput {
+    fn new(kind: ToolInputKind) -> Self {
+        Self {
+            kind,
+            streamed: String::new(),
+            saw_delta: false,
+            final_value: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolInputKind {
+    FunctionCall,
+    CustomToolCall,
+}
+
+impl ToolInputKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::FunctionCall => "function-call arguments",
+            Self::CustomToolCall => "custom-tool input",
+        }
+    }
 }
 
 /// 1 つの reasoning output_item の蓄積バッファ。
@@ -173,6 +210,8 @@ enum OutputItem {
         id: Option<String>,
         call_id: String,
         name: String,
+        #[serde(default)]
+        arguments: Option<String>,
     },
     CustomToolCall {
         #[allow(dead_code)]
@@ -180,6 +219,8 @@ enum OutputItem {
         id: Option<String>,
         call_id: String,
         name: String,
+        #[serde(default)]
+        input: Option<String>,
     },
     #[serde(other)]
     Other,
@@ -261,9 +302,21 @@ struct FunctionCallArgumentsDelta {
 }
 
 #[derive(Debug, Deserialize)]
+struct FunctionCallArgumentsDone {
+    output_index: usize,
+    arguments: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct CustomToolCallInputDelta {
     output_index: usize,
     delta: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CustomToolCallInputDone {
+    output_index: usize,
+    input: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -398,16 +451,20 @@ pub(crate) fn parse_sse(
         "response.output_item.added" => {
             let ev: OutputItemAdded = from_json(data)?;
             match ev.item {
-                OutputItem::FunctionCall { call_id, name, .. }
-                | OutputItem::CustomToolCall { call_id, name, .. } => {
-                    let info =
-                        state.allocate(SlotKey::OutputItem(ev.output_index), BlockType::ToolUse);
-                    Ok(vec![Event::BlockStart(BlockStart {
-                        index: info.flat_index,
-                        block_type: BlockType::ToolUse,
-                        metadata: BlockMetadata::ToolUse { id: call_id, name },
-                    })])
-                }
+                OutputItem::FunctionCall { call_id, name, .. } => start_tool_output_item(
+                    state,
+                    ev.output_index,
+                    ToolInputKind::FunctionCall,
+                    call_id,
+                    name,
+                ),
+                OutputItem::CustomToolCall { call_id, name, .. } => start_tool_output_item(
+                    state,
+                    ev.output_index,
+                    ToolInputKind::CustomToolCall,
+                    call_id,
+                    name,
+                ),
                 OutputItem::Reasoning { id, .. } => {
                     // wrapper を確保。中身の content_part / summary_part は
                     // 別 SlotKey で扱われ続ける（Streaming 表示は維持）。
@@ -431,19 +488,19 @@ pub(crate) fn parse_sse(
                 id,
                 encrypted_content,
                 ..
-            } = ev.item
+            } = &ev.item
             {
                 let mut pending = state
                     .pending_reasoning
                     .remove(&ev.output_index)
                     .unwrap_or_default();
                 if pending.id.is_none() {
-                    pending.id = id;
+                    pending.id = id.clone();
                 }
 
                 let mut stop_blocks = std::mem::take(&mut pending.deferred_thinking_stops);
                 stop_blocks.extend(state.take_active_reasoning_slots(ev.output_index));
-                let reasoning = pending.into_reasoning_data(encrypted_content);
+                let reasoning = pending.into_reasoning_data(encrypted_content.clone());
 
                 if stop_blocks.is_empty() {
                     let info =
@@ -478,15 +535,45 @@ pub(crate) fn parse_sse(
                     })
                     .collect());
             }
-            if let Some(info) = state.slots.remove(&SlotKey::OutputItem(ev.output_index)) {
-                Ok(vec![Event::BlockStop(BlockStop {
-                    index: info.flat_index,
-                    block_type: info.block_type,
-                    stop_reason: None,
-                    reasoning: None,
-                })])
-            } else {
-                Ok(Vec::new())
+            match ev.item {
+                OutputItem::FunctionCall {
+                    call_id,
+                    name,
+                    arguments,
+                    ..
+                } => finish_tool_output_item(
+                    state,
+                    ev.output_index,
+                    ToolInputKind::FunctionCall,
+                    call_id,
+                    name,
+                    arguments,
+                ),
+                OutputItem::CustomToolCall {
+                    call_id,
+                    name,
+                    input,
+                    ..
+                } => finish_tool_output_item(
+                    state,
+                    ev.output_index,
+                    ToolInputKind::CustomToolCall,
+                    call_id,
+                    name,
+                    input,
+                ),
+                _ => {
+                    if let Some(info) = state.slots.remove(&SlotKey::OutputItem(ev.output_index)) {
+                        Ok(vec![Event::BlockStop(BlockStop {
+                            index: info.flat_index,
+                            block_type: info.block_type,
+                            stop_reason: None,
+                            reasoning: None,
+                        })])
+                    } else {
+                        Ok(Vec::new())
+                    }
+                }
             }
         }
 
@@ -619,30 +706,50 @@ pub(crate) fn parse_sse(
 
         "response.function_call_arguments.delta" => {
             let ev: FunctionCallArgumentsDelta = from_json(data)?;
-            Ok(ensure_and_delta(
+            record_tool_input_delta(
                 state,
-                SlotKey::OutputItem(ev.output_index),
-                BlockType::ToolUse,
+                ev.output_index,
+                ToolInputKind::FunctionCall,
+                ev.delta,
+            )
+        }
+
+        "response.function_call_arguments.done" => {
+            let ev: FunctionCallArgumentsDone = from_json(data)?;
+            reconcile_tool_input(
+                state,
+                ev.output_index,
+                ToolInputKind::FunctionCall,
+                ev.arguments,
                 BlockMetadata::ToolUse {
                     id: String::new(),
                     name: String::new(),
                 },
-                DeltaContent::InputJson(ev.delta),
-            ))
+            )
         }
 
         "response.custom_tool_call_input.delta" => {
             let ev: CustomToolCallInputDelta = from_json(data)?;
-            Ok(ensure_and_delta(
+            record_tool_input_delta(
                 state,
-                SlotKey::OutputItem(ev.output_index),
-                BlockType::ToolUse,
+                ev.output_index,
+                ToolInputKind::CustomToolCall,
+                ev.delta,
+            )
+        }
+
+        "response.custom_tool_call_input.done" => {
+            let ev: CustomToolCallInputDone = from_json(data)?;
+            reconcile_tool_input(
+                state,
+                ev.output_index,
+                ToolInputKind::CustomToolCall,
+                ev.input,
                 BlockMetadata::ToolUse {
                     id: String::new(),
                     name: String::new(),
                 },
-                DeltaContent::InputJson(ev.delta),
-            ))
+            )
         }
 
         "error" => {
@@ -663,6 +770,181 @@ pub(crate) fn parse_sse(
 
         // 未対応 / 情報系 event type は生成 semantics からは無視しつつ trace に残す。
         _ => Ok(vec![unhandled_sse_event(event_type, data)]),
+    }
+}
+
+fn start_tool_output_item(
+    state: &mut OpenAIResponsesState,
+    output_index: usize,
+    kind: ToolInputKind,
+    call_id: String,
+    name: String,
+) -> Result<Vec<Event>, ClientError> {
+    ensure_tool_input_kind(state, output_index, kind)?;
+    let (info, just_created) =
+        state.get_or_allocate(SlotKey::OutputItem(output_index), BlockType::ToolUse);
+    if just_created {
+        Ok(vec![Event::BlockStart(BlockStart {
+            index: info.flat_index,
+            block_type: BlockType::ToolUse,
+            metadata: BlockMetadata::ToolUse { id: call_id, name },
+        })])
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+fn record_tool_input_delta(
+    state: &mut OpenAIResponsesState,
+    output_index: usize,
+    kind: ToolInputKind,
+    delta: String,
+) -> Result<Vec<Event>, ClientError> {
+    let pending = ensure_tool_input_kind(state, output_index, kind)?;
+    if pending.final_value.is_some() {
+        return Err(tool_input_error(
+            "tool_input_delta_after_done",
+            format!(
+                "OpenAI Responses {} delta arrived after its final value at output index {output_index}",
+                kind.label()
+            ),
+        ));
+    }
+    pending.saw_delta = true;
+    pending.streamed.push_str(&delta);
+
+    Ok(ensure_and_delta(
+        state,
+        SlotKey::OutputItem(output_index),
+        BlockType::ToolUse,
+        BlockMetadata::ToolUse {
+            id: String::new(),
+            name: String::new(),
+        },
+        DeltaContent::InputJson(delta),
+    ))
+}
+
+fn reconcile_tool_input(
+    state: &mut OpenAIResponsesState,
+    output_index: usize,
+    kind: ToolInputKind,
+    final_value: String,
+    metadata: BlockMetadata,
+) -> Result<Vec<Event>, ClientError> {
+    let pending = ensure_tool_input_kind(state, output_index, kind)?;
+    if pending
+        .final_value
+        .as_ref()
+        .is_some_and(|existing| existing != &final_value)
+    {
+        return Err(tool_input_error(
+            "tool_input_final_mismatch",
+            format!(
+                "OpenAI Responses authoritative {} values disagree at output index {output_index}",
+                kind.label()
+            ),
+        ));
+    }
+    if pending.saw_delta && pending.streamed != final_value {
+        return Err(tool_input_error(
+            "tool_input_delta_mismatch",
+            format!(
+                "OpenAI Responses streamed {} does not match its authoritative final value at output index {output_index}",
+                kind.label()
+            ),
+        ));
+    }
+
+    let should_emit = !pending.saw_delta;
+    if should_emit {
+        pending.saw_delta = true;
+        pending.streamed.clone_from(&final_value);
+    }
+    pending.final_value = Some(final_value.clone());
+
+    if should_emit {
+        Ok(ensure_and_delta(
+            state,
+            SlotKey::OutputItem(output_index),
+            BlockType::ToolUse,
+            metadata,
+            DeltaContent::InputJson(final_value),
+        ))
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+fn finish_tool_output_item(
+    state: &mut OpenAIResponsesState,
+    output_index: usize,
+    kind: ToolInputKind,
+    call_id: String,
+    name: String,
+    final_value: Option<String>,
+) -> Result<Vec<Event>, ClientError> {
+    let metadata = BlockMetadata::ToolUse { id: call_id, name };
+    let mut out = if let Some(final_value) = final_value {
+        reconcile_tool_input(state, output_index, kind, final_value, metadata.clone())?
+    } else {
+        let pending = ensure_tool_input_kind(state, output_index, kind)?;
+        if pending.final_value.is_none() {
+            return Err(tool_input_error(
+                "tool_input_final_missing",
+                format!(
+                    "OpenAI Responses {} ended without an authoritative final value at output index {output_index}",
+                    kind.label()
+                ),
+            ));
+        }
+        Vec::new()
+    };
+
+    let (info, just_created) =
+        state.get_or_allocate(SlotKey::OutputItem(output_index), BlockType::ToolUse);
+    if just_created {
+        out.push(Event::BlockStart(BlockStart {
+            index: info.flat_index,
+            block_type: BlockType::ToolUse,
+            metadata,
+        }));
+    }
+    state.slots.remove(&SlotKey::OutputItem(output_index));
+    state.pending_tool_inputs.remove(&output_index);
+    out.push(Event::BlockStop(BlockStop {
+        index: info.flat_index,
+        block_type: info.block_type,
+        stop_reason: None,
+        reasoning: None,
+    }));
+    Ok(out)
+}
+
+fn ensure_tool_input_kind(
+    state: &mut OpenAIResponsesState,
+    output_index: usize,
+    kind: ToolInputKind,
+) -> Result<&mut PendingToolInput, ClientError> {
+    let pending = state
+        .pending_tool_inputs
+        .entry(output_index)
+        .or_insert_with(|| PendingToolInput::new(kind));
+    if pending.kind != kind {
+        return Err(tool_input_error(
+            "tool_input_kind_mismatch",
+            format!("OpenAI Responses tool input kind changed at output index {output_index}"),
+        ));
+    }
+    Ok(pending)
+}
+
+fn tool_input_error(code: &str, message: String) -> ClientError {
+    ClientError::Api {
+        status: None,
+        code: Some(code.to_string()),
+        message,
+        retry_after: None,
     }
 }
 
@@ -855,6 +1137,26 @@ mod tests {
         parse_sse(event_type, data, state).unwrap()
     }
 
+    fn input_json_deltas(events: &[Event]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::BlockDelta(BlockDelta {
+                    delta: DeltaContent::InputJson(delta),
+                    ..
+                }) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn api_error_code(error: ClientError) -> Option<String> {
+        match error {
+            ClientError::Api { code, .. } => code,
+            other => panic!("expected ClientError::Api, got {other:?}"),
+        }
+    }
+
     #[test]
     fn created_emits_status_started() {
         let (events, _) = run("response.created", r#"{"response":{}}"#);
@@ -981,6 +1283,19 @@ mod tests {
         if let Event::BlockDelta(d) = &ev[0] {
             assert!(matches!(&d.delta, DeltaContent::InputJson(j) if j == "{\"x\":"));
         }
+        let ev = with(
+            &mut state,
+            "response.function_call_arguments.delta",
+            r#"{"output_index":1,"item_id":"fc1","delta":"1}"}"#,
+        );
+        assert_eq!(ev.len(), 1);
+        assert!(matches!(
+            &ev[0],
+            Event::BlockDelta(BlockDelta {
+                delta: DeltaContent::InputJson(j),
+                ..
+            }) if j == "1}"
+        ));
         // output_item.done → BlockStop
         let ev = with(
             &mut state,
@@ -1010,6 +1325,155 @@ mod tests {
         } else {
             panic!("expected delta");
         }
+    }
+
+    #[test]
+    fn function_call_done_payload_emits_missing_final_input_before_stop() {
+        let mut state = OpenAIResponsesState::default();
+        with(
+            &mut state,
+            "response.output_item.added",
+            r#"{"output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"lookup"}}"#,
+        );
+
+        let events = with(
+            &mut state,
+            "response.output_item.done",
+            r#"{"output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"city\":\"Tokyo\"}"}}"#,
+        );
+
+        assert_eq!(input_json_deltas(&events), vec![r#"{"city":"Tokyo"}"#]);
+        assert!(matches!(events.last(), Some(Event::BlockStop(_))));
+    }
+
+    #[test]
+    fn function_call_arguments_done_accepts_exact_stream_without_duplication() {
+        let mut state = OpenAIResponsesState::default();
+        with(
+            &mut state,
+            "response.output_item.added",
+            r#"{"output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"lookup"}}"#,
+        );
+        let delta = with(
+            &mut state,
+            "response.function_call_arguments.delta",
+            r#"{"output_index":0,"delta":"{\"city\":\"Tokyo\"}"}"#,
+        );
+        assert_eq!(input_json_deltas(&delta), vec![r#"{"city":"Tokyo"}"#]);
+
+        let done = with(
+            &mut state,
+            "response.function_call_arguments.done",
+            r#"{"output_index":0,"arguments":"{\"city\":\"Tokyo\"}"}"#,
+        );
+        assert!(done.is_empty());
+        let output_done = with(
+            &mut state,
+            "response.output_item.done",
+            r#"{"output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"city\":\"Tokyo\"}"}}"#,
+        );
+        assert!(input_json_deltas(&output_done).is_empty());
+        assert!(matches!(output_done.as_slice(), [Event::BlockStop(_)]));
+    }
+
+    #[test]
+    fn function_call_arguments_done_rejects_stream_mismatch() {
+        let mut state = OpenAIResponsesState::default();
+        with(
+            &mut state,
+            "response.output_item.added",
+            r#"{"output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"lookup"}}"#,
+        );
+        with(
+            &mut state,
+            "response.function_call_arguments.delta",
+            r#"{"output_index":0,"delta":"{\"city\":\"Kyoto\"}"}"#,
+        );
+
+        let error = parse_sse(
+            "response.function_call_arguments.done",
+            r#"{"output_index":0,"arguments":"{\"city\":\"Tokyo\"}"}"#,
+            &mut state,
+        )
+        .unwrap_err();
+        assert_eq!(
+            api_error_code(error).as_deref(),
+            Some("tool_input_delta_mismatch")
+        );
+    }
+
+    #[test]
+    fn custom_tool_input_done_event_emits_missing_final_input_once() {
+        let mut state = OpenAIResponsesState::default();
+        with(
+            &mut state,
+            "response.output_item.added",
+            r#"{"output_index":0,"item":{"type":"custom_tool_call","call_id":"call_1","name":"shell"}}"#,
+        );
+
+        let done = with(
+            &mut state,
+            "response.custom_tool_call_input.done",
+            r#"{"output_index":0,"input":"echo ready"}"#,
+        );
+        assert_eq!(input_json_deltas(&done), vec!["echo ready"]);
+        let output_done = with(
+            &mut state,
+            "response.output_item.done",
+            r#"{"output_index":0,"item":{"type":"custom_tool_call","call_id":"call_1","name":"shell","input":"echo ready"}}"#,
+        );
+        assert!(input_json_deltas(&output_done).is_empty());
+        assert!(matches!(output_done.as_slice(), [Event::BlockStop(_)]));
+    }
+
+    #[test]
+    fn custom_tool_done_payload_accepts_exact_stream_without_duplication() {
+        let mut state = OpenAIResponsesState::default();
+        with(
+            &mut state,
+            "response.output_item.added",
+            r#"{"output_index":0,"item":{"type":"custom_tool_call","call_id":"call_1","name":"shell"}}"#,
+        );
+        let delta = with(
+            &mut state,
+            "response.custom_tool_call_input.delta",
+            r#"{"output_index":0,"delta":"echo ready"}"#,
+        );
+        assert_eq!(input_json_deltas(&delta), vec!["echo ready"]);
+
+        let output_done = with(
+            &mut state,
+            "response.output_item.done",
+            r#"{"output_index":0,"item":{"type":"custom_tool_call","call_id":"call_1","name":"shell","input":"echo ready"}}"#,
+        );
+        assert!(input_json_deltas(&output_done).is_empty());
+        assert!(matches!(output_done.as_slice(), [Event::BlockStop(_)]));
+    }
+
+    #[test]
+    fn custom_tool_done_payload_rejects_stream_mismatch() {
+        let mut state = OpenAIResponsesState::default();
+        with(
+            &mut state,
+            "response.output_item.added",
+            r#"{"output_index":0,"item":{"type":"custom_tool_call","call_id":"call_1","name":"shell"}}"#,
+        );
+        with(
+            &mut state,
+            "response.custom_tool_call_input.delta",
+            r#"{"output_index":0,"delta":"echo stale"}"#,
+        );
+
+        let error = parse_sse(
+            "response.output_item.done",
+            r#"{"output_index":0,"item":{"type":"custom_tool_call","call_id":"call_1","name":"shell","input":"echo ready"}}"#,
+            &mut state,
+        )
+        .unwrap_err();
+        assert_eq!(
+            api_error_code(error).as_deref(),
+            Some("tool_input_delta_mismatch")
+        );
     }
 
     #[test]

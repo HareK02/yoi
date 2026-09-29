@@ -26,6 +26,17 @@ pub const MAX_EXTERNAL_RESULT_ITEMS: usize = 10_000;
 const MAX_EXTERNAL_GREP_CONTEXT: usize = 100;
 const MAX_EXTERNAL_SCOPE_RULES: usize = 64;
 pub const MAX_EXTERNAL_WRITE_BYTES: usize = 512 * 1024;
+pub const MAX_EXTERNAL_COMMAND_BYTES: usize = 64 * 1024;
+pub const MAX_EXTERNAL_COMMAND_OUTPUT_BYTES: usize = 512 * 1024;
+pub const MAX_EXTERNAL_COMMAND_TIMEOUT_SECS: u64 = 600;
+const MAX_EXTERNAL_COMMAND_CURSOR: usize = 1_000_000;
+
+fn valid_command_handle(handle: &crate::CommandHandle) -> bool {
+    !handle.0.is_empty()
+        && handle.0.len() <= MAX_PROTOCOL_ID_BYTES
+        && handle.0.trim() == handle.0
+        && !handle.0.chars().any(char::is_control)
+}
 
 /// Fail-closed wire version for the External Workdir provider protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -123,10 +134,9 @@ fn is_root_relative(path: &WorkdirPath) -> bool {
         })
 }
 
-/// Validate the filesystem-only subset shared by read-only and read-write
-/// External Workdirs. Capability enforcement remains a separate grant/session
-/// boundary; command operations never enter the provider protocol.
-fn validate_filesystem_operation(operation: &WorkdirSessionOperation) -> Result<(), String> {
+/// Validate the bounded operation subset available to External Workdirs.
+/// Capability enforcement remains a separate grant/session boundary.
+fn validate_external_operation(operation: &WorkdirSessionOperation) -> Result<(), String> {
     let path_is_valid = match operation {
         WorkdirSessionOperation::AuthorizeScope(request) => {
             is_root_relative(&request.path)
@@ -182,17 +192,34 @@ fn validate_filesystem_operation(operation: &WorkdirSessionOperation) -> Result<
                     .checked_add(request.new_string.len())
                     .is_some_and(|size| size <= MAX_EXTERNAL_WRITE_BYTES)
         }
-        WorkdirSessionOperation::CommandStart(_)
-        | WorkdirSessionOperation::CommandStatus(_)
-        | WorkdirSessionOperation::CommandOutput(_)
-        | WorkdirSessionOperation::CommandCancel(_) => {
-            return Err("command operations are not available to an External Workdir".to_string());
+        WorkdirSessionOperation::CommandStart(request) => {
+            !request.command.is_empty()
+                && request.command.len() <= MAX_EXTERNAL_COMMAND_BYTES
+                && (1..=MAX_EXTERNAL_COMMAND_TIMEOUT_SECS).contains(&request.timeout_secs)
+                && (1..=MAX_EXTERNAL_COMMAND_OUTPUT_BYTES).contains(&request.output_limit)
+                && is_root_relative(&request.cwd)
+                && request.spill_dir.is_none()
+                && request.tool_call_id.as_ref().is_none_or(|tool_call_id| {
+                    !tool_call_id.is_empty()
+                        && tool_call_id.len() <= MAX_PROTOCOL_ID_BYTES
+                        && !tool_call_id.chars().any(char::is_control)
+                })
+        }
+        WorkdirSessionOperation::CommandStatus(handle)
+        | WorkdirSessionOperation::CommandCancel(handle) => valid_command_handle(handle),
+        WorkdirSessionOperation::CommandOutput(request) => {
+            valid_command_handle(&request.handle)
+                && request.cursor <= MAX_EXTERNAL_COMMAND_CURSOR
+                && (1..=MAX_EXTERNAL_COMMAND_OUTPUT_BYTES).contains(&request.limit)
         }
     };
     if path_is_valid {
         Ok(())
     } else {
-        Err("External Workdir operation paths must be root-relative".to_string())
+        Err(
+            "External Workdir operation exceeds protocol bounds or uses an invalid path"
+                .to_string(),
+        )
     }
 }
 
@@ -215,7 +242,7 @@ impl TryFrom<WorkdirSessionOperation> for ExternalWorkdirOperation {
     type Error = String;
 
     fn try_from(operation: WorkdirSessionOperation) -> Result<Self, Self::Error> {
-        validate_filesystem_operation(&operation)?;
+        validate_external_operation(&operation)?;
         Ok(Self(operation))
     }
 }
@@ -239,7 +266,7 @@ fn result_paths_fit<'a>(paths: impl IntoIterator<Item = &'a WorkdirPath>) -> boo
         .is_some_and(|retained| retained <= fs_operation::MAX_RESULT_PATH_BYTES)
 }
 
-fn validate_filesystem_result(result: &WorkdirSessionOperationResult) -> Result<(), String> {
+fn validate_external_result(result: &WorkdirSessionOperationResult) -> Result<(), String> {
     let result_is_valid = match result {
         WorkdirSessionOperationResult::AuthorizeScope
         | WorkdirSessionOperationResult::ScopeRulesOverlap { .. } => true,
@@ -273,14 +300,16 @@ fn validate_filesystem_result(result: &WorkdirSessionOperationResult) -> Result<
             result.bytes_written <= MAX_EXTERNAL_WRITE_BYTES
                 && result.replacements <= MAX_EXTERNAL_RESULT_ITEMS
         }
-        WorkdirSessionOperationResult::CommandStart(_)
-        | WorkdirSessionOperationResult::CommandStatus(_)
-        | WorkdirSessionOperationResult::CommandOutput(_)
-        | WorkdirSessionOperationResult::CommandCancel => {
-            return Err(
-                "command operation results are not available to an External Workdir".to_string(),
-            );
+        WorkdirSessionOperationResult::CommandStart(handle) => valid_command_handle(handle),
+        WorkdirSessionOperationResult::CommandStatus(_) => true,
+        WorkdirSessionOperationResult::CommandOutput(output) => {
+            output.content.len() <= MAX_EXTERNAL_COMMAND_OUTPUT_BYTES
+                && output
+                    .next_cursor
+                    .is_none_or(|cursor| cursor <= MAX_EXTERNAL_COMMAND_CURSOR)
+                && output.output_path.is_none()
         }
+        WorkdirSessionOperationResult::CommandCancel => true,
     };
     if result_is_valid {
         Ok(())
@@ -308,7 +337,7 @@ impl TryFrom<WorkdirSessionOperationResult> for ExternalWorkdirOperationResult {
     type Error = String;
 
     fn try_from(result: WorkdirSessionOperationResult) -> Result<Self, Self::Error> {
-        validate_filesystem_result(&result)?;
+        validate_external_result(&result)?;
         Ok(Self(result))
     }
 }
@@ -324,13 +353,34 @@ impl<'de> Deserialize<'de> for ExternalWorkdirOperationResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalWorkdirOperationError {
+    code: crate::http::WorkdirTransportErrorCode,
+}
+
+impl ExternalWorkdirOperationError {
+    /// Collapse provider failures to a closed error code. Provider-authored
+    /// diagnostics never cross the External Workdir trust boundary.
+    pub fn from_transport_error(error: WorkdirTransportError) -> Self {
+        Self { code: error.code }
+    }
+
+    pub fn into_transport_error(self) -> WorkdirTransportError {
+        WorkdirTransportError {
+            code: self.code,
+            message: format!("External Workdir provider reported {}", self.code.as_str()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExternalWorkdirOperationOutcome {
     Completed {
         result: ExternalWorkdirOperationResult,
     },
     Failed {
-        error: WorkdirTransportError,
+        error: ExternalWorkdirOperationError,
     },
     Cancelled,
 }
@@ -529,6 +579,39 @@ mod tests {
     }
 
     #[test]
+    fn provider_failures_are_closed_and_drop_provider_authored_diagnostics() {
+        let error = ExternalWorkdirOperationError::from_transport_error(WorkdirTransportError {
+            code: crate::http::WorkdirTransportErrorCode::Internal,
+            message: "/home/operator/private provider-secret\ncontrol".to_string(),
+        });
+        let frame = ExternalWorkdirProviderFrame::current(
+            ExternalWorkdirProviderMessage::OperationResult {
+                generation: 1,
+                operation_id: ExternalWorkdirOperationId::new("operation-failed").unwrap(),
+                outcome: ExternalWorkdirOperationOutcome::Failed {
+                    error: error.clone(),
+                },
+            },
+        );
+        let value = serde_json::to_value(&frame).unwrap();
+        assert_no_provider_authority(&value);
+        assert!(value.to_string().len() < 512);
+        assert_eq!(
+            error.into_transport_error().message,
+            "External Workdir provider reported internal"
+        );
+
+        let provider_message = serde_json::to_string(&frame).unwrap().replace(
+            r#""code":"internal""#,
+            r#""code":"internal","message":"provider-secret""#,
+        );
+        assert!(
+            serde_json::from_str::<ExternalWorkdirProviderFrame>(&provider_message).is_err(),
+            "provider-authored diagnostics must not be accepted"
+        );
+    }
+
+    #[test]
     fn unsupported_protocol_versions_and_invalid_read_limits_fail_closed() {
         let future = r#"{
             "version": 2,
@@ -544,7 +627,7 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_protocol_rejects_host_paths_and_commands_but_allows_bounded_mutations() {
+    fn protocol_rejects_host_paths_and_unbounded_commands_but_allows_bounded_operations() {
         let absolute = WorkdirSessionOperation::Read(ReadRequest {
             path: WorkdirPath::new_scoped("/home/operator/private/session.log").unwrap(),
             offset: 0,
@@ -562,6 +645,29 @@ mod tests {
             tool_call_id: None,
         });
         assert!(ExternalWorkdirOperation::try_from(command).is_err());
+
+        let command = WorkdirSessionOperation::CommandStart(CommandRequest {
+            command: "printf bounded".to_string(),
+            timeout_secs: 30,
+            output_limit: 12 * 1024,
+            cwd: WorkdirPath::root(),
+            spill_dir: None,
+            tool_call_id: Some("tool-call-1".to_string()),
+        });
+        assert!(ExternalWorkdirOperation::try_from(command).is_ok());
+        assert!(
+            ExternalWorkdirOperation::try_from(WorkdirSessionOperation::CommandStart(
+                CommandRequest {
+                    command: "x".repeat(MAX_EXTERNAL_COMMAND_BYTES + 1),
+                    timeout_secs: 30,
+                    output_limit: 12 * 1024,
+                    cwd: WorkdirPath::root(),
+                    spill_dir: None,
+                    tool_call_id: None,
+                }
+            ))
+            .is_err()
+        );
 
         assert!(
             ExternalWorkdirOperation::try_from(WorkdirSessionOperation::Write(WriteRequest {
@@ -587,6 +693,35 @@ mod tests {
                 content: vec![0; MAX_EXTERNAL_WRITE_BYTES + 1],
                 expected_hash: None,
             }))
+            .is_err()
+        );
+
+        assert!(
+            ExternalWorkdirOperationResult::try_from(WorkdirSessionOperationResult::CommandOutput(
+                crate::CommandOutput {
+                    status: crate::CommandStatus::Completed,
+                    exit_code: Some(0),
+                    timed_out: false,
+                    content: "bounded".to_string(),
+                    next_cursor: None,
+                    truncated: false,
+                    output_path: None,
+                }
+            ))
+            .is_ok()
+        );
+        assert!(
+            ExternalWorkdirOperationResult::try_from(WorkdirSessionOperationResult::CommandOutput(
+                crate::CommandOutput {
+                    status: crate::CommandStatus::Completed,
+                    exit_code: Some(0),
+                    timed_out: false,
+                    content: "bounded".to_string(),
+                    next_cursor: None,
+                    truncated: true,
+                    output_path: Some("/provider/private/output".into()),
+                }
+            ))
             .is_err()
         );
     }

@@ -96,6 +96,48 @@ Deno.test("Worker summary parser enforces observation freshness", () => {
   assertEquals(observedStopped.state, "stopped");
 });
 
+Deno.test("Worker summary parser preserves attachment-effective External permissions", () => {
+  const attachment = {
+    alias: "sessions",
+    effective_permissions: { read: false, write: false, command: true },
+    working_directory: {
+      working_directory_id: "external-1",
+      display_name: "Sessions",
+      source: {
+        kind: "external_grant",
+        grant_id: "grant-1",
+        grant_permissions: { read: true, write: false, command: true },
+      },
+      materializer_kind: "client_hosted_external",
+      status: "active",
+    },
+  };
+  const parsed = parseWorkerSummary({
+    ...worker,
+    resource_key: "W-1",
+    availability: "observed",
+    workdir_attachments: [attachment],
+  });
+  assertEquals(
+    parsed.workdir_attachments?.[0]?.effective_permissions,
+    attachment.effective_permissions,
+  );
+  assertThrows(
+    () =>
+      parseWorkerSummary({
+        ...worker,
+        resource_key: "W-1",
+        availability: "observed",
+        workdir_attachments: [{
+          alias: attachment.alias,
+          working_directory: attachment.working_directory,
+        }],
+      }),
+    Error,
+    "effective_permissions",
+  );
+});
+
 Deno.test("Worker launch options parser accepts the generated wire shape", () => {
   const parsed = parseWorkerLaunchOptionsResponse({
     workspace_id: "workspace-a",
