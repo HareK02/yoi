@@ -1688,6 +1688,7 @@ mod tests {
         );
 
         connection.observe_worker_event(&Event::UserMessage {
+            entry_id: None,
             segments: vec![Segment::text("inspect"), Segment::UploadedFile { file }],
         });
         assert!(connection.pending_attachments.is_empty());
@@ -1776,7 +1777,10 @@ mod tests {
             assert!(!reconcile_attachment_submission(
                 &mut pending,
                 &mut awaiting,
-                &Event::UserMessage { segments },
+                &Event::UserMessage {
+                    entry_id: None,
+                    segments,
+                },
             ));
             assert_eq!(awaiting, expected);
             assert!(pending.is_empty());

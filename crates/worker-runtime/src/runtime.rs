@@ -16,7 +16,8 @@ use crate::execution::{
     WorkerExecutionBackend, WorkerExecutionBackendRef, WorkerExecutionHandle,
     WorkerExecutionOperation, WorkerExecutionResult, WorkerExecutionSpawnRequest,
     WorkerExecutionSpawnResult, WorkerExecutionStopRequest, WorkerLifecycleOperationId,
-    WorkerSessionObservationRequest, WorkspaceConfigFetchRequest, WorkspaceConfigFetchResult,
+    WorkerSessionHistoryRequest, WorkerSessionObservationRequest, WorkspaceConfigFetchRequest,
+    WorkspaceConfigFetchResult,
 };
 #[cfg(feature = "fs-store")]
 use crate::fs_store::{
@@ -1609,6 +1610,38 @@ impl Runtime {
             None => runtime_api::WorkerSessionAvailability::Unavailable {
                 reason: runtime_api::WorkerSessionUnavailableReason::StorageUnavailable,
                 message: "retained session storage is unavailable".to_string(),
+            },
+        })
+    }
+
+    /// Read one bounded page from the adopted durable Session lineage without
+    /// restoring the Worker or modifying model context.
+    pub fn worker_session_history_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        worker_ref: &WorkerRef,
+        cursor: Option<String>,
+        limit: Option<usize>,
+    ) -> Result<runtime_api::WorkerSessionHistoryAvailability, RuntimeError> {
+        let operation_lock = self.worker_operation_lock(worker_ref.worker_id)?;
+        let _operation_guard = operation_lock
+            .lock()
+            .map_err(|_| RuntimeError::StatePoisoned)?;
+        self.ensure_worker_in_workspace(scope, worker_ref)?;
+        let backend = {
+            let state = self.lock()?;
+            state.worker(worker_ref)?;
+            state.execution_backend.clone()
+        };
+        Ok(match backend {
+            Some(backend) => backend.worker_session_history(WorkerSessionHistoryRequest {
+                worker_ref: worker_ref.clone(),
+                cursor,
+                limit,
+            }),
+            None => runtime_api::WorkerSessionHistoryAvailability::Unavailable {
+                reason: runtime_api::WorkerSessionHistoryUnavailableReason::Unsupported,
+                message: "session history paging is not supported by this Runtime".to_string(),
             },
         })
     }

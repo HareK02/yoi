@@ -389,6 +389,20 @@ pub struct WorkspaceWorkerSessionResponse {
     pub observation: runtime_api::WorkerSessionAvailability,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceWorkerSessionHistoryQuery {
+    pub cursor: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceWorkerSessionHistoryResponse {
+    pub subject: WorkspaceWorkerSubject,
+    #[serde(flatten)]
+    pub observation: runtime_api::WorkerSessionHistoryAvailability,
+}
+
 #[api(reqwest, axum, openapi)]
 pub trait ServerApi {
     #[get("/health", status = 200, error_status = 400)]
@@ -1140,6 +1154,20 @@ pub trait ServerApi {
         #[path] runtime_id: String,
         #[path] worker_id: String,
     ) -> Result<WorkspaceWorkerSessionResponse, ServerApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/session/history",
+        status = 200,
+        error_status = 400,
+        openapi = false
+    )]
+    async fn worker_session_history(
+        &self,
+        #[path] workspace_id: String,
+        #[path] runtime_id: String,
+        #[path] worker_id: String,
+        #[query] query: WorkspaceWorkerSessionHistoryQuery,
+    ) -> Result<WorkspaceWorkerSessionHistoryResponse, ServerApiError>;
 
     #[get(
         "/api/workers",
@@ -11506,7 +11534,7 @@ mod openapi_artifact_tests {
         ];
         // Session observation retains its existing explicit non-OpenAPI boundary independently of
         // the Runtime/Worker-source signed operation inventory above.
-        const OTHER_OPENAPI_EXCLUDED: &[&str] = &["worker_session"];
+        const OTHER_OPENAPI_EXCLUDED: &[&str] = &["worker_session", "worker_session_history"];
         const DOCUMENTED_SIGNED_INTERNAL: &[&str] = &["workspace_runtime_config"];
         const BROWSER_ONLY: &[&str] = &["merge_request_selector_repair"];
 

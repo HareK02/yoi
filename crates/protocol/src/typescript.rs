@@ -11,12 +11,13 @@ use crate::{
     InternalWorkerRef, InternalWorkerSnapshot, InvokeKind, MemoryWorkerEvent, Method,
     PasteArtifactAvailability, PasteArtifactMediaType, PasteArtifactRef, PendingSubmissionSummary,
     PendingSubmissionsSnapshot, Permission, RewindSummary, RewindTarget, RewindTargetId, RunResult,
-    ScopeRule, Segment, SessionContentPart, SessionEntryProvenance, SessionMessageRole,
-    SessionSnapshot, SessionSnapshotEntry, SessionSnapshotEntryData, SessionToolAttachment,
-    SubmissionDisposition, SymlinkPolicy, ToolResultDisposition, TurnResult,
-    UploadedFileAvailability, UploadedFileRef, WorkerBusyState, WorkerCommandAcknowledgement,
-    WorkerCommandDisposition, WorkerCommandEnvelope, WorkerCommandKind, WorkerEvent,
-    WorkerMaintenanceState, WorkerRunState, WorkerState, WorkerStateSnapshot, WorkerStatus,
+    ScopeRule, Segment, SessionContentPart, SessionConversationTurn, SessionEntryProvenance,
+    SessionHistoryPage, SessionMessageRole, SessionSnapshot, SessionSnapshotEntry,
+    SessionSnapshotEntryData, SessionToolAttachment, SubmissionDisposition, SymlinkPolicy,
+    ToolResultDisposition, TurnResult, UploadedFileAvailability, UploadedFileRef, WorkerBusyState,
+    WorkerCommandAcknowledgement, WorkerCommandDisposition, WorkerCommandEnvelope,
+    WorkerCommandKind, WorkerEvent, WorkerMaintenanceState, WorkerRunState, WorkerState,
+    WorkerStateSnapshot, WorkerStatus,
     subscription::{
         EventSubscriptionSelector, MAX_CORRELATION_ID_BYTES, MAX_REJECTION_MESSAGE_BYTES,
         MAX_RESOURCE_ID_BYTES, MAX_SUBSCRIPTION_COLLECTION_ITEMS,
@@ -104,6 +105,8 @@ pub fn generated_protocol_types() -> String {
     push_decl::<SessionToolAttachment>(&cfg, &mut output);
     push_decl::<SessionSnapshotEntryData>(&cfg, &mut output);
     push_decl::<SessionSnapshotEntry>(&cfg, &mut output);
+    push_decl::<SessionConversationTurn>(&cfg, &mut output);
+    push_decl::<SessionHistoryPage>(&cfg, &mut output);
     push_decl::<PendingSubmissionSummary>(&cfg, &mut output);
     push_decl::<PendingSubmissionsSnapshot>(&cfg, &mut output);
     push_decl::<SubmissionDisposition>(&cfg, &mut output);

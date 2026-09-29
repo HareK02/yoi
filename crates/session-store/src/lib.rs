@@ -37,23 +37,31 @@ use std::path::Path;
 /// Read an existing retained file without updating its access timestamp.
 /// Observation fails closed when the platform cannot provide that guarantee.
 pub(crate) fn read_without_atime(path: &Path) -> io::Result<Vec<u8>> {
+    read_without_atime_bounded(path, u64::MAX)
+}
+
+/// Read at most `max_bytes + 1` retained bytes without updating access time.
+/// The extra byte lets callers prove that the authoritative file exceeded a
+/// limit without first racing a separate metadata length observation.
+pub(crate) fn read_without_atime_bounded(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         use std::fs::OpenOptions;
         use std::io::Read;
         use std::os::unix::fs::OpenOptionsExt;
 
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOATIME)
             .open(path)?;
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
+        file.take(max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)?;
         Ok(bytes)
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
-        let _ = path;
+        let _ = (path, max_bytes);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "read-only retained observation requires no-atime file reads",
@@ -88,8 +96,12 @@ pub use history::{
 pub use logged_item::{LoggedContentPart, LoggedItem, LoggedRole, from_logged, to_logged};
 pub use paste_artifact::PasteArtifactLimits;
 pub use public_snapshot::{
-    DEFAULT_RETAINED_SNAPSHOT_MAX_BYTES, RetainedSessionIdentity, RetainedSessionSnapshot,
-    RetainedSnapshotReadError, project_session_snapshot, read_retained_session_snapshot,
+    DEFAULT_RETAINED_HISTORY_MAX_ENTRIES, DEFAULT_RETAINED_HISTORY_MAX_RESPONSE_BYTES,
+    DEFAULT_RETAINED_HISTORY_MAX_SCAN_BYTES, DEFAULT_RETAINED_HISTORY_MAX_SEGMENTS,
+    DEFAULT_RETAINED_HISTORY_PAGE_TURNS, DEFAULT_RETAINED_SNAPSHOT_MAX_BYTES,
+    MAX_RETAINED_HISTORY_PAGE_TURNS, RetainedHistoryReadError, RetainedHistoryReadLimits,
+    RetainedSessionIdentity, RetainedSessionSnapshot, RetainedSnapshotReadError,
+    project_session_snapshot, read_retained_session_history_page, read_retained_session_snapshot,
 };
 pub use segment::{
     SegmentStartState, append_entry, append_system_item, classify_logged_history_entry,

@@ -106,6 +106,52 @@ function sessionWithUserMessage(content: string): SessionSnapshot {
   };
 }
 
+function emptyHistoryPage() {
+  return {
+    availability: "page",
+    page: {
+      session_id: "session-a",
+      lineage_id: "lineage-a",
+      turns: [],
+      next_cursor: null,
+      has_more: false,
+    },
+  };
+}
+
+function historyPage(indices: number[], cursor: string | null) {
+  return {
+    availability: "page",
+    page: {
+      session_id: "session-a",
+      lineage_id: "lineage-a",
+      turns: indices.map((index) => ({
+        turn_id: `user-${index}`,
+        entries: [
+          {
+            entry_id: `user-${index}`,
+            timestamp: index,
+            provenance: "human_input",
+            kind: "message",
+            role: "user",
+            content: [{ kind: "text", text: `question ${index}` }],
+          },
+          {
+            entry_id: `assistant-${index}`,
+            timestamp: index,
+            provenance: "model_output",
+            kind: "message",
+            role: "assistant",
+            content: [{ kind: "text", text: `done ${index}` }],
+          },
+        ],
+      })),
+      next_cursor: cursor,
+      has_more: cursor !== null,
+    },
+  };
+}
+
 function snapshotEvent(session = emptySession()): ProtocolEvent {
   return {
     event: "snapshot",
@@ -256,12 +302,21 @@ test("applies retained empty and nonempty snapshots before showing their read-on
 });
 
 test("shows bounded initial failures and retries explicitly", async () => {
-  const fetchMock = vi.fn()
-    .mockResolvedValueOnce(new Response(null, { status: 503 }))
-    .mockResolvedValueOnce(Response.json({
-      availability: "retained_snapshot",
-      snapshot: emptySession(),
-    }));
+  let sessionRequests = 0;
+  const fetchMock = vi.fn((input: RequestInfo | URL) => {
+    if (String(input).includes("/session/history")) {
+      return Promise.resolve(Response.json(emptyHistoryPage()));
+    }
+    sessionRequests += 1;
+    return Promise.resolve(
+      sessionRequests === 1
+        ? new Response(null, { status: 503 })
+        : Response.json({
+          availability: "retained_snapshot",
+          snapshot: emptySession(),
+        }),
+    );
+  });
   vi.stubGlobal("fetch", fetchMock);
   render(ConsolePage, { data: pageData() });
 
@@ -271,7 +326,7 @@ test("shows bounded initial failures and retries explicitly", async () => {
   await fireEvent.click(screen.getByRole("button", { name: "Retry" }));
 
   expect(await screen.findByText("No conversation to display")).not.toBeNull();
-  expect(fetchMock).toHaveBeenCalledTimes(2);
+  expect(sessionRequests).toBe(2);
 });
 
 test("distinguishes typed unavailability and an initial live connection closure", async () => {
@@ -327,6 +382,9 @@ test("route changes clear prior content and fence stale Session responses", asyn
   const current = deferred<Response>();
   let firstWorkerLoads = 0;
   const fetchMock = vi.fn((input: RequestInfo | URL) => {
+    if (String(input).includes("/session/history")) {
+      return Promise.resolve(Response.json(emptyHistoryPage()));
+    }
     if (String(input).includes("worker-b")) {
       return current.promise.then((value) => value.clone());
     }
@@ -369,4 +427,186 @@ test("route changes clear prior content and fence stale Session responses", asyn
   expect(screen.queryByText("stale worker error")).toBeNull();
   expect(screen.queryByText("previous worker content")).toBeNull();
   expect(screen.getByText("current worker content")).not.toBeNull();
+});
+
+test("loads retained conversation turns five at a time into the log and turn bar", async () => {
+  const historyPages = [
+    {
+      availability: "page",
+      page: {
+        session_id: "session-a",
+        lineage_id: "lineage-a",
+        turns: [8, 9, 10, 11, 12].map((index) => ({
+          turn_id: `user-${index}`,
+          entries: [
+            {
+              entry_id: `user-${index}`,
+              timestamp: index,
+              provenance: "human_input",
+              kind: "message",
+              role: "user",
+              content: [{ kind: "text", text: `question ${index}` }],
+            },
+            {
+              entry_id: `assistant-${index}`,
+              timestamp: index,
+              provenance: "model_output",
+              kind: "message",
+              role: "assistant",
+              content: [{ kind: "text", text: `done ${index}` }],
+            },
+          ],
+        })),
+        next_cursor: "older-8",
+        has_more: true,
+      },
+    },
+    {
+      availability: "page",
+      page: {
+        session_id: "session-a",
+        lineage_id: "lineage-a",
+        turns: [3, 4, 5, 6, 7].map((index) => ({
+          turn_id: `user-${index}`,
+          entries: [{
+            entry_id: `user-${index}`,
+            timestamp: index,
+            provenance: "human_input",
+            kind: "message",
+            role: "user",
+            content: [{ kind: "text", text: `question ${index}` }],
+          }],
+        })),
+        next_cursor: "older-3",
+        has_more: true,
+      },
+    },
+    historyPage([1, 2], null),
+  ];
+  let historyRequests = 0;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL) => {
+      if (String(input).includes("/session/history")) {
+        return Promise.resolve(Response.json(historyPages[historyRequests++]));
+      }
+      return Promise.resolve(Response.json({ availability: "live_protocol" }));
+    }),
+  );
+
+  render(ConsolePage, { data: pageData() });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
+  latestListener().onFrame(subscribedFrame());
+
+  await waitFor(() =>
+    expect(screen.getAllByText("question 8")).toHaveLength(2)
+  );
+  expect(screen.getAllByText("done 12")).toHaveLength(2);
+  const transcriptScroller = screen.getByLabelText("main transcript")
+    .parentElement as HTMLElement;
+  transcriptScroller.scrollTop = 0;
+  await fireEvent.scroll(transcriptScroller);
+  await waitFor(() =>
+    expect(screen.getAllByText("question 3")).toHaveLength(2)
+  );
+  expect(historyRequests).toBe(2);
+
+  const navigation = screen.getByLabelText("Conversation turns");
+  const navigationList = navigation.firstElementChild as HTMLElement;
+  navigationList.scrollTop = 0;
+  await fireEvent.scroll(navigationList);
+  await fireEvent.scroll(navigationList);
+  transcriptScroller.scrollTop = 0;
+  await fireEvent.scroll(transcriptScroller);
+  await settleMicrotasks();
+  expect(historyRequests).toBe(2);
+
+  await fireEvent.click(
+    screen.getByRole("button", {
+      name: "Earlier conversation available · load 5 turns",
+    }),
+  );
+  await waitFor(() =>
+    expect(screen.getAllByText("question 1")).toHaveLength(2)
+  );
+  expect(screen.getAllByText("Start of conversation")).toHaveLength(2);
+  expect(historyRequests).toBe(3);
+
+  const scrollIntoView = vi.fn();
+  vi.spyOn(HTMLElement.prototype, "scrollIntoView").mockImplementation(
+    scrollIntoView,
+  );
+  await fireEvent.click(
+    screen.getByRole("button", {
+      name: "Jump to conversation: question 8",
+    }),
+  );
+  expect(scrollIntoView).toHaveBeenCalledOnce();
+});
+
+test("keeps live content when history fails and retries the bounded page explicitly", async () => {
+  let historyRequests = 0;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL) => {
+      if (String(input).includes("/session/history")) {
+        historyRequests += 1;
+        return Promise.resolve(
+          historyRequests === 1
+            ? new Response(null, { status: 503 })
+            : Response.json(historyPage([1, 2, 3, 4], null)),
+        );
+      }
+      return Promise.resolve(Response.json({ availability: "live_protocol" }));
+    }),
+  );
+
+  render(ConsolePage, { data: pageData() });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
+  latestListener().onFrame(
+    subscribedFrame(sessionWithUserMessage("current response remains")),
+  );
+
+  expect(await screen.findByText("current response remains")).not.toBeNull();
+  await fireEvent.click(
+    await screen.findByRole("button", {
+      name: "Earlier conversation unavailable · retry",
+    }),
+  );
+  await waitFor(() =>
+    expect(screen.getAllByText("question 1")).toHaveLength(2)
+  );
+  expect(historyRequests).toBe(2);
+  expect(screen.getByText("current response remains")).not.toBeNull();
+  expect(screen.getAllByText("Start of conversation")).toHaveLength(2);
+});
+
+test("fences delayed history pages when the selected Worker route changes", async () => {
+  const stale = deferred<Response>();
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.includes("/session/history")) {
+        return path.includes("worker-b")
+          ? Promise.resolve(Response.json(historyPage([21], null)))
+          : stale.promise;
+      }
+      return Promise.resolve(Response.json({
+        availability: "retained_snapshot",
+        snapshot: emptySession(),
+      }));
+    }),
+  );
+
+  const view = render(ConsolePage, { data: pageData() });
+  await view.rerender({ data: pageData("worker-b", "runtime-b") });
+  await waitFor(() =>
+    expect(screen.getAllByText("question 21")).toHaveLength(2)
+  );
+
+  stale.resolve(Response.json(historyPage([99], null)));
+  await settleMicrotasks();
+  expect(screen.queryByText("question 99")).toBeNull();
+  expect(screen.getAllByText("question 21")).toHaveLength(2);
 });

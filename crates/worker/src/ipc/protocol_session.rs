@@ -34,7 +34,41 @@ pub fn live_log_entry_event(entry: LogEntry) -> Option<Event> {
                 session_store::public_snapshot::project_current_session_snapshot(&[entry]);
             Some(Event::SegmentRotated { session })
         }
-        LogEntry::AnnotatedUserInput { segments, .. } => Some(Event::UserMessage { segments }),
+        LogEntry::AnnotatedUserInput {
+            ts,
+            segments,
+            history,
+            extensions,
+        } => {
+            let projected = session_store::public_snapshot::project_current_session_snapshot(&[
+                LogEntry::AnnotatedUserInput {
+                    ts,
+                    segments: segments.clone(),
+                    history,
+                    extensions,
+                },
+            ]);
+            let entry_id = projected
+                .entries
+                .iter()
+                .find(|entry| {
+                    matches!(
+                        entry.data,
+                        protocol::SessionSnapshotEntryData::UserInput { .. }
+                    )
+                })
+                .map(|entry| entry.entry_id.clone());
+            Some(Event::UserMessage { entry_id, segments })
+        }
+        entry
+        @ (LogEntry::AnnotatedAssistantItem { .. } | LogEntry::AnnotatedToolResult { .. }) => {
+            let mut projected =
+                session_store::public_snapshot::project_current_session_snapshot(&[entry]);
+            projected
+                .entries
+                .pop()
+                .map(|entry| Event::SessionEntryCommitted { entry })
+        }
         LogEntry::AnnotatedSystemItem { entry, .. } => {
             let value = serde_json::to_value(&entry.item).expect("SystemItem is Serialize");
             Some(Event::SystemItem { item: value })
@@ -94,7 +128,9 @@ mod tests {
         .expect("UserInput must be live-relevant");
 
         match event {
-            Event::UserMessage { segments: echoed } => assert_eq!(echoed, segments),
+            Event::UserMessage {
+                segments: echoed, ..
+            } => assert_eq!(echoed, segments),
             other => panic!("expected UserMessage, got {other:?}"),
         }
     }

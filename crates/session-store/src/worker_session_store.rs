@@ -111,6 +111,19 @@ impl WorkerSessionStore {
         session_id: SessionId,
         segment_id: SegmentId,
     ) -> Result<Vec<LogEntry>, StoreError> {
+        self.read_all_read_only_bounded(session_id, segment_id, u64::MAX)
+            .map(|(entries, _)| entries)
+    }
+
+    /// Read one retained Segment under an actual byte bound without touching
+    /// access time. The file descriptor read, rather than a preceding stat, is
+    /// the limit authority so concurrent appends cannot evade accounting.
+    pub fn read_all_read_only_bounded(
+        &self,
+        session_id: SessionId,
+        segment_id: SegmentId,
+        max_bytes: u64,
+    ) -> Result<(Vec<LogEntry>, u64), StoreError> {
         let retained_session_id = self.session_id.lock().map_err(|_| StoreError::Corrupt {
             line: 0,
             message: "Worker Session identity lock poisoned".to_string(),
@@ -123,14 +136,18 @@ impl WorkerSessionStore {
             });
         }
         let path = self.log_path(segment_id);
-        let bytes = crate::read_without_atime(&path).map_err(|error| {
+        let bytes = crate::read_without_atime_bounded(&path, max_bytes).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 StoreError::NotFound(segment_id)
             } else {
                 StoreError::Io(error)
             }
         })?;
-        parse_jsonl(&bytes)
+        let byte_len = bytes.len() as u64;
+        if byte_len > max_bytes {
+            return Err(StoreError::ReadLimitExceeded);
+        }
+        Ok((parse_jsonl(&bytes)?, byte_len))
     }
 
     pub fn segment_log_len(&self, segment_id: SegmentId) -> Result<u64, StoreError> {

@@ -33,6 +33,9 @@ pub enum StoreError {
     #[error("log corrupted at line {line}: {message}")]
     Corrupt { line: usize, message: String },
 
+    #[error("retained observation read limit exceeded")]
+    ReadLimitExceeded,
+
     #[error("paste artifact storage is unavailable")]
     PasteArtifactUnsupported,
 

@@ -4584,6 +4584,9 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::skill_get(service.clone()))
         .merge(server_api::server_api_axum::skill_activate(service.clone()))
         .merge(server_api::server_api_axum::worker_session(service.clone()))
+        .merge(server_api::server_api_axum::worker_session_history(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::repository_list(
             service.clone(),
         ))
@@ -6240,6 +6243,50 @@ impl server_api::ServerApi for ServerApiContractService {
                 )
             })?;
         Ok(server_api::WorkspaceWorkerSessionResponse {
+            subject: server_api::WorkspaceWorkerSubject::RuntimeWorker {
+                runtime_id,
+                worker_id,
+            },
+            observation,
+        })
+    }
+
+    async fn worker_session_history(
+        &self,
+        workspace_id: String,
+        runtime_id: String,
+        worker_id: String,
+        query: server_api::WorkspaceWorkerSessionHistoryQuery,
+    ) -> std::result::Result<
+        server_api::WorkspaceWorkerSessionHistoryResponse,
+        server_api::ServerApiError,
+    > {
+        let api = self.workspace_api().map_err(|_| {
+            runtime_api::RuntimeApiError::new(
+                StatusCode::NOT_FOUND.as_u16(),
+                "workspace_not_found",
+                "Workspace was not found",
+            )
+        })?;
+        if workspace_id != api.config.workspace_id {
+            return Err(runtime_api::RuntimeApiError::new(
+                StatusCode::NOT_FOUND.as_u16(),
+                "workspace_not_found",
+                "Workspace was not found",
+            ));
+        }
+        let worker = RuntimeWorkerRef::new(runtime_id.clone(), worker_id.clone());
+        let observation = api
+            .runtime
+            .worker_session_history(&workspace_id, &worker, query.cursor, query.limit)
+            .map_err(|_error| {
+                runtime_api::RuntimeApiError::new(
+                    StatusCode::BAD_GATEWAY.as_u16(),
+                    "worker_session_history_failed",
+                    "Worker Session history request failed",
+                )
+            })?;
+        Ok(server_api::WorkspaceWorkerSessionHistoryResponse {
             subject: server_api::WorkspaceWorkerSubject::RuntimeWorker {
                 runtime_id,
                 worker_id,

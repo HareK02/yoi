@@ -92,14 +92,11 @@ impl SegmentLogSink {
     ///   - `LogEntry::AnnotatedSegmentStart` → `Event::SegmentRotated` on the wire.
     ///   - `LogEntry::AnnotatedUserInput`    → `Event::UserMessage`.
     ///   - `LogEntry::AnnotatedSystemItem`   → `Event::SystemItem`.
+    ///   - assistant/tool commits            → `Event::SessionEntryCommitted`.
     ///   - `LogEntry::Invoke`       → `Event::InvokeStart`.
-    /// Everything else (AssistantItem, ToolResult, TurnEnd,
-    /// RunCompleted, RunErrored, PausedTurnAbandoned, LlmUsage, Extension,
-    /// ConfigChanged) is reflected in the mirror so reconnect snapshots stay accurate,
-    /// but is not sent live — the streaming events (TextDelta /
-    /// ToolCallStart / ToolResult / TurnEnd / etc.) already provide
-    /// that data, and re-broadcasting it as a typed entry would just
-    /// double-render every block on the client side.
+    /// Operational checkpoints remain mirror-only. Assistant/tool streaming
+    /// events are still the in-flight authority; the committed-entry event adds
+    /// the durable stable identity needed to reconcile retained history.
     pub fn publish(&self, entry: LogEntry) {
         let mut mirror = self
             .inner
@@ -122,6 +119,8 @@ impl SegmentLogSink {
             entry,
             LogEntry::AnnotatedSegmentStart { .. }
                 | LogEntry::AnnotatedUserInput { .. }
+                | LogEntry::AnnotatedAssistantItem { .. }
+                | LogEntry::AnnotatedToolResult { .. }
                 | LogEntry::AnnotatedSystemItem { .. }
                 | LogEntry::Invoke { .. }
         )

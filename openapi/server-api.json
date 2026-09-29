@@ -14020,7 +14020,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:7b06d005d3436758c96fc4cfd462df76460f89620fd1b58fdf05009d96bb9052"
+    "x-yoi-source-digest": "sha256:49856606e4a16d138cc04a62a6096fd40fff213587b1cbf7f0594f28994a45b0"
   },
   "openapi": "3.1.0",
   "paths": {

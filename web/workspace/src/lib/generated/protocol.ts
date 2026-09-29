@@ -149,6 +149,14 @@ entry_id: string,
  */
 timestamp: number, provenance: SessionEntryProvenance, derived_from?: Array<string>, } & ({ "kind": "user_input", segments: Array<Segment>, } | { "kind": "message", role: SessionMessageRole, content: Array<SessionContentPart>, } | { "kind": "tool_call", call_id: string, name: string, arguments: string, } | { "kind": "tool_result", call_id: string, summary: string, content?: string | null, is_error: boolean, attachments?: Array<SessionToolAttachment>, } | { "kind": "system_item", item_kind: string, content: string, data?: unknown, } | { "kind": "run_error", message: string, });
 
+export type SessionConversationTurn = { turn_id: string, entries: Array<SessionSnapshotEntry>, };
+
+export type SessionHistoryPage = { session_id: string,
+/**
+ * Stable identity of the adopted active lineage used to fence stale pages.
+ */
+lineage_id: string, turns: Array<SessionConversationTurn>, next_cursor?: string | null, has_more: boolean, };
+
 export type PendingSubmissionSummary = { submission_id: string, accepted_at_ms: number, segment_count: number, byte_len: number, };
 
 export type PendingSubmissionsSnapshot = { revision: number, notification_count: number, head_id: string | null, submissions: Array<PendingSubmissionSummary>, };
@@ -296,7 +304,11 @@ export type SubscriptionFrame = { protocol_version: number, } & ({ "frame": "req
 
 export type Method = { "method": "submit", "params": { submission_request_id: string, input: Array<Segment>, } } | { "method": "notify", "params": { notification_request_id: string, message: string, } } | { "method": "worker_event", "params": WorkerEvent } | { "method": "list_pending_submissions" } | { "method": "cancel_pending_submission", "params": { submission_id: string, expected_revision: number, } } | { "method": "clear_pending_submissions", "params": { expected_revision: number, } } | { "method": "continue_pending", "params": { expected_revision: number, expected_head_id: string, } } | { "method": "resume", "params": { command: WorkerCommandEnvelope, } } | { "method": "cancel", "params": { command: WorkerCommandEnvelope, } } | { "method": "pause", "params": { command: WorkerCommandEnvelope, } } | { "method": "compact", "params": { command: WorkerCommandEnvelope, } } | { "method": "list_rewind_targets" } | { "method": "rewind_to", "params": { target: RewindTargetId, expected_head_entries: number, } } | { "method": "shutdown", "params": { command: WorkerCommandEnvelope, } } | { "method": "list_completions", "params": { kind: CompletionKind, prefix: string, } } | { "method": "list_workers" } | { "method": "restore_worker", "params": { name: string, } } | { "method": "register_peer", "params": { name: string, } };
 
-export type Event = { "event": "submission_accepted", "data": { submission_request_id: string, submission_id: string, disposition: SubmissionDisposition, } } | { "event": "submission_rejected", "data": { submission_request_id: string, message: string, } } | { "event": "pending_submissions_changed", "data": { pending: PendingSubmissionsSnapshot, } } | { "event": "user_message", "data": { segments: Array<Segment>, } } | { "event": "system_item", "data": { item: unknown, } } | { "event": "invoke_start", "data": { kind: InvokeKind, } } | { "event": "turn_start", "data": { turn: number, } } | { "event": "turn_end", "data": { turn: number, result: TurnResult, } } | { "event": "llm_call_start", "data": { llm_call: number, } } | { "event": "llm_call_end", "data": { llm_call: number, } } | { "event": "llm_retry", "data": { llm_call: number,
+export type Event = { "event": "submission_accepted", "data": { submission_request_id: string, submission_id: string, disposition: SubmissionDisposition, } } | { "event": "submission_rejected", "data": { submission_request_id: string, message: string, } } | { "event": "pending_submissions_changed", "data": { pending: PendingSubmissionsSnapshot, } } | { "event": "user_message", "data": {
+/**
+ * Stable durable history identity. Older mixed-version producers omit it.
+ */
+entry_id?: string | null, segments: Array<Segment>, } } | { "event": "session_entry_committed", "data": { entry: SessionSnapshotEntry, } } | { "event": "system_item", "data": { item: unknown, } } | { "event": "invoke_start", "data": { kind: InvokeKind, } } | { "event": "turn_start", "data": { turn: number, } } | { "event": "turn_end", "data": { turn: number, result: TurnResult, } } | { "event": "llm_call_start", "data": { llm_call: number, } } | { "event": "llm_call_end", "data": { llm_call: number, } } | { "event": "llm_retry", "data": { llm_call: number,
 /**
  * The attempt that just failed. 1 origin.
  */

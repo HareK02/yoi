@@ -2970,3 +2970,113 @@ Deno.test("new invoke resets stats before the next RunEnd", () => {
 
   assertEquals(projection.lines.at(-1)?.body, "0s ・0 reqs ↑0/↓0");
 });
+
+Deno.test("committed assistant identity reconciles the live block without text matching", () => {
+  const lines = projectConsole([
+    {
+      eventId: "user-live",
+      event: {
+        event: "user_message",
+        data: {
+          entry_id: "user-entry",
+          segments: [{ kind: "text", content: "question" }],
+        },
+      },
+    },
+    {
+      eventId: "assistant-live",
+      event: { event: "text_done", data: { text: "final answer" } },
+    },
+    {
+      eventId: "assistant-commit",
+      event: {
+        event: "session_entry_committed",
+        data: {
+          entry: {
+            entry_id: "assistant-entry",
+            timestamp: 7,
+            provenance: "model_output",
+            kind: "message",
+            role: "assistant",
+            content: [{ kind: "text", text: "final answer" }],
+          },
+        },
+      },
+    },
+  ]).lines;
+  assertEquals(lines.filter((line) => line.kind === "assistant").length, 1);
+  assertEquals(
+    lines.find((line) => line.kind === "assistant")?.entryId,
+    "assistant-entry",
+  );
+  assertEquals(
+    lines.find((line) => line.kind === "user")?.entryId,
+    "user-entry",
+  );
+});
+
+Deno.test("committed tool identities reconcile one live call block", () => {
+  const lines = projectConsole([
+    {
+      eventId: "tool-live",
+      event: {
+        event: "tool_call_done",
+        data: { id: "call-1", name: "Read", arguments: '{"file_path":"a"}' },
+      },
+    },
+    {
+      eventId: "tool-call-commit",
+      event: {
+        event: "session_entry_committed",
+        data: {
+          entry: {
+            entry_id: "tool-call-entry",
+            timestamp: 8,
+            provenance: "model_output",
+            kind: "tool_call",
+            call_id: "call-1",
+            name: "Read",
+            arguments: '{"file_path":"a"}',
+          },
+        },
+      },
+    },
+    {
+      eventId: "tool-result-live",
+      event: {
+        event: "tool_result",
+        data: {
+          id: "call-1",
+          summary: "read",
+          output: "contents",
+          is_error: false,
+        },
+      },
+    },
+    {
+      eventId: "tool-result-commit",
+      event: {
+        event: "session_entry_committed",
+        data: {
+          entry: {
+            entry_id: "tool-result-entry",
+            timestamp: 9,
+            provenance: "tool_output",
+            kind: "tool_result",
+            call_id: "call-1",
+            summary: "read",
+            content: "contents",
+            is_error: false,
+          },
+        },
+      },
+    },
+  ]).lines;
+
+  assertEquals(
+    lines.filter((line) => line.toolCall?.id === "call-1").length,
+    1,
+  );
+  assertEquals(lines[0].entryId, "tool-result-entry");
+  assertEquals(lines[0].toolCall?.state, "done");
+});

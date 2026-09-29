@@ -619,8 +619,8 @@ mod tests {
         let (committed_tx, committed_rx) = mpsc::channel();
         let commit_thread = thread::spawn(move || {
             // This mirrors Worker::append_entry ordering: clear in-flight first,
-            // then publish the finalized AssistantItem. AssistantItem entries
-            // are mirror-only and are not delivered as live entry events.
+            // then publish the finalized AssistantItem. Identity-aware clients
+            // reconcile this durable commit with the preceding streamed block.
             in_flight_for_commit.clear_for_committed_item_then(&assistant_item, || {
                 sink_for_commit.publish(assistant_entry);
             });
@@ -639,7 +639,10 @@ mod tests {
             in_flight_snapshot.blocks.as_slice(),
             [InFlightBlock::Text { text, finished: true }] if text == "done"
         ));
-        assert!(entry_rx.try_recv().is_err());
+        assert!(matches!(
+            entry_rx.try_recv(),
+            Ok(LogEntry::AnnotatedAssistantItem { .. })
+        ));
         let post_commit_guard = in_flight.snapshot_guard();
         assert!(snapshot_from_guard(&post_commit_guard).is_empty());
     }

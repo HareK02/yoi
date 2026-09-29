@@ -720,7 +720,7 @@ Deno.test("Worker Console renders Edit diffs without preformatted template gaps"
   );
 });
 
-Deno.test("Worker Console exposes a foldable timeline beside the scroll body", async () => {
+Deno.test("Worker Console exposes paged conversation navigation beside the scroll body", async () => {
   const consolePage = await Deno.readTextFile(
     new URL(
       "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
@@ -730,28 +730,24 @@ Deno.test("Worker Console exposes a foldable timeline beside the scroll body", a
   const consoleLine = await Deno.readTextFile(
     new URL("./ConsoleLineItem.svelte", import.meta.url),
   );
-  const consoleTimeline = await Deno.readTextFile(
-    new URL("./ConsoleTimeline.svelte", import.meta.url),
+  const turnNavigation = await Deno.readTextFile(
+    new URL("./ConsoleTurnNavigation.svelte", import.meta.url),
   );
   assert(
-    consoleTimeline.includes('class="console-timeline"') &&
-      consolePage.includes("timelineMarks") &&
-      consolePage.includes("jumpToTimelineMark") &&
+    turnNavigation.includes('class="turn-navigation"') &&
+      turnNavigation.includes('class="turn-list"') &&
+      turnNavigation.includes("data-turn-id={item.turnId}") &&
+      turnNavigation.includes('class="user-preview"') &&
+      turnNavigation.includes('class="assistant-preview"') &&
+      turnNavigation.includes("onTopEdgeChange(target.scrollTop <= 1)") &&
+      consolePage.includes("<ConsoleTurnNavigation") &&
+      consolePage.includes("items={turnNavigationItems}") &&
+      consolePage.includes("onTopEdgeChange={handleHistoryTopEdge}") &&
+      consolePage.includes("onTurnClick={jumpToConversationTurn}") &&
+      consolePage.includes('class="conversation-history-boundary"') &&
       consoleLine.includes("data-console-line-id={item.id}") &&
-      consolePage.includes("class:timeline-open={timelineOpen}") &&
-      consolePage.includes('class="timeline-fold"') &&
-      consolePage.includes("expanded={timelineOpen}") &&
-      !consolePage.includes("{#if timelineOpen}") &&
-      consolePage.includes("handleTimelineRailPointerDown") &&
-      consolePage.includes("projectTimelineAxisPosition") &&
-      consolePage.includes("scrollbar-width: none") &&
-      consoleTimeline.includes("onpointerdown={onRailPointerDown}") &&
-      consoleTimeline.includes("expanded ? 'expanded' : 'folded'") &&
-      consoleTimeline.includes(".timeline-mark.expanded .timeline-card") &&
-      !consoleTimeline.includes("{#if expanded}") &&
-      consoleTimeline.includes(".timeline-thumb") &&
-      consoleTimeline.includes(".timeline-card"),
-    "Worker Console should expose a foldable timeline with scroll and line jump markers",
+      !consolePage.includes("<ConsoleTimeline"),
+    "Worker Console should expose bounded turn navigation with shared paging and transcript jump targets",
   );
 });
 

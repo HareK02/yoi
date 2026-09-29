@@ -117,7 +117,7 @@ async fn in_process_host_runs_text_and_read_tool_then_shuts_down() {
                 .expect("protocol event")
                 .expect("worker event")
             {
-                Event::UserMessage { segments }
+                Event::UserMessage { segments, .. }
                     if format!("{segments:?}").contains("read the probe") =>
                 {
                     saw_user_message = true;
