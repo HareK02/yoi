@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agen::interceptor::{
-    Interceptor, InterceptorError, InterceptorErrorCategory, InterceptorPhase, InterceptorResult,
-    PostToolAction, PreToolAction, ToolCallInfo, ToolResultInfo,
+    AssistantTurnEndContext, Interceptor, InterceptorError, InterceptorErrorCategory,
+    InterceptorPhase, InterceptorResult, PostToolAction, PreToolAction, ToolCallInfo,
+    ToolResultInfo, TurnEndAction,
 };
 use agen::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use agen::llm_client::{
@@ -308,6 +309,46 @@ impl LlmClient for ControlledStreamClient {
 }
 
 #[derive(Clone)]
+struct BoundedStreamClient {
+    receiver: Arc<Mutex<Option<tokio::sync::mpsc::Receiver<Result<Event, ClientError>>>>>,
+}
+
+impl BoundedStreamClient {
+    fn new(capacity: usize) -> (Self, tokio::sync::mpsc::Sender<Result<Event, ClientError>>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+        (
+            Self {
+                receiver: Arc::new(Mutex::new(Some(rx))),
+            },
+            tx,
+        )
+    }
+}
+
+#[async_trait]
+impl LlmClient for BoundedStreamClient {
+    async fn stream(&self, _request: Request) -> Result<ResponseStream, ClientError> {
+        let mut rx = self
+            .receiver
+            .lock()
+            .unwrap()
+            .take()
+            .expect("bounded stream is consumed once");
+        Ok(Box::pin(futures::stream::poll_fn(move |cx| {
+            rx.poll_recv(cx)
+        })))
+    }
+
+    fn clone_boxed(&self) -> Box<dyn LlmClient> {
+        Box::new(self.clone())
+    }
+
+    fn tool_call_completion_support(&self) -> ToolCallCompletionSupport {
+        ToolCallCompletionSupport::PerBlock
+    }
+}
+
+#[derive(Clone)]
 struct BarrierTool {
     name: &'static str,
     starts: Arc<AtomicUsize>,
@@ -401,6 +442,141 @@ async fn default_dispatch_waits_for_response_completion() {
 }
 
 #[tokio::test]
+async fn turn_end_policy_incompatibility_visibly_falls_back_before_side_effects() {
+    struct TurnEndPause;
+
+    #[async_trait]
+    impl Interceptor for TurnEndPause {
+        async fn on_assistant_turn_end(
+            &self,
+            _context: AssistantTurnEndContext<'_>,
+        ) -> InterceptorResult<TurnEndAction> {
+            Ok(TurnEndAction::Pause)
+        }
+    }
+
+    let (client, tx) = ControlledStreamClient::new(ToolCallCompletionSupport::PerBlock);
+    let tool = BarrierTool::new("turn_end_fallback");
+    let probe = tool.clone();
+    let mut engine = Engine::new(client);
+    engine.set_tool_call_dispatch_mode(ToolCallDispatchMode::OnToolCallComplete);
+    engine.set_interceptor(TurnEndPause);
+    engine.register_tool(tool.definition());
+    let (warning_tx, mut warning_rx) = tokio::sync::mpsc::unbounded_channel();
+    engine.on_warning(move |warning| {
+        let _ = warning_tx.send(warning.to_string());
+    });
+    let (ping_tx, mut ping_rx) = tokio::sync::mpsc::unbounded_channel();
+    engine.on_stream_event(move |_, _, event| {
+        if matches!(event, Event::Ping(_)) {
+            let _ = ping_tx.send(());
+        }
+    });
+
+    let run = tokio::spawn(async move {
+        let mut history = History::new();
+        let output = engine.run(&mut history, "run").await;
+        (output, history)
+    });
+    tx.send(Ok(Event::tool_use_start(
+        0,
+        "call_turn_end_fallback",
+        "turn_end_fallback",
+    )))
+    .unwrap();
+    tx.send(Ok(Event::tool_input_delta(0, r#"{}"#))).unwrap();
+    tx.send(Ok(Event::tool_use_stop(0))).unwrap();
+    tx.send(Ok(Event::ping())).unwrap();
+    ping_rx.recv().await.unwrap();
+    assert_eq!(probe.starts.load(Ordering::SeqCst), 0);
+    assert!(
+        warning_rx
+            .recv()
+            .await
+            .is_some_and(|warning| warning.contains("whole-response turn-end gate"))
+    );
+
+    tx.send(Ok(Event::Status(StatusEvent {
+        status: ResponseStatus::Completed,
+    })))
+    .unwrap();
+    drop(tx);
+    let (output, _history) = run.await.unwrap();
+    assert!(matches!(output.result, EngineRunExit::Paused));
+    assert_eq!(probe.starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn blocking_pre_tool_policy_keeps_receiving_stream_and_services_pause() {
+    struct BlockingEarlyPolicy {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Interceptor for BlockingEarlyPolicy {
+        fn supports_early_tool_dispatch(&self) -> bool {
+            true
+        }
+
+        async fn pre_tool_call(
+            &self,
+            _info: &mut ToolCallInfo<'_>,
+        ) -> InterceptorResult<PreToolAction> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(PreToolAction::Continue)
+        }
+    }
+
+    let (client, tx) = BoundedStreamClient::new(1);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let tool = SlowTool::new("blocked_policy_tool", 0);
+    let probe = tool.clone();
+    let mut engine = Engine::new(client);
+    engine.set_tool_call_dispatch_mode(ToolCallDispatchMode::OnToolCallComplete);
+    engine.set_interceptor(BlockingEarlyPolicy {
+        entered: entered.clone(),
+        release,
+    });
+    engine.register_tool(tool.definition());
+    let pause = engine.pause_sender();
+    let run = tokio::spawn(async move {
+        let mut history = History::new();
+        let output = engine.run(&mut history, "run").await;
+        (output, history)
+    });
+
+    tx.send(Ok(Event::tool_use_start(
+        0,
+        "call_blocked_policy",
+        "blocked_policy_tool",
+    )))
+    .await
+    .unwrap();
+    tx.send(Ok(Event::tool_input_delta(0, r#"{}"#)))
+        .await
+        .unwrap();
+    tx.send(Ok(Event::tool_use_stop(0))).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .expect("pre-tool policy entered");
+
+    tx.send(Ok(Event::ping())).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), tx.send(Ok(Event::ping())))
+        .await
+        .expect("background pump continues draining the bounded provider stream")
+        .unwrap();
+    pause.send(()).await.unwrap();
+    drop(tx);
+
+    let (output, _history) = run.await.unwrap();
+    assert!(matches!(output.result, EngineRunExit::Paused));
+    assert_eq!(probe.call_count(), 0);
+}
+
+#[tokio::test]
 async fn per_block_dispatch_starts_siblings_without_waiting_for_stream_or_prior_result() {
     let (client, tx) = ControlledStreamClient::new(ToolCallCompletionSupport::PerBlock);
     let first = BarrierTool::new("barrier_a");
@@ -455,6 +631,146 @@ async fn per_block_dispatch_starts_siblings_without_waiting_for_stream_or_prior_
         .filter(|entry| matches!(entry.item, Item::ToolResult { .. }))
         .count();
     assert_eq!((calls, results), (2, 2));
+}
+
+#[tokio::test]
+async fn early_terminal_result_commits_while_response_stream_is_open() {
+    let (client, tx) = ControlledStreamClient::new(ToolCallCompletionSupport::PerBlock);
+    let tool = BarrierTool::new("commit_while_streaming");
+    let probe = tool.clone();
+    let mut engine = Engine::new(client);
+    engine.set_max_turns(Some(1));
+    engine.set_tool_call_dispatch_mode(ToolCallDispatchMode::OnToolCallComplete);
+    engine.register_tool(tool.definition());
+    let (committed_tx, mut committed_rx) = tokio::sync::mpsc::unbounded_channel();
+    engine.on_history_append(move |item| {
+        if matches!(item, Item::ToolResult { call_id, .. } if call_id == "call_commit_open") {
+            let _ = committed_tx.send(());
+        }
+        Ok(())
+    });
+
+    let run = tokio::spawn(async move {
+        let mut history = History::new();
+        let output = engine.run(&mut history, "run").await;
+        (output, history)
+    });
+    tx.send(Ok(Event::tool_use_start(
+        0,
+        "call_commit_open",
+        "commit_while_streaming",
+    )))
+    .unwrap();
+    tx.send(Ok(Event::tool_input_delta(0, r#"{}"#))).unwrap();
+    tx.send(Ok(Event::tool_use_stop(0))).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), probe.started.notified())
+        .await
+        .expect("tool starts while response remains open");
+    probe.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), committed_rx.recv())
+        .await
+        .expect("terminal result is durably committed before response release")
+        .expect("commit notification channel remains open");
+
+    tx.send(Ok(Event::Status(StatusEvent {
+        status: ResponseStatus::Completed,
+    })))
+    .unwrap();
+    drop(tx);
+    let _ = run.await.unwrap();
+}
+
+#[tokio::test]
+async fn reverse_stop_order_preserves_model_call_indexes() {
+    let (client, tx) = ControlledStreamClient::new(ToolCallCompletionSupport::PerBlock);
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = Engine::new(client);
+    engine.set_max_turns(Some(1));
+    engine.set_tool_call_dispatch_mode(ToolCallDispatchMode::OnToolCallComplete);
+    engine.register_tool(ContextRecordingTool::new("ordered_a", contexts.clone()).definition());
+    engine.register_tool(ContextRecordingTool::new("ordered_b", contexts.clone()).definition());
+
+    let run = tokio::spawn(async move {
+        let mut history = History::new();
+        let output = engine.run(&mut history, "run").await;
+        (output, history)
+    });
+    tx.send(Ok(Event::tool_use_start(0, "call_order_a", "ordered_a")))
+        .unwrap();
+    tx.send(Ok(Event::tool_use_start(1, "call_order_b", "ordered_b")))
+        .unwrap();
+    tx.send(Ok(Event::tool_input_delta(1, r#"{}"#))).unwrap();
+    tx.send(Ok(Event::tool_use_stop(1))).unwrap();
+    tx.send(Ok(Event::tool_input_delta(0, r#"{}"#))).unwrap();
+    tx.send(Ok(Event::tool_use_stop(0))).unwrap();
+    tx.send(Ok(Event::Status(StatusEvent {
+        status: ResponseStatus::Completed,
+    })))
+    .unwrap();
+    drop(tx);
+    let _ = run.await.unwrap();
+
+    let by_id = contexts
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|context| (context.call_id.clone(), context.call_index))
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(by_id.get("call_order_a"), Some(&0));
+    assert_eq!(by_id.get("call_order_b"), Some(&1));
+}
+
+#[tokio::test]
+async fn reverse_stop_order_projects_next_provider_request_in_model_order() {
+    let first_response = vec![
+        Event::tool_use_start(0, "call_project_a", "project_a"),
+        Event::tool_use_start(1, "call_project_b", "project_b"),
+        Event::tool_input_delta(1, r#"{}"#),
+        Event::tool_use_stop(1),
+        Event::tool_input_delta(0, r#"{}"#),
+        Event::tool_use_stop(0),
+        Event::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        }),
+    ];
+    let second_response = vec![
+        Event::text_delta(0, "done"),
+        Event::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        }),
+    ];
+    let client = MockLlmClient::with_responses(vec![first_response, second_response])
+        .with_completion_support(ToolCallCompletionSupport::PerBlock);
+    let probe = client.clone();
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = Engine::new(client);
+    engine.set_tool_call_dispatch_mode(ToolCallDispatchMode::OnToolCallComplete);
+    engine.register_tool(ContextRecordingTool::new("project_a", contexts.clone()).definition());
+    engine.register_tool(ContextRecordingTool::new("project_b", contexts).definition());
+    let mut history = History::new();
+
+    let _ = engine.run(&mut history, "run").await;
+
+    let requests = probe.requests();
+    assert_eq!(requests.len(), 2);
+    let tool_order = requests[1]
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::ToolCall { call_id, .. } => Some(format!("call:{call_id}")),
+            Item::ToolResult { call_id, .. } => Some(format!("result:{call_id}")),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        tool_order,
+        [
+            "call:call_project_a",
+            "call:call_project_b",
+            "result:call_project_a",
+            "result:call_project_b",
+        ]
+    );
 }
 
 #[tokio::test]
@@ -522,6 +838,108 @@ async fn later_history_failure_terminalizes_already_started_early_sibling() {
             disposition: ToolResultDisposition::OutcomeUnknown,
             ..
         } if call_id == "call_history_first"
+    )));
+}
+
+#[tokio::test]
+async fn persisted_started_call_is_closed_unknown_and_never_resumed() {
+    let (client, tx) = ControlledStreamClient::new(ToolCallCompletionSupport::PerBlock);
+    let tool = SlowTool::new("must_not_resume_started", 0);
+    let probe = tool.clone();
+    let mut engine = Engine::new(client);
+    engine.set_max_turns(Some(1));
+    engine.register_tool(tool.definition());
+    let mut history = History::from_items(vec![
+        Item::user_message("run"),
+        Item::tool_call_json(
+            "call_started_before_restore",
+            "must_not_resume_started",
+            serde_json::json!({}),
+        )
+        .with_tool_execution_metadata(
+            0,
+            Some("restored-batch:call_started_before_restore".to_string()),
+        )
+        .with_status(agen::llm_client::ItemStatus::InProgress),
+    ]);
+
+    let run = tokio::spawn(async move {
+        let output = engine.resume(&mut history).await;
+        (output, history)
+    });
+    tx.send(Ok(Event::Status(StatusEvent {
+        status: ResponseStatus::Completed,
+    })))
+    .unwrap();
+    drop(tx);
+    let (_output, history) = run.await.unwrap();
+
+    assert_eq!(probe.call_count(), 0);
+    assert!(history.iter().any(|entry| matches!(
+        &entry.item,
+        Item::ToolResult {
+            call_id,
+            disposition: ToolResultDisposition::OutcomeUnknown,
+            ..
+        } if call_id == "call_started_before_restore"
+    )));
+}
+
+#[tokio::test]
+async fn abort_during_early_admission_commits_synthetic_terminal() {
+    struct AbortAdmission;
+
+    #[async_trait]
+    impl Interceptor for AbortAdmission {
+        fn supports_early_tool_dispatch(&self) -> bool {
+            true
+        }
+
+        async fn pre_tool_call(
+            &self,
+            _info: &mut ToolCallInfo<'_>,
+        ) -> InterceptorResult<PreToolAction> {
+            Ok(PreToolAction::Abort("denied after completion".to_string()))
+        }
+    }
+
+    let (client, tx) = ControlledStreamClient::new(ToolCallCompletionSupport::PerBlock);
+    let tool = SlowTool::new("must_not_run_aborted", 0);
+    let probe = tool.clone();
+    let mut engine = Engine::new(client);
+    engine.set_tool_call_dispatch_mode(ToolCallDispatchMode::OnToolCallComplete);
+    engine.set_interceptor(AbortAdmission);
+    engine.register_tool(tool.definition());
+    let run = tokio::spawn(async move {
+        let mut history = History::new();
+        let output = engine.run(&mut history, "run").await;
+        (output, history)
+    });
+
+    tx.send(Ok(Event::tool_use_start(
+        0,
+        "call_aborted_admission",
+        "must_not_run_aborted",
+    )))
+    .unwrap();
+    tx.send(Ok(Event::tool_input_delta(0, r#"{}"#))).unwrap();
+    tx.send(Ok(Event::tool_use_stop(0))).unwrap();
+    drop(tx);
+    let (output, history) = run.await.unwrap();
+
+    assert!(matches!(
+        output.result,
+        EngineRunExit::Interrupted(RunInterruptionReason::Unexpected(EngineError::Aborted(ref reason)))
+            if reason == "denied after completion"
+    ));
+    assert_eq!(probe.call_count(), 0);
+    assert!(history.iter().any(|entry| matches!(
+        &entry.item,
+        Item::ToolResult {
+            call_id,
+            summary,
+            ..
+        } if call_id == "call_aborted_admission" && summary.contains("denied after completion")
     )));
 }
 

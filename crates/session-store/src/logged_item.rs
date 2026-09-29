@@ -7,13 +7,14 @@
 //! save / replay boundaries.
 //!
 //! Fields kept here are limited to what is needed to reconstruct a worker
-//! `Item` for replay. `id` and `status` annotations are intentionally dropped
-//! (they are output-side metadata; replayed items synthesize fresh `None`).
+//! `Item` for replay. `id` annotations are intentionally dropped because they
+//! are output-side metadata. ToolCall execution status/order are retained because
+//! they fence durable resume from replaying an already-started side effect.
 //! `Reasoning::encrypted_content` is preserved because OpenAI Responses ZDR
 //! requires it on stateless re-send.
 
 use agen::{
-    llm_client::types::{ContentPart, Item, Role},
+    llm_client::types::{ContentPart, Item, ItemStatus, Role},
     tool::{Attachment, ImageAttachment, ToolResultDisposition},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -53,6 +54,12 @@ pub enum LoggedItem {
         call_id: String,
         name: String,
         arguments: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_index: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<ItemStatus>,
     },
     ToolResult {
         call_id: String,
@@ -119,11 +126,17 @@ impl From<&Item> for LoggedItem {
                 call_id,
                 name,
                 arguments,
+                call_index,
+                execution_id,
+                status,
                 ..
             } => Self::ToolCall {
                 call_id: call_id.clone(),
                 name: name.clone(),
                 arguments: arguments.clone(),
+                call_index: *call_index,
+                execution_id: execution_id.clone(),
+                status: *status,
             },
             Item::ToolResult {
                 call_id,
@@ -176,12 +189,17 @@ impl From<LoggedItem> for Item {
                 call_id,
                 name,
                 arguments,
+                call_index,
+                execution_id,
+                status,
             } => Item::ToolCall {
                 id: None,
                 call_id,
                 name,
                 arguments,
-                status: None,
+                call_index,
+                execution_id,
+                status,
             },
             LoggedItem::ToolResult {
                 call_id,
@@ -327,7 +345,9 @@ mod tests {
 
     #[test]
     fn round_trip_tool_call() {
-        let original = Item::tool_call("call_42", "get_weather", r#"{"city":"Tokyo"}"#);
+        let original = Item::tool_call("call_42", "get_weather", r#"{"city":"Tokyo"}"#)
+            .with_tool_execution_metadata(3, Some("batch:call_42".to_string()))
+            .with_status(ItemStatus::InProgress);
         let logged: LoggedItem = (&original).into();
         let json = serde_json::to_string(&logged).unwrap();
         let parsed: LoggedItem = serde_json::from_str(&json).unwrap();
@@ -336,11 +356,17 @@ mod tests {
                 call_id,
                 name,
                 arguments,
+                call_index,
+                execution_id,
+                status,
                 ..
             } => {
                 assert_eq!(call_id, "call_42");
                 assert_eq!(name, "get_weather");
                 assert_eq!(arguments, r#"{"city":"Tokyo"}"#);
+                assert_eq!(call_index, Some(3));
+                assert_eq!(execution_id.as_deref(), Some("batch:call_42"));
+                assert_eq!(status, Some(ItemStatus::InProgress));
             }
             other => panic!("unexpected variant: {other:?}"),
         }

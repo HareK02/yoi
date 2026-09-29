@@ -17,8 +17,17 @@ pub struct CollectorState {
     /// 現在のツール呼び出し情報 (ブロック進行中)
     current_id: Option<String>,
     current_name: Option<String>,
+    /// Zero-based order among tool calls in this assistant response.
+    call_index: Option<usize>,
     /// 蓄積中のJSON入力
     input_json_buffer: String,
+}
+
+/// One provider-completed call together with its stable model order.
+#[derive(Debug, Clone)]
+pub(crate) struct CollectedToolCall {
+    pub call_index: usize,
+    pub call: ToolCall,
 }
 
 /// ToolCallCollector - ToolUseブロックハンドラ
@@ -28,7 +37,8 @@ pub struct CollectorState {
 #[derive(Clone)]
 pub struct ToolCallCollector {
     /// 収集されたToolCall
-    collected: Arc<Mutex<Vec<ToolCall>>>,
+    collected: Arc<Mutex<Vec<CollectedToolCall>>>,
+    next_call_index: Arc<Mutex<usize>>,
 }
 
 impl ToolCallCollector {
@@ -36,18 +46,38 @@ impl ToolCallCollector {
     pub fn new() -> Self {
         Self {
             collected: Arc::new(Mutex::new(Vec::new())),
+            next_call_index: Arc::new(Mutex::new(0)),
         }
     }
 
     /// 収集されたToolCallを取得してクリア
     pub fn take_collected(&self) -> Vec<ToolCall> {
+        self.take_collected_with_index()
+            .into_iter()
+            .map(|collected| collected.call)
+            .collect()
+    }
+
+    /// Drain completed calls while preserving their model-returned order.
+    pub(crate) fn take_collected_with_index(&self) -> Vec<CollectedToolCall> {
         let mut guard = self.collected.lock().unwrap();
         std::mem::take(&mut *guard)
     }
 
     /// 収集されたToolCallの参照を取得
     pub fn collected(&self) -> Vec<ToolCall> {
-        self.collected.lock().unwrap().clone()
+        self.collected
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|collected| collected.call.clone())
+            .collect()
+    }
+
+    /// Start one response-local tool-call ordering scope.
+    pub(crate) fn begin_response(&self) {
+        self.collected.lock().unwrap().clear();
+        *self.next_call_index.lock().unwrap() = 0;
     }
 
     /// 収集されたToolCallがあるかどうか
@@ -75,6 +105,11 @@ impl Handler<ToolUseBlockKind> for ToolCallCollector {
             ToolUseBlockEvent::Start(start) => {
                 scope.current_id = Some(start.id.clone());
                 scope.current_name = Some(start.name.clone());
+                if scope.call_index.is_none() {
+                    let mut next = self.next_call_index.lock().unwrap();
+                    scope.call_index = Some(*next);
+                    *next += 1;
+                }
                 scope.input_json_buffer.clear();
             }
             ToolUseBlockEvent::InputJsonDelta(delta) => {
@@ -98,8 +133,15 @@ impl Handler<ToolUseBlockKind> for ToolCallCollector {
                     };
 
                     let tool_call = ToolCall { id, name, input };
+                    let call_index = scope
+                        .call_index
+                        .take()
+                        .expect("tool-use stop follows a started collector scope");
 
-                    self.collected.lock().unwrap().push(tool_call);
+                    self.collected.lock().unwrap().push(CollectedToolCall {
+                        call_index,
+                        call: tool_call,
+                    });
                 }
                 scope.input_json_buffer.clear();
             }

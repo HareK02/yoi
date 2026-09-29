@@ -356,6 +356,7 @@ fn project_item(item: &LoggedItem) -> Option<SessionSnapshotEntryData> {
             call_id,
             name,
             arguments,
+            ..
         } => Some(SessionSnapshotEntryData::ToolCall {
             call_id: call_id.clone(),
             name: name.clone(),

@@ -104,7 +104,14 @@ pub enum Item {
         name: String,
         /// Tool arguments as JSON string
         arguments: String,
-        /// Item status
+        /// Provider/model order among tool calls in this assistant response.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_index: Option<usize>,
+        /// Durable identity of a tool execution attempt that has started.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution_id: Option<String>,
+        /// Item status. `InProgress` on a persisted ToolCall means provider
+        /// execution ownership was transferred and must never be inferred pending.
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<ItemStatus>,
     },
@@ -234,6 +241,8 @@ impl Item {
             call_id: call_id.into(),
             name: name.into(),
             arguments: arguments.into(),
+            call_index: None,
+            execution_id: None,
             status: None,
         }
     }
@@ -245,6 +254,25 @@ impl Item {
         arguments: serde_json::Value,
     ) -> Self {
         Self::tool_call(call_id, name, arguments.to_string())
+    }
+
+    /// Attach response-local ordering and, when execution has started, its
+    /// durable attempt identity to a tool call.
+    pub fn with_tool_execution_metadata(
+        mut self,
+        call_index: usize,
+        execution_id: Option<String>,
+    ) -> Self {
+        if let Self::ToolCall {
+            call_index: item_call_index,
+            execution_id: item_execution_id,
+            ..
+        } = &mut self
+        {
+            *item_call_index = Some(call_index);
+            *item_execution_id = execution_id;
+        }
+        self
     }
 
     /// Create a tool result item with summary only (no content).
