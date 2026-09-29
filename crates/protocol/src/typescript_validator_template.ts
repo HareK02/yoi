@@ -391,8 +391,7 @@ function validateWorker(worker: SubscriptionWorker): boolean {
     if (
       !validateIdentifier(attachment.alias, MAX_RESOURCE_ID_BYTES) ||
       !validateIdentifier(attachment.working_directory_id, MAX_RESOURCE_ID_BYTES) ||
-      attachment.repository_key == null ||
-      !validateRepositoryKey(attachment.repository_key) ||
+      (attachment.repository_key != null && !validateRepositoryKey(attachment.repository_key)) ||
       aliases.has(attachment.alias) ||
       workdirIds.has(attachment.working_directory_id)
     ) {

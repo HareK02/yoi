@@ -42,6 +42,37 @@ Deno.test('generated subscription validator accepts a current exact frame', () =
   assert(result.value.frame === 'response', 'expected response frame');
 });
 
+Deno.test('generated subscription validator accepts an external Workdir Worker', () => {
+  const result = decode(subscribedFrame({
+    snapshot: {
+      topic: 'workers',
+      data: {
+        workers: [
+          {
+            worker_id: 'worker-1',
+            runtime_id: 'runtime-1',
+            resource_key: 'worker-resource-1',
+            availability: 'observed',
+            subject_revision: 1,
+            state: 'idle',
+            has_running_internal_workers: false,
+            workspace_id: 'workspace-1',
+            display_name: 'Companion',
+            profile: 'companion',
+            workdir_attachments: [
+              {
+                alias: 'workspace',
+                working_directory_id: 'external-workdir-1',
+              },
+            ],
+          },
+        ],
+      },
+    },
+  }));
+  assert(result.ok, `external Workdir Worker was rejected: ${JSON.stringify(result)}`);
+});
+
 Deno.test('Rust-serialized compatibility fixtures satisfy the generated Browser contract', () => {
   for (const fixture of RUST_SERIALIZED_SUBSCRIPTION_FRAME_FIXTURES) {
     const result = decode(fixture);

@@ -214,6 +214,8 @@ fn rust_serialized_subscription_frame_fixtures() -> Vec<SubscriptionFrame> {
         SubscriptionId::new("fixture-subscription").expect("fixture subscription id must be valid");
     let worker_id =
         SubscriptionWorkerId::new("fixture-worker").expect("fixture worker id must be valid");
+    let external_workdir_id = SubscriptionWorkdirId::new("fixture-external-workdir")
+        .expect("fixture external Workdir id must be valid");
     let worker = SubscriptionWorker {
         worker_id: worker_id.clone(),
         runtime_id: Some("fixture-runtime".to_string()),
@@ -226,7 +228,12 @@ fn rust_serialized_subscription_frame_fixtures() -> Vec<SubscriptionFrame> {
         workspace_id: Some("fixture-workspace".to_string()),
         display_name: None,
         profile: None,
-        workdir_attachments: Vec::new(),
+        workdir_attachments: vec![SubscriptionWorkerWorkdirAttachment {
+            alias: "external".to_string(),
+            repository_id: None,
+            repository_key: None,
+            working_directory_id: external_workdir_id,
+        }],
     };
     let subscribed = SubscriptionFrame::new(SubscriptionFramePayload::Response(
         SubscriptionResponse::Subscribed {
