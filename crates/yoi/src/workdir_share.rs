@@ -37,6 +37,39 @@ pub(crate) struct WorkdirShareOptions {
 
 const PROVIDER_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 
+fn validate_provider_registration(message: Message, generation: u64) -> Result<(), String> {
+    let registered = match message {
+        Message::Text(text) => text,
+        Message::Close(Some(frame)) => {
+            let reason = frame.reason.trim();
+            return Err(if reason.is_empty() {
+                "Backend rejected the External Workdir provider registration".to_string()
+            } else {
+                format!("Backend rejected the External Workdir provider registration: {reason}")
+            });
+        }
+        Message::Close(None) => {
+            return Err("Backend rejected the External Workdir provider registration".to_string());
+        }
+        _ => {
+            return Err(
+                "Backend returned an invalid External Workdir registration frame".to_string(),
+            );
+        }
+    };
+    let frame = serde_json::from_str::<ExternalWorkdirServerFrame>(&registered)
+        .map_err(|error| format!("Backend returned an invalid External Workdir frame: {error}"))?;
+    if matches!(
+        frame.message,
+        ExternalWorkdirServerMessage::Registered { generation: registered_generation, .. }
+            if registered_generation == generation
+    ) {
+        Ok(())
+    } else {
+        Err("Backend rejected the External Workdir provider registration".to_string())
+    }
+}
+
 fn provider_operation_timeout(operation: &workdir::http::WorkdirSessionOperation) -> Duration {
     if matches!(
         operation,
@@ -672,18 +705,7 @@ async fn serve_provider_connection(
                 .map_err(|error| format!("External Workdir provider registration failed: {error}"))?
         }
     };
-    let Message::Text(registered) = registered else {
-        return Err("Backend returned an invalid External Workdir registration frame".to_string());
-    };
-    let frame = serde_json::from_str::<ExternalWorkdirServerFrame>(&registered)
-        .map_err(|error| format!("Backend returned an invalid External Workdir frame: {error}"))?;
-    if !matches!(
-        frame.message,
-        ExternalWorkdirServerMessage::Registered { generation: registered_generation, .. }
-            if registered_generation == generation
-    ) {
-        return Err("Backend rejected the External Workdir provider registration".to_string());
-    }
+    validate_provider_registration(registered, generation)?;
     println!("Connection: online (generation {generation})");
 
     let (completion_sender, mut completions) =
@@ -1045,6 +1067,23 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         }
+    }
+
+    #[test]
+    fn provider_registration_surfaces_backend_close_reason() {
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+        let error = validate_provider_registration(
+            Message::Close(Some(CloseFrame {
+                code: CloseCode::Policy,
+                reason: "provider read limits source=1024 response=512; Backend requires source=2048 response=1024".into(),
+            })),
+            1,
+        )
+        .unwrap_err();
+        assert!(error.contains("provider read limits"), "{error}");
+        assert!(error.contains("Backend requires"), "{error}");
     }
 
     #[test]

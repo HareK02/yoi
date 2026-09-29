@@ -1016,12 +1016,15 @@ impl WorkdirSession for ScopedWorkdirSession {
         &self,
         mut request: ReadBytesRequest,
     ) -> Result<ReadBytesResult, WorkdirError> {
+        let caller_path = request.path.clone();
         let path = self
             .resolve_operation_path(&request.path, WorkdirToolScopePermission::Read)
             .await?;
         self.ensure_read(&path, WorkdirSessionCapability::Read)?;
         request.path = path;
-        self.source.read_bytes(request).await
+        let mut result = self.source.read_bytes(request).await?;
+        result.path = caller_path;
+        Ok(result)
     }
 
     async fn write(&self, mut request: WriteRequest) -> Result<WriteResult, WorkdirError> {
@@ -1913,14 +1916,9 @@ mod tests {
             child.read(read("readme.md")).await.unwrap().bytes,
             b"visible"
         );
-        assert_eq!(
-            child
-                .read_bytes(read_bytes("readme.md"))
-                .await
-                .unwrap()
-                .bytes,
-            b"visible"
-        );
+        let binary = child.read_bytes(read_bytes("readme.md")).await.unwrap();
+        assert_eq!(binary.path, fs_path("readme.md"));
+        assert_eq!(binary.bytes, b"visible");
         assert!(matches!(
             child.write(write("new.md", "no")).await,
             Err(WorkdirError::Denied(_))

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use async_trait::async_trait;
-use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Extension, Path as AxumPath, Query, Request, State};
 #[cfg(test)]
 use axum::http::header::{CACHE_CONTROL, ETAG, IF_NONE_MATCH};
@@ -17472,41 +17472,116 @@ async fn send_external_workdir_server_frame(
     )
 }
 
+async fn reject_external_workdir_provider(socket: &mut WebSocket, code: u16, mut reason: String) {
+    const MAX_CLOSE_REASON_BYTES: usize = 123;
+    if reason.len() > MAX_CLOSE_REASON_BYTES {
+        reason.truncate(MAX_CLOSE_REASON_BYTES);
+    }
+    let _ = socket
+        .send(WsMessage::Close(Some(CloseFrame {
+            code,
+            reason: reason.into(),
+        })))
+        .await;
+}
+
+fn external_workdir_registration_parse_error(text: &str) -> String {
+    let actual_version = serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|value| value.get("version")?.as_u64());
+    match actual_version {
+        Some(actual)
+            if actual != workdir::external::EXTERNAL_WORKDIR_PROVIDER_PROTOCOL_VERSION as u64 =>
+        {
+            format!(
+                "unsupported External Workdir protocol version {actual}; Backend requires {}",
+                workdir::external::EXTERNAL_WORKDIR_PROVIDER_PROTOCOL_VERSION
+            )
+        }
+        _ => "invalid External Workdir provider registration".to_string(),
+    }
+}
+
 async fn serve_external_workdir_provider(
     api: WorkspaceApi,
     initial_grant: ExternalWorkdirGrantRecord,
     mut socket: WebSocket,
 ) {
-    let registration =
+    let registration_text =
         match tokio::time::timeout(std::time::Duration::from_secs(10), socket.next()).await {
-            Ok(Some(Ok(WsMessage::Text(text)))) if text.len() <= 64 * 1024 => {
-                serde_json::from_str::<ExternalWorkdirProviderFrame>(&text).ok()
+            Ok(Some(Ok(WsMessage::Text(text)))) if text.len() <= 64 * 1024 => text,
+            _ => {
+                reject_external_workdir_provider(
+                    &mut socket,
+                    1008,
+                    "External Workdir provider registration was missing or oversized".to_string(),
+                )
+                .await;
+                return;
             }
-            _ => None,
         };
-    let Some(ExternalWorkdirProviderFrame {
+    let registration_frame =
+        match serde_json::from_str::<ExternalWorkdirProviderFrame>(&registration_text) {
+            Ok(frame) => frame,
+            Err(_) => {
+                let reason = external_workdir_registration_parse_error(&registration_text);
+                reject_external_workdir_provider(&mut socket, 1002, reason).await;
+                return;
+            }
+        };
+    let ExternalWorkdirProviderFrame {
         message: ExternalWorkdirProviderMessage::Register { registration },
         ..
-    }) = registration
+    } = registration_frame
     else {
-        let _ = socket.close().await;
+        reject_external_workdir_provider(
+            &mut socket,
+            1008,
+            "expected External Workdir provider registration".to_string(),
+        )
+        .await;
         return;
     };
     let expected_capabilities = match external_workdir_capabilities(&initial_grant.permissions) {
         Ok(capabilities) => capabilities,
         Err(_) => {
-            let _ = socket.close().await;
+            reject_external_workdir_provider(
+                &mut socket,
+                1011,
+                "Backend could not validate External Workdir capabilities".to_string(),
+            )
+            .await;
             return;
         }
     };
+    if registration.read_limits != workdir::BoundedReadLimits::EXTERNAL_DEFAULT {
+        let required = workdir::BoundedReadLimits::EXTERNAL_DEFAULT;
+        reject_external_workdir_provider(
+            &mut socket,
+            1008,
+            format!(
+                "provider read limits source={} response={}; Backend requires source={} response={}",
+                registration.read_limits.max_source_bytes,
+                registration.read_limits.max_response_bytes,
+                required.max_source_bytes,
+                required.max_response_bytes,
+            ),
+        )
+        .await;
+        return;
+    }
     if registration.grant_id.as_str() != initial_grant.grant_id
         || registration.workdir_id.as_str() != initial_grant.workdir_id
         || registration.provider_instance_id.as_str() != initial_grant.provider_instance_id
         || registration.capabilities != expected_capabilities
-        || registration.read_limits != workdir::BoundedReadLimits::EXTERNAL_DEFAULT
         || registration.generation == 0
     {
-        let _ = socket.close().await;
+        reject_external_workdir_provider(
+            &mut socket,
+            1008,
+            "External Workdir provider registration does not match the grant".to_string(),
+        )
+        .await;
         return;
     }
     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
@@ -26473,6 +26548,26 @@ mod tests {
         WorkspaceRuntimeBinding,
     };
 
+    fn valid_gif_with_len(target_len: usize) -> Vec<u8> {
+        let fixture = include_bytes!("../../tools/tests/fixtures/view-image/valid.gif");
+        assert_eq!(fixture.last(), Some(&0x3b));
+        let mut bytes = fixture[..fixture.len() - 1].to_vec();
+        bytes.extend_from_slice(&[0x21, 0xfe]);
+        let mut remaining = target_len.checked_sub(bytes.len() + 2).unwrap();
+        while remaining > 0 {
+            let mut block = remaining.min(256);
+            if remaining - block == 1 {
+                block -= 1;
+            }
+            bytes.push((block - 1) as u8);
+            bytes.extend(std::iter::repeat_n(b'x', block - 1));
+            remaining -= block;
+        }
+        bytes.extend_from_slice(&[0, 0x3b]);
+        assert_eq!(bytes.len(), target_len);
+        bytes
+    }
+
     #[test]
     fn external_permission_levels_map_to_existing_bits_and_reject_legacy_partial_grants() {
         let bits = |capabilities| {
@@ -28018,6 +28113,50 @@ mod tests {
             })
         };
 
+        let (mut old_provider, _) = connect_async(&url).await.unwrap();
+        let old_registration = serde_json::to_string(&register(1)).unwrap().replacen(
+            r#""version":2"#,
+            r#""version":1"#,
+            1,
+        );
+        old_provider
+            .send(Message::Text(old_registration.into()))
+            .await
+            .unwrap();
+        let rejected = old_provider.next().await.unwrap().unwrap();
+        let Message::Close(Some(frame)) = rejected else {
+            panic!("old provider must receive a bounded compatibility close reason");
+        };
+        assert!(
+            frame
+                .reason
+                .contains("unsupported External Workdir protocol version 1")
+        );
+        assert!(frame.reason.contains("requires 2"));
+
+        let (mut smaller_provider, _) = connect_async(&url).await.unwrap();
+        let mut smaller_registration = serde_json::to_value(register(1)).unwrap();
+        smaller_registration["message"]["registration"]["read_limits"] = serde_json::json!({
+            "max_source_bytes": 32 * 1024 * 1024,
+            "max_response_bytes": 512 * 1024,
+        });
+        smaller_provider
+            .send(Message::Text(
+                serde_json::to_string(&smaller_registration).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+        let rejected = smaller_provider.next().await.unwrap().unwrap();
+        let Message::Close(Some(frame)) = rejected else {
+            panic!("smaller provider limits must receive the required effective limits");
+        };
+        assert!(frame.reason.contains("response=524288"), "{}", frame.reason);
+        assert!(
+            frame.reason.contains("response=1048576"),
+            "{}",
+            frame.reason
+        );
+
         let (mut first, _) = connect_async(&url).await.unwrap();
         first
             .send(Message::Text(
@@ -28128,8 +28267,8 @@ mod tests {
         );
         let provider_root = tempfile::tempdir().unwrap();
         fs::write(provider_root.path().join("events.jsonl"), b"one\ntwo\n").unwrap();
-        let image_bytes = b"\x89PNG\r\n\x1a\nexternal\0image\n\xff";
-        fs::write(provider_root.path().join("image.png"), image_bytes).unwrap();
+        let image_bytes = valid_gif_with_len(1024 * 1024 + 257);
+        fs::write(provider_root.path().join("image.gif"), &image_bytes).unwrap();
         let pinned_provider_root = workdir::ExternalWorkdirRoot::pin(provider_root.path()).unwrap();
         let local_session = workdir::LocalWorkdirSession::external_with_capabilities_pinned(
             workdir::Workdir::new(&grant.working_directory_id),
@@ -28199,17 +28338,72 @@ mod tests {
         let read_result = read.await.unwrap().unwrap();
         assert_eq!(read_result.bytes, b"one\ntwo\n");
 
-        let read_bytes = {
+        let view_image = {
             let broker_session = broker_session.clone();
             tokio::spawn(async move {
-                broker_session
-                    .read_bytes(workdir::ReadBytesRequest {
-                        path: workdir::WorkdirPath::new("image.png").unwrap(),
-                        offset: 0,
-                        max_bytes: 1024,
-                        expected_hash: None,
-                    })
-                    .await
+                let (_meta, tool) = tools::view_image_tool(broker_session)();
+                tool.execute(
+                    r#"{"path":"image.gif"}"#,
+                    agen::tool::ToolExecutionContext::default(),
+                )
+                .await
+            })
+        };
+        for expected_offset in [0_u64, 1024 * 1024] {
+            let (operation_id, operation) = loop {
+                let text = second.next().await.unwrap().unwrap().into_text().unwrap();
+                let frame = serde_json::from_str::<ExternalWorkdirServerFrame>(&text).unwrap();
+                if let ExternalWorkdirServerMessage::Operation {
+                    generation: 2,
+                    operation_id,
+                    operation,
+                } = frame.message
+                {
+                    break (operation_id, operation);
+                }
+            };
+            let WorkdirSessionOperation::ReadBytes(request) = operation.as_inner() else {
+                panic!("ViewImage must use the bounded binary operation");
+            };
+            assert_eq!(request.offset, expected_offset);
+            assert!(request.max_bytes <= 1024 * 1024);
+            let result = workdir::http::dispatch_workdir_session_operation(
+                &local_session,
+                operation.into_inner(),
+            )
+            .await
+            .unwrap()
+            .try_into()
+            .unwrap();
+            second
+                .send(Message::Text(
+                    serde_json::to_string(&ExternalWorkdirProviderFrame::current(
+                        ExternalWorkdirProviderMessage::OperationResult {
+                            generation: 2,
+                            operation_id,
+                            outcome: ExternalWorkdirOperationOutcome::Completed { result },
+                        },
+                    ))
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        }
+        let output = view_image.await.unwrap().unwrap();
+        let agen::tool::Attachment::Image(image) = &output.attachments[0];
+        assert_eq!(image.mime_type(), "image/gif");
+        assert_eq!(image.data(), image_bytes);
+
+        let missing_image = {
+            let broker_session = broker_session.clone();
+            tokio::spawn(async move {
+                let (_meta, tool) = tools::view_image_tool(broker_session)();
+                tool.execute(
+                    r#"{"path":"missing.gif"}"#,
+                    agen::tool::ToolExecutionContext::default(),
+                )
+                .await
             })
         };
         let (operation_id, operation) = loop {
@@ -28228,21 +28422,22 @@ mod tests {
             operation.as_inner(),
             WorkdirSessionOperation::ReadBytes(_)
         ));
-        let result = workdir::http::dispatch_workdir_session_operation(
+        let workdir_error = workdir::http::dispatch_workdir_session_operation(
             &local_session,
             operation.into_inner(),
         )
         .await
-        .unwrap()
-        .try_into()
-        .unwrap();
+        .unwrap_err();
+        let error = workdir::external::ExternalWorkdirOperationError::from_transport_error(
+            workdir::http::WorkdirTransportError::from_workdir_error(&workdir_error),
+        );
         second
             .send(Message::Text(
                 serde_json::to_string(&ExternalWorkdirProviderFrame::current(
                     ExternalWorkdirProviderMessage::OperationResult {
                         generation: 2,
                         operation_id,
-                        outcome: ExternalWorkdirOperationOutcome::Completed { result },
+                        outcome: ExternalWorkdirOperationOutcome::Failed { error },
                     },
                 ))
                 .unwrap()
@@ -28250,9 +28445,8 @@ mod tests {
             ))
             .await
             .unwrap();
-        let read_bytes_result = read_bytes.await.unwrap().unwrap();
-        assert_eq!(read_bytes_result.bytes, image_bytes);
-        assert!(read_bytes_result.eof);
+        let error = missing_image.await.unwrap().unwrap_err().to_string();
+        assert!(error.contains("not found"), "{error}");
 
         let edit = {
             let broker_session = broker_session.clone();
