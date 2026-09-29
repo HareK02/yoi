@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex, MutexGuard},
+};
 
 use protocol::{
     CommandEvent, CommandSnapshot, CommandStatus, CommandStream, CommandStreamSlice, Event,
@@ -22,6 +25,9 @@ pub struct InFlightEvents {
 pub(crate) struct InFlightInner {
     next_block_id: u64,
     blocks: Vec<TrackedBlock>,
+    // The physical Workdir provider can be shared with scoped Internal Workers.
+    // Keep command telemetry only for tool calls observed in this Worker stream.
+    known_tool_call_ids: HashSet<String>,
     commands: Vec<CommandSnapshot>,
     compaction: Option<protocol::InFlightCompaction>,
 }
@@ -53,6 +59,7 @@ impl InFlightEvents {
             inner: Arc::new(Mutex::new(InFlightInner {
                 next_block_id: 1,
                 blocks: Vec::new(),
+                known_tool_call_ids: HashSet::new(),
                 commands: Vec::new(),
                 compaction: None,
             })),
@@ -150,6 +157,7 @@ impl InFlightEvents {
     pub(crate) fn tool_call_start(&self, id: String, name: String) -> InFlightBlockId {
         let mut inner = self.lock();
         let block_id = inner.next_id();
+        inner.known_tool_call_ids.insert(id.clone());
         inner.blocks.push(TrackedBlock::ToolCall {
             block_id,
             id: id.clone(),
@@ -213,12 +221,26 @@ impl InFlightEvents {
     }
 
     pub(crate) fn publish_command_event(&self, event: CommandEvent) {
-        self.lock().apply_command_event(&event);
+        let mut inner = self.lock();
+        if !inner.accepts_command_event(&event) {
+            return;
+        }
+        inner.apply_command_event(&event);
+        drop(inner);
         let _ = self.working_event_tx.send(Event::Command { event });
     }
 
     pub(crate) fn replace_command_snapshot(&self, commands: Vec<CommandSnapshot>) {
-        self.lock().commands = commands;
+        let mut inner = self.lock();
+        inner.commands = commands
+            .into_iter()
+            .filter(|command| {
+                command
+                    .tool_call_id
+                    .as_ref()
+                    .is_some_and(|tool_call_id| inner.known_tool_call_ids.contains(tool_call_id))
+            })
+            .collect();
     }
 
     /// Atomically update reconnect state and publish the matching live progress event.
@@ -251,6 +273,23 @@ impl InFlightInner {
         self.blocks
             .iter_mut()
             .find(|block| block.block_id() == block_id)
+    }
+
+    fn accepts_command_event(&self, event: &CommandEvent) -> bool {
+        match event {
+            CommandEvent::Started {
+                tool_call_id: Some(tool_call_id),
+                ..
+            } => self.known_tool_call_ids.contains(tool_call_id),
+            CommandEvent::Started {
+                tool_call_id: None, ..
+            } => false,
+            CommandEvent::Output { command_id, .. }
+            | CommandEvent::Terminal { command_id, .. } => self
+                .commands
+                .iter()
+                .any(|command| command.command_id == *command_id),
+        }
     }
 
     fn apply_command_event(&mut self, event: &CommandEvent) {
@@ -394,10 +433,14 @@ impl InFlightInner {
     }
 
     fn clear(&mut self) -> bool {
-        if self.blocks.is_empty() && self.commands.is_empty() {
+        if self.blocks.is_empty()
+            && self.known_tool_call_ids.is_empty()
+            && self.commands.is_empty()
+        {
             false
         } else {
             self.blocks.clear();
+            self.known_tool_call_ids.clear();
             self.commands.clear();
             true
         }
@@ -503,6 +546,20 @@ pub(crate) fn snapshot_from_guard(guard: &MutexGuard<'_, InFlightInner>) -> InFl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn command_snapshot(command_id: &str, tool_call_id: Option<&str>) -> CommandSnapshot {
+        CommandSnapshot {
+            command_id: command_id.into(),
+            tool_call_id: tool_call_id.map(str::to_owned),
+            status: CommandStatus::Running,
+            started_at_ms: 100,
+            observed_at_ms: 100,
+            last_output_at_ms: None,
+            stdout: CommandStreamSlice::default(),
+            stderr: CommandStreamSlice::default(),
+            exit_code: None,
+        }
+    }
 
     #[test]
     fn snapshot_boundary_does_not_duplicate_or_gap_delta_sent_after_subscribe() {
@@ -706,6 +763,8 @@ mod tests {
         let (working_event_tx, _) = broadcast::channel(16);
         let mut rx = working_event_tx.subscribe();
         let in_flight = InFlightEvents::new(working_event_tx);
+        in_flight.tool_call_start("tool-1".into(), "Bash".into());
+        assert!(matches!(rx.try_recv().unwrap(), Event::ToolCallStart { .. }));
         in_flight.publish_command_event(CommandEvent::Started {
             command_id: "command-1".into(),
             tool_call_id: Some("tool-1".into()),
@@ -750,6 +809,49 @@ mod tests {
         });
         let guard = in_flight.snapshot_guard();
         assert!(snapshot_from_guard(&guard).commands.is_empty());
+    }
+
+    #[test]
+    fn foreign_command_telemetry_is_not_published_or_restored() {
+        let (working_event_tx, _) = broadcast::channel(16);
+        let mut rx = working_event_tx.subscribe();
+        let in_flight = InFlightEvents::new(working_event_tx);
+        in_flight.tool_call_start("own-tool".into(), "Bash".into());
+        assert!(matches!(rx.try_recv().unwrap(), Event::ToolCallStart { .. }));
+
+        in_flight.publish_command_event(CommandEvent::Started {
+            command_id: "foreign-command".into(),
+            tool_call_id: Some("foreign-tool".into()),
+            observed_at_ms: 100,
+        });
+        in_flight.publish_command_event(CommandEvent::Output {
+            command_id: "foreign-command".into(),
+            stream: CommandStream::Stdout,
+            start_offset: 0,
+            end_offset: 6,
+            content: "leaked".into(),
+            observed_at_ms: 110,
+        });
+        in_flight.publish_command_event(CommandEvent::Terminal {
+            command_id: "foreign-command".into(),
+            status: CommandStatus::Completed,
+            exit_code: Some(0),
+            stdout_end_offset: 6,
+            stderr_end_offset: 0,
+            observed_at_ms: 120,
+        });
+
+        assert!(rx.try_recv().is_err());
+        assert!(snapshot_from_guard(&in_flight.snapshot_guard()).commands.is_empty());
+
+        in_flight.replace_command_snapshot(vec![
+            command_snapshot("own-command", Some("own-tool")),
+            command_snapshot("foreign-command", Some("foreign-tool")),
+            command_snapshot("unattributed-command", None),
+        ]);
+        let snapshot = snapshot_from_guard(&in_flight.snapshot_guard());
+        assert_eq!(snapshot.commands.len(), 1);
+        assert_eq!(snapshot.commands[0].command_id, "own-command");
     }
 
     #[test]

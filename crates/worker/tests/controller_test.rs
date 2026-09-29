@@ -162,6 +162,24 @@ fn simple_text_events() -> Vec<LlmEvent> {
     ]
 }
 
+fn bash_tool_events(call_id: &str, command: &str) -> Vec<LlmEvent> {
+    vec![
+        LlmEvent::tool_use_start(0, call_id, "Bash"),
+        LlmEvent::tool_input_delta(
+            0,
+            serde_json::json!({
+                "command": command,
+                "cwd": ".",
+            })
+            .to_string(),
+        ),
+        LlmEvent::tool_use_stop(0),
+        LlmEvent::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        }),
+    ]
+}
+
 const MANIFEST_TOML: &str = r#"
 [worker]
 name = "test-worker"
@@ -377,10 +395,10 @@ async fn shutdown_closes_bound_workdir_session() {
 }
 
 #[tokio::test]
-async fn controller_projects_workdir_command_events_and_snapshot_state() {
+async fn controller_filters_workdir_command_not_owned_by_worker() {
     let (mut worker, pwd) = make_worker_with_pwd(MockClient::new(simple_text_events())).await;
     let session: WorkdirSessionHandle = Arc::new(LocalWorkdirSession::materialized_bound(
-        Workdir::new("controller-command-observation-workdir"),
+        Workdir::new("controller-foreign-command-workdir"),
         pwd.clone(),
         pwd,
         worker.scope().clone(),
@@ -392,76 +410,26 @@ async fn controller_projects_workdir_command_events_and_snapshot_state() {
 
     let command = session
         .start_command(CommandRequest {
-            command: "printf ready; sleep 0.3; printf done".to_owned(),
+            command: "sleep 0.2".to_owned(),
             timeout_secs: 5,
             output_limit: 1024,
             cwd: workdir::WorkdirPath::root(),
             spill_dir: None,
-            tool_call_id: Some("tool-command-1".into()),
+            tool_call_id: Some("foreign-tool-call".into()),
         })
         .await
         .unwrap();
 
-    let mut saw_started = false;
-    let mut saw_output = false;
-    while !saw_output {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), events.recv())
             .await
-            .expect("command event should arrive")
-            .unwrap();
-        match event {
-            Event::Command {
-                event:
-                    protocol::CommandEvent::Started {
-                        command_id,
-                        tool_call_id,
-                        ..
-                    },
-            } => {
-                assert_eq!(command_id, command.0);
-                assert_eq!(tool_call_id.as_deref(), Some("tool-command-1"));
-                saw_started = true;
-            }
-            Event::Command {
-                event:
-                    protocol::CommandEvent::Output {
-                        command_id,
-                        stream: protocol::CommandStream::Stdout,
-                        content,
-                        ..
-                    },
-            } if command_id == command.0 && content.contains("ready") => saw_output = true,
-            _ => {}
-        }
-    }
-    assert!(saw_started);
-
+            .is_err(),
+        "a command without a Worker-owned tool call must not enter its protocol stream"
+    );
     let Event::Snapshot { in_flight, .. } = handle.snapshot_event() else {
         panic!("worker snapshot expected");
     };
-    assert_eq!(in_flight.commands.len(), 1);
-    assert_eq!(in_flight.commands[0].command_id, command.0);
-    assert_eq!(in_flight.commands[0].stdout.content, "ready");
-    assert_eq!(
-        in_flight.commands[0].status,
-        protocol::CommandStatus::Running
-    );
-
-    let saw_terminal = drain_until(&mut events, std::time::Duration::from_secs(2), |event| {
-        matches!(
-            event,
-            Event::Command {
-                event: protocol::CommandEvent::Terminal {
-                    command_id,
-                    status: protocol::CommandStatus::Completed,
-                    exit_code: Some(0),
-                    ..
-                }
-            } if command_id == &command.0
-        )
-    })
-    .await;
-    assert!(saw_terminal, "completed command event should arrive");
+    assert!(in_flight.commands.is_empty());
 
     let output = session
         .command_output(CommandOutputRequest {
@@ -473,12 +441,104 @@ async fn controller_projects_workdir_command_events_and_snapshot_state() {
         .await
         .unwrap();
     assert_eq!(output.status, workdir::CommandStatus::Completed);
-    let (entries, _) = handle.sink.subscribe_with_snapshot();
-    let durable_history = serde_json::to_string(&entries).unwrap();
-    assert!(
-        !durable_history.contains("ready") && !durable_history.contains("done"),
-        "operational command chunks must not be appended to Worker history: {durable_history}"
+    handle
+        .send(Method::Shutdown {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn controller_projects_workdir_command_events_and_snapshot_state() {
+    let client = MockClient::sequential(vec![
+        MockResponse::Complete(bash_tool_events(
+            "tool-command-1",
+            "printf ready; sleep 0.3; printf done",
+        )),
+        MockResponse::Complete(simple_text_events()),
+    ]);
+    let (mut worker, pwd) = make_worker_with_pwd(client).await;
+    let session: WorkdirSessionHandle = Arc::new(LocalWorkdirSession::materialized_bound(
+        Workdir::new("controller-command-observation-workdir"),
+        pwd.clone(),
+        pwd,
+        worker.scope().clone(),
+        WorkdirSessionCapabilities::ALL,
+    ));
+    worker.bind_single_workdir_session(Some(Arc::clone(&session)));
+    let handle = spawn_controller(worker).await;
+    let mut events = handle.subscribe();
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "run the command",
+        ))
+        .await
+        .unwrap();
+
+    let mut command_id = None;
+    let mut saw_output = false;
+    while !saw_output {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .expect("command event should arrive")
+            .unwrap();
+        match event {
+            Event::Command {
+                event:
+                    protocol::CommandEvent::Started {
+                        command_id: started_id,
+                        tool_call_id,
+                        ..
+                    },
+            } => {
+                assert_eq!(tool_call_id.as_deref(), Some("tool-command-1"));
+                command_id = Some(started_id);
+            }
+            Event::Command {
+                event:
+                    protocol::CommandEvent::Output {
+                        command_id: output_id,
+                        stream: protocol::CommandStream::Stdout,
+                        content,
+                        ..
+                    },
+            } if command_id.as_deref() == Some(output_id.as_str()) && content.contains("ready") => {
+                saw_output = true;
+            }
+            _ => {}
+        }
+    }
+    let command_id = command_id.expect("owned command start should be projected");
+
+    let Event::Snapshot { in_flight, .. } = handle.snapshot_event() else {
+        panic!("worker snapshot expected");
+    };
+    assert_eq!(in_flight.commands.len(), 1);
+    assert_eq!(in_flight.commands[0].command_id, command_id);
+    assert_eq!(in_flight.commands[0].stdout.content, "ready");
+    assert_eq!(
+        in_flight.commands[0].status,
+        protocol::CommandStatus::Running
     );
+
+    let saw_terminal = drain_until(&mut events, std::time::Duration::from_secs(2), |event| {
+        matches!(
+            event,
+            Event::Command {
+                event: protocol::CommandEvent::Terminal {
+                    command_id: terminal_id,
+                    status: protocol::CommandStatus::Completed,
+                    exit_code: Some(0),
+                    ..
+                }
+            } if terminal_id == &command_id
+        )
+    })
+    .await;
+    assert!(saw_terminal, "completed command event should arrive");
+
     handle
         .send(Method::Shutdown {
             command: worker_command(&handle),
@@ -489,7 +549,12 @@ async fn controller_projects_workdir_command_events_and_snapshot_state() {
 
 #[tokio::test]
 async fn controller_refreshes_command_snapshot_after_high_output_provider_lag() {
-    let (mut worker, pwd) = make_worker_with_pwd(MockClient::new(simple_text_events())).await;
+    let command_text = "dd if=/dev/zero bs=8192 count=300 2>/dev/null | tr '\\0' x; sleep 5";
+    let client = MockClient::sequential(vec![
+        MockResponse::Complete(bash_tool_events("tool-high-output", command_text)),
+        MockResponse::Complete(simple_text_events()),
+    ]);
+    let (mut worker, pwd) = make_worker_with_pwd(client).await;
     let session: WorkdirSessionHandle = Arc::new(LocalWorkdirSession::materialized_bound(
         Workdir::new("controller-command-lag-recovery-workdir"),
         pwd.clone(),
@@ -499,23 +564,37 @@ async fn controller_refreshes_command_snapshot_after_high_output_provider_lag() 
     ));
     worker.bind_single_workdir_session(Some(Arc::clone(&session)));
     let handle = spawn_controller(worker).await;
+    let mut events = handle.subscribe();
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "run the high-output command",
+        ))
+        .await
+        .unwrap();
+
+    let command_id = loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .expect("owned command start should arrive")
+            .unwrap();
+        if let Event::Command {
+            event:
+                protocol::CommandEvent::Started {
+                    command_id,
+                    tool_call_id: Some(tool_call_id),
+                    ..
+                },
+        } = event
+            && tool_call_id == "tool-high-output"
+        {
+            break command_id;
+        }
+    };
 
     // Local command telemetry uses 8 KiB chunks and a 256-event channel. One
     // synchronous file-poll burst with 300 chunks deterministically makes the
     // worker-side receiver observe `Lagged` before this command terminates.
-    let command = session
-        .start_command(CommandRequest {
-            command: "dd if=/dev/zero bs=8192 count=300 2>/dev/null | tr '\\0' x; sleep 5"
-                .to_owned(),
-            timeout_secs: 10,
-            output_limit: 1024,
-            cwd: workdir::WorkdirPath::root(),
-            spill_dir: None,
-            tool_call_id: Some("tool-high-output".into()),
-        })
-        .await
-        .unwrap();
-
     let expected_end_offset = 300_u64 * 8192;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
     let recovered = loop {
@@ -525,7 +604,7 @@ async fn controller_refreshes_command_snapshot_after_high_output_provider_lag() 
         if let Some(snapshot) = in_flight
             .commands
             .iter()
-            .find(|snapshot| snapshot.command_id == command.0)
+            .find(|snapshot| snapshot.command_id == command_id)
             && snapshot.stdout.end_offset >= expected_end_offset
         {
             break snapshot.clone();
@@ -545,17 +624,8 @@ async fn controller_refreshes_command_snapshot_after_high_output_provider_lag() 
     assert!(recovered.stdout.content.len() <= 32 * 1024);
     assert!(recovered.stdout.content.bytes().all(|byte| byte == b'x'));
 
-    session.cancel_command(command.clone()).await.unwrap();
-    let output = session
-        .command_output(CommandOutputRequest {
-            handle: command,
-            cursor: 0,
-            limit: 1024,
-            wait: true,
-        })
-        .await
-        .unwrap();
-    assert_eq!(output.status, workdir::CommandStatus::Cancelled);
+    let command = workdir::CommandHandle(command_id);
+    session.cancel_command(command).await.unwrap();
     handle
         .send(Method::Shutdown {
             command: worker_command(&handle),
