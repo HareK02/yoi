@@ -6181,6 +6181,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "fs-operation",
+ "libc",
  "manifest",
  "reqwest",
  "schemars",

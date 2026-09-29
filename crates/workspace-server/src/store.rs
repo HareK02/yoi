@@ -21,7 +21,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 67;
+const LATEST_SCHEMA_VERSION: i64 = 68;
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
@@ -50,6 +50,8 @@ const TICKET_TARGETS_AND_WORKDIR_CAPABILITIES_MIGRATION_NAME: &str =
     "Ticket target collection and Workdir attachment capabilities";
 const EXTERNAL_WORKDIR_ACCESS_AND_OPTIONAL_EXPIRY_MIGRATION_NAME: &str =
     "External Workdir read-write access and optional expiry";
+const EXTERNAL_WORKDIR_COMMAND_PERMISSION_MIGRATION_NAME: &str =
+    "External Workdir explicit command permission";
 const TICKET_SCHEMA_VERSION_WITH_TARGETS: i64 = 7;
 const TICKET_SCHEMA_BASELINE_NAME: &str = "ticket schema baseline";
 const WORKER_REGISTRY_PROJECTION_SCHEMA: &str = r#"
@@ -181,6 +183,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 67,
         name: EXTERNAL_WORKDIR_ACCESS_AND_OPTIONAL_EXPIRY_MIGRATION_NAME,
         apply: migrate_external_workdir_access_and_optional_expiry_v66_to_v67,
+    },
+    Migration {
+        version: 68,
+        name: EXTERNAL_WORKDIR_COMMAND_PERMISSION_MIGRATION_NAME,
+        apply: migrate_external_workdir_command_permission_v67_to_v68,
     },
 ];
 
@@ -12098,6 +12105,90 @@ fn migrate_external_workdir_access_and_optional_expiry_v66_to_v67(conn: &Connect
     }
 }
 
+fn migrate_external_workdir_command_permission_v67_to_v68(conn: &Connection) -> Result<()> {
+    let current = current_schema_version(conn)?;
+    if current != 67 {
+        return Err(Error::Store(format!(
+            "expected schema version 67 before {EXTERNAL_WORKDIR_COMMAND_PERMISSION_MIGRATION_NAME} migration, found {current}"
+        )));
+    }
+    let foreign_keys_enabled =
+        conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))? != 0;
+    if foreign_keys_enabled {
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    }
+    let result = (|| {
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+        tx.execute_batch(
+            r#"
+            CREATE TABLE external_workdir_grants_v68 (
+                grant_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                workdir_id TEXT NOT NULL,
+                provider_instance_id TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                permissions TEXT NOT NULL CHECK (permissions IN (
+                    'read_only', 'read_write', 'command_only',
+                    'read_command', 'read_write_command'
+                )),
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT,
+                generation INTEGER NOT NULL CHECK (generation > 0),
+                status TEXT NOT NULL CHECK (status IN ('pending', 'online', 'offline', 'revoked', 'expired')),
+                updated_at TEXT NOT NULL,
+                cleanup_state TEXT NOT NULL DEFAULT 'not_required' CHECK (cleanup_state IN ('not_required', 'pending', 'retry_required', 'completed')),
+                cleanup_error TEXT,
+                cleanup_updated_at TEXT,
+                PRIMARY KEY (workspace_id, grant_id),
+                UNIQUE (workspace_id, workdir_id),
+                FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+                FOREIGN KEY (workspace_id, workdir_id)
+                    REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+            );
+            INSERT INTO external_workdir_grants_v68 (
+                grant_id, workspace_id, workdir_id, provider_instance_id, display_name,
+                permissions, created_by, created_at, expires_at, generation, status, updated_at,
+                cleanup_state, cleanup_error, cleanup_updated_at
+            ) SELECT grant_id, workspace_id, workdir_id, provider_instance_id, display_name,
+                     permissions, created_by, created_at, expires_at, generation, status, updated_at,
+                     cleanup_state, cleanup_error, cleanup_updated_at
+                FROM external_workdir_grants;
+            DROP TABLE external_workdir_grants;
+            ALTER TABLE external_workdir_grants_v68 RENAME TO external_workdir_grants;
+            CREATE INDEX idx_external_workdir_grants_status_expiry
+                ON external_workdir_grants(workspace_id, status, expires_at);
+            "#,
+        )?;
+        let violations =
+            tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        if violations != 0 {
+            return Err(Error::Store(format!(
+                "schema-68 migration left {violations} foreign-key violation(s)"
+            )));
+        }
+        tx.execute(
+            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+            params![68_i64, EXTERNAL_WORKDIR_COMMAND_PERMISSION_MIGRATION_NAME],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+    let restore = if foreign_keys_enabled {
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(Error::from)
+    } else {
+        Ok(())
+    };
+    match (result, restore) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("DROP TABLE IF EXISTS typed_ticket_targets;")?;
     conn.execute_batch(include_str!("latest_schema.sql"))?;
@@ -14233,6 +14324,10 @@ mod tests {
                     version: 67,
                     name: EXTERNAL_WORKDIR_ACCESS_AND_OPTIONAL_EXPIRY_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 68,
+                    name: EXTERNAL_WORKDIR_COMMAND_PERMISSION_MIGRATION_NAME.to_string(),
+                },
             ]
         );
 
@@ -14295,6 +14390,10 @@ mod tests {
                             67,
                             EXTERNAL_WORKDIR_ACCESS_AND_OPTIONAL_EXPIRY_MIGRATION_NAME.to_string(),
                         ),
+                        (
+                            68,
+                            EXTERNAL_WORKDIR_COMMAND_PERMISSION_MIGRATION_NAME.to_string(),
+                        ),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -14349,6 +14448,68 @@ mod tests {
     }
 
     #[test]
+    fn schema_v68_preserves_legacy_external_grants_without_command_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        prepare_schema_v50(&path, Some("workspace-a"));
+        let mut conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 67)
+        {
+            (migration.apply)(&conn).unwrap();
+        }
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(
+            "INSERT INTO external_workdir_grants (
+                 grant_id, workspace_id, workdir_id, provider_instance_id, display_name,
+                 permissions, created_by, created_at, expires_at, generation, status, updated_at
+             ) VALUES
+                 ('grant-ro', 'workspace-a', 'external-ro', 'provider-ro', 'Read only',
+                  'read_only', 'owner', '1', NULL, 1, 'pending', '1'),
+                 ('grant-rw', 'workspace-a', 'external-rw', 'provider-rw', 'Read write',
+                  'read_write', 'owner', '1', NULL, 1, 'pending', '1');
+             INSERT INTO workdir_registry (
+                 workspace_id, workdir_id, display_name, source_kind, runtime_id,
+                 repository_id, external_grant_id, creation_selector, creation_ref,
+                 materialization_status, cleanliness, created_at, updated_at
+             ) VALUES
+                 ('workspace-a', 'external-ro', 'Read only', 'external_grant', NULL,
+                  NULL, 'grant-ro', NULL, NULL, 'pending', 'unknown', '1', '1'),
+                 ('workspace-a', 'external-rw', 'Read write', 'external_grant', NULL,
+                  NULL, 'grant-rw', NULL, NULL, 'pending', 'unknown', '1', '1');",
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        migrate_external_workdir_command_permission_v67_to_v68(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 68);
+        let permissions = conn
+            .prepare("SELECT permissions FROM external_workdir_grants ORDER BY grant_id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(permissions, vec!["read_only", "read_write"]);
+        assert!(
+            conn.execute(
+                "UPDATE external_workdir_grants SET permissions = 'read_command' WHERE grant_id = 'grant-ro'",
+                [],
+            )
+            .is_ok()
+        );
+        assert!(
+            conn.execute(
+                "UPDATE external_workdir_grants SET permissions = 'write_only' WHERE grant_id = 'grant-rw'",
+                [],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn migration_resumes_from_a_valid_partially_applied_chain() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("server.db");
@@ -14366,7 +14527,7 @@ mod tests {
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
             vec![
-                52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67
+                52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68
             ]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
@@ -14375,7 +14536,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 18);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 19);
         assert!(column_exists(&conn, "worker_workdir_links", "alias").unwrap());
         assert!(column_exists(&conn, "worker_workdir_links", "capabilities").unwrap());
         assert!(!column_exists(&conn, "worker_workdir_links", "role").unwrap());

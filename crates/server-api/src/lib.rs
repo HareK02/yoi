@@ -5241,13 +5241,28 @@ impl From<workdir::workspace::WorkingDirectorySummary> for WorkingDirectorySumma
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum ExternalWorkdirPermission {
-    #[default]
-    ReadOnly,
-    ReadWrite,
+#[serde(deny_unknown_fields)]
+pub struct ExternalWorkdirPermissions {
+    /// Read files and use read-only discovery operations such as Glob and Grep.
+    pub read: bool,
+    /// Create or update files with Write and Edit. Existing-file mutation also
+    /// requires `read` so callers can satisfy the read-before-write contract.
+    pub write: bool,
+    /// Execute commands as the sharing CLI user on the provider host. This is
+    /// explicit authority and does not imply either filesystem category.
+    pub command: bool,
+}
+
+impl Default for ExternalWorkdirPermissions {
+    fn default() -> Self {
+        Self {
+            read: true,
+            write: false,
+            command: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -5261,7 +5276,7 @@ pub struct ExternalWorkdirGrantCreateRequest {
     #[cfg_attr(feature = "typescript", ts(optional, type = "number | null"))]
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub ttl_seconds: Option<u64>,
-    pub permission: ExternalWorkdirPermission,
+    pub permissions: ExternalWorkdirPermissions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -5274,7 +5289,7 @@ pub struct ExternalWorkdirGrantResponse {
     pub working_directory_id: String,
     pub provider_instance_id: String,
     pub display_name: String,
-    pub permission: ExternalWorkdirPermission,
+    pub permissions: ExternalWorkdirPermissions,
     /// `None` means the grant has no automatic expiry. It remains bounded by
     /// explicit revoke, provider disconnect, and provider shutdown cleanup.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -711,14 +711,40 @@ impl ExternalOperationCancelGuard {
     fn disarm(&mut self) {
         self.operation_id = None;
     }
+
+    fn cancel(&mut self) {
+        let Some(operation_id) = self.operation_id.take() else {
+            return;
+        };
+        enqueue_external_operation_cancel(self.sender.clone(), operation_id);
+    }
 }
 
 impl Drop for ExternalOperationCancelGuard {
     fn drop(&mut self) {
-        if let Some(operation_id) = self.operation_id.take() {
-            let _ = self
-                .sender
-                .try_send(ExternalProviderCommand::Cancel { operation_id });
+        self.cancel();
+    }
+}
+
+fn enqueue_external_operation_cancel(
+    sender: tokio::sync::mpsc::Sender<ExternalProviderCommand>,
+    operation_id: ExternalWorkdirOperationId,
+) {
+    let command = ExternalProviderCommand::Cancel { operation_id };
+    match sender.try_send(command) {
+        Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(command)) => {
+            let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+                return;
+            };
+            runtime.spawn(async move {
+                // Never delay the failed operation's return on a saturated provider
+                // queue, but give the provider a bounded opportunity to accept the
+                // cancellation as it drains already queued messages.
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), sender.send(command))
+                        .await;
+            });
         }
     }
 }
@@ -792,6 +818,8 @@ struct ExternalProviderWorkdirSession {
     connection: Arc<ExternalProviderConnection>,
     audit: Option<ExternalProviderAuditContext>,
     closed: std::sync::atomic::AtomicBool,
+    close_lock: tokio::sync::Mutex<()>,
+    active_commands: tokio::sync::Mutex<HashMap<String, workdir::CommandHandle>>,
 }
 
 impl std::fmt::Debug for ExternalProviderWorkdirSession {
@@ -815,6 +843,8 @@ impl ExternalProviderWorkdirSession {
             connection,
             audit,
             closed: std::sync::atomic::AtomicBool::new(false),
+            close_lock: tokio::sync::Mutex::new(()),
+            active_commands: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -858,6 +888,7 @@ impl ExternalProviderWorkdirSession {
         operation: WorkdirSessionOperation,
     ) -> std::result::Result<WorkdirSessionOperationResult, workdir::WorkdirError> {
         let operation_kind = external_workdir_operation_kind(&operation);
+        let operation_timeout = external_workdir_operation_timeout(&operation);
         if self.closed.load(Ordering::Acquire) {
             return Err(workdir::WorkdirError::SessionClosed);
         }
@@ -914,7 +945,7 @@ impl ExternalProviderWorkdirSession {
                 "External Workdir provider disconnected".to_string(),
             ));
         }
-        let result = match tokio::time::timeout(std::time::Duration::from_secs(30), receive).await {
+        let result = match tokio::time::timeout(operation_timeout, receive).await {
             Ok(result) => {
                 cancel_guard.disarm();
                 match result {
@@ -925,14 +956,7 @@ impl ExternalProviderWorkdirSession {
                 }
             }
             Err(_) => {
-                if let Some(cancel_operation_id) = cancel_guard.operation_id.take() {
-                    let _ = cancel_guard
-                        .sender
-                        .send(ExternalProviderCommand::Cancel {
-                            operation_id: cancel_operation_id,
-                        })
-                        .await;
-                }
+                cancel_guard.cancel();
                 Err(workdir::WorkdirError::Unavailable(
                     "External Workdir provider operation timed out".to_string(),
                 ))
@@ -950,10 +974,32 @@ impl ExternalProviderWorkdirSession {
         result
     }
 
+    fn ensure_capability(
+        &self,
+        capability: workdir::WorkdirSessionCapability,
+    ) -> std::result::Result<(), workdir::WorkdirError> {
+        if self.connection.capabilities.supports(capability) {
+            Ok(())
+        } else {
+            Err(workdir::WorkdirError::Unsupported(capability))
+        }
+    }
+
     fn mismatch(expected: &str) -> workdir::WorkdirError {
         workdir::WorkdirError::Unavailable(format!(
             "External Workdir provider returned a mismatched result; expected {expected}"
         ))
+    }
+}
+
+fn external_workdir_operation_timeout(operation: &WorkdirSessionOperation) -> std::time::Duration {
+    if matches!(
+        operation,
+        WorkdirSessionOperation::CommandOutput(request) if request.wait
+    ) {
+        std::time::Duration::from_secs(workdir::external::MAX_EXTERNAL_COMMAND_TIMEOUT_SECS + 10)
+    } else {
+        std::time::Duration::from_secs(30)
     }
 }
 
@@ -988,6 +1034,7 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
         &self,
         request: workdir::WorkdirScopeAuthorizationRequest,
     ) -> std::result::Result<(), workdir::WorkdirError> {
+        self.ensure_capability(workdir::WorkdirSessionCapability::Read)?;
         match self
             .operate(WorkdirSessionOperation::AuthorizeScope(request))
             .await?
@@ -1000,6 +1047,7 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
         &self,
         request: workdir::WorkdirScopeOverlapRequest,
     ) -> std::result::Result<bool, workdir::WorkdirError> {
+        self.ensure_capability(workdir::WorkdirSessionCapability::Read)?;
         match self
             .operate(WorkdirSessionOperation::ScopeRulesOverlap(request))
             .await?
@@ -1012,6 +1060,7 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
         &self,
         request: workdir::StatRequest,
     ) -> std::result::Result<workdir::StatResult, workdir::WorkdirError> {
+        self.ensure_capability(workdir::WorkdirSessionCapability::Read)?;
         match self.operate(WorkdirSessionOperation::Stat(request)).await? {
             WorkdirSessionOperationResult::Stat(value) => Ok(value),
             _ => Err(Self::mismatch("stat")),
@@ -1021,6 +1070,7 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
         &self,
         request: workdir::ReadRequest,
     ) -> std::result::Result<workdir::ReadResult, workdir::WorkdirError> {
+        self.ensure_capability(workdir::WorkdirSessionCapability::Read)?;
         match self.operate(WorkdirSessionOperation::Read(request)).await? {
             WorkdirSessionOperationResult::Read(value) => Ok(value),
             _ => Err(Self::mismatch("read")),
@@ -1030,15 +1080,7 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
         &self,
         request: workdir::WriteRequest,
     ) -> std::result::Result<workdir::WriteResult, workdir::WorkdirError> {
-        if !self
-            .connection
-            .capabilities
-            .supports(workdir::WorkdirSessionCapability::Write)
-        {
-            return Err(workdir::WorkdirError::Unsupported(
-                workdir::WorkdirSessionCapability::Write,
-            ));
-        }
+        self.ensure_capability(workdir::WorkdirSessionCapability::Write)?;
         match self
             .operate(WorkdirSessionOperation::Write(request))
             .await?
@@ -1051,15 +1093,7 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
         &self,
         request: workdir::EditRequest,
     ) -> std::result::Result<workdir::EditResult, workdir::WorkdirError> {
-        if !self
-            .connection
-            .capabilities
-            .supports(workdir::WorkdirSessionCapability::Edit)
-        {
-            return Err(workdir::WorkdirError::Unsupported(
-                workdir::WorkdirSessionCapability::Edit,
-            ));
-        }
+        self.ensure_capability(workdir::WorkdirSessionCapability::Edit)?;
         match self.operate(WorkdirSessionOperation::Edit(request)).await? {
             WorkdirSessionOperationResult::Edit(value) => Ok(value),
             _ => Err(Self::mismatch("edit")),
@@ -1069,6 +1103,7 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
         &self,
         request: workdir::ListRequest,
     ) -> std::result::Result<workdir::ListResult, workdir::WorkdirError> {
+        self.ensure_capability(workdir::WorkdirSessionCapability::Read)?;
         match self.operate(WorkdirSessionOperation::List(request)).await? {
             WorkdirSessionOperationResult::List(value) => Ok(value),
             _ => Err(Self::mismatch("list")),
@@ -1078,6 +1113,7 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
         &self,
         request: workdir::GlobRequest,
     ) -> std::result::Result<workdir::GlobResult, workdir::WorkdirError> {
+        self.ensure_capability(workdir::WorkdirSessionCapability::Glob)?;
         match self.operate(WorkdirSessionOperation::Glob(request)).await? {
             WorkdirSessionOperationResult::Glob(value) => Ok(value),
             _ => Err(Self::mismatch("glob")),
@@ -1087,6 +1123,7 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
         &self,
         request: workdir::GrepRequest,
     ) -> std::result::Result<workdir::GrepResult, workdir::WorkdirError> {
+        self.ensure_capability(workdir::WorkdirSessionCapability::Grep)?;
         match self.operate(WorkdirSessionOperation::Grep(request)).await? {
             WorkdirSessionOperationResult::Grep(value) => Ok(value),
             _ => Err(Self::mismatch("grep")),
@@ -1094,37 +1131,107 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
     }
     async fn start_command(
         &self,
-        _request: workdir::CommandRequest,
+        mut request: workdir::CommandRequest,
     ) -> std::result::Result<workdir::CommandHandle, workdir::WorkdirError> {
-        Err(workdir::WorkdirError::Unsupported(
-            workdir::WorkdirSessionCapability::Command,
-        ))
+        self.ensure_capability(workdir::WorkdirSessionCapability::Command)?;
+        let _close_guard = self.close_lock.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(workdir::WorkdirError::SessionClosed);
+        }
+        // Bash supplies a Worker-host spill directory. It is neither meaningful
+        // nor safe to send to a client-hosted provider, so External commands use
+        // bounded inline output and report truncation without a provider path.
+        request.spill_dir = None;
+        match self
+            .operate(WorkdirSessionOperation::CommandStart(request))
+            .await?
+        {
+            WorkdirSessionOperationResult::CommandStart(handle) => {
+                self.active_commands
+                    .lock()
+                    .await
+                    .insert(handle.0.clone(), handle.clone());
+                Ok(handle)
+            }
+            _ => Err(Self::mismatch("command_start")),
+        }
     }
     async fn command_status(
         &self,
-        _handle: workdir::CommandHandle,
+        handle: workdir::CommandHandle,
     ) -> std::result::Result<workdir::CommandStatus, workdir::WorkdirError> {
-        Err(workdir::WorkdirError::Unsupported(
-            workdir::WorkdirSessionCapability::Command,
-        ))
+        self.ensure_capability(workdir::WorkdirSessionCapability::Command)?;
+        match self
+            .operate(WorkdirSessionOperation::CommandStatus(handle))
+            .await?
+        {
+            WorkdirSessionOperationResult::CommandStatus(status) => Ok(status),
+            _ => Err(Self::mismatch("command_status")),
+        }
     }
     async fn command_output(
         &self,
-        _request: workdir::CommandOutputRequest,
+        request: workdir::CommandOutputRequest,
     ) -> std::result::Result<workdir::CommandOutput, workdir::WorkdirError> {
-        Err(workdir::WorkdirError::Unsupported(
-            workdir::WorkdirSessionCapability::Command,
-        ))
+        self.ensure_capability(workdir::WorkdirSessionCapability::Command)?;
+        let command_id = request.handle.0.clone();
+        match self
+            .operate(WorkdirSessionOperation::CommandOutput(request))
+            .await?
+        {
+            WorkdirSessionOperationResult::CommandOutput(output) => {
+                if output.status != workdir::CommandStatus::Running && output.next_cursor.is_none()
+                {
+                    self.active_commands.lock().await.remove(&command_id);
+                }
+                Ok(output)
+            }
+            _ => Err(Self::mismatch("command_output")),
+        }
     }
     async fn cancel_command(
         &self,
-        _handle: workdir::CommandHandle,
+        handle: workdir::CommandHandle,
     ) -> std::result::Result<(), workdir::WorkdirError> {
-        Err(workdir::WorkdirError::Unsupported(
-            workdir::WorkdirSessionCapability::Command,
-        ))
+        self.ensure_capability(workdir::WorkdirSessionCapability::Command)?;
+        match self
+            .operate(WorkdirSessionOperation::CommandCancel(handle))
+            .await?
+        {
+            WorkdirSessionOperationResult::CommandCancel => Ok(()),
+            _ => Err(Self::mismatch("command_cancel")),
+        }
     }
     async fn close(&self) -> std::result::Result<(), workdir::WorkdirError> {
+        let _close_guard = self.close_lock.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let commands = self
+            .active_commands
+            .lock()
+            .await
+            .drain()
+            .map(|(_, handle)| handle)
+            .collect::<Vec<_>>();
+        for handle in commands {
+            // Detach/session replacement is terminal authority for commands
+            // started through this exact provider generation. Request cancel,
+            // then wait for provider-owned process reaping before closing.
+            let _ = self
+                .operate(WorkdirSessionOperation::CommandCancel(handle.clone()))
+                .await;
+            let _ = self
+                .operate(WorkdirSessionOperation::CommandOutput(
+                    workdir::CommandOutputRequest {
+                        handle,
+                        cursor: 0,
+                        limit: workdir::external::MAX_EXTERNAL_COMMAND_OUTPUT_BYTES,
+                        wait: true,
+                    },
+                ))
+                .await;
+        }
         self.closed.store(true, Ordering::Release);
         Ok(())
     }
@@ -3674,14 +3781,73 @@ struct ValidatedTicketImplementationTarget {
     capabilities: workdir::WorkdirSessionCapabilities,
 }
 
-fn external_workdir_capabilities(permissions: &str) -> Result<workdir::WorkdirSessionCapabilities> {
-    match permissions {
-        "read_only" => Ok(workdir::WorkdirSessionCapabilities::READ_ONLY),
-        "read_write" => Ok(workdir::WorkdirSessionCapabilities::READ_WRITE),
-        _ => Err(Error::Store(
-            "External Workdir grant has invalid persisted permissions".to_string(),
+fn external_workdir_permissions(persisted: &str) -> Result<server_api::ExternalWorkdirPermissions> {
+    let permissions = match persisted {
+        "read_only" => server_api::ExternalWorkdirPermissions {
+            read: true,
+            write: false,
+            command: false,
+        },
+        "read_write" => server_api::ExternalWorkdirPermissions {
+            read: true,
+            write: true,
+            command: false,
+        },
+        "command_only" => server_api::ExternalWorkdirPermissions {
+            read: false,
+            write: false,
+            command: true,
+        },
+        "read_command" => server_api::ExternalWorkdirPermissions {
+            read: true,
+            write: false,
+            command: true,
+        },
+        "read_write_command" => server_api::ExternalWorkdirPermissions {
+            read: true,
+            write: true,
+            command: true,
+        },
+        _ => {
+            return Err(Error::Store(
+                "External Workdir grant has invalid persisted permissions".to_string(),
+            ));
+        }
+    };
+    Ok(permissions)
+}
+
+fn persist_external_workdir_permissions(
+    permissions: server_api::ExternalWorkdirPermissions,
+) -> Result<&'static str> {
+    match (permissions.read, permissions.write, permissions.command) {
+        (true, false, false) => Ok("read_only"),
+        (true, true, false) => Ok("read_write"),
+        (false, false, true) => Ok("command_only"),
+        (true, false, true) => Ok("read_command"),
+        (true, true, true) => Ok("read_write_command"),
+        (false, true, _) => Err(Error::InvalidInput(
+            "External Workdir WRITE permission requires READ for read-before-write".to_string(),
+        )),
+        (false, false, false) => Err(Error::InvalidInput(
+            "External Workdir sharing requires at least one of READ or COMMAND".to_string(),
         )),
     }
+}
+
+fn external_workdir_capabilities(permissions: &str) -> Result<workdir::WorkdirSessionCapabilities> {
+    let permissions = external_workdir_permissions(permissions)?;
+    let mut capabilities = workdir::WorkdirSessionCapabilities::EMPTY;
+    if permissions.read {
+        capabilities = capabilities.union(workdir::WorkdirSessionCapabilities::READ_ONLY);
+    }
+    if permissions.write {
+        capabilities = capabilities.union(workdir::WorkdirSessionCapabilities::WRITE_ONLY);
+    }
+    if permissions.command {
+        capabilities = capabilities.union(workdir::WorkdirSessionCapabilities::COMMAND_ONLY);
+    }
+    Ok(capabilities)
 }
 
 fn workdir_source_capabilities(
@@ -17037,10 +17203,7 @@ async fn scoped_create_external_workdir_grant(
         .ttl_seconds
         .map(|ttl_seconds| now + Duration::seconds(ttl_seconds as i64))
         .map(|expires_at| expires_at.to_rfc3339_opts(SecondsFormat::Nanos, true));
-    let permissions = match request.permission {
-        server_api::ExternalWorkdirPermission::ReadOnly => "read_only",
-        server_api::ExternalWorkdirPermission::ReadWrite => "read_write",
-    };
+    let permissions = persist_external_workdir_permissions(request.permissions)?;
     let grant_id = format!("ewg-{}", Uuid::now_v7());
     let workdir_id = format!("external-{}", Uuid::now_v7());
     let grant = ExternalWorkdirGrantRecord {
@@ -17080,27 +17243,24 @@ async fn scoped_create_external_workdir_grant(
     schedule_external_workdir_expiry(&api, &grant)?;
     Ok((
         StatusCode::CREATED,
-        Json(external_workdir_grant_response(&grant)),
+        Json(external_workdir_grant_response(&grant)?),
     ))
 }
 
 fn external_workdir_grant_response(
     grant: &ExternalWorkdirGrantRecord,
-) -> ExternalWorkdirGrantResponse {
-    ExternalWorkdirGrantResponse {
+) -> Result<ExternalWorkdirGrantResponse> {
+    Ok(ExternalWorkdirGrantResponse {
         grant_id: grant.grant_id.clone(),
         workspace_id: grant.workspace_id.clone(),
         working_directory_id: grant.workdir_id.clone(),
         provider_instance_id: grant.provider_instance_id.clone(),
         display_name: grant.display_name.clone(),
-        permission: match grant.permissions.as_str() {
-            "read_write" => server_api::ExternalWorkdirPermission::ReadWrite,
-            _ => server_api::ExternalWorkdirPermission::ReadOnly,
-        },
+        permissions: external_workdir_permissions(&grant.permissions)?,
         expires_at: grant.expires_at.clone(),
         generation: grant.generation,
         status: grant.status.clone(),
-    }
+    })
 }
 
 async fn scoped_external_workdir_provider_ws(
@@ -17501,7 +17661,7 @@ async fn scoped_get_external_workdir_grant(
         cleanup_external_workdir_attachments(&api, &grant.workdir_id).await?;
         cancel_external_workdir_expiry(&api, &grant_id);
     }
-    Ok(Json(external_workdir_grant_response(&grant)))
+    Ok(Json(external_workdir_grant_response(&grant)?))
 }
 
 async fn scoped_revoke_external_workdir_grant(
@@ -17565,7 +17725,7 @@ async fn scoped_revoke_external_workdir_grant(
     // have committed its fence before a Runtime/session projection failure.
     cleanup_external_workdir_attachments(&api, &grant.workdir_id).await?;
     cancel_external_workdir_expiry(&api, &grant_id);
-    Ok(Json(external_workdir_grant_response(&grant)))
+    Ok(Json(external_workdir_grant_response(&grant)?))
 }
 
 async fn cleanup_external_workdir_attachments(
@@ -26069,6 +26229,39 @@ mod tests {
     };
 
     #[test]
+    fn external_permission_categories_map_to_existing_capability_bits_without_escalation() {
+        assert_eq!(
+            external_workdir_capabilities("read_only").unwrap(),
+            workdir::WorkdirSessionCapabilities::READ_ONLY
+        );
+        assert_eq!(
+            external_workdir_capabilities("read_write").unwrap(),
+            workdir::WorkdirSessionCapabilities::READ_WRITE
+        );
+        assert_eq!(
+            external_workdir_capabilities("command_only").unwrap(),
+            workdir::WorkdirSessionCapabilities::COMMAND_ONLY
+        );
+        assert_eq!(
+            external_workdir_capabilities("read_command").unwrap(),
+            workdir::WorkdirSessionCapabilities::READ_ONLY
+                .union(workdir::WorkdirSessionCapabilities::COMMAND_ONLY)
+        );
+        assert_eq!(
+            external_workdir_capabilities("read_write_command").unwrap(),
+            workdir::WorkdirSessionCapabilities::ALL
+        );
+        assert!(
+            persist_external_workdir_permissions(server_api::ExternalWorkdirPermissions {
+                read: false,
+                write: true,
+                command: false,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
     fn worker_projection_does_not_expose_unavailable_snapshot_as_current() {
         let availability = protocol::subscription::SubscriptionWorkerAvailability::Unavailable;
         let worker_ref = RuntimeWorkerRef::new("runtime-a", "worker-a");
@@ -26260,6 +26453,156 @@ mod tests {
             ))
         ));
         assert!(commands.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn external_operation_cancel_retries_without_blocking_a_saturated_provider_queue() {
+        let (sender, mut commands) = tokio::sync::mpsc::channel(1);
+        let queued_id = ExternalWorkdirOperationId::new("op-queued").unwrap();
+        sender
+            .send(ExternalProviderCommand::Cancel {
+                operation_id: queued_id.clone(),
+            })
+            .await
+            .unwrap();
+
+        let retried_id = ExternalWorkdirOperationId::new("op-retried").unwrap();
+        enqueue_external_operation_cancel(sender, retried_id.clone());
+
+        let Some(ExternalProviderCommand::Cancel { operation_id }) = commands.recv().await else {
+            panic!("expected pre-existing queued cancellation");
+        };
+        assert_eq!(operation_id, queued_id);
+        let retried = tokio::time::timeout(std::time::Duration::from_secs(1), commands.recv())
+            .await
+            .expect("cancellation retry should not be lost");
+        let Some(ExternalProviderCommand::Cancel { operation_id }) = retried else {
+            panic!("expected retried cancellation");
+        };
+        assert_eq!(operation_id, retried_id);
+    }
+
+    #[tokio::test]
+    async fn external_provider_command_only_session_denies_read_and_routes_bounded_lifecycle() {
+        let (sender, mut commands) = tokio::sync::mpsc::channel(4);
+        let capabilities = workdir::WorkdirSessionCapabilities::COMMAND_ONLY;
+        let connection = Arc::new(ExternalProviderConnection {
+            grant_id: "grant-command".to_string(),
+            workdir_id: "external-command".to_string(),
+            provider_instance_id: "provider-command".to_string(),
+            generation: 8,
+            expires_at: None,
+            capabilities,
+            admission: Arc::new(tokio::sync::Semaphore::new(16)),
+            sender,
+        });
+        let session = Arc::new(ExternalProviderWorkdirSession::new(connection, None));
+        let denied = session
+            .read(workdir::ReadRequest {
+                path: workdir::WorkdirPath::new("secret.txt").unwrap(),
+                offset: 0,
+                limit: 1,
+                max_bytes: 1,
+            })
+            .await;
+        assert!(matches!(
+            denied,
+            Err(workdir::WorkdirError::Unsupported(
+                workdir::WorkdirSessionCapability::Read
+            ))
+        ));
+        assert!(commands.try_recv().is_err());
+
+        let starter = {
+            let session = session.clone();
+            tokio::spawn(async move {
+                session
+                    .start_command(workdir::CommandRequest {
+                        command: "printf routed".to_string(),
+                        timeout_secs: 30,
+                        output_limit: 1024,
+                        cwd: workdir::WorkdirPath::root(),
+                        spill_dir: Some("/worker/private/spill".into()),
+                        tool_call_id: Some("call-1".to_string()),
+                    })
+                    .await
+            })
+        };
+        let Some(ExternalProviderCommand::Operation {
+            operation,
+            response,
+            ..
+        }) = commands.recv().await
+        else {
+            panic!("expected command start operation");
+        };
+        assert!(matches!(
+            operation,
+            WorkdirSessionOperation::CommandStart(workdir::CommandRequest {
+                spill_dir: None,
+                ..
+            })
+        ));
+        let handle = workdir::CommandHandle("command-1".to_string());
+        response
+            .send(Ok(WorkdirSessionOperationResult::CommandStart(
+                handle.clone(),
+            )))
+            .unwrap();
+        assert_eq!(starter.await.unwrap().unwrap(), handle);
+
+        let closer = {
+            let session = session.clone();
+            tokio::spawn(async move { session.close().await })
+        };
+        let Some(ExternalProviderCommand::Operation {
+            operation,
+            response,
+            ..
+        }) = commands.recv().await
+        else {
+            panic!("expected command cancel during close");
+        };
+        assert!(matches!(
+            operation,
+            WorkdirSessionOperation::CommandCancel(ref current) if current == &handle
+        ));
+        response
+            .send(Ok(WorkdirSessionOperationResult::CommandCancel))
+            .unwrap();
+        let Some(ExternalProviderCommand::Operation {
+            operation,
+            response,
+            ..
+        }) = commands.recv().await
+        else {
+            panic!("expected terminal command output during close");
+        };
+        assert!(matches!(
+            operation,
+            WorkdirSessionOperation::CommandOutput(workdir::CommandOutputRequest {
+                wait: true,
+                ..
+            })
+        ));
+        response
+            .send(Ok(WorkdirSessionOperationResult::CommandOutput(
+                workdir::CommandOutput {
+                    status: workdir::CommandStatus::Cancelled,
+                    exit_code: None,
+                    timed_out: false,
+                    content: String::new(),
+                    next_cursor: None,
+                    truncated: false,
+                    output_path: None,
+                },
+            )))
+            .unwrap();
+        closer.await.unwrap().unwrap();
+        assert!(matches!(
+            session.command_status(handle).await,
+            Err(workdir::WorkdirError::SessionClosed)
+        ));
     }
 
     #[tokio::test]
@@ -26696,7 +27039,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_provider_websocket_reconnects_with_fresh_generation_and_revokes() {
+    async fn external_provider_websocket_routes_files_and_commands_then_reconnects_and_revokes() {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
         let api = test_api(dir.path()).await;
@@ -26726,7 +27069,11 @@ mod tests {
                 provider_instance_id: "provider-a".to_string(),
                 display_name: "Session logs".to_string(),
                 ttl_seconds: Some(600),
-                permission: server_api::ExternalWorkdirPermission::ReadWrite,
+                permissions: server_api::ExternalWorkdirPermissions {
+                    read: true,
+                    write: true,
+                    command: true,
+                },
             }),
         )
         .await
@@ -26755,7 +27102,7 @@ mod tests {
                         .id()
                         .clone(),
                     generation,
-                    capabilities: workdir::WorkdirSessionCapabilities::READ_WRITE,
+                    capabilities: workdir::WorkdirSessionCapabilities::ALL,
                     read_limits: workdir::BoundedReadLimits::EXTERNAL_DEFAULT,
                 },
             })
@@ -26867,14 +27214,16 @@ mod tests {
         );
         assert_eq!(
             external_capabilities,
-            workdir::WorkdirSessionCapabilities::READ_WRITE
+            workdir::WorkdirSessionCapabilities::ALL
         );
         let provider_root = tempfile::tempdir().unwrap();
         fs::write(provider_root.path().join("events.jsonl"), b"one\ntwo\n").unwrap();
-        let local_session = workdir::LocalWorkdirSession::external_read_write(
+        let pinned_provider_root = workdir::ExternalWorkdirRoot::pin(provider_root.path()).unwrap();
+        let local_session = workdir::LocalWorkdirSession::external_with_capabilities_pinned(
             workdir::Workdir::new(&grant.working_directory_id),
-            provider_root.path(),
+            pinned_provider_root,
             workdir::BoundedReadLimits::EXTERNAL_DEFAULT,
+            workdir::WorkdirSessionCapabilities::ALL,
         )
         .unwrap();
         let session_lock = current_worker_session_lock(&api, &worker);
@@ -26885,7 +27234,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             broker_session.capabilities(),
-            workdir::WorkdirSessionCapabilities::READ_WRITE
+            workdir::WorkdirSessionCapabilities::ALL
         );
         drop(session_guard);
         let read = {
@@ -27052,26 +27401,120 @@ mod tests {
             fs::read_to_string(provider_root.path().join("created.txt")).unwrap(),
             "created"
         );
-        let command_error = broker_session
-            .start_command(workdir::CommandRequest {
-                command: "touch forbidden".to_string(),
-                timeout_secs: 1,
-                output_limit: 1024,
-                cwd: workdir::WorkdirPath::root(),
-                spill_dir: None,
-                tool_call_id: None,
+        let command_start = {
+            let broker_session = broker_session.clone();
+            tokio::spawn(async move {
+                broker_session
+                    .start_command(workdir::CommandRequest {
+                        command: "printf command-ok".to_string(),
+                        timeout_secs: 30,
+                        output_limit: 1024,
+                        cwd: workdir::WorkdirPath::root(),
+                        spill_dir: Some("/worker/private/spill".into()),
+                        tool_call_id: Some("call-e2e".to_string()),
+                    })
+                    .await
             })
+        };
+        let (operation_id, operation) = loop {
+            let text = second.next().await.unwrap().unwrap().into_text().unwrap();
+            let frame = serde_json::from_str::<ExternalWorkdirServerFrame>(&text).unwrap();
+            if let ExternalWorkdirServerMessage::Operation {
+                generation: 2,
+                operation_id,
+                operation,
+            } = frame.message
+            {
+                break (operation_id, operation);
+            }
+        };
+        assert!(matches!(
+            operation.as_inner(),
+            WorkdirSessionOperation::CommandStart(workdir::CommandRequest {
+                spill_dir: None,
+                ..
+            })
+        ));
+        let result = workdir::http::dispatch_workdir_session_operation(
+            &local_session,
+            operation.into_inner(),
+        )
+        .await
+        .unwrap()
+        .try_into()
+        .unwrap();
+        second
+            .send(Message::Text(
+                serde_json::to_string(&ExternalWorkdirProviderFrame::current(
+                    ExternalWorkdirProviderMessage::OperationResult {
+                        generation: 2,
+                        operation_id,
+                        outcome: ExternalWorkdirOperationOutcome::Completed { result },
+                    },
+                ))
+                .unwrap()
+                .into(),
+            ))
             .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                command_error,
-                workdir::WorkdirError::Unsupported(workdir::WorkdirSessionCapability::Command)
-                    | workdir::WorkdirError::UnsupportedOperation(_)
-                    | workdir::WorkdirError::Denied(_)
-            ),
-            "unexpected command error: {command_error:?}"
-        );
+            .unwrap();
+        let command_handle = command_start.await.unwrap().unwrap();
+
+        let command_output = {
+            let broker_session = broker_session.clone();
+            let handle = command_handle.clone();
+            tokio::spawn(async move {
+                broker_session
+                    .command_output(workdir::CommandOutputRequest {
+                        handle,
+                        cursor: 0,
+                        limit: 1024,
+                        wait: true,
+                    })
+                    .await
+            })
+        };
+        let (operation_id, operation) = loop {
+            let text = second.next().await.unwrap().unwrap().into_text().unwrap();
+            let frame = serde_json::from_str::<ExternalWorkdirServerFrame>(&text).unwrap();
+            if let ExternalWorkdirServerMessage::Operation {
+                generation: 2,
+                operation_id,
+                operation,
+            } = frame.message
+            {
+                break (operation_id, operation);
+            }
+        };
+        assert!(matches!(
+            operation.as_inner(),
+            WorkdirSessionOperation::CommandOutput(_)
+        ));
+        let result = workdir::http::dispatch_workdir_session_operation(
+            &local_session,
+            operation.into_inner(),
+        )
+        .await
+        .unwrap()
+        .try_into()
+        .unwrap();
+        second
+            .send(Message::Text(
+                serde_json::to_string(&ExternalWorkdirProviderFrame::current(
+                    ExternalWorkdirProviderMessage::OperationResult {
+                        generation: 2,
+                        operation_id,
+                        outcome: ExternalWorkdirOperationOutcome::Completed { result },
+                    },
+                ))
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let command_output = command_output.await.unwrap().unwrap();
+        assert_eq!(command_output.content, "command-ok");
+        assert_eq!(command_output.exit_code, Some(0));
+        assert_eq!(command_output.output_path, None);
 
         let Json(revoked) = scoped_revoke_external_workdir_grant(
             State(api.clone()),

@@ -697,7 +697,10 @@ CREATE TABLE external_workdir_grants (
     workdir_id TEXT NOT NULL,
     provider_instance_id TEXT NOT NULL,
     display_name TEXT NOT NULL,
-    permissions TEXT NOT NULL CHECK (permissions IN ('read_only', 'read_write')),
+    permissions TEXT NOT NULL CHECK (permissions IN (
+        'read_only', 'read_write', 'command_only',
+        'read_command', 'read_write_command'
+    )),
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
     expires_at TEXT,

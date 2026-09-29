@@ -2015,8 +2015,8 @@
           "display_name": {
             "type": "string"
           },
-          "permission": {
-            "$ref": "#/components/schemas/ExternalWorkdirPermission"
+          "permissions": {
+            "$ref": "#/components/schemas/ExternalWorkdirPermissions"
           },
           "provider_instance_id": {
             "type": "string"
@@ -2034,7 +2034,7 @@
         "required": [
           "provider_instance_id",
           "display_name",
-          "permission"
+          "permissions"
         ],
         "type": "object"
       },
@@ -2060,8 +2060,8 @@
           "grant_id": {
             "type": "string"
           },
-          "permission": {
-            "$ref": "#/components/schemas/ExternalWorkdirPermission"
+          "permissions": {
+            "$ref": "#/components/schemas/ExternalWorkdirPermissions"
           },
           "provider_instance_id": {
             "type": "string"
@@ -2082,18 +2082,34 @@
           "working_directory_id",
           "provider_instance_id",
           "display_name",
-          "permission",
+          "permissions",
           "generation",
           "status"
         ],
         "type": "object"
       },
-      "ExternalWorkdirPermission": {
-        "enum": [
-          "read_only",
-          "read_write"
+      "ExternalWorkdirPermissions": {
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "description": "Execute commands as the sharing CLI user on the provider host. This is\nexplicit authority and does not imply either filesystem category.",
+            "type": "boolean"
+          },
+          "read": {
+            "description": "Read files and use read-only discovery operations such as Glob and Grep.",
+            "type": "boolean"
+          },
+          "write": {
+            "description": "Create or update files with Write and Edit. Existing-file mutation also\nrequires `read` so callers can satisfy the read-before-write contract.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "read",
+          "write",
+          "command"
         ],
-        "type": "string"
+        "type": "object"
       },
       "ExtractAudit": {
         "properties": {
@@ -13994,7 +14010,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:845d8859bab4de95f0539969ae8c84bbf3fb4a0548638e4278d6c90f9bb6cb3a"
+    "x-yoi-source-digest": "sha256:e0407f2ae3f1d454d05543627b87eff8eb001b5a90a900ca5af91d7bb492c3be"
   },
   "openapi": "3.1.0",
   "paths": {

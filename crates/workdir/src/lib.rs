@@ -134,6 +134,16 @@ impl WorkdirSessionCapabilities {
         bits: Self::READ | Self::GLOB | Self::GREP,
     };
 
+    /// Operator-facing WRITE category without implicitly granting READ or COMMAND.
+    pub const WRITE_ONLY: Self = Self {
+        bits: Self::WRITE | Self::EDIT,
+    };
+
+    /// Operator-facing COMMAND category without implicitly granting file access.
+    pub const COMMAND_ONLY: Self = Self {
+        bits: Self::COMMAND,
+    };
+
     /// Filesystem read/write authority without process execution.
     ///
     /// External Workdirs use this capability set so operator-approved file
@@ -389,5 +399,25 @@ impl From<fs_operation::FsError> for WorkdirError {
             fs_operation::FsError::InvalidArgument(message) => Self::InvalidArgument(message),
             fs_operation::FsError::Io { path, source } => Self::Io { path, source },
         }
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    fn bits(capabilities: WorkdirSessionCapabilities) -> u8 {
+        serde_json::to_value(capabilities).unwrap()["bits"]
+            .as_u64()
+            .unwrap() as u8
+    }
+
+    #[test]
+    fn external_categories_preserve_operation_bit_values() {
+        assert_eq!(bits(WorkdirSessionCapabilities::READ_ONLY), 25);
+        assert_eq!(bits(WorkdirSessionCapabilities::WRITE_ONLY), 6);
+        assert_eq!(bits(WorkdirSessionCapabilities::READ_WRITE), 31);
+        assert_eq!(bits(WorkdirSessionCapabilities::COMMAND_ONLY), 32);
+        assert_eq!(bits(WorkdirSessionCapabilities::ALL), 63);
     }
 }

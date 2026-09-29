@@ -11,6 +11,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -762,6 +764,42 @@ impl LocalWorkdirSession {
         Self::external_read_write_pinned(workdir, root, read_limits)
     }
 
+    /// Construct an External provider session with an exact operator-approved
+    /// READ/WRITE/COMMAND category set. WRITE requires READ so callers can
+    /// satisfy the read-before-write contract; COMMAND remains independent.
+    pub fn external_with_capabilities_pinned(
+        workdir: Workdir,
+        pinned: ExternalWorkdirRoot,
+        read_limits: BoundedReadLimits,
+        capabilities: WorkdirSessionCapabilities,
+    ) -> Result<Self, WorkdirError> {
+        let read = WorkdirSessionCapabilities::READ_ONLY;
+        let read_write = WorkdirSessionCapabilities::READ_WRITE;
+        let command = WorkdirSessionCapabilities::COMMAND_ONLY;
+        if ![
+            read,
+            read_write,
+            command,
+            read.union(command),
+            read_write.union(command),
+        ]
+        .contains(&capabilities)
+        {
+            return Err(WorkdirError::InvalidArgument(
+                "External Workdir capabilities must contain at least one of READ or COMMAND, and WRITE requires READ"
+                    .to_string(),
+            ));
+        }
+        let permission = if capabilities.supports(WorkdirSessionCapability::Write) {
+            Permission::Write
+        } else {
+            // Command execution still needs provider-internal read access to
+            // validate and enter its cwd. This scope is not an exposed READ grant.
+            Permission::Read
+        };
+        Self::external_pinned(workdir, pinned, read_limits, permission, capabilities)
+    }
+
     /// Construct a read-only provider session from a root pinned before remote
     /// grant creation.
     pub fn external_read_only_pinned(
@@ -769,11 +807,10 @@ impl LocalWorkdirSession {
         pinned: ExternalWorkdirRoot,
         read_limits: BoundedReadLimits,
     ) -> Result<Self, WorkdirError> {
-        Self::external_pinned(
+        Self::external_with_capabilities_pinned(
             workdir,
             pinned,
             read_limits,
-            Permission::Read,
             WorkdirSessionCapabilities::READ_ONLY,
         )
     }
@@ -785,11 +822,10 @@ impl LocalWorkdirSession {
         pinned: ExternalWorkdirRoot,
         read_limits: BoundedReadLimits,
     ) -> Result<Self, WorkdirError> {
-        Self::external_pinned(
+        Self::external_with_capabilities_pinned(
             workdir,
             pinned,
             read_limits,
-            Permission::Write,
             WorkdirSessionCapabilities::READ_WRITE,
         )
     }
@@ -1556,6 +1592,45 @@ fn sanitize_error(error: WorkdirError, logical: &WorkdirPath) -> WorkdirError {
     }
 }
 
+#[derive(Debug)]
+struct CommandProcessGroupGuard {
+    process_group_id: Option<u32>,
+}
+
+impl CommandProcessGroupGuard {
+    fn new(process_group_id: Option<u32>) -> Self {
+        Self { process_group_id }
+    }
+
+    fn terminate(&mut self) {
+        let Some(process_group_id) = self.process_group_id.take() else {
+            return;
+        };
+        terminate_process_group(process_group_id);
+    }
+}
+
+impl Drop for CommandProcessGroupGuard {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+#[cfg(unix)]
+fn terminate_process_group(process_group_id: u32) {
+    let Ok(process_group_id) = i32::try_from(process_group_id) else {
+        return;
+    };
+    // The command is spawned as its own process-group leader below. A negative
+    // pid addresses that exact group, including descendants that outlive bash.
+    unsafe {
+        libc::kill(-process_group_id, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_process_group(_process_group_id: u32) {}
+
 async fn run_command(
     cwd: PathBuf,
     request: CommandRequest,
@@ -1574,7 +1649,8 @@ async fn run_command(
         .map_err(|error| WorkdirError::io(&stderr_path, error))?;
 
     telemetry.started(&command_id, request.tool_call_id.clone());
-    let mut child = match Command::new("bash")
+    let mut command = Command::new("bash");
+    command
         .arg("-c")
         .arg(&request.command)
         .current_dir(&cwd)
@@ -1582,15 +1658,17 @@ async fn run_command(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
-        .kill_on_drop(true)
-        .spawn()
-    {
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.as_std_mut().process_group(0);
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             telemetry.terminal(&command_id, CommandStatus::Failed, None);
             return Err(WorkdirError::io(&cwd, error));
         }
     };
+    let mut process_group = CommandProcessGroupGuard::new(child.id());
 
     let mut stdout_reader =
         std::fs::File::open(&stdout_path).map_err(|error| WorkdirError::io(&stdout_path, error))?;
@@ -1609,18 +1687,21 @@ async fn run_command(
         tokio::select! {
             exit = child.wait() => {
                 let exit = exit.map_err(|error| WorkdirError::io(&cwd, error))?;
+                process_group.terminate();
                 break (
                     if exit.success() { CommandStatus::Completed } else { CommandStatus::Failed },
                     exit.code(),
                 );
             }
             _ = &mut timeout => {
+                process_group.terminate();
                 let _ = child.start_kill();
                 let exit_code = child.wait().await.ok().and_then(|status| status.code());
                 break (CommandStatus::TimedOut, exit_code);
             }
             changed = cancel.changed() => {
                 if changed.is_err() || *cancel.borrow() {
+                    process_group.terminate();
                     let _ = child.start_kill();
                     let exit_code = child.wait().await.ok().and_then(|status| status.code());
                     break (CommandStatus::Cancelled, exit_code);
@@ -3471,6 +3552,55 @@ mod tests {
         );
         WorkdirSession::close(&session).await.unwrap();
         assert!(released.load(Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_kills_command_process_group_descendants() {
+        let dir = TempDir::new().unwrap();
+        let workdir = make_fs(&dir);
+        let handle = WorkdirSession::start_command(
+            &workdir,
+            CommandRequest {
+                command: "(sleep 0.4; echo leaked > child-marker) & echo ready > child-ready; wait"
+                    .into(),
+                timeout_secs: 60,
+                output_limit: 1024,
+                cwd: WorkdirPath::root(),
+                spill_dir: None,
+                tool_call_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        for _ in 0..100 {
+            if dir.path().join("child-ready").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(dir.path().join("child-ready").exists());
+
+        WorkdirSession::cancel_command(&workdir, handle.clone())
+            .await
+            .unwrap();
+        let output = WorkdirSession::command_output(
+            &workdir,
+            CommandOutputRequest {
+                handle,
+                cursor: 0,
+                limit: 1024,
+                wait: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.status, CommandStatus::Cancelled);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !dir.path().join("child-marker").exists(),
+            "cancelled command descendant survived its process group"
+        );
     }
 
     #[tokio::test]
