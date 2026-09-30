@@ -16,9 +16,10 @@ use tokio::sync::broadcast;
 use crate::{
     CommandEvent, CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest,
     CommandSnapshot, CommandStatus, EditRequest, EditResult, GlobRequest, GlobResult, GrepRequest,
-    GrepResult, ListRequest, ListResult, ReadRequest, ReadResult, StatRequest, StatResult, Workdir,
-    WorkdirError, WorkdirScopeAuthorizationRequest, WorkdirScopeOverlapRequest, WorkdirSession,
-    WorkdirSessionCapabilities, WorkdirSessionHandle, WriteRequest, WriteResult,
+    GrepResult, ListRequest, ListResult, ReadBytesRequest, ReadBytesResult, ReadRequest,
+    ReadResult, StatRequest, StatResult, Workdir, WorkdirError, WorkdirScopeAuthorizationRequest,
+    WorkdirScopeOverlapRequest, WorkdirSession, WorkdirSessionCapabilities, WorkdirSessionHandle,
+    WriteRequest, WriteResult,
 };
 
 /// Stable Worker-local routing key for one attached Workdir.
@@ -255,6 +256,11 @@ impl WorkdirSession for RoutedWorkdirSession {
     async fn read(&self, request: ReadRequest) -> Result<ReadResult, WorkdirError> {
         let _active = self.state.enter()?;
         self.state.session.read(request).await
+    }
+
+    async fn read_bytes(&self, request: ReadBytesRequest) -> Result<ReadBytesResult, WorkdirError> {
+        let _active = self.state.enter()?;
+        self.state.session.read_bytes(request).await
     }
 
     async fn write(&self, request: WriteRequest) -> Result<WriteResult, WorkdirError> {

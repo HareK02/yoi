@@ -106,7 +106,7 @@ Deno.test("Worker summary parser preserves attachment-effective External permiss
       source: {
         kind: "external_grant",
         grant_id: "grant-1",
-        grant_permissions: { read: true, write: false, command: true },
+        grant_permissions: { read: true, write: true, command: true },
       },
       materializer_kind: "client_hosted_external",
       status: "active",

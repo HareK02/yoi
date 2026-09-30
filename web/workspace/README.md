@@ -96,6 +96,7 @@ Use semantic tokens from `app.css`. Do not introduce component-local color, spac
 - `src/routes/w/[workspaceId]/settings/+layout.svelte`: Settings Sidebar registration.
 - `src/lib/workspace/header/`: Header frame, context, and overrides.
 - `src/lib/workspace/sidebar/`: Sidebar frame, scoped content, contexts, and override stack.
+- `src/lib/workspace/markdown/`: shared safe Markdown parsing plus presentation-specific document renderers.
 - `src/lib/workspace/ui/`: generic presentation components such as `Tooltip`, `Bevel`, and `BevelLine`.
 - `src/routes/design-lab/workspace-web-ux/`: static Design Language showroom.
 

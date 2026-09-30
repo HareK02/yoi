@@ -10,6 +10,7 @@ import type {
   InternalWorkerRef,
   InternalWorkerSnapshot,
   Segment,
+  SessionSnapshotEntry,
   WorkerState,
   WorkerStateSnapshot,
   WorkerStatus,
@@ -90,6 +91,8 @@ export type ConsoleLine = {
   compaction?: ConsoleCompaction;
   diff?: ConsoleDiffLine[];
   eventId?: string | null;
+  /** Stable durable identity when this line originates from a committed entry. */
+  entryId?: string;
   source: "event";
   streaming?: boolean;
   error?: boolean;
@@ -244,6 +247,86 @@ export function createConsoleProjector() {
       return projectVisibleConsole(projection);
     },
   };
+}
+
+export function mergeCommittedHistoryLines(
+  history: ConsoleLine[],
+  current: ConsoleLine[],
+): ConsoleLine[] {
+  const currentEntryIds = new Set(
+    current.map((line) => line.entryId).filter((id): id is string =>
+      Boolean(id)
+    ),
+  );
+  const historyPositions = new Map<string, number>();
+  history.forEach((line, index) => {
+    if (line.entryId && !historyPositions.has(line.entryId)) {
+      historyPositions.set(line.entryId, index);
+    }
+  });
+
+  // Use stable entries that occur in the same order in both projections as
+  // anchors. History-only rows are inserted in their retained interval, while
+  // current-only rows retain the snapshot's authoritative order. This handles
+  // Compact snapshots that preserve only a non-contiguous subset of context.
+  const anchors: Array<{ history: number; current: number }> = [];
+  let lastHistoryIndex = -1;
+  current.forEach((line, currentIndex) => {
+    const historyIndex = line.entryId
+      ? historyPositions.get(line.entryId)
+      : undefined;
+    if (historyIndex !== undefined && historyIndex > lastHistoryIndex) {
+      anchors.push({ history: historyIndex, current: currentIndex });
+      lastHistoryIndex = historyIndex;
+    }
+  });
+
+  if (anchors.length === 0) {
+    return [
+      ...history.filter((line) =>
+        !line.entryId || !currentEntryIds.has(line.entryId)
+      ),
+      ...current,
+    ];
+  }
+
+  const merged: ConsoleLine[] = [];
+  let historyCursor = 0;
+  let currentCursor = 0;
+  const appendHistoryInterval = (end: number) => {
+    for (; historyCursor < end; historyCursor += 1) {
+      const line = history[historyCursor]!;
+      if (!line.entryId || !currentEntryIds.has(line.entryId)) {
+        merged.push(line);
+      }
+    }
+  };
+  for (const [index, anchor] of anchors.entries()) {
+    if (index === 0) {
+      // Current rows before the first shared entry can be older retained
+      // context that the newest history page starts after.
+      merged.push(...current.slice(currentCursor, anchor.current));
+      appendHistoryInterval(anchor.history);
+    } else {
+      appendHistoryInterval(anchor.history);
+      merged.push(...current.slice(currentCursor, anchor.current));
+    }
+    merged.push(current[anchor.current]!);
+    historyCursor = anchor.history + 1;
+    currentCursor = anchor.current + 1;
+  }
+  appendHistoryInterval(history.length);
+  merged.push(...current.slice(currentCursor));
+  return merged;
+}
+
+export function projectSessionHistoryEntries(
+  entries: SessionSnapshotEntry[],
+  cwd: string | null,
+): ConsoleLine[] {
+  return projectVisibleConsole(
+    snapshotProjectionFromSession("history", { entries }, cwd),
+  ).lines;
 }
 
 function projectVisibleConsole(
@@ -813,14 +896,19 @@ export function applyProtocolEvent(
 
   switch (event.event) {
     case "user_message":
-      next.lines.push(
-        line(
+      next.lines.push({
+        ...line(
           envelope.eventId,
           "user",
           "User",
           segmentsToText(event.data.segments),
         ),
-      );
+        entryId: event.data.entry_id ?? undefined,
+      });
+      break;
+    case "session_entry_committed":
+      reconcileCommittedSessionEntry(next, event.data.entry);
+      applySessionEntry(next, envelope.eventId, event.data.entry);
       break;
     case "system_item":
       next.lines.push(systemItemLine(envelope.eventId, event.data.item));
@@ -1507,6 +1595,7 @@ function readAggregateLine(group: ConsoleLine[]): ConsoleLine {
     toolStatus: hasError ? "failed" : inProgress ? "reading…" : "done",
     detail: calls.map(readDetail).join("\n\n"),
     eventId: group.at(-1)?.eventId,
+    entryId: group.at(-1)?.entryId,
     source: "event",
     streaming: inProgress,
     error: hasError,
@@ -1971,6 +2060,22 @@ function snapshotProjectionFromSession(
   return projection;
 }
 
+function reconcileCommittedSessionEntry(
+  projection: ConsoleProjection,
+  entry: SessionSnapshotEntry,
+): void {
+  if (entry.kind !== "message" || entry.role !== "assistant") return;
+  for (let index = projection.lines.length - 1; index >= 0; index -= 1) {
+    const line = projection.lines[index];
+    if (line.entryId) continue;
+    if (line.kind === "assistant" || line.kind === "in_flight") {
+      projection.lines.splice(index, 1);
+      return;
+    }
+    if (line.kind === "user") return;
+  }
+}
+
 function applySessionEntry(
   projection: ConsoleProjection,
   fallbackEventId: string,
@@ -1978,6 +2083,7 @@ function applySessionEntry(
 ): void {
   if (!isRecord(value)) return;
   const eventId = stringField(value, "entry_id") ?? fallbackEventId;
+  const lineCountBefore = projection.lines.length;
   switch (stringField(value, "kind")) {
     case "user_input":
       projection.lines.push(
@@ -2034,6 +2140,18 @@ function applySessionEntry(
       break;
     default:
       break;
+  }
+  const entryId = stringField(value, "entry_id");
+  if (entryId) {
+    for (
+      let index = Math.max(0, lineCountBefore - 1);
+      index < projection.lines.length;
+      index += 1
+    ) {
+      if (projection.lines[index].eventId === eventId) {
+        projection.lines[index].entryId = entryId;
+      }
+    }
   }
 }
 

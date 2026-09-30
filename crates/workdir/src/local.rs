@@ -30,10 +30,10 @@ use crate::{
     BoundedReadLimits, CommandEvent, CommandHandle, CommandOutput, CommandOutputRequest,
     CommandRequest, CommandSnapshot, CommandStatus, CommandStream, CommandStreamSlice, EditRequest,
     EditResult, GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest, ListResult,
-    ReadRequest, ReadResult, StatRequest, StatResult, Workdir, WorkdirError, WorkdirPath,
-    WorkdirScopeAuthorizationRequest, WorkdirScopeOverlapRequest, WorkdirSession,
-    WorkdirSessionCapabilities, WorkdirSessionCapability, WorkdirToolScopePermission, WriteRequest,
-    WriteResult,
+    ReadBytesRequest, ReadBytesResult, ReadRequest, ReadResult, StatRequest, StatResult, Workdir,
+    WorkdirError, WorkdirPath, WorkdirScopeAuthorizationRequest, WorkdirScopeOverlapRequest,
+    WorkdirSession, WorkdirSessionCapabilities, WorkdirSessionCapability,
+    WorkdirToolScopePermission, WriteRequest, WriteResult,
 };
 #[cfg(test)]
 use crate::{EntryKind, WriteOutcome};
@@ -1256,6 +1256,21 @@ impl WorkdirSession for LocalWorkdirSession {
                 fs_operation::run_read_bounded(&self.inner.root, request, &access, limits)
             }
             None => fs_operation::run_read(&self.inner.root, request, &access),
+        }
+        .map_err(WorkdirError::from)
+        .map_err(|error| sanitize_error(error, &logical))
+    }
+
+    async fn read_bytes(&self, request: ReadBytesRequest) -> Result<ReadBytesResult, WorkdirError> {
+        self.ensure_capability(WorkdirSessionCapability::Read)?;
+        let logical = request.path.clone();
+        self.validate_operation_path(&request.path)?;
+        let access = self.scope_access();
+        match self.inner.read_limits {
+            Some(limits) => {
+                fs_operation::run_read_bytes_bounded(&self.inner.root, request, &access, limits)
+            }
+            None => fs_operation::run_read_bytes(&self.inner.root, request, &access),
         }
         .map_err(WorkdirError::from)
         .map_err(|error| sanitize_error(error, &logical))

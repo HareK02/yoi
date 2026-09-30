@@ -1148,7 +1148,7 @@ impl App {
             Event::PendingSubmissionsChanged { pending } => {
                 self.pending_submissions = pending;
             }
-            Event::UserMessage { segments } => {
+            Event::UserMessage { segments, .. } => {
                 self.turn_index += 1;
                 self.blocks.push(Block::TurnHeader {
                     turn: self.turn_index,
@@ -1168,6 +1168,9 @@ impl App {
                 }
                 self.assistant_streaming = false;
             }
+            // The TUI already renders assistant/tool streaming events. This commit
+            // marker exists so identity-aware clients can reconcile durable history.
+            Event::SessionEntryCommitted { .. } => {}
             Event::SystemItem { item } => {
                 self.apply_system_item(&item);
                 self.assistant_streaming = false;
@@ -3391,6 +3394,7 @@ mod completion_flow_tests {
             ]),
         });
         app.handle_worker_event(Event::UserMessage {
+            entry_id: None,
             segments: vec![Segment::text("first persisted message")],
         });
 
@@ -3409,6 +3413,7 @@ mod completion_flow_tests {
         assert_eq!(input_text(&app), "");
 
         app.handle_worker_event(Event::UserMessage {
+            entry_id: None,
             segments: submitted,
         });
         // Simulate run-derived attachment display after the submitted user line.
@@ -3449,6 +3454,7 @@ mod completion_flow_tests {
         let mut app = App::new("test".into());
         let submitted = submit_text(&mut app, "original submit");
         app.handle_worker_event(Event::UserMessage {
+            entry_id: None,
             segments: submitted,
         });
         for c in "draft while running".chars() {
@@ -3477,6 +3483,7 @@ mod completion_flow_tests {
             let mut app = App::new("test".into());
             let submitted = submit_text(&mut app, "normal run");
             app.handle_worker_event(Event::UserMessage {
+                entry_id: None,
                 segments: submitted,
             });
             app.handle_worker_event(Event::RunEnd { result });

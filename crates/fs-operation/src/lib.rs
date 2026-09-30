@@ -15,7 +15,8 @@ use thiserror::Error;
 
 pub use glob::run_glob;
 pub use local::{
-    resolve_access_path, run_edit, run_list, run_read, run_read_bounded, run_stat, run_write,
+    resolve_access_path, run_edit, run_list, run_read, run_read_bounded, run_read_bytes,
+    run_read_bytes_bounded, run_stat, run_write,
 };
 pub use operation::*;
 pub use search::run_grep;
@@ -567,6 +568,103 @@ mod tests {
             limit: 10,
             offset: 0,
         }
+    }
+
+    #[test]
+    fn bounded_byte_reads_preserve_binary_ranges_and_fence_versions() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let original = b"\x89PNG\r\n\x1a\n\0line\n\xfftail";
+        std::fs::write(root.join("image.bin"), original).unwrap();
+        let access = RootAccess(root.clone());
+        let limits = BoundedReadLimits::new(1024, 8).unwrap();
+
+        let first = run_read_bytes_bounded(
+            &root,
+            ReadBytesRequest {
+                path: FsPath::new("image.bin").unwrap(),
+                offset: 0,
+                max_bytes: 8,
+                expected_hash: None,
+            },
+            &access,
+            limits,
+        )
+        .unwrap();
+        assert_eq!(first.bytes, original[..8]);
+        assert_eq!(first.total_bytes, original.len() as u64);
+        assert!(!first.eof);
+
+        let second = run_read_bytes_bounded(
+            &root,
+            ReadBytesRequest {
+                path: FsPath::new("image.bin").unwrap(),
+                offset: 8,
+                max_bytes: 8,
+                expected_hash: Some(first.content_hash),
+            },
+            &access,
+            limits,
+        )
+        .unwrap();
+        assert_eq!(second.bytes, original[8..16]);
+        assert_eq!(second.content_hash, first.content_hash);
+
+        std::fs::write(root.join("image.bin"), b"different bytes long!").unwrap();
+        let error = run_read_bytes_bounded(
+            &root,
+            ReadBytesRequest {
+                path: FsPath::new("image.bin").unwrap(),
+                offset: 16,
+                max_bytes: 8,
+                expected_hash: Some(first.content_hash),
+            },
+            &access,
+            limits,
+        )
+        .expect_err("a later chunk must not cross file versions");
+        assert!(matches!(error, FsError::Conflict(_)));
+    }
+
+    #[test]
+    fn bounded_byte_reads_reject_request_and_source_limit_overflow() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::write(root.join("image.bin"), [0_u8; 17]).unwrap();
+        let access = RootAccess(root.clone());
+        let limits = BoundedReadLimits::new(16, 8).unwrap();
+
+        let response_error = run_read_bytes_bounded(
+            &root,
+            ReadBytesRequest {
+                path: FsPath::new("image.bin").unwrap(),
+                offset: 0,
+                max_bytes: 9,
+                expected_hash: None,
+            },
+            &access,
+            limits,
+        )
+        .expect_err("requests above the response ceiling must be rejected");
+        assert!(
+            matches!(response_error, FsError::InvalidArgument(message) if message.contains("8 bytes"))
+        );
+
+        let source_error = run_read_bytes_bounded(
+            &root,
+            ReadBytesRequest {
+                path: FsPath::new("image.bin").unwrap(),
+                offset: 0,
+                max_bytes: 8,
+                expected_hash: None,
+            },
+            &access,
+            limits,
+        )
+        .expect_err("sources above the provider ceiling must be rejected");
+        assert!(
+            matches!(source_error, FsError::InvalidArgument(message) if message.contains("provider limit 16"))
+        );
     }
 
     #[test]

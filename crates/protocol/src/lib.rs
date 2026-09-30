@@ -838,6 +838,56 @@ pub struct SessionSnapshot {
     pub entries: Vec<SessionSnapshotEntry>,
 }
 
+/// One user-visible conversation turn. A turn starts at a canonical user entry
+/// and contains every public committed entry until the next user entry.
+/// `turn_id` is the stable `entry_id` of that first user entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct SessionConversationTurn {
+    pub turn_id: String,
+    pub entries: Vec<SessionSnapshotEntry>,
+}
+
+/// The immediate parent lineage and the stable real-user boundary adopted from it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct SessionHistoryLineageBoundary {
+    pub lineage_id: String,
+    /// Canonical public form of the final user-visible turn at the exact
+    /// provider boundary. Entries after that boundary are excluded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted_through_turn: Option<SessionConversationTurn>,
+}
+
+/// Bounded backward page over the adopted conversation lineage.
+///
+/// Turns remain chronological within a page. `next_cursor` is an opaque,
+/// identity-bound boundary for the page immediately preceding `turns`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct SessionHistoryPage {
+    pub session_id: String,
+    /// Stable identity of the adopted active lineage used to fence stale pages.
+    pub lineage_id: String,
+    /// Older lineage identities that the active lineage fully adopted through
+    /// one or more consecutive Compact rotations. Clients may retain already
+    /// loaded turns when their prior lineage appears here, while replacing the
+    /// cursor with this page's boundary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compact_ancestor_lineage_ids: Vec<String>,
+    /// Immediate parent relationship used to retain only the adopted prefix
+    /// across fork/rewind refreshes that have no newest-page overlap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_lineage: Option<SessionHistoryLineageBoundary>,
+    pub turns: Vec<SessionConversationTurn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
@@ -963,7 +1013,16 @@ pub enum Event {
     /// activated for a turn. Broadcast to every subscribed client so TUI / GUI
     /// instances show the same user line that reconnect snapshots replay.
     UserMessage {
+        /// Stable durable history identity. Older mixed-version producers omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry_id: Option<String>,
         segments: Vec<Segment>,
+    },
+    /// A canonical assistant/tool entry has committed to durable history.
+    /// Streaming events remain the in-flight authority; this event supplies the
+    /// stable identity used to reconcile that live block with paged history.
+    SessionEntryCommitted {
+        entry: SessionSnapshotEntry,
     },
     /// One agent-injected system item committed to history.
     ///
@@ -2765,6 +2824,7 @@ mod tests {
     #[test]
     fn event_user_message_roundtrip() {
         let event = Event::UserMessage {
+            entry_id: Some("entry-1".to_string()),
             segments: vec![Segment::text("hello 世界")],
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -2775,7 +2835,7 @@ mod tests {
 
         let decoded: Event = serde_json::from_str(&json).unwrap();
         match decoded {
-            Event::UserMessage { segments } => {
+            Event::UserMessage { segments, .. } => {
                 assert_eq!(segments.len(), 1);
                 match &segments[0] {
                     Segment::Text { content } => assert_eq!(content, "hello 世界"),

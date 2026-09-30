@@ -1,123 +1,165 @@
 <script lang="ts">
+  import DocumentMarkdown from '$lib/workspace/markdown/DocumentMarkdown.svelte';
   import { formatDate } from '$lib/workspace/api/http';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
-
-  const lineCount = $derived(data.memory.data?.body_md.split('\n').length ?? 0);
 </script>
 
 <svelte:head>
-  <title>Memory Document · Yoi Workspace</title>
-  <meta name="description" content="Workspace Memory Document" />
+  <title>Memory · Yoi Workspace</title>
+  <meta name="description" content="Workspace Memory document" />
 </svelte:head>
 
-<section class="card memory-document-card">
-  <div class="detail-heading">
-    <div>
-      <p class="eyebrow">Workspace memory</p>
-      <h2>Memory Document</h2>
-    </div>
-    {#if data.memory.data}
-      <span>{data.memory.data.bytes} bytes</span>
-    {/if}
-  </div>
-
-  <p class="section-note">
-    Durable workspace Memory as a single Markdown document. This view is read-only.
-  </p>
-
+<section class="memory-document-page" aria-label="Memory document">
   {#if data.memory.data}
-    <div class="memory-document-summary" aria-label="Memory document summary">
-      <div>
-        <span>Updated</span>
-        <strong>{formatDate(data.memory.data.updated_at)}</strong>
-      </div>
-      <div>
-        <span>Created</span>
-        <strong>{formatDate(data.memory.data.created_at)}</strong>
-      </div>
-      <div>
-        <span>Lines</span>
-        <strong>{lineCount}</strong>
-      </div>
-      <div>
-        <span>Source</span>
-        <strong>{data.memory.data.record_source}</strong>
-      </div>
+    <div class="memory-document-meta">
+      <p>
+        <span>Read-only</span>
+        <span aria-hidden="true">·</span>
+        <span>Updated <time datetime={data.memory.data.updated_at}>{formatDate(data.memory.data.updated_at)}</time></span>
+      </p>
+      <details>
+        <summary>Document details</summary>
+        <dl>
+          <div>
+            <dt>Created</dt>
+            <dd><time datetime={data.memory.data.created_at}>{formatDate(data.memory.data.created_at)}</time></dd>
+          </div>
+          <div>
+            <dt>Size</dt>
+            <dd>{data.memory.data.bytes} bytes</dd>
+          </div>
+          <div>
+            <dt>Source</dt>
+            <dd><code>{data.memory.data.record_source}</code></dd>
+          </div>
+        </dl>
+      </details>
     </div>
 
     {#if data.memory.data.body_md.trim().length === 0}
-      <p>No Memory document content is present.</p>
+      <div class="memory-document-state" role="status">
+        <strong>Memory document is empty.</strong>
+        <p>Durable Workspace context will appear here when it is available.</p>
+      </div>
     {:else}
-      <pre class="memory-document-body">{data.memory.data.body_md}</pre>
+      <article class="memory-document-content" aria-label="Memory document content">
+        <DocumentMarkdown text={data.memory.data.body_md} />
+      </article>
     {/if}
   {:else if data.memory.error}
-    <p class="error">{data.memory.error}</p>
+    <div class="memory-document-state memory-document-error">
+      <p role="alert"><strong>Memory document unavailable.</strong> {data.memory.error}</p>
+    </div>
   {:else}
-    <p>Waiting for <code>/api/w/{data.workspaceId}/memory</code>…</p>
+    <div class="memory-document-state" role="status">
+      <p>Memory document data is unavailable.</p>
+    </div>
   {/if}
 </section>
 
 <style>
-  .memory-document-card {
-    overflow: hidden;
-  }
-
-  .memory-document-summary {
+  .memory-document-page {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 0.75rem;
-    margin: 1rem 0;
+    flex: 0 0 auto;
+    gap: var(--space-5);
+    width: 100%;
+    min-width: 0;
+    max-width: 78rem;
+    margin-inline: auto;
   }
 
-  .memory-document-summary div {
-    border: 1px solid var(--line);
-    border-radius: 0.75rem;
-    background: var(--bg-raised);
-    padding: 0.8rem;
-  }
-
-  .memory-document-summary span {
+  .memory-document-meta {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-4);
     color: var(--text-muted);
-    display: block;
     font-size: var(--font-size-compact);
-    font-weight: 600;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
+    line-height: var(--line-height-compact);
   }
 
-  .memory-document-summary strong {
+  .memory-document-meta > p {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin: 0;
+  }
+
+  .memory-document-meta details {
+    flex: 0 0 auto;
+  }
+
+  .memory-document-meta summary {
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .memory-document-meta dl {
+    display: grid;
+    gap: var(--space-2);
+    min-width: min(24rem, calc(100vw - (2 * var(--space-4))));
+    margin: var(--space-3) 0 0;
+    padding: var(--space-3) 0 0;
+    border-top: 1px solid var(--line);
+  }
+
+  .memory-document-meta dl > div {
+    display: grid;
+    grid-template-columns: 5rem minmax(0, 1fr);
+    gap: var(--space-3);
+  }
+
+  .memory-document-meta dt {
+    color: var(--text-faint);
+  }
+
+  .memory-document-meta dd {
+    min-width: 0;
+    margin: 0;
     color: var(--text);
-    display: block;
-    font-size: var(--font-size-compact);
-    margin-top: 0.25rem;
     overflow-wrap: anywhere;
   }
 
-  .memory-document-body {
-    background: var(--bg-raised);
-    border: 1px solid var(--line);
-    border-radius: 0.9rem;
-    color: var(--text);
-    font-family: var(--font-mono);
-    font-size: var(--font-size-body);
-    line-height: var(--line-height-body);
-    margin: 1rem 0 0;
-    overflow: auto;
-    padding: 1rem;
-    white-space: pre-wrap;
+  .memory-document-content {
+    min-width: 0;
   }
 
-  @media (max-width: 900px) {
-    .memory-document-summary {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+  .memory-document-state {
+    padding-block: var(--space-5);
+    color: var(--text-muted);
+  }
+
+  .memory-document-state strong {
+    color: var(--text-strong);
+  }
+
+  .memory-document-state p {
+    margin: var(--space-1) 0 0;
+  }
+
+  .memory-document-state > p:first-child {
+    margin-top: 0;
+  }
+
+  .memory-document-error,
+  .memory-document-error strong {
+    color: var(--danger);
+  }
+
+  @media (max-width: 600px) {
+    .memory-document-meta {
+      display: grid;
+      gap: var(--space-2);
     }
-  }
 
-  @media (max-width: 640px) {
-    .memory-document-summary {
-      grid-template-columns: 1fr;
+    .memory-document-meta details {
+      width: 100%;
+    }
+
+    .memory-document-meta dl {
+      min-width: 0;
     }
   }
 </style>

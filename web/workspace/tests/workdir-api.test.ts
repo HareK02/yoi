@@ -56,7 +56,7 @@ Deno.test("Workdir REST validation accepts External grant sources without Runtim
       source: {
         kind: "external_grant",
         grant_id: "grant-1",
-        grant_permissions: { read: true, write: false, command: true },
+        grant_permissions: { read: true, write: true, command: true },
       },
       materializer_kind: "client_hosted_external",
       status: "active",
@@ -72,7 +72,7 @@ Deno.test("Workdir REST validation accepts External grant sources without Runtim
   }
   if (
     !detail.item.source.grant_permissions.read ||
-    detail.item.source.grant_permissions.write ||
+    !detail.item.source.grant_permissions.write ||
     !detail.item.source.grant_permissions.command
   ) {
     throw new Error("External Workdir grant permissions were not preserved");
@@ -83,6 +83,11 @@ Deno.test("Workdir REST validation rejects missing or misplaced External grant p
   for (
     const source of [
       { kind: "external_grant", grant_id: "grant-1" },
+      {
+        kind: "external_grant",
+        grant_id: "grant-1",
+        grant_permissions: { read: false, write: false, command: true },
+      },
       {
         kind: "external_grant",
         grant_id: "grant-1",
@@ -113,7 +118,11 @@ Deno.test("Workdir REST validation rejects missing or misplaced External grant p
       rejected = true;
     }
     if (!rejected) {
-      throw new Error(`invalid External permission projection was accepted: ${JSON.stringify(source)}`);
+      throw new Error(
+        `invalid External permission projection was accepted: ${
+          JSON.stringify(source)
+        }`,
+      );
     }
   }
 });

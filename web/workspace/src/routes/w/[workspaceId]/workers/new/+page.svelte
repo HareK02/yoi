@@ -12,7 +12,7 @@
     parseWorkerLaunchOptionsResponse,
   } from '$lib/workspace/api/workers';
   import { formatCurrentWorkdirRevision } from '$lib/workspace/settings/workdir-revision';
-  import { formatWorkdirPermissions } from '$lib/workspace/settings/workdir-permissions';
+  import { formatExternalGrantPermissionLevel } from '$lib/workspace/settings/workdir-permissions';
   import {
     buildCreateWorkspaceWorkerRequest,
     defaultWorkerLaunchForm,
@@ -40,7 +40,7 @@
       : null;
     const label = directory.display_name ?? repositoryKey ?? 'External Workdir';
     if (directory.source.kind === 'external_grant') {
-      return `${label} · External · ${formatWorkdirPermissions(directory.source.grant_permissions)}`;
+      return `${label} · External · ${formatExternalGrantPermissionLevel(directory.source.grant_permissions)}`;
     }
     return `${label} · ${formatCurrentWorkdirRevision(directory, provider)}`;
   }

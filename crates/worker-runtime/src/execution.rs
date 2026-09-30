@@ -477,6 +477,13 @@ pub struct WorkerSessionObservationRequest {
     pub worker_ref: WorkerRef,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerSessionHistoryRequest {
+    pub worker_ref: WorkerRef,
+    pub cursor: Option<String>,
+    pub limit: Option<usize>,
+}
+
 pub trait WorkerExecutionBackend: Send + Sync + 'static {
     fn backend_id(&self) -> &str;
 
@@ -494,6 +501,16 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         runtime_api::WorkerSessionAvailability::Unavailable {
             reason: runtime_api::WorkerSessionUnavailableReason::StorageUnavailable,
             message: "retained session storage is unavailable".to_string(),
+        }
+    }
+
+    fn worker_session_history(
+        &self,
+        _request: WorkerSessionHistoryRequest,
+    ) -> runtime_api::WorkerSessionHistoryAvailability {
+        runtime_api::WorkerSessionHistoryAvailability::Unavailable {
+            reason: runtime_api::WorkerSessionHistoryUnavailableReason::Unsupported,
+            message: "session history paging is not supported by this Runtime".to_string(),
         }
     }
 
@@ -724,6 +741,13 @@ impl WorkerExecutionBackendRef {
         request: WorkerSessionObservationRequest,
     ) -> runtime_api::WorkerSessionAvailability {
         self.backend.worker_session(request)
+    }
+
+    pub(crate) fn worker_session_history(
+        &self,
+        request: WorkerSessionHistoryRequest,
+    ) -> runtime_api::WorkerSessionHistoryAvailability {
+        self.backend.worker_session_history(request)
     }
 
     pub(crate) fn spawn_worker(

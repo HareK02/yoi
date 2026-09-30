@@ -11,7 +11,7 @@
     "web-ux": "deno run --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys cli.ts",
     "check": "deno check cli.ts src/*.ts tests/*.ts browser-tests/*.ts",
     "test": "deno test --allow-env --allow-read --allow-write --allow-run --allow-sys tests",
-    "test:browser": "deno test --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys browser-tests/capture_smoke_test.ts"
+    "test:browser": "deno test --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys browser-tests/capture_smoke_test.ts browser-tests/memory_document_shell_test.ts browser-tests/console_history_shell_test.ts"
   },
   "fmt": {
     "lineWidth": 100,

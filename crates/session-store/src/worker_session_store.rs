@@ -25,7 +25,7 @@ use crate::{
 use protocol::{PasteArtifactRef, UploadedFileRef};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -48,6 +48,106 @@ pub struct WorkerSessionStore {
 struct SessionManifest {
     schema_version: u32,
     session_id: SessionId,
+}
+
+const RETAINED_BACKWARD_READ_CHUNK_BYTES: usize = 64 * 1024;
+
+#[derive(Debug)]
+pub(crate) struct RetainedLogRecord {
+    pub start_offset: u64,
+    pub end_offset: u64,
+    pub entry: LogEntry,
+}
+
+pub(crate) struct RetainedSegmentReader {
+    file: File,
+    read_end: u64,
+    buffer_start: u64,
+    buffer: Vec<u8>,
+}
+
+impl RetainedSegmentReader {
+    pub fn previous_record(
+        &mut self,
+        max_additional_bytes: u64,
+    ) -> Result<(Option<RetainedLogRecord>, u64), StoreError> {
+        let mut read_bytes = 0_u64;
+        loop {
+            if !self.buffer.is_empty() {
+                if self.buffer.last() != Some(&b'\n') {
+                    return Err(StoreError::Corrupt {
+                        line: 0,
+                        message: "retained Segment cursor is not at a record boundary".to_string(),
+                    });
+                }
+                let prior_newline = self.buffer[..self.buffer.len() - 1]
+                    .iter()
+                    .rposition(|byte| *byte == b'\n');
+                if let Some(newline) =
+                    prior_newline.or((self.buffer_start == 0).then_some(usize::MAX))
+                {
+                    let record_start_in_buffer = if newline == usize::MAX {
+                        0
+                    } else {
+                        newline + 1
+                    };
+                    let record_start = self.buffer_start + record_start_in_buffer as u64;
+                    let record_end = self.buffer_start + self.buffer.len() as u64;
+                    let record =
+                        self.buffer[record_start_in_buffer..self.buffer.len() - 1].to_vec();
+                    self.buffer.truncate(record_start_in_buffer);
+                    self.read_end = record_start;
+                    if record.is_empty() {
+                        return Err(StoreError::Corrupt {
+                            line: 0,
+                            message: "empty retained Segment log record".to_string(),
+                        });
+                    }
+                    let entry = serde_json::from_slice(&record)?;
+                    return Ok((
+                        Some(RetainedLogRecord {
+                            start_offset: record_start,
+                            end_offset: record_end,
+                            entry,
+                        }),
+                        read_bytes,
+                    ));
+                }
+            } else if self.read_end == 0 {
+                return Ok((None, read_bytes));
+            }
+
+            if self.buffer_start == 0 && !self.buffer.is_empty() {
+                return Err(StoreError::Corrupt {
+                    line: 0,
+                    message: "retained Segment log does not end at a record boundary".to_string(),
+                });
+            }
+            if read_bytes >= max_additional_bytes {
+                return Err(StoreError::ReadLimitExceeded);
+            }
+            let end = if self.buffer.is_empty() {
+                self.read_end
+            } else {
+                self.buffer_start
+            };
+            let available = max_additional_bytes - read_bytes;
+            let chunk_len = end
+                .min(RETAINED_BACKWARD_READ_CHUNK_BYTES as u64)
+                .min(available);
+            if chunk_len == 0 {
+                return Err(StoreError::ReadLimitExceeded);
+            }
+            let start = end - chunk_len;
+            self.file.seek(SeekFrom::Start(start))?;
+            let mut chunk = vec![0_u8; chunk_len as usize];
+            self.file.read_exact(&mut chunk)?;
+            read_bytes += chunk_len;
+            chunk.extend_from_slice(&self.buffer);
+            self.buffer = chunk;
+            self.buffer_start = start;
+        }
+    }
 }
 
 impl WorkerSessionStore {
@@ -119,6 +219,19 @@ impl WorkerSessionStore {
         session_id: SessionId,
         segment_id: SegmentId,
     ) -> Result<Vec<LogEntry>, StoreError> {
+        self.read_all_read_only_bounded(session_id, segment_id, u64::MAX)
+            .map(|(entries, _)| entries)
+    }
+
+    /// Read one retained Segment under an actual byte bound without touching
+    /// access time. The file descriptor read, rather than a preceding stat, is
+    /// the limit authority so concurrent appends cannot evade accounting.
+    pub fn read_all_read_only_bounded(
+        &self,
+        session_id: SessionId,
+        segment_id: SegmentId,
+        max_bytes: u64,
+    ) -> Result<(Vec<LogEntry>, u64), StoreError> {
         let retained_session_id = self.session_id.lock().map_err(|_| StoreError::Corrupt {
             line: 0,
             message: "Worker Session identity lock poisoned".to_string(),
@@ -131,14 +244,210 @@ impl WorkerSessionStore {
             });
         }
         let path = self.log_path(segment_id);
-        let bytes = crate::read_without_atime(&path).map_err(|error| {
+        let bytes = crate::read_without_atime_bounded(&path, max_bytes).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 StoreError::NotFound(segment_id)
             } else {
                 StoreError::Io(error)
             }
         })?;
-        parse_jsonl(&bytes)
+        let byte_len = bytes.len() as u64;
+        if byte_len > max_bytes {
+            return Err(StoreError::ReadLimitExceeded);
+        }
+        Ok((parse_jsonl(&bytes)?, byte_len))
+    }
+
+    pub(crate) fn read_first_log_record_read_only_bounded(
+        &self,
+        session_id: SessionId,
+        segment_id: SegmentId,
+        max_bytes: u64,
+    ) -> Result<(Option<RetainedLogRecord>, u64, u64), StoreError> {
+        self.validate_retained_session(session_id)?;
+        let file = open_retained_file(&self.log_path(segment_id)).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                StoreError::NotFound(segment_id)
+            } else {
+                StoreError::Io(error)
+            }
+        })?;
+        let file_len = file.metadata()?.len();
+        if file_len == 0 {
+            return Ok((None, 0, 0));
+        }
+        let mut reader = BufReader::new(file.take(max_bytes.saturating_add(1)));
+        let mut record = Vec::new();
+        let read_bytes = reader.read_until(b'\n', &mut record)? as u64;
+        if read_bytes > max_bytes || record.last() != Some(&b'\n') {
+            return Err(StoreError::ReadLimitExceeded);
+        }
+        record.pop();
+        if record.is_empty() {
+            return Err(StoreError::Corrupt {
+                line: 0,
+                message: "empty retained Segment log record".to_string(),
+            });
+        }
+        let entry = serde_json::from_slice(&record)?;
+        Ok((
+            Some(RetainedLogRecord {
+                start_offset: 0,
+                end_offset: read_bytes,
+                entry,
+            }),
+            read_bytes,
+            file_len,
+        ))
+    }
+
+    pub(crate) fn read_next_log_record_read_only_bounded(
+        &self,
+        session_id: SessionId,
+        segment_id: SegmentId,
+        start_offset: u64,
+        max_bytes: u64,
+    ) -> Result<(Option<RetainedLogRecord>, u64), StoreError> {
+        self.validate_retained_session(session_id)?;
+        let mut file = open_retained_file(&self.log_path(segment_id)).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                StoreError::NotFound(segment_id)
+            } else {
+                StoreError::Io(error)
+            }
+        })?;
+        let file_len = file.metadata()?.len();
+        if start_offset >= file_len {
+            return Ok((None, 0));
+        }
+        file.seek(SeekFrom::Start(start_offset))?;
+        let mut reader = BufReader::new(file.take(max_bytes.saturating_add(1)));
+        let mut record = Vec::new();
+        let read_bytes = reader.read_until(b'\n', &mut record)? as u64;
+        if read_bytes > max_bytes || record.last() != Some(&b'\n') {
+            return Err(StoreError::ReadLimitExceeded);
+        }
+        record.pop();
+        if record.is_empty() {
+            return Err(StoreError::Corrupt {
+                line: 0,
+                message: "empty retained Segment log record".to_string(),
+            });
+        }
+        let entry = serde_json::from_slice(&record)?;
+        Ok((
+            Some(RetainedLogRecord {
+                start_offset,
+                end_offset: start_offset + read_bytes,
+                entry,
+            }),
+            read_bytes,
+        ))
+    }
+
+    pub(crate) fn read_log_record_range_read_only_bounded(
+        &self,
+        session_id: SessionId,
+        segment_id: SegmentId,
+        start_offset: u64,
+        end_offset: u64,
+        max_bytes: u64,
+    ) -> Result<RetainedLogRecord, StoreError> {
+        self.validate_retained_session(session_id)?;
+        let record_len =
+            end_offset
+                .checked_sub(start_offset)
+                .ok_or_else(|| StoreError::Corrupt {
+                    line: 0,
+                    message: "retained Segment record range is reversed".to_string(),
+                })?;
+        if record_len == 0 || record_len > max_bytes {
+            return Err(StoreError::ReadLimitExceeded);
+        }
+        let mut file = open_retained_file(&self.log_path(segment_id)).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                StoreError::NotFound(segment_id)
+            } else {
+                StoreError::Io(error)
+            }
+        })?;
+        if end_offset > file.metadata()?.len() {
+            return Err(StoreError::Corrupt {
+                line: 0,
+                message: "retained Segment record range exceeds the committed log".to_string(),
+            });
+        }
+        file.seek(SeekFrom::Start(start_offset))?;
+        let mut record = vec![0_u8; record_len as usize];
+        file.read_exact(&mut record)?;
+        if record.last() != Some(&b'\n') || record[..record.len() - 1].contains(&b'\n') {
+            return Err(StoreError::Corrupt {
+                line: 0,
+                message: "retained Segment cursor does not identify one record".to_string(),
+            });
+        }
+        record.pop();
+        let entry = serde_json::from_slice(&record)?;
+        Ok(RetainedLogRecord {
+            start_offset,
+            end_offset,
+            entry,
+        })
+    }
+
+    pub(crate) fn open_retained_segment_reader(
+        &self,
+        session_id: SessionId,
+        segment_id: SegmentId,
+        before_offset: u64,
+    ) -> Result<RetainedSegmentReader, StoreError> {
+        self.validate_retained_session(session_id)?;
+        let mut file = open_retained_file(&self.log_path(segment_id)).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                StoreError::NotFound(segment_id)
+            } else {
+                StoreError::Io(error)
+            }
+        })?;
+        let file_len = file.metadata()?.len();
+        if before_offset > file_len {
+            return Err(StoreError::Corrupt {
+                line: 0,
+                message: "retained Segment cursor is beyond the committed log".to_string(),
+            });
+        }
+        if before_offset > 0 {
+            file.seek(SeekFrom::Start(before_offset - 1))?;
+            let mut boundary = [0_u8; 1];
+            file.read_exact(&mut boundary)?;
+            if boundary[0] != b'\n' {
+                return Err(StoreError::Corrupt {
+                    line: 0,
+                    message: "retained Segment cursor is not at a record boundary".to_string(),
+                });
+            }
+        }
+        Ok(RetainedSegmentReader {
+            file,
+            read_end: before_offset,
+            buffer_start: before_offset,
+            buffer: Vec::new(),
+        })
+    }
+
+    fn validate_retained_session(&self, requested: SessionId) -> Result<(), StoreError> {
+        let retained_session_id = self.session_id.lock().map_err(|_| StoreError::Corrupt {
+            line: 0,
+            message: "Worker Session identity lock poisoned".to_string(),
+        })?;
+        if *retained_session_id != Some(requested) {
+            return Err(StoreError::Corrupt {
+                line: 0,
+                message: "active Worker Session identity does not match retained manifest"
+                    .to_string(),
+            });
+        }
+        Ok(())
     }
 
     pub fn segment_log_len(&self, segment_id: SegmentId) -> Result<u64, StoreError> {
@@ -646,6 +955,25 @@ impl Store for WorkerSessionStore {
     ) -> Result<(), StoreError> {
         self.ensure_session(session_id, true)?;
         self.append_line(&self.trace_path(segment_id), &serde_json::to_string(entry)?)
+    }
+}
+
+fn open_retained_file(path: &Path) -> std::io::Result<File> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOATIME)
+            .open(path)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "read-only retained observation requires no-atime file reads",
+        ))
     }
 }
 

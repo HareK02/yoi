@@ -656,6 +656,41 @@ pub struct WorkerSessionRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerSessionHistoryRequest {
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerSessionHistoryUnavailableReason {
+    RetentionMissing,
+    ActivePointerMissing,
+    CorruptLog,
+    MigrationRequired,
+    RetentionExpired,
+    StorageUnavailable,
+    InvalidCursor,
+    ResourceLimit,
+    Unsupported,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "availability", rename_all = "snake_case")]
+pub enum WorkerSessionHistoryAvailability {
+    Page {
+        page: protocol::SessionHistoryPage,
+    },
+    Unavailable {
+        reason: WorkerSessionHistoryUnavailableReason,
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetainedSessionIdentity {
     pub session_id: String,
     pub segment_id: String,
@@ -717,6 +752,17 @@ pub trait RuntimeApi {
         #[path] worker_id: String,
         #[query] request: WorkerSessionRequest,
     ) -> Result<WorkerSessionAvailability, RuntimeApiError>;
+
+    #[get(
+        "/v1/workers/{worker_id}/session/history",
+        status = 200,
+        error_status = 400
+    )]
+    async fn worker_session_history(
+        &self,
+        #[path] worker_id: String,
+        #[query] request: WorkerSessionHistoryRequest,
+    ) -> Result<WorkerSessionHistoryAvailability, RuntimeApiError>;
 
     #[post("/v1/workers", status = 200, error_status = 400)]
     async fn create_worker(
@@ -1053,6 +1099,17 @@ mod tests {
             Ok(WorkerSessionAvailability::LiveProtocol)
         }
 
+        async fn worker_session_history(
+            &self,
+            _worker_id: String,
+            _request: WorkerSessionHistoryRequest,
+        ) -> Result<WorkerSessionHistoryAvailability, RuntimeApiError> {
+            Ok(WorkerSessionHistoryAvailability::Unavailable {
+                reason: WorkerSessionHistoryUnavailableReason::Unsupported,
+                message: "unsupported".to_string(),
+            })
+        }
+
         async fn create_worker(
             &self,
             _request: CreateWorkerRequest,
@@ -1175,9 +1232,21 @@ mod tests {
     }
 
     #[test]
+    fn worker_session_history_availability_has_closed_tagged_wire_shape() {
+        let value = serde_json::to_value(WorkerSessionHistoryAvailability::Unavailable {
+            reason: WorkerSessionHistoryUnavailableReason::InvalidCursor,
+            message: "cursor is stale".to_string(),
+        })
+        .unwrap();
+        assert_eq!(value["availability"], "unavailable");
+        assert_eq!(value["reason"], "invalid_cursor");
+        assert_eq!(value["message"], "cursor is stale");
+    }
+
+    #[test]
     fn contract_inventory_is_complete_and_unique() {
         let operations = RuntimeApiMetadata::OPERATIONS;
-        assert_eq!(operations.len(), 16);
+        assert_eq!(operations.len(), 17);
         let mut routes = operations
             .iter()
             .map(|operation| (format!("{:?}", operation.method), operation.path))

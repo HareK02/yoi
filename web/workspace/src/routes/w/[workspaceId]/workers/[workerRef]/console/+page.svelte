@@ -3,7 +3,6 @@
     import { tick, untrack, type SvelteComponent } from "svelte";
     import ConsoleLineItem from "$lib/workspace/console/ConsoleLineItem.svelte";
     import ConsoleTurnNavigation from "$lib/workspace/console/ConsoleTurnNavigation.svelte";
-    import { consoleTurns } from "$lib/workspace/console/turn-navigation";
     import ConsoleDisplayStateView from "$lib/workspace/console/ConsoleDisplayState.svelte";
     import ConsoleTasks from "$lib/workspace/console/ConsoleTasks.svelte";
     import { namePastedImage } from "$lib/workspace/console/composer-paste";
@@ -30,7 +29,9 @@
         consoleWorkerViews,
         createConsoleProjector,
         isConsoleProjectionEvent,
+        mergeCommittedHistoryLines,
         projectConsoleLines,
+        projectSessionHistoryEntries,
         resolveConsoleViewScrollTop,
         resolveConsoleWorkerView,
         type ConsoleEventInput,
@@ -44,6 +45,7 @@
         PendingSubmissionsSnapshot,
         RewindTarget,
         Segment,
+        SessionHistoryPage,
     } from "$lib/generated/protocol";
     import {
         MAX_FILES_PER_SUBMISSION,
@@ -69,6 +71,18 @@
         type WorkerSessionRequestIdentity,
         type WorkerSessionTarget,
     } from "$lib/workspace/session-observation";
+    import {
+        applyConsoleHistoryPage,
+        beginConsoleHistoryRequest,
+        conversationTurnPreviewsFromLines,
+        emptyConsoleHistoryState,
+        failConsoleHistoryRequest,
+        historyEntries,
+        setConsoleHistoryTopEdge,
+        shouldLoadHistoryAtTop,
+        type ConsoleHistoryState,
+    } from "$lib/workspace/console/history";
+    import type { TurnNavigationItem } from "$lib/workspace/console/turn-navigation";
     import type { Diagnostic, Worker } from "$lib/workspace/sidebar/types";
 
     type Props = {
@@ -162,6 +176,7 @@
     let workerViewSelectionGeneration = 0;
     let consoleViewMode = $state<ConsoleViewMode>("overview");
     let consoleBodyElement: HTMLElement | null = null;
+    let turnNavigationElement = $state<HTMLElement | null>(null);
     let composerInputElement = $state<
         (SvelteComponent & ComposerInputHandle) | null
     >(null);
@@ -176,6 +191,8 @@
     let consoleProjection = $state.raw<ConsoleProjection>(
         consoleProjector.snapshot(),
     );
+    let historyByView = $state.raw<Record<string, ConsoleHistoryState>>({});
+    const pendingHistoryRefreshes = new Set<string>();
     let pendingObservationEvents: ConsoleEventInput[] = [];
     let pendingInitialSnapshotApplication: {
         eventId: string;
@@ -205,10 +222,30 @@
         ),
     );
     const selectedConsoleProjection = $derived(selectedWorkerView.console);
-    const lines = $derived(
+    const selectedHistoryKey = $derived(
+        `${workspaceId}:${runtimeId ?? ""}:${workerId ?? ""}:${selectedWorkerViewSessionId ?? "main"}`,
+    );
+    const selectedHistory = $derived(
+        historyByView[selectedHistoryKey] ?? emptyConsoleHistoryState(),
+    );
+    const currentLines = $derived(
         projectConsoleLines(selectedConsoleProjection.lines, consoleViewMode),
     );
-    const turns = $derived(consoleTurns(lines));
+    const committedHistoryLines = $derived(
+        projectConsoleLines(
+            projectSessionHistoryEntries(
+                historyEntries(selectedHistory),
+                selectedConsoleProjection.cwd,
+            ),
+            consoleViewMode,
+        ),
+    );
+    const lines = $derived(
+        mergeCommittedHistoryLines(committedHistoryLines, currentLines),
+    );
+    const turnNavigationItems = $derived(
+        conversationTurnPreviewsFromLines(lines),
+    );
     const tasks = $derived(selectedConsoleProjection.tasks);
     const diagnostics = $derived(
         mergeDiagnostics(worker?.diagnostics ?? [], streamDiagnostics),
@@ -262,6 +299,233 @@
             throw new Error(`GET ${path} failed: ${response.status}`);
         }
         return response.json() as Promise<T>;
+    }
+
+    type WorkerSessionHistoryResponse =
+        | { availability: "page"; page: SessionHistoryPage }
+        | {
+            availability: "unavailable";
+            reason: string;
+            message: string;
+        };
+
+    function mainHistoryKey(target: ConsoleTarget): string {
+        return `${target.workspaceId}:${target.runtimeId}:${target.workerId}:main`;
+    }
+
+    function historyStateFor(key: string): ConsoleHistoryState {
+        return historyByView[key] ?? emptyConsoleHistoryState();
+    }
+
+    function setHistoryState(key: string, state: ConsoleHistoryState) {
+        historyByView = { ...historyByView, [key]: state };
+    }
+
+    async function requestHistoryPage(
+        target: ConsoleTarget,
+        key: string,
+        cursor: string | null,
+        token: number,
+    ) {
+        const started = beginConsoleHistoryRequest(historyStateFor(key), cursor);
+        if (!started) return;
+        setHistoryState(key, started);
+
+        const anchors = cursor === null ? null : captureHistoryAnchors();
+        const query = new URLSearchParams({ limit: "5" });
+        if (cursor) query.set("cursor", cursor);
+        const path = workerApiPath(
+            `/runtimes/${encodeURIComponent(target.runtimeId)}/workers/${encodeURIComponent(target.workerId)}/session/history?${query}`,
+        );
+        try {
+            const response = await fetch(path, {
+                credentials: "same-origin",
+                headers: { accept: "application/json" },
+            });
+            if (response.status === 404 || response.status === 405) {
+                throw new Error("Earlier conversation is not supported by this Runtime version.");
+            }
+            if (!response.ok) {
+                throw new Error(`History request failed (${response.status}).`);
+            }
+            const payload = (await response.json()) as WorkerSessionHistoryResponse;
+            if (token !== reloadToken || mainHistoryKey(target) !== key) return;
+            if (pendingHistoryRefreshes.has(key)) return;
+            if (payload.availability === "unavailable") {
+                setHistoryState(
+                    key,
+                    failConsoleHistoryRequest(historyStateFor(key), payload.message),
+                );
+                return;
+            }
+            setHistoryState(
+                key,
+                applyConsoleHistoryPage(historyStateFor(key), payload.page, cursor),
+            );
+            await tick();
+            restoreHistoryAnchors(anchors);
+        } catch (error) {
+            if (
+                token !== reloadToken ||
+                mainHistoryKey(target) !== key ||
+                pendingHistoryRefreshes.has(key)
+            )
+                return;
+            setHistoryState(
+                key,
+                failConsoleHistoryRequest(
+                    historyStateFor(key),
+                    error instanceof Error ? error.message : String(error),
+                ),
+            );
+        } finally {
+            const refreshAgain = pendingHistoryRefreshes.delete(key);
+            if (
+                refreshAgain &&
+                token === reloadToken &&
+                mainHistoryKey(target) === key
+            ) {
+                const stale = historyStateFor(key);
+                setHistoryState(key, {
+                    ...stale,
+                    status: stale.turns.length > 0 ? "ready" : "idle",
+                    error: null,
+                    requestedCursor: null,
+                });
+                void requestHistoryPage(target, key, null, token);
+            }
+        }
+    }
+
+    type HistoryAnchor = { id: string; top: number };
+    type HistoryAnchors = {
+        transcript: HistoryAnchor | null;
+        navigation: HistoryAnchor | null;
+    };
+
+    function captureElementAnchor(
+        container: HTMLElement | null,
+        selector: string,
+        dataKey: "consoleLineId" | "turnId",
+    ): HistoryAnchor | null {
+        const first = container?.querySelector<HTMLElement>(selector);
+        const id = first?.dataset[dataKey] ?? "";
+        return first && id ? { id, top: first.getBoundingClientRect().top } : null;
+    }
+
+    function captureHistoryAnchors(): HistoryAnchors {
+        return {
+            transcript: captureElementAnchor(
+                consoleBodyElement,
+                "[data-console-line-id]",
+                "consoleLineId",
+            ),
+            navigation: captureElementAnchor(
+                turnNavigationElement,
+                "[data-turn-id]",
+                "turnId",
+            ),
+        };
+    }
+
+    function restoreElementAnchor(
+        container: HTMLElement | null,
+        selector: string,
+        anchor: HistoryAnchor | null,
+    ) {
+        if (!anchor || !container) return;
+        const target = container.querySelector<HTMLElement>(selector);
+        if (!target) return;
+        container.scrollTop += target.getBoundingClientRect().top - anchor.top;
+    }
+
+    function restoreHistoryAnchors(anchors: HistoryAnchors | null) {
+        if (!anchors) return;
+        restoreElementAnchor(
+            consoleBodyElement,
+            `[data-console-line-id="${CSS.escape(anchors.transcript?.id ?? "")}"]`,
+            anchors.transcript,
+        );
+        restoreElementAnchor(
+            turnNavigationElement,
+            `[data-turn-id="${CSS.escape(anchors.navigation?.id ?? "")}"]`,
+            anchors.navigation,
+        );
+    }
+
+    function loadEarlierHistory() {
+        const target = consoleTarget;
+        if (!target || selectedWorkerViewSessionId !== null) return;
+        const key = mainHistoryKey(target);
+        const state = historyStateFor(key);
+        if (!state.hasMore || !state.cursor) return;
+        void requestHistoryPage(target, key, state.cursor, reloadToken);
+    }
+
+    function retryHistoryLoad() {
+        const target = consoleTarget;
+        if (!target || selectedWorkerViewSessionId !== null) return;
+        const key = mainHistoryKey(target);
+        const state = historyStateFor(key);
+        void requestHistoryPage(
+            target,
+            key,
+            state.hasMore ? state.cursor : null,
+            reloadToken,
+        );
+    }
+
+    function fenceCurrentHistoryForRewind() {
+        const target = consoleTarget;
+        if (!target) return;
+        const key = mainHistoryKey(target);
+        const current = historyStateFor(key);
+        const loading = current.status === "loading";
+        const reset = emptyConsoleHistoryState();
+        setHistoryState(key, {
+            ...reset,
+            status: loading ? "loading" : "idle",
+            requestedCursor: loading ? current.requestedCursor : null,
+            topEdgeArmed: current.topEdgeArmed,
+        });
+        if (loading) pendingHistoryRefreshes.add(key);
+    }
+
+    function refreshCurrentHistory() {
+        const target = consoleTarget;
+        if (!target) return;
+        const key = mainHistoryKey(target);
+        if (historyStateFor(key).status === "loading") {
+            pendingHistoryRefreshes.add(key);
+            return;
+        }
+        void requestHistoryPage(target, key, null, reloadToken);
+    }
+
+    function handleHistoryTopEdge(atTop: boolean) {
+        if (selectedWorkerViewSessionId !== null) return;
+        const key = selectedHistoryKey;
+        const state = historyStateFor(key);
+        if (shouldLoadHistoryAtTop(state, atTop)) {
+            loadEarlierHistory();
+        } else if (!atTop) {
+            const rearmed = setConsoleHistoryTopEdge(state, false);
+            if (rearmed !== state) setHistoryState(key, rearmed);
+        }
+    }
+
+    function jumpToConversationTurn(item: TurnNavigationItem) {
+        const line = lines.find(
+            (candidate) => candidate.entryId === item.lineId || candidate.id === item.lineId,
+        );
+        const target = line
+            ? consoleBodyElement?.querySelector(
+                `[data-console-line-id="${CSS.escape(line.id)}"]`,
+            )
+            : null;
+        if (target instanceof HTMLElement && line) {
+            selectConsoleTurn(line.id);
+        }
     }
 
     async function loadWorker(target: ConsoleTarget, token: number) {
@@ -406,6 +670,22 @@
             liveWorkerState = consoleProjection.status === "shutdown"
                 ? "shutdown"
                 : workerStateFromSnapshot(consoleProjection.workerState);
+            if (
+                eventBatch.some((event) => event.event.event === "rewind_applied")
+            ) {
+                fenceCurrentHistoryForRewind();
+            }
+            if (
+                eventBatch.some((event) =>
+                    event.event.event === "snapshot" ||
+                    event.event.event === "segment_rotated" ||
+                    event.event.event === "rewind_applied" ||
+                    event.event.event === "user_message" ||
+                    event.event.event === "session_entry_committed"
+                )
+            ) {
+                refreshCurrentHistory();
+            }
             if (
                 initialSnapshotApplication &&
                 eventBatch.some(
@@ -1338,6 +1618,7 @@
         }
         autoFollowConsole = isNearConsoleBottom(consoleBodyElement);
         rememberConsoleWorkerViewScroll();
+        handleHistoryTopEdge(consoleBodyElement.scrollTop <= 1);
     }
 
     async function scrollConsoleToBottom() {
@@ -1543,40 +1824,67 @@
 
     <div class:with-task-pane={taskPaneOpen} class="console-history">
         <section class="console-body">
-            <div
-                class="console-scroll"
-                bind:this={consoleBodyElement}
-                onscroll={handleConsoleScroll}
+        <div
+            class="console-scroll"
+            bind:this={consoleBodyElement}
+            onscroll={handleConsoleScroll}
+        >
+            <article
+                class="card console-card worker-console-card"
+                aria-label={`${selectedWorkerView.label} transcript`}
             >
-                <article
-                    class="card console-card worker-console-card"
-                    aria-label={`${selectedWorkerView.label} transcript`}
-                >
-                    {#if workerError}
-                        <p class="error">{workerError}</p>
-                    {/if}
+                {#if workerError}
+                    <p class="error">{workerError}</p>
+                {/if}
 
-                    <ConsoleDisplayStateView
-                        state={consoleDisplayState}
-                        hasContent={lines.length > 0}
-                        hasUnfilteredContent={selectedConsoleProjection.lines.length > 0}
-                        onRetry={retryConsoleLoad}
-                    />
+                {#if selectedWorkerViewSessionId === null && (selectedHistory.hasMore || selectedHistory.error || selectedHistory.status === "loading")}
+                    <div class="conversation-history-boundary">
+                        <button
+                            type="button"
+                            disabled={selectedHistory.status === "loading"}
+                            onclick={selectedHistory.error ? retryHistoryLoad : loadEarlierHistory}
+                        >
+                            {selectedHistory.status === "loading"
+                                ? "Loading earlier conversation…"
+                                : selectedHistory.error
+                                  ? "Earlier conversation unavailable · retry"
+                                  : "Earlier conversation available · load 5 turns"}
+                        </button>
+                    </div>
+                {:else if selectedWorkerViewSessionId === null && selectedHistory.status === "ready"}
+                    <div class="conversation-history-boundary complete">Start of conversation</div>
+                {/if}
 
-                    {#if (consoleDisplayState.kind === "ready" || consoleDisplayState.kind === "stale") && lines.length > 0}
-                        <ol class="console-log">
-                            {#each lines as item (item.id)}
-                                <ConsoleLineItem {item} />
-                            {/each}
-                        </ol>
-                    {/if}
-                </article>
-            </div>
-            {#if (consoleDisplayState.kind === "ready" || consoleDisplayState.kind === "stale") && turns.length > 0}
-                {#key `${workerId}:${selectedWorkerView.sessionId}`}
-                    <ConsoleTurnNavigation {turns} onSelect={selectConsoleTurn} />
-                {/key}
-            {/if}
+                <ConsoleDisplayStateView
+                    state={consoleDisplayState}
+                    hasContent={lines.length > 0}
+                    hasUnfilteredContent={selectedConsoleProjection.lines.length > 0}
+                    onRetry={retryConsoleLoad}
+                />
+
+                {#if (consoleDisplayState.kind === "ready" || consoleDisplayState.kind === "stale") && lines.length > 0}
+                    <ol class="console-log">
+                        {#each lines as item (item.id)}
+                            <ConsoleLineItem {item} />
+                        {/each}
+                    </ol>
+                {/if}
+            </article>
+        </div>
+
+            <ConsoleTurnNavigation
+                items={turnNavigationItems}
+                hasMore={selectedWorkerViewSessionId === null && selectedHistory.hasMore}
+                loading={selectedHistory.status === "loading"}
+                error={selectedWorkerViewSessionId === null
+                    ? selectedHistory.error
+                    : "Earlier history is unavailable for direct SubWorker views."}
+                onLoadMore={selectedHistory.error ? retryHistoryLoad : loadEarlierHistory}
+                onTopEdgeChange={handleHistoryTopEdge}
+                onTurnClick={jumpToConversationTurn}
+                historyAvailable={selectedWorkerViewSessionId === null}
+                bind:element={turnNavigationElement}
+            />
         </section>
 
         {#if taskPaneOpen}
@@ -2039,6 +2347,36 @@
 
     .console-scroll::-webkit-scrollbar {
         display: none;
+    }
+
+    .conversation-history-boundary {
+        display: flex;
+        justify-content: center;
+        color: var(--text-muted);
+        font-size: var(--font-size-compact);
+        padding-bottom: var(--space-3);
+    }
+
+    .conversation-history-boundary button {
+        border: 0;
+        background: transparent;
+        color: var(--tui-cyan);
+        cursor: pointer;
+        font: inherit;
+    }
+
+    .conversation-history-boundary button:disabled {
+        cursor: wait;
+        opacity: 0.65;
+    }
+
+    .conversation-history-boundary.complete::before,
+    .conversation-history-boundary.complete::after {
+        content: "";
+        align-self: center;
+        width: 2rem;
+        margin: 0 var(--space-2);
+        border-top: 1px solid var(--line);
     }
 
     .pending-submissions {

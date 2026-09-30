@@ -27,7 +27,8 @@ use tokio::sync::broadcast;
 pub use fs_operation::{
     BoundedReadLimits, ContentHash, EditRequest, EditResult, EntryKind, FsPath as WorkdirPath,
     GlobRequest, GlobResult, GrepOutputMode, GrepRequest, GrepResult, ListEntry, ListRequest,
-    ListResult, ReadRequest, ReadResult, StatRequest, StatResult, WriteRequest, WriteResult,
+    ListResult, ReadBytesRequest, ReadBytesResult, ReadRequest, ReadResult, StatRequest,
+    StatResult, WriteRequest, WriteResult,
 };
 pub use http::dispatch_workdir_session_operation;
 pub use local::{
@@ -220,6 +221,14 @@ pub trait WorkdirSession: std::fmt::Debug + Send + Sync {
 
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError>;
     async fn read(&self, request: ReadRequest) -> Result<ReadResult, WorkdirError>;
+    async fn read_bytes(
+        &self,
+        _request: ReadBytesRequest,
+    ) -> Result<ReadBytesResult, WorkdirError> {
+        Err(WorkdirError::UnsupportedOperation(
+            "bounded binary reads are not supported by this provider".to_string(),
+        ))
+    }
     async fn write(&self, request: WriteRequest) -> Result<WriteResult, WorkdirError>;
     async fn edit(&self, request: EditRequest) -> Result<EditResult, WorkdirError>;
     async fn list(&self, request: ListRequest) -> Result<ListResult, WorkdirError>;

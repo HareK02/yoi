@@ -1188,6 +1188,19 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         })
     }
 
+    fn worker_session_history(
+        &self,
+        _workspace_id: &str,
+        _worker_ref: &EmbeddedWorkerRef,
+        _cursor: Option<String>,
+        _limit: Option<usize>,
+    ) -> Result<runtime_api::WorkerSessionHistoryAvailability, String> {
+        Ok(runtime_api::WorkerSessionHistoryAvailability::Unavailable {
+            reason: runtime_api::WorkerSessionHistoryUnavailableReason::Unsupported,
+            message: "session history paging is not supported by this Runtime".to_string(),
+        })
+    }
+
     fn observation_source(
         &self,
         _worker_id: &str,
@@ -2013,6 +2026,31 @@ impl RuntimeRegistry {
             .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
                 runtime_id: worker.runtime_id.clone(),
                 code: "worker_session_observation_failed".to_string(),
+                message,
+            })
+    }
+
+    pub fn worker_session_history(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        cursor: Option<String>,
+        limit: Option<usize>,
+    ) -> Result<runtime_api::WorkerSessionHistoryAvailability, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", &worker.runtime_id)?;
+        validate_backend_identifier("worker_id", &worker.worker_id)?;
+        let runtime = self.runtime(&worker.runtime_id)?;
+        let worker_ref =
+            EmbeddedWorkerRef::new(EmbeddedWorkerId::parse(&worker.worker_id).ok_or_else(
+                || RuntimeRegistryError::UnknownWorker {
+                    worker: worker.clone(),
+                },
+            )?);
+        runtime
+            .worker_session_history(workspace_id, &worker_ref, cursor, limit)
+            .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: worker.runtime_id.clone(),
+                code: "worker_session_history_failed".to_string(),
                 message,
             })
     }
@@ -2906,6 +2944,19 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         let scope = RuntimeWorkspaceScope::new(workspace_id, "embedded-backend");
         self.runtime
             .worker_session_scoped(&scope, worker_ref)
+            .map_err(|error| error.to_string())
+    }
+
+    fn worker_session_history(
+        &self,
+        workspace_id: &str,
+        worker_ref: &EmbeddedWorkerRef,
+        cursor: Option<String>,
+        limit: Option<usize>,
+    ) -> Result<runtime_api::WorkerSessionHistoryAvailability, String> {
+        let scope = RuntimeWorkspaceScope::new(workspace_id, "embedded-backend");
+        self.runtime
+            .worker_session_history_scoped(&scope, worker_ref, cursor, limit)
             .map_err(|error| error.to_string())
     }
 
@@ -4920,6 +4971,27 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             self.request_timeout,
             MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
             move |client| async move { client.worker_session(worker_id, request).await },
+        )
+        .map_err(|diagnostic| diagnostic.message)
+    }
+
+    fn worker_session_history(
+        &self,
+        workspace_id: &str,
+        worker_ref: &EmbeddedWorkerRef,
+        cursor: Option<String>,
+        limit: Option<usize>,
+    ) -> Result<runtime_api::WorkerSessionHistoryAvailability, String> {
+        let worker_id = worker_ref.worker_id.to_string();
+        let request = runtime_api::WorkerSessionHistoryRequest {
+            workspace_id: workspace_id.to_string(),
+            cursor,
+            limit,
+        };
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.worker_session_history(worker_id, request).await },
         )
         .map_err(|diagnostic| diagnostic.message)
     }

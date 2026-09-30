@@ -1,9 +1,20 @@
 <script lang="ts">
-  import type { ConsoleTurn } from './turn-navigation';
+  import type { TurnNavigationItem } from './turn-navigation';
 
-  let { turns, onSelect }: {
-    turns: ConsoleTurn[];
-    onSelect: (id: string) => void;
+  let {
+    items, onTurnClick, hasMore = false, loading = false, error = null,
+    onLoadMore = () => {}, onTopEdgeChange = () => {}, historyAvailable = true,
+    element = $bindable(null),
+  }: {
+    items: TurnNavigationItem[];
+    onTurnClick: (item: TurnNavigationItem) => void;
+    hasMore?: boolean;
+    loading?: boolean;
+    error?: string | null;
+    onLoadMore?: () => void;
+    onTopEdgeChange?: (atTop: boolean) => void;
+    historyAvailable?: boolean;
+    element?: HTMLElement | null;
   } = $props();
 
   const tooltipId = $props.id();
@@ -14,8 +25,8 @@
   let railHeight = $state(0);
   let previewHeight = $state(0);
   let rail: HTMLElement;
-  const preview = $derived(dismissed ? undefined : turns.find(
-    (turn) => turn.id === (hoveredId ?? focusedId),
+  const preview = $derived(dismissed ? undefined : items.find(
+    (turn) => turn.turnId === (hoveredId ?? focusedId),
   ));
   const previewTop = $derived(Math.max(0, Math.min(anchorY, railHeight - previewHeight)));
 
@@ -37,18 +48,35 @@
   bind:clientHeight={railHeight}
   onmouseleave={() => { hoveredId = null; }}
 >
-  <div class="turn-bars" onscroll={() => { dismissed = true; }}>
-    {#each turns as turn, index (turn.id)}
+  <div class="turn-bars turn-list" bind:this={element} onscroll={(event) => {
+    dismissed = true;
+    onTopEdgeChange(event.currentTarget.scrollTop <= 1);
+  }}>
+    <div class="history-boundary">
+      {#if !historyAvailable}
+        <span title="Earlier history is unavailable for this view" aria-label="Earlier history is unavailable for this view">·</span>
+      {:else if loading}
+        <button type="button" disabled aria-label="Loading earlier conversation…">…</button>
+      {:else if error}
+        <button type="button" onclick={onLoadMore} title={error} aria-label="Retry earlier conversation">↻</button>
+      {:else if hasMore}
+        <button type="button" onclick={onLoadMore} title="Earlier conversation available" aria-label="Earlier conversation available">↑</button>
+      {:else}
+        <span title="Start of conversation" aria-label="Start of conversation">·</span>
+      {/if}
+    </div>
+    {#each items as turn, index (turn.turnId)}
       <button
         type="button"
         class="turn-button"
-        class:previewing={preview?.id === turn.id}
+        data-turn-id={turn.turnId}
+        class:previewing={preview?.turnId === turn.turnId}
         aria-label={`Turn ${index + 1}: ${turn.user || 'User message'}`}
-        aria-describedby={preview?.id === turn.id ? tooltipId : undefined}
-        onmouseenter={(event) => show(event, turn.id)}
-        onfocus={(event) => show(event, turn.id)}
+        aria-describedby={preview?.turnId === turn.turnId ? tooltipId : undefined}
+        onmouseenter={(event) => show(event, turn.turnId)}
+        onfocus={(event) => show(event, turn.turnId)}
         onblur={() => { focusedId = null; }}
-        onclick={() => onSelect(turn.id)}
+        onclick={() => onTurnClick(turn)}
       ><span class="turn-bar" aria-hidden="true"></span></button>
     {/each}
   </div>
@@ -60,7 +88,7 @@
     >
       <div class="turn-preview" id={tooltipId} role="tooltip">
         <p class="preview-user">{preview.user || '—'}</p>
-        <p class="preview-assistant">{preview.assistant || 'No response yet'}</p>
+        <p class="preview-assistant">{preview.assistant.join(" ") || 'No response yet'}</p>
       </div>
     </div>
   {/if}
@@ -86,7 +114,19 @@
   .turn-bars::-webkit-scrollbar { display: none; }
 
   /* Center short lists without making overflowing turns unreachable. */
-  .turn-button:first-child { margin-top: auto; }
+  .history-boundary { margin-top: auto; }
+  .history-boundary button, .history-boundary span {
+    display: grid;
+    place-items: center;
+    width: 32px;
+    min-height: 24px;
+    padding: var(--space-1);
+    border: 0;
+    background: transparent;
+    color: var(--text-muted);
+    font: inherit;
+  }
+  .history-boundary button { cursor: pointer; color: var(--tui-cyan); }
   .turn-button:last-child { margin-bottom: auto; }
 
   .turn-button {

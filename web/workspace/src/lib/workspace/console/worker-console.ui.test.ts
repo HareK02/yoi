@@ -496,11 +496,13 @@ Deno.test("workspace Memory surfaces use read-only scoped memory APIs", async ()
   assert(
     memoryDocumentLoad.includes("workspaceApiPath(params.workspaceId") &&
       memoryDocumentLoad.includes('"/memory"') &&
-      memoryDocumentPage.includes("Memory Document") &&
-      memoryDocumentPage.includes("This view is read-only") &&
+      memoryDocumentPage.includes("DocumentMarkdown from") &&
+      memoryDocumentPage.includes("Read-only") &&
       memoryDocumentPage.includes("data.memory.data.body_md") &&
-      memoryDocumentPage.includes("data.memory.data.updated_at"),
-    "Memory Document page should read the scoped API and expose the durable document without mutation controls",
+      memoryDocumentPage.includes("data.memory.data.updated_at") &&
+      memoryDocumentPage.includes('role="alert"') &&
+      !memoryDocumentPage.includes('<pre class="memory-document-body"'),
+    "Memory Document page should read the scoped API and expose safe Markdown states without mutation controls",
   );
   assert(
     memoryStagingLoad.includes("workspaceApiPath(params.workspaceId") &&
@@ -790,19 +792,19 @@ Deno.test("Worker Console uses turn bars with hidden scrollbars and preserves sc
   const navigation = await Deno.readTextFile(new URL("./ConsoleTurnNavigation.svelte", import.meta.url));
   assert(
     !/timeline/i.test(consolePage) &&
-      consolePage.includes("const turns = $derived(consoleTurns(lines))") &&
-      consolePage.includes("<ConsoleTurnNavigation {turns} onSelect={selectConsoleTurn}") &&
+      consolePage.includes("conversationTurnPreviewsFromLines(lines)") &&
+      consolePage.includes("items={turnNavigationItems}") &&
       consolePage.includes("CSS.escape(id)") &&
       consolePage.includes("scrollbar-width: none") &&
       consolePage.includes("::-webkit-scrollbar"),
     "Console should replace the scrollbar with conversation turn navigation, not the former timeline",
   );
   assert(
-    navigation.includes("{#each turns as turn, index (turn.id)}") &&
+    navigation.includes("{#each items as turn, index (turn.turnId)}") &&
       navigation.includes('class="turn-bar"') &&
       navigation.includes("onmouseenter=") &&
       navigation.includes("onfocus=") &&
-      navigation.includes("onclick={() => onSelect(turn.id)}") &&
+      navigation.includes("onclick={() => onTurnClick(turn)}") &&
       navigation.includes('role="tooltip"') &&
       navigation.includes("aria-describedby=") &&
       navigation.includes("event.key === 'Escape'") &&

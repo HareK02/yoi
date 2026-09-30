@@ -9,6 +9,7 @@ import {
   consoleWorkerViews,
   createConsoleProjector,
   isConsoleProjectionEvent,
+  mergeCommittedHistoryLines,
   projectConsole,
   projectConsoleLines,
   projectOverviewLines,
@@ -2949,4 +2950,204 @@ Deno.test("new invoke resets stats before the next RunEnd", () => {
   ]);
 
   assertEquals(projection.lines.at(-1)?.body, "0s ・0 reqs ↑0/↓0");
+});
+
+Deno.test("committed assistant identity reconciles the live block without text matching", () => {
+  const lines = projectConsole([
+    {
+      eventId: "user-live",
+      event: {
+        event: "user_message",
+        data: {
+          entry_id: "user-entry",
+          segments: [{ kind: "text", content: "question" }],
+        },
+      },
+    },
+    {
+      eventId: "assistant-live",
+      event: { event: "text_done", data: { text: "final answer" } },
+    },
+    {
+      eventId: "assistant-commit",
+      event: {
+        event: "session_entry_committed",
+        data: {
+          entry: {
+            entry_id: "assistant-entry",
+            timestamp: 7,
+            provenance: "model_output",
+            kind: "message",
+            role: "assistant",
+            content: [{ kind: "text", text: "final answer" }],
+          },
+        },
+      },
+    },
+  ]).lines;
+  assertEquals(lines.filter((line) => line.kind === "assistant").length, 1);
+  assertEquals(
+    lines.find((line) => line.kind === "assistant")?.entryId,
+    "assistant-entry",
+  );
+  assertEquals(
+    lines.find((line) => line.kind === "user")?.entryId,
+    "user-entry",
+  );
+});
+
+Deno.test("committed tool identities reconcile one live call block", () => {
+  const lines = projectConsole([
+    {
+      eventId: "tool-live",
+      event: {
+        event: "tool_call_done",
+        data: { id: "call-1", name: "Read", arguments: '{"file_path":"a"}' },
+      },
+    },
+    {
+      eventId: "tool-call-commit",
+      event: {
+        event: "session_entry_committed",
+        data: {
+          entry: {
+            entry_id: "tool-call-entry",
+            timestamp: 8,
+            provenance: "model_output",
+            kind: "tool_call",
+            call_id: "call-1",
+            name: "Read",
+            arguments: '{"file_path":"a"}',
+          },
+        },
+      },
+    },
+    {
+      eventId: "tool-result-live",
+      event: {
+        event: "tool_result",
+        data: {
+          id: "call-1",
+          summary: "read",
+          output: "contents",
+          is_error: false,
+        },
+      },
+    },
+    {
+      eventId: "tool-result-commit",
+      event: {
+        event: "session_entry_committed",
+        data: {
+          entry: {
+            entry_id: "tool-result-entry",
+            timestamp: 9,
+            provenance: "tool_output",
+            kind: "tool_result",
+            call_id: "call-1",
+            summary: "read",
+            content: "contents",
+            is_error: false,
+          },
+        },
+      },
+    },
+  ]).lines;
+
+  assertEquals(
+    lines.filter((line) => line.toolCall?.id === "call-1").length,
+    1,
+  );
+  assertEquals(lines[0].entryId, "tool-result-entry");
+  assertEquals(lines[0].toolCall?.state, "done");
+});
+
+Deno.test("committed history preserves unmatched current rows in stable entry order", () => {
+  const history = [2, 3, 4, 5, 6].flatMap((turn) => {
+    const user = consoleLine(`history-user-${turn}`, "user");
+    user.entryId = `user-${turn}`;
+    const assistant = consoleLine(`history-assistant-${turn}`, "assistant");
+    assistant.entryId = `assistant-${turn}`;
+    return [user, assistant];
+  });
+  const current = [1, 2, 3, 4, 5, 6].flatMap((turn) => {
+    const user = consoleLine(`current-user-${turn}`, "user");
+    user.entryId = `user-${turn}`;
+    const assistant = consoleLine(`current-assistant-${turn}`, "assistant");
+    assistant.entryId = `assistant-${turn}`;
+    return [user, assistant];
+  });
+
+  const merged = mergeCommittedHistoryLines(history, current);
+  assertEquals(
+    merged.map((line) => line.entryId),
+    [1, 2, 3, 4, 5, 6].flatMap((turn) => [
+      `user-${turn}`,
+      `assistant-${turn}`,
+    ]),
+  );
+  assert(
+    merged.every((line) => line.id.startsWith("current-")),
+    "the ordered current snapshot must remain authoritative for overlapping entries",
+  );
+});
+
+Deno.test("committed history places omitted retained rows between snapshot anchors", () => {
+  const makeLine = (prefix: string, turn: number) => {
+    const line = consoleLine(`${prefix}-${turn}`, "user");
+    line.entryId = `user-${turn}`;
+    return line;
+  };
+  const history = [2, 3, 4, 5, 6].map((turn) => makeLine("history", turn));
+  const current = [1, 2, 6].map((turn) => makeLine("current", turn));
+
+  assertEquals(
+    mergeCommittedHistoryLines(history, current).map((line) => line.entryId),
+    [1, 2, 3, 4, 5, 6].map((turn) => `user-${turn}`),
+  );
+});
+
+Deno.test("committed history places current context before an interior first anchor", () => {
+  const makeLine = (prefix: string, turn: number) => {
+    const line = consoleLine(`${prefix}-${turn}`, "user");
+    line.entryId = `user-${turn}`;
+    return line;
+  };
+  const history = [6, 7, 8, 9, 10].map((turn) => makeLine("history", turn));
+  const current = [1, 8, 10].map((turn) => makeLine("current", turn));
+
+  assertEquals(
+    mergeCommittedHistoryLines(history, current).map((line) => line.entryId),
+    [1, 6, 7, 8, 9, 10].map((turn) => `user-${turn}`),
+  );
+});
+
+Deno.test("committed history places a retained suffix before newer current-only rows", () => {
+  const makeLine = (prefix: string, turn: number) => {
+    const line = consoleLine(`${prefix}-${turn}`, "user");
+    line.entryId = `user-${turn}`;
+    return line;
+  };
+  const history = [2, 3, 4, 5, 6].map((turn) => makeLine("history", turn));
+  const current = [1, 2, 7].map((turn) => makeLine("current", turn));
+
+  assertEquals(
+    mergeCommittedHistoryLines(history, current).map((line) => line.entryId),
+    [1, 2, 3, 4, 5, 6, 7].map((turn) => `user-${turn}`),
+  );
+});
+
+Deno.test("committed history inserts current live rows after their last stable anchor", () => {
+  const historyUser = consoleLine("history-user", "user");
+  historyUser.entryId = "user-1";
+  const currentUser = consoleLine("current-user", "user");
+  currentUser.entryId = "user-1";
+  const live = consoleLine("live-assistant", "in_flight");
+
+  assertEquals(
+    mergeCommittedHistoryLines([historyUser], [currentUser, live]).map((line) =>
+      line.id
+    ),
+    ["current-user", "live-assistant"],
+  );
 });

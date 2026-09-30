@@ -172,6 +172,15 @@ pub trait RuntimeWorkerFactory: Send + Sync + 'static {
         Err(session_store::RetainedSnapshotReadError::RetentionMissing)
     }
 
+    fn retained_session_history_page(
+        &self,
+        _worker_ref: &WorkerRef,
+        _cursor: Option<&str>,
+        _limit: Option<usize>,
+    ) -> Result<protocol::SessionHistoryPage, session_store::RetainedHistoryReadError> {
+        Err(session_store::RetainedHistoryReadError::RetentionMissing)
+    }
+
     async fn spawn_controller(
         &self,
         request: WorkerExecutionSpawnRequest,
@@ -1024,6 +1033,25 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             &aggregate_dir,
             &worker_name,
             session_store::DEFAULT_RETAINED_SNAPSHOT_MAX_BYTES,
+        )
+    }
+
+    fn retained_session_history_page(
+        &self,
+        worker_ref: &WorkerRef,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<protocol::SessionHistoryPage, session_store::RetainedHistoryReadError> {
+        let aggregate_dir = self
+            .worker_aggregate_dir(worker_ref)
+            .map_err(|_| session_store::RetainedHistoryReadError::RetentionMissing)?;
+        let worker_name = Self::runtime_worker_name_for_ref(worker_ref);
+        session_store::read_retained_session_history_page(
+            &aggregate_dir,
+            &worker_name,
+            cursor,
+            limit,
+            session_store::RetainedHistoryReadLimits::default(),
         )
     }
 
@@ -2209,6 +2237,48 @@ where
                     }
                 };
                 runtime_api::WorkerSessionAvailability::Unavailable {
+                    reason,
+                    message: error.to_string(),
+                }
+            }
+        }
+    }
+
+    fn worker_session_history(
+        &self,
+        request: crate::execution::WorkerSessionHistoryRequest,
+    ) -> runtime_api::WorkerSessionHistoryAvailability {
+        match self.factory.retained_session_history_page(
+            &request.worker_ref,
+            request.cursor.as_deref(),
+            request.limit,
+        ) {
+            Ok(page) => runtime_api::WorkerSessionHistoryAvailability::Page { page },
+            Err(error) => {
+                let reason = match error {
+                    session_store::RetainedHistoryReadError::RetentionMissing => {
+                        runtime_api::WorkerSessionHistoryUnavailableReason::RetentionMissing
+                    }
+                    session_store::RetainedHistoryReadError::ActivePointerMissing => {
+                        runtime_api::WorkerSessionHistoryUnavailableReason::ActivePointerMissing
+                    }
+                    session_store::RetainedHistoryReadError::MigrationRequired => {
+                        runtime_api::WorkerSessionHistoryUnavailableReason::MigrationRequired
+                    }
+                    session_store::RetainedHistoryReadError::CorruptLog => {
+                        runtime_api::WorkerSessionHistoryUnavailableReason::CorruptLog
+                    }
+                    session_store::RetainedHistoryReadError::StorageUnavailable => {
+                        runtime_api::WorkerSessionHistoryUnavailableReason::StorageUnavailable
+                    }
+                    session_store::RetainedHistoryReadError::InvalidCursor => {
+                        runtime_api::WorkerSessionHistoryUnavailableReason::InvalidCursor
+                    }
+                    session_store::RetainedHistoryReadError::ResourceLimit => {
+                        runtime_api::WorkerSessionHistoryUnavailableReason::ResourceLimit
+                    }
+                };
+                runtime_api::WorkerSessionHistoryAvailability::Unavailable {
                     reason,
                     message: error.to_string(),
                 }
