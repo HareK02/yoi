@@ -113,7 +113,8 @@
 
   .turn-bars::-webkit-scrollbar { display: none; }
 
-  /* Center short lists without making overflowing turns unreachable. */
+  /* Bottom-align short lists so prepending older turns does not move existing bars.
+     Once overflowing, scroll-anchor restoration keeps those bars in place. */
   .history-boundary { margin-top: auto; }
   .history-boundary button, .history-boundary span {
     display: grid;
@@ -127,7 +128,6 @@
     font: inherit;
   }
   .history-boundary button { cursor: pointer; color: var(--tui-cyan); }
-  .turn-button:last-child { margin-bottom: auto; }
 
   .turn-button {
     display: grid;

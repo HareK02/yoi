@@ -97,11 +97,11 @@ Deno.test("production Console pages backward by real turns while preserving both
           }\nerrors=${JSON.stringify(errors)}\nbody=${await page.locator("body").innerText()}`,
         );
       }
-      const navigation = page.getByRole("complementary", { name: "Conversation turns" });
-      await navigation.getByText("question 7", { exact: true }).waitFor();
+      const navigation = page.getByRole("navigation", { name: "Conversation turns" });
+      await navigation.getByRole("button", { name: /^Turn \d+: question 7$/ }).waitFor();
       assertEquals(await historyRequestCount(baseUrl), 1);
       assertEquals(await transcript.getByText(/^question (7|8|9|10|11|12)$/).count(), 6);
-      assertEquals(await navigation.getByText(/^question (7|8|9|10|11|12)$/).count(), 6);
+      assertEquals(await navigation.getByRole("button", { name: /^Turn \d+: question (7|8|9|10|11|12)$/ }).count(), 6);
       const currentQuestionTop = await transcript
         .getByText("question 7", { exact: true })
         .evaluate((element) => element.getBoundingClientRect().top);
@@ -114,13 +114,15 @@ Deno.test("production Console pages backward by real turns while preserving both
       );
 
       const question12 = navigation.getByRole("button", {
-        name: "Jump to conversation: question 12",
+        name: /^Turn \d+: question 12$/,
       });
-      assertEquals(await question12.getByText("detail 12.1", { exact: true }).count(), 1);
-      assertEquals(await question12.getByText("detail 12.2", { exact: true }).count(), 1);
-      assertEquals(await question12.getByText("detail 12.3", { exact: true }).count(), 0);
-      assert(!(await question12.textContent())?.includes("User"));
-      assert(!(await question12.textContent())?.includes("AI"));
+      await question12.hover();
+      const preview = navigation.getByRole("tooltip");
+      await preview.waitFor();
+      assert((await preview.textContent())?.includes("detail 12.1"));
+      assert((await preview.textContent())?.includes("detail 12.2"));
+      assert(!(await preview.textContent())?.includes("detail 12.3"));
+      await page.keyboard.press("Escape");
 
       const consoleScroll = transcript.locator("xpath=..");
       const topAlignment = await page.evaluate(() => {
@@ -142,7 +144,7 @@ Deno.test("production Console pages backward by real turns while preserving both
         return top;
       });
       await transcript.getByText("question 3", { exact: true }).waitFor();
-      await navigation.getByText("question 3", { exact: true }).waitFor();
+      await navigation.getByRole("button", { name: /^Turn \d+: question 3$/ }).waitFor();
       const restoredTop = await transcript
         .locator('[data-console-line-id*="user-8"]')
         .evaluate((element) => element.getBoundingClientRect().top);
@@ -172,12 +174,12 @@ Deno.test("production Console pages backward by real turns while preserving both
         element.dispatchEvent(new Event("scroll"));
       });
       await transcript.getByText("question 1", { exact: true }).waitFor();
-      await navigation.getByText("question 1", { exact: true }).waitFor();
+      await navigation.getByRole("button", { name: /^Turn \d+: question 1$/ }).waitFor();
       assertEquals(await historyRequestCount(baseUrl), 3);
-      assertEquals(await page.getByText("Start of conversation", { exact: true }).count(), 2);
+      assertEquals(await page.getByText("Start of conversation", { exact: true }).count(), 1);
 
       await navigation.getByRole("button", {
-        name: "Jump to conversation: question 3",
+        name: /^Turn \d+: question 3$/,
       }).click();
       await page.waitForFunction(() => {
         const document = (globalThis as any).document;
@@ -201,7 +203,7 @@ Deno.test("production Console pages backward by real turns while preserving both
 
       const centering = await question12.evaluate((button) => {
         const turn = button.getBoundingClientRect();
-        const bar = button.querySelector(".bar")!.getBoundingClientRect();
+        const bar = button.querySelector(".turn-bar")!.getBoundingClientRect();
         return Math.abs((turn.top + turn.bottom) / 2 - (bar.top + bar.bottom) / 2);
       });
       assert(centering <= 1, `turn marker is not vertically centered (${centering}px)`);
