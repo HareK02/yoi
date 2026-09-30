@@ -22,7 +22,7 @@ type CommandSpec = {
   description: string;
 };
 
-const COMMANDS: Record<string, CommandSpec> = {
+export const COMMANDS: Record<string, CommandSpec> = {
   help: {
     usage: ":help [command]",
     description:

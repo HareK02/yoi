@@ -12,6 +12,15 @@ function assertEquals<T>(actual: T, expected: T): void {
   if (a !== e) throw new Error(`Expected ${e}, got ${a}`);
 }
 
+Deno.test("compact and rewind remain explicit Composer commands", () => {
+  assertEquals(buildComposerSegmentsRequest([{ kind: "text", content: ":compact" }]), {
+    ok: true, request: { kind: "compact", content: "" }, notice: "compact requested",
+  });
+  assertEquals(buildComposerRequest(":rewind"), {
+    ok: true, request: { kind: "list_rewind_targets", content: "" }, notice: "rewind targets requested",
+  });
+});
+
 Deno.test("parseSigilSegments turns file sigils into file refs", () => {
   assertEquals(parseSigilSegments("read @src/main.rs"), [
     { kind: "text", content: "read " },

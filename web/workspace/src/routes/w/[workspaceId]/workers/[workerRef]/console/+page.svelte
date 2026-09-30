@@ -17,12 +17,7 @@
         buildComposerSegmentsRequest,
         type WorkerConsoleInputRequest,
     } from "$lib/workspace/console/composer-command";
-    import {
-        completionTokenAt,
-        localCommandCompletions,
-        type ComposerCompletionEntry,
-        type ComposerCompletionToken,
-    } from "$lib/workspace/console/composer-completion";
+    import { FileCompletions } from "$lib/workspace/console/file-completions";
     import WorkerRunStatus from "$lib/workspace/console/WorkerRunStatus.svelte";
     import { resolveWorkerControlShortcut } from "$lib/workspace/console/worker-control-shortcuts";
     import {
@@ -141,10 +136,6 @@
     let nextAttachmentId = 1;
     let fileInput: HTMLInputElement | null = null;
     let isDraggingFiles = $state(false);
-    let completionEntries = $state<ComposerCompletionEntry[]>([]);
-    let completionToken = $state<ComposerCompletionToken | null>(null);
-    let completionBusy = $state(false);
-    let completionError = $state<string | null>(null);
     let sending = $state(false);
     let sendError = $state<string | null>(null);
     let rewindTargets = $state<RewindTarget[]>([]);
@@ -164,11 +155,9 @@
         submissions: [],
     });
     let pendingSubmissionItems = $derived(pendingSubmissions.submissions ?? []);
-    let pendingCompletionRequest: {
-        resolve: (entries: ComposerCompletionEntry[]) => void;
-        reject: (error: Error) => void;
-        timeout: number;
-    } | null = null;
+    const fileCompletions = new FileCompletions((prefix) => sendProtocolMethod({
+        method: "list_completions", params: { kind: "file", prefix },
+    }));
     let streamDiagnostics = $state<Diagnostic[]>([]);
     let workerDetailsOpen = $state(false);
     let taskPaneOpen = $state(false);
@@ -181,9 +170,9 @@
         (SvelteComponent & ComposerInputHandle) | null
     >(null);
     const composerDrafts = new Map<string, ComposerDraftCache>();
-    let activeComposerTargetKey = untrack(() =>
+    let activeComposerTargetKey = $state(untrack(() =>
         runtimeId && workerId ? `${workspaceId}:${runtimeId}:${workerId}` : "",
-    );
+    ));
     let autoFollowConsole = $state(true);
     const consoleViewScroll = new Map<string, ConsoleViewScroll>();
     const CONSOLE_BOTTOM_THRESHOLD_PX = 48;
@@ -749,96 +738,11 @@
         scheduleObservationFlush();
     }
 
-    async function applyComposerCompletion() {
-        if (!composerEditable || !composerInputElement) return;
-        const input = composerInputElement;
-        const targetKey = activeComposerTargetKey;
-        const document = draft.document;
-        const token = completionTokenAt(
-            document,
-            input.cursor(),
-        );
-        completionToken = token;
-        completionError = null;
-        if (!token) {
-            completionEntries = [];
-            return;
-        }
-
-        completionBusy = true;
-        try {
-            const entries = await resolveCompletionEntries(token);
-            if (
-                !composerEditable ||
-                composerInputElement !== input ||
-                activeComposerTargetKey !== targetKey ||
-                draft.document !== document
-            ) {
-                return;
-            }
-            completionEntries = entries;
-            if (entries.length === 0) {
-                completionError = `No completions for ${token.sigil}${token.prefix}`;
-                return;
-            }
-            input.replaceRange(
-                token.start,
-                token.end,
-                `${entries[0].value} `,
-            );
-        } catch (error) {
-            completionError =
-                error instanceof Error ? error.message : String(error);
-        } finally {
-            completionBusy = false;
-        }
-    }
-
-    async function resolveCompletionEntries(
-        token: ComposerCompletionToken,
-    ): Promise<ComposerCompletionEntry[]> {
-        if (token.kind === "command") {
-            return localCommandCompletions(token.prefix);
-        }
-        const completionKind = token.kind;
-        const completionPrefix = token.prefix;
-        return new Promise((resolve, reject) => {
-            if (pendingCompletionRequest) {
-                rejectPendingCompletion(
-                    new Error("Superseded by a newer completion request."),
-                );
-            }
-            const timeout = window.setTimeout(() => {
-                rejectPendingCompletion(
-                    new Error("Worker completion request timed out."),
-                );
-            }, 30_000);
-            pendingCompletionRequest = { resolve, reject, timeout };
-            try {
-                sendProtocolMethod({
-                    method: "list_completions",
-                    params: { kind: completionKind, prefix: completionPrefix },
-                });
-            } catch (error) {
-                rejectPendingCompletion(
-                    error instanceof Error ? error : new Error(String(error)),
-                );
-            }
-        });
-    }
-
     function handleComposerKeydown(event: KeyboardEvent) {
         if (event.key === "PageUp" || event.key === "PageDown") {
             event.preventDefault();
             scrollConsoleByPage(event.key === "PageDown" ? 1 : -1);
-            return;
         }
-        if (event.key !== "Tab") {
-            return;
-        }
-        event.preventDefault();
-        if (!composerEditable) return;
-        void applyComposerCompletion();
     }
 
     function scrollConsoleByPage(direction: 1 | -1) {
@@ -946,10 +850,6 @@
         sendWorkerControl(command);
     }
 
-    function requestRewindTargets() {
-        sendControl({ method: "list_rewind_targets" }, "Rewind target request");
-    }
-
     function rewindTo(target: RewindTarget) {
         sendControl(
             {
@@ -1050,7 +950,15 @@
         });
     }
 
+    function handleComposerCommand() {
+        void submitDraft(composerInputElement?.snapshot() ?? draft);
+    }
+
     function handleComposerSubmit() {
+        if ((composerInputElement?.snapshot() ?? draft).document.trimStart().startsWith(":")) {
+            handleComposerCommand();
+            return;
+        }
         if (workerRunning) {
             sendWorkerControl("cancel");
             return;
@@ -1205,6 +1113,7 @@
             return;
         }
         if (!command.request) {
+            if (command.notice) pushWorkspaceAlert("info", command.notice, { title: "Console command" });
             composerInputElement?.clear();
             return;
         }
@@ -1216,7 +1125,10 @@
             hasText: value.content.trim().length > 0,
             hasAttachments: attachments.length > 0,
         };
-        if (!canDeliverComposerDraft(deliveryState)) {
+        // Commands are controls, not idle-only chat submissions. Keep the
+        // removed header controls available while the Worker is busy too.
+        const isCommand = delivery === "submit" && command.request.kind !== "user";
+        if (isCommand ? !composerEditable : !canDeliverComposerDraft(deliveryState)) {
             return;
         }
 
@@ -1236,7 +1148,9 @@
         sendError = null;
         try {
             const method = composerRequestToProtocolMethod(request);
-            if (!sendComposerDelivery(deliveryState, method, sendProtocolMethod)) {
+            if (isCommand) {
+                sendProtocolMethod(method);
+            } else if (!sendComposerDelivery(deliveryState, method, sendProtocolMethod)) {
                 return;
             }
             composerInputElement?.recordHistory(value);
@@ -1428,6 +1342,7 @@
                                     "The live subscription did not provide an initial snapshot.",
                                 );
                             }
+                            fileCompletions.reset();
                             protocolState = "open";
                         } else if (
                             frame.frame === "event" &&
@@ -1480,7 +1395,10 @@
         );
         protocolSubscription = subscription;
         return () => {
-            if (protocolSubscription === subscription) protocolSubscription = null;
+            if (protocolSubscription === subscription) {
+                protocolSubscription = null;
+                fileCompletions.close();
+            }
             subscription.close();
         };
     }
@@ -1494,13 +1412,7 @@
 
     function handleProtocolCommandEvent(event: ProtocolEvent) {
         if (event.event === "completions") {
-            const pending = pendingCompletionRequest;
-            if (!pending) {
-                return;
-            }
-            pendingCompletionRequest = null;
-            window.clearTimeout(pending.timeout);
-            pending.resolve(event.data.entries);
+            if (event.data.kind === "file") fileCompletions.receive(event.data.entries);
             return;
         }
         if (event.event === "rewind_targets") {
@@ -1517,7 +1429,7 @@
         }
         if (event.event === "error") {
             const error = new Error(event.data.message);
-            if (pendingCompletionRequest) {
+            if (fileCompletions.pending) {
                 rejectPendingCompletion(error);
             }
             streamDiagnostics = [
@@ -1532,13 +1444,7 @@
     }
 
     function rejectPendingCompletion(error: Error) {
-        const pending = pendingCompletionRequest;
-        if (!pending) {
-            return;
-        }
-        pendingCompletionRequest = null;
-        window.clearTimeout(pending.timeout);
-        pending.reject(error);
+        fileCompletions.close(error);
     }
 
     function mergeDiagnostics(...groups: Diagnostic[][]): Diagnostic[] {
@@ -1759,36 +1665,6 @@
             <button
                 type="button"
                 class="secondary-button"
-                disabled={protocolState !== "open"}
-                onclick={() => {
-                    const method = lifecycleMethod("compact");
-                    if (method) sendControl(method, "Compact");
-                }}
-            >
-                Compact
-            </button>
-            <button
-                type="button"
-                class="secondary-button"
-                disabled={protocolState !== "open"}
-                onclick={requestRewindTargets}
-            >
-                Rewind
-            </button>
-            <button
-                type="button"
-                class="secondary-button"
-                aria-expanded={taskPaneOpen}
-                onclick={() => {
-                    taskPaneOpen = !taskPaneOpen;
-                    if (taskPaneOpen) workerDetailsOpen = false;
-                }}
-            >
-                Tasks{tasks.length > 0 ? ` ${tasks.length}` : ""}
-            </button>
-            <button
-                type="button"
-                class="secondary-button"
                 aria-expanded={workerDetailsOpen}
                 onclick={() => {
                     workerDetailsOpen = !workerDetailsOpen;
@@ -1888,7 +1764,7 @@
         </section>
 
         {#if taskPaneOpen}
-            <ConsoleTasks {tasks} mode="pane" />
+            <ConsoleTasks {tasks} mode="pane" paneId="console-task-pane" />
         {/if}
     </div>
 
@@ -1973,6 +1849,12 @@
     <ConsoleTasks
         {tasks}
         mode="mini"
+        paneId="console-task-pane"
+        paneOpen={taskPaneOpen}
+        onTogglePane={() => {
+            taskPaneOpen = !taskPaneOpen;
+            if (taskPaneOpen) workerDetailsOpen = false;
+        }}
         workerViews={workerViews.map(({ sessionId, label }) => ({
             sessionId,
             label,
@@ -2064,6 +1946,9 @@
                 disabled={!composerEditable}
                 onchange={handleComposerChange}
                 onkeydown={handleComposerKeydown}
+                completionScope={activeComposerTargetKey}
+                resolveFileCompletions={(prefix, signal) => fileCompletions.request(prefix, signal)}
+                oncommand={handleComposerCommand}
                 onsubmit={handleComposerSubmit}
                 onpasteimages={addPastedImages}
             />
@@ -2108,23 +1993,6 @@
                             <path d="M12 5V19M5 12H19" />
                         </svg>
                     </button>
-                    {#if completionBusy || completionError || completionEntries.length > 0}
-                        <div class="composer-completions" aria-live="polite">
-                            {#if completionBusy}
-                                <span>completing…</span>
-                            {:else if completionError}
-                                <span class="error">{completionError}</span>
-                            {:else}
-                                <span
-                                    >Tab: {completionToken?.sigil}{completionEntries[0]
-                                        ?.value}</span
-                                >
-                                {#if completionEntries.length > 1}
-                                    <span>{completionEntries.length - 1} more</span>
-                                {/if}
-                            {/if}
-                        </div>
-                    {/if}
                 </div>
                 <div class="composer-submit-actions">
                     {#if workerRunning || workerPaused}
@@ -2703,16 +2571,6 @@
         stroke-width: 2;
     }
 
-    .composer-completions {
-        display: flex;
-        flex-wrap: wrap;
-        gap: var(--space-2);
-        align-items: center;
-        color: var(--text-muted);
-        font-size: var(--font-size-compact);
-        line-height: var(--line-height-compact);
-    }
-
     .composer-submit-actions {
         display: flex;
         align-items: center;
@@ -2722,6 +2580,7 @@
     @media (max-width: 960px) {
         .console-history.with-task-pane {
             grid-template-columns: minmax(0, 1fr);
+            grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
         }
 
         .console-header {

@@ -1,5 +1,6 @@
 import {
   applyCompletion,
+  completionSelection,
   completionTokenAt,
   localCommandCompletions,
 } from "./composer-completion.ts";
@@ -47,6 +48,43 @@ Deno.test("applyCompletion replaces the active token and advances the cursor", (
     value: "open @src/ please",
     cursor: "open @src/".length,
   });
+});
+
+Deno.test("completion scope, aliases and middle-of-token replacement match command semantics", () => {
+  assertEquals(completionTokenAt("explain :comp", 13), null);
+  assertEquals(completionTokenAt(":notify @file", 13), null);
+  assertEquals(completionTokenAt("@\uFFF91\uFFFB", 4), null);
+  assertEquals(localCommandCompletions("roll").map((entry) => entry.value), [
+    "rewind",
+  ]);
+  assertEquals(localCommandCompletions("?").map((entry) => entry.value), [
+    "help",
+  ]);
+  const value = ":notify old argument";
+  const token = completionTokenAt(value, 4)!;
+  assertEquals(
+    applyCompletion(value, token, { value: "peer" }).value,
+    ":peer old argument",
+  );
+  const file = "see @sr trailing";
+  assertEquals(
+    applyCompletion(file, completionTokenAt(file, 7)!, {
+      value: "src/",
+      is_dir: true,
+    }).value,
+    "see @src/ trailing",
+  );
+  assertEquals(
+    applyCompletion(
+      "@ma",
+      completionTokenAt("@ma", 3)!,
+      { value: "main.rs" },
+      "tab",
+    ).value,
+    "@main.rs",
+  );
+  assertEquals(completionSelection(null, 6, -1), 5);
+  assertEquals(completionSelection(5, 6, 1), 0);
 });
 
 Deno.test("localCommandCompletions filters colon commands", () => {

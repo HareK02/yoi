@@ -15,6 +15,7 @@ import type {
   SessionSnapshot,
 } from "$lib/generated/protocol";
 import type { Worker } from "$lib/workspace/sidebar/types";
+import { EditorView } from "@codemirror/view";
 import ConsolePage from "./+page.svelte";
 
 const multiplexer = vi.hoisted(() => {
@@ -316,6 +317,95 @@ test("queue-only state keeps the notification column empty and disables cancella
   expect(screen.getByRole("group", { name: "Notifications" }).querySelector("ol")).toBeNull();
   latestListener().onStatus?.("closed", "connection lost");
   await waitFor(() => expect((screen.getByRole("button", { name: "Cancel queued input 1" }) as HTMLButtonElement).disabled).toBe(true));
+});
+
+test.each(["idle", "running", "paused"] as const)("Composer completion executes Compact/Rewind without header controls or Submit (%s)", async (state) => {
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ availability: "live_protocol" })));
+  const view = render(ConsolePage, { data: pageData() });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
+  const frame = subscribedFrame(emptySession());
+  const snapshot = frame.message.payload.snapshot.data.events[0];
+  if (snapshot.event === "snapshot" && state !== "idle") {
+    snapshot.data.state.state = { kind: "busy", state: { kind: "run", state } };
+  }
+  latestListener().onFrame(frame);
+  await screen.findByText("No conversation to display");
+  expect(screen.queryByRole("button", { name: "Compact" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Rewind" })).toBeNull();
+  const cm = EditorView.findFromDOM(view.container.querySelector(".cm-editor") as HTMLElement)!;
+  cm.focus();
+  cm.dispatch({ changes: { from: 0, insert: ":comp" }, selection: { anchor: 5 } });
+  await screen.findByRole("option");
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter" });
+  await waitFor(() => expect(multiplexer.sendWorkerMethod).toHaveBeenCalledWith({
+    method: "compact", params: { command: expect.objectContaining({ command_id: 1 }) },
+  }));
+  await waitFor(() => expect(cm.state.doc.toString()).toBe(""));
+  cm.dispatch({ changes: { from: 0, insert: ":rew" }, selection: { anchor: 4 } });
+  const option = await screen.findByRole("option");
+  await fireEvent.pointerDown(option);
+  await fireEvent.click(option);
+  await waitFor(() => expect(multiplexer.sendWorkerMethod).toHaveBeenCalledWith({ method: "list_rewind_targets" }));
+  expect(multiplexer.sendWorkerMethod.mock.calls.every(([method]) => method.method !== "submit" && method.method !== "cancel")).toBe(true);
+});
+
+test("file completions consume stale responses before the latest prefix and close with the connection", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ availability: "live_protocol" })));
+  const view = render(ConsolePage, { data: pageData() });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
+  latestListener().onFrame(subscribedFrame(emptySession()));
+  await screen.findByText("No conversation to display");
+  const cm = EditorView.findFromDOM(view.container.querySelector(".cm-editor") as HTMLElement)!;
+  cm.focus();
+  cm.dispatch({ changes: { from: 0, insert: "@old" }, selection: { anchor: 4 } });
+  await waitFor(() => expect(multiplexer.sendWorkerMethod).toHaveBeenCalledWith({ method: "list_completions", params: { kind: "file", prefix: "old" } }));
+  cm.dispatch({ changes: { from: 1, to: 4, insert: "new" }, selection: { anchor: 4 } });
+  await settleMicrotasks();
+  expect(multiplexer.sendWorkerMethod).toHaveBeenCalledOnce();
+  const receive = (value: string) => latestListener().onFrame({
+    frame: "event", message: { event: "event", data: { payload: {
+      event: "worker_protocol", data: { event: { event: "completions", data: { kind: "file", entries: [{ value, is_dir: false }] } } },
+    } } },
+  });
+  receive("old-result");
+  await waitFor(() => expect(multiplexer.sendWorkerMethod).toHaveBeenCalledWith({ method: "list_completions", params: { kind: "file", prefix: "new" } }));
+  expect(screen.queryByRole("option")).toBeNull();
+  receive("new-result");
+  expect((await screen.findByRole("option")).textContent).toContain("@new-result");
+  latestListener().onStatus?.("closed", "connection lost");
+  await waitFor(() => expect(screen.queryByRole("listbox")).toBeNull());
+  receive("late-result");
+  await settleMicrotasks();
+  expect(screen.queryByRole("listbox")).toBeNull();
+});
+
+test("mini task summary opens and closes details without a header Tasks button", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ availability: "live_protocol" })));
+  const view = render(ConsolePage, { data: pageData() });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
+  const session = emptySession();
+  session.entries.push({
+    kind: "tool_call", entry_id: "task-create", timestamp: 1, provenance: "model_output", derived_from: [],
+    call_id: "task-call", name: "TaskCreate",
+    arguments: JSON.stringify({ subject: "Inspect layout", description: "Detailed task description" }),
+  });
+  latestListener().onFrame(subscribedFrame(session));
+  const summary = await screen.findByRole("button", { name: /1 task — pending/ });
+  expect(screen.queryByRole("complementary", { name: "Worker tasks" })).toBeNull();
+  expect(view.container.querySelector(".console-header")?.textContent).not.toContain("Tasks");
+  await fireEvent.click(screen.getByRole("button", { name: "Details" }));
+  const details = await screen.findByRole("complementary", { name: "Worker detail" });
+  expect(details.textContent).not.toContain("Capabilities");
+  expect(details.textContent).not.toContain("follow-up spawn");
+  await fireEvent.click(summary);
+  const pane = await screen.findByRole("complementary", { name: "Worker tasks" });
+  expect(summary.getAttribute("aria-expanded")).toBe("true");
+  expect(summary.getAttribute("aria-controls")).toBe(pane.id);
+  expect(pane.textContent).toContain("Detailed task description");
+  expect(screen.queryByRole("complementary", { name: "Worker detail" })).toBeNull();
+  await fireEvent.click(summary);
+  await waitFor(() => expect(screen.queryByRole("complementary", { name: "Worker tasks" })).toBeNull());
+  expect(summary.getAttribute("aria-expanded")).toBe("false");
 });
 
 test("turn navigation jumps only the transcript to its user message and stops bottom-follow", async () => {

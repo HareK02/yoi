@@ -9,6 +9,9 @@
   type Props = {
     tasks: ConsoleTask[];
     mode: "mini" | "pane";
+    paneOpen?: boolean;
+    paneId?: string;
+    onTogglePane?: () => void;
     workerViews?: WorkerViewTab[];
     selectedWorkerViewSessionId?: string | null;
     onSelectWorkerView?: (sessionId: string | null) => void;
@@ -17,6 +20,9 @@
   let {
     tasks,
     mode,
+    paneOpen = false,
+    paneId,
+    onTogglePane,
     workerViews = [],
     selectedWorkerViewSessionId = null,
     onSelectWorkerView = () => {},
@@ -46,7 +52,7 @@
   }
 </script>
 
-{#if mode === "mini" && (tasks.length > 0 || workerViews.length > 1)}
+{#if mode === "mini" && (tasks.length > 0 || workerViews.length > 1 || paneOpen)}
   <section class="task-mini" aria-label="Worker task summary">
     {#each activeTasks as task (task.taskid)}
       <div class="task-mini-row">
@@ -57,9 +63,15 @@
       </div>
     {/each}
     <div class="task-summary-row">
-      <span class="task-summary">
+      <button
+        type="button"
+        class="task-summary"
+        aria-expanded={paneOpen}
+        aria-controls={paneId}
+        onclick={onTogglePane}
+      >
         {counts.total} {taskNoun(counts.total)} — pending: {counts.pending}, inprogress: {counts.inprogress}, completed: {counts.completed}
-      </span>
+      </button>
       {#if workerViews.length > 1}
         <span class="worker-view-tabs" role="group" aria-label="Worker transcript view">
           <span aria-hidden="true">[ </span>
@@ -78,7 +90,7 @@
     </div>
   </section>
 {:else if mode === "pane"}
-  <aside class="task-pane" aria-label="Worker tasks">
+  <aside id={paneId} class="task-pane" aria-label="Worker tasks">
     <h3>Tasks ({counts.total})</h3>
 
     {#if tasks.length === 0}
@@ -141,11 +153,27 @@
   }
 
   .task-summary {
+    padding: 0;
+    border: 0;
+    background: transparent;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
     flex: 1 1 auto;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .task-summary:hover,
+  .task-summary:focus-visible {
+    color: var(--text);
+  }
+
+  .task-summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
 
   .worker-view-tabs {
@@ -266,9 +294,10 @@
     line-height: var(--line-height-body);
   }
 
-  @media (max-width: 900px) {
+  @media (max-width: 960px) {
     .task-pane {
-      display: none;
+      border-left: 0;
+      padding-top: var(--space-3);
     }
   }
 </style>

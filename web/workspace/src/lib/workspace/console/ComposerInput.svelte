@@ -46,6 +46,7 @@
     type ComposerHistoryDirection,
     type ComposerHistoryEntry,
   } from "$lib/workspace/console/composer-history.ts";
+  import { applyCompletion, completionSelection, completionTokenAt, localCommandCompletions, type ComposerCompletionEntry, type ComposerCompletionToken } from "./composer-completion";
   import { shouldSubmitChatKey } from "$lib/workspace/console/chat-submit.ts";
 
   interface Props {
@@ -57,6 +58,9 @@
     onkeydown?: (event: KeyboardEvent) => void;
     onsubmit?: () => void;
     onpasteimages?: (files: File[]) => void;
+    oncommand?: () => void;
+    completionScope?: string;
+    resolveFileCompletions?: (prefix: string, signal: AbortSignal) => Promise<ComposerCompletionEntry[]>;
   }
 
   let {
@@ -68,6 +72,9 @@
     onkeydown,
     onsubmit,
     onpasteimages,
+    oncommand,
+    completionScope = "",
+    resolveFileCompletions,
   }: Props = $props();
 
   let mountElement: HTMLDivElement;
@@ -77,6 +84,135 @@
   let nextPasteId = 1;
   let nextPasteKey = 1;
   const editable = new Compartment();
+
+  const completionId = $props.id();
+  let completionToken = $state<ComposerCompletionToken | null>(null);
+  let completionEntries = $state<ComposerCompletionEntry[]>([]);
+  let completionSelected = $state<number | null>(null);
+  let completionBusy = $state(false);
+  let completionMessage = $state("");
+  let completionAbort: AbortController | null = null;
+  let completionVersion = 0;
+  let completionContext = "";
+  const completionStart = $derived(Math.max(0, (completionSelected ?? 0) - 5));
+  const visibleCompletions = $derived(completionEntries.slice(completionStart, completionStart + 6));
+
+  function closeCompletion(): void {
+    completionVersion++;
+    completionAbort?.abort();
+    completionAbort = null;
+    completionToken = null;
+    completionEntries = [];
+    completionSelected = null;
+    completionBusy = false;
+    completionMessage = "";
+  }
+
+  function refreshCompletion(force = false): void {
+    if (!view) return;
+    const selection = view.state.selection.main;
+    const document = view.state.doc.toString();
+    const context = JSON.stringify([document, selection.from, selection.to]);
+    if (!force && context === completionContext) return;
+    completionContext = context;
+    closeCompletion();
+    if (disabled || !view.hasFocus || view.composing || !selection.empty) return;
+    const token = completionTokenAt(document, selection.head);
+    if (!token) return;
+    completionToken = token;
+    if (token.kind === "command") {
+      completionEntries = localCommandCompletions(token.prefix);
+      if (!completionEntries.length) completionMessage = "No matching commands";
+      return;
+    }
+    if (!resolveFileCompletions) { closeCompletion(); return; }
+    completionBusy = true;
+    const version = completionVersion;
+    const abort = new AbortController();
+    completionAbort = abort;
+    void resolveFileCompletions(token.prefix, abort.signal).then((entries) => {
+      if (version !== completionVersion || abort.signal.aborted) return;
+      completionEntries = entries;
+      completionSelected = entries.length ? 0 : null;
+      if (!entries.length) completionMessage = "No matching files";
+    }).catch((error) => {
+      if (version !== completionVersion || abort.signal.aborted) return;
+      completionMessage = error instanceof Error ? error.message : String(error);
+    }).finally(() => {
+      if (version === completionVersion) completionBusy = false;
+    });
+  }
+
+  function acceptCompletion(action: "tab" | "accept", index = completionSelected): void {
+    if (!view || !completionToken || disabled) return;
+    const token = completionToken;
+    const document = view.state.doc.toString();
+    if (token.kind === "command" && index === null) {
+      const exact = completionEntries.findIndex((entry) => entry.value === token.prefix);
+      if (exact >= 0) index = exact;
+    }
+    if (index === null && completionEntries.length === 1) index = 0;
+    if (index === null && completionEntries.length > 1) {
+      completionMessage = "Select a command with ↑/↓ or keep typing";
+      return;
+    }
+    const entry = index === null ? undefined : completionEntries[index];
+    if (!entry) return;
+    const result = applyCompletion(document, token, entry, action);
+    const to = document.length - (result.value.length - result.cursor);
+    closeCompletion();
+    view.dispatch({
+      changes: { from: token.start, to, insert: result.value.slice(token.start, result.cursor) },
+      selection: EditorSelection.cursor(result.cursor), userEvent: "input.complete",
+    });
+    view.focus();
+    if (token.kind === "command" && action === "accept") oncommand?.();
+    else queueMicrotask(() => refreshCompletion(true));
+  }
+
+  function completionKeydown(event: KeyboardEvent): boolean {
+    if (disabled || event.isComposing || view?.composing || event.keyCode === 229) return false;
+    if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return false;
+    if (event.key === "Escape" && completionToken) {
+      event.preventDefault(); closeCompletion(); return true;
+    }
+    if (completionToken && completionEntries.length && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+      event.preventDefault();
+      completionSelected = completionSelection(completionSelected, completionEntries.length, event.key === "ArrowDown" ? 1 : -1);
+      completionMessage = "";
+      return true;
+    }
+    if (event.key === "Tab") {
+      if (!completionToken) refreshCompletion(true);
+      if (!completionToken) return false;
+      event.preventDefault(); acceptCompletion("tab"); return true;
+    }
+    if (event.key === "Enter" && completionToken && completionEntries.length) {
+      event.preventDefault(); acceptCompletion("accept"); return true;
+    }
+    if (event.key === "Enter" && view?.state.doc.toString().trimStart().startsWith(":")) {
+      event.preventDefault(); oncommand?.(); return true;
+    }
+    return false;
+  }
+
+  $effect(() => {
+    const activeId = completionSelected === null ? undefined : completionId + "-" + completionSelected;
+    const open = completionToken !== null;
+    if (!view) return;
+    view.contentDOM.setAttribute("aria-autocomplete", "list");
+    if (open) view.contentDOM.setAttribute("aria-controls", completionId);
+    else view.contentDOM.removeAttribute("aria-controls");
+    if (open && activeId) view.contentDOM.setAttribute("aria-activedescendant", activeId);
+    else view.contentDOM.removeAttribute("aria-activedescendant");
+  });
+
+  $effect(() => {
+    void completionScope;
+    void disabled;
+    closeCompletion();
+    completionContext = "";
+  });
 
   const registerPaste = StateEffect.define<{ key: number; paste: ComposerPaste }>();
   const pasteRegistry = StateField.define<ReadonlyMap<number, ComposerPaste>>({
@@ -333,6 +469,7 @@
       state: EditorState.create({
         extensions: [
           history(),
+          Prec.highest(EditorView.domEventHandlers({ keydown: completionKeydown })),
           Prec.highest(keymap.of([
             {
               key: "Mod-z",
@@ -381,12 +518,16 @@
             spellcheck: "true",
           }),
           EditorView.updateListener.of((update) => {
+            if (update.docChanged || update.selectionSet) queueMicrotask(() => refreshCompletion());
             if (update.docChanged && !restoringHistory) composerHistory.cancelNavigation();
             if (update.docChanged || update.transactions.some((tx) => tx.effects.length > 0)) {
               emitChange();
             }
           }),
           Prec.high(EditorView.domEventHandlers({
+            focus() { queueMicrotask(() => refreshCompletion(true)); return false; },
+            blur() { closeCompletion(); return false; },
+            compositionend() { queueMicrotask(() => refreshCompletion(true)); return false; },
             paste(event) {
               return handlePasteEvent(event);
             },
@@ -440,6 +581,7 @@
     emitChange();
 
     return () => {
+      closeCompletion();
       view?.destroy();
       view = null;
     };
@@ -546,15 +688,82 @@
   }
 </script>
 
-<div class="composer-input" class:disabled bind:this={mountElement}></div>
+<div class="composer-input" class:disabled>
+  {#if completionToken}
+    <div class="completion-popup">
+      <div id={completionId} role="listbox" aria-label="Composer completions" aria-busy={completionBusy}>
+        {#each visibleCompletions as entry, offset (entry.value)}
+          {@const index = completionStart + offset}
+          <button
+            id={completionId + "-" + index}
+            type="button" role="option" tabindex="-1"
+            aria-selected={completionSelected === index}
+            title={entry.usage ?? entry.value}
+            onpointerdown={(event) => event.preventDefault()}
+            onclick={() => acceptCompletion("accept", index)}
+          >
+            <span class="completion-value">{completionToken.sigil}{entry.value}{entry.is_dir && !entry.value.endsWith("/") ? "/" : ""}</span>
+            {#if entry.description}<span class="completion-description">{entry.description}</span>{/if}
+          </button>
+        {/each}
+      </div>
+      <div class="completion-hint" role="status">
+        {#if completionBusy}Loading files…{:else if completionMessage}{completionMessage}{:else}↑↓ select · Tab complete · Enter confirm · Esc close{/if}
+      </div>
+    </div>
+  {/if}
+  <div bind:this={mountElement}></div>
+</div>
 
 <style>
   .composer-input {
+    position: relative;
     min-width: 0;
     flex: 1;
     color: var(--text-strong);
     font: inherit;
   }
+
+  .completion-popup {
+    position: absolute;
+    bottom: 100%;
+    left: 0;
+    right: 0;
+    z-index: 10;
+    padding: var(--space-1);
+    background: var(--bg-raised);
+    box-shadow: var(--shadow-overlay);
+    color: var(--text);
+    font-size: var(--font-size-compact);
+    line-height: var(--line-height-compact);
+  }
+
+  .completion-popup button {
+    display: flex;
+    gap: var(--space-3);
+    width: 100%;
+    min-width: 0;
+    padding: var(--space-1) var(--space-2);
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .completion-popup button:hover { background: var(--interactive-hover); }
+  .completion-popup button[aria-selected="true"] { background: var(--interactive-selected); }
+  .completion-value { flex: 0 1 auto; font-family: var(--font-mono); }
+  .completion-description { flex: 1 1 auto; color: var(--text-muted); }
+  .completion-value, .completion-description {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .completion-hint { padding: var(--space-1) var(--space-2); color: var(--text-muted); }
 
   .composer-input.disabled {
     opacity: 0.56;

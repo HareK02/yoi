@@ -985,7 +985,8 @@ Deno.test("Worker Console paste chips preserve typed draft and target authority"
       composerInput.includes('key: "Mod-z"') &&
       composerInput.includes("if (!view || view.state.readOnly) return") &&
       composerInput.includes("if (currentView.state.readOnly) return false") &&
-      consolePage.includes("activeComposerTargetKey !== targetKey") &&
+      consolePage.includes("completionScope={activeComposerTargetKey}") &&
+      composerInput.includes("version !== completionVersion") &&
       consolePage.includes("if (!composerEditable) return") &&
       composerInput.includes('chip.setAttribute("aria-label", label)') &&
       composerInput.includes("preserveExactText = false") &&
@@ -1487,6 +1488,28 @@ Deno.test("Web Console switches main and direct SubWorker views from the Tasks r
       consoleModel.includes("resolveConsoleWorkerView"),
     "Worker view selection should expose only direct SubWorker session identities with main fallback",
   );
+});
+
+Deno.test("Composer owns TUI-style completion and replaces Compact/Rewind header buttons", async () => {
+  const page = await Deno.readTextFile(new URL("./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte", import.meta.url));
+  const input = await Deno.readTextFile(new URL("./ComposerInput.svelte", import.meta.url));
+  const header = page.slice(page.indexOf('<section class="console-header'), page.indexOf('{#if rewindTargets.length'));
+  assert(!header.includes("Compact") && !header.includes("Rewind") && !page.includes("requestRewindTargets"), "Header must defer Compact/Rewind to commands");
+  assert(input.includes('role="listbox"') && input.includes('role="option"') && input.includes("entry.description") && input.includes("completionStart + 6"), "Completion must expose a bounded selectable list with descriptions");
+  assert(input.indexOf("keydown: completionKeydown") < input.indexOf('key: "ArrowUp"'), "Completion navigation must precede input history");
+  assert(page.includes("fileCompletions.receive(event.data.entries)") && page.includes("fileCompletions.close()"), "File completion lifecycle must be scoped to the transport");
+});
+
+Deno.test("mini task summary owns pane toggling instead of the header", async () => {
+  const page = await Deno.readTextFile(new URL(
+    "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte", import.meta.url,
+  ));
+  const component = await Deno.readTextFile(new URL("./ConsoleTasks.svelte", import.meta.url));
+  const header = page.slice(page.indexOf('<section class="console-header'), page.indexOf('{#if rewindTargets.length'));
+  assert(!header.includes("taskPaneOpen = !taskPaneOpen") && page.includes("onTogglePane={() => {"), "Only the mini summary should own Tasks toggling");
+  assert(component.includes("aria-expanded={paneOpen}") && component.includes("aria-controls={paneId}") && component.includes("onclick={onTogglePane}"), "Tasks summary must be an accessible pane toggle");
+  assert(!/\.task-pane\s*\{[^}]*display:\s*none/.test(component), "Narrow layouts must not hide the opened Tasks pane");
+  assert(page.includes("grid-template-rows: minmax(0, 1fr) minmax(0, 1fr)"), "Narrow layouts should bound transcript and task scrolling separately");
 });
 
 Deno.test("Pending inputs are single-line previews between Tasks and Composer", async () => {
