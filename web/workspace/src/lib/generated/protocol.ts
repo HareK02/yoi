@@ -151,7 +151,12 @@ timestamp: number, provenance: SessionEntryProvenance, derived_from?: Array<stri
 
 export type SessionConversationTurn = { turn_id: string, entries: Array<SessionSnapshotEntry>, };
 
-export type SessionHistoryLineageBoundary = { lineage_id: string, adopted_through_turn_id?: string | null, };
+export type SessionHistoryLineageBoundary = { lineage_id: string,
+/**
+ * Canonical public form of the final user-visible turn at the exact
+ * provider boundary. Entries after that boundary are excluded.
+ */
+adopted_through_turn?: SessionConversationTurn | null, };
 
 export type SessionHistoryPage = { session_id: string,
 /**

@@ -261,24 +261,25 @@ pub fn read_retained_session_history_page(
     } else {
         None
     };
-    let parent_lineage = if lineage.len() > 1 {
+    let mut scanned_bytes = metadata_bytes;
+    let mut scanned_entries = metadata_entries;
+    let parent_lineage = if cursor.is_none() && lineage.len() > 1 {
         let parent_turns = read_history_turns_backward(
             &store,
             active.session_id,
             &lineage[1..],
             None,
             1,
-            RetainedHistoryReadLimits {
-                max_scan_bytes: limits.max_scan_bytes.saturating_sub(metadata_bytes),
-                max_entries: limits.max_entries.saturating_sub(metadata_entries),
-                ..limits
-            },
+            limits,
+            &mut scanned_bytes,
+            &mut scanned_entries,
         )?;
         Some(SessionHistoryLineageBoundary {
             lineage_id: lineage_identity(active.session_id, &lineage[1..]),
-            adopted_through_turn_id: parent_turns
-                .first()
-                .map(|positioned| positioned.turn.turn_id.clone()),
+            adopted_through_turn: parent_turns
+                .into_iter()
+                .next()
+                .map(|positioned| positioned.turn),
         })
     } else {
         None
@@ -289,11 +290,9 @@ pub fn read_retained_session_history_page(
         &lineage,
         start,
         page_limit.saturating_add(1),
-        RetainedHistoryReadLimits {
-            max_scan_bytes: limits.max_scan_bytes.saturating_sub(metadata_bytes),
-            max_entries: limits.max_entries.saturating_sub(metadata_entries),
-            ..limits
-        },
+        limits,
+        &mut scanned_bytes,
+        &mut scanned_entries,
     )?;
     let has_more = turns.len() > page_limit;
     if has_more {
@@ -641,9 +640,9 @@ fn read_history_turns_backward(
     start: Option<(HistoryTurnPosition, &str)>,
     turn_limit: usize,
     limits: RetainedHistoryReadLimits,
+    scanned_bytes: &mut u64,
+    scanned_entries: &mut usize,
 ) -> Result<Vec<PositionedHistoryTurn>, RetainedHistoryReadError> {
-    let mut scanned_bytes = 0_u64;
-    let mut scanned_entries = 0_usize;
     let mut turns = Vec::new();
     let mut pending_entries = Vec::new();
     let mut seen_entries = HashSet::new();
@@ -676,7 +675,7 @@ fn read_history_turns_backward(
             let record_end = position
                 .record_end_offset
                 .ok_or(RetainedHistoryReadError::InvalidCursor)?;
-            let remaining = limits.max_scan_bytes.saturating_sub(scanned_bytes);
+            let remaining = limits.max_scan_bytes.saturating_sub(*scanned_bytes);
             let record = store
                 .read_log_record_range_read_only_bounded(
                     session_id,
@@ -686,7 +685,7 @@ fn read_history_turns_backward(
                     remaining,
                 )
                 .map_err(map_history_cursor_store_error)?;
-            scanned_bytes = scanned_bytes
+            *scanned_bytes = scanned_bytes
                 .checked_add(record.end_offset - record.start_offset)
                 .ok_or(RetainedHistoryReadError::ResourceLimit)?;
             if record.start_offset != position.before_offset
@@ -696,10 +695,10 @@ fn read_history_turns_backward(
             {
                 return Err(RetainedHistoryReadError::InvalidCursor);
             }
-            scanned_entries = scanned_entries
+            *scanned_entries = scanned_entries
                 .checked_add(persisted_entry_units(std::slice::from_ref(&record.entry)))
                 .ok_or(RetainedHistoryReadError::ResourceLimit)?;
-            if scanned_entries > limits.max_entries {
+            if *scanned_entries > limits.max_entries {
                 return Err(RetainedHistoryReadError::ResourceLimit);
             }
         }
@@ -738,8 +737,8 @@ fn read_history_turns_backward(
             session_id,
             segment,
             limits,
-            &mut scanned_bytes,
-            &mut scanned_entries,
+            scanned_bytes,
+            scanned_entries,
         )?;
         let before_offset = if starting_here {
             start_position
@@ -756,20 +755,20 @@ fn read_history_turns_backward(
             .open_retained_segment_reader(session_id, segment.segment_id, before_offset)
             .map_err(map_history_store_error)?;
         loop {
-            let remaining = limits.max_scan_bytes.saturating_sub(scanned_bytes);
+            let remaining = limits.max_scan_bytes.saturating_sub(*scanned_bytes);
             let (record, bytes) = reader
                 .previous_record(remaining)
                 .map_err(map_history_store_error)?;
-            scanned_bytes = scanned_bytes
+            *scanned_bytes = scanned_bytes
                 .checked_add(bytes)
                 .ok_or(RetainedHistoryReadError::ResourceLimit)?;
             let Some(record) = record else {
                 break;
             };
-            scanned_entries = scanned_entries
+            *scanned_entries = scanned_entries
                 .checked_add(persisted_entry_units(std::slice::from_ref(&record.entry)))
                 .ok_or(RetainedHistoryReadError::ResourceLimit)?;
-            if scanned_entries > limits.max_entries {
+            if *scanned_entries > limits.max_entries {
                 return Err(RetainedHistoryReadError::ResourceLimit);
             }
             if matches!(record.entry, LogEntry::AnnotatedSegmentStart { .. }) {
@@ -1766,12 +1765,17 @@ mod tests {
             RetainedHistoryReadLimits::default(),
         )
         .unwrap();
+        let parent = page.parent_lineage.as_ref().unwrap();
+        assert_eq!(parent.lineage_id, source_lineage_id);
+        let adopted_turn = parent.adopted_through_turn.as_ref().unwrap();
+        assert_eq!(adopted_turn.turn_id, "user-1");
         assert_eq!(
-            page.parent_lineage,
-            Some(SessionHistoryLineageBoundary {
-                lineage_id: source_lineage_id,
-                adopted_through_turn_id: Some("user-1".to_string()),
-            })
+            adopted_turn
+                .entries
+                .iter()
+                .map(|entry| entry.entry_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user-1", "assistant-1-boundary"]
         );
     }
 
@@ -2262,6 +2266,62 @@ mod tests {
             vec!["user-96", "user-97", "user-98", "user-99", "user-100"]
         );
         assert!(page.has_more);
+    }
+
+    #[test]
+    fn retained_history_shares_one_entry_budget_with_parent_boundary_lookup() {
+        let worker_name = "worker-shared-parent-budget";
+        let session_id = crate::new_session_id();
+        let source_segment = crate::new_segment_id();
+        let active_segment = crate::new_segment_id();
+        let mut source_log = vec![segment_start(session_id, Vec::new(), None, None)];
+        for turn in 1..=5 {
+            append_turn(&mut source_log, turn);
+        }
+        let mut active_log = vec![segment_start(
+            session_id,
+            Vec::new(),
+            Some(SegmentOrigin {
+                segment_id: source_segment,
+                at_turn_index: 5,
+            }),
+            None,
+        )];
+        for turn in 6..=10 {
+            append_turn(&mut active_log, turn);
+        }
+        let (_root, aggregate_root) = persist_history_fixture(
+            worker_name,
+            session_id,
+            active_segment,
+            vec![(source_segment, source_log), (active_segment, active_log)],
+        );
+
+        let error = read_retained_session_history_page(
+            &aggregate_root,
+            worker_name,
+            None,
+            Some(1),
+            RetainedHistoryReadLimits {
+                max_entries: 40,
+                ..RetainedHistoryReadLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, RetainedHistoryReadError::ResourceLimit);
+
+        let page = read_retained_session_history_page(
+            &aggregate_root,
+            worker_name,
+            None,
+            Some(1),
+            RetainedHistoryReadLimits {
+                max_entries: 100,
+                ..RetainedHistoryReadLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(turn_ids(&page), vec!["user-10"]);
     }
 
     #[test]

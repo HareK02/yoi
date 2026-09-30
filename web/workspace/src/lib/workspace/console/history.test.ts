@@ -58,7 +58,7 @@ function page(
   compactAncestorLineageIds: string[] = [],
   parentLineage?: {
     lineage_id: string;
-    adopted_through_turn_id?: string | null;
+    adopted_through_turn?: SessionConversationTurn | null;
   },
 ): SessionHistoryPage {
   return {
@@ -256,6 +256,10 @@ Deno.test("fork lineage boundary preserves an adopted prefix without page overla
     status: "loading",
     requestedCursor: "__initial__",
   };
+  state.turns[24]!.entries.push(
+    message("a-unadopted-25", "assistant", "stale sibling response"),
+  );
+  const adoptedBoundary = turn(25);
   state = applyConsoleHistoryPage(
     state,
     page(
@@ -265,7 +269,7 @@ Deno.test("fork lineage boundary preserves an adopted prefix without page overla
       [],
       {
         lineage_id: "lineage-a",
-        adopted_through_turn_id: "u-25",
+        adopted_through_turn: adoptedBoundary,
       },
     ),
     null,
@@ -278,6 +282,10 @@ Deno.test("fork lineage boundary preserves an adopted prefix without page overla
         ...Array.from({ length: 5 }, (_, index) => `u-${index + 101}`),
       ].join(","),
     "fork refresh must retain only the authoritative adopted prefix",
+  );
+  assert(
+    historyEntries(state).every((entry) => entry.entry_id !== "a-unadopted-25"),
+    "the canonical provider boundary must trim a sibling entry in the same visible turn",
   );
   assert(
     state.cursor === "cursor-101" && state.hasMore,

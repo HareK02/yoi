@@ -848,8 +848,10 @@ pub struct SessionConversationTurn {
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct SessionHistoryLineageBoundary {
     pub lineage_id: String,
+    /// Canonical public form of the final user-visible turn at the exact
+    /// provider boundary. Entries after that boundary are excluded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub adopted_through_turn_id: Option<String>,
+    pub adopted_through_turn: Option<SessionConversationTurn>,
 }
 
 /// Bounded backward page over the adopted conversation lineage.

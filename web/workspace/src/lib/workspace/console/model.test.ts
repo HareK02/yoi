@@ -3127,6 +3127,21 @@ Deno.test("committed history places omitted retained rows between snapshot ancho
   );
 });
 
+Deno.test("committed history places current context before an interior first anchor", () => {
+  const makeLine = (prefix: string, turn: number) => {
+    const line = consoleLine(`${prefix}-${turn}`, "user");
+    line.entryId = `user-${turn}`;
+    return line;
+  };
+  const history = [6, 7, 8, 9, 10].map((turn) => makeLine("history", turn));
+  const current = [1, 8, 10].map((turn) => makeLine("current", turn));
+
+  assertEquals(
+    mergeCommittedHistoryLines(history, current).map((line) => line.entryId),
+    [1, 6, 7, 8, 9, 10].map((turn) => `user-${turn}`),
+  );
+});
+
 Deno.test("committed history places a retained suffix before newer current-only rows", () => {
   const makeLine = (prefix: string, turn: number) => {
     const line = consoleLine(`${prefix}-${turn}`, "user");

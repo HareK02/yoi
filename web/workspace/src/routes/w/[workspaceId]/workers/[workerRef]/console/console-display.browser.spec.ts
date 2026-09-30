@@ -11,6 +11,7 @@ import {
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type {
   Event as ProtocolEvent,
+  SessionConversationTurn,
   SessionSnapshot,
 } from "$lib/generated/protocol";
 import type { Worker } from "$lib/workspace/sidebar/types";
@@ -127,7 +128,7 @@ function historyPage(
   lineageId = "lineage-a",
   parentLineage?: {
     lineage_id: string;
-    adopted_through_turn_id?: string | null;
+    adopted_through_turn?: SessionConversationTurn | null;
   },
 ) {
   return {
@@ -506,7 +507,8 @@ test("fork refresh reconciles an in-flight older page to the adopted prefix", as
         "lineage-fork",
         {
           lineage_id: "lineage-a",
-          adopted_through_turn_id: "user-48",
+          adopted_through_turn: historyPage([48], null).page
+            .turns[0] as SessionConversationTurn,
         },
       )));
     }),

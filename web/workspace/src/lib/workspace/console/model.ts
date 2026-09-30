@@ -334,9 +334,16 @@ export function mergeCommittedHistoryLines(
       }
     }
   };
-  for (const anchor of anchors) {
-    appendHistoryInterval(anchor.history);
-    merged.push(...current.slice(currentCursor, anchor.current));
+  for (const [index, anchor] of anchors.entries()) {
+    if (index === 0) {
+      // Current rows before the first shared entry can be older retained
+      // context that the newest history page starts after.
+      merged.push(...current.slice(currentCursor, anchor.current));
+      appendHistoryInterval(anchor.history);
+    } else {
+      appendHistoryInterval(anchor.history);
+      merged.push(...current.slice(currentCursor, anchor.current));
+    }
     merged.push(current[anchor.current]!);
     historyCursor = anchor.history + 1;
     currentCursor = anchor.current + 1;
