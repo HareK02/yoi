@@ -105,6 +105,8 @@
     display: flex;
     flex-direction: column;
     align-items: center;
+    /* Center short lists; overflowing lists stay reachable from the top. */
+    justify-content: safe center;
     height: 100%;
     overflow-y: auto;
     scrollbar-width: none;

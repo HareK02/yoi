@@ -113,9 +113,14 @@ async function checkConsoleHistory(viewportHeight: number): Promise<void> {
           controlHeight: control.getBoundingClientRect().height,
           boundaryOffset: boundary.getBoundingClientRect().top - element.getBoundingClientRect().top + element.scrollTop,
           firstOffset: first.getBoundingClientRect().top - boundary.getBoundingClientRect().top,
+          expectedOffset: Math.max(0, (element.getBoundingClientRect().height - element.children.length * 24) / 2),
         };
       });
-      assertEquals(initialGeometry, { boundaryHeight: 24, controlHeight: 24, boundaryOffset: 0, firstOffset: 24 });
+      assertEquals(initialGeometry.boundaryHeight, 24);
+      assertEquals(initialGeometry.controlHeight, 24);
+      assertEquals(initialGeometry.firstOffset, 24);
+      assert(Math.abs(initialGeometry.boundaryOffset - initialGeometry.expectedOffset) <= 1,
+        "short turn lists must be vertically centered, with overflowing lists starting at the top");
       assertEquals(await turnList.evaluate((element) => element.scrollHeight > element.clientHeight), viewportHeight === 340);
       const currentQuestionTop = await transcript
         .getByText("question 7", { exact: true })
@@ -202,11 +207,15 @@ async function checkConsoleHistory(viewportHeight: number): Promise<void> {
           element.dispatchEvent(new Event("scroll"));
         });
       } else {
-        // A short list cannot scroll: older turns take their natural place above
-        // existing bars instead of adding blank space to force a fixed anchor.
-        const firstOffset = await turnList.evaluate((element) =>
-          element.querySelector(".turn-button")!.getBoundingClientRect().top - element.getBoundingClientRect().top);
-        assertEquals(firstOffset, 24);
+        // A short list cannot scroll: keep the whole compact list centered
+        // rather than adding artificial space to force a fixed anchor.
+        const centerOffset = await turnList.evaluate((element) => {
+          const first = element.firstElementChild!.getBoundingClientRect();
+          const last = element.lastElementChild!.getBoundingClientRect();
+          const viewport = element.getBoundingClientRect();
+          return (first.top + last.bottom - viewport.top - viewport.bottom) / 2;
+        });
+        assert(Math.abs(centerOffset) <= 1, "short lists must remain centered after prepending history");
         await navigation.getByRole("button", { name: "Earlier conversation available" }).click();
       }
       await transcript.getByText("question 1", { exact: true }).waitFor();
@@ -255,6 +264,6 @@ async function checkConsoleHistory(viewportHeight: number): Promise<void> {
 }
 
 for (const viewportHeight of [600, 400, 340]) {
-  Deno.test(`production Console keeps compact top-aligned turns and pages history at ${viewportHeight}px`,
+  Deno.test(`production Console keeps compact centered turns and pages history at ${viewportHeight}px`,
     () => checkConsoleHistory(viewportHeight));
 }
