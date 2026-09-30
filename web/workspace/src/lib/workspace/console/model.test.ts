@@ -1,5 +1,6 @@
 import type {
   Event,
+  SessionSnapshotEntry,
   WorkerStateSnapshot,
   WorkerStatus,
 } from "$lib/generated/protocol";
@@ -13,6 +14,7 @@ import {
   projectConsole,
   projectConsoleLines,
   projectOverviewLines,
+  projectSessionHistoryEntries,
   resolveConsoleViewScrollTop,
   resolveConsoleWorkerView,
   segmentsToText,
@@ -3060,6 +3062,57 @@ Deno.test("committed tool identities reconcile one live call block", () => {
   );
   assertEquals(lines[0].entryId, "tool-result-entry");
   assertEquals(lines[0].toolCall?.state, "done");
+});
+
+function readHistory(ids: string[], summary: string): ConsoleLine[] {
+  const entries = ids.flatMap((id): SessionSnapshotEntry[] => [{
+    kind: "tool_call", entry_id: `call-entry-${id}`, timestamp: 1,
+    provenance: "model_output", call_id: id, name: "Read",
+    arguments: JSON.stringify({ file_path: id }),
+  }, {
+    kind: "tool_result", entry_id: `result-entry-${id}`, timestamp: 2,
+    provenance: "tool_output", call_id: id, summary, content: summary, is_error: false,
+  }]);
+  return projectSessionHistoryEntries(entries, null);
+}
+
+Deno.test("committed history reconciles overlapping Read groups before counting activity", () => {
+  const history = readHistory(["a", "b", "c"], "retained");
+  for (const ids of [["a", "b", "c"], ["a", "b"], ["b", "c"], ["a", "c"]]) {
+    const merged = mergeCommittedHistoryLines(history, readHistory(ids, "current"));
+    assertEquals(merged.length, 1);
+    assertEquals(merged[0].toolCallCount, 3);
+    assertEquals(merged[0].toolCallLines?.map((line) => line.toolCall?.id), ["a", "b", "c"]);
+    assertEquals(merged[0].toolCallLines?.map((line) => line.toolCall?.summary),
+      ["a", "b", "c"].map((id) => ids.includes(id) ? "current" : "retained"));
+    assertEquals(projectOverviewLines(merged)[0].body, "3 files read");
+    assertEquals(mergeCommittedHistoryLines(history, merged)[0].toolCallCount, 3);
+  }
+});
+
+Deno.test("committed history matches tool calls across live and durable result identities", () => {
+  const retained: ConsoleLine = {
+    ...consoleLine("tool-call-a", "tool"), entryId: "call-entry-a",
+    toolCall: { id: "a", name: "Bash", argsStream: "", state: "running" },
+  };
+  for (const entryId of [undefined, "result-entry-a"]) {
+    const current: ConsoleLine = {
+      ...retained, entryId,
+      toolCall: { ...retained.toolCall!, state: "done", summary: "latest result" },
+    };
+    const merged = mergeCommittedHistoryLines([retained], [current]);
+    assertEquals(merged, [current]);
+    assertEquals(projectOverviewLines(merged)[0].body, "ran 1 command");
+  }
+});
+
+Deno.test("committed history restores retained separators inside compacted Read groups", () => {
+  const separator = { ...consoleLine("assistant", "assistant"), entryId: "assistant-entry" };
+  const history = [...readHistory(["a"], "retained"), separator, ...readHistory(["b"], "retained")];
+  const merged = mergeCommittedHistoryLines(history, readHistory(["a", "b"], "current"));
+  assertEquals(merged.map((line) => line.kind), ["tool", "assistant", "tool"]);
+  assertEquals(merged.filter((line) => line.kind === "tool").map((line) => line.toolCallCount), [1, 1]);
+  assertEquals(projectOverviewLines(merged).map((line) => line.kind), ["activity", "assistant", "activity"]);
 });
 
 Deno.test("committed history preserves unmatched current rows in stable entry order", () => {

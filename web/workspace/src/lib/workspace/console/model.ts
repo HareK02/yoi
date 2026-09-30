@@ -99,6 +99,8 @@ export type ConsoleLine = {
   toolCall?: ToolCallView;
   /** Number of calls represented by a lower-level aggregate line. */
   toolCallCount?: number;
+  /** Original Read rows, retained so history can reconcile before aggregation. */
+  toolCallLines?: ConsoleLine[];
   /** Typed `SystemItem.kind` used by presentation-only projections. */
   systemItemKind?: string;
 };
@@ -253,15 +255,30 @@ export function mergeCommittedHistoryLines(
   history: ConsoleLine[],
   current: ConsoleLine[],
 ): ConsoleLine[] {
-  const currentEntryIds = new Set(
-    current.map((line) => line.entryId).filter((id): id is string =>
-      Boolean(id)
-    ),
+  return aggregateReadToolLines(mergeHistorySourceLines(
+    history.flatMap((line) => line.toolCallLines ?? [line]),
+    current.flatMap((line) => line.toolCallLines ?? [line]),
+  ));
+}
+
+function historyLineKey(line: ConsoleLine): string | undefined {
+  // Calls and results have different entry IDs but update the same tool row.
+  if (line.toolCall) return `tool:${line.toolCall.id}`;
+  return line.entryId ? `entry:${line.entryId}` : undefined;
+}
+
+function mergeHistorySourceLines(
+  history: ConsoleLine[],
+  current: ConsoleLine[],
+): ConsoleLine[] {
+  const currentKeys = new Set(
+    current.map(historyLineKey).filter((id): id is string => Boolean(id)),
   );
   const historyPositions = new Map<string, number>();
   history.forEach((line, index) => {
-    if (line.entryId && !historyPositions.has(line.entryId)) {
-      historyPositions.set(line.entryId, index);
+    const key = historyLineKey(line);
+    if (key && !historyPositions.has(key)) {
+      historyPositions.set(key, index);
     }
   });
 
@@ -272,9 +289,8 @@ export function mergeCommittedHistoryLines(
   const anchors: Array<{ history: number; current: number }> = [];
   let lastHistoryIndex = -1;
   current.forEach((line, currentIndex) => {
-    const historyIndex = line.entryId
-      ? historyPositions.get(line.entryId)
-      : undefined;
+    const key = historyLineKey(line);
+    const historyIndex = key ? historyPositions.get(key) : undefined;
     if (historyIndex !== undefined && historyIndex > lastHistoryIndex) {
       anchors.push({ history: historyIndex, current: currentIndex });
       lastHistoryIndex = historyIndex;
@@ -283,9 +299,10 @@ export function mergeCommittedHistoryLines(
 
   if (anchors.length === 0) {
     return [
-      ...history.filter((line) =>
-        !line.entryId || !currentEntryIds.has(line.entryId)
-      ),
+      ...history.filter((line) => {
+        const key = historyLineKey(line);
+        return key === undefined || !currentKeys.has(key);
+      }),
       ...current,
     ];
   }
@@ -296,7 +313,8 @@ export function mergeCommittedHistoryLines(
   const appendHistoryInterval = (end: number) => {
     for (; historyCursor < end; historyCursor += 1) {
       const line = history[historyCursor]!;
-      if (!line.entryId || !currentEntryIds.has(line.entryId)) {
+      const key = historyLineKey(line);
+      if (key === undefined || !currentKeys.has(key)) {
         merged.push(line);
       }
     }
@@ -1605,6 +1623,7 @@ function readAggregateLine(group: ConsoleLine[]): ConsoleLine {
       isError: hasError,
     },
     toolCallCount: count,
+    toolCallLines: group,
   };
 }
 

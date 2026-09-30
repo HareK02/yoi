@@ -57,6 +57,20 @@ function historyEntry(index: number, role: "user" | "assistant") {
   };
 }
 
+function historyTurnEntries(index: number) {
+  const tools = ["Bash", "Grep"].flatMap((name) => {
+    const callId = `${name}-${index}`;
+    return [{
+      kind: "tool_call", entry_id: `call-${callId}`, timestamp: index,
+      provenance: "model_output", call_id: callId, name, arguments: "{}",
+    }, {
+      kind: "tool_result", entry_id: `result-${callId}`, timestamp: index,
+      provenance: "tool_output", call_id: callId, summary: "done", content: "done", is_error: false,
+    }];
+  });
+  return [historyEntry(index, "user"), ...tools, historyEntry(index, "assistant")];
+}
+
 function historyPage(indices: number[], cursor: string | null) {
   return {
     availability: "page",
@@ -66,7 +80,7 @@ function historyPage(indices: number[], cursor: string | null) {
       compact_ancestor_lineage_ids: [],
       turns: indices.map((index) => ({
         turn_id: `user-${index}`,
-        entries: [historyEntry(index, "user"), historyEntry(index, "assistant")],
+        entries: historyTurnEntries(index),
       })),
       next_cursor: cursor,
       has_more: cursor !== null,
@@ -162,7 +176,7 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
   ) {
     return json({
       availability: "retained_snapshot",
-      identity: { session_id: "session-a", segment_id: "segment-a", entry_count: 12 },
+      identity: { session_id: "session-a", segment_id: "segment-a", entry_count: 36 },
       snapshot: {
         pending_submissions: {
           revision: 0,
@@ -170,10 +184,7 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
           head_id: null,
           submissions: [],
         },
-        entries: [7, 8, 9, 10, 11, 12].flatMap((index) => [
-          historyEntry(index, "user"),
-          historyEntry(index, "assistant"),
-        ]),
+        entries: [7, 8, 9, 10, 11, 12].flatMap(historyTurnEntries),
       },
     });
   }

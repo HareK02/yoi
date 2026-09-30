@@ -103,6 +103,8 @@ async function checkConsoleHistory(viewportHeight: number): Promise<void> {
       assertEquals(await historyRequestCount(baseUrl), 1);
       assertEquals(await transcript.getByText(/^question (7|8|9|10|11|12)$/).count(), 6);
       assertEquals(await navigation.getByRole("button", { name: /^Turn \d+: question (7|8|9|10|11|12)$/ }).count(), 6);
+      assertEquals(await transcript.getByText("searched 1 time・ran 1 command", { exact: true }).count(), 6,
+        "overlapping snapshot and history must render each tool activity once");
       const turnList = navigation.locator(".turn-list");
       const initialGeometry = await turnList.evaluate((element) => {
         const boundary = element.querySelector(".history-boundary")!;
@@ -252,6 +254,14 @@ async function checkConsoleHistory(viewportHeight: number): Promise<void> {
         return Math.abs((turn.top + turn.bottom) / 2 - (bar.top + bar.bottom) / 2);
       });
       assert(centering <= 1, `turn marker is not vertically centered (${centering}px)`);
+      assertEquals(await transcript.getByText("searched 1 time・ran 1 command", { exact: true }).count(), 12);
+      await page.getByRole("button", { name: "Normal", exact: true }).click();
+      const rowIds = await transcript.locator("[data-console-line-id]").evaluateAll((rows) =>
+        rows.map((row) => row.getAttribute("data-console-line-id")));
+      assertEquals(rowIds.length, 48);
+      assertEquals(new Set(rowIds).size, rowIds.length);
+      await page.getByRole("button", { name: "Overview", exact: true }).click();
+      assertEquals(await transcript.getByText("searched 1 time・ran 1 command", { exact: true }).count(), 12);
       assertEquals(errors, []);
       await context.close();
     } finally {

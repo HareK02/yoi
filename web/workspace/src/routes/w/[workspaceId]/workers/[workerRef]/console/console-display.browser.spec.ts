@@ -223,6 +223,46 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+test.each(["live_protocol", "retained_snapshot"] as const)("overlapping history and %s render tool activity once in both modes", async (availability) => {
+  const session = sessionWithUserMessage("inspect tools");
+  for (const [callId, name] of [["call-a", "Bash"], ["call-b", "Grep"]]) {
+    session.entries.push({
+      kind: "tool_call", entry_id: `entry-${callId}`, timestamp: 2,
+      provenance: "model_output", call_id: callId, name, arguments: "{}",
+    }, {
+      kind: "tool_result", entry_id: `result-${callId}`, timestamp: 3,
+      provenance: "tool_output", call_id: callId, summary: "done", content: "done", is_error: false,
+    });
+  }
+  const historyResponse = deferred<Response>();
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    if (String(input).includes("/session/history")) return historyResponse.promise;
+    return Response.json({ availability, snapshot: session });
+  }));
+  const view = render(ConsolePage, { data: pageData() });
+  if (availability === "live_protocol") {
+    await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
+    latestListener().onFrame(subscribedFrame(session));
+  }
+  await screen.findByText("searched 1 time・ran 1 command");
+  historyResponse.resolve(Response.json({
+    availability: "page", page: {
+      ...emptyHistoryPage().page,
+      turns: [{ turn_id: session.entries[0].entry_id, entries: session.entries }],
+    },
+  }));
+  await screen.findByText("Start of conversation");
+  expect(view.container.querySelectorAll(".activity-summary")).toHaveLength(1);
+  expect(screen.getAllByText("searched 1 time・ran 1 command")).toHaveLength(1);
+  await fireEvent.click(screen.getByRole("button", { name: "Normal" }));
+  const transcript = screen.getByRole("article", { name: "main transcript" });
+  const ids = [...transcript.querySelectorAll("[data-console-line-id]")].map((line) => line.getAttribute("data-console-line-id"));
+  expect(ids).toHaveLength(3);
+  expect(new Set(ids).size).toBe(ids.length);
+  await fireEvent.click(screen.getByRole("button", { name: "Overview" }));
+  expect(view.container.querySelectorAll(".activity-summary")).toHaveLength(1);
+});
+
 test("pending inputs show literal previews above Composer with revision-fenced icon actions", async () => {
   vi.stubGlobal("fetch", vi.fn(async () => Response.json({ availability: "live_protocol" })));
   const view = render(ConsolePage, { data: pageData() });

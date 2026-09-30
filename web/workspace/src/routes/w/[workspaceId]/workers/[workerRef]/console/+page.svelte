@@ -217,20 +217,20 @@
     const selectedHistory = $derived(
         historyByView[selectedHistoryKey] ?? emptyConsoleHistoryState(),
     );
-    const currentLines = $derived(
-        projectConsoleLines(selectedConsoleProjection.lines, consoleViewMode),
-    );
     const committedHistoryLines = $derived(
-        projectConsoleLines(
-            projectSessionHistoryEntries(
-                historyEntries(selectedHistory),
-                selectedConsoleProjection.cwd,
-            ),
-            consoleViewMode,
+        projectSessionHistoryEntries(
+            historyEntries(selectedHistory),
+            selectedConsoleProjection.cwd,
         ),
     );
     const lines = $derived(
-        mergeCommittedHistoryLines(committedHistoryLines, currentLines),
+        projectConsoleLines(
+            mergeCommittedHistoryLines(
+                committedHistoryLines,
+                selectedConsoleProjection.lines,
+            ),
+            consoleViewMode,
+        ),
     );
     const turnNavigationItems = $derived(
         conversationTurnPreviewsFromLines(lines),
