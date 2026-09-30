@@ -124,7 +124,6 @@
     min-height: 0;
     box-sizing: border-box;
     padding: 0;
-    line-height: 1;
     border: 0;
     background: transparent;
     color: var(--text-muted);
