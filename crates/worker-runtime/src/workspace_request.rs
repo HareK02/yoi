@@ -268,11 +268,10 @@ impl RuntimeWorkspaceRequestClient {
         request: RuntimeWorkspaceRequest,
     ) -> Result<RuntimeWorkspaceResponse, RuntimeWorkspaceRequestError> {
         let prepared = self.prepare(&request)?;
-        let mut client_builder = reqwest::blocking::Client::builder();
-        if let Some(timeout) = request.timeout {
-            client_builder = client_builder.timeout(timeout);
-        }
-        let client = client_builder
+        // The blocking client defaults to 30 seconds. Apply None explicitly so
+        // provider-owned command waits are not cut short by an HTTP deadline.
+        let client = reqwest::blocking::Client::builder()
+            .timeout(request.timeout)
             .build()
             .map_err(RuntimeWorkspaceRequestError::transport)?;
         let mut builder = client
