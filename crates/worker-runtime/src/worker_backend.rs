@@ -5101,7 +5101,9 @@ mod tests {
             second.submission.as_ref().map(|ack| ack.disposition),
             Some(protocol::SubmissionDisposition::Queued)
         );
-        let retry = runtime.send_input(&detail.worker_ref, second_input).unwrap();
+        let retry = runtime
+            .send_input(&detail.worker_ref, second_input)
+            .unwrap();
         assert_eq!(retry.submission, second.submission);
     }
 
