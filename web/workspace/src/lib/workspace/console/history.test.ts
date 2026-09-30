@@ -56,11 +56,16 @@ function page(
   cursor: string | null,
   lineageId = "lineage-a",
   compactAncestorLineageIds: string[] = [],
+  parentLineage?: {
+    lineage_id: string;
+    adopted_through_turn_id?: string | null;
+  },
 ): SessionHistoryPage {
   return {
     session_id: "session-a",
     lineage_id: lineageId,
     compact_ancestor_lineage_ids: compactAncestorLineageIds,
+    parent_lineage: parentLineage,
     turns,
     next_cursor: cursor,
     has_more: cursor !== null,
@@ -237,6 +242,46 @@ Deno.test("Compact lineage refresh preserves already loaded adopted history", ()
   assert(
     state.cursor === "cursor-11-new" && state.hasMore,
     "Compact must replace the old-lineage cursor even when adopted turns are preserved",
+  );
+});
+
+Deno.test("fork lineage boundary preserves an adopted prefix without page overlap", () => {
+  let state: ConsoleHistoryState = {
+    ...emptyConsoleHistoryState(),
+    sessionId: "session-a",
+    lineageId: "lineage-a",
+    turns: Array.from({ length: 50 }, (_, index) => turn(index + 1)),
+    cursor: null,
+    hasMore: false,
+    status: "loading",
+    requestedCursor: "__initial__",
+  };
+  state = applyConsoleHistoryPage(
+    state,
+    page(
+      [101, 102, 103, 104, 105].map(turn),
+      "cursor-101",
+      "lineage-fork",
+      [],
+      {
+        lineage_id: "lineage-a",
+        adopted_through_turn_id: "u-25",
+      },
+    ),
+    null,
+  );
+
+  assert(
+    state.turns.map((value) => value.turn_id).join(",") ===
+      [
+        ...Array.from({ length: 25 }, (_, index) => `u-${index + 1}`),
+        ...Array.from({ length: 5 }, (_, index) => `u-${index + 101}`),
+      ].join(","),
+    "fork refresh must retain only the authoritative adopted prefix",
+  );
+  assert(
+    state.cursor === "cursor-101" && state.hasMore,
+    "fork refresh must replace the old paging boundary",
   );
 });
 

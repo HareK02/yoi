@@ -3112,6 +3112,36 @@ Deno.test("committed history preserves unmatched current rows in stable entry or
   );
 });
 
+Deno.test("committed history places omitted retained rows between snapshot anchors", () => {
+  const makeLine = (prefix: string, turn: number) => {
+    const line = consoleLine(`${prefix}-${turn}`, "user");
+    line.entryId = `user-${turn}`;
+    return line;
+  };
+  const history = [2, 3, 4, 5, 6].map((turn) => makeLine("history", turn));
+  const current = [1, 2, 6].map((turn) => makeLine("current", turn));
+
+  assertEquals(
+    mergeCommittedHistoryLines(history, current).map((line) => line.entryId),
+    [1, 2, 3, 4, 5, 6].map((turn) => `user-${turn}`),
+  );
+});
+
+Deno.test("committed history places a retained suffix before newer current-only rows", () => {
+  const makeLine = (prefix: string, turn: number) => {
+    const line = consoleLine(`${prefix}-${turn}`, "user");
+    line.entryId = `user-${turn}`;
+    return line;
+  };
+  const history = [2, 3, 4, 5, 6].map((turn) => makeLine("history", turn));
+  const current = [1, 2, 7].map((turn) => makeLine("current", turn));
+
+  assertEquals(
+    mergeCommittedHistoryLines(history, current).map((line) => line.entryId),
+    [1, 2, 3, 4, 5, 6, 7].map((turn) => `user-${turn}`),
+  );
+});
+
 Deno.test("committed history inserts current live rows after their last stable anchor", () => {
   const historyUser = consoleLine("history-user", "user");
   historyUser.entryId = "user-1";

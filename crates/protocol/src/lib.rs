@@ -842,6 +842,16 @@ pub struct SessionConversationTurn {
     pub entries: Vec<SessionSnapshotEntry>,
 }
 
+/// The immediate parent lineage and the stable real-user boundary adopted from it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct SessionHistoryLineageBoundary {
+    pub lineage_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted_through_turn_id: Option<String>,
+}
+
 /// Bounded backward page over the adopted conversation lineage.
 ///
 /// Turns remain chronological within a page. `next_cursor` is an opaque,
@@ -859,6 +869,10 @@ pub struct SessionHistoryPage {
     /// cursor with this page's boundary.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compact_ancestor_lineage_ids: Vec<String>,
+    /// Immediate parent relationship used to retain only the adopted prefix
+    /// across fork/rewind refreshes that have no newest-page overlap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_lineage: Option<SessionHistoryLineageBoundary>,
     pub turns: Vec<SessionConversationTurn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,

@@ -151,6 +151,8 @@ timestamp: number, provenance: SessionEntryProvenance, derived_from?: Array<stri
 
 export type SessionConversationTurn = { turn_id: string, entries: Array<SessionSnapshotEntry>, };
 
+export type SessionHistoryLineageBoundary = { lineage_id: string, adopted_through_turn_id?: string | null, };
+
 export type SessionHistoryPage = { session_id: string,
 /**
  * Stable identity of the adopted active lineage used to fence stale pages.
@@ -162,7 +164,12 @@ lineage_id: string,
  * loaded turns when their prior lineage appears here, while replacing the
  * cursor with this page's boundary.
  */
-compact_ancestor_lineage_ids?: Array<string>, turns: Array<SessionConversationTurn>, next_cursor?: string | null, has_more: boolean, };
+compact_ancestor_lineage_ids?: Array<string>,
+/**
+ * Immediate parent relationship used to retain only the adopted prefix
+ * across fork/rewind refreshes that have no newest-page overlap.
+ */
+parent_lineage?: SessionHistoryLineageBoundary | null, turns: Array<SessionConversationTurn>, next_cursor?: string | null, has_more: boolean, };
 
 export type PendingSubmissionSummary = { submission_id: string, accepted_at_ms: number, segment_count: number, byte_len: number, };
 

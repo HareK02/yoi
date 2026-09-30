@@ -4,8 +4,8 @@ use base64::{
 };
 use protocol::{
     Segment, SessionContentPart, SessionConversationTurn, SessionEntryProvenance,
-    SessionHistoryPage, SessionMessageRole, SessionSnapshot, SessionSnapshotEntry,
-    SessionSnapshotEntryData, SessionToolAttachment,
+    SessionHistoryLineageBoundary, SessionHistoryPage, SessionMessageRole, SessionSnapshot,
+    SessionSnapshotEntry, SessionSnapshotEntryData, SessionToolAttachment,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -261,6 +261,28 @@ pub fn read_retained_session_history_page(
     } else {
         None
     };
+    let parent_lineage = if lineage.len() > 1 {
+        let parent_turns = read_history_turns_backward(
+            &store,
+            active.session_id,
+            &lineage[1..],
+            None,
+            1,
+            RetainedHistoryReadLimits {
+                max_scan_bytes: limits.max_scan_bytes.saturating_sub(metadata_bytes),
+                max_entries: limits.max_entries.saturating_sub(metadata_entries),
+                ..limits
+            },
+        )?;
+        Some(SessionHistoryLineageBoundary {
+            lineage_id: lineage_identity(active.session_id, &lineage[1..]),
+            adopted_through_turn_id: parent_turns
+                .first()
+                .map(|positioned| positioned.turn.turn_id.clone()),
+        })
+    } else {
+        None
+    };
     let mut turns = read_history_turns_backward(
         &store,
         active.session_id,
@@ -302,6 +324,7 @@ pub fn read_retained_session_history_page(
         session_id: active.session_id.to_string(),
         lineage_id,
         compact_ancestor_lineage_ids,
+        parent_lineage,
         turns: turns
             .into_iter()
             .map(|positioned| positioned.turn)
@@ -1735,6 +1758,21 @@ mod tests {
                 .all(|entry| entry.entry_id != "assistant-1-unadopted")
         }));
         assert!(page.turns.iter().all(|turn| turn.turn_id != "user-2"));
+        let store = WorkerSessionStore::open_read_only(aggregate_root.join("session")).unwrap();
+        let (_, source_lineage_id, _, _) = load_adopted_lineage(
+            &store,
+            session_id,
+            source_segment,
+            RetainedHistoryReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            page.parent_lineage,
+            Some(SessionHistoryLineageBoundary {
+                lineage_id: source_lineage_id,
+                adopted_through_turn_id: Some("user-1".to_string()),
+            })
+        );
     }
 
     #[test]

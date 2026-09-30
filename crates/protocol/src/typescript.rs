@@ -12,10 +12,10 @@ use crate::{
     PasteArtifactAvailability, PasteArtifactMediaType, PasteArtifactRef, PendingSubmissionSummary,
     PendingSubmissionsSnapshot, Permission, RewindSummary, RewindTarget, RewindTargetId, RunResult,
     ScopeRule, Segment, SessionContentPart, SessionConversationTurn, SessionEntryProvenance,
-    SessionHistoryPage, SessionMessageRole, SessionSnapshot, SessionSnapshotEntry,
-    SessionSnapshotEntryData, SessionToolAttachment, SubmissionDisposition, SymlinkPolicy,
-    ToolResultDisposition, TurnResult, UploadedFileAvailability, UploadedFileRef, WorkerBusyState,
-    WorkerCommandAcknowledgement, WorkerCommandDisposition, WorkerCommandEnvelope,
+    SessionHistoryLineageBoundary, SessionHistoryPage, SessionMessageRole, SessionSnapshot,
+    SessionSnapshotEntry, SessionSnapshotEntryData, SessionToolAttachment, SubmissionDisposition,
+    SymlinkPolicy, ToolResultDisposition, TurnResult, UploadedFileAvailability, UploadedFileRef,
+    WorkerBusyState, WorkerCommandAcknowledgement, WorkerCommandDisposition, WorkerCommandEnvelope,
     WorkerCommandKind, WorkerEvent, WorkerMaintenanceState, WorkerRunState, WorkerState,
     WorkerStateSnapshot, WorkerStatus,
     subscription::{
@@ -106,6 +106,7 @@ pub fn generated_protocol_types() -> String {
     push_decl::<SessionSnapshotEntryData>(&cfg, &mut output);
     push_decl::<SessionSnapshotEntry>(&cfg, &mut output);
     push_decl::<SessionConversationTurn>(&cfg, &mut output);
+    push_decl::<SessionHistoryLineageBoundary>(&cfg, &mut output);
     push_decl::<SessionHistoryPage>(&cfg, &mut output);
     push_decl::<PendingSubmissionSummary>(&cfg, &mut output);
     push_decl::<PendingSubmissionsSnapshot>(&cfg, &mut output);

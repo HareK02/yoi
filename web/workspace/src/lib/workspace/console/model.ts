@@ -291,12 +291,59 @@ export function mergeCommittedHistoryLines(
       Boolean(id)
     ),
   );
-  return [
-    ...history.filter((line) =>
-      !line.entryId || !currentEntryIds.has(line.entryId)
-    ),
-    ...current,
-  ];
+  const historyPositions = new Map<string, number>();
+  history.forEach((line, index) => {
+    if (line.entryId && !historyPositions.has(line.entryId)) {
+      historyPositions.set(line.entryId, index);
+    }
+  });
+
+  // Use stable entries that occur in the same order in both projections as
+  // anchors. History-only rows are inserted in their retained interval, while
+  // current-only rows retain the snapshot's authoritative order. This handles
+  // Compact snapshots that preserve only a non-contiguous subset of context.
+  const anchors: Array<{ history: number; current: number }> = [];
+  let lastHistoryIndex = -1;
+  current.forEach((line, currentIndex) => {
+    const historyIndex = line.entryId
+      ? historyPositions.get(line.entryId)
+      : undefined;
+    if (historyIndex !== undefined && historyIndex > lastHistoryIndex) {
+      anchors.push({ history: historyIndex, current: currentIndex });
+      lastHistoryIndex = historyIndex;
+    }
+  });
+
+  if (anchors.length === 0) {
+    return [
+      ...history.filter((line) =>
+        !line.entryId || !currentEntryIds.has(line.entryId)
+      ),
+      ...current,
+    ];
+  }
+
+  const merged: ConsoleLine[] = [];
+  let historyCursor = 0;
+  let currentCursor = 0;
+  const appendHistoryInterval = (end: number) => {
+    for (; historyCursor < end; historyCursor += 1) {
+      const line = history[historyCursor]!;
+      if (!line.entryId || !currentEntryIds.has(line.entryId)) {
+        merged.push(line);
+      }
+    }
+  };
+  for (const anchor of anchors) {
+    appendHistoryInterval(anchor.history);
+    merged.push(...current.slice(currentCursor, anchor.current));
+    merged.push(current[anchor.current]!);
+    historyCursor = anchor.history + 1;
+    currentCursor = anchor.current + 1;
+  }
+  appendHistoryInterval(history.length);
+  merged.push(...current.slice(currentCursor));
+  return merged;
 }
 
 export function projectSessionHistoryEntries(

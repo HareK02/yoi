@@ -86,6 +86,9 @@ export function applyConsoleHistoryPage(
     state.turns.length > 0;
   const refreshingSameLineage = refreshingSameSession &&
     state.lineageId === page.lineage_id;
+  const refreshingParentLineage = refreshingSameSession &&
+    state.lineageId !== null &&
+    page.parent_lineage?.lineage_id === state.lineageId;
   const refreshingCompactDescendant = refreshingSameSession &&
     state.lineageId !== null &&
     (page.compact_ancestor_lineage_ids ?? []).includes(state.lineageId);
@@ -93,7 +96,15 @@ export function applyConsoleHistoryPage(
     (turn) => state.turns.some((retained) => retained.turn_id === turn.turn_id),
   );
   const turns = initial
-    ? refreshingSameLineage || refreshingCompactDescendant
+    ? refreshingSameLineage
+      ? mergeRefreshedTurns(state.turns, incoming)
+      : refreshingParentLineage
+      ? reconcileParentLineage(
+        state.turns,
+        incoming,
+        page.parent_lineage?.adopted_through_turn_id ?? null,
+      )
+      : refreshingCompactDescendant
       ? mergeRefreshedTurns(state.turns, incoming)
       : refreshingSameSession
       ? reconcileChangedLineage(state.turns, incoming)
@@ -214,6 +225,19 @@ function previewAssistant(value: string): string[] {
     .map((line) => line.trim())
     .filter(Boolean)
     .slice(0, 3);
+}
+
+function reconcileParentLineage(
+  retained: readonly SessionConversationTurn[],
+  refreshed: readonly SessionConversationTurn[],
+  adoptedThroughTurnId: string | null,
+): SessionConversationTurn[] {
+  if (adoptedThroughTurnId === null) return dedupeTurns(refreshed);
+  const boundary = retained.findIndex((turn) =>
+    turn.turn_id === adoptedThroughTurnId
+  );
+  if (boundary < 0) return dedupeTurns(refreshed);
+  return dedupeTurns([...retained.slice(0, boundary + 1), ...refreshed]);
 }
 
 function reconcileChangedLineage(

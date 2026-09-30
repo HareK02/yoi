@@ -121,13 +121,22 @@ function emptyHistoryPage() {
   };
 }
 
-function historyPage(indices: number[], cursor: string | null) {
+function historyPage(
+  indices: number[],
+  cursor: string | null,
+  lineageId = "lineage-a",
+  parentLineage?: {
+    lineage_id: string;
+    adopted_through_turn_id?: string | null;
+  },
+) {
   return {
     availability: "page",
     page: {
       session_id: "session-a",
-      lineage_id: "lineage-a",
+      lineage_id: lineageId,
       compact_ancestor_lineage_ids: [],
+      parent_lineage: parentLineage,
       turns: indices.map((index) => ({
         turn_id: `user-${index}`,
         entries: [
@@ -471,6 +480,63 @@ test("snapshot supersedes an in-flight page before stale lineage can render", as
   );
   expect(screen.queryByText("question 1")).toBeNull();
   expect(historyRequests).toBe(2);
+});
+
+test("fork refresh reconciles an in-flight older page to the adopted prefix", async () => {
+  const staleOlder = deferred<Response>();
+  let historyRequests = 0;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL) => {
+      if (!String(input).includes("/session/history")) {
+        return Promise.resolve(
+          Response.json({ availability: "live_protocol" }),
+        );
+      }
+      historyRequests += 1;
+      if (historyRequests === 1) {
+        return Promise.resolve(
+          Response.json(historyPage([46, 47, 48, 49, 50], "older-46")),
+        );
+      }
+      if (historyRequests === 2) return staleOlder.promise;
+      return Promise.resolve(Response.json(historyPage(
+        [101, 102, 103, 104, 105],
+        "older-101",
+        "lineage-fork",
+        {
+          lineage_id: "lineage-a",
+          adopted_through_turn_id: "user-48",
+        },
+      )));
+    }),
+  );
+
+  render(ConsolePage, { data: pageData() });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
+  latestListener().onFrame(subscribedFrame());
+  await waitFor(() =>
+    expect(screen.getAllByText("question 50")).toHaveLength(2)
+  );
+
+  const transcriptScroller = screen.getByLabelText("main transcript")
+    .parentElement as HTMLElement;
+  transcriptScroller.scrollTop = 0;
+  await fireEvent.scroll(transcriptScroller);
+  await waitFor(() => expect(historyRequests).toBe(2));
+
+  latestListener().onFrame(
+    subscribedFrame(sessionWithUserMessage("fork current")),
+  );
+  staleOlder.resolve(Response.json(historyPage([41, 42, 43, 44, 45], null)));
+
+  await waitFor(() =>
+    expect(screen.getAllByText("question 101")).toHaveLength(2)
+  );
+  expect(screen.getAllByText("question 48")).toHaveLength(2);
+  expect(screen.queryByText("question 49")).toBeNull();
+  expect(screen.getAllByText("question 41")).toHaveLength(2);
+  expect(historyRequests).toBe(3);
 });
 
 test("route changes clear prior content and fence stale Session responses", async () => {
