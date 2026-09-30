@@ -187,12 +187,18 @@ impl PendingActivationState {
         protocol::PendingSubmissionsSnapshot {
             revision: self.revision,
             notification_count: u32::try_from(self.pending_notifications.len()).unwrap_or(u32::MAX),
+            notification_previews: self
+                .pending_notifications
+                .iter()
+                .map(|notification| pending_input_preview(notification.message.chars()))
+                .collect(),
             head_id,
             submissions: self
                 .pending
                 .iter()
                 .map(|pending| protocol::PendingSubmissionSummary {
                     submission_id: pending.submission_id.clone(),
+                    preview: Some(pending_submission_preview(&pending.input)),
                     accepted_at_ms: pending.accepted_at_ms,
                     segment_count: u32::try_from(pending.input.len()).unwrap_or(u32::MAX),
                     byte_len: submission_payload_len(&pending.input),
@@ -291,6 +297,55 @@ fn notification_head_id(source_namespace: &str, request_id: &str) -> String {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     )
+}
+
+/// Display-only preview: no artifact reads, payload clones, or input mutation.
+fn pending_submission_preview(input: &[Segment]) -> String {
+    let chars = input.iter().flat_map(|segment| {
+        let parts: [&str; 3] = match segment {
+            Segment::Text { content } | Segment::Paste { content, .. } => ["", content, ""],
+            Segment::UploadedFile { file } => ["[Attached file: ", &file.file_name, "]"],
+            Segment::PasteArtifact { .. } => ["[Large paste]", "", ""],
+            Segment::FileRef { path } => ["@", path, ""],
+            Segment::Flow { selector } => ["[Flow: ", selector, "]"],
+            Segment::Unknown => ["[Unknown input]", "", ""],
+        };
+        parts
+            .into_iter()
+            .flat_map(str::chars)
+            .chain(std::iter::once(' '))
+    });
+    pending_input_preview(chars)
+}
+
+fn pending_input_preview(chars: impl Iterator<Item = char>) -> String {
+    const LIMIT: usize = 240;
+    let mut preview = String::new();
+    let mut count = 0;
+    let mut space = false;
+    for ch in chars {
+        if ch.is_whitespace() || ch.is_control() {
+            space = !preview.is_empty();
+            continue;
+        }
+        if space && count < LIMIT {
+            preview.push(' ');
+            count += 1;
+        }
+        space = false;
+        if count == LIMIT {
+            preview.truncate(preview.trim_end().len());
+            preview.push('…');
+            return preview;
+        }
+        preview.push(ch);
+        count += 1;
+    }
+    if preview.is_empty() {
+        "[Empty input]".into()
+    } else {
+        preview
+    }
 }
 
 fn submission_payload_len(input: &[Segment]) -> u64 {
@@ -11216,6 +11271,131 @@ mod build_summary_prompt_tests {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn pending_notification_previews_are_bounded_ordered_and_survive_queue_cancel() {
+        let temp = tempfile::tempdir().unwrap();
+        let handle = PendingSubmissionHandle::for_test(temp.path());
+        let submit = handle
+            .accept("submit".into(), vec![Segment::text("queued")], false)
+            .unwrap();
+        let long = "界".repeat(1000);
+        handle
+            .accept_notification("n1".into(), "通知\n\t<b>内容</b>".into())
+            .unwrap();
+        handle
+            .accept_notification("n2".into(), long.clone())
+            .unwrap();
+        let before = handle.snapshot();
+        assert_eq!(before.notification_count, 2);
+        assert_eq!(
+            before.notification_previews,
+            vec![
+                "通知 <b>内容</b>".to_owned(),
+                format!("{}…", "界".repeat(240))
+            ]
+        );
+        let after = handle
+            .cancel(&submit.submission_id, before.revision)
+            .unwrap();
+        assert!(after.submissions.is_empty());
+        assert_eq!(after.notification_previews, before.notification_previews);
+        let entries = handle.persisted_entries_for_test();
+        let restored: PendingActivationState = entries
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                LogEntry::Extension {
+                    domain, payload, ..
+                } if domain == SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN => {
+                    Some(serde_json::from_value(payload.clone()).unwrap())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            restored.snapshot().notification_previews,
+            before.notification_previews
+        );
+        let batch = handle.prepare_notification_batch();
+        assert_eq!(batch[0].0.message, "通知\n\t<b>内容</b>");
+        assert_eq!(batch[1].0.message, long);
+        assert_eq!(handle.snapshot().notification_count, 0);
+        assert!(handle.snapshot().notification_previews.is_empty());
+    }
+
+    #[test]
+    fn pending_submission_preview_is_single_line_bounded_and_display_only() {
+        let input = vec![
+            Segment::text("  日本語\n\tの確認  "),
+            Segment::Paste {
+                id: 1,
+                chars: 4,
+                lines: 2,
+                content: "<b>\r\ntext</b>".into(),
+            },
+            Segment::FileRef {
+                path: "src/main.rs".into(),
+            },
+        ];
+        assert_eq!(
+            pending_submission_preview(&input),
+            "日本語 の確認 <b> text</b> @src/main.rs"
+        );
+        assert_eq!(
+            pending_submission_preview(&[Segment::text("\n\t")]),
+            "[Empty input]"
+        );
+        assert_eq!(
+            pending_submission_preview(&[Segment::Unknown]),
+            "[Unknown input]"
+        );
+        assert_eq!(
+            pending_submission_preview(&[Segment::text("界".repeat(240))]),
+            "界".repeat(240)
+        );
+        let long = pending_submission_preview(&[Segment::text("界".repeat(10000))]);
+        assert_eq!(long, format!("{}…", "界".repeat(240)));
+        assert_eq!(long.chars().count(), 241);
+
+        let temp = tempfile::tempdir().unwrap();
+        let handle = PendingSubmissionHandle::for_test(temp.path());
+        handle
+            .accept("preview".into(), input.clone(), false)
+            .unwrap();
+        let snapshot = handle.snapshot();
+        assert_eq!(
+            snapshot.submissions[0].preview.as_deref(),
+            Some("日本語 の確認 <b> text</b> @src/main.rs")
+        );
+        let activation = handle.prepare_next_activation(None).unwrap().unwrap();
+        let PendingActivation::Submission(submission) = activation;
+        assert_eq!(submission.input, input);
+    }
+
+    #[test]
+    fn pending_submission_preview_labels_attachments_without_resolving_them() {
+        let file: protocol::UploadedFileRef = serde_json::from_value(serde_json::json!({
+            "artifact_id": "hidden-id", "file_name": "図\n面.png", "media_type": "image/png",
+            "created_at_ms": 1, "availability": "available", "byte_len": 20,
+            "sha256": "hidden-digest"
+        }))
+        .unwrap();
+        assert_eq!(
+            pending_submission_preview(&[Segment::UploadedFile { file }]),
+            "[Attached file: 図 面.png]"
+        );
+        let artifact: protocol::PasteArtifactRef = serde_json::from_value(serde_json::json!({
+            "artifact_id": "hidden-id", "created_at_ms": 1, "media_type": "text_plain_utf8",
+            "availability": "available", "byte_len": 500, "char_count": 500, "line_count": 10,
+            "sha256": "hidden-digest", "source_entry_id": "hidden-entry"
+        }))
+        .unwrap();
+        assert_eq!(
+            pending_submission_preview(&[Segment::PasteArtifact { artifact }]),
+            "[Large paste]"
         );
     }
 

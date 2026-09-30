@@ -571,8 +571,8 @@
 
   .composer-input :global(.cm-content) {
     min-height: 2.65rem;
-    padding: 0.55rem 0.65rem 0.35rem;
-    line-height: 1.45;
+    padding: var(--space-2) var(--space-2) var(--space-1);
+    line-height: var(--line-height-body);
   }
 
   .composer-input :global(.cm-line) {
@@ -583,8 +583,8 @@
     display: inline-flex;
     align-items: center;
     max-width: min(26rem, 70vw);
-    margin: 0 0.15rem;
-    padding: 0.08rem 0.42rem;
+    margin: 0 var(--space-1);
+    padding: 0 var(--space-2);
     overflow: hidden;
     border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--line));
     border-radius: 999px;
@@ -592,7 +592,7 @@
     color: var(--text-muted);
     font-size: var(--font-size-compact);
     font-weight: 600;
-    line-height: 1.35;
+    line-height: var(--line-height-compact);
     text-overflow: ellipsis;
     vertical-align: baseline;
     white-space: nowrap;

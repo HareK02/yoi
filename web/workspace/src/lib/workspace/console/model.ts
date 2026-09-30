@@ -176,39 +176,6 @@ export type ConsoleProjection = {
   removedInternalWorkers: Record<string, number>;
 };
 
-export type ConsoleTimelineLineSelection = {
-  item: ConsoleLine;
-  index: number;
-};
-
-export function selectConsoleTimelineLines(
-  items: ConsoleLine[],
-): ConsoleTimelineLineSelection[] {
-  const selected: ConsoleTimelineLineSelection[] = [];
-  let lastAssistant: ConsoleTimelineLineSelection | null = null;
-
-  const flushAssistant = () => {
-    if (lastAssistant) {
-      selected.push(lastAssistant);
-      lastAssistant = null;
-    }
-  };
-
-  items.forEach((item, index) => {
-    if (item.kind === "user") {
-      flushAssistant();
-      selected.push({ item, index });
-      return;
-    }
-    if (item.kind === "assistant") {
-      lastAssistant = { item, index };
-    }
-  });
-
-  flushAssistant();
-  return selected;
-}
-
 export type WorkerTarget = {
   runtime_id: string;
   worker_id: string;

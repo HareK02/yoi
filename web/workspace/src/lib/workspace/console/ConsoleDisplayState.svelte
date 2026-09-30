@@ -102,12 +102,13 @@
     flex: 0 0 auto;
     border: 1px solid var(--line);
     border-radius: 999px;
-    padding: 0.4rem 0.75rem;
+    padding: var(--space-1) var(--space-3);
     background: var(--bg);
     color: var(--text-strong);
     cursor: pointer;
     font: inherit;
     font-size: var(--font-size-compact);
+    line-height: var(--line-height-compact);
     font-weight: 700;
   }
 

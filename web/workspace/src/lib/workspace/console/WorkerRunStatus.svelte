@@ -67,11 +67,12 @@
   .worker-run-status {
     display: flex;
     align-items: center;
-    gap: 0.42rem;
+    gap: var(--space-2);
     min-height: 1.35rem;
     color: var(--text-muted);
     font-family: var(--font-mono);
     font-size: var(--font-size-compact);
+    line-height: var(--line-height-compact);
     font-variant-numeric: tabular-nums;
   }
 </style>

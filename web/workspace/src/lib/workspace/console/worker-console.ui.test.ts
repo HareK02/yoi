@@ -670,7 +670,7 @@ Deno.test("Worker Console renders markdown only for message rows", async () => {
         ".console-line.tool.tool-bash .console-plain-text",
       ) &&
       consoleLine.includes("font-size: var(--font-size-compact);") &&
-      consoleLine.includes("line-height: 1.1;") &&
+      consoleLine.includes("line-height: var(--line-height-compact);") &&
       consoleLine.includes("{:else if shouldRenderMarkdown(item)}") &&
       consoleLine.includes(
         "<RichMarkdown text={item.body || '—'} streamId={item.id} />",
@@ -720,38 +720,109 @@ Deno.test("Worker Console renders Edit diffs without preformatted template gaps"
   );
 });
 
-Deno.test("Worker Console exposes a foldable timeline beside the scroll body", async () => {
+Deno.test("Console spacing and text metrics use existing design tokens", async () => {
+  const files = [
+    "ComposerInput.svelte", "ConsoleLineItem.svelte", "RichMarkdown.svelte",
+    "ConsoleTasks.svelte", "WorkerRunStatus.svelte", "ConsoleDisplayState.svelte",
+    "ConsoleTurnNavigation.svelte",
+    "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
+  ];
+  for (const file of files) {
+    const source = await Deno.readTextFile(new URL(file, import.meta.url));
+    const css = source.split("<style>")[1];
+    assert(
+      !/(?:gap|padding(?:-[\w]+)?|margin(?:-[\w]+)?)\s*:[^;]*\d(?:\.\d+)?rem/.test(css),
+      `${file} should use shared spacing tokens, not a local rem spacing scale`,
+    );
+    assert(
+      !/line-height:\s*\d/.test(css),
+      `${file} should use the body/compact line-height tokens`,
+    );
+  }
+  const navigation = await Deno.readTextFile(new URL("./ConsoleTurnNavigation.svelte", import.meta.url));
+  assert(
+    navigation.includes("box-shadow: var(--shadow-overlay)") &&
+      navigation.includes("font-size: var(--font-size-body)") &&
+      navigation.includes("line-height: var(--line-height-body)") &&
+      navigation.includes("gap: var(--space-2)") &&
+      navigation.includes("padding: var(--space-3)") &&
+      navigation.includes("line-height: inherit"),
+    "Preview text should use body typography, shared spacing and overlay shadow",
+  );
+  const page = await Deno.readTextFile(new URL(files.at(-1)!, import.meta.url));
+  assert(
+    page.includes("grid-template-columns: minmax(0, 1fr) max-content"),
+    "The turn column should fit the button instead of independently sizing to 2rem",
+  );
+});
+
+Deno.test("Console and app shell keep compact layout spacing", async () => {
+  const layout = await Deno.readTextFile(
+    new URL("./../../../routes/+layout.svelte", import.meta.url),
+  );
+  const page = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
+      import.meta.url,
+    ),
+  );
+  const mainRules = [...layout.matchAll(/^\s*\.app-shell__main\s*\{([^}]+)\}/gm)];
+  assert(
+    mainRules.length === 2 &&
+      mainRules.every((rule) => rule[1].includes("padding: var(--space-4);")),
+    "Desktop and mobile main padding should both use 16px",
+  );
+  const shell = page.match(/\.worker-console-shell\s*\{([^}]+)\}/)?.[1] ?? "";
+  assert(
+    shell.includes("gap: var(--space-2);") &&
+      shell.includes("height: calc(100dvh - (var(--space-4) * 2));"),
+    "Console should use an 8px gap and account for the 16px main padding",
+  );
+});
+
+Deno.test("Worker Console uses turn bars with hidden scrollbars and preserves scrolling", async () => {
   const consolePage = await Deno.readTextFile(
     new URL(
       "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
       import.meta.url,
     ),
   );
-  const consoleLine = await Deno.readTextFile(
-    new URL("./ConsoleLineItem.svelte", import.meta.url),
-  );
-  const consoleTimeline = await Deno.readTextFile(
-    new URL("./ConsoleTimeline.svelte", import.meta.url),
+  const navigation = await Deno.readTextFile(new URL("./ConsoleTurnNavigation.svelte", import.meta.url));
+  assert(
+    !/timeline/i.test(consolePage) &&
+      consolePage.includes("const turns = $derived(consoleTurns(lines))") &&
+      consolePage.includes("<ConsoleTurnNavigation {turns} onSelect={selectConsoleTurn}") &&
+      consolePage.includes("CSS.escape(id)") &&
+      consolePage.includes("scrollbar-width: none") &&
+      consolePage.includes("::-webkit-scrollbar"),
+    "Console should replace the scrollbar with conversation turn navigation, not the former timeline",
   );
   assert(
-    consoleTimeline.includes('class="console-timeline"') &&
-      consolePage.includes("timelineMarks") &&
-      consolePage.includes("jumpToTimelineMark") &&
-      consoleLine.includes("data-console-line-id={item.id}") &&
-      consolePage.includes("class:timeline-open={timelineOpen}") &&
-      consolePage.includes('class="timeline-fold"') &&
-      consolePage.includes("expanded={timelineOpen}") &&
-      !consolePage.includes("{#if timelineOpen}") &&
-      consolePage.includes("handleTimelineRailPointerDown") &&
-      consolePage.includes("projectTimelineAxisPosition") &&
-      consolePage.includes("scrollbar-width: none") &&
-      consoleTimeline.includes("onpointerdown={onRailPointerDown}") &&
-      consoleTimeline.includes("expanded ? 'expanded' : 'folded'") &&
-      consoleTimeline.includes(".timeline-mark.expanded .timeline-card") &&
-      !consoleTimeline.includes("{#if expanded}") &&
-      consoleTimeline.includes(".timeline-thumb") &&
-      consoleTimeline.includes(".timeline-card"),
-    "Worker Console should expose a foldable timeline with scroll and line jump markers",
+    navigation.includes("{#each turns as turn, index (turn.id)}") &&
+      navigation.includes('class="turn-bar"') &&
+      navigation.includes("onmouseenter=") &&
+      navigation.includes("onfocus=") &&
+      navigation.includes("onclick={() => onSelect(turn.id)}") &&
+      navigation.includes('role="tooltip"') &&
+      navigation.includes("aria-describedby=") &&
+      navigation.includes("event.key === 'Escape'") &&
+      navigation.includes("text-overflow: ellipsis") &&
+      navigation.includes("-webkit-line-clamp: 3") &&
+      navigation.includes("railHeight - previewHeight") &&
+      !navigation.includes("{@html"),
+    "Turn bars need keyboard and hover previews, one user line, three AI lines, bounded positioning and escaped content",
+  );
+  assert(
+    consolePage.includes('class="console-scroll"') &&
+      consolePage.includes("overflow-y: auto") &&
+      consolePage.includes("onscroll={handleConsoleScroll}") &&
+      consolePage.includes("autoFollowConsole = isNearConsoleBottom(consoleBodyElement)") &&
+      consolePage.includes("void scrollConsoleToBottom()") &&
+      consolePage.includes("rememberConsoleWorkerViewScroll()") &&
+      consolePage.includes("consoleBodyElement.scrollTop = resolveConsoleViewScrollTop(") &&
+      consolePage.includes('event.key === "PageUp" || event.key === "PageDown"') &&
+      consolePage.includes("consoleBodyElement.scrollBy({"),
+    "Native scroll, PageUp/PageDown, conditional bottom-follow and per-Worker scroll restoration must remain",
   );
 });
 
@@ -836,7 +907,7 @@ Deno.test("Worker Console composer separates the editor from its icon toolbar", 
   );
   assert(
     composerInput.includes("min-height: 2.65rem") &&
-      composerInput.includes("padding: 0.55rem 0.65rem 0.35rem") &&
+      composerInput.includes("padding: var(--space-2) var(--space-2) var(--space-1)") &&
       !composerInput.includes("padding: 0.55rem 3.4rem 3rem 0.65rem"),
     "Editor must not reserve an overlapping toolbar inside its scrolling content",
   );
@@ -1416,7 +1487,47 @@ Deno.test("Web Console switches main and direct SubWorker views from the Tasks r
   );
 });
 
-Deno.test("Web Console uses Notify while running and keeps recovery pending controls", async () => {
+Deno.test("Pending inputs are single-line previews between Tasks and Composer", async () => {
+  const page = await Deno.readTextFile(new URL(
+    "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
+    import.meta.url,
+  ));
+  const pending = page.indexOf('<section class="pending-submissions"');
+  assert(
+    page.indexOf("<ConsoleTasks") < pending && pending < page.indexOf('<form class="console-composer"'),
+    "Pending inputs should sit between Tasks and Composer",
+  );
+  const section = page.slice(pending, page.indexOf("</section>", pending));
+  assert(
+    !section.includes("<details") && !page.includes('method: "continue_pending"') &&
+      !section.includes("{submission.submission_id}") && !section.includes("segment_count") &&
+      section.includes('submission.preview || "Preview unavailable"') &&
+      section.includes('aria-label={`Cancel queued input ${index + 1}`}') &&
+      section.includes('aria-label="Notifications"') &&
+      section.includes("pendingSubmissions.notification_previews ?? []") &&
+      !page.includes('method: "clear_pending_submissions"'),
+    "Always-visible previews should replace UUIDs and use named icon-only cancellation controls",
+  );
+  const css = page.split("<style>")[1];
+  const previewRule = css.match(/\.pending-submission-preview,[^{]+\{([^}]+)\}/)?.[1] ?? "";
+  assert(
+    previewRule.includes("white-space: nowrap") && previewRule.includes("min-width: 0") &&
+      previewRule.includes("overflow: hidden") && previewRule.includes("text-overflow: ellipsis"),
+    "Preview text must truncate instead of wrapping or expanding the row",
+  );
+  assert(
+    /\.pending-queue li\s*\{[^}]*grid-template-columns: minmax\(0, 1fr\) auto/.test(css) &&
+      css.includes("grid-template-columns: repeat(2, minmax(0, 1fr))") &&
+      !section.includes("BevelLine") &&
+      /\.pending-submissions\s*\{[^}]*font-size: var\(--font-size-compact\);[^}]*line-height: var\(--line-height-compact\);/.test(css) &&
+      css.includes(".pending-queue li:hover .pending-icon-button") &&
+      css.includes(".pending-queue li:focus-within .pending-icon-button") &&
+      css.includes("@media (hover: none)") && section.includes('<path d="M5 12h14"'),
+    "Cancel icons must retain their column when preview text is long",
+  );
+});
+
+Deno.test("Web Console uses Notify while running and exposes queued input cancellation", async () => {
   const consolePage = await Deno.readTextFile(
     new URL(
       "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
@@ -1432,8 +1543,6 @@ Deno.test("Web Console uses Notify while running and keeps recovery pending cont
       "submission_request_id: crypto.randomUUID()",
       'payload.event === "pending_submissions_changed"',
       'method: "cancel_pending_submission"',
-      'method: "clear_pending_submissions"',
-      'method: "continue_pending"',
       "handleNotifySubmit",
       "disabled={!canNotifyDraft}",
       'class="composer-notify-button"',

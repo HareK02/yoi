@@ -2166,9 +2166,11 @@ mod tests {
             pending: protocol::PendingSubmissionsSnapshot {
                 revision: 1,
                 notification_count: 0,
+                notification_previews: vec![],
                 head_id: Some(id.into()),
                 submissions: vec![protocol::PendingSubmissionSummary {
                     submission_id: id.into(),
+                    preview: None,
                     accepted_at_ms: 1,
                     segment_count: 1,
                     byte_len: 1,

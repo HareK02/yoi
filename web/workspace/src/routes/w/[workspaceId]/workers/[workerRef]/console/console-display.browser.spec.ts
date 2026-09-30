@@ -167,6 +167,123 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+test("pending inputs show literal previews above Composer with revision-fenced icon actions", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ availability: "live_protocol" })));
+  const view = render(ConsolePage, { data: pageData() });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
+  const session = emptySession();
+  session.pending_submissions = {
+    revision: 7, head_id: "private-submission-id", notification_count: 1,
+    notification_previews: ["<b>通知内容</b>"],
+    submissions: [
+      { submission_id: "private-submission-id", preview: "<b>実際の入力</b> " + "長文".repeat(100), accepted_at_ms: 1, segment_count: 1, byte_len: 500 },
+      { submission_id: "legacy-submission-id", accepted_at_ms: 2, segment_count: 1, byte_len: 10 },
+    ],
+  };
+  latestListener().onFrame(subscribedFrame(session));
+  const region = await screen.findByRole("region", { name: "Pending activations" });
+  expect(region.querySelector("details")).toBeNull();
+  expect(region.textContent).not.toContain("private-submission-id");
+  expect(region.textContent).not.toContain("legacy-submission-id");
+  expect(region.textContent).toContain("<b>実際の入力</b>");
+  expect(region.querySelector("b")).toBeNull();
+  expect(region.textContent).toContain("Preview unavailable");
+  const queue = screen.getByRole("list", { name: "Queued inputs" });
+  const notifications = screen.getByRole("group", { name: "Notifications" });
+  expect(queue.querySelectorAll("li")).toHaveLength(2);
+  expect(notifications.textContent).toContain("<b>通知内容</b>");
+  expect(notifications.querySelector("button")).toBeNull();
+  expect(notifications.querySelector("b")).toBeNull();
+  expect(region.textContent).toContain("2 Queued");
+  expect(screen.queryByRole("button", { name: /Clear all/ })).toBeNull();
+  expect(region.nextElementSibling).toBe(view.container.querySelector(".console-composer"));
+  expect(screen.queryByRole("button", { name: "Continue next" })).toBeNull();
+  const cancel = screen.getByRole("button", { name: "Cancel queued input 1" });
+  expect(cancel.textContent?.trim()).toBe("");
+  expect(cancel.querySelector("path")?.getAttribute("d")).toBe("M5 12h14");
+  await fireEvent.focus(cancel);
+  await fireEvent.click(cancel);
+  expect(multiplexer.sendWorkerMethod).toHaveBeenLastCalledWith({
+    method: "cancel_pending_submission",
+    params: { submission_id: "private-submission-id", expected_revision: 7 },
+  });
+  // Do not remove a row optimistically before the authoritative snapshot arrives.
+  expect(queue.querySelectorAll("li")).toHaveLength(2);
+  latestListener().onFrame({ frame: "event", message: { event: "event", data: {
+    payload: { event: "worker_protocol", data: { worker_id: "worker-a", event: {
+      event: "pending_submissions_changed", data: { pending: {
+        ...session.pending_submissions, revision: 8, head_id: "legacy-submission-id",
+        submissions: session.pending_submissions.submissions.slice(1),
+      } },
+    } } },
+  } } });
+  await waitFor(() => expect(queue.querySelectorAll("li")).toHaveLength(1));
+  expect(notifications.textContent).toContain("<b>通知内容</b>");
+  await fireEvent.click(screen.getByRole("button", { name: "Cancel queued input 1" }));
+  expect(multiplexer.sendWorkerMethod).toHaveBeenLastCalledWith({
+    method: "cancel_pending_submission", params: { submission_id: "legacy-submission-id", expected_revision: 8 },
+  });
+  latestListener().onFrame(subscribedFrame(emptySession()));
+  await waitFor(() => expect(screen.queryByRole("region", { name: "Pending activations" })).toBeNull());
+});
+
+test("notification-only state displays previews without actions and supports legacy runtimes", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ availability: "live_protocol" })));
+  render(ConsolePage, { data: pageData() });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
+  const session = emptySession();
+  session.pending_submissions.notification_count = 2;
+  session.pending_submissions.notification_previews = ["一件目の通知", "二件目の通知"];
+  session.pending_submissions.head_id = "notification-head";
+  latestListener().onFrame(subscribedFrame(session));
+  const region = await screen.findByRole("region", { name: "Pending activations" });
+  expect(region.textContent).toContain("0 Queued");
+  expect(region.textContent).toContain("一件目の通知");
+  expect(region.textContent).toContain("二件目の通知");
+  expect(region.querySelectorAll("li")).toHaveLength(2);
+  expect(region.querySelector("button")).toBeNull();
+  delete session.pending_submissions.notification_previews;
+  latestListener().onFrame(subscribedFrame(session));
+  await waitFor(() => expect(region.textContent).toContain("2 pending · Preview unavailable"));
+  expect(region.querySelector("button")).toBeNull();
+  latestListener().onFrame(subscribedFrame(emptySession()));
+  await waitFor(() => expect(screen.queryByRole("region", { name: "Pending activations" })).toBeNull());
+});
+
+test("queue-only state keeps the notification column empty and disables cancellation when disconnected", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ availability: "live_protocol" })));
+  render(ConsolePage, { data: pageData() });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
+  const session = emptySession();
+  session.pending_submissions.submissions = [{ submission_id: "queue-1", preview: "送信内容", accepted_at_ms: 1, segment_count: 1, byte_len: 12 }];
+  latestListener().onFrame(subscribedFrame(session));
+  await screen.findByText("送信内容");
+  expect(screen.getByRole("group", { name: "Notifications" }).querySelector("ol")).toBeNull();
+  latestListener().onStatus?.("closed", "connection lost");
+  await waitFor(() => expect((screen.getByRole("button", { name: "Cancel queued input 1" }) as HTMLButtonElement).disabled).toBe(true));
+});
+
+test("turn navigation jumps only the transcript to its user message and stops bottom-follow", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ availability: "live_protocol" })));
+  const view = render(ConsolePage, { data: pageData() });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
+  latestListener().onFrame(subscribedFrame(sessionWithUserMessage("Navigation question")));
+  const button = await screen.findByRole("button", { name: "Turn 1: Navigation question" });
+  const scroll = view.container.querySelector<HTMLElement>(".console-scroll")!;
+  const user = view.container.querySelector<HTMLElement>(".console-line.user")!;
+  Object.defineProperties(scroll, {
+    scrollHeight: { configurable: true, value: 2000 },
+    clientHeight: { configurable: true, value: 400 },
+  });
+  scroll.scrollTop = 400;
+  vi.spyOn(scroll, "getBoundingClientRect").mockReturnValue({ top: 200 } as DOMRect);
+  vi.spyOn(user, "getBoundingClientRect").mockReturnValue({ top: 600 } as DOMRect);
+  await fireEvent.click(button);
+  expect(scroll.scrollTop).toBe(800);
+  await settleMicrotasks();
+  expect(scroll.scrollTop).toBe(800);
+});
+
 test("does not call Runtime APIs before the Worker execution target resolves", async () => {
   const request = vi.fn();
   vi.stubGlobal("fetch", request);

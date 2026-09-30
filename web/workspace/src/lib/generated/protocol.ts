@@ -149,9 +149,19 @@ entry_id: string,
  */
 timestamp: number, provenance: SessionEntryProvenance, derived_from?: Array<string>, } & ({ "kind": "user_input", segments: Array<Segment>, } | { "kind": "message", role: SessionMessageRole, content: Array<SessionContentPart>, } | { "kind": "tool_call", call_id: string, name: string, arguments: string, } | { "kind": "tool_result", call_id: string, summary: string, content?: string | null, is_error: boolean, attachments?: Array<SessionToolAttachment>, } | { "kind": "system_item", item_kind: string, content: string, data?: unknown, } | { "kind": "run_error", message: string, });
 
-export type PendingSubmissionSummary = { submission_id: string, accepted_at_ms: number, segment_count: number, byte_len: number, };
+export type PendingSubmissionSummary = { submission_id: string,
+/**
+ * Single-line display text, at most 240 Unicode scalars plus an ellipsis.
+ * Absent on older runtimes. Never used to reconstruct the submitted input.
+ */
+preview?: string | null, accepted_at_ms: number, segment_count: number, byte_len: number, };
 
-export type PendingSubmissionsSnapshot = { revision: number, notification_count: number, head_id: string | null, submissions: Array<PendingSubmissionSummary>, };
+export type PendingSubmissionsSnapshot = { revision: number, notification_count: number,
+/**
+ * Ordered display-only previews of waiting notifications, each bounded like
+ * PendingSubmissionSummary::preview. Older runtimes omit this field.
+ */
+notification_previews?: Array<string>, head_id: string | null, submissions: Array<PendingSubmissionSummary>, };
 
 export type SubmissionDisposition = "started" | "queued";
 

@@ -15,7 +15,6 @@ import {
   resolveConsoleViewScrollTop,
   resolveConsoleWorkerView,
   segmentsToText,
-  selectConsoleTimelineLines,
 } from "./model.ts";
 import { workerConsoleHref } from "../resource-links.ts";
 
@@ -2226,25 +2225,6 @@ Deno.test("projectConsole reseeds visible rows from segment rotation", () => {
   assertEquals(
     projection.lines.map((line) => `${line.kind}:${line.body}`),
     ["user:after rotation seed"],
-  );
-});
-
-Deno.test("selectConsoleTimelineLines keeps all users and only last assistant per turn", () => {
-  const items = [
-    consoleLine("u1", "user"),
-    consoleLine("a1", "assistant"),
-    consoleLine("tool1", "tool"),
-    consoleLine("a2", "assistant"),
-    consoleLine("u2", "user"),
-    consoleLine("a3", "assistant"),
-    consoleLine("a4", "assistant"),
-  ];
-
-  assertEquals(
-    selectConsoleTimelineLines(items).map(({ item, index }) =>
-      `${index}:${item.id}`
-    ),
-    ["0:u1", "3:a2", "4:u2", "6:a4"],
   );
 });
 

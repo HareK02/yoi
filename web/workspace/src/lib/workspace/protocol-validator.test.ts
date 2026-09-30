@@ -42,6 +42,39 @@ Deno.test('generated subscription validator accepts a current exact frame', () =
   assert(result.value.frame === 'response', 'expected response frame');
 });
 
+Deno.test('pending submission previews accept new and legacy runtime payloads', () => {
+  for (const preview of [undefined, '日本語 <b>literal</b>', null]) {
+    const result = decode(subscribedFrame({
+      selector: { topic: 'worker_protocol', worker_id: 'worker-1' },
+      snapshot: { topic: 'worker_protocol', data: {
+        worker_id: 'worker-1',
+        events: [{ event: 'pending_submissions_changed', data: { pending: {
+          revision: 1, notification_count: 0, head_id: 'queued-1',
+          submissions: [{ submission_id: 'queued-1', accepted_at_ms: 1,
+            segment_count: 1, byte_len: 10, ...(preview === undefined ? {} : { preview }) }],
+        } } }],
+      } },
+    }));
+    assert(result.ok, `pending preview rejected: ${JSON.stringify(result)}`);
+  }
+});
+
+Deno.test('pending notification previews accept new and legacy runtime payloads', () => {
+  for (const previews of [undefined, [], ['通知 <b>literal</b>']]) {
+    const result = decode(subscribedFrame({
+      selector: { topic: 'worker_protocol', worker_id: 'worker-1' },
+      snapshot: { topic: 'worker_protocol', data: {
+        worker_id: 'worker-1',
+        events: [{ event: 'pending_submissions_changed', data: { pending: {
+          revision: 1, notification_count: 1, head_id: 'notification-head', submissions: [],
+          ...(previews === undefined ? {} : { notification_previews: previews }),
+        } } }],
+      } },
+    }));
+    assert(result.ok, `notification previews rejected: ${JSON.stringify(result)}`);
+  }
+});
+
 Deno.test('generated subscription validator accepts an external Workdir Worker', () => {
   const result = decode(subscribedFrame({
     snapshot: {

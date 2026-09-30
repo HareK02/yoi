@@ -790,13 +790,17 @@ pub enum SubmissionDisposition {
     Queued,
 }
 
-/// Bounded public projection of one pending submission. Payload segments and
-/// provenance remain in the session log and are intentionally not exposed.
+/// Bounded public projection of one pending submission. Only a short display
+/// preview is exposed; full payload segments and provenance remain in the log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct PendingSubmissionSummary {
     pub submission_id: String,
+    /// Single-line display text, at most 240 Unicode scalars plus an ellipsis.
+    /// Absent on older runtimes. Never used to reconstruct the submitted input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
     pub accepted_at_ms: u64,
     pub segment_count: u32,
     pub byte_len: u64,
@@ -810,6 +814,10 @@ pub struct PendingSubmissionsSnapshot {
     pub revision: u64,
     #[serde(default)]
     pub notification_count: u32,
+    /// Ordered display-only previews of waiting notifications, each bounded like
+    /// PendingSubmissionSummary::preview. Older runtimes omit this field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notification_previews: Vec<String>,
     #[serde(default)]
     pub head_id: Option<String>,
     #[serde(default)]
@@ -2850,6 +2858,37 @@ mod tests {
             Event::InternalWorkerRemoved { worker, revision }
                 if worker.session_id == "session-1" && revision == 8
         ));
+    }
+
+    #[test]
+    fn pending_notification_previews_are_optional_and_roundtrip() {
+        let legacy = serde_json::json!({
+            "revision": 1, "notification_count": 1,
+            "head_id": "notification-head", "submissions": []
+        });
+        let mut snapshot: PendingSubmissionsSnapshot =
+            serde_json::from_value(legacy.clone()).unwrap();
+        assert!(snapshot.notification_previews.is_empty());
+        assert_eq!(serde_json::to_value(&snapshot).unwrap(), legacy);
+        snapshot.notification_previews = vec!["通知内容".into()];
+        let decoded: PendingSubmissionsSnapshot =
+            serde_json::from_value(serde_json::to_value(&snapshot).unwrap()).unwrap();
+        assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn pending_submission_preview_is_optional_and_roundtrips() {
+        let legacy = serde_json::json!({
+            "submission_id": "queued-1", "accepted_at_ms": 1,
+            "segment_count": 1, "byte_len": 12
+        });
+        let mut summary: PendingSubmissionSummary = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(summary.preview, None);
+        assert_eq!(serde_json::to_value(&summary).unwrap(), legacy);
+        summary.preview = Some("確認 <b>text</b>".into());
+        let decoded: PendingSubmissionSummary =
+            serde_json::from_value(serde_json::to_value(&summary).unwrap()).unwrap();
+        assert_eq!(decoded, summary);
     }
 
     #[test]

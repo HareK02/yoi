@@ -178,7 +178,7 @@
     max-width: 1280px;
     margin-inline: auto;
     overflow-y: auto;
-    padding: var(--space-6);
+    padding: var(--space-4);
   }
 
   @media (max-width: 760px) {
@@ -208,7 +208,7 @@
       grid-column: 1;
       grid-row: 2;
       overflow-y: auto;
-      padding: var(--space-5) var(--space-4);
+      padding: var(--space-4);
     }
 
     .app-shell.sidebar-open .app-shell__main {

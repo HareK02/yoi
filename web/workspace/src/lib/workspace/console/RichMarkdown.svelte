@@ -55,7 +55,7 @@
 <style>
   .rich-markdown {
     color: inherit;
-    line-height: 1.55;
+    line-height: var(--line-height-body);
   }
 
   :global(.rich-markdown > :first-child) {
@@ -70,18 +70,18 @@
   :global(.rich-markdown ul),
   :global(.rich-markdown blockquote),
   :global(.rich-markdown pre) {
-    margin: 0.45rem 0;
+    margin: var(--space-2) 0;
   }
 
   :global(.rich-markdown ul) {
-    padding-left: 1.2rem;
+    padding-left: var(--space-4);
   }
 
   :global(.rich-markdown h1),
   :global(.rich-markdown h2),
   :global(.rich-markdown h3),
   :global(.rich-markdown h4) {
-    margin: 0.7rem 0 0.35rem;
+    margin: var(--space-3) 0 var(--space-1);
     color: var(--text-strong);
     font-size: var(--font-size-body);
   }
@@ -89,7 +89,7 @@
   :global(.rich-markdown blockquote) {
     border-left: 2px solid var(--tui-dark-gray);
     color: var(--text-muted);
-    padding-left: 0.8rem;
+    padding-left: var(--space-3);
   }
 
   :global(.rich-markdown :not(pre) > code) {
@@ -97,7 +97,7 @@
     border: 1px solid var(--line);
     border-radius: 0.35rem;
     color: var(--tui-blue);
-    padding: 0.05rem 0.28rem;
+    padding: 0 var(--space-1);
   }
 
   :global(.rich-markdown a) {
@@ -109,6 +109,6 @@
     border: 1px solid var(--line);
     border-radius: 0.65rem;
     overflow: auto;
-    padding: 0.75rem;
+    padding: var(--space-3);
   }
 </style>

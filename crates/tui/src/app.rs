@@ -3533,9 +3533,11 @@ mod completion_flow_tests {
             pending: protocol::PendingSubmissionsSnapshot {
                 revision: 3,
                 notification_count: 0,
+                notification_previews: vec![],
                 head_id: Some("submission-1".into()),
                 submissions: vec![protocol::PendingSubmissionSummary {
                     submission_id: "submission-1".into(),
+                    preview: None,
                     accepted_at_ms: 7,
                     segment_count: 2,
                     byte_len: 42,

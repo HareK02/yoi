@@ -157,7 +157,7 @@
 <style>
   .console-line {
     min-width: 0;
-    padding: 0.2rem 0;
+    padding: var(--space-1) 0;
     background: transparent;
   }
 
@@ -172,14 +172,14 @@
   .user-message {
     display: grid;
     grid-template-columns: auto minmax(0, 1fr);
-    gap: 0.55rem;
+    gap: var(--space-2);
     align-items: start;
   }
 
   .user-prompt {
     color: var(--tui-green);
     font-weight: 700;
-    line-height: 1.55;
+    line-height: var(--line-height-body);
   }
 
   .activity-summary,
@@ -187,7 +187,7 @@
     margin: 0;
     color: var(--text-muted);
     font-size: var(--font-size-compact);
-    line-height: 1.55;
+    line-height: var(--line-height-compact);
     white-space: pre-line;
   }
 
@@ -198,20 +198,23 @@
     color: var(--text-muted);
     font-family: var(--font-mono);
     font-size: var(--font-size-compact);
+    line-height: var(--line-height-compact);
     font-variant-numeric: tabular-nums;
     font-weight: 750;
   }
 
   .compaction-activity {
     margin: var(--space-1) 0;
-    padding-left: 1.25rem;
+    padding-left: var(--space-4);
     color: var(--tui-dark-gray);
     font-family: var(--font-mono);
     font-size: var(--font-size-compact);
+    line-height: var(--line-height-compact);
   }
 
   .activity-summary {
     font-size: var(--font-size-body);
+    line-height: var(--line-height-body);
   }
 
   .task-reminder-summary {
@@ -229,6 +232,7 @@
     color: var(--text-muted);
     font-family: var(--font-mono);
     font-size: var(--font-size-compact);
+    line-height: var(--line-height-compact);
     font-variant-numeric: tabular-nums;
     text-align: right;
     white-space: nowrap;
@@ -249,9 +253,9 @@
   }
 
   .console-plain-text {
-    margin: 0.45rem 0;
+    margin: var(--space-2) 0;
     color: inherit;
-    line-height: 1.55;
+    line-height: var(--line-height-body);
     overflow-wrap: anywhere;
     white-space: pre-wrap;
   }
@@ -271,7 +275,7 @@
     margin: 0;
     font-family: var(--font-mono);
     font-size: var(--font-size-compact);
-    line-height: 1.1;
+    line-height: var(--line-height-compact);
     overflow-x: auto;
     white-space: pre;
   }
@@ -287,9 +291,10 @@
   .tool-summary {
     display: flex;
     align-items: baseline;
-    gap: 0.5rem;
+    gap: var(--space-2);
     color: var(--text-muted);
     font-size: var(--font-size-compact);
+    line-height: var(--line-height-compact);
     font-weight: 750;
   }
 
@@ -306,6 +311,7 @@
     flex: 0 0 auto;
     color: var(--tui-dark-gray);
     font-size: var(--font-size-compact);
+    line-height: var(--line-height-compact);
     white-space: nowrap;
   }
 
@@ -334,6 +340,7 @@
     gap: var(--space-2);
     color: var(--text-muted);
     font-size: var(--font-size-compact);
+    line-height: var(--line-height-compact);
     font-weight: 750;
   }
 
@@ -344,10 +351,10 @@
     color: var(--text);
     font-family: var(--font-mono);
     font-size: var(--font-size-compact);
-    line-height: 1.45;
-    margin: 0.6rem 0 0;
+    line-height: var(--line-height-compact);
+    margin: var(--space-2) 0 0;
     overflow-x: auto;
-    padding: 0.45rem 0;
+    padding: var(--space-2) 0;
   }
 
   .diff-line {
@@ -373,13 +380,13 @@
   .diff-gutter,
   .diff-marker {
     color: var(--tui-gray);
-    padding: 0 0.5rem;
+    padding: 0 var(--space-2);
     text-align: right;
     user-select: none;
   }
 
   .diff-content {
-    padding-right: 0.75rem;
+    padding-right: var(--space-3);
     white-space: pre;
   }
 
@@ -395,12 +402,13 @@
     margin-inline-start: auto;
     border: 1px solid var(--line);
     border-radius: 0.35rem;
-    padding: 0.08rem 0.35rem;
+    padding: 0 var(--space-1);
     background: var(--bg-raised);
     color: var(--text-muted);
     cursor: pointer;
     font: inherit;
     font-size: var(--font-size-compact);
+    line-height: var(--line-height-compact);
     font-weight: 750;
     opacity: 0;
     pointer-events: none;
@@ -415,15 +423,17 @@
   }
 
   .message-detail {
-    margin-top: 0.35rem;
+    margin-top: var(--space-1);
     border-left: 2px solid var(--line);
-    padding-left: 0.6rem;
+    padding-left: var(--space-2);
     color: var(--text-muted);
     font-size: var(--font-size-compact);
+    line-height: var(--line-height-compact);
   }
 
   .message-detail p {
     margin: 0;
+    line-height: inherit;
     overflow-wrap: anywhere;
     white-space: pre-wrap;
   }

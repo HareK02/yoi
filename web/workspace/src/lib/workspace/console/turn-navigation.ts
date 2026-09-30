@@ -1,0 +1,36 @@
+import type { ConsoleLine } from "./model.ts";
+
+export type ConsoleTurn = {
+  id: string;
+  user: string;
+  assistant: string;
+};
+
+const PREVIEW_LIMIT = 1200;
+
+function previewText(text: string): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  return compact.length > PREVIEW_LIMIT
+    ? `${compact.slice(0, PREVIEW_LIMIT)}…`
+    : compact;
+}
+
+/** One user message and its last nonempty assistant message before the next user. */
+export function consoleTurns(lines: readonly ConsoleLine[]): ConsoleTurn[] {
+  const turns: ConsoleTurn[] = [];
+  let current: ConsoleTurn | undefined;
+  for (const line of lines) {
+    if (line.kind === "user") {
+      current = { id: line.id, user: previewText(line.body), assistant: "" };
+      turns.push(current);
+    } else if (
+      current &&
+      (line.kind === "assistant" ||
+        (line.kind === "in_flight" && line.title === "in-flight assistant text"))
+    ) {
+      const assistant = previewText(line.body);
+      if (assistant) current.assistant = assistant;
+    }
+  }
+  return turns;
+}

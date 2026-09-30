@@ -121,11 +121,11 @@
 
   .task-mini {
     display: grid;
-    gap: 0.1rem;
+    gap: var(--space-1);
     min-width: 0;
-    padding-inline: 0.75rem;
+    padding-inline: var(--space-3);
     font-size: var(--font-size-compact);
-    line-height: 1.35;
+    line-height: var(--line-height-compact);
   }
 
   .task-mini-row,
@@ -133,7 +133,7 @@
   .task-summary-row {
     display: flex;
     min-width: 0;
-    gap: 0.5rem;
+    gap: var(--space-2);
   }
 
   .task-summary-row {
@@ -230,12 +230,12 @@
     min-width: 0;
     min-height: 0;
     overflow: auto;
-    padding-inline: 1rem;
+    padding-inline: var(--space-4);
     border-left: 1px solid var(--line);
   }
 
   .task-pane h3 {
-    margin: 0 0 1rem;
+    margin: 0 0 var(--space-4);
     color: var(--accent);
     font-size: var(--font-size-body);
   }
@@ -246,7 +246,7 @@
 
   .task-list {
     display: grid;
-    gap: 1rem;
+    gap: var(--space-4);
     margin: 0;
     padding: 0;
     list-style: none;

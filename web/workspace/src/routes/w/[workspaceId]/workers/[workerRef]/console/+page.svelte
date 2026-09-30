@@ -2,9 +2,10 @@
     import { invalidateAll } from "$app/navigation";
     import { tick, untrack, type SvelteComponent } from "svelte";
     import ConsoleLineItem from "$lib/workspace/console/ConsoleLineItem.svelte";
+    import ConsoleTurnNavigation from "$lib/workspace/console/ConsoleTurnNavigation.svelte";
+    import { consoleTurns } from "$lib/workspace/console/turn-navigation";
     import ConsoleDisplayStateView from "$lib/workspace/console/ConsoleDisplayState.svelte";
     import ConsoleTasks from "$lib/workspace/console/ConsoleTasks.svelte";
-    import ConsoleTimeline from "$lib/workspace/console/ConsoleTimeline.svelte";
     import { namePastedImage } from "$lib/workspace/console/composer-paste";
     import ComposerInput from "$lib/workspace/console/ComposerInput.svelte";
     import type { ComposerDraftSnapshot } from "$lib/workspace/console/composer-draft";
@@ -32,9 +33,7 @@
         projectConsoleLines,
         resolveConsoleViewScrollTop,
         resolveConsoleWorkerView,
-        selectConsoleTimelineLines,
         type ConsoleEventInput,
-        type ConsoleLine,
         type ConsoleProjection,
         type ConsoleViewMode,
         type ConsoleViewScroll,
@@ -91,42 +90,6 @@
     function workerApiPath(path: string): string {
         return workspaceApiPath(workspaceId, path);
     }
-
-    type TimelineKind = "turn" | "assistant";
-
-    type TimelineMark = {
-        id: string;
-        lineId: string;
-        label: string;
-        detail: string;
-        timeLabel: string;
-        position: number;
-        sourcePosition: number;
-        kind: TimelineKind;
-    };
-
-    type TimelineScaleSegment = {
-        sourceStart: number;
-        sourceEnd: number;
-        targetStart: number;
-        targetEnd: number;
-    };
-
-    type TimelineScale = {
-        segments: TimelineScaleSegment[];
-    };
-
-    type TimelineLayout = {
-        marks: TimelineMark[];
-        scale: TimelineScale;
-        axisSize: number;
-    };
-
-    type ScrollMetrics = {
-        top: number;
-        height: number;
-        client: number;
-    };
 
     let worker = $state<Worker | null>(untrack(() => data.worker));
     let liveWorkerState = $state<string | null>(
@@ -197,7 +160,6 @@
     let taskPaneOpen = $state(false);
     let selectedWorkerViewSessionId = $state<string | null>(null);
     let workerViewSelectionGeneration = 0;
-    let timelineOpen = $state(false);
     let consoleViewMode = $state<ConsoleViewMode>("overview");
     let consoleBodyElement: HTMLElement | null = null;
     let composerInputElement = $state<
@@ -207,17 +169,9 @@
     let activeComposerTargetKey = untrack(() =>
         runtimeId && workerId ? `${workspaceId}:${runtimeId}:${workerId}` : "",
     );
-    let timelineRailDragCleanup: (() => void) | null = null;
     let autoFollowConsole = $state(true);
-    let consoleScroll = $state<ScrollMetrics>({ top: 0, height: 1, client: 1 });
     const consoleViewScroll = new Map<string, ConsoleViewScroll>();
-    const eventObservedAtById = new Map<string, number>();
-    let nextEventObservedAtVersion = 0;
-    let eventObservedAtVersion = $state(0);
     const CONSOLE_BOTTOM_THRESHOLD_PX = 48;
-    const TIMELINE_EDGE_PX = 42;
-    const TIMELINE_MIN_MARK_GAP_PX = 40;
-    const TIMELINE_AXIS_PADDING_PX = 42;
     const consoleProjector = createConsoleProjector();
     let consoleProjection = $state.raw<ConsoleProjection>(
         consoleProjector.snapshot(),
@@ -254,17 +208,8 @@
     const lines = $derived(
         projectConsoleLines(selectedConsoleProjection.lines, consoleViewMode),
     );
+    const turns = $derived(consoleTurns(lines));
     const tasks = $derived(selectedConsoleProjection.tasks);
-    const timelineLayout = $derived(
-        buildTimelineLayout(lines, eventObservedAtVersion, consoleScroll),
-    );
-    const timelineMarks = $derived(timelineLayout.marks);
-    const timelineAxisStyle = $derived(
-        timelineAxisStyleFor(timelineLayout, consoleScroll),
-    );
-    const timelineThumb = $derived(
-        timelineThumbStyle(consoleScroll, timelineLayout),
-    );
     const diagnostics = $derived(
         mergeDiagnostics(worker?.diagnostics ?? [], streamDiagnostics),
     );
@@ -423,16 +368,9 @@
         if (!worker) void loadWorker(target, token);
     }
 
-    function advanceEventObservedAtVersion() {
-        nextEventObservedAtVersion += 1;
-        eventObservedAtVersion = nextEventObservedAtVersion;
-    }
-
     function resetObservedEvents() {
         cancelObservationFlush();
         consoleProjection = consoleProjector.reset();
-        eventObservedAtById.clear();
-        advanceEventObservedAtVersion();
     }
 
     function cancelObservationFlush() {
@@ -468,7 +406,6 @@
             liveWorkerState = consoleProjection.status === "shutdown"
                 ? "shutdown"
                 : workerStateFromSnapshot(consoleProjection.workerState);
-            advanceEventObservedAtVersion();
             if (
                 initialSnapshotApplication &&
                 eventBatch.some(
@@ -512,7 +449,6 @@
 
         const eventId = `protocol-${++protocolEventSequence}`;
         const observedAtMs = Date.now();
-        eventObservedAtById.set(eventId, observedAtMs);
         pendingObservationEvents.push({
             eventId,
             event: payload,
@@ -633,7 +569,6 @@
             top: direction * Math.max(consoleBodyElement.clientHeight * 0.86, 1),
             behavior: "auto",
         });
-        window.requestAnimationFrame(updateConsoleScrollMetrics);
     }
 
     function sendControl(method: ProtocolMethod, label: string) {
@@ -1336,386 +1271,6 @@
             .join("\n");
     }
 
-    function buildTimelineLayout(
-        items: ConsoleLine[],
-        _observedAtVersion: number,
-        metrics: ScrollMetrics,
-    ): TimelineLayout {
-        const denominator = Math.max(items.length - 1, 1);
-        const rawMarks = selectConsoleTimelineLines(items)
-            .map(({ item, index }) =>
-                timelineMarkForLine(item, index, denominator)
-            )
-            .filter((mark): mark is TimelineMark => mark !== null);
-        const trackHeight = timelineTrackHeight(metrics);
-        const positioned = positionTimelineMarks(rawMarks, trackHeight);
-        const axisSize = timelineAxisSize(positioned, trackHeight);
-        const scale = buildTimelineScale(
-            positioned.map((mark) => mark.sourcePosition),
-            positioned.map((mark) => mark.position),
-            axisSize,
-        );
-        return {
-            scale,
-            axisSize,
-            marks: projectTimelineMarks(positioned, axisSize, trackHeight),
-        };
-    }
-
-    function positionTimelineMarks(
-        marks: TimelineMark[],
-        trackHeight: number,
-    ): TimelineMark[] {
-        if (marks.length === 0) {
-            return marks;
-        }
-        const ordered = marks
-            .map((mark, index) => ({ mark, index }))
-            .sort(
-                (a, b) =>
-                    a.mark.sourcePosition - b.mark.sourcePosition ||
-                    a.index - b.index,
-            );
-        const usableHeight = Math.max(trackHeight - TIMELINE_EDGE_PX * 2, 1);
-        const targetPositions = ordered.map(
-            ({ mark }) =>
-                TIMELINE_EDGE_PX + (mark.sourcePosition / 100) * usableHeight,
-        );
-        const minimumGap = TIMELINE_MIN_MARK_GAP_PX;
-
-        for (let index = 1; index < targetPositions.length; index += 1) {
-            targetPositions[index] = Math.max(
-                targetPositions[index],
-                targetPositions[index - 1] + minimumGap,
-            );
-        }
-
-        const positioned = [...marks];
-        ordered.forEach(({ mark, index }, orderIndex) => {
-            positioned[index] = {
-                ...mark,
-                position: targetPositions[orderIndex],
-            };
-        });
-        return positioned;
-    }
-
-    function projectTimelineMarks(
-        marks: TimelineMark[],
-        axisSize: number,
-        trackHeight: number,
-    ): TimelineMark[] {
-        return marks.map((mark) => ({
-            ...mark,
-            position: projectTimelineAxisPosition(mark.position, axisSize, trackHeight),
-        }));
-    }
-
-    function projectTimelineAxisPosition(
-        axisPosition: number,
-        axisSize: number,
-        trackHeight: number,
-    ): number {
-        if (axisSize <= 0) {
-            return 0;
-        }
-        return (axisPosition / axisSize) * trackHeight;
-    }
-
-    function timelineAxisSize(
-        marks: TimelineMark[],
-        trackHeight: number,
-    ): number {
-        const last = marks.reduce(
-            (max, mark) => Math.max(max, mark.position),
-            0,
-        );
-        return Math.max(trackHeight, last + TIMELINE_EDGE_PX);
-    }
-
-    function timelineMarkForLine(
-        item: ConsoleLine,
-        index: number,
-        denominator: number,
-    ): TimelineMark | null {
-        const kind = timelineKindForLine(item);
-        if (!kind) {
-            return null;
-        }
-        const observedAt = item.eventId
-            ? observedAtForEventId(item.eventId)
-            : null;
-        const sourcePosition = (index / denominator) * 100;
-        return {
-            id: `timeline-${item.id}`,
-            lineId: item.id,
-            label: timelineLabelForLine(item, kind),
-            detail: item.body || item.title,
-            timeLabel: observedAt
-                ? formatTimelineTime(observedAt)
-                : "time unknown",
-            position: sourcePosition,
-            sourcePosition,
-            kind,
-        };
-    }
-
-    function buildTimelineScale(
-        sourcePositions: number[],
-        targetPositions: number[],
-        axisSize: number,
-    ): TimelineScale {
-        if (sourcePositions.length === 0 || targetPositions.length === 0) {
-            return {
-                segments: [
-                    {
-                        sourceStart: 0,
-                        sourceEnd: 100,
-                        targetStart: 0,
-                        targetEnd: axisSize,
-                    },
-                ],
-            };
-        }
-
-        const pairs = sourcePositions
-            .map((source, index) => ({
-                source,
-                target: targetPositions[index] ?? source,
-                index,
-            }))
-            .filter((pair) => pair.source > 0 && pair.source < 100)
-            .sort((a, b) => a.source - b.source || a.index - b.index);
-        const sourceAnchors = [0, ...pairs.map((pair) => pair.source), 100];
-        const targetAnchors = [
-            0,
-            ...pairs.map((pair) => pair.target),
-            axisSize,
-        ];
-        const segments: TimelineScaleSegment[] = [];
-        for (let index = 1; index < sourceAnchors.length; index += 1) {
-            segments.push({
-                sourceStart: sourceAnchors[index - 1],
-                sourceEnd: sourceAnchors[index],
-                targetStart: targetAnchors[index - 1],
-                targetEnd: targetAnchors[index],
-            });
-        }
-        return { segments };
-    }
-
-    function mapTimelinePosition(
-        scale: TimelineScale,
-        sourcePosition: number,
-    ): number {
-        const source = Math.max(0, Math.min(100, sourcePosition));
-        const segment =
-            scale.segments.find((item) => source <= item.sourceEnd) ??
-            scale.segments.at(-1)!;
-        const sourceRange = segment.sourceEnd - segment.sourceStart;
-        if (sourceRange <= 0) {
-            return segment.targetEnd;
-        }
-        const ratio = (source - segment.sourceStart) / sourceRange;
-        return (
-            segment.targetStart +
-            (segment.targetEnd - segment.targetStart) * ratio
-        );
-    }
-
-    function unmapTimelinePosition(
-        scale: TimelineScale,
-        targetPosition: number,
-    ): number {
-        const maxTarget = scale.segments.at(-1)?.targetEnd ?? 100;
-        const target = Math.max(0, Math.min(maxTarget, targetPosition));
-        const segment =
-            scale.segments.find((item) => target <= item.targetEnd) ??
-            scale.segments.at(-1)!;
-        const targetRange = segment.targetEnd - segment.targetStart;
-        if (targetRange <= 0) {
-            return segment.sourceEnd;
-        }
-        const ratio = (target - segment.targetStart) / targetRange;
-        return (
-            segment.sourceStart +
-            (segment.sourceEnd - segment.sourceStart) * ratio
-        );
-    }
-
-    function timelineKindForLine(item: ConsoleLine): TimelineKind | null {
-        if (item.kind === "user") {
-            return "turn";
-        }
-        if (item.kind === "assistant") {
-            return "assistant";
-        }
-        return null;
-    }
-
-    function timelineLabelForLine(
-        item: ConsoleLine,
-        _kind: TimelineKind,
-    ): string {
-        return firstTimelineText(item.body || item.title);
-    }
-
-    function firstTimelineText(value: string): string {
-        const firstLine = value.trim().split(/\r?\n/, 1)[0] ?? "";
-        const compact = firstLine.replace(/\s+/g, " ").trim();
-        if (!compact) {
-            return "—";
-        }
-        return compact.length > 10 ? `${compact.slice(0, 10)}…` : compact;
-    }
-
-    function observedAtForEventId(eventId: string): number | null {
-        if (eventObservedAtById.has(eventId)) {
-            return eventObservedAtById.get(eventId) ?? null;
-        }
-        const snapshotIndex = eventId.indexOf("-snapshot-");
-        if (snapshotIndex > 0) {
-            return (
-                eventObservedAtById.get(eventId.slice(0, snapshotIndex)) ?? null
-            );
-        }
-        return null;
-    }
-
-    function formatTimelineTime(timestampMs: number): string {
-        return new Intl.DateTimeFormat(undefined, {
-            hour: "2-digit",
-            minute: "2-digit",
-            second: "2-digit",
-        }).format(new Date(timestampMs));
-    }
-
-    function timelineThumbStyle(
-        metrics: ScrollMetrics,
-        layout: TimelineLayout,
-    ): string {
-        const trackHeight = timelineTrackHeight(metrics);
-        const contentHeight = Math.max(metrics.height, 1);
-        const viewportHeight = Math.max(metrics.client, 1);
-        const scrollable = Math.max(contentHeight - viewportHeight, 1);
-        const viewportRatio = Math.min(viewportHeight / contentHeight, 1);
-        const sourceTop =
-            (metrics.top / scrollable) * (100 * (1 - viewportRatio));
-        const sourceBottom = Math.min(100, sourceTop + viewportRatio * 100);
-        const targetTop = mapTimelinePosition(layout.scale, sourceTop);
-        const targetBottom = mapTimelinePosition(layout.scale, sourceBottom);
-        const projectedTop = projectTimelineAxisPosition(
-            targetTop,
-            layout.axisSize,
-            trackHeight,
-        );
-        const projectedBottom = projectTimelineAxisPosition(
-            targetBottom,
-            layout.axisSize,
-            trackHeight,
-        );
-        const height = Math.max(projectedBottom - projectedTop, 18);
-        const top = Math.min(projectedTop, Math.max(0, trackHeight - height));
-        return `top: ${Math.max(0, top)}px; height: ${Math.min(height, trackHeight)}px;`;
-    }
-
-    function timelineTrackHeight(metrics: ScrollMetrics): number {
-        return Math.max(metrics.client - TIMELINE_AXIS_PADDING_PX * 2, 1);
-    }
-
-    function timelineAxisStyleFor(
-        _layout: TimelineLayout,
-        metrics: ScrollMetrics,
-    ): string {
-        return [
-            `height: ${timelineTrackHeight(metrics)}px`,
-            `top: ${TIMELINE_AXIS_PADDING_PX}px`,
-        ].join("; ");
-    }
-
-    function jumpToTimelineMark(mark: TimelineMark) {
-        const target = consoleBodyElement?.querySelector(
-            `[data-console-line-id="${cssEscape(mark.lineId)}"]`,
-        );
-        if (target instanceof HTMLElement) {
-            target.scrollIntoView({ block: "start", behavior: "smooth" });
-        }
-    }
-
-    function scrollConsoleToTimelineRailPosition(
-        rail: HTMLElement,
-        clientY: number,
-        behavior: ScrollBehavior,
-    ) {
-        if (!consoleBodyElement) {
-            return;
-        }
-        const rect = rail.getBoundingClientRect();
-        const trackHeight = Math.max(rect.height, 1);
-        const targetPx = Math.max(0, Math.min(trackHeight, clientY - rect.top));
-        const axisPosition = (targetPx / trackHeight) * timelineLayout.axisSize;
-        const sourcePercent = unmapTimelinePosition(
-            timelineLayout.scale,
-            axisPosition,
-        );
-        consoleBodyElement.scrollTo({
-            top:
-                (sourcePercent / 100) *
-                Math.max(
-                    consoleBodyElement.scrollHeight -
-                        consoleBodyElement.clientHeight,
-                    0,
-                ),
-            behavior,
-        });
-    }
-
-    function handleTimelineRailPointerDown(event: PointerEvent) {
-        if (!(event.currentTarget instanceof HTMLElement)) {
-            return;
-        }
-        event.preventDefault();
-        const rail = event.currentTarget;
-        const pointerId = event.pointerId;
-        scrollConsoleToTimelineRailPosition(rail, event.clientY, "auto");
-
-        const handleMove = (moveEvent: PointerEvent) => {
-            if (moveEvent.pointerId !== pointerId) {
-                return;
-            }
-            moveEvent.preventDefault();
-            scrollConsoleToTimelineRailPosition(rail, moveEvent.clientY, "auto");
-        };
-        const stopDrag = (finishEvent: PointerEvent) => {
-            if (finishEvent.pointerId !== pointerId) {
-                return;
-            }
-            timelineRailDragCleanup?.();
-        };
-
-        timelineRailDragCleanup?.();
-        timelineRailDragCleanup = () => {
-            window.removeEventListener("pointermove", handleMove);
-            window.removeEventListener("pointerup", stopDrag);
-            window.removeEventListener("pointercancel", stopDrag);
-            timelineRailDragCleanup = null;
-        };
-        window.addEventListener("pointermove", handleMove);
-        window.addEventListener("pointerup", stopDrag);
-        window.addEventListener("pointercancel", stopDrag);
-        try {
-            rail.setPointerCapture(pointerId);
-        } catch {
-            // Pointer capture can fail if the pointer is already released.
-        }
-    }
-
-    function cssEscape(value: string): string {
-        return typeof CSS !== "undefined" && typeof CSS.escape === "function"
-            ? CSS.escape(value)
-            : value.replaceAll('"', '\\"');
-    }
-
     function consoleWorkerViewKey(sessionId: string | null): string {
         return sessionId === null ? "main" : `internal:${sessionId}`;
     }
@@ -1754,18 +1309,6 @@
             consoleBodyElement.scrollHeight,
             consoleBodyElement.clientHeight,
         );
-        updateConsoleScrollMetrics();
-    }
-
-    function updateConsoleScrollMetrics() {
-        if (!consoleBodyElement) {
-            return;
-        }
-        consoleScroll = {
-            top: consoleBodyElement.scrollTop,
-            height: consoleBodyElement.scrollHeight,
-            client: consoleBodyElement.clientHeight,
-        };
     }
 
     function isNearConsoleBottom(element: HTMLElement): boolean {
@@ -1775,12 +1318,25 @@
         );
     }
 
+    function selectConsoleTurn(id: string) {
+        if (!consoleBodyElement || !consoleWorkerViewSelectionIsResolved()) return;
+        const target = consoleBodyElement.querySelector<HTMLElement>(
+            `[data-console-line-id="${CSS.escape(id)}"]`,
+        );
+        if (!target) return;
+        // Stop following before moving so streaming output cannot undo the jump.
+        autoFollowConsole = false;
+        consoleBodyElement.scrollTop +=
+            target.getBoundingClientRect().top -
+            consoleBodyElement.getBoundingClientRect().top;
+        handleConsoleScroll();
+    }
+
     function handleConsoleScroll() {
         if (!consoleWorkerViewSelectionIsResolved() || !consoleBodyElement) {
             return;
         }
         autoFollowConsole = isNearConsoleBottom(consoleBodyElement);
-        updateConsoleScrollMetrics();
         rememberConsoleWorkerViewScroll();
     }
 
@@ -1797,7 +1353,6 @@
             return;
         }
         consoleBodyElement.scrollTop = consoleBodyElement.scrollHeight;
-        updateConsoleScrollMetrics();
         autoFollowConsole = true;
         rememberConsoleWorkerViewScroll();
     }
@@ -1816,16 +1371,6 @@
         if (!consoleWorkerViewSelectionIsResolved()) return;
         if (autoFollowConsole) {
             void scrollConsoleToBottom();
-        } else {
-            const sessionId = selectedWorkerView.sessionId;
-            tick().then(() => {
-                if (
-                    consoleWorkerViewSelectionIsResolved() &&
-                    selectedWorkerView.sessionId === sessionId
-                ) {
-                    updateConsoleScrollMetrics();
-                }
-            });
         }
     });
 
@@ -1840,10 +1385,6 @@
         if (resolvedSessionId !== selectedWorkerViewSessionId) {
             void selectConsoleWorkerView(resolvedSessionId, false);
         }
-    });
-
-    $effect(() => {
-        return () => timelineRailDragCleanup?.();
     });
 
     $effect(() => {
@@ -2001,57 +1542,41 @@
     {/if}
 
     <div class:with-task-pane={taskPaneOpen} class="console-history">
-        <section class:timeline-open={timelineOpen} class="console-body">
-        <div class="console-timeline-spacer" aria-hidden="true"></div>
-        <div class="timeline-fold-cell">
-            <button
-                type="button"
-                class="timeline-fold"
-                aria-expanded={timelineOpen}
-                aria-label={timelineOpen ? "Hide timeline" : "Show timeline"}
-                onclick={() => (timelineOpen = !timelineOpen)}
+        <section class="console-body">
+            <div
+                class="console-scroll"
+                bind:this={consoleBodyElement}
+                onscroll={handleConsoleScroll}
             >
-                {timelineOpen ? "Timeline ◂" : "Timeline ▸"}
-            </button>
-        </div>
-        <div
-            class="console-scroll"
-            bind:this={consoleBodyElement}
-            onscroll={handleConsoleScroll}
-        >
-            <article
-                class="card console-card worker-console-card"
-                aria-label={`${selectedWorkerView.label} transcript`}
-            >
-                {#if workerError}
-                    <p class="error">{workerError}</p>
-                {/if}
+                <article
+                    class="card console-card worker-console-card"
+                    aria-label={`${selectedWorkerView.label} transcript`}
+                >
+                    {#if workerError}
+                        <p class="error">{workerError}</p>
+                    {/if}
 
-                <ConsoleDisplayStateView
-                    state={consoleDisplayState}
-                    hasContent={lines.length > 0}
-                    hasUnfilteredContent={selectedConsoleProjection.lines.length > 0}
-                    onRetry={retryConsoleLoad}
-                />
+                    <ConsoleDisplayStateView
+                        state={consoleDisplayState}
+                        hasContent={lines.length > 0}
+                        hasUnfilteredContent={selectedConsoleProjection.lines.length > 0}
+                        onRetry={retryConsoleLoad}
+                    />
 
-                {#if (consoleDisplayState.kind === "ready" || consoleDisplayState.kind === "stale") && lines.length > 0}
-                    <ol class="console-log">
-                        {#each lines as item (item.id)}
-                            <ConsoleLineItem {item} />
-                        {/each}
-                    </ol>
-                {/if}
-            </article>
-        </div>
-
-            <ConsoleTimeline
-                marks={timelineMarks}
-                thumbStyle={timelineThumb}
-                axisStyle={timelineAxisStyle}
-                expanded={timelineOpen}
-                onRailPointerDown={handleTimelineRailPointerDown}
-                onMarkClick={jumpToTimelineMark}
-            />
+                    {#if (consoleDisplayState.kind === "ready" || consoleDisplayState.kind === "stale") && lines.length > 0}
+                        <ol class="console-log">
+                            {#each lines as item (item.id)}
+                                <ConsoleLineItem {item} />
+                            {/each}
+                        </ol>
+                    {/if}
+                </article>
+            </div>
+            {#if (consoleDisplayState.kind === "ready" || consoleDisplayState.kind === "stale") && turns.length > 0}
+                {#key `${workerId}:${selectedWorkerView.sessionId}`}
+                    <ConsoleTurnNavigation {turns} onSelect={selectConsoleTurn} />
+                {/key}
+            {/if}
         </section>
 
         {#if taskPaneOpen}
@@ -2142,62 +1667,6 @@
         </aside>
     {/if}
 
-    {#if pendingSubmissionItems.length > 0 || pendingSubmissions.notification_count > 0}
-        <details class="pending-submissions">
-            <summary>
-                Pending activations ({pendingSubmissionItems.length} submissions · {pendingSubmissions.notification_count} notifications)
-            </summary>
-            <ol>
-                {#each pendingSubmissionItems as submission (submission.submission_id)}
-                    <li>
-                        <code>{submission.submission_id}</code>
-                        <span>{submission.segment_count} segments · {submission.byte_len} bytes</span>
-                        <button
-                            type="button"
-                            onclick={() =>
-                                sendControl(
-                                    {
-                                        method: "cancel_pending_submission",
-                                        params: {
-                                            submission_id: submission.submission_id,
-                                            expected_revision: pendingSubmissions.revision,
-                                        },
-                                    },
-                                    "Pending submission cancellation",
-                                )}
-                        >Cancel</button>
-                    </li>
-                {/each}
-            </ol>
-            <button
-                type="button"
-                disabled={workerRunning || pendingSubmissions.head_id === null}
-                onclick={() =>
-                    sendControl(
-                        {
-                            method: "continue_pending",
-                            params: {
-                                expected_revision: pendingSubmissions.revision,
-                                expected_head_id: pendingSubmissions.head_id ?? "",
-                            },
-                        },
-                        "Pending activation continue",
-                    )}
-            >Continue next</button>
-            <button
-                type="button"
-                onclick={() =>
-                    sendControl(
-                        {
-                            method: "clear_pending_submissions",
-                            params: { expected_revision: pendingSubmissions.revision },
-                        },
-                        "Pending submissions clear",
-                    )}
-            >Clear all</button>
-        </details>
-    {/if}
-
     {#if workerRunning}
         <WorkerRunStatus
             startedAtMs={consoleProjection.runActivity.startedAtMs}
@@ -2221,6 +1690,61 @@
             void selectConsoleWorkerView(sessionId);
         }}
     />
+
+    {#if pendingSubmissionItems.length > 0 || pendingSubmissions.notification_count > 0}
+        <section class="pending-submissions" aria-label="Pending activations">
+            <div class="pending-column pending-queue" role="group" aria-label="Queued inputs">
+                <h2 class="pending-submissions-label">{pendingSubmissionItems.length} Queued</h2>
+                {#if pendingSubmissionItems.length > 0}
+                    <ol aria-label="Queued inputs">
+                        {#each pendingSubmissionItems as submission, index (submission.submission_id)}
+                            <li>
+                                <span class="pending-submission-preview" title={submission.preview || "Preview unavailable"}>
+                                    {submission.preview || "Preview unavailable"}
+                                </span>
+                                <button
+                                    class="pending-icon-button"
+                                    type="button"
+                                    aria-label={`Cancel queued input ${index + 1}`}
+                                    title="Cancel queued input"
+                                    disabled={protocolState !== "open"}
+                                    onclick={() => sendControl({
+                                        method: "cancel_pending_submission",
+                                        params: {
+                                            submission_id: submission.submission_id,
+                                            expected_revision: pendingSubmissions.revision,
+                                        },
+                                    }, "Pending submission cancellation")}
+                                >
+                                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                                        <path d="M5 12h14" />
+                                    </svg>
+                                </button>
+                            </li>
+                        {/each}
+                    </ol>
+                {/if}
+            </div>
+            <div class="pending-column pending-notifications" role="group" aria-label="Notifications">
+                <h2 class="pending-submissions-label">Notifications</h2>
+                {#if pendingSubmissions.notification_count > 0}
+                    <ol aria-label="Pending notifications">
+                        {#each pendingSubmissions.notification_previews ?? [] as preview}
+                            <li>
+                                <span class="pending-submission-preview" title={preview}>{preview}</span>
+                            </li>
+                        {:else}
+                            <li>
+                                <span class="pending-submission-preview" title="Notification previews are unavailable on this Runtime">
+                                    {pendingSubmissions.notification_count} pending · Preview unavailable
+                                </span>
+                            </li>
+                        {/each}
+                    </ol>
+                {/if}
+            </div>
+        </section>
+    {/if}
 
     <form class="console-composer" onsubmit={sendMessage}>
         <div
@@ -2395,9 +1919,9 @@
     .worker-console-shell {
         display: flex;
         flex-direction: column;
-        gap: 1rem;
+        gap: var(--space-2);
         min-height: 0;
-        height: calc(100dvh - (var(--space-6) * 2));
+        height: calc(100dvh - (var(--space-4) * 2));
         overflow: hidden;
     }
 
@@ -2442,9 +1966,10 @@
         border: 0;
         background: transparent;
         color: var(--text-muted);
-        padding: 0.42rem 0.65rem;
+        padding: var(--space-1) var(--space-2);
         font: inherit;
         font-size: var(--font-size-compact);
+        line-height: var(--line-height-compact);
         font-weight: 700;
         cursor: pointer;
     }
@@ -2481,7 +2006,7 @@
     }
 
     .rewind-target-list span {
-        margin-left: 0.5rem;
+        margin-left: var(--space-2);
         color: var(--text-muted);
     }
 
@@ -2497,63 +2022,18 @@
     }
 
     .console-body {
-        --console-timeline-width: 12rem;
-        --console-timeline-fold-width: 2.25rem;
-
         display: grid;
-        grid-template-columns: minmax(0, 1fr) var(--console-timeline-fold-width);
-        grid-template-rows: auto minmax(0, 1fr);
-        gap: 0 var(--space-3);
+        grid-template-columns: minmax(0, 1fr) max-content;
+        grid-template-rows: minmax(0, 1fr);
+        min-width: 0;
         min-height: 0;
-        overflow: hidden;
-        transition: grid-template-columns 160ms ease;
-    }
-
-    .console-body.timeline-open {
-        grid-template-columns: minmax(0, 1fr) var(--console-timeline-width);
-    }
-
-    .console-timeline-spacer {
-        grid-column: 1;
-        grid-row: 1;
-    }
-
-    .timeline-fold-cell {
-        grid-column: 2;
-        grid-row: 1;
-        display: flex;
-        justify-content: flex-start;
-        padding-bottom: var(--space-2);
-    }
-
-    .timeline-fold {
-        width: 100%;
-        border: 1px solid var(--line);
-        border-radius: 999px;
-        background: var(--bg-raised);
-        color: var(--text-muted);
-        cursor: pointer;
-        font-size: var(--font-size-compact);
-        font-weight: 800;
-        padding: 0.35rem 0.5rem;
-        text-align: left;
-        white-space: nowrap;
-    }
-
-    .timeline-fold:focus-visible {
-        border-color: var(--tui-cyan);
-        color: var(--text-strong);
     }
 
     .console-scroll {
-        grid-column: 1;
-        grid-row: 2;
         height: 100%;
         min-width: 0;
         min-height: 0;
         overflow-y: auto;
-        padding-right: 0;
-        scrollbar-gutter: auto;
         scrollbar-width: none;
     }
 
@@ -2562,28 +2042,114 @@
     }
 
     .pending-submissions {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: var(--space-3);
+        flex: 0 0 auto;
+        min-width: 0;
         margin: 0 var(--space-3);
-        color: var(--muted);
+        color: var(--text-muted);
         font-size: var(--font-size-compact);
+        line-height: var(--line-height-compact);
+    }
+
+    .pending-column {
+        min-width: 0;
+    }
+
+    .pending-submissions li {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        min-height: var(--space-6);
+        align-items: center;
+    }
+
+    .pending-queue li {
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: var(--space-2);
+    }
+
+    .pending-notifications {
+        text-align: right;
+    }
+
+    .pending-submissions-label {
+        margin: 0 0 var(--space-1);
+        font-size: var(--font-size-compact);
+        line-height: var(--line-height-compact);
+        font-weight: 500;
     }
 
     .pending-submissions ol {
         display: grid;
         gap: var(--space-1);
-        margin: var(--space-2) 0;
-        padding-left: var(--space-5);
+        max-height: calc(var(--space-6) * 4);
+        overflow-y: auto;
+        margin: 0;
+        padding: 0;
+        list-style: none;
     }
 
-    .pending-submissions li {
-        display: flex;
-        gap: var(--space-2);
-        align-items: center;
-    }
-
-    .pending-submissions code {
-        max-width: 16rem;
+    .pending-submission-preview,
+    .pending-submissions-label {
+        min-width: 0;
+        white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
+    }
+
+    .pending-icon-button {
+        opacity: 0;
+        pointer-events: none;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: var(--space-6);
+        height: var(--space-6);
+        padding: var(--space-2);
+        border: 0;
+        border-radius: var(--radius-soft);
+        background: transparent;
+        color: var(--text-muted);
+        cursor: pointer;
+    }
+
+    .pending-queue li:hover .pending-icon-button,
+    .pending-queue li:focus-within .pending-icon-button {
+        opacity: 1;
+        pointer-events: auto;
+    }
+
+    @media (hover: none) {
+        .pending-icon-button {
+            opacity: 1;
+            pointer-events: auto;
+        }
+    }
+
+    .pending-icon-button:hover:not(:disabled) {
+        background: var(--interactive-hover);
+        color: var(--text);
+    }
+
+    .pending-icon-button:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: -2px;
+    }
+
+    .pending-icon-button:disabled {
+        color: var(--text-faint);
+        cursor: default;
+    }
+
+    .pending-icon-button svg {
+        width: var(--space-4);
+        height: var(--space-4);
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.5;
+        stroke-linecap: round;
+        stroke-linejoin: round;
     }
 
     .console-log {
@@ -2631,6 +2197,7 @@
     .console-side-panel dt {
         color: var(--text-muted);
         font-size: var(--font-size-compact);
+        line-height: var(--line-height-compact);
         font-weight: 800;
         letter-spacing: 0.05em;
         text-transform: uppercase;
@@ -2645,6 +2212,7 @@
     .metadata-details {
         color: var(--text-muted);
         font-size: var(--font-size-compact);
+        line-height: var(--line-height-compact);
     }
 
     .metadata-details summary {
@@ -2668,7 +2236,7 @@
         border-radius: 18px;
         background: var(--bg-raised);
         cursor: text;
-        padding: 0.35rem;
+        padding: var(--space-1);
     }
 
     .composer-input-shell:focus-within {
@@ -2703,7 +2271,7 @@
         max-width: 100%;
         border: 1px solid var(--line);
         border-radius: 999px;
-        padding: 0.2rem 0.5rem;
+        padding: var(--space-1) var(--space-2);
         font: 500 var(--font-size-compact) / var(--line-height-compact) var(--font-mono);
     }
 
@@ -2766,7 +2334,7 @@
         gap: var(--space-2);
         align-items: end;
         min-height: 2.35rem;
-        padding: 0 0.35rem 0.35rem 0.65rem;
+        padding: 0 var(--space-1) var(--space-1) var(--space-2);
     }
 
     .composer-footer-slot {
@@ -2820,6 +2388,7 @@
         align-items: center;
         color: var(--text-muted);
         font-size: var(--font-size-compact);
+        line-height: var(--line-height-compact);
     }
 
     .composer-submit-actions {
