@@ -18214,12 +18214,12 @@ async fn scoped_list_working_directories(
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
 ) -> ApiResult<Json<BrowserWorkingDirectoryListResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let items = working_directory_summaries(&api)?;
+    let (items, diagnostics) = working_directory_summaries(&api)?;
     let items = items.into_iter().map(Into::into).collect();
     Ok(Json(BrowserWorkingDirectoryListResponse {
         workspace_id: api.config.workspace_id.clone(),
         items,
-        diagnostics: Vec::new(),
+        diagnostics: working_directory_diagnostics(diagnostics),
     }))
 }
 
@@ -24619,16 +24619,48 @@ fn working_directory_repository_options(
         .collect()
 }
 
-fn working_directory_summaries(api: &WorkspaceApi) -> ApiResult<Vec<WorkingDirectorySummary>> {
-    let _ = sync_all_runtime_workdir_observations(api);
+// Inventory reads must not reinterpret legacy grants as broader permissions or
+// let one unsupported grant prevent unrelated Workdirs from being listed.
+fn legacy_external_workdir_grant_id(
+    api: &WorkspaceApi,
+    record: &WorkdirRegistryRecord,
+) -> Result<Option<String>> {
+    let WorkdirRegistrySource::ExternalGrant { grant_id } = &record.source else {
+        return Ok(None);
+    };
+    let grant = api
+        .store
+        .get_external_workdir_grant(&record.workspace_id, grant_id)?
+        .ok_or_else(|| Error::Store("External Workdir grant is unavailable".to_string()))?;
+    Ok(
+        matches!(grant.permissions.as_str(), "command_only" | "read_command")
+            .then(|| grant_id.clone()),
+    )
+}
+
+fn working_directory_summaries(
+    api: &WorkspaceApi,
+) -> ApiResult<(Vec<WorkingDirectorySummary>, Vec<RuntimeDiagnostic>)> {
+    let mut diagnostics = sync_all_runtime_workdir_observations(api);
     let records = api
         .store
         .list_workdir_registry(&api.config.workspace_id, 200)?;
-    records
-        .iter()
-        .map(|record| projected_workdir_summary_from_record(api, record))
-        .collect::<Result<Vec<_>>>()
-        .map_err(ApiError::from)
+    let mut items = Vec::new();
+    for record in records {
+        if let Some(grant_id) = legacy_external_workdir_grant_id(api, &record)? {
+            diagnostics.push(RuntimeDiagnostic {
+                code: "external_workdir_legacy_permissions".to_string(),
+                severity: HostDiagnosticSeverity::Warning,
+                message: format!(
+                    "Workdir {} was omitted because External grant {} uses legacy non-hierarchical permissions; revoke the old grant and share again with READ, WRITE, or COMMAND",
+                    record.workdir_id, grant_id,
+                ),
+            });
+            continue;
+        }
+        items.push(projected_workdir_summary_from_record(api, &record)?);
+    }
+    Ok((items, diagnostics))
 }
 
 fn available_working_directory_summaries(
@@ -24643,6 +24675,9 @@ fn available_working_directory_summaries(
         .list_workdir_registry(&api.config.workspace_id, 200)?;
     let mut available = Vec::new();
     for record in records {
+        if legacy_external_workdir_grant_id(api, &record)?.is_some() {
+            continue;
+        }
         let summary = projected_workdir_summary_from_record(api, &record)?;
         let source_is_available = match record.source {
             WorkdirRegistrySource::Repository { .. } => {
@@ -27616,6 +27651,140 @@ mod tests {
         assert!(audit_actions.contains(&"external_workdir_grant_expired".to_string()));
         assert!(audit_actions.contains(&"external_workdir_cleanup_attention_required".to_string()));
         assert!(audit_actions.contains(&"external_workdir_cleanup_completed".to_string()));
+    }
+
+    #[tokio::test]
+    async fn workdir_inventory_skips_legacy_grants_without_expanding_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let api = test_api(dir.path()).await;
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let mut legacy_records = Vec::new();
+        let mut expected_ids = HashSet::new();
+        for permissions in [
+            "read_only",
+            "read_write",
+            "read_write_command",
+            "command_only",
+            "read_command",
+        ] {
+            let legacy = matches!(permissions, "command_only" | "read_command");
+            let statuses: &[&str] = if legacy {
+                &["pending", "online", "offline", "revoked", "expired"]
+            } else {
+                &["online"]
+            };
+            for status in statuses {
+                let grant = ExternalWorkdirGrantRecord {
+                    grant_id: format!("inventory-{permissions}-{status}"),
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    workdir_id: format!("external-{permissions}-{status}"),
+                    provider_instance_id: format!("provider-{permissions}-{status}"),
+                    display_name: format!("External {permissions} {status}"),
+                    permissions: permissions.to_string(),
+                    created_by: test_browser_request_actor().account_id,
+                    created_at: now.clone(),
+                    expires_at: None,
+                    generation: 1,
+                    status: status.to_string(),
+                    updated_at: now.clone(),
+                };
+                let record = WorkdirRegistryRecord {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    workdir_id: grant.workdir_id.clone(),
+                    display_name: Some(grant.display_name.clone()),
+                    source: WorkdirRegistrySource::ExternalGrant {
+                        grant_id: grant.grant_id.clone(),
+                    },
+                    creation_selector: None,
+                    creation_ref: None,
+                    creation_tree: None,
+                    current_selector: None,
+                    current_ref: None,
+                    current_tree: None,
+                    observed_at_epoch_seconds: None,
+                    materialization_status: "present".to_string(),
+                    cleanliness: "unknown".to_string(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                };
+                api.store
+                    .create_external_workdir_grant(&grant, &record)
+                    .unwrap();
+                if legacy {
+                    legacy_records.push((grant, record));
+                } else {
+                    expected_ids.insert(record.workdir_id);
+                }
+            }
+        }
+        let Json(response) = scoped_list_working_directories(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+        )
+        .await
+        .expect("legacy grants must not break the automatic inventory request");
+        assert_eq!(
+            response
+                .items
+                .iter()
+                .map(|item| item.working_directory_id.clone())
+                .collect::<HashSet<_>>(),
+            expected_ids
+        );
+        let warnings = response
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "external_workdir_legacy_permissions")
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), legacy_records.len());
+        let available = available_working_directory_summaries(&api).unwrap();
+        assert_eq!(
+            available
+                .iter()
+                .map(|item| item.working_directory_id.clone())
+                .collect::<HashSet<_>>(),
+            expected_ids
+        );
+        for (grant, record) in legacy_records {
+            assert!(warnings.iter().any(|diagnostic| {
+                diagnostic.severity == server_api::DiagnosticSeverity::Warning
+                    && diagnostic.message.contains(&record.workdir_id)
+                    && diagnostic.message.contains(&grant.grant_id)
+            }));
+            assert!(
+                workdir_source_capabilities(&api, &record).is_err(),
+                "legacy grants must remain unusable for attachment"
+            );
+            let stored = api
+                .store
+                .get_external_workdir_grant(TEST_WORKSPACE_ID, &grant.grant_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.permissions, grant.permissions);
+            assert_eq!(
+                stored.status, grant.status,
+                "listing must not mutate or revoke grants"
+            );
+        }
+        for item in response.items {
+            let server_api::WorkingDirectorySource::ExternalGrant {
+                grant_permissions, ..
+            } = item.source
+            else {
+                panic!("unexpected repository Workdir");
+            };
+            let expected = if item.working_directory_id.contains("read_write_command") {
+                server_api::ExternalWorkdirPermissions::COMMAND
+            } else if item.working_directory_id.contains("read_write") {
+                server_api::ExternalWorkdirPermissions::WRITE
+            } else {
+                server_api::ExternalWorkdirPermissions::READ
+            };
+            assert_eq!(grant_permissions, expected);
+        }
     }
 
     #[tokio::test]
@@ -32354,7 +32523,7 @@ mod tests {
             })
             .unwrap();
 
-        let summaries = working_directory_summaries(&api)
+        let (summaries, _) = working_directory_summaries(&api)
             .unwrap_or_else(|err| panic!("working_directory_summaries failed: {}", err.error));
         let ids = summaries
             .iter()
