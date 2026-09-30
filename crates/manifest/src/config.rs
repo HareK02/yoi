@@ -1348,35 +1348,78 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_dispatch_defaults_merges_and_round_trips() {
+    fn tool_call_dispatch_default_merge_and_snapshots() {
+        assert_eq!(
+            EngineManifestConfig::default().tool_call_dispatch,
+            None,
+            "partial configs must preserve omission until final resolution"
+        );
+
         let manifest: WorkerManifest = minimal_valid().try_into().unwrap();
         assert_eq!(
             manifest.engine.tool_call_dispatch,
-            crate::ToolCallDispatchMode::AfterResponse
+            crate::ToolCallDispatchMode::OnToolCallComplete
         );
 
         let lower = WorkerManifestConfig {
+            engine: EngineManifestConfig {
+                tool_call_dispatch: Some(crate::ToolCallDispatchMode::AfterResponse),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let merged = lower.clone().merge(WorkerManifestConfig::default());
+        assert_eq!(
+            merged.engine.tool_call_dispatch,
+            Some(crate::ToolCallDispatchMode::AfterResponse),
+            "an omitted upper profile must not replace a lower explicit value"
+        );
+        let overridden = lower.merge(WorkerManifestConfig {
             engine: EngineManifestConfig {
                 tool_call_dispatch: Some(crate::ToolCallDispatchMode::OnToolCallComplete),
                 ..Default::default()
             },
             ..Default::default()
-        };
-        let upper = WorkerManifestConfig::default();
+        });
         assert_eq!(
-            lower.merge(upper).engine.tool_call_dispatch,
+            overridden.engine.tool_call_dispatch,
             Some(crate::ToolCallDispatchMode::OnToolCallComplete)
         );
 
-        let mut configured = minimal_valid();
-        configured.engine.tool_call_dispatch =
+        let mut explicit_early = minimal_valid();
+        explicit_early.engine.tool_call_dispatch =
             Some(crate::ToolCallDispatchMode::OnToolCallComplete);
+        let explicit_early: WorkerManifest = explicit_early.try_into().unwrap();
+        assert_eq!(
+            explicit_early.engine.tool_call_dispatch,
+            crate::ToolCallDispatchMode::OnToolCallComplete
+        );
+
+        let mut configured = minimal_valid();
+        configured.engine.tool_call_dispatch = Some(crate::ToolCallDispatchMode::AfterResponse);
         let manifest: WorkerManifest = configured.try_into().unwrap();
-        let snapshot = serde_json::to_value(&manifest).unwrap();
-        let restored: WorkerManifest = serde_json::from_value(snapshot).unwrap();
+        assert_eq!(
+            manifest.engine.tool_call_dispatch,
+            crate::ToolCallDispatchMode::AfterResponse
+        );
+        let snapshot = crate::write_persisted_worker_manifest_snapshot(&manifest).unwrap();
+        let restored = crate::read_persisted_worker_manifest_snapshot(snapshot.clone()).unwrap();
         assert_eq!(
             restored.engine.tool_call_dispatch,
-            crate::ToolCallDispatchMode::OnToolCallComplete
+            crate::ToolCallDispatchMode::AfterResponse,
+            "an explicitly persisted after_response value must survive restore"
+        );
+
+        let mut field_missing = snapshot;
+        field_missing["manifest"]["engine"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tool_call_dispatch");
+        let restored = crate::read_persisted_worker_manifest_snapshot(field_missing).unwrap();
+        assert_eq!(
+            restored.engine.tool_call_dispatch,
+            crate::ToolCallDispatchMode::OnToolCallComplete,
+            "snapshots without the field must use the new default"
         );
     }
 

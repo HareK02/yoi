@@ -20,8 +20,8 @@ use agen::tool::{
     ToolResultDisposition,
 };
 use agen::{
-    Engine, EngineError, EngineRunExit, History, Item, RunInterruptionReason, ToolCallDispatchMode,
-    ToolExecutionPolicy,
+    Engine, EngineConfig, EngineError, EngineRunExit, History, Item, RunInterruptionReason,
+    ToolCallDispatchMode, ToolExecutionPolicy,
 };
 use async_trait::async_trait;
 
@@ -465,12 +465,13 @@ impl Tool for BarrierTool {
 // =============================================================================
 
 #[tokio::test]
-async fn default_dispatch_waits_for_response_completion() {
+async fn explicit_after_response_dispatch_waits_for_response_completion() {
     let (client, tx) = ControlledStreamClient::new(ToolCallCompletionSupport::PerBlock);
     let tool = BarrierTool::new("barrier_default");
     let probe = tool.clone();
     let mut engine = Engine::new(client);
     engine.set_max_turns(Some(1));
+    engine.set_tool_call_dispatch_mode(ToolCallDispatchMode::AfterResponse);
     engine.register_tool(tool.definition());
 
     let (observed_tx, mut observed_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -528,7 +529,6 @@ async fn turn_end_policy_incompatibility_visibly_falls_back_before_side_effects(
     let tool = BarrierTool::new("turn_end_fallback");
     let probe = tool.clone();
     let mut engine = Engine::new(client);
-    engine.set_tool_call_dispatch_mode(ToolCallDispatchMode::OnToolCallComplete);
     engine.set_interceptor(TurnEndPause);
     engine.register_tool(tool.definition());
     let (warning_tx, mut warning_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -762,7 +762,11 @@ async fn blocking_pre_tool_policy_keeps_receiving_stream_and_services_cancel() {
 }
 
 #[tokio::test]
-async fn per_block_dispatch_starts_siblings_without_waiting_for_stream_or_prior_result() {
+async fn default_per_block_dispatch_starts_siblings_without_waiting_for_stream_or_prior_result() {
+    assert_eq!(
+        EngineConfig::default().tool_call_dispatch,
+        ToolCallDispatchMode::OnToolCallComplete
+    );
     let (client, tx) = ControlledStreamClient::new(ToolCallCompletionSupport::PerBlock);
     let first = BarrierTool::new("barrier_a");
     let second = BarrierTool::new("barrier_b");
@@ -770,7 +774,6 @@ async fn per_block_dispatch_starts_siblings_without_waiting_for_stream_or_prior_
     let second_probe = second.clone();
     let mut engine = Engine::new(client);
     engine.set_max_turns(Some(1));
-    engine.set_tool_call_dispatch_mode(ToolCallDispatchMode::OnToolCallComplete);
     engine.register_tool(first.definition());
     engine.register_tool(second.definition());
 
@@ -1641,13 +1644,12 @@ async fn clean_eof_without_provider_completion_after_early_start_stops_without_c
 }
 
 #[tokio::test]
-async fn unsupported_provider_visibly_defers_opt_in_dispatch() {
+async fn unsupported_provider_visibly_defers_default_dispatch() {
     let (client, tx) = ControlledStreamClient::new(ToolCallCompletionSupport::ResponseComplete);
     let tool = BarrierTool::new("barrier_fallback");
     let probe = tool.clone();
     let mut engine = Engine::new(client);
     engine.set_max_turns(Some(1));
-    engine.set_tool_call_dispatch_mode(ToolCallDispatchMode::OnToolCallComplete);
     engine.register_tool(tool.definition());
     let warnings = Arc::new(Mutex::new(Vec::new()));
     let warning_probe = warnings.clone();

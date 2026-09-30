@@ -8726,7 +8726,7 @@ mod build_summary_prompt_tests {
     }
 
     #[test]
-    fn engine_manifest_generation_settings_become_request_config() {
+    fn engine_manifest_generation_and_dispatch_settings_are_applied() {
         let manifest = manifest::EngineManifest {
             instruction: "unused".into(),
             language: manifest::defaults::WORKER_LANGUAGE.into(),
@@ -8755,6 +8755,14 @@ mod build_summary_prompt_tests {
         assert_eq!(
             engine.tool_call_dispatch_mode(),
             agen::ToolCallDispatchMode::OnToolCallComplete
+        );
+
+        let mut explicit_after_response = manifest;
+        explicit_after_response.tool_call_dispatch = manifest::ToolCallDispatchMode::AfterResponse;
+        apply_worker_manifest(&mut engine, &explicit_after_response);
+        assert_eq!(
+            engine.tool_call_dispatch_mode(),
+            agen::ToolCallDispatchMode::AfterResponse
         );
     }
 

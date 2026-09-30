@@ -2228,7 +2228,7 @@ max_tokens = 3333
             &[("reviewer", "reviewer.toml", REVIEWER_PROFILE)],
         );
         let mut parent = parent_manifest(&parent_root, Some(&parent_root.join("deny")));
-        parent.engine.tool_call_dispatch = manifest::ToolCallDispatchMode::OnToolCallComplete;
+        parent.engine.tool_call_dispatch = manifest::ToolCallDispatchMode::AfterResponse;
         let scope = vec![abs_rule(&delegated, Permission::Read)];
 
         let profile_config = child_config_from_profile(
@@ -2252,7 +2252,7 @@ max_tokens = 3333
 
         assert_eq!(
             inherit_config.engine.tool_call_dispatch,
-            Some(manifest::ToolCallDispatchMode::OnToolCallComplete)
+            Some(manifest::ToolCallDispatchMode::AfterResponse)
         );
         for config in [profile_config, inherit_config] {
             assert_eq!(config.scope.allow, scope);

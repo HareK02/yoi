@@ -594,10 +594,10 @@ pub struct WorkerMeta {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolCallDispatchMode {
-    /// Preserve the historical behavior: wait for the whole response stream.
-    #[default]
+    /// Wait for the whole response stream before starting any tools.
     AfterResponse,
     /// Start each call once the provider emits a trustworthy per-call completion.
+    #[default]
     OnToolCallComplete,
 }
 
@@ -628,7 +628,7 @@ pub struct EngineManifest {
     pub stop_sequences: Vec<String>,
     #[serde(default)]
     pub reasoning: Option<ReasoningControl>,
-    /// Tool-call start timing. Omitted manifests preserve `after_response`.
+    /// Tool-call start timing. Omitted manifests use `on_tool_call_complete`.
     #[serde(default)]
     pub tool_call_dispatch: ToolCallDispatchMode,
     /// Byte-size caps applied to tool `content` before it reaches the

@@ -83,9 +83,9 @@ pub enum ToolRegistryError {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ToolCallDispatchMode {
     /// Wait for the complete assistant response before starting any tools.
-    #[default]
     AfterResponse,
     /// Start calls at trustworthy provider per-call completion boundaries.
+    #[default]
     OnToolCallComplete,
 }
 

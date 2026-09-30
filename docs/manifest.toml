@@ -121,14 +121,15 @@ ref = "anthropic/claude-sonnet-4-6"
 # reasoning = "medium"
 # reasoning = -1
 
-# 任意。デフォルト: "after_response"。
-# "on_tool_call_complete" は provider が個別 ToolCall の完成を保証する場合だけ、
-# そのブロック完成後に実行開始を前倒しする。安全な完成境界がない provider、または
-# 応答全体を見て実行前 Pause を判断する turn-end hook がある場合は、応答完了まで
-# 警告付きで明示的に遅延する。これは直列実行モードではなく、先行 call の完了を
-# 待たず後続 call も開始するため、完了順・DB 反映順・採番順は保証しない。
-# 早期開始後に stream が切断された場合は自動 continuation せず、安全に terminalize して停止する。
-# tool_call_dispatch = "on_tool_call_complete"
+# 任意。デフォルト: "on_tool_call_complete"。
+# provider が個別 ToolCall の完成を保証する場合、そのブロック完成後に実行開始を
+# 前倒しする。安全な完成境界がない provider、または応答全体を見て実行前 Pause を
+# 判断する turn-end hook がある場合は、応答完了まで警告付きで明示的に遅延する。
+# これは直列実行モードではなく、先行 call の完了を待たず後続 call も開始するため、
+# 完了順・DB 反映順・採番順は保証しない。早期開始後に stream が切断された場合は
+# 自動 continuation せず、安全に terminalize して停止する。
+# 従来どおり応答全体の完了後に実行を開始するには "after_response" を明示する。
+# tool_call_dispatch = "after_response"
 
 # 任意。tool 実行 content の byte 長キャップ。
 # セクション省略時は default_max_bytes = 64 * 1024、per_tool 空。

@@ -80,33 +80,38 @@ async fn assert_response_complete_scheme_accepts_clean_eof<S: Scheme>(
         ToolCallCompletionSupport::ResponseComplete
     );
 
-    for mode in [
-        ToolCallDispatchMode::AfterResponse,
-        ToolCallDispatchMode::OnToolCallComplete,
+    for (label, mode) in [
+        ("default on_tool_call_complete fallback", None),
+        (
+            "explicit after_response",
+            Some(ToolCallDispatchMode::AfterResponse),
+        ),
     ] {
         let client = SchemeReplayClient::new(scheme.clone(), vec![frames.clone()]);
         let probe = client.clone();
         let mut engine = Engine::new(client);
-        engine.set_tool_call_dispatch_mode(mode);
+        if let Some(mode) = mode {
+            engine.set_tool_call_dispatch_mode(mode);
+        }
         let mut history = History::new();
 
         let output = engine.run(&mut history, "hello").await;
 
         assert!(
             matches!(output.result, EngineRunExit::Finished),
-            "{mode:?} should accept the response-complete scheme's clean EOF, got {:?}",
+            "{label} should accept the response-complete scheme's clean EOF, got {:?}",
             output.result
         );
         assert_eq!(
             probe.stream_count(),
             1,
-            "{mode:?} must not open a continuation request after the adapter's normal EOF"
+            "{label} must not open a continuation request after the adapter's normal EOF"
         );
     }
 }
 
 #[tokio::test]
-async fn openai_chat_clean_eof_completes_in_default_and_opt_in_fallback_modes() {
+async fn openai_chat_clean_eof_completes_in_default_and_explicit_after_response_modes() {
     assert_response_complete_scheme_accepts_clean_eof(
         OpenAIScheme::new(),
         vec![
@@ -124,7 +129,7 @@ async fn openai_chat_clean_eof_completes_in_default_and_opt_in_fallback_modes() 
 }
 
 #[tokio::test]
-async fn gemini_clean_eof_completes_in_default_and_opt_in_fallback_modes() {
+async fn gemini_clean_eof_completes_in_default_and_explicit_after_response_modes() {
     assert_response_complete_scheme_accepts_clean_eof(
         GeminiScheme::new(),
         vec![
