@@ -75,6 +75,7 @@
     import {
         applyConsoleHistoryPage,
         beginConsoleHistoryRequest,
+        conversationTurnPreviewsFromLines,
         emptyConsoleHistoryState,
         failConsoleHistoryRequest,
         historyEntries,
@@ -82,7 +83,7 @@
         shouldLoadHistoryAtTop,
         type ConsoleHistoryState,
     } from "$lib/workspace/console/history";
-    import { buildTurnNavigationItems, type TurnNavigationItem } from "$lib/workspace/console/turn-navigation";
+    import type { TurnNavigationItem } from "$lib/workspace/console/turn-navigation";
     import type { Diagnostic, Worker } from "$lib/workspace/sidebar/types";
 
     type Props = {
@@ -290,7 +291,7 @@
         mergeCommittedHistoryLines(committedHistoryLines, currentLines),
     );
     const turnNavigationItems = $derived(
-        buildTurnNavigationItems(selectedHistory.turns),
+        conversationTurnPreviewsFromLines(lines),
     );
     const tasks = $derived(selectedConsoleProjection.tasks);
     const timelineLayout = $derived(
@@ -396,6 +397,7 @@
             }
             const payload = (await response.json()) as WorkerSessionHistoryResponse;
             if (token !== reloadToken || mainHistoryKey(target) !== key) return;
+            if (pendingHistoryRefreshes.has(key)) return;
             if (payload.availability === "unavailable") {
                 setHistoryState(
                     key,
@@ -410,7 +412,12 @@
             await tick();
             restoreHistoryAnchors(anchors);
         } catch (error) {
-            if (token !== reloadToken || mainHistoryKey(target) !== key) return;
+            if (
+                token !== reloadToken ||
+                mainHistoryKey(target) !== key ||
+                pendingHistoryRefreshes.has(key)
+            )
+                return;
             setHistoryState(
                 key,
                 failConsoleHistoryRequest(
@@ -425,6 +432,13 @@
                 token === reloadToken &&
                 mainHistoryKey(target) === key
             ) {
+                const stale = historyStateFor(key);
+                setHistoryState(key, {
+                    ...stale,
+                    status: stale.turns.length > 0 ? "ready" : "idle",
+                    error: null,
+                    requestedCursor: null,
+                });
                 void requestHistoryPage(target, key, null, token);
             }
         }
@@ -509,6 +523,22 @@
         );
     }
 
+    function fenceCurrentHistoryForRewind() {
+        const target = consoleTarget;
+        if (!target) return;
+        const key = mainHistoryKey(target);
+        const current = historyStateFor(key);
+        const loading = current.status === "loading";
+        const reset = emptyConsoleHistoryState();
+        setHistoryState(key, {
+            ...reset,
+            status: loading ? "loading" : "idle",
+            requestedCursor: loading ? current.requestedCursor : null,
+            topEdgeArmed: current.topEdgeArmed,
+        });
+        if (loading) pendingHistoryRefreshes.add(key);
+    }
+
     function refreshCurrentHistory() {
         const target = consoleTarget;
         if (!target) return;
@@ -533,7 +563,9 @@
     }
 
     function jumpToConversationTurn(item: TurnNavigationItem) {
-        const line = lines.find((candidate) => candidate.entryId === item.lineId);
+        const line = lines.find(
+            (candidate) => candidate.entryId === item.lineId || candidate.id === item.lineId,
+        );
         const target = line
             ? consoleBodyElement?.querySelector(
                 `[data-console-line-id="${cssEscape(line.id)}"]`,
@@ -695,6 +727,22 @@
                 : workerStateFromSnapshot(consoleProjection.workerState);
             advanceEventObservedAtVersion();
             if (
+                eventBatch.some((event) => event.event.event === "rewind_applied")
+            ) {
+                fenceCurrentHistoryForRewind();
+            }
+            if (
+                eventBatch.some((event) =>
+                    event.event.event === "snapshot" ||
+                    event.event.event === "segment_rotated" ||
+                    event.event.event === "rewind_applied" ||
+                    event.event.event === "user_message" ||
+                    event.event.event === "session_entry_committed"
+                )
+            ) {
+                refreshCurrentHistory();
+            }
+            if (
                 initialSnapshotApplication &&
                 eventBatch.some(
                     (event) => event.eventId === initialSnapshotApplication.eventId,
@@ -723,13 +771,6 @@
             pendingSubmissions = payload.data.session.pending_submissions;
         } else if (payload.event === "pending_submissions_changed") {
             pendingSubmissions = payload.data.pending;
-        }
-        if (
-            payload.event === "segment_rotated" ||
-            payload.event === "user_message" ||
-            payload.event === "session_entry_committed"
-        ) {
-            refreshCurrentHistory();
         }
         if (payload.event === "error") {
             queueObservationDiagnostic({
@@ -1335,9 +1376,6 @@
                     ];
                     return;
                 }
-                untrack(() => {
-                    void requestHistoryPage(target, mainHistoryKey(target), null, token);
-                });
                 if (
                     action.kind === "subscribe_live" &&
                     targetWorker &&

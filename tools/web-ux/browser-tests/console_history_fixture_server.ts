@@ -64,6 +64,7 @@ function historyPage(indices: number[], cursor: string | null) {
     page: {
       session_id: "session-a",
       lineage_id: "lineage-a",
+      compact_ancestor_lineage_ids: [],
       turns: indices.map((index) => ({
         turn_id: `user-${index}`,
         entries: [historyEntry(index, "user"), historyEntry(index, "assistant")],
@@ -162,7 +163,7 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
   ) {
     return json({
       availability: "retained_snapshot",
-      identity: { session_id: "session-a", segment_id: "segment-a", entry_count: 0 },
+      identity: { session_id: "session-a", segment_id: "segment-a", entry_count: 12 },
       snapshot: {
         pending_submissions: {
           revision: 0,
@@ -170,7 +171,10 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
           head_id: null,
           submissions: [],
         },
-        entries: [],
+        entries: [7, 8, 9, 10, 11, 12].flatMap((index) => [
+          historyEntry(index, "user"),
+          historyEntry(index, "assistant"),
+        ]),
       },
     });
   }

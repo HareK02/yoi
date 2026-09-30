@@ -10,7 +10,7 @@ use protocol::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
 
 use thiserror::Error;
@@ -63,8 +63,9 @@ pub const DEFAULT_RETAINED_HISTORY_MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Explicit resource bounds for one retained-history page read.
 ///
-/// The operation never truncates a turn to fit these limits. A lineage or one
-/// selected page that exceeds a bound fails with [`RetainedHistoryReadError::ResourceLimit`].
+/// The operation never truncates a turn to fit these limits. Bounded lineage
+/// metadata or one selected page that exceeds a bound fails with
+/// [`RetainedHistoryReadError::ResourceLimit`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetainedHistoryReadLimits {
     pub max_scan_bytes: u64,
@@ -108,15 +109,37 @@ struct RetainedHistoryCursor {
     version: u8,
     worker_name: String,
     session_id: String,
+    active_segment_id: String,
     lineage_id: String,
     before_turn_id: String,
+    segment_id: String,
+    before_offset: u64,
+    record_end_offset: Option<u64>,
+    seed_entry_index: Option<usize>,
 }
 
 #[derive(Debug)]
 struct LoadedLineageSegment {
     segment_id: SegmentId,
     adopted_through_turn: Option<usize>,
-    entries: Vec<LogEntry>,
+    file_len: u64,
+    seed_end_offset: u64,
+    origin: Option<LineageOrigin>,
+    seed_entries: Vec<SessionSnapshotEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct HistoryTurnPosition {
+    segment_id: SegmentId,
+    before_offset: u64,
+    record_end_offset: Option<u64>,
+    seed_entry_index: Option<usize>,
+}
+
+#[derive(Debug)]
+struct PositionedHistoryTurn {
+    turn: SessionConversationTurn,
+    position: HistoryTurnPosition,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -125,7 +148,7 @@ enum LineageOriginKind {
     Compact,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct LineageOrigin {
     kind: LineageOriginKind,
     origin: SegmentOrigin,
@@ -207,50 +230,82 @@ pub fn read_retained_session_history_page(
         .ok_or(RetainedHistoryReadError::ActivePointerMissing)?;
     let store = WorkerSessionStore::open_read_only(aggregate_root.join("session"))
         .map_err(map_history_store_error)?;
-    let (lineage, lineage_id) =
+    let (lineage, lineage_id, metadata_bytes, metadata_entries) =
         load_adopted_lineage(&store, active.session_id, active_segment_id, limits)?;
-    let entries = project_adopted_lineage(active.session_id, &lineage)?;
-    let turns = group_conversation_turns(entries);
-
-    let page_end = match cursor {
-        Some(cursor) => {
-            let cursor = decode_history_cursor(cursor)?;
-            if cursor.version != 1
-                || cursor.worker_name != worker_name
-                || cursor.session_id != active.session_id.to_string()
-                || cursor.lineage_id != lineage_id
-            {
-                return Err(RetainedHistoryReadError::InvalidCursor);
-            }
-            turns
+    let cursor = cursor.map(decode_history_cursor).transpose()?;
+    let start = if let Some(cursor) = cursor.as_ref() {
+        if cursor.version != 2
+            || cursor.worker_name != worker_name
+            || cursor.session_id != active.session_id.to_string()
+            || cursor.active_segment_id != active_segment_id.to_string()
+            || cursor.lineage_id != lineage_id
+            || !lineage
                 .iter()
-                .position(|turn| turn.turn_id == cursor.before_turn_id)
-                .ok_or(RetainedHistoryReadError::InvalidCursor)?
+                .any(|segment| segment.segment_id.to_string() == cursor.segment_id)
+        {
+            return Err(RetainedHistoryReadError::InvalidCursor);
         }
-        None => turns.len(),
+        let segment_id = cursor
+            .segment_id
+            .parse()
+            .map_err(|_| RetainedHistoryReadError::InvalidCursor)?;
+        Some((
+            HistoryTurnPosition {
+                segment_id,
+                before_offset: cursor.before_offset,
+                record_end_offset: cursor.record_end_offset,
+                seed_entry_index: cursor.seed_entry_index,
+            },
+            cursor.before_turn_id.as_str(),
+        ))
+    } else {
+        None
     };
-    let page_start = page_end.saturating_sub(page_limit);
-    let page_turns = turns[page_start..page_end].to_vec();
-    let has_more = page_start > 0;
-    let next_cursor = has_more
-        .then(|| {
-            encode_history_cursor(&RetainedHistoryCursor {
-                version: 1,
-                worker_name: worker_name.to_owned(),
-                session_id: active.session_id.to_string(),
-                lineage_id: lineage_id.clone(),
-                before_turn_id: page_turns
-                    .first()
-                    .expect("a page with earlier history cannot be empty")
-                    .turn_id
-                    .clone(),
-            })
-        })
-        .transpose()?;
+    let mut turns = read_history_turns_backward(
+        &store,
+        active.session_id,
+        &lineage,
+        start,
+        page_limit.saturating_add(1),
+        RetainedHistoryReadLimits {
+            max_scan_bytes: limits.max_scan_bytes.saturating_sub(metadata_bytes),
+            max_entries: limits.max_entries.saturating_sub(metadata_entries),
+            ..limits
+        },
+    )?;
+    let has_more = turns.len() > page_limit;
+    if has_more {
+        turns.truncate(page_limit);
+    }
+    let next_cursor = if has_more {
+        let oldest = turns
+            .last()
+            .expect("a page with earlier history cannot be empty");
+        Some(encode_history_cursor(&RetainedHistoryCursor {
+            version: 2,
+            worker_name: worker_name.to_owned(),
+            session_id: active.session_id.to_string(),
+            active_segment_id: active_segment_id.to_string(),
+            lineage_id: lineage_id.clone(),
+            before_turn_id: oldest.turn.turn_id.clone(),
+            segment_id: oldest.position.segment_id.to_string(),
+            before_offset: oldest.position.before_offset,
+            record_end_offset: oldest.position.record_end_offset,
+            seed_entry_index: oldest.position.seed_entry_index,
+        })?)
+    } else {
+        None
+    };
+    turns.reverse();
+    let compact_ancestor_lineage_ids = compact_ancestor_lineage_ids(active.session_id, &lineage);
     let page = SessionHistoryPage {
         session_id: active.session_id.to_string(),
         lineage_id,
-        turns: page_turns,
+        compact_ancestor_lineage_ids,
+        turns: turns
+            .into_iter()
+            .map(|positioned| positioned.turn)
+            .collect(),
         next_cursor,
         has_more,
     };
@@ -268,17 +323,13 @@ fn load_adopted_lineage(
     session_id: SessionId,
     active_segment_id: SegmentId,
     limits: RetainedHistoryReadLimits,
-) -> Result<(Vec<LoadedLineageSegment>, String), RetainedHistoryReadError> {
+) -> Result<(Vec<LoadedLineageSegment>, String, u64, usize), RetainedHistoryReadError> {
     let mut lineage = Vec::new();
     let mut visited = HashSet::new();
     let mut segment_id = active_segment_id;
     let mut adopted_through_turn = None;
     let mut scanned_bytes = 0_u64;
     let mut scanned_entries = 0_usize;
-    let mut lineage_hash = Sha256::new();
-    lineage_hash.update(b"yoi-retained-history-lineage-v1\0");
-    lineage_hash.update(session_id.as_bytes());
-    lineage_hash.update(active_segment_id.as_bytes());
 
     loop {
         if lineage.len() >= limits.max_segments {
@@ -291,84 +342,149 @@ fn load_adopted_lineage(
             .max_scan_bytes
             .checked_sub(scanned_bytes)
             .ok_or(RetainedHistoryReadError::ResourceLimit)?;
-        let (entries, segment_bytes) = store
-            .read_all_read_only_bounded(session_id, segment_id, remaining_scan_bytes)
+        let (first, segment_bytes, file_len) = store
+            .read_first_log_record_read_only_bounded(session_id, segment_id, remaining_scan_bytes)
             .map_err(map_history_store_error)?;
         scanned_bytes = scanned_bytes
             .checked_add(segment_bytes)
             .ok_or(RetainedHistoryReadError::ResourceLimit)?;
-        scanned_entries = scanned_entries
-            .checked_add(persisted_entry_units(&entries))
-            .ok_or(RetainedHistoryReadError::ResourceLimit)?;
-        if scanned_entries > limits.max_entries {
-            return Err(RetainedHistoryReadError::ResourceLimit);
-        }
-        let origin = validate_segment_start(session_id, &entries)?;
-
-        lineage_hash.update(segment_id.as_bytes());
-        match adopted_through_turn {
-            Some(turn) => {
-                lineage_hash.update([1]);
-                lineage_hash.update((turn as u64).to_be_bytes());
+        if let Some(first) = first.as_ref() {
+            scanned_entries = scanned_entries
+                .checked_add(persisted_entry_units(std::slice::from_ref(&first.entry)))
+                .ok_or(RetainedHistoryReadError::ResourceLimit)?;
+            if scanned_entries > limits.max_entries {
+                return Err(RetainedHistoryReadError::ResourceLimit);
             }
-            None => lineage_hash.update([0]),
         }
-        if let Some(origin) = &origin {
-            lineage_hash.update(match origin.kind {
-                LineageOriginKind::Fork => [1],
-                LineageOriginKind::Compact => [2],
-            });
-            lineage_hash.update(origin.origin.segment_id.as_bytes());
-            lineage_hash.update((origin.origin.at_turn_index as u64).to_be_bytes());
-        } else {
-            lineage_hash.update([0]);
-        }
+        let origin =
+            validate_segment_start_entry(session_id, first.as_ref().map(|entry| &entry.entry))?;
 
+        let seed_entries = if origin.is_none() {
+            let mut seed_records = first
+                .as_ref()
+                .map(|first| vec![first.entry.clone()])
+                .unwrap_or_default();
+            if let Some(first) = first.as_ref() {
+                let remaining_scan_bytes = limits.max_scan_bytes.saturating_sub(scanned_bytes);
+                let (next, next_bytes) = store
+                    .read_next_log_record_read_only_bounded(
+                        session_id,
+                        segment_id,
+                        first.end_offset,
+                        remaining_scan_bytes,
+                    )
+                    .map_err(map_history_store_error)?;
+                scanned_bytes = scanned_bytes
+                    .checked_add(next_bytes)
+                    .ok_or(RetainedHistoryReadError::ResourceLimit)?;
+                if let Some(next) = next {
+                    scanned_entries = scanned_entries
+                        .checked_add(persisted_entry_units(std::slice::from_ref(&next.entry)))
+                        .ok_or(RetainedHistoryReadError::ResourceLimit)?;
+                    if scanned_entries > limits.max_entries {
+                        return Err(RetainedHistoryReadError::ResourceLimit);
+                    }
+                    if matches!(&next.entry, LogEntry::InputSegmentsCheckpoint { .. }) {
+                        seed_records.push(next.entry);
+                    }
+                }
+            }
+            project_session_snapshot_for_segment(session_id, Some(segment_id), &seed_records)
+                .entries
+                .into_iter()
+                .filter(|entry| entry.provenance != SessionEntryProvenance::DerivedSummary)
+                .collect()
+        } else {
+            Vec::new()
+        };
         lineage.push(LoadedLineageSegment {
             segment_id,
             adopted_through_turn,
-            entries,
+            file_len,
+            seed_end_offset: first.as_ref().map(|record| record.end_offset).unwrap_or(0),
+            origin: origin.clone(),
+            seed_entries,
         });
         let Some(origin) = origin else {
             break;
         };
         segment_id = origin.origin.segment_id;
-        adopted_through_turn = Some(
-            adopted_through_turn
-                .map(|boundary| boundary.min(origin.origin.at_turn_index))
-                .unwrap_or(origin.origin.at_turn_index),
-        );
+        adopted_through_turn = Some(origin.origin.at_turn_index);
     }
 
-    lineage.reverse();
-    Ok((lineage, URL_SAFE_NO_PAD.encode(lineage_hash.finalize())))
+    let lineage_id = lineage_identity(session_id, &lineage);
+    Ok((lineage, lineage_id, scanned_bytes, scanned_entries))
 }
 
-fn validate_segment_start(
-    expected_session_id: SessionId,
-    entries: &[LogEntry],
-) -> Result<Option<LineageOrigin>, RetainedHistoryReadError> {
-    if entries.is_empty() {
-        // A freshly reserved active Segment can be empty until its first turn
-        // materializes SegmentStart. The Session manifest still supplies the
-        // same-Session fence, and an empty Segment has no parent lineage.
-        return Ok(None);
+fn lineage_identity(session_id: SessionId, lineage: &[LoadedLineageSegment]) -> String {
+    let active_segment_id = lineage
+        .first()
+        .expect("an adopted lineage always contains its active Segment")
+        .segment_id;
+    let mut hash = Sha256::new();
+    hash.update(b"yoi-retained-history-lineage-v2\0");
+    hash.update(session_id.as_bytes());
+    hash.update(active_segment_id.as_bytes());
+    for (index, segment) in lineage.iter().enumerate() {
+        hash.update(segment.segment_id.as_bytes());
+        let boundary = (index != 0)
+            .then_some(segment.adopted_through_turn)
+            .flatten();
+        match boundary {
+            Some(turn) => {
+                hash.update([1]);
+                hash.update((turn as u64).to_be_bytes());
+            }
+            None => hash.update([0]),
+        }
+        if let Some(origin) = &segment.origin {
+            hash.update(match origin.kind {
+                LineageOriginKind::Fork => [1],
+                LineageOriginKind::Compact => [2],
+            });
+            hash.update(origin.origin.segment_id.as_bytes());
+            hash.update((origin.origin.at_turn_index as u64).to_be_bytes());
+        } else {
+            hash.update([0]);
+        }
     }
-    let Some(LogEntry::AnnotatedSegmentStart {
+    URL_SAFE_NO_PAD.encode(hash.finalize())
+}
+
+fn compact_ancestor_lineage_ids(
+    session_id: SessionId,
+    lineage: &[LoadedLineageSegment],
+) -> Vec<String> {
+    let mut ancestors = Vec::new();
+    for index in 0..lineage.len().saturating_sub(1) {
+        if !matches!(
+            lineage[index].origin.as_ref().map(|origin| origin.kind),
+            Some(LineageOriginKind::Compact)
+        ) {
+            break;
+        }
+        ancestors.push(lineage_identity(session_id, &lineage[index + 1..]));
+    }
+    ancestors
+}
+
+fn validate_segment_start_entry(
+    expected_session_id: SessionId,
+    entry: Option<&LogEntry>,
+) -> Result<Option<LineageOrigin>, RetainedHistoryReadError> {
+    let Some(entry) = entry else {
+        return Ok(None);
+    };
+    let LogEntry::AnnotatedSegmentStart {
         session_id,
         forked_from,
         compacted_from,
         ..
-    }) = entries.first()
+    } = entry
     else {
         return Err(RetainedHistoryReadError::CorruptLog);
     };
-    if *session_id != expected_session_id
-        || entries
-            .iter()
-            .skip(1)
-            .any(|entry| matches!(entry, LogEntry::AnnotatedSegmentStart { .. }))
-    {
+    if *session_id != expected_session_id {
         return Err(RetainedHistoryReadError::CorruptLog);
     }
     match (forked_from, compacted_from) {
@@ -399,113 +515,333 @@ fn persisted_entry_units(entries: &[LogEntry]) -> usize {
     })
 }
 
-fn project_adopted_lineage(
+fn locate_adopted_segment_end(
+    store: &WorkerSessionStore,
     session_id: SessionId,
-    lineage: &[LoadedLineageSegment],
-) -> Result<Vec<SessionSnapshotEntry>, RetainedHistoryReadError> {
-    let mut entries = Vec::<SessionSnapshotEntry>::new();
-    let mut positions = HashMap::<String, usize>::new();
-    let mut excluded_by_boundary = HashSet::<String>::new();
+    segment: &LoadedLineageSegment,
+    limits: RetainedHistoryReadLimits,
+    scanned_bytes: &mut u64,
+    scanned_entries: &mut usize,
+) -> Result<u64, RetainedHistoryReadError> {
+    const FORWARD_BOUNDARY_TURN_THRESHOLD: usize = 64;
 
-    for segment in lineage {
-        let prefix = adopted_segment_prefix(&segment.entries, segment.adopted_through_turn)?;
-        let snapshot =
-            project_session_snapshot_for_segment(session_id, Some(segment.segment_id), prefix);
-        if prefix.len() < segment.entries.len() {
-            let adopted_ids = snapshot
-                .entries
-                .iter()
-                .map(|entry| entry.entry_id.as_str())
-                .collect::<HashSet<_>>();
-            for entry in project_session_snapshot_for_segment(
-                session_id,
-                Some(segment.segment_id),
-                &segment.entries,
-            )
-            .entries
-            {
-                if !adopted_ids.contains(entry.entry_id.as_str()) {
-                    excluded_by_boundary.insert(entry.entry_id);
-                }
-            }
-        }
-        for mut entry in snapshot.entries {
-            if entry.provenance == SessionEntryProvenance::DerivedSummary
-                || excluded_by_boundary.contains(&entry.entry_id)
-            {
-                continue;
-            }
-            if let Some(position) = positions.get(&entry.entry_id).copied() {
-                // A newer seed may carry a richer canonical projection (notably
-                // typed input segments). Keep the original durable timestamp and
-                // ordering while replacing the duplicate representation.
-                entry.timestamp = entries[position].timestamp;
-                entries[position] = entry;
-            } else {
-                positions.insert(entry.entry_id.clone(), entries.len());
-                entries.push(entry);
-            }
-        }
-    }
-    Ok(entries)
-}
-
-fn adopted_segment_prefix(
-    entries: &[LogEntry],
-    adopted_through_turn: Option<usize>,
-) -> Result<&[LogEntry], RetainedHistoryReadError> {
-    let Some(boundary) = adopted_through_turn else {
-        return Ok(entries);
+    let Some(boundary) = segment.adopted_through_turn else {
+        return Ok(segment.file_len);
     };
-    let seed_end = entries
-        .iter()
-        .position(|entry| {
-            !matches!(
-                entry,
-                LogEntry::AnnotatedSegmentStart { .. } | LogEntry::InputSegmentsCheckpoint { .. }
-            )
-        })
-        .unwrap_or(entries.len());
-    if boundary == 0 {
-        return Ok(&entries[..seed_end]);
+    let inherited_turns = segment
+        .origin
+        .as_ref()
+        .map(|origin| origin.origin.at_turn_index)
+        .unwrap_or(0);
+    if boundary <= inherited_turns {
+        // This edge adopts no locally completed turns. The Segment's own
+        // origin remains an independent edge with its original boundary.
+        return Ok(segment.seed_end_offset);
     }
 
-    let mut current_turn_start = seed_end;
-    for (index, entry) in entries.iter().enumerate().skip(seed_end) {
-        match entry {
-            LogEntry::Invoke { .. } => current_turn_start = index,
-            LogEntry::TurnEnd { turn_count, .. } if *turn_count == boundary => {
-                return Ok(&entries[..=index]);
+    // Small/early boundaries are cheapest to resolve from the Segment seed and
+    // must not pay for an arbitrarily large unadopted suffix. Later boundaries
+    // are resolved backward so a large adopted prefix does not have to be read
+    // merely to find the nearby split point.
+    if boundary <= inherited_turns.saturating_add(FORWARD_BOUNDARY_TURN_THRESHOLD) {
+        let mut offset = segment.seed_end_offset;
+        loop {
+            let remaining = limits.max_scan_bytes.saturating_sub(*scanned_bytes);
+            let (record, bytes) = store
+                .read_next_log_record_read_only_bounded(
+                    session_id,
+                    segment.segment_id,
+                    offset,
+                    remaining,
+                )
+                .map_err(map_history_store_error)?;
+            *scanned_bytes = scanned_bytes
+                .checked_add(bytes)
+                .ok_or(RetainedHistoryReadError::ResourceLimit)?;
+            let record = record.ok_or(RetainedHistoryReadError::CorruptLog)?;
+            *scanned_entries = scanned_entries
+                .checked_add(persisted_entry_units(std::slice::from_ref(&record.entry)))
+                .ok_or(RetainedHistoryReadError::ResourceLimit)?;
+            if *scanned_entries > limits.max_entries {
+                return Err(RetainedHistoryReadError::ResourceLimit);
             }
-            LogEntry::TurnEnd { turn_count, .. } if *turn_count > boundary => {
-                return Ok(&entries[..current_turn_start]);
+            offset = record.end_offset;
+            match record.entry {
+                LogEntry::TurnEnd { turn_count, .. } if turn_count == boundary => {
+                    return Ok(offset);
+                }
+                LogEntry::TurnEnd { turn_count, .. } if turn_count > boundary => {
+                    return Err(RetainedHistoryReadError::CorruptLog);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut reader = store
+        .open_retained_segment_reader(session_id, segment.segment_id, segment.file_len)
+        .map_err(map_history_store_error)?;
+    loop {
+        let remaining = limits.max_scan_bytes.saturating_sub(*scanned_bytes);
+        let (record, bytes) = reader
+            .previous_record(remaining)
+            .map_err(map_history_store_error)?;
+        *scanned_bytes = scanned_bytes
+            .checked_add(bytes)
+            .ok_or(RetainedHistoryReadError::ResourceLimit)?;
+        let record = record.ok_or(RetainedHistoryReadError::CorruptLog)?;
+        *scanned_entries = scanned_entries
+            .checked_add(persisted_entry_units(std::slice::from_ref(&record.entry)))
+            .ok_or(RetainedHistoryReadError::ResourceLimit)?;
+        if *scanned_entries > limits.max_entries {
+            return Err(RetainedHistoryReadError::ResourceLimit);
+        }
+        match record.entry {
+            LogEntry::TurnEnd { turn_count, .. } if turn_count == boundary => {
+                return Ok(record.end_offset);
+            }
+            LogEntry::TurnEnd { turn_count, .. } if turn_count < boundary => {
+                return Err(RetainedHistoryReadError::CorruptLog);
+            }
+            LogEntry::AnnotatedSegmentStart { .. } => {
+                return Err(RetainedHistoryReadError::CorruptLog);
             }
             _ => {}
         }
     }
-    Ok(entries)
 }
 
-fn group_conversation_turns(entries: Vec<SessionSnapshotEntry>) -> Vec<SessionConversationTurn> {
+fn read_history_turns_backward(
+    store: &WorkerSessionStore,
+    session_id: SessionId,
+    lineage: &[LoadedLineageSegment],
+    start: Option<(HistoryTurnPosition, &str)>,
+    turn_limit: usize,
+    limits: RetainedHistoryReadLimits,
+) -> Result<Vec<PositionedHistoryTurn>, RetainedHistoryReadError> {
+    let mut scanned_bytes = 0_u64;
+    let mut scanned_entries = 0_usize;
     let mut turns = Vec::new();
-    let mut current: Option<SessionConversationTurn> = None;
-    for entry in entries {
-        if is_user_entry(&entry) {
-            if let Some(turn) = current.take() {
-                turns.push(turn);
+    let mut pending_entries = Vec::new();
+    let mut seen_entries = HashSet::new();
+
+    let (start_segment_index, start_position, cursor_turn_id) = match start {
+        Some((position, turn_id)) => {
+            let index = lineage
+                .iter()
+                .position(|segment| segment.segment_id == position.segment_id)
+                .ok_or(RetainedHistoryReadError::InvalidCursor)?;
+            (index, Some(position), Some(turn_id))
+        }
+        None => (0, None, None),
+    };
+
+    if let (Some(position), Some(turn_id)) = (start_position.as_ref(), cursor_turn_id) {
+        let segment = &lineage[start_segment_index];
+        if let Some(seed_index) = position.seed_entry_index {
+            if start_segment_index + 1 != lineage.len()
+                || position.before_offset != 0
+                || position.record_end_offset.is_some()
+                || segment
+                    .seed_entries
+                    .get(seed_index)
+                    .is_none_or(|entry| entry.entry_id != turn_id || !is_user_entry(entry))
+            {
+                return Err(RetainedHistoryReadError::InvalidCursor);
             }
-            current = Some(SessionConversationTurn {
-                turn_id: entry.entry_id.clone(),
-                entries: vec![entry],
-            });
-        } else if let Some(turn) = current.as_mut() {
-            turn.entries.push(entry);
+        } else {
+            let record_end = position
+                .record_end_offset
+                .ok_or(RetainedHistoryReadError::InvalidCursor)?;
+            let remaining = limits.max_scan_bytes.saturating_sub(scanned_bytes);
+            let record = store
+                .read_log_record_range_read_only_bounded(
+                    session_id,
+                    segment.segment_id,
+                    position.before_offset,
+                    record_end,
+                    remaining,
+                )
+                .map_err(map_history_cursor_store_error)?;
+            scanned_bytes = scanned_bytes
+                .checked_add(record.end_offset - record.start_offset)
+                .ok_or(RetainedHistoryReadError::ResourceLimit)?;
+            if record.start_offset != position.before_offset
+                || !project_history_record(session_id, segment.segment_id, &record.entry)
+                    .iter()
+                    .any(|entry| entry.entry_id == turn_id && is_user_entry(entry))
+            {
+                return Err(RetainedHistoryReadError::InvalidCursor);
+            }
+            scanned_entries = scanned_entries
+                .checked_add(persisted_entry_units(std::slice::from_ref(&record.entry)))
+                .ok_or(RetainedHistoryReadError::ResourceLimit)?;
+            if scanned_entries > limits.max_entries {
+                return Err(RetainedHistoryReadError::ResourceLimit);
+            }
         }
     }
-    if let Some(turn) = current {
-        turns.push(turn);
+
+    for (segment_index, segment) in lineage.iter().enumerate().skip(start_segment_index) {
+        let starting_here = segment_index == start_segment_index;
+        if starting_here
+            && start_position
+                .as_ref()
+                .and_then(|position| position.seed_entry_index)
+                .is_some()
+        {
+            let seed_index = start_position
+                .as_ref()
+                .and_then(|position| position.seed_entry_index)
+                .expect("checked seed cursor");
+            if collect_history_entries_backward(
+                &segment.seed_entries[..seed_index],
+                segment.segment_id,
+                0,
+                None,
+                true,
+                turn_limit,
+                &mut seen_entries,
+                &mut pending_entries,
+                &mut turns,
+            ) {
+                return Ok(turns);
+            }
+            continue;
+        }
+
+        let adopted_end = locate_adopted_segment_end(
+            store,
+            session_id,
+            segment,
+            limits,
+            &mut scanned_bytes,
+            &mut scanned_entries,
+        )?;
+        let before_offset = if starting_here {
+            start_position
+                .as_ref()
+                .map(|position| position.before_offset)
+                .unwrap_or(adopted_end)
+        } else {
+            adopted_end
+        };
+        if before_offset > adopted_end {
+            return Err(RetainedHistoryReadError::InvalidCursor);
+        }
+        let mut reader = store
+            .open_retained_segment_reader(session_id, segment.segment_id, before_offset)
+            .map_err(map_history_store_error)?;
+        loop {
+            let remaining = limits.max_scan_bytes.saturating_sub(scanned_bytes);
+            let (record, bytes) = reader
+                .previous_record(remaining)
+                .map_err(map_history_store_error)?;
+            scanned_bytes = scanned_bytes
+                .checked_add(bytes)
+                .ok_or(RetainedHistoryReadError::ResourceLimit)?;
+            let Some(record) = record else {
+                break;
+            };
+            scanned_entries = scanned_entries
+                .checked_add(persisted_entry_units(std::slice::from_ref(&record.entry)))
+                .ok_or(RetainedHistoryReadError::ResourceLimit)?;
+            if scanned_entries > limits.max_entries {
+                return Err(RetainedHistoryReadError::ResourceLimit);
+            }
+            if matches!(record.entry, LogEntry::AnnotatedSegmentStart { .. }) {
+                if record.start_offset != 0 {
+                    return Err(RetainedHistoryReadError::CorruptLog);
+                }
+                continue;
+            }
+            let entries = project_history_record(session_id, segment.segment_id, &record.entry);
+            if collect_history_entries_backward(
+                &entries,
+                segment.segment_id,
+                record.start_offset,
+                Some(record.end_offset),
+                false,
+                turn_limit,
+                &mut seen_entries,
+                &mut pending_entries,
+                &mut turns,
+            ) {
+                return Ok(turns);
+            }
+        }
+
+        if segment_index + 1 == lineage.len()
+            && collect_history_entries_backward(
+                &segment.seed_entries,
+                segment.segment_id,
+                0,
+                None,
+                true,
+                turn_limit,
+                &mut seen_entries,
+                &mut pending_entries,
+                &mut turns,
+            )
+        {
+            return Ok(turns);
+        }
     }
-    turns
+    Ok(turns)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_history_entries_backward(
+    entries: &[SessionSnapshotEntry],
+    segment_id: SegmentId,
+    before_offset: u64,
+    record_end_offset: Option<u64>,
+    seed: bool,
+    turn_limit: usize,
+    seen_entries: &mut HashSet<String>,
+    pending_entries: &mut Vec<SessionSnapshotEntry>,
+    turns: &mut Vec<PositionedHistoryTurn>,
+) -> bool {
+    for (index, entry) in entries.iter().enumerate().rev() {
+        if entry.provenance == SessionEntryProvenance::DerivedSummary
+            || !seen_entries.insert(entry.entry_id.clone())
+        {
+            continue;
+        }
+        pending_entries.push(entry.clone());
+        if is_user_entry(entry) {
+            let mut turn_entries = std::mem::take(pending_entries);
+            turn_entries.reverse();
+            turns.push(PositionedHistoryTurn {
+                turn: SessionConversationTurn {
+                    turn_id: entry.entry_id.clone(),
+                    entries: turn_entries,
+                },
+                position: HistoryTurnPosition {
+                    segment_id,
+                    before_offset,
+                    record_end_offset,
+                    seed_entry_index: seed.then_some(index),
+                },
+            });
+            if turns.len() >= turn_limit {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn project_history_record(
+    session_id: SessionId,
+    segment_id: SegmentId,
+    record: &LogEntry,
+) -> Vec<SessionSnapshotEntry> {
+    project_session_snapshot_for_segment(session_id, Some(segment_id), std::slice::from_ref(record))
+        .entries
+        .into_iter()
+        .filter(|entry| entry.provenance != SessionEntryProvenance::DerivedSummary)
+        .collect()
 }
 
 fn is_user_entry(entry: &SessionSnapshotEntry) -> bool {
@@ -550,6 +886,13 @@ fn map_history_worker_store_error(error: WorkerStoreError) -> RetainedHistoryRea
             RetainedHistoryReadError::CorruptLog
         }
         WorkerStoreError::Io(_) => RetainedHistoryReadError::StorageUnavailable,
+    }
+}
+
+fn map_history_cursor_store_error(error: StoreError) -> RetainedHistoryReadError {
+    match error {
+        StoreError::ReadLimitExceeded => RetainedHistoryReadError::ResourceLimit,
+        _ => RetainedHistoryReadError::InvalidCursor,
     }
 }
 
@@ -1120,6 +1463,7 @@ mod tests {
         );
         assert!(newest.has_more);
         assert!(newest.next_cursor.is_some());
+        assert_eq!(newest.compact_ancestor_lineage_ids.len(), 2);
         assert_eq!(
             newest.turns[2]
                 .entries
@@ -1465,11 +1809,43 @@ mod tests {
             .unwrap_err(),
             RetainedHistoryReadError::InvalidCursor
         );
+        let mut tampered = decode_history_cursor(&cursor).unwrap();
+        tampered.before_turn_id = "user-1".to_string();
+        let tampered = encode_history_cursor(&tampered).unwrap();
+        assert_eq!(
+            read_retained_session_history_page(
+                &aggregate_a,
+                "worker-a",
+                Some(&tampered),
+                None,
+                RetainedHistoryReadLimits::default(),
+            )
+            .unwrap_err(),
+            RetainedHistoryReadError::InvalidCursor
+        );
 
         let aggregate = WorkerAggregateStore::new(&aggregate_a, "worker-a").unwrap();
         let metadata = aggregate.read_by_name("worker-a").unwrap().unwrap();
         let active = metadata.active.unwrap();
         let old_segment = active.segment_id.unwrap();
+        let mut appended = Vec::new();
+        append_turn(&mut appended, 7);
+        let session = WorkerSessionStore::new(aggregate_a.join("session")).unwrap();
+        for entry in appended {
+            session
+                .append(active.session_id, old_segment, &entry)
+                .unwrap();
+        }
+        let older = read_retained_session_history_page(
+            &aggregate_a,
+            "worker-a",
+            Some(&cursor),
+            None,
+            RetainedHistoryReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(turn_ids(&older), vec!["user-1"]);
+
         let new_segment = crate::new_segment_id();
         WorkerSessionStore::new(aggregate_a.join("session"))
             .unwrap()
@@ -1507,6 +1883,347 @@ mod tests {
             .unwrap_err(),
             RetainedHistoryReadError::InvalidCursor
         );
+    }
+
+    #[test]
+    fn retained_history_reads_only_a_bounded_suffix_for_each_page() {
+        let worker_name = "worker-bounded-backward-pages";
+        let session_id = crate::new_session_id();
+        let segment_id = crate::new_segment_id();
+        let mut log = vec![segment_start(session_id, Vec::new(), None, None)];
+        for turn in 1..=200 {
+            append_turn(&mut log, turn);
+        }
+        let (_root, aggregate_root) =
+            persist_history_fixture(worker_name, session_id, segment_id, vec![(segment_id, log)]);
+        let limits = RetainedHistoryReadLimits {
+            max_scan_bytes: 64 * 1024,
+            ..RetainedHistoryReadLimits::default()
+        };
+        assert!(
+            std::fs::metadata(
+                aggregate_root
+                    .join("session/segments")
+                    .join(format!("{segment_id}.jsonl")),
+            )
+            .unwrap()
+            .len()
+                > limits.max_scan_bytes,
+            "the fixture must be larger than one page's complete scan budget",
+        );
+
+        let newest =
+            read_retained_session_history_page(&aggregate_root, worker_name, None, None, limits)
+                .unwrap();
+        assert_eq!(
+            turn_ids(&newest),
+            vec!["user-196", "user-197", "user-198", "user-199", "user-200"]
+        );
+
+        let earlier = read_retained_session_history_page(
+            &aggregate_root,
+            worker_name,
+            newest.next_cursor.as_deref(),
+            None,
+            limits,
+        )
+        .unwrap();
+        assert_eq!(
+            turn_ids(&earlier),
+            vec!["user-191", "user-192", "user-193", "user-194", "user-195"]
+        );
+    }
+
+    #[test]
+    fn retained_history_does_not_scan_a_fork_sources_unadopted_suffix() {
+        let worker_name = "worker-bounded-fork-prefix";
+        let session_id = crate::new_session_id();
+        let source_segment = crate::new_segment_id();
+        let active_segment = crate::new_segment_id();
+        let mut source_log = vec![segment_start(session_id, Vec::new(), None, None)];
+        for turn in 1..=200 {
+            append_turn(&mut source_log, turn);
+        }
+        let mut active_log = vec![segment_start(
+            session_id,
+            Vec::new(),
+            Some(SegmentOrigin {
+                segment_id: source_segment,
+                at_turn_index: 5,
+            }),
+            None,
+        )];
+        append_turn(&mut active_log, 201);
+        let (_root, aggregate_root) = persist_history_fixture(
+            worker_name,
+            session_id,
+            active_segment,
+            vec![(source_segment, source_log), (active_segment, active_log)],
+        );
+        let limits = RetainedHistoryReadLimits {
+            max_scan_bytes: 64 * 1024,
+            ..RetainedHistoryReadLimits::default()
+        };
+        assert!(
+            std::fs::metadata(
+                aggregate_root
+                    .join("session/segments")
+                    .join(format!("{source_segment}.jsonl")),
+            )
+            .unwrap()
+            .len()
+                > limits.max_scan_bytes,
+        );
+
+        let page =
+            read_retained_session_history_page(&aggregate_root, worker_name, None, None, limits)
+                .unwrap();
+        assert_eq!(
+            turn_ids(&page),
+            vec!["user-2", "user-3", "user-4", "user-5", "user-201"]
+        );
+        assert!(page.has_more);
+    }
+
+    #[test]
+    fn retained_history_pages_within_one_root_seed_record() {
+        let worker_name = "worker-root-seed-pages";
+        let session_id = crate::new_session_id();
+        let segment_id = crate::new_segment_id();
+        let history = (1..=12)
+            .flat_map(|turn| [user_message(turn), assistant_message(turn, "final")])
+            .collect();
+        let log = vec![
+            segment_start(session_id, history, None, None),
+            LogEntry::InputSegmentsCheckpoint {
+                ts: 2,
+                user_segments: (1..=12)
+                    .map(|turn| {
+                        vec![Segment::Text {
+                            content: format!("typed request {turn}"),
+                        }]
+                    })
+                    .collect(),
+            },
+        ];
+        let (_root, aggregate_root) =
+            persist_history_fixture(worker_name, session_id, segment_id, vec![(segment_id, log)]);
+
+        let newest = read_retained_session_history_page(
+            &aggregate_root,
+            worker_name,
+            None,
+            None,
+            RetainedHistoryReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            turn_ids(&newest),
+            vec!["user-8", "user-9", "user-10", "user-11", "user-12"]
+        );
+        assert_eq!(
+            newest.turns[0].entries[0].data,
+            SessionSnapshotEntryData::UserInput {
+                segments: vec![Segment::Text {
+                    content: "typed request 8".to_string(),
+                }],
+            }
+        );
+        let middle = read_retained_session_history_page(
+            &aggregate_root,
+            worker_name,
+            newest.next_cursor.as_deref(),
+            None,
+            RetainedHistoryReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            turn_ids(&middle),
+            vec!["user-3", "user-4", "user-5", "user-6", "user-7"]
+        );
+        let oldest = read_retained_session_history_page(
+            &aggregate_root,
+            worker_name,
+            middle.next_cursor.as_deref(),
+            None,
+            RetainedHistoryReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(turn_ids(&oldest), vec!["user-1", "user-2"]);
+        assert!(!oldest.has_more);
+    }
+
+    #[test]
+    fn retained_history_keeps_each_nested_lineage_edge_boundary_local() {
+        let worker_name = "worker-nested-boundaries";
+        let session_id = crate::new_session_id();
+        let root_segment = crate::new_segment_id();
+        let middle_segment = crate::new_segment_id();
+        let active_segment = crate::new_segment_id();
+        let mut root_log = vec![segment_start(session_id, Vec::new(), None, None)];
+        for turn in 1..=3 {
+            append_turn(&mut root_log, turn);
+        }
+        let middle_log = vec![segment_start(
+            session_id,
+            vec![user_message(3), assistant_message(3, "final")],
+            Some(SegmentOrigin {
+                segment_id: root_segment,
+                at_turn_index: 3,
+            }),
+            None,
+        )];
+        let mut active_log = vec![segment_start(
+            session_id,
+            Vec::new(),
+            Some(SegmentOrigin {
+                segment_id: middle_segment,
+                at_turn_index: 0,
+            }),
+            None,
+        )];
+        append_turn(&mut active_log, 4);
+        let (_root, aggregate_root) = persist_history_fixture(
+            worker_name,
+            session_id,
+            active_segment,
+            vec![
+                (root_segment, root_log),
+                (middle_segment, middle_log),
+                (active_segment, active_log),
+            ],
+        );
+
+        let page = read_retained_session_history_page(
+            &aggregate_root,
+            worker_name,
+            None,
+            None,
+            RetainedHistoryReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            turn_ids(&page),
+            vec!["user-1", "user-2", "user-3", "user-4"]
+        );
+    }
+
+    #[test]
+    fn retained_history_resolves_an_immediate_consecutive_compact_at_the_seed() {
+        let worker_name = "worker-consecutive-compact";
+        let session_id = crate::new_session_id();
+        let root_segment = crate::new_segment_id();
+        let middle_segment = crate::new_segment_id();
+        let active_segment = crate::new_segment_id();
+        let mut root_log = vec![segment_start(session_id, Vec::new(), None, None)];
+        for turn in 1..=5 {
+            append_turn(&mut root_log, turn);
+        }
+        let middle_log = vec![segment_start(
+            session_id,
+            Vec::new(),
+            None,
+            Some(SegmentOrigin {
+                segment_id: root_segment,
+                at_turn_index: 5,
+            }),
+        )];
+        let active_log = vec![segment_start(
+            session_id,
+            Vec::new(),
+            None,
+            Some(SegmentOrigin {
+                segment_id: middle_segment,
+                at_turn_index: 5,
+            }),
+        )];
+        let (_root, aggregate_root) = persist_history_fixture(
+            worker_name,
+            session_id,
+            active_segment,
+            vec![
+                (root_segment, root_log),
+                (middle_segment, middle_log),
+                (active_segment, active_log),
+            ],
+        );
+
+        let page = read_retained_session_history_page(
+            &aggregate_root,
+            worker_name,
+            None,
+            None,
+            RetainedHistoryReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            turn_ids(&page),
+            vec!["user-1", "user-2", "user-3", "user-4", "user-5"]
+        );
+        assert_eq!(page.compact_ancestor_lineage_ids.len(), 2);
+    }
+
+    #[test]
+    fn retained_history_finds_a_late_adopted_boundary_from_the_tail() {
+        let worker_name = "worker-late-adopted-boundary";
+        let session_id = crate::new_session_id();
+        let source_segment = crate::new_segment_id();
+        let active_segment = crate::new_segment_id();
+        let mut source_log = vec![segment_start(session_id, Vec::new(), None, None)];
+        append_turn(&mut source_log, 1);
+        source_log.insert(
+            3,
+            LogEntry::AnnotatedAssistantItem {
+                ts: 12,
+                entry: history_message(
+                    "assistant-1-large",
+                    LoggedRole::Assistant,
+                    "x".repeat(300 * 1024),
+                    LoggedSessionHistoryOrigin::LegacyUnknown,
+                ),
+            },
+        );
+        for turn in 2..=101 {
+            append_turn(&mut source_log, turn);
+        }
+        let active_log = vec![segment_start(
+            session_id,
+            Vec::new(),
+            Some(SegmentOrigin {
+                segment_id: source_segment,
+                at_turn_index: 100,
+            }),
+            None,
+        )];
+        let (_root, aggregate_root) = persist_history_fixture(
+            worker_name,
+            session_id,
+            active_segment,
+            vec![(source_segment, source_log), (active_segment, active_log)],
+        );
+        let limits = RetainedHistoryReadLimits {
+            max_scan_bytes: 256 * 1024,
+            ..RetainedHistoryReadLimits::default()
+        };
+        assert!(
+            std::fs::metadata(
+                aggregate_root
+                    .join("session/segments")
+                    .join(format!("{source_segment}.jsonl")),
+            )
+            .unwrap()
+            .len()
+                > limits.max_scan_bytes,
+        );
+
+        let page =
+            read_retained_session_history_page(&aggregate_root, worker_name, None, None, limits)
+                .unwrap();
+        assert_eq!(
+            turn_ids(&page),
+            vec!["user-96", "user-97", "user-98", "user-99", "user-100"]
+        );
+        assert!(page.has_more);
     }
 
     #[test]
@@ -1574,7 +2291,7 @@ mod tests {
         let worker_name = "worker-oversized-turn";
         let session_id = crate::new_session_id();
         let segment_id = crate::new_segment_id();
-        let body = "x".repeat(4096);
+        let body = "x".repeat(128 * 1024);
         let log = vec![
             segment_start(session_id, Vec::new(), None, None),
             LogEntry::Invoke {

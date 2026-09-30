@@ -286,14 +286,16 @@ export function mergeCommittedHistoryLines(
   history: ConsoleLine[],
   current: ConsoleLine[],
 ): ConsoleLine[] {
-  const committed = new Set(
-    history.map((line) => line.entryId).filter((id): id is string =>
+  const currentEntryIds = new Set(
+    current.map((line) => line.entryId).filter((id): id is string =>
       Boolean(id)
     ),
   );
   return [
-    ...history,
-    ...current.filter((line) => !line.entryId || !committed.has(line.entryId)),
+    ...history.filter((line) =>
+      !line.entryId || !currentEntryIds.has(line.entryId)
+    ),
+    ...current,
   ];
 }
 

@@ -9,6 +9,7 @@ import {
   consoleWorkerViews,
   createConsoleProjector,
   isConsoleProjectionEvent,
+  mergeCommittedHistoryLines,
   projectConsole,
   projectConsoleLines,
   projectOverviewLines,
@@ -3079,4 +3080,49 @@ Deno.test("committed tool identities reconcile one live call block", () => {
   );
   assertEquals(lines[0].entryId, "tool-result-entry");
   assertEquals(lines[0].toolCall?.state, "done");
+});
+
+Deno.test("committed history preserves unmatched current rows in stable entry order", () => {
+  const history = [2, 3, 4, 5, 6].flatMap((turn) => {
+    const user = consoleLine(`history-user-${turn}`, "user");
+    user.entryId = `user-${turn}`;
+    const assistant = consoleLine(`history-assistant-${turn}`, "assistant");
+    assistant.entryId = `assistant-${turn}`;
+    return [user, assistant];
+  });
+  const current = [1, 2, 3, 4, 5, 6].flatMap((turn) => {
+    const user = consoleLine(`current-user-${turn}`, "user");
+    user.entryId = `user-${turn}`;
+    const assistant = consoleLine(`current-assistant-${turn}`, "assistant");
+    assistant.entryId = `assistant-${turn}`;
+    return [user, assistant];
+  });
+
+  const merged = mergeCommittedHistoryLines(history, current);
+  assertEquals(
+    merged.map((line) => line.entryId),
+    [1, 2, 3, 4, 5, 6].flatMap((turn) => [
+      `user-${turn}`,
+      `assistant-${turn}`,
+    ]),
+  );
+  assert(
+    merged.every((line) => line.id.startsWith("current-")),
+    "the ordered current snapshot must remain authoritative for overlapping entries",
+  );
+});
+
+Deno.test("committed history inserts current live rows after their last stable anchor", () => {
+  const historyUser = consoleLine("history-user", "user");
+  historyUser.entryId = "user-1";
+  const currentUser = consoleLine("current-user", "user");
+  currentUser.entryId = "user-1";
+  const live = consoleLine("live-assistant", "in_flight");
+
+  assertEquals(
+    mergeCommittedHistoryLines([historyUser], [currentUser, live]).map((line) =>
+      line.id
+    ),
+    ["current-user", "live-assistant"],
+  );
 });

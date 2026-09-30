@@ -6,6 +6,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/svelte";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type {
@@ -112,6 +113,7 @@ function emptyHistoryPage() {
     page: {
       session_id: "session-a",
       lineage_id: "lineage-a",
+      compact_ancestor_lineage_ids: [],
       turns: [],
       next_cursor: null,
       has_more: false,
@@ -125,6 +127,7 @@ function historyPage(indices: number[], cursor: string | null) {
     page: {
       session_id: "session-a",
       lineage_id: "lineage-a",
+      compact_ancestor_lineage_ids: [],
       turns: indices.map((index) => ({
         turn_id: `user-${index}`,
         entries: [
@@ -296,7 +299,10 @@ test("applies retained empty and nonempty snapshots before showing their read-on
     snapshot: sessionWithUserMessage("retained message"),
   }));
 
-  expect(await screen.findByText("retained message")).not.toBeNull();
+  expect(
+    await within(screen.getByRole("article", { name: "main transcript" }))
+      .findByText("retained message"),
+  ).not.toBeNull();
   expect(screen.getByText("Read-only retained conversation")).not.toBeNull();
   expect(screen.queryByText("No conversation to display")).toBeNull();
 });
@@ -364,17 +370,107 @@ test("preserves rendered content while reconnecting", async () => {
   latestListener().onFrame(
     subscribedFrame(sessionWithUserMessage("kept message")),
   );
-  expect(await screen.findByText("kept message")).not.toBeNull();
+  expect(
+    await within(screen.getByRole("article", { name: "main transcript" }))
+      .findByText("kept message"),
+  ).not.toBeNull();
 
   latestListener().onStatus?.("closed", "Workspace subscription disconnected");
   expect(await screen.findByText("Conversation updates are unavailable")).not
     .toBeNull();
-  expect(screen.getByText("kept message")).not.toBeNull();
+  expect(
+    within(screen.getByRole("article", { name: "main transcript" })).getByText(
+      "kept message",
+    ),
+  ).not.toBeNull();
   expect(screen.queryByText("No conversation to display")).toBeNull();
 
   latestListener().onStatus?.("connecting", "resubscribing");
   expect(await screen.findByText("Refreshing conversation")).not.toBeNull();
-  expect(screen.getByText("kept message")).not.toBeNull();
+  expect(
+    within(screen.getByRole("article", { name: "main transcript" })).getByText(
+      "kept message",
+    ),
+  ).not.toBeNull();
+});
+
+test("reconnect snapshot refreshes lineage and removes stale sibling history", async () => {
+  let historyRequests = 0;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL) => {
+      if (!String(input).includes("/session/history")) {
+        return Promise.resolve(
+          Response.json({ availability: "live_protocol" }),
+        );
+      }
+      historyRequests += 1;
+      const response = historyPage([historyRequests], null);
+      if (historyRequests === 2) {
+        response.page.lineage_id = "lineage-b";
+      }
+      return Promise.resolve(Response.json(response));
+    }),
+  );
+
+  render(ConsolePage, { data: pageData() });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
+  latestListener().onFrame(
+    subscribedFrame(sessionWithUserMessage("lineage A current")),
+  );
+  await waitFor(() =>
+    expect(screen.getAllByText("question 1")).toHaveLength(2)
+  );
+
+  latestListener().onStatus?.("closed", "disconnected during rewind");
+  latestListener().onStatus?.("connecting", "reconnecting");
+  latestListener().onFrame(
+    subscribedFrame(sessionWithUserMessage("lineage B current")),
+  );
+
+  await waitFor(() =>
+    expect(screen.getAllByText("question 2")).toHaveLength(2)
+  );
+  expect(screen.queryByText("question 1")).toBeNull();
+  expect(historyRequests).toBe(2);
+});
+
+test("snapshot supersedes an in-flight page before stale lineage can render", async () => {
+  const staleHistory = deferred<Response>();
+  let historyRequests = 0;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL) => {
+      if (!String(input).includes("/session/history")) {
+        return Promise.resolve(
+          Response.json({ availability: "live_protocol" }),
+        );
+      }
+      historyRequests += 1;
+      if (historyRequests === 1) return staleHistory.promise;
+      const response = historyPage([2], null);
+      response.page.lineage_id = "lineage-b";
+      return Promise.resolve(Response.json(response));
+    }),
+  );
+
+  render(ConsolePage, { data: pageData() });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
+  latestListener().onFrame(
+    subscribedFrame(sessionWithUserMessage("lineage A current")),
+  );
+  await waitFor(() => expect(historyRequests).toBe(1));
+
+  latestListener().onFrame(
+    subscribedFrame(sessionWithUserMessage("lineage B current")),
+  );
+  staleHistory.resolve(Response.json(historyPage([1], null)));
+
+  await waitFor(() =>
+    expect(screen.getAllByText("question 2")).toHaveLength(2)
+  );
+  expect(screen.queryByText("question 1")).toBeNull();
+  expect(historyRequests).toBe(2);
 });
 
 test("route changes clear prior content and fence stale Session responses", async () => {
@@ -400,7 +496,10 @@ test("route changes clear prior content and fence stale Session responses", asyn
   latestListener().onFrame(
     subscribedFrame(sessionWithUserMessage("previous worker content")),
   );
-  expect(await screen.findByText("previous worker content")).not.toBeNull();
+  expect(
+    await within(screen.getByRole("article", { name: "main transcript" }))
+      .findByText("previous worker content"),
+  ).not.toBeNull();
 
   latestListener().onStatus?.("closed", "reload old worker");
   await fireEvent.click(
@@ -408,7 +507,10 @@ test("route changes clear prior content and fence stale Session responses", asyn
   );
   await waitFor(() => expect(firstWorkerLoads).toBe(2));
   await view.rerender({ data: pageData("worker-b", "runtime-b") });
-  expect(screen.queryByText("previous worker content")).toBeNull();
+  expect(
+    within(screen.getByRole("article", { name: "main transcript" }))
+      .queryByText("previous worker content"),
+  ).toBeNull();
   expect(screen.getByRole("status").textContent).toContain(
     "Loading conversation",
   );
@@ -417,7 +519,12 @@ test("route changes clear prior content and fence stale Session responses", asyn
     availability: "retained_snapshot",
     snapshot: sessionWithUserMessage("current worker content"),
   }));
-  expect(await screen.findByText("current worker content")).not.toBeNull();
+  expect(
+    await within(screen.getByRole("article", { name: "main transcript" }))
+      .findByText(
+        "current worker content",
+      ),
+  ).not.toBeNull();
 
   staleReload.resolve(Response.json({
     availability: "unavailable",
@@ -425,8 +532,15 @@ test("route changes clear prior content and fence stale Session responses", asyn
   }));
   await settleMicrotasks();
   expect(screen.queryByText("stale worker error")).toBeNull();
-  expect(screen.queryByText("previous worker content")).toBeNull();
-  expect(screen.getByText("current worker content")).not.toBeNull();
+  expect(
+    within(screen.getByRole("article", { name: "main transcript" }))
+      .queryByText("previous worker content"),
+  ).toBeNull();
+  expect(
+    within(screen.getByRole("article", { name: "main transcript" })).getByText(
+      "current worker content",
+    ),
+  ).not.toBeNull();
 });
 
 test("loads retained conversation turns five at a time into the log and turn bar", async () => {
@@ -436,6 +550,7 @@ test("loads retained conversation turns five at a time into the log and turn bar
       page: {
         session_id: "session-a",
         lineage_id: "lineage-a",
+        compact_ancestor_lineage_ids: [],
         turns: [8, 9, 10, 11, 12].map((index) => ({
           turn_id: `user-${index}`,
           entries: [
@@ -466,6 +581,7 @@ test("loads retained conversation turns five at a time into the log and turn bar
       page: {
         session_id: "session-a",
         lineage_id: "lineage-a",
+        compact_ancestor_lineage_ids: [],
         turns: [3, 4, 5, 6, 7].map((index) => ({
           turn_id: `user-${index}`,
           entries: [{
@@ -567,7 +683,10 @@ test("keeps live content when history fails and retries the bounded page explici
     subscribedFrame(sessionWithUserMessage("current response remains")),
   );
 
-  expect(await screen.findByText("current response remains")).not.toBeNull();
+  expect(
+    await within(screen.getByRole("article", { name: "main transcript" }))
+      .findByText("current response remains"),
+  ).not.toBeNull();
   await fireEvent.click(
     await screen.findByRole("button", {
       name: "Earlier conversation unavailable · retry",
@@ -577,7 +696,11 @@ test("keeps live content when history fails and retries the bounded page explici
     expect(screen.getAllByText("question 1")).toHaveLength(2)
   );
   expect(historyRequests).toBe(2);
-  expect(screen.getByText("current response remains")).not.toBeNull();
+  expect(
+    within(screen.getByRole("article", { name: "main transcript" })).getByText(
+      "current response remains",
+    ),
+  ).not.toBeNull();
   expect(screen.getAllByText("Start of conversation")).toHaveLength(2);
 });
 

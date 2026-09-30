@@ -98,10 +98,20 @@ Deno.test("production Console pages backward by real turns while preserving both
         );
       }
       const navigation = page.getByRole("complementary", { name: "Conversation turns" });
-      await navigation.getByText("question 8", { exact: true }).waitFor();
+      await navigation.getByText("question 7", { exact: true }).waitFor();
       assertEquals(await historyRequestCount(baseUrl), 1);
-      assertEquals(await transcript.getByText(/^question (8|9|10|11|12)$/).count(), 5);
-      assertEquals(await navigation.getByText(/^question (8|9|10|11|12)$/).count(), 5);
+      assertEquals(await transcript.getByText(/^question (7|8|9|10|11|12)$/).count(), 6);
+      assertEquals(await navigation.getByText(/^question (7|8|9|10|11|12)$/).count(), 6);
+      const currentQuestionTop = await transcript
+        .getByText("question 7", { exact: true })
+        .evaluate((element) => element.getBoundingClientRect().top);
+      const retainedQuestionTop = await transcript
+        .getByText("question 8", { exact: true })
+        .evaluate((element) => element.getBoundingClientRect().top);
+      assert(
+        currentQuestionTop < retainedQuestionTop,
+        "the unmatched current-snapshot turn must precede overlapping retained history",
+      );
 
       const question12 = navigation.getByRole("button", {
         name: "Jump to conversation: question 12",

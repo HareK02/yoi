@@ -155,7 +155,14 @@ export type SessionHistoryPage = { session_id: string,
 /**
  * Stable identity of the adopted active lineage used to fence stale pages.
  */
-lineage_id: string, turns: Array<SessionConversationTurn>, next_cursor?: string | null, has_more: boolean, };
+lineage_id: string,
+/**
+ * Older lineage identities that the active lineage fully adopted through
+ * one or more consecutive Compact rotations. Clients may retain already
+ * loaded turns when their prior lineage appears here, while replacing the
+ * cursor with this page's boundary.
+ */
+compact_ancestor_lineage_ids?: Array<string>, turns: Array<SessionConversationTurn>, next_cursor?: string | null, has_more: boolean, };
 
 export type PendingSubmissionSummary = { submission_id: string, accepted_at_ms: number, segment_count: number, byte_len: number, };
 

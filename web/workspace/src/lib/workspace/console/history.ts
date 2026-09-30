@@ -1,3 +1,4 @@
+import type { ConsoleLine } from "./model.ts";
 import type {
   SessionConversationTurn,
   SessionHistoryPage,
@@ -83,9 +84,19 @@ export function applyConsoleHistoryPage(
   const refreshingSameSession = initial &&
     state.sessionId === page.session_id &&
     state.turns.length > 0;
+  const refreshingSameLineage = refreshingSameSession &&
+    state.lineageId === page.lineage_id;
+  const refreshingCompactDescendant = refreshingSameSession &&
+    state.lineageId !== null &&
+    (page.compact_ancestor_lineage_ids ?? []).includes(state.lineageId);
+  const refreshBridgesRetained = refreshingSameLineage && incoming.some(
+    (turn) => state.turns.some((retained) => retained.turn_id === turn.turn_id),
+  );
   const turns = initial
-    ? refreshingSameSession
+    ? refreshingSameLineage || refreshingCompactDescendant
       ? mergeRefreshedTurns(state.turns, incoming)
+      : refreshingSameSession
+      ? reconcileChangedLineage(state.turns, incoming)
       : dedupeTurns(incoming)
     : dedupeTurns([...incoming, ...state.turns]);
   return {
@@ -93,8 +104,8 @@ export function applyConsoleHistoryPage(
     sessionId: page.session_id,
     lineageId: page.lineage_id,
     turns,
-    cursor: refreshingSameSession ? state.cursor : (page.next_cursor ?? null),
-    hasMore: refreshingSameSession ? state.hasMore : page.has_more,
+    cursor: refreshBridgesRetained ? state.cursor : (page.next_cursor ?? null),
+    hasMore: refreshBridgesRetained ? state.hasMore : page.has_more,
     status: "ready",
     error: null,
     requestedCursor: null,
@@ -144,18 +155,84 @@ export function conversationTurnPreviews(
       .filter(isAssistantEntry)
       .map(entryText)
       .filter((text) => text.trim().length > 0);
-    const assistant = (assistants.at(-1) ?? "")
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .slice(0, 3);
     return {
       turnId: turn.turn_id,
       lineId: userEntry?.entry_id ?? turn.turn_id,
       user: firstNonEmptyLine(userEntry ? entryText(userEntry) : ""),
-      assistant,
+      assistant: previewAssistant(assistants.at(-1) ?? ""),
     };
   });
+}
+
+export function conversationTurnPreviewsFromLines(
+  lines: readonly ConsoleLine[],
+): ConsoleTurnPreview[] {
+  const previews: ConsoleTurnPreview[] = [];
+  let current: {
+    turnId: string;
+    lineId: string;
+    user: string;
+    assistants: string[];
+  } | null = null;
+  for (const line of lines) {
+    if (line.kind === "user") {
+      if (current) {
+        previews.push({
+          turnId: current.turnId,
+          lineId: current.lineId,
+          user: current.user,
+          assistant: previewAssistant(current.assistants.at(-1) ?? ""),
+        });
+      }
+      const stableId = line.entryId ?? line.id;
+      current = {
+        turnId: stableId,
+        lineId: stableId,
+        user: firstNonEmptyLine(line.body),
+        assistants: [],
+      };
+    } else if (
+      line.kind === "assistant" && current && line.body.trim().length > 0
+    ) {
+      current.assistants.push(line.body);
+    }
+  }
+  if (current) {
+    previews.push({
+      turnId: current.turnId,
+      lineId: current.lineId,
+      user: current.user,
+      assistant: previewAssistant(current.assistants.at(-1) ?? ""),
+    });
+  }
+  return previews;
+}
+
+function previewAssistant(value: string): string[] {
+  return value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(0, 3);
+}
+
+function reconcileChangedLineage(
+  retained: readonly SessionConversationTurn[],
+  refreshed: readonly SessionConversationTurn[],
+): SessionConversationTurn[] {
+  const retainedPositions = new Map(
+    retained.map((turn, index) => [turn.turn_id, index] as const),
+  );
+  const firstShared = refreshed.find((turn) =>
+    retainedPositions.has(turn.turn_id)
+  );
+  if (!firstShared) return dedupeTurns(refreshed);
+
+  const retainedPrefix = retained.slice(
+    0,
+    retainedPositions.get(firstShared.turn_id) ?? 0,
+  );
+  return dedupeTurns([...retainedPrefix, ...refreshed]);
 }
 
 function mergeRefreshedTurns(

@@ -8,6 +8,7 @@ import {
   beginConsoleHistoryRequest,
   type ConsoleHistoryState,
   conversationTurnPreviews,
+  conversationTurnPreviewsFromLines,
   emptyConsoleHistoryState,
   historyEntries,
   setConsoleHistoryTopEdge,
@@ -53,10 +54,13 @@ function turn(index: number): SessionConversationTurn {
 function page(
   turns: SessionConversationTurn[],
   cursor: string | null,
+  lineageId = "lineage-a",
+  compactAncestorLineageIds: string[] = [],
 ): SessionHistoryPage {
   return {
     session_id: "session-a",
-    lineage_id: "lineage-a",
+    lineage_id: lineageId,
+    compact_ancestor_lineage_ids: compactAncestorLineageIds,
     turns,
     next_cursor: cursor,
     has_more: cursor !== null,
@@ -141,6 +145,151 @@ Deno.test("refresh replaces overlapping latest turns while retaining loaded earl
   assert(
     state.cursor === "cursor-3",
     "refresh must retain the oldest paging boundary",
+  );
+});
+
+Deno.test("same-lineage refresh without overlap replaces the paging boundary", () => {
+  let state: ConsoleHistoryState = {
+    ...emptyConsoleHistoryState(),
+    sessionId: "session-a",
+    lineageId: "lineage-a",
+    turns: [1, 2, 3, 4].map(turn),
+    cursor: null,
+    hasMore: false,
+    status: "loading",
+    requestedCursor: "__initial__",
+  };
+  state = applyConsoleHistoryPage(
+    state,
+    page([6, 7, 8, 9, 10].map(turn), "cursor-6", "lineage-a"),
+    null,
+  );
+
+  assert(
+    state.turns.map((value) => value.turn_id).join(",") ===
+      "u-1,u-2,u-3,u-4,u-6,u-7,u-8,u-9,u-10",
+    "a reconnect may preserve loaded rows while still exposing the missing gap",
+  );
+  assert(
+    state.cursor === "cursor-6" && state.hasMore,
+    "a non-overlapping same-lineage page must replace an exhausted old boundary",
+  );
+});
+
+Deno.test("changed lineage keeps the adopted prefix and discards the replaced branch", () => {
+  let state = emptyConsoleHistoryState();
+  state = beginConsoleHistoryRequest(state, null)!;
+  state = applyConsoleHistoryPage(
+    state,
+    page([6, 7, 8, 9, 10].map(turn), "cursor-6"),
+    null,
+  );
+  state = beginConsoleHistoryRequest(state, "cursor-6")!;
+  state = applyConsoleHistoryPage(
+    state,
+    page([1, 2, 3, 4, 5].map(turn), null),
+    "cursor-6",
+  );
+
+  state = beginConsoleHistoryRequest(state, null)!;
+  state = applyConsoleHistoryPage(
+    state,
+    page([3, 4, 5, 11, 12].map(turn), "cursor-3-new", "lineage-b"),
+    null,
+  );
+
+  assert(
+    state.turns.map((value) => value.turn_id).join(",") ===
+      "u-1,u-2,u-3,u-4,u-5,u-11,u-12",
+    "rewind must preserve only the prefix adopted by the new lineage",
+  );
+  assert(
+    state.cursor === "cursor-3-new" && state.hasMore,
+    "a changed lineage must replace the stale paging cursor",
+  );
+});
+
+Deno.test("Compact lineage refresh preserves already loaded adopted history", () => {
+  let state: ConsoleHistoryState = {
+    ...emptyConsoleHistoryState(),
+    sessionId: "session-a",
+    lineageId: "lineage-a",
+    turns: Array.from({ length: 10 }, (_, index) => turn(index + 1)),
+    status: "loading",
+    requestedCursor: "__initial__",
+  };
+  state = applyConsoleHistoryPage(
+    state,
+    page(
+      [11, 12, 13, 14, 15].map(turn),
+      "cursor-11-new",
+      "lineage-compact",
+      ["lineage-a"],
+    ),
+    null,
+  );
+
+  assert(
+    state.turns.map((value) => value.turn_id).join(",") ===
+      Array.from({ length: 15 }, (_, index) => `u-${index + 1}`).join(","),
+    "Compact must keep the adopted prefix without requiring newest-page overlap",
+  );
+  assert(
+    state.cursor === "cursor-11-new" && state.hasMore,
+    "Compact must replace the old-lineage cursor even when adopted turns are preserved",
+  );
+});
+
+Deno.test("changed lineage without a stable overlap replaces retained turns", () => {
+  let state: ConsoleHistoryState = {
+    ...emptyConsoleHistoryState(),
+    sessionId: "session-a",
+    lineageId: "lineage-a",
+    turns: [1, 2, 3].map(turn),
+    cursor: "old-cursor",
+    hasMore: true,
+    status: "loading",
+    requestedCursor: "__initial__",
+  };
+  state = applyConsoleHistoryPage(
+    state,
+    page([11, 12].map(turn), null, "lineage-b"),
+    null,
+  );
+  assert(
+    state.turns.map((value) => value.turn_id).join(",") === "u-11,u-12",
+    "unrelated lineage content must not survive refresh",
+  );
+  assert(
+    state.cursor === null && !state.hasMore,
+    "new lineage boundary must be authoritative",
+  );
+});
+
+Deno.test("line previews include a current turn outside the retained five-turn page", () => {
+  const lines = [1, 2, 3, 4, 5, 6].flatMap((index) => [
+    {
+      id: `user-${index}`,
+      entryId: `u-${index}`,
+      kind: "user" as const,
+      title: "User",
+      body: `question ${index}`,
+      source: "event" as const,
+    },
+    {
+      id: `assistant-${index}`,
+      entryId: `a-${index}`,
+      kind: "assistant" as const,
+      title: "Assistant",
+      body: `done ${index}`,
+      source: "event" as const,
+    },
+  ]);
+  assert(
+    conversationTurnPreviewsFromLines(lines).map((preview) => preview.turnId)
+      .join(",") ===
+      "u-1,u-2,u-3,u-4,u-5,u-6",
+    "turn navigation must include unmatched current snapshot turns in transcript order",
   );
 });
 

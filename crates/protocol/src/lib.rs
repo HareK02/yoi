@@ -853,6 +853,12 @@ pub struct SessionHistoryPage {
     pub session_id: String,
     /// Stable identity of the adopted active lineage used to fence stale pages.
     pub lineage_id: String,
+    /// Older lineage identities that the active lineage fully adopted through
+    /// one or more consecutive Compact rotations. Clients may retain already
+    /// loaded turns when their prior lineage appears here, while replacing the
+    /// cursor with this page's boundary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compact_ancestor_lineage_ids: Vec<String>,
     pub turns: Vec<SessionConversationTurn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
