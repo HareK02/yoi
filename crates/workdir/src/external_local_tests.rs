@@ -425,6 +425,46 @@ async fn external_read_write_provider_rejects_symlink_mutation_escape() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+async fn external_grep_honors_ignore_files_below_search_root() {
+    let root = tempfile::tempdir().unwrap();
+    for (directory, ignore_file) in [
+        ("search/gitignore-rules", ".gitignore"),
+        ("search/ignore-rules", ".ignore"),
+    ] {
+        let directory = root.path().join(directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join(ignore_file), "ignored.txt\n").unwrap();
+        std::fs::write(directory.join("ignored.txt"), "needle ignored\n").unwrap();
+        std::fs::write(directory.join("visible.txt"), "needle visible\n").unwrap();
+    }
+    let session = external_session(&root, BoundedReadLimits::new(4096, 1024).unwrap());
+
+    let result = WorkdirSession::grep(
+        &session,
+        GrepRequest {
+            pattern: "needle".to_string(),
+            path: WorkdirPath::new("search").unwrap(),
+            glob: Some("*.txt".to_string()),
+            file_type: None,
+            case_insensitive: false,
+            before_context: 0,
+            after_context: 0,
+            multiline: false,
+            output_mode: GrepOutputMode::FilesWithMatches,
+            limit: 10,
+            offset: 0,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(result.output.contains("search/gitignore-rules/visible.txt"));
+    assert!(result.output.contains("search/ignore-rules/visible.txt"));
+    assert!(!result.output.contains("ignored.txt"));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn external_grep_honors_gitignore_above_a_nested_search_root() {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("nested")).unwrap();

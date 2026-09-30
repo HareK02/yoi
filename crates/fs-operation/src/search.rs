@@ -282,9 +282,10 @@ impl DescriptorIgnoreMatchers {
         let matcher = builder.build().map_err(|_| {
             FsError::InvalidArgument("ignore patterns could not be compiled".to_string())
         })?;
-        // An explicitly selected search root is traversed even when an ancestor
-        // ignores that directory, matching path-backed Grep behavior.
+        // An explicitly selected search root is traversed even when a strict
+        // ancestor ignores that directory, matching path-backed Grep behavior.
         if directory != explicit_base
+            && explicit_base.starts_with(directory)
             && matcher
                 .matched_path_or_any_parents(explicit_base, true)
                 .is_ignore()
