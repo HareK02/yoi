@@ -7,8 +7,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     AtomicWriteMode, BoundedReadLimits, ContentHash, EditRequest, EditResult, EntryKind,
-    FsAccessPolicy, FsError, FsPath, ListEntry, ListRequest, ListResult, ReadRequest, ReadResult,
-    StatRequest, StatResult, WriteRequest, WriteResult, direct_symlink,
+    FsAccessPolicy, FsError, FsPath, ListEntry, ListRequest, ListResult, ReadBytesRequest,
+    ReadBytesResult, ReadRequest, ReadResult, StatRequest, StatResult, WriteRequest, WriteResult,
+    direct_symlink,
 };
 
 const READ_BUFFER_BYTES: usize = 16 * 1024;
@@ -192,6 +193,137 @@ fn run_read_with_limits(
         total_lines,
         content_hash: content_hasher.finalize().into(),
         truncated: end < total_lines || byte_truncated,
+    })
+}
+
+pub fn run_read_bytes(
+    root: &Path,
+    request: ReadBytesRequest,
+    access: &dyn FsAccessPolicy,
+) -> Result<ReadBytesResult, FsError> {
+    run_read_bytes_with_limits(root, request, access, None)
+}
+
+pub fn run_read_bytes_bounded(
+    root: &Path,
+    request: ReadBytesRequest,
+    access: &dyn FsAccessPolicy,
+    limits: BoundedReadLimits,
+) -> Result<ReadBytesResult, FsError> {
+    run_read_bytes_with_limits(root, request, access, Some(limits))
+}
+
+fn run_read_bytes_with_limits(
+    root: &Path,
+    request: ReadBytesRequest,
+    access: &dyn FsAccessPolicy,
+    limits: Option<BoundedReadLimits>,
+) -> Result<ReadBytesResult, FsError> {
+    let logical = request.path;
+    if request.max_bytes == 0 {
+        return Err(FsError::InvalidArgument(
+            "byte read max_bytes must be greater than zero".to_string(),
+        ));
+    }
+    if let Some(limits) = limits
+        && request.max_bytes > limits.max_response_bytes
+    {
+        return Err(FsError::InvalidArgument(format!(
+            "byte read response limit is {} bytes",
+            limits.max_response_bytes
+        )));
+    }
+
+    access
+        .check_cancelled()
+        .map_err(|error| map_io(&logical, error))?;
+    let path = resolve(root, &logical)?;
+    let target = require_access(&path, &logical, access, false, false)?;
+    let file = access
+        .open_read_file(&path, &target)
+        .map_err(|error| map_io(&logical, error))?;
+    let metadata = file.metadata().map_err(|error| map_io(&logical, error))?;
+    if metadata.is_dir() {
+        return Err(FsError::IsDirectory(PathBuf::from(logical.as_str())));
+    }
+    if !metadata.is_file() {
+        return Err(FsError::InvalidArgument(
+            "byte read source must be a regular file".to_string(),
+        ));
+    }
+    if let Some(limits) = limits
+        && metadata.len() > limits.max_source_bytes
+    {
+        return Err(FsError::InvalidArgument(format!(
+            "byte read source exceeds provider limit {}",
+            limits.max_source_bytes
+        )));
+    }
+
+    let mut bytes = Vec::with_capacity(request.max_bytes.min(READ_BUFFER_BYTES));
+    let mut source_bytes = 0_u64;
+    let mut hasher = Sha256::new();
+    let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, file);
+    let mut buffer = [0_u8; READ_BUFFER_BYTES];
+    loop {
+        access
+            .check_cancelled()
+            .map_err(|error| map_io(&logical, error))?;
+        let read_limit = limits
+            .map(|limits| {
+                limits
+                    .max_source_bytes
+                    .saturating_sub(source_bytes)
+                    .saturating_add(1)
+                    .min(READ_BUFFER_BYTES as u64) as usize
+            })
+            .unwrap_or(READ_BUFFER_BYTES);
+        let read = reader
+            .read(&mut buffer[..read_limit])
+            .map_err(|error| map_io(&logical, error))?;
+        if read == 0 {
+            break;
+        }
+        let chunk_start = source_bytes;
+        source_bytes = source_bytes.saturating_add(read as u64);
+        if let Some(limits) = limits
+            && source_bytes > limits.max_source_bytes
+        {
+            return Err(FsError::InvalidArgument(format!(
+                "byte read source exceeds provider limit {}",
+                limits.max_source_bytes
+            )));
+        }
+        hasher.update(&buffer[..read]);
+
+        if bytes.len() < request.max_bytes && source_bytes > request.offset {
+            let start = request.offset.saturating_sub(chunk_start).min(read as u64) as usize;
+            let retained = (request.max_bytes - bytes.len()).min(read - start);
+            bytes.extend_from_slice(&buffer[start..start + retained]);
+        }
+    }
+
+    let content_hash: ContentHash = hasher.finalize().into();
+    if request
+        .expected_hash
+        .is_some_and(|expected| expected != content_hash)
+    {
+        return Err(FsError::Conflict(logical.as_str().to_string()));
+    }
+    if request.offset > source_bytes {
+        return Err(FsError::InvalidArgument(format!(
+            "byte offset {} exceeds file size {source_bytes}",
+            request.offset
+        )));
+    }
+    let eof = request.offset.saturating_add(bytes.len() as u64) == source_bytes;
+    Ok(ReadBytesResult {
+        path: logical,
+        bytes,
+        offset: request.offset,
+        total_bytes: source_bytes,
+        content_hash,
+        eof,
     })
 }
 

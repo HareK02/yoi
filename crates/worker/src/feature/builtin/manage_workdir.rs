@@ -18,8 +18,8 @@ use workdir::workspace::WorkspaceWorkdirSessionOperationRequest;
 use workdir::{
     CommandHandle, CommandOutput, CommandOutputRequest, CommandRequest, CommandStatus, EditRequest,
     EditResult, GlobRequest, GlobResult, GrepRequest, GrepResult, ListRequest, ListResult,
-    ReadRequest, ReadResult, StatRequest, StatResult, Workdir, WorkdirError,
-    WorkdirScopeAuthorizationRequest, WorkdirScopeOverlapRequest, WorkdirSession,
+    ReadBytesRequest, ReadBytesResult, ReadRequest, ReadResult, StatRequest, StatResult, Workdir,
+    WorkdirError, WorkdirScopeAuthorizationRequest, WorkdirScopeOverlapRequest, WorkdirSession,
     WorkdirSessionCapabilities, WorkdirSessionHandle, WriteRequest, WriteResult,
 };
 
@@ -354,6 +354,13 @@ impl WorkdirSession for WorkspaceAttachedWorkdirSession {
         match self.operate(WorkdirSessionOperation::Read(request))? {
             WorkdirSessionOperationResult::Read(result) => Ok(result),
             _ => Err(Self::mismatch("read")),
+        }
+    }
+
+    async fn read_bytes(&self, request: ReadBytesRequest) -> Result<ReadBytesResult, WorkdirError> {
+        match self.operate(WorkdirSessionOperation::ReadBytes(request))? {
+            WorkdirSessionOperationResult::ReadBytes(result) => Ok(result),
+            _ => Err(Self::mismatch("read_bytes")),
         }
     }
 

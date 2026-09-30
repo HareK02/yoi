@@ -20,13 +20,9 @@
 </script>
 
 <script lang="ts">
-  import SvelteMarkdown, {
-    buildUnsupportedHTML,
-    type Renderers,
-    type SvelteMarkdownProps,
-  } from "@humanspeak/svelte-markdown";
+  import type { Renderers } from "@humanspeak/svelte-markdown";
   import { ShikiCode } from "@humanspeak/svelte-markdown/extensions/shiki";
-  import MarkdownLink from "$lib/workspace/console/MarkdownLink.svelte";
+  import SafeMarkdown from "$lib/workspace/markdown/SafeMarkdown.svelte";
 
   type Props = {
     text: string;
@@ -36,24 +32,15 @@
 
   let { text, streamId = "static", class: className = "" }: Props = $props();
 
-  const options = {
-    breaks: true,
-    gfm: true,
-  } satisfies NonNullable<SvelteMarkdownProps["options"]>;
-
   const renderers = {
     code: ShikiCode,
-    html: buildUnsupportedHTML(),
-    link: MarkdownLink,
   } satisfies Partial<Renderers>;
 </script>
 
-<div class={`rich-markdown ${className}`}>
-  <SvelteMarkdown source={text} {streamId} {options} {renderers} streaming />
-</div>
+<SafeMarkdown {text} {streamId} class={`rich-markdown ${className}`} {renderers} streaming />
 
 <style>
-  .rich-markdown {
+  :global(.rich-markdown) {
     color: inherit;
     line-height: 1.55;
   }

@@ -25,7 +25,7 @@ use workdir::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WorkdirShareOptions {
+pub struct WorkdirShareOptions {
     pub path: PathBuf,
     pub workspace_id: Option<String>,
     pub backend_url: String,
@@ -36,6 +36,39 @@ pub(crate) struct WorkdirShareOptions {
 }
 
 const PROVIDER_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn validate_provider_registration(message: Message, generation: u64) -> Result<(), String> {
+    let registered = match message {
+        Message::Text(text) => text,
+        Message::Close(Some(frame)) => {
+            let reason = frame.reason.trim();
+            return Err(if reason.is_empty() {
+                "Backend rejected the External Workdir provider registration".to_string()
+            } else {
+                format!("Backend rejected the External Workdir provider registration: {reason}")
+            });
+        }
+        Message::Close(None) => {
+            return Err("Backend rejected the External Workdir provider registration".to_string());
+        }
+        _ => {
+            return Err(
+                "Backend returned an invalid External Workdir registration frame".to_string(),
+            );
+        }
+    };
+    let frame = serde_json::from_str::<ExternalWorkdirServerFrame>(&registered)
+        .map_err(|error| format!("Backend returned an invalid External Workdir frame: {error}"))?;
+    if matches!(
+        frame.message,
+        ExternalWorkdirServerMessage::Registered { generation: registered_generation, .. }
+            if registered_generation == generation
+    ) {
+        Ok(())
+    } else {
+        Err("Backend rejected the External Workdir provider registration".to_string())
+    }
+}
 
 fn provider_operation_timeout(operation: &workdir::http::WorkdirSessionOperation) -> Duration {
     if matches!(
@@ -49,7 +82,7 @@ fn provider_operation_timeout(operation: &workdir::http::WorkdirSessionOperation
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProviderEnd {
+pub enum ProviderEnd {
     Disconnected,
     Revoked,
     Interrupted,
@@ -188,7 +221,7 @@ struct ResolvedWorkdirShareOptions {
     permissions: server_api::ExternalWorkdirPermissions,
 }
 
-pub(crate) fn parse_ttl(value: &str) -> Result<Duration, String> {
+pub fn parse_ttl(value: &str) -> Result<Duration, String> {
     let (number, multiplier) = if let Some(value) = value.strip_suffix('h') {
         (value, 60 * 60)
     } else if let Some(value) = value.strip_suffix('m') {
@@ -424,7 +457,7 @@ async fn resolve_share_options(
     configure_interactively(options, &workspaces, &mut input, &mut output)
 }
 
-pub(crate) async fn run(options: WorkdirShareOptions) -> Result<(), String> {
+pub async fn run(options: WorkdirShareOptions) -> Result<(), String> {
     let Some(options) = resolve_share_options(options).await? else {
         eprintln!("External Workdir share cancelled; no grant was created.");
         return Ok(());
@@ -636,7 +669,7 @@ async fn serve_provider_connection(
         .max_message_size(Some(workdir::external::MAX_EXTERNAL_SERVER_FRAME_BYTES))
         .max_frame_size(Some(workdir::external::MAX_EXTERNAL_SERVER_FRAME_BYTES));
     let connection = connect_async_with_config(request, Some(websocket_config), false);
-    let (mut socket, _) = tokio::select! {
+    let (socket, _) = tokio::select! {
         signal = tokio::signal::ctrl_c() => {
             signal.map_err(|error| format!("failed to wait for Ctrl-C: {error}"))?;
             revoke(server_api_client, &options.workspace_id, &grant.grant_id).await?;
@@ -658,11 +691,40 @@ async fn serve_provider_connection(
                 read_limits: BoundedReadLimits::EXTERNAL_DEFAULT,
             },
         });
+    let end =
+        serve_external_workdir_provider_socket(socket, registration, session, generation, async {
+            tokio::signal::ctrl_c()
+                .await
+                .map_err(|error| format!("failed to wait for Ctrl-C: {error}"))
+        })
+        .await?;
+    if end == ProviderEnd::Interrupted {
+        revoke(server_api_client, &options.workspace_id, &grant.grant_id).await?;
+    }
+    Ok(end)
+}
+
+/// Run the production External Workdir provider protocol over an established WebSocket.
+///
+/// The CLI uses this pump after opening its authenticated Backend connection. Keeping the
+/// protocol pump separate lets composed tests exercise the same registration, operation,
+/// cancellation, and result-forwarding implementation without spawning a second CLI process.
+pub async fn serve_external_workdir_provider_socket<S, I>(
+    mut socket: tokio_tungstenite::WebSocketStream<S>,
+    registration: ExternalWorkdirProviderFrame,
+    session: &LocalWorkdirSession,
+    generation: u64,
+    interrupt: I,
+) -> Result<ProviderEnd, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    I: std::future::Future<Output = Result<(), String>>,
+{
+    tokio::pin!(interrupt);
     send_provider_frame(&mut socket, &registration).await?;
     let registered = tokio::select! {
-        signal = tokio::signal::ctrl_c() => {
-            signal.map_err(|error| format!("failed to wait for Ctrl-C: {error}"))?;
-            revoke(server_api_client, &options.workspace_id, &grant.grant_id).await?;
+        signal = &mut interrupt => {
+            signal?;
             return Ok(ProviderEnd::Interrupted);
         }
         registered = tokio::time::timeout(Duration::from_secs(10), socket.next()) => {
@@ -672,18 +734,7 @@ async fn serve_provider_connection(
                 .map_err(|error| format!("External Workdir provider registration failed: {error}"))?
         }
     };
-    let Message::Text(registered) = registered else {
-        return Err("Backend returned an invalid External Workdir registration frame".to_string());
-    };
-    let frame = serde_json::from_str::<ExternalWorkdirServerFrame>(&registered)
-        .map_err(|error| format!("Backend returned an invalid External Workdir frame: {error}"))?;
-    if !matches!(
-        frame.message,
-        ExternalWorkdirServerMessage::Registered { generation: registered_generation, .. }
-            if registered_generation == generation
-    ) {
-        return Err("Backend rejected the External Workdir provider registration".to_string());
-    }
+    validate_provider_registration(registered, generation)?;
     println!("Connection: online (generation {generation})");
 
     let (completion_sender, mut completions) =
@@ -691,10 +742,9 @@ async fn serve_provider_connection(
     let mut operations = HashMap::<String, OperationTask>::new();
     loop {
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal.map_err(|error| format!("failed to wait for Ctrl-C: {error}"))?;
+            signal = &mut interrupt => {
+                signal?;
                 stop_provider_operations(session, &mut operations, &mut completions).await?;
-                revoke(server_api_client, &options.workspace_id, &grant.grant_id).await?;
                 return Ok(ProviderEnd::Interrupted);
             }
             completion = completions.recv() => {
@@ -903,7 +953,7 @@ async fn execute_operation(
             Ok(result) => ExternalWorkdirOperationOutcome::Completed { result },
             Err(message) => ExternalWorkdirOperationOutcome::Failed {
                 error: ExternalWorkdirOperationError::from_transport_error(WorkdirTransportError {
-                    code: workdir::http::WorkdirTransportErrorCode::Unsupported,
+                    code: workdir::http::WorkdirTransportErrorCode::InvalidRequest,
                     message,
                 }),
             },
@@ -1045,6 +1095,23 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         }
+    }
+
+    #[test]
+    fn provider_registration_surfaces_backend_close_reason() {
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+        let error = validate_provider_registration(
+            Message::Close(Some(CloseFrame {
+                code: CloseCode::Policy,
+                reason: "provider read limits source=1024 response=512; Backend requires source=2048 response=1024".into(),
+            })),
+            1,
+        )
+        .unwrap_err();
+        assert!(error.contains("provider read limits"), "{error}");
+        assert!(error.contains("Backend requires"), "{error}");
     }
 
     #[test]
