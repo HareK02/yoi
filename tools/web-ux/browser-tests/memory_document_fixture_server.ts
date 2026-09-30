@@ -25,7 +25,7 @@ const paragraphs = Array.from(
 const bodyMd =
   `# Workspace Memory\n\nThis document is read-only.\n\n| Very wide heading | Another heading | Decision |\n| --- | --- | --- |\n| ${
     "wide-value-".repeat(16)
-  } | stable | keep scrolling local |\n\n\`\`\`rust\nfn example() { println!("${
+  } | stable | keep scrolling local |\n\n##### Deep document heading\n\n###### Deepest document heading\n\n\`\`\`rust\nfn example() { println!("${
     "wide-code-".repeat(18)
   }"); }\n\`\`\`\n\n[Safe link](https://example.com) [Unsafe link](javascript:alert(1))\n\n<img src=x onerror=alert(1)>\n\n${paragraphs}\n\n## T-661 UNIQUE END MARKER`;
 

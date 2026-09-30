@@ -165,6 +165,21 @@ Deno.test("production Memory shell renders safe Markdown and scrolls to its end 
           );
           assertEquals(await page.locator("blockquote").count() > 0, true);
           assertEquals(await page.locator("ul li").count() > 0, true);
+          for (
+            const heading of [
+              { selector: "h5", text: "Deep document heading" },
+              { selector: "h6", text: "Deepest document heading" },
+            ]
+          ) {
+            const element = page.locator(heading.selector, { hasText: heading.text });
+            assertEquals(await element.count(), 1);
+            assert(
+              await element.evaluate((node) =>
+                Number.parseFloat((globalThis as any).getComputedStyle(node).fontSize) >= 12
+              ),
+              `${heading.selector} fell below the design language minimum text size`,
+            );
+          }
           assertEquals(await page.locator('a[href="https://example.com"]').count(), 1);
           assertEquals(await page.locator('a[href^="javascript:"]').count(), 0);
           assertEquals(await page.locator("article img, article script").count(), 0);

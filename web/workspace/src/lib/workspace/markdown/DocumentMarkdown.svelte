@@ -41,7 +41,9 @@
 
   :global(.document-markdown h2),
   :global(.document-markdown h3),
-  :global(.document-markdown h4) {
+  :global(.document-markdown h4),
+  :global(.document-markdown h5),
+  :global(.document-markdown h6) {
     margin: var(--space-6) 0 var(--space-2);
     color: var(--text-strong);
     font-size: var(--font-size-body);
@@ -53,7 +55,9 @@
   }
 
   :global(.document-markdown h3),
-  :global(.document-markdown h4) {
+  :global(.document-markdown h4),
+  :global(.document-markdown h5),
+  :global(.document-markdown h6) {
     font-weight: 600;
   }
 

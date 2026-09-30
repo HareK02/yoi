@@ -10,6 +10,10 @@ test("renders document Markdown semantics through the shared safe policy", async
   const source = [
     "# Memory heading",
     "",
+    "##### Deep heading",
+    "",
+    "###### Deepest heading",
+    "",
     "A paragraph with **strong context** and `inline-code`.",
     "",
     "- first item",
@@ -36,10 +40,15 @@ test("renders document Markdown semantics through the shared safe policy", async
     expect(container.querySelector("table")).not.toBeNull();
   });
 
+  expect(container.querySelector("h5")?.textContent).toBe("Deep heading");
+  expect(container.querySelector("h6")?.textContent).toBe("Deepest heading");
   expect(container.querySelector("strong")?.textContent).toBe("strong context");
   expect(container.querySelectorAll("li")).toHaveLength(2);
-  expect(container.querySelector("blockquote")?.textContent).toContain("durable quote");
-  expect(container.querySelector('a[href="https://example.com"]')).not.toBeNull();
+  expect(container.querySelector("blockquote")?.textContent).toContain(
+    "durable quote",
+  );
+  expect(container.querySelector('a[href="https://example.com"]')).not
+    .toBeNull();
   expect(container.querySelectorAll("a")).toHaveLength(1);
   expect(container.querySelector("img")).toBeNull();
   expect(container.querySelector("script")).toBeNull();
@@ -52,13 +61,16 @@ test("renders document Markdown semantics through the shared safe policy", async
   );
   expect(tableRegion?.tabIndex).toBe(0);
   expect(codeRegion?.tabIndex).toBe(0);
-  expect(codeRegion?.querySelector("pre > code")?.textContent).toContain("println!");
+  expect(codeRegion?.querySelector("pre > code")?.textContent).toContain(
+    "println!",
+  );
 });
 
 test("wraps long prose and identifiers without turning them into document-level controls", async () => {
   const longIdentifier = "memory-identifier-".repeat(40);
   const { container } = render(DocumentMarkdown, {
-    text: `Long value: ${longIdentifier}\n\n<details open><summary>unsafe HTML</summary></details>`,
+    text:
+      `Long value: ${longIdentifier}\n\n<details open><summary>unsafe HTML</summary></details>`,
   });
 
   await waitFor(() => expect(container.textContent).toContain(longIdentifier));
