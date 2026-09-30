@@ -113,15 +113,16 @@
 
   .turn-bars::-webkit-scrollbar { display: none; }
 
-  /* Bottom-align short lists so prepending older turns does not move existing bars.
-     Once overflowing, scroll-anchor restoration keeps those bars in place. */
-  .history-boundary { margin-top: auto; }
+  .history-boundary { flex: 0 0 24px; }
   .history-boundary button, .history-boundary span {
     display: grid;
     place-items: center;
     width: 32px;
-    min-height: 24px;
-    padding: var(--space-1);
+    height: 24px;
+    min-height: 0;
+    box-sizing: border-box;
+    padding: 0;
+    line-height: 1;
     border: 0;
     background: transparent;
     color: var(--text-muted);

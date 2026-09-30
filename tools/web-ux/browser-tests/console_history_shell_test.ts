@@ -35,7 +35,7 @@ async function historyRequestCount(baseUrl: string): Promise<number> {
   return state.history_requests;
 }
 
-Deno.test("production Console pages backward by real turns while preserving both scroll anchors", async () => {
+async function checkConsoleHistory(viewportHeight: number): Promise<void> {
   const build = await new Deno.Command(Deno.execPath(), {
     args: ["task", "build"],
     cwd: workspaceRoot,
@@ -68,10 +68,11 @@ Deno.test("production Console pages backward by real turns while preserving both
     const browser = await chromium.launch({ headless: true });
     try {
       const context = await browser.newContext({
-        viewport: { width: 1440, height: 600 },
+        viewport: { width: 1440, height: viewportHeight },
         colorScheme: "dark",
       });
       const page = await context.newPage();
+      page.setDefaultTimeout(5_000);
       const errors: string[] = [];
       const responses: string[] = [];
       page.on("console", (message) => {
@@ -102,6 +103,20 @@ Deno.test("production Console pages backward by real turns while preserving both
       assertEquals(await historyRequestCount(baseUrl), 1);
       assertEquals(await transcript.getByText(/^question (7|8|9|10|11|12)$/).count(), 6);
       assertEquals(await navigation.getByRole("button", { name: /^Turn \d+: question (7|8|9|10|11|12)$/ }).count(), 6);
+      const turnList = navigation.locator(".turn-list");
+      const initialGeometry = await turnList.evaluate((element) => {
+        const boundary = element.querySelector(".history-boundary")!;
+        const control = boundary.firstElementChild!;
+        const first = element.querySelector(".turn-button")!;
+        return {
+          boundaryHeight: boundary.getBoundingClientRect().height,
+          controlHeight: control.getBoundingClientRect().height,
+          boundaryOffset: boundary.getBoundingClientRect().top - element.getBoundingClientRect().top + element.scrollTop,
+          firstOffset: first.getBoundingClientRect().top - boundary.getBoundingClientRect().top,
+        };
+      });
+      assertEquals(initialGeometry, { boundaryHeight: 24, controlHeight: 24, boundaryOffset: 0, firstOffset: 24 });
+      assertEquals(await turnList.evaluate((element) => element.scrollHeight > element.clientHeight), viewportHeight === 340);
       const currentQuestionTop = await transcript
         .getByText("question 7", { exact: true })
         .evaluate((element) => element.getBoundingClientRect().top);
@@ -116,6 +131,8 @@ Deno.test("production Console pages backward by real turns while preserving both
       const question12 = navigation.getByRole("button", {
         name: /^Turn \d+: question 12$/,
       });
+      await question12.scrollIntoViewIfNeeded();
+      await page.waitForTimeout(50);
       await question12.hover();
       const preview = navigation.getByRole("tooltip");
       await preview.waitFor();
@@ -159,20 +176,39 @@ Deno.test("production Console pages backward by real turns while preserving both
         "a stationary top sentinel must not drain another page",
       );
 
-      const turnList = navigation.locator(".turn-list");
       const navigationAfterPrepend = await navigation
         .locator('[data-turn-id="user-8"]')
         .evaluate((element) => element.getBoundingClientRect().top);
-      assert(
-        Math.abs(navigationAfterPrepend - navigationAnchoredTop) <= 1,
-        `turn-bar anchor moved from ${navigationAnchoredTop}px to ${navigationAfterPrepend}px`,
-      );
-      await turnList.evaluate((element) => {
-        element.scrollTop = Math.max(2, element.scrollTop);
-        element.dispatchEvent(new Event("scroll"));
-        element.scrollTop = 0;
-        element.dispatchEvent(new Event("scroll"));
-      });
+      const overflowing = await turnList.evaluate((element) => element.scrollHeight > element.clientHeight);
+      assertEquals(overflowing, viewportHeight < 600);
+      if (overflowing) {
+        const scroll = await turnList.evaluate((element) => ({
+          top: element.scrollTop, max: element.scrollHeight - element.clientHeight,
+        }));
+        // When a short list first overflows, the requested anchor can exceed
+        // the scroll range. Restore as far as possible without artificial space.
+        const requested = scroll.top + navigationAfterPrepend - navigationAnchoredTop;
+        assert(Math.abs(scroll.top - Math.max(0, Math.min(scroll.max, requested))) <= 1);
+        if (viewportHeight === 340) {
+          assert(
+            Math.abs(navigationAfterPrepend - navigationAnchoredTop) <= 1,
+            `turn-bar anchor moved from ${navigationAnchoredTop}px to ${navigationAfterPrepend}px`,
+          );
+        }
+        await turnList.evaluate((element) => {
+          element.scrollTop = Math.max(2, element.scrollTop);
+          element.dispatchEvent(new Event("scroll"));
+          element.scrollTop = 0;
+          element.dispatchEvent(new Event("scroll"));
+        });
+      } else {
+        // A short list cannot scroll: older turns take their natural place above
+        // existing bars instead of adding blank space to force a fixed anchor.
+        const firstOffset = await turnList.evaluate((element) =>
+          element.querySelector(".turn-button")!.getBoundingClientRect().top - element.getBoundingClientRect().top);
+        assertEquals(firstOffset, 24);
+        await navigation.getByRole("button", { name: "Earlier conversation available" }).click();
+      }
       await transcript.getByText("question 1", { exact: true }).waitFor();
       await navigation.getByRole("button", { name: /^Turn \d+: question 1$/ }).waitFor();
       assertEquals(await historyRequestCount(baseUrl), 3);
@@ -216,4 +252,9 @@ Deno.test("production Console pages backward by real turns while preserving both
     server.kill("SIGTERM");
     await server.status;
   }
-});
+}
+
+for (const viewportHeight of [600, 400, 340]) {
+  Deno.test(`production Console keeps compact top-aligned turns and pages history at ${viewportHeight}px`,
+    () => checkConsoleHistory(viewportHeight));
+}
