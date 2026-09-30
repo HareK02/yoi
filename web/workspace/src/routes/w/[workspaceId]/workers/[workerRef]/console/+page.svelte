@@ -1935,22 +1935,6 @@
                         </dd>
                     </div>
                 </dl>
-                <details class="metadata-details">
-                    <summary>Capabilities</summary>
-                    <ul>
-                        <li>
-                            stop: {worker.capabilities.can_stop
-                                ? "available"
-                                : "unsupported"}
-                        </li>
-                        <li>
-                            follow-up spawn: {worker.capabilities
-                                .can_spawn_followup
-                                ? "available"
-                                : "unsupported"}
-                        </li>
-                    </ul>
-                </details>
             {:else if !workerError}
                 <p>Loading Worker detail…</p>
             {/if}

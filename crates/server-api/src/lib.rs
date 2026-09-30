@@ -6892,7 +6892,6 @@ pub struct RuntimeWorkerSummary {
     #[serde(default)]
     pub retention_state: String,
     pub implementation: WorkerImplementationSummary,
-    pub capabilities: WorkerCapabilitySummary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workdir_attachments: Vec<serde_json::Value>,
     #[serde(default)]
@@ -7890,13 +7889,6 @@ pub struct WorkerImplementationSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-pub struct WorkerCapabilitySummary {
-    pub can_stop: bool,
-    pub can_spawn_followup: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkspaceWorkerSubject {
     RuntimeWorker {
@@ -8120,7 +8112,6 @@ pub struct WorkerSummary {
     #[serde(default)]
     pub retention_state: String,
     pub implementation: WorkerImplementationSummary,
-    pub capabilities: WorkerCapabilitySummary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workdir_attachments: Vec<WorkerWorkdirAttachmentSummary>,
     #[serde(default)]
@@ -8163,7 +8154,6 @@ pub struct WorkerLaunchWorkerSummary {
     pub pinned: bool,
     pub retention_state: String,
     pub implementation: WorkerImplementationSummary,
-    pub capabilities: WorkerCapabilitySummary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workdir_attachments: Vec<RuntimeWorkerWorkdirAttachmentSummary>,
     #[serde(default)]
@@ -9339,7 +9329,6 @@ pub fn worker_launch_api_typescript() -> String {
         WorkingDirectorySummary::decl(&config),
         WorkerWorkspaceSummary::decl(&config),
         WorkerImplementationSummary::decl(&config),
-        WorkerCapabilitySummary::decl(&config),
         RuntimeWorkerWorkdirAttachmentSummary::decl(&config),
         WorkerLaunchWorkerSummary::decl(&config),
         WorkerLaunchRuntimeOption::decl(&config),
@@ -10308,10 +10297,6 @@ mod tests {
                 kind: "runtime".to_string(),
                 display_hint: "Runtime Worker".to_string(),
             },
-            capabilities: WorkerCapabilitySummary {
-                can_stop: true,
-                can_spawn_followup: false,
-            },
             workdir_attachments: Vec::new(),
             diagnostics: Vec::new(),
         }
@@ -10791,7 +10776,6 @@ mod tests {
             },
             "state": "idle",
             "implementation": {"kind": "worker", "display_hint": "Coder"},
-            "capabilities": {"can_stop": true, "can_spawn_followup": false}
         });
 
         assert!(serde_json::from_value::<WorkerSummary>(payload).is_err());

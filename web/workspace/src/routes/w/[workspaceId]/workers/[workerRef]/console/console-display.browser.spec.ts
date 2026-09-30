@@ -62,10 +62,6 @@ function worker(workerId = "worker-a", runtimeId = "runtime-a"): Worker {
     profile: "default",
     tags: [],
     diagnostics: [],
-    capabilities: {
-      can_stop: true,
-      can_spawn_followup: true,
-    },
     workspace: { visibility: "workspace", identity: "workspace-a" },
     implementation: { kind: "builtin", display_hint: "test" },
     workdir_attachments: [],

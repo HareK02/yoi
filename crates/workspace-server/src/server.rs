@@ -152,17 +152,16 @@ use crate::companion::{
 use crate::config_source::ConfigCommitRequest;
 use crate::hosts::{
     EMBEDDED_RUNTIME_ID, EmbeddedWorkerRuntime, HostDiagnosticSeverity, InternalHostSummary,
-    InternalWorkerCapabilitySummary, InternalWorkerImplementationSummary,
-    InternalWorkerOperationState, InternalWorkerRestoreResult, InternalWorkerSummary,
-    InternalWorkerWorkspaceSummary, RemoteRuntimeConfig, RemoteWorkerRuntime, RuntimeDiagnostic,
-    RuntimePingFailureKind, RuntimeRegistry, RuntimeRegistryError, RuntimeRegistryUnregisterResult,
-    TicketWorkerRole, WorkerCompletionsRequest, WorkerCompletionsResult, WorkerControlOperation,
-    WorkerCreateBinding, WorkerInputKind, WorkerInputRequest, WorkerInputResult,
-    WorkerLifecycleRequest, WorkerLifecycleResult, WorkerSpawnAcceptanceRequirement,
-    WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult, WorkerSpawnWorkingDirectoryRequest,
-    WorkerTicketAssignmentRequest, WorkspaceRuntimeAuthorization,
-    is_disallowed_remote_runtime_address, is_loopback_runtime_origin,
-    worker_spawn_create_fingerprint, workspace_worker_summary,
+    InternalWorkerImplementationSummary, InternalWorkerOperationState, InternalWorkerRestoreResult,
+    InternalWorkerSummary, InternalWorkerWorkspaceSummary, RemoteRuntimeConfig,
+    RemoteWorkerRuntime, RuntimeDiagnostic, RuntimePingFailureKind, RuntimeRegistry,
+    RuntimeRegistryError, RuntimeRegistryUnregisterResult, TicketWorkerRole,
+    WorkerCompletionsRequest, WorkerCompletionsResult, WorkerControlOperation, WorkerCreateBinding,
+    WorkerInputKind, WorkerInputRequest, WorkerInputResult, WorkerLifecycleRequest,
+    WorkerLifecycleResult, WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest,
+    WorkerSpawnResult, WorkerSpawnWorkingDirectoryRequest, WorkerTicketAssignmentRequest,
+    WorkspaceRuntimeAuthorization, is_disallowed_remote_runtime_address,
+    is_loopback_runtime_origin, worker_spawn_create_fingerprint, workspace_worker_summary,
 };
 use crate::memory_backend::execute_memory_backend_operation_with_authority;
 use crate::memory_staging::{
@@ -5174,10 +5173,6 @@ fn runtime_worker_summary_to_api(
         implementation: server_api::WorkerImplementationSummary {
             kind: worker.implementation.kind,
             display_hint: worker.implementation.display_hint,
-        },
-        capabilities: server_api::WorkerCapabilitySummary {
-            can_stop: worker.capabilities.can_stop,
-            can_spawn_followup: worker.capabilities.can_spawn_followup,
         },
         workdir_attachments: worker
             .workdir_attachments
@@ -16956,10 +16951,6 @@ fn worker_launch_worker_summary(worker: InternalWorkerSummary) -> WorkerLaunchWo
             kind: worker.implementation.kind,
             display_hint: worker.implementation.display_hint,
         },
-        capabilities: server_api::WorkerCapabilitySummary {
-            can_stop: worker.capabilities.can_stop,
-            can_spawn_followup: worker.capabilities.can_spawn_followup,
-        },
         workdir_attachments: worker
             .workdir_attachments
             .into_iter()
@@ -24806,10 +24797,6 @@ fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> InternalWorker
         last_seen_at: Some(record.updated_at.clone()),
         pinned: record.retention_state == "pinned",
         retention_state: record.retention_state.clone(),
-        capabilities: InternalWorkerCapabilitySummary {
-            can_stop: false,
-            can_spawn_followup: false,
-        },
         workspace: InternalWorkerWorkspaceSummary {
             visibility: "backend_registry".to_string(),
             identity: record.workspace_id.clone(),
@@ -24855,8 +24842,6 @@ fn worker_summary_from_projection(
         .then(|| observation.worker.worker_state.clone())
         .flatten();
     summary.last_seen_at = Some(observation.observed_at.clone());
-    summary.capabilities.can_stop = observed
-        && observation.worker.state != protocol::subscription::SubscriptionWorkerState::Stopped;
     summary.implementation.display_hint = if observed {
         "Runtime-backed Worker".to_string()
     } else {
@@ -26709,7 +26694,12 @@ mod tests {
         assert_eq!(unavailable.availability, availability);
         assert_eq!(unavailable.state, "unavailable");
         assert_eq!(unavailable.worker_state, None);
-        assert!(!unavailable.capabilities.can_stop);
+        assert!(
+            serde_json::to_value(&unavailable)
+                .unwrap()
+                .get("capabilities")
+                .is_none()
+        );
 
         let mut observed_stopped = projection;
         let observation = observed_stopped.observation.as_mut().unwrap();
@@ -28644,10 +28634,6 @@ mod tests {
                 implementation: InternalWorkerImplementationSummary {
                     kind: "fixture".to_string(),
                     display_hint: "Workdirless fixture".to_string(),
-                },
-                capabilities: InternalWorkerCapabilitySummary {
-                    can_stop: true,
-                    can_spawn_followup: false,
                 },
                 workdir_attachments: Vec::new(),
                 diagnostics: Vec::new(),
@@ -40983,10 +40969,6 @@ mod tests {
                     kind: "remote".to_string(),
                     display_hint: "remote".to_string(),
                 },
-                capabilities: server_api::WorkerCapabilitySummary {
-                    can_stop: true,
-                    can_spawn_followup: false,
-                },
                 workdir_attachments: Vec::new(),
                 diagnostics: Vec::new(),
             }
@@ -41080,10 +41062,6 @@ mod tests {
                 implementation: server_api::WorkerImplementationSummary {
                     kind: "remote".to_string(),
                     display_hint: "remote".to_string(),
-                },
-                capabilities: server_api::WorkerCapabilitySummary {
-                    can_stop: true,
-                    can_spawn_followup: false,
                 },
                 workdir_attachments: Vec::new(),
                 diagnostics: Vec::new(),
@@ -43445,7 +43423,12 @@ mod tests {
         // catalog remains controllable while its failed execution is represented in
         // `worker_state` rather than by removing the catalog Worker.
         assert_eq!(restored_worker.state, "idle");
-        assert!(restored_worker.capabilities.can_stop);
+        assert!(
+            serde_json::to_value(&restored_worker)
+                .unwrap()
+                .get("capabilities")
+                .is_none()
+        );
 
         let bundles = restored
             .runtime

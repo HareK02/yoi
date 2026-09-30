@@ -56,12 +56,27 @@ const worker = {
     kind: "runtime",
     display_hint: "Runtime Worker",
   },
-  capabilities: {
-    can_stop: true,
-    can_spawn_followup: false,
-  },
   diagnostics: [],
 };
+
+Deno.test("Worker summaries omit the removed management capabilities field", () => {
+  const summary = { ...worker, resource_key: "W-1", availability: "observed" };
+  assertEquals("capabilities" in parseWorkerSummary(summary), false);
+  assertThrows(
+    () => parseWorkerSummary({ ...summary, capabilities: {} }),
+    Error,
+    "unknown field capabilities",
+  );
+  const created = parseBrowserCreateWorkerResponse({
+    workspace_id: "workspace-a",
+    runtime_id: "runtime-a",
+    worker_id: "worker-a",
+    console_href: "/w/workspace-a/workers/W-1/console",
+    worker,
+    diagnostics: [],
+  });
+  assertEquals("capabilities" in created.worker, false);
+});
 
 Deno.test("Worker summary parser enforces observation freshness", () => {
   const unavailable = {

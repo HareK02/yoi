@@ -31,7 +31,6 @@ const worker = {
   profile: "default",
   tags: [],
   diagnostics: [],
-  capabilities: { can_stop: false, can_spawn_followup: false },
   workspace: {
     workspace_id: workspaceId,
     visibility: "workspace",

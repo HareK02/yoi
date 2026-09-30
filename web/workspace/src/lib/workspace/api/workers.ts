@@ -10,7 +10,6 @@ import type {
   RuntimeWorkerWorkdirAttachmentSummary,
   RuntimeWorkingDirectoryCleanupTarget,
   RuntimeWorkingDirectorySummary,
-  WorkerCapabilitySummary,
   WorkerImplementationSummary,
   WorkerLaunchOptionsResponse,
   WorkerLaunchProfileCandidate,
@@ -251,21 +250,6 @@ function implementationSummary(
   };
 }
 
-function capabilitySummary(
-  value: unknown,
-  label: string,
-): WorkerCapabilitySummary {
-  const item = record(value, label);
-  exact(item, ["can_stop", "can_spawn_followup"], label);
-  return {
-    can_stop: boolean(item.can_stop, `${label}.can_stop`),
-    can_spawn_followup: boolean(
-      item.can_spawn_followup,
-      `${label}.can_spawn_followup`,
-    ),
-  };
-}
-
 function workerStateSnapshot(
   value: unknown,
   label: string,
@@ -374,7 +358,6 @@ export function parseWorkerSummary(
       "pinned",
       "retention_state",
       "implementation",
-      "capabilities",
       "workdir_attachments",
       "diagnostics",
     ],
@@ -423,7 +406,6 @@ export function parseWorkerSummary(
       item.implementation,
       `${label}.implementation`,
     ),
-    capabilities: capabilitySummary(item.capabilities, `${label}.capabilities`),
     workdir_attachments: item.workdir_attachments === undefined
       ? undefined
       : array(
@@ -617,7 +599,6 @@ function workerSummary(
       "pinned",
       "retention_state",
       "implementation",
-      "capabilities",
       "workdir_attachments",
       "diagnostics",
     ],
@@ -641,7 +622,6 @@ function workerSummary(
       item.implementation,
       `${label}.implementation`,
     ),
-    capabilities: capabilitySummary(item.capabilities, `${label}.capabilities`),
     workdir_attachments: item.workdir_attachments === undefined
       ? undefined
       : array(

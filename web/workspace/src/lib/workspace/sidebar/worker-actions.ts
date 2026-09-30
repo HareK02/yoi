@@ -4,10 +4,7 @@ import {
   parseRuntimeCleanupPlan,
   parseRuntimeWorkerLifecycleResult,
 } from "$lib/workspace/api/runtime-workers";
-import type {
-  Diagnostic,
-  Worker,
-} from "./types";
+import type { Diagnostic, Worker } from "./types";
 
 type FetchFn = typeof fetch;
 type WorkerActionTarget = Pick<Worker, "runtime_id" | "worker_id" | "state">;
@@ -25,13 +22,17 @@ async function responseError(response: Response): Promise<string> {
   const fallback = `${response.status} ${response.statusText}`.trim();
   try {
     const payload: unknown = await response.json();
-    if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    if (
+      typeof payload !== "object" || payload === null || Array.isArray(payload)
+    ) {
       return fallback;
     }
     const record = payload as Record<string, unknown>;
     if (typeof record.message === "string") return record.message.slice(0, 512);
     const nested = record.error;
-    if (typeof nested === "object" && nested !== null && !Array.isArray(nested)) {
+    if (
+      typeof nested === "object" && nested !== null && !Array.isArray(nested)
+    ) {
       const message = (nested as Record<string, unknown>).message;
       if (typeof message === "string") return message.slice(0, 512);
     }
@@ -49,6 +50,14 @@ function diagnosticMessage(
     ?.message ??
     diagnostics?.[0]?.message ??
     fallback;
+}
+
+export function canStopSidebarWorker(worker: {
+  availability: Worker["availability"];
+  lifecycleState: string;
+}): boolean {
+  return worker.availability === "observed" &&
+    ["idle", "running", "paused"].includes(worker.lifecycleState);
 }
 
 export function canDeleteSidebarWorker(worker: WorkerActionTarget): boolean {
@@ -112,7 +121,9 @@ export async function deleteSidebarWorker(
     throw new Error(await responseError(executionResponse));
   }
 
-  const execution = parseRuntimeCleanupExecution(await executionResponse.json());
+  const execution = parseRuntimeCleanupExecution(
+    await executionResponse.json(),
+  );
   const outcome = execution.results.find((result) =>
     result.target_id === candidate.target_id
   );

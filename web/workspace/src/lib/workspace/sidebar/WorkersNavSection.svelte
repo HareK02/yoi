@@ -3,6 +3,7 @@
   import { workerConsoleHref } from '$lib/workspace/resource-links';
   import { pushWorkspaceAlert } from '$lib/workspace/alerts/store';
   import {
+    canStopSidebarWorker,
     canDeleteSidebarWorker,
     deleteSidebarWorker,
     stopSidebarWorker,
@@ -91,14 +92,14 @@
   }
 
   async function stopWorker(worker: SidebarWorker) {
-    if (busyAction || !worker.capabilities.can_stop) return;
+    if (busyAction || !canStopSidebarWorker(worker)) return;
     closeWorkerMenu();
     busyAction = { workerKey: workerKey(worker), kind: 'stop' };
     try {
       await stopSidebarWorker(workspaceId, worker);
       workers = workers.map((item) =>
         workerKey(item) === workerKey(worker)
-          ? { ...item, state: 'stopped', capabilities: { ...item.capabilities, can_stop: false } }
+          ? { ...item, state: 'stopped', lifecycleState: 'stopped' }
           : item
       );
       pushWorkspaceAlert('info', `${worker.display_name || worker.label} stopped`, {
@@ -226,7 +227,7 @@
               <button
                 type="button"
                 role="menuitem"
-                disabled={busyAction !== null || !worker.capabilities.can_stop}
+                disabled={busyAction !== null || !canStopSidebarWorker(worker)}
                 onclick={() => stopWorker(worker)}
               >
                 {isBusy(worker, 'stop') ? 'Stopping…' : 'Stop'}

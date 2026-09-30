@@ -1,5 +1,6 @@
 import {
   canDeleteSidebarWorker,
+  canStopSidebarWorker,
   deleteSidebarWorker,
   stopSidebarWorker,
 } from "../../src/lib/workspace/sidebar/worker-actions.ts";
@@ -41,7 +42,6 @@ const worker = {
   runtime_id: "runtime /",
   worker_id: "worker /",
   state: "running",
-  capabilities: { can_stop: true },
 } as Worker;
 
 function jsonResponse(payload: unknown, status = 200): Response {
@@ -50,6 +50,33 @@ function jsonResponse(payload: unknown, status = 200): Response {
     headers: { "content-type": "application/json" },
   });
 }
+
+Deno.test("sidebar Stop follows observed catalog lifecycle, not foreground display state", () => {
+  for (const lifecycleState of ["idle", "running", "paused"]) {
+    const target = {
+      availability: "observed" as const,
+      lifecycleState,
+      state: "unknown",
+    };
+    assert(canStopSidebarWorker(target));
+    assert(!canStopSidebarWorker({ ...target, availability: "unavailable" }));
+  }
+  for (
+    const lifecycleState of [
+      "stopped",
+      "missing",
+      "execution_unavailable",
+      "unknown",
+    ]
+  ) {
+    const target = {
+      availability: "observed" as const,
+      lifecycleState,
+      state: "running",
+    };
+    assert(!canStopSidebarWorker(target));
+  }
+});
 
 Deno.test("sidebar Stop uses the workspace-scoped Worker lifecycle endpoint", async () => {
   const requests: Array<{ url: string; init?: RequestInit }> = [];

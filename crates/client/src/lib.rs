@@ -24,7 +24,7 @@ pub use backend_runtime::{
     BackendCreateWorkerRequest, BackendCreateWorkerResponse, BackendDiagnostic,
     BackendDiagnosticSeverity, BackendRuntimeClientError, BackendRuntimeListResponse,
     BackendRuntimeListTarget, BackendRuntimeSummary, BackendRuntimeTarget,
-    BackendWorkerCapabilitySummary, BackendWorkerImplementationSummary, BackendWorkerLaunchOptions,
+    BackendWorkerImplementationSummary, BackendWorkerLaunchOptions,
     BackendWorkerLaunchProfileCandidate, BackendWorkerLaunchRuntimeOption,
     BackendWorkerLaunchTarget, BackendWorkerOperationState, BackendWorkerRestoreResponse,
     BackendWorkerRestoreResult, BackendWorkerRestoreState, BackendWorkerSummary,

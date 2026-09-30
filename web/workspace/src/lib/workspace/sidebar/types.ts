@@ -10,7 +10,6 @@ import type {
   BrowserWorkerWorkingDirectorySelection
     as SharedBrowserWorkerWorkingDirectorySelection,
   Diagnostic as SharedDiagnostic,
-  WorkerCapabilitySummary as SharedWorkerCapabilitySummary,
   WorkerLaunchOptionsResponse as SharedWorkerLaunchOptionsResponse,
   WorkerLaunchProfileCandidate as SharedWorkerLaunchProfileCandidate,
   WorkerLaunchRuntimeOption as SharedWorkerLaunchRuntimeOption,
@@ -77,8 +76,6 @@ export type Runtime = {
     token_ref_configured: boolean;
   };
 };
-
-export type WorkerCapabilities = SharedWorkerCapabilitySummary;
 
 export type WorkerWorkdirAttachment = SharedWorkerWorkdirAttachmentSummary;
 

@@ -241,12 +241,6 @@ pub struct InternalWorkerImplementationSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct InternalWorkerCapabilitySummary {
-    pub can_stop: bool,
-    pub can_spawn_followup: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InternalWorkerSummary {
     #[serde(flatten)]
     pub worker: RuntimeWorkerRef,
@@ -273,7 +267,6 @@ pub struct InternalWorkerSummary {
     #[serde(default)]
     pub retention_state: String,
     pub implementation: InternalWorkerImplementationSummary,
-    pub capabilities: InternalWorkerCapabilitySummary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workdir_attachments: Vec<WorkingDirectoryAttachmentStatus>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
@@ -383,10 +376,6 @@ pub(crate) fn workspace_worker_summary(
         implementation: server_api::WorkerImplementationSummary {
             kind: summary.implementation.kind,
             display_hint: summary.implementation.display_hint,
-        },
-        capabilities: server_api::WorkerCapabilitySummary {
-            can_stop: summary.capabilities.can_stop,
-            can_spawn_followup: summary.capabilities.can_spawn_followup,
         },
         workdir_attachments,
         diagnostics: summary.diagnostics.into_iter().map(Into::into).collect(),
@@ -2231,10 +2220,6 @@ impl EmbeddedWorkerRuntime {
         Some(EmbeddedWorkerRef::new(EmbeddedWorkerId::parse(worker_id)?))
     }
 
-    fn can_stop_embedded_worker(&self, status: EmbeddedWorkerStatus) -> bool {
-        runtime_worker_can_stop(self.execution_enabled, status)
-    }
-
     fn map_worker_summary(
         &self,
         summary: worker_runtime::catalog::WorkerSummary,
@@ -2273,11 +2258,6 @@ impl EmbeddedWorkerRuntime {
             implementation: InternalWorkerImplementationSummary {
                 kind: "embedded_worker_runtime".to_string(),
                 display_hint: "backend-internal worker-runtime Worker".to_string(),
-            },
-            capabilities: InternalWorkerCapabilitySummary {
-                can_stop: summary.execution_metadata_available
-                    && self.can_stop_embedded_worker(summary.status),
-                can_spawn_followup: false,
             },
             workdir_attachments: summary.workdir_attachments,
             diagnostics: embedded_worker_projection_diagnostics(
@@ -2318,11 +2298,6 @@ impl EmbeddedWorkerRuntime {
             implementation: InternalWorkerImplementationSummary {
                 kind: "embedded_worker_runtime".to_string(),
                 display_hint: "backend-internal worker-runtime Worker".to_string(),
-            },
-            capabilities: InternalWorkerCapabilitySummary {
-                can_stop: detail.execution_metadata_available
-                    && self.can_stop_embedded_worker(detail.status),
-                can_spawn_followup: false,
             },
             workdir_attachments: detail.workdir_attachments,
             diagnostics: embedded_worker_projection_diagnostics(
@@ -4127,11 +4102,6 @@ impl RemoteWorkerRuntime {
                 kind: "remote_worker_runtime".to_string(),
                 display_hint: "Backend-proxied remote worker-runtime Worker".to_string(),
             },
-            capabilities: InternalWorkerCapabilitySummary {
-                can_stop: summary.execution_metadata_available
-                    && runtime_worker_can_stop(true, summary.status),
-                can_spawn_followup: false,
-            },
             workdir_attachments: summary.workdir_attachments,
             diagnostics: remote_worker_projection_diagnostics(summary.execution_metadata_available),
         }
@@ -4169,11 +4139,6 @@ impl RemoteWorkerRuntime {
             implementation: InternalWorkerImplementationSummary {
                 kind: "remote_worker_runtime".to_string(),
                 display_hint: "Backend-proxied remote worker-runtime Worker".to_string(),
-            },
-            capabilities: InternalWorkerCapabilitySummary {
-                can_stop: detail.execution_metadata_available
-                    && runtime_worker_can_stop(true, detail.status),
-                can_spawn_followup: false,
             },
             workdir_attachments: detail.workdir_attachments,
             diagnostics: remote_worker_projection_diagnostics(detail.execution_metadata_available),
@@ -5152,10 +5117,6 @@ fn embedded_runtime_status_label(status: RuntimeStatus) -> &'static str {
     }
 }
 
-fn runtime_worker_can_stop(execution_enabled: bool, status: EmbeddedWorkerStatus) -> bool {
-    execution_enabled && status.is_active()
-}
-
 fn embedded_worker_status_label(status: EmbeddedWorkerStatus) -> &'static str {
     match status {
         EmbeddedWorkerStatus::Idle => "idle",
@@ -5963,10 +5924,6 @@ pub fn placeholder_worker(host_id: impl Into<String>) -> InternalWorkerSummary {
             kind: "placeholder".to_string(),
             display_hint: "unsupported".to_string(),
         },
-        capabilities: InternalWorkerCapabilitySummary {
-            can_stop: false,
-            can_spawn_followup: false,
-        },
         workdir_attachments: Vec::new(),
         diagnostics: vec![diagnostic(
             "runtime_capability_unsupported",
@@ -6621,10 +6578,6 @@ mod tests {
                         kind: "fixture".to_string(),
                         display_hint: "test fixture".to_string(),
                     },
-                    capabilities: InternalWorkerCapabilitySummary {
-                        can_stop: false,
-                        can_spawn_followup: false,
-                    },
                     workdir_attachments: Vec::new(),
                     diagnostics: Vec::new(),
                 }],
@@ -7123,7 +7076,12 @@ mod tests {
         let spawned = runtime.spawn_worker(test_create_binding(), embedded_spawn_request());
         assert_eq!(spawned.state, InternalWorkerOperationState::Accepted);
         let worker = spawned.worker.expect("created embedded worker");
-        assert!(worker.capabilities.can_stop);
+        assert!(
+            serde_json::to_value(&worker)
+                .unwrap()
+                .get("capabilities")
+                .is_none()
+        );
 
         let input = runtime.send_input(
             &worker.worker.worker_id,
@@ -7496,7 +7454,12 @@ mod tests {
             workers.items[0].workspace.identity,
             "runtime_registry_worker"
         );
-        assert!(workers.items[0].capabilities.can_stop);
+        assert!(
+            serde_json::to_value(&workers.items[0])
+                .unwrap()
+                .get("capabilities")
+                .is_none()
+        );
 
         let input = registry
             .send_input(
@@ -7581,11 +7544,14 @@ mod tests {
 
         let workers = registry.list_workers(10);
         assert_eq!(workers.items.len(), 5);
-        assert!(!workers.items[0].capabilities.can_stop);
-        assert!(workers.items[1].capabilities.can_stop);
-        assert!(workers.items[2].capabilities.can_stop);
-        assert!(workers.items[3].capabilities.can_stop);
-        assert!(!workers.items[4].capabilities.can_stop);
+        for worker in &workers.items {
+            assert!(
+                serde_json::to_value(worker)
+                    .unwrap()
+                    .get("capabilities")
+                    .is_none()
+            );
+        }
         assert_eq!(workers.items[0].state, "stopped");
         assert_eq!(workers.items[1].state, "running");
         assert_eq!(workers.items[2].state, "paused");
@@ -7601,7 +7567,12 @@ mod tests {
         let stopped_detail = registry
             .worker(&RuntimeWorkerRef::new("remote:primary", &worker_id))
             .unwrap();
-        assert!(!stopped_detail.capabilities.can_stop);
+        assert!(
+            serde_json::to_value(&stopped_detail)
+                .unwrap()
+                .get("capabilities")
+                .is_none()
+        );
         assert_eq!(stopped_detail.state, "stopped");
 
         server.join().expect("mock remote server finished");

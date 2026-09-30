@@ -16,6 +16,8 @@ import type { Worker } from "./types";
 export type SidebarWorker = Omit<Worker, "workdir_attachments"> & {
   workdir_attachments: SidebarWorkdirAttachment[];
   has_running_internal_workers: boolean;
+  /** Catalog lifecycle, independent of the possibly unknown foreground display state. */
+  lifecycleState: SubscriptionWorker["state"];
 };
 
 export type WorkspaceWorkersState = {
@@ -148,17 +150,13 @@ function projectWorker(
     },
     availability: worker.availability,
     state: liveWorkerState(worker),
+    lifecycleState: worker.state,
     worker_state: worker.worker_state,
     pinned: false,
     retention_state: "transient",
     implementation: {
       kind: "runtime_subscription_worker",
       display_hint: "Workspace-authorized Runtime Worker",
-    },
-    capabilities: {
-      can_stop: worker.availability !== "unavailable" &&
-        worker.state !== "stopped",
-      can_spawn_followup: false,
     },
     workdir_attachments: (worker.workdir_attachments ?? []).map((
       attachment,

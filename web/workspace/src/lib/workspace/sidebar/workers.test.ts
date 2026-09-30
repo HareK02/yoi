@@ -38,10 +38,6 @@ function worker(overrides: Partial<Worker>): Worker {
       kind: "runtime_worker",
       display_hint: "Runtime Worker",
     },
-    capabilities: {
-      can_stop: true,
-      can_spawn_followup: false,
-    },
     workdir_attachments: [],
     diagnostics: [],
     ...overrides,
@@ -55,10 +51,6 @@ Deno.test("registry-only workers are not sidebar targets or console targets", ()
     implementation: {
       kind: "backend_worker_registry",
       display_hint: "Missing Worker",
-    },
-    capabilities: {
-      can_stop: false,
-      can_spawn_followup: false,
     },
   });
   assertEquals(canShowWorkerInSidebar(registryOnly), false);

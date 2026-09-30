@@ -5,7 +5,6 @@ pub use server_api::{
     CreateWorkspaceWorkerRequest as BackendCreateWorkerRequest, Diagnostic as BackendDiagnostic,
     DiagnosticSeverity as BackendDiagnosticSeverity, ListResponse as BackendRuntimeListResponse,
     RuntimeSummary as BackendRuntimeSummary,
-    WorkerCapabilitySummary as BackendWorkerCapabilitySummary,
     WorkerImplementationSummary as BackendWorkerImplementationSummary,
     WorkerLaunchOptionsResponse as BackendWorkerLaunchOptions,
     WorkerLaunchProfileCandidate as BackendWorkerLaunchProfileCandidate,
@@ -869,7 +868,6 @@ mod tests {
                 "pinned": false,
                 "retention_state": "resident",
                 "implementation": {"kind": "embedded", "display_hint": "Embedded"},
-                "capabilities": {"can_stop": true, "can_spawn_followup": false},
                 "diagnostics": []
             },
             "diagnostics": []
@@ -952,10 +950,11 @@ mod tests {
             "label": "Coder",
             "workspace": {"visibility": "workspace", "identity": "workspace"},
             "state": "idle",
+            "availability": "observed",
             "implementation": {"kind": "worker", "display_hint": "Coder"},
-            "capabilities": {"can_stop": true, "can_spawn_followup": false},
             "workdir_attachments": [{
                 "alias": "checkout",
+                "effective_permissions": {"read": true, "write": true, "command": true},
                 "working_directory": {
                     "working_directory_id": "wd-1",
                     "source": {"kind": "repository", "repository_key": "main"},

@@ -552,9 +552,8 @@ fn working_directory_text(worker: &BackendWorkerSummary) -> String {
 mod tests {
     use super::*;
     use client::{
-        BackendDiagnostic, BackendDiagnosticSeverity, BackendWorkerCapabilitySummary,
-        BackendWorkerImplementationSummary, BackendWorkerRestoreResult,
-        BackendWorkerWorkspaceSummary,
+        BackendDiagnostic, BackendDiagnosticSeverity, BackendWorkerImplementationSummary,
+        BackendWorkerRestoreResult, BackendWorkerWorkspaceSummary,
     };
 
     fn worker(runtime_id: &str, worker_id: &str, profile: Option<&str>) -> BackendWorkerSummary {
@@ -587,10 +586,6 @@ mod tests {
             implementation: BackendWorkerImplementationSummary {
                 kind: "embedded".to_string(),
                 display_hint: "embedded".to_string(),
-            },
-            capabilities: BackendWorkerCapabilitySummary {
-                can_stop: true,
-                can_spawn_followup: false,
             },
             workdir_attachments: Vec::new(),
             diagnostics: Vec::new(),

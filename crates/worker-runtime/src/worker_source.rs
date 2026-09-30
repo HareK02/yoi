@@ -1298,7 +1298,9 @@ mod tests {
 
     #[test]
     fn runtime_owned_workspace_client_has_no_fixed_request_timeout() {
-        let (base_url, server) = delayed_workspace_response(Duration::from_millis(75));
+        // This must exceed reqwest::blocking::Client's default 30-second timeout.
+        // A short delay only checks our Option field, not the effective HTTP deadline.
+        let (base_url, server) = delayed_workspace_response(Duration::from_secs(31));
         let client =
             RuntimeOwnedWorkspaceClient::new("workspace-a", base_url, "runtime-a", "worker-a");
         assert_eq!(client.request_timeout, None);

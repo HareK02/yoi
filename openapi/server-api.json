@@ -7448,9 +7448,6 @@
             "$ref": "#/components/schemas/SubscriptionWorkerAvailability",
             "description": "Freshness of the Runtime observation used to construct `worker_state`.\n`Unavailable` means no current controller snapshot is being asserted."
           },
-          "capabilities": {
-            "$ref": "#/components/schemas/WorkerCapabilitySummary"
-          },
           "diagnostics": {
             "default": [],
             "items": {
@@ -7550,7 +7547,6 @@
           "availability",
           "state",
           "implementation",
-          "capabilities",
           "updated_at"
         ],
         "type": "object"
@@ -7791,9 +7787,6 @@
       "RuntimeWorkerSummary": {
         "additionalProperties": false,
         "properties": {
-          "capabilities": {
-            "$ref": "#/components/schemas/WorkerCapabilitySummary"
-          },
           "diagnostics": {
             "default": [],
             "items": {
@@ -7872,8 +7865,7 @@
           "label",
           "workspace",
           "state",
-          "implementation",
-          "capabilities"
+          "implementation"
         ],
         "type": "object"
       },
@@ -11254,21 +11246,6 @@
           }
         ]
       },
-      "WorkerCapabilitySummary": {
-        "properties": {
-          "can_spawn_followup": {
-            "type": "boolean"
-          },
-          "can_stop": {
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "can_stop",
-          "can_spawn_followup"
-        ],
-        "type": "object"
-      },
       "WorkerFileDeleteResponse": {
         "additionalProperties": false,
         "properties": {
@@ -11447,9 +11424,6 @@
         "additionalProperties": false,
         "description": "Runtime-owned Worker summary embedded in Worker launch responses.\n\nThis preserves the existing launch wire shape. Workspace-owned Worker list\nand detail responses use [`WorkerSummary`] instead.",
         "properties": {
-          "capabilities": {
-            "$ref": "#/components/schemas/WorkerCapabilitySummary"
-          },
           "diagnostics": {
             "default": [],
             "items": {
@@ -11529,8 +11503,7 @@
           "state",
           "pinned",
           "retention_state",
-          "implementation",
-          "capabilities"
+          "implementation"
         ],
         "type": "object"
       },
@@ -11830,9 +11803,6 @@
             "$ref": "#/components/schemas/SubscriptionWorkerAvailability",
             "description": "Freshness of the Runtime observation used to construct `worker_state`.\n`Unavailable` means no current controller snapshot is being asserted."
           },
-          "capabilities": {
-            "$ref": "#/components/schemas/WorkerCapabilitySummary"
-          },
           "diagnostics": {
             "default": [],
             "items": {
@@ -11928,8 +11898,7 @@
           "workspace",
           "availability",
           "state",
-          "implementation",
-          "capabilities"
+          "implementation"
         ],
         "type": "object"
       },
@@ -14020,7 +13989,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:49856606e4a16d138cc04a62a6096fd40fff213587b1cbf7f0594f28994a45b0"
+    "x-yoi-source-digest": "sha256:ae559492220ec118f04c2c0c9593e8b3cb44c3cb857be3ae85715ace26da8043"
   },
   "openapi": "3.1.0",
   "paths": {
