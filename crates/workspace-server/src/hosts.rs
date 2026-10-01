@@ -507,6 +507,9 @@ pub struct WorkerSpawnRequest {
     pub intent: WorkerSpawnIntent,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_worker_name: Option<String>,
+    /// Opaque Backend-owned singleton key. Runtime providers must not infer semantics from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub singleton_key: Option<String>,
     pub acceptance: WorkerSpawnAcceptanceRequirement,
     pub profile: ProfileSelector,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6911,6 +6914,7 @@ mod tests {
                 role: TicketWorkerRole::Coder,
             },
             requested_worker_name: None,
+            singleton_key: None,
             acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                 expected_segments: 0,
             },
@@ -7198,6 +7202,7 @@ mod tests {
                         role: TicketWorkerRole::Coder,
                     },
                     requested_worker_name: Some("friendly-name-is-not-authority".to_string()),
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -7299,6 +7304,7 @@ mod tests {
                         role: TicketWorkerRole::Coder,
                     },
                     requested_worker_name: None,
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -7340,6 +7346,7 @@ mod tests {
                 WorkerSpawnRequest {
                     intent: WorkerSpawnIntent::WorkspaceCompanion,
                     requested_worker_name: None,
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::SocketReady,
                     profile: ProfileSelector::Builtin("builtin:companion".to_string()),
                     ticket_assignment: None,

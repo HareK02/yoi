@@ -80,6 +80,7 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "worker_removal_operations",
     "worker_retention_audit_events",
     "worker_session_archives",
+    "worker_singleton_owners",
     "worker_tombstones",
     "worker_workdir_attachment_reservations",
     "worker_workdir_links",

@@ -27,7 +27,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 72;
+const LATEST_SCHEMA_VERSION: i64 = 73;
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
@@ -66,6 +66,8 @@ const BACKEND_JOB_DELIVERY_CLAIM_MIGRATION_NAME: &str =
     "atomic Backend Job notification delivery claims";
 const BACKEND_JOB_DISPATCH_QUEUE_MIGRATION_NAME: &str =
     "durable bounded Backend Job dispatch queue";
+const WORKER_SINGLETON_OWNERSHIP_MIGRATION_NAME: &str =
+    "durable Workspace Worker singleton ownership";
 const TICKET_SCHEMA_VERSION_WITH_TARGETS: i64 = 7;
 const TICKET_SCHEMA_BASELINE_NAME: &str = "ticket schema baseline";
 const WORKER_REGISTRY_PROJECTION_SCHEMA: &str = r#"
@@ -223,6 +225,11 @@ const MIGRATIONS: &[Migration] = &[
         name: BACKEND_JOB_DISPATCH_QUEUE_MIGRATION_NAME,
         apply: migrate_backend_job_dispatch_queue_v71_to_v72,
     },
+    Migration {
+        version: 73,
+        name: WORKER_SINGLETON_OWNERSHIP_MIGRATION_NAME,
+        apply: migrate_worker_singleton_ownership_v72_to_v73,
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -277,6 +284,18 @@ pub struct WorkerCreateReservation {
     pub worker_id: WorkerId,
     pub create_fingerprint: String,
     pub memory_settings: manifest::WorkspaceMemorySettingsSnapshot,
+    pub singleton: Option<WorkerSingletonLease>,
+}
+
+/// Durable lease proving which Worker generation owns one opaque Workspace singleton key.
+///
+/// The current owner lives in `worker_singleton_owners`; matching lease data remains on every
+/// create reservation so a displaced generation can be fenced from later restore attempts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerSingletonLease {
+    pub key: String,
+    pub generation: u64,
+    pub worker: RuntimeWorkerRef,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1566,6 +1585,16 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         now: &str,
     ) -> Result<BackendJobDeliveryRecord>;
 
+    fn current_worker_singleton_owner(
+        &self,
+        workspace_id: &str,
+        singleton_key: &str,
+    ) -> Result<Option<WorkerSingletonLease>>;
+    fn require_current_worker_singleton_owner(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<WorkerSingletonLease>>;
     fn upsert_worker_registry(
         &self,
         record: &WorkerRegistryRecord,
@@ -1579,6 +1608,11 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         &self,
         workspace_id: &str,
         worker: &RuntimeWorkerRef,
+    ) -> Result<bool>;
+    fn has_reserved_worker_create_for_runtime(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
     ) -> Result<bool>;
     fn list_worker_registry(
         &self,
@@ -2095,6 +2129,7 @@ impl SqliteWorkspaceStore {
         runtime_id: &str,
         allocation_key: &str,
         request_fingerprint: &str,
+        singleton_key: Option<&str>,
         current_memory_settings: &WorkspaceMemorySettingsRecord,
     ) -> Result<WorkerCreateReservation> {
         if allocation_key.trim().is_empty() || request_fingerprint.trim().is_empty() {
@@ -2102,13 +2137,17 @@ impl SqliteWorkspaceStore {
                 "Worker create allocation key and fingerprint must be non-empty".to_string(),
             ));
         }
+        if let Some(key) = singleton_key {
+            validate_worker_singleton_key(key)?;
+        }
         validate_workspace_memory_settings_record(current_memory_settings, workspace_id)?;
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let existing = tx
                 .query_row(
                     "SELECT worker_id, runtime_id, request_fingerprint, create_fingerprint, \
-                            memory_settings_revision, memory_language, state \
+                            memory_settings_revision, memory_language, state, singleton_key, \
+                            singleton_generation \
                      FROM worker_create_reservations \
                      WHERE workspace_id = ?1 AND allocation_key = ?2",
                     params![workspace_id, allocation_key],
@@ -2121,11 +2160,13 @@ impl SqliteWorkspaceStore {
                             row.get::<_, Option<i64>>(4)?,
                             row.get::<_, Option<String>>(5)?,
                             row.get::<_, String>(6)?,
+                            row.get::<_, Option<String>>(7)?,
+                            row.get::<_, Option<i64>>(8)?,
                         ))
                     },
                 )
                 .optional()?;
-            if let Some((worker_id, reserved_runtime_id, stored_request_fingerprint, create_fingerprint, revision, language, state)) = existing {
+            if let Some((worker_id, reserved_runtime_id, stored_request_fingerprint, create_fingerprint, revision, language, state, stored_singleton_key, singleton_generation)) = existing {
                 if state == "removed" {
                     return Err(Error::InvalidInput(format!(
                         "Worker create allocation {allocation_key} was terminally removed"
@@ -2133,6 +2174,7 @@ impl SqliteWorkspaceStore {
                 }
                 if reserved_runtime_id != runtime_id
                     || stored_request_fingerprint.as_deref() != Some(request_fingerprint)
+                    || stored_singleton_key.as_deref() != singleton_key
                 {
                     return Err(Error::InvalidInput(format!(
                         "Worker create allocation {allocation_key} was already used with different input"
@@ -2161,10 +2203,31 @@ impl SqliteWorkspaceStore {
                     language,
                 };
                 validate_workspace_memory_settings_snapshot(&snapshot, workspace_id)?;
+                let singleton = match (stored_singleton_key, singleton_generation) {
+                    (Some(key), Some(generation)) => Some(WorkerSingletonLease {
+                        key,
+                        generation: generation.try_into().map_err(|_| {
+                            Error::Store(format!(
+                                "Worker create allocation {allocation_key} has an invalid singleton generation"
+                            ))
+                        })?,
+                        worker: RuntimeWorkerRef::new(reserved_runtime_id, worker_id.to_string()),
+                    }),
+                    (None, None) => None,
+                    _ => {
+                        return Err(Error::Store(format!(
+                            "Worker create allocation {allocation_key} has an incomplete singleton lease"
+                        )));
+                    }
+                };
+                if let Some(lease) = singleton.as_ref() {
+                    require_current_worker_singleton_lease(&tx, workspace_id, lease)?;
+                }
                 return Ok(WorkerCreateReservation {
                     worker_id,
                     create_fingerprint,
                     memory_settings: snapshot,
+                    singleton,
                 });
             }
 
@@ -2197,38 +2260,175 @@ impl SqliteWorkspaceStore {
             let create_fingerprint =
                 bound_worker_create_fingerprint(request_fingerprint, &snapshot);
             let worker_id = WorkerId::now_v7();
+            let worker_id_text = worker_id.to_string();
             let now = chrono::Utc::now().to_rfc3339();
+            let singleton_owner = singleton_key
+                .map(|key| current_worker_singleton_owner(&tx, workspace_id, key))
+                .transpose()?
+                .flatten();
+            let singleton_generation = match singleton_owner.as_ref() {
+                None if singleton_key.is_some() => Some(1_u64),
+                None => None,
+                Some((owner, state)) if state.as_deref() == Some("removed") => {
+                    Some(owner.generation.saturating_add(1))
+                }
+                Some((owner, _)) => {
+                    return Err(Error::RepositoryConflict(format!(
+                        "worker_singleton_owned: singleton key is already owned by Worker {}:{}",
+                        owner.worker.runtime_id, owner.worker.worker_id
+                    )));
+                }
+            };
             allocate_resource_key(
                 &tx,
                 workspace_id,
                 WorkspaceResourceKind::Worker,
-                &worker_id.to_string(),
+                &worker_id_text,
                 &now,
             )?;
             tx.execute(
                 "INSERT INTO worker_create_reservations(\
                     workspace_id, allocation_key, worker_id, runtime_id, create_fingerprint,\
                     state, created_at, updated_at, request_fingerprint,\
-                    memory_settings_revision, memory_language\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?6, ?7, ?8, ?9)",
+                    memory_settings_revision, memory_language, singleton_key, singleton_generation\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     workspace_id,
                     allocation_key,
-                    worker_id.to_string(),
+                    worker_id_text,
                     runtime_id,
                     create_fingerprint,
                     now,
                     request_fingerprint,
                     snapshot.settings_revision as i64,
                     snapshot.language,
+                    singleton_key,
+                    singleton_generation.map(|generation| generation as i64),
                 ],
             )?;
+            let singleton = singleton_key.zip(singleton_generation).map(|(key, generation)| {
+                WorkerSingletonLease {
+                    key: key.to_string(),
+                    generation,
+                    worker: RuntimeWorkerRef::new(runtime_id, worker_id_text.clone()),
+                }
+            });
+            if let Some(lease) = singleton.as_ref() {
+                let changed = if let Some((previous, _)) = singleton_owner {
+                    tx.execute(
+                        "UPDATE worker_singleton_owners \
+                         SET runtime_id = ?4, worker_id = ?5, generation = ?6, updated_at = ?7 \
+                         WHERE workspace_id = ?1 AND singleton_key = ?2 AND worker_id = ?3",
+                        params![
+                            workspace_id,
+                            lease.key,
+                            previous.worker.worker_id,
+                            runtime_id,
+                            worker_id_text,
+                            lease.generation as i64,
+                            now,
+                        ],
+                    )?
+                } else {
+                    tx.execute(
+                        "INSERT INTO worker_singleton_owners(\
+                            workspace_id, singleton_key, runtime_id, worker_id, generation, created_at, updated_at\
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                        params![
+                            workspace_id,
+                            lease.key,
+                            runtime_id,
+                            worker_id_text,
+                            lease.generation as i64,
+                            now,
+                        ],
+                    )?
+                };
+                if changed != 1 {
+                    return Err(Error::RepositoryConflict(
+                        "worker_singleton_raced: singleton ownership changed during create reservation"
+                            .to_string(),
+                    ));
+                }
+            }
             tx.commit()?;
             Ok(WorkerCreateReservation {
                 worker_id,
                 create_fingerprint,
                 memory_settings: snapshot,
+                singleton,
             })
+        })
+    }
+
+    pub(crate) fn current_worker_singleton_owner(
+        &self,
+        workspace_id: &str,
+        singleton_key: &str,
+    ) -> Result<Option<WorkerSingletonLease>> {
+        validate_worker_singleton_key(singleton_key)?;
+        self.with_conn(|conn| {
+            Ok(
+                current_worker_singleton_owner(conn, workspace_id, singleton_key)?.and_then(
+                    |(lease, state)| (state.as_deref() != Some("removed")).then_some(lease),
+                ),
+            )
+        })
+    }
+
+    /// Returns the Worker's historical singleton lease and rejects it when another generation is
+    /// current. Workers without a singleton lease continue through the ordinary lifecycle path.
+    pub(crate) fn require_current_worker_singleton_owner(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<WorkerSingletonLease>> {
+        self.with_conn(|conn| {
+            let stored = conn
+                .query_row(
+                    "SELECT singleton_key, singleton_generation, state \
+                     FROM worker_create_reservations \
+                     WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
+                    params![workspace_id, worker.runtime_id, worker.worker_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((key, generation, state)) = stored else {
+                return Ok(None);
+            };
+            let lease = match (key, generation) {
+                (None, None) => return Ok(None),
+                (Some(key), Some(generation)) => WorkerSingletonLease {
+                    key,
+                    generation: generation.try_into().map_err(|_| {
+                        Error::Store(format!(
+                            "Worker {}:{} has an invalid singleton generation",
+                            worker.runtime_id, worker.worker_id
+                        ))
+                    })?,
+                    worker: worker.clone(),
+                },
+                _ => {
+                    return Err(Error::Store(format!(
+                        "Worker {}:{} has an incomplete singleton lease",
+                        worker.runtime_id, worker.worker_id
+                    )));
+                }
+            };
+            if state == "removed" {
+                return Err(Error::RepositoryConflict(format!(
+                    "worker_singleton_fenced: Worker {}:{} generation {} has been terminally removed from singleton key {:?}",
+                    worker.runtime_id, worker.worker_id, lease.generation, lease.key
+                )));
+            }
+            require_current_worker_singleton_lease(conn, workspace_id, &lease)?;
+            Ok(Some(lease))
         })
     }
 
@@ -6458,6 +6658,22 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn current_worker_singleton_owner(
+        &self,
+        workspace_id: &str,
+        singleton_key: &str,
+    ) -> Result<Option<WorkerSingletonLease>> {
+        SqliteWorkspaceStore::current_worker_singleton_owner(self, workspace_id, singleton_key)
+    }
+
+    fn require_current_worker_singleton_owner(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<WorkerSingletonLease>> {
+        SqliteWorkspaceStore::require_current_worker_singleton_owner(self, workspace_id, worker)
+    }
+
     fn upsert_worker_registry(
         &self,
         record: &WorkerRegistryRecord,
@@ -6588,6 +6804,27 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                        AND state = 'reserved'
                    )"#,
                 params![workspace_id, worker.runtime_id, worker.worker_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(Error::from)
+        })
+    }
+
+    fn has_reserved_worker_create_for_runtime(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+    ) -> Result<bool> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                r#"SELECT EXISTS(
+                     SELECT 1
+                     FROM worker_create_reservations
+                     WHERE workspace_id = ?1
+                       AND runtime_id = ?2
+                       AND state = 'reserved'
+                   )"#,
+                params![workspace_id, runtime_id],
                 |row| row.get::<_, bool>(0),
             )
             .map_err(Error::from)
@@ -6913,7 +7150,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     "UPDATE worker_create_reservations
                      SET state = 'removed', updated_at = ?4
                      WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
-                       AND state = 'created'",
+                       AND state IN ('reserved', 'created')",
                     params![
                         workspace_id,
                         worker.runtime_id,
@@ -13444,6 +13681,160 @@ fn migrate_backend_job_dispatch_queue_v71_to_v72(conn: &Connection) -> Result<()
     Ok(())
 }
 
+fn migrate_worker_singleton_ownership_v72_to_v73(conn: &Connection) -> Result<()> {
+    let current = current_schema_version(conn)?;
+    if current != 72 {
+        return Err(Error::Store(format!(
+            "expected schema version 72 before {WORKER_SINGLETON_OWNERSHIP_MIGRATION_NAME} migration, found {current}"
+        )));
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    if !column_exists(&tx, "worker_create_reservations", "singleton_key")? {
+        tx.execute(
+            "ALTER TABLE worker_create_reservations ADD COLUMN singleton_key TEXT",
+            [],
+        )?;
+    }
+    if !column_exists(&tx, "worker_create_reservations", "singleton_generation")? {
+        tx.execute(
+            "ALTER TABLE worker_create_reservations ADD COLUMN singleton_generation INTEGER \
+             CHECK (singleton_generation IS NULL OR singleton_generation > 0)",
+            [],
+        )?;
+    }
+    tx.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS worker_singleton_owners (
+            workspace_id TEXT NOT NULL,
+            singleton_key TEXT NOT NULL,
+            runtime_id TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            generation INTEGER NOT NULL CHECK (generation > 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (workspace_id, singleton_key),
+            UNIQUE (workspace_id, worker_id),
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+        );
+        CREATE TRIGGER IF NOT EXISTS worker_create_reservation_singleton_lease_insert
+        BEFORE INSERT ON worker_create_reservations
+        WHEN (NEW.singleton_key IS NULL AND NEW.singleton_generation IS NOT NULL)
+          OR (NEW.singleton_key IS NOT NULL AND NEW.singleton_generation IS NULL)
+        BEGIN
+            SELECT RAISE(ABORT, 'worker_singleton_lease_incomplete');
+        END;
+        CREATE TRIGGER IF NOT EXISTS worker_create_reservation_singleton_lease_update
+        BEFORE UPDATE OF singleton_key, singleton_generation ON worker_create_reservations
+        WHEN (NEW.singleton_key IS NULL AND NEW.singleton_generation IS NOT NULL)
+          OR (NEW.singleton_key IS NOT NULL AND NEW.singleton_generation IS NULL)
+        BEGIN
+            SELECT RAISE(ABORT, 'worker_singleton_lease_incomplete');
+        END;
+
+        -- Preserve the two historical singleton conventions as Backend ownership. If an old
+        -- database contains duplicates, deterministically fence every Worker except the oldest.
+        INSERT INTO worker_singleton_owners (
+            workspace_id, singleton_key, runtime_id, worker_id, generation, created_at, updated_at
+        )
+        SELECT worker.workspace_id, 'workspace-orchestrator', worker.runtime_id, worker.worker_id,
+               1, worker.created_at, worker.updated_at
+        FROM worker_registry worker
+        WHERE worker.profile IN ('orchestrator', 'builtin:orchestrator')
+          AND worker.display_name = 'Workspace Orchestrator'
+          AND NOT EXISTS (
+              SELECT 1 FROM worker_registry older
+              WHERE older.workspace_id = worker.workspace_id
+                AND older.profile IN ('orchestrator', 'builtin:orchestrator')
+                AND older.display_name = 'Workspace Orchestrator'
+                AND (older.created_at < worker.created_at
+                     OR (older.created_at = worker.created_at AND older.worker_id < worker.worker_id))
+          );
+        INSERT INTO worker_singleton_owners (
+            workspace_id, singleton_key, runtime_id, worker_id, generation, created_at, updated_at
+        )
+        SELECT worker.workspace_id, 'workspace-memory-consolidation', worker.runtime_id,
+               worker.worker_id, 1, worker.created_at, worker.updated_at
+        FROM worker_registry worker
+        WHERE worker.profile IN ('memory-consolidation', 'builtin:memory-consolidation')
+          AND NOT EXISTS (
+              SELECT 1 FROM worker_registry older
+              WHERE older.workspace_id = worker.workspace_id
+                AND older.profile IN ('memory-consolidation', 'builtin:memory-consolidation')
+                AND (older.created_at < worker.created_at
+                     OR (older.created_at = worker.created_at AND older.worker_id < worker.worker_id))
+          );
+        INSERT INTO worker_create_reservations (
+            workspace_id, allocation_key, worker_id, runtime_id, create_fingerprint,
+            state, created_at, updated_at, request_fingerprint,
+            memory_settings_revision, memory_language, singleton_key, singleton_generation
+        )
+        SELECT worker.workspace_id, 'migration-v73-singleton:' || worker.worker_id,
+               worker.worker_id, worker.runtime_id,
+               'migration-v73:' || CASE
+                   WHEN worker.profile IN ('orchestrator', 'builtin:orchestrator')
+                        AND worker.display_name = 'Workspace Orchestrator'
+                       THEN 'workspace-orchestrator'
+                   ELSE 'workspace-memory-consolidation'
+               END,
+               'created', worker.created_at, worker.updated_at, NULL, NULL, NULL,
+               CASE
+                   WHEN worker.profile IN ('orchestrator', 'builtin:orchestrator')
+                        AND worker.display_name = 'Workspace Orchestrator'
+                       THEN 'workspace-orchestrator'
+                   ELSE 'workspace-memory-consolidation'
+               END,
+               1
+        FROM worker_registry worker
+        WHERE (
+                (
+                    worker.profile IN ('orchestrator', 'builtin:orchestrator')
+                    AND worker.display_name = 'Workspace Orchestrator'
+                )
+                OR worker.profile IN ('memory-consolidation', 'builtin:memory-consolidation')
+              )
+          AND NOT EXISTS (
+              SELECT 1 FROM worker_create_reservations reservation
+              WHERE reservation.workspace_id = worker.workspace_id
+                AND reservation.worker_id = worker.worker_id
+          );
+        UPDATE worker_create_reservations
+        SET singleton_key = (
+                SELECT CASE
+                    WHEN worker.profile IN ('orchestrator', 'builtin:orchestrator')
+                         AND worker.display_name = 'Workspace Orchestrator'
+                        THEN 'workspace-orchestrator'
+                    ELSE 'workspace-memory-consolidation'
+                END
+                FROM worker_registry worker
+                WHERE worker.workspace_id = worker_create_reservations.workspace_id
+                  AND worker.worker_id = worker_create_reservations.worker_id
+                  AND (
+                        (worker.profile IN ('orchestrator', 'builtin:orchestrator')
+                         AND worker.display_name = 'Workspace Orchestrator')
+                        OR worker.profile IN ('memory-consolidation', 'builtin:memory-consolidation')
+                      )
+            ),
+            singleton_generation = 1
+        WHERE EXISTS (
+            SELECT 1 FROM worker_registry worker
+            WHERE worker.workspace_id = worker_create_reservations.workspace_id
+              AND worker.worker_id = worker_create_reservations.worker_id
+              AND (
+                    (worker.profile IN ('orchestrator', 'builtin:orchestrator')
+                     AND worker.display_name = 'Workspace Orchestrator')
+                    OR worker.profile IN ('memory-consolidation', 'builtin:memory-consolidation')
+                  )
+        );
+        "#,
+    )?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+        params![73_i64, WORKER_SINGLETON_OWNERSHIP_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("DROP TABLE IF EXISTS typed_ticket_targets;")?;
     conn.execute_batch(include_str!("latest_schema.sql"))?;
@@ -13894,6 +14285,90 @@ fn normalize_workspace_memory_language(language: &str) -> Result<String> {
         )));
     }
     Ok(language.to_string())
+}
+
+pub(crate) fn validate_worker_singleton_key(key: &str) -> Result<()> {
+    if key.is_empty() {
+        return Err(Error::InvalidInput(
+            "Worker singleton key must not be empty".to_string(),
+        ));
+    }
+    if key.len() > 512 {
+        return Err(Error::InvalidInput(
+            "Worker singleton key must not exceed 512 UTF-8 bytes".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn current_worker_singleton_owner(
+    conn: &Connection,
+    workspace_id: &str,
+    singleton_key: &str,
+) -> Result<Option<(WorkerSingletonLease, Option<String>)>> {
+    let owner = conn
+        .query_row(
+            "SELECT owner.runtime_id, owner.worker_id, owner.generation, reservation.state \
+             FROM worker_singleton_owners owner \
+             LEFT JOIN worker_create_reservations reservation \
+               ON reservation.workspace_id = owner.workspace_id \
+              AND reservation.worker_id = owner.worker_id \
+             WHERE owner.workspace_id = ?1 AND owner.singleton_key = ?2",
+            params![workspace_id, singleton_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    owner
+        .map(|(runtime_id, worker_id, generation, state)| {
+            let generation = generation.try_into().map_err(|_| {
+                Error::Store(format!(
+                    "Worker singleton key {singleton_key:?} has an invalid generation"
+                ))
+            })?;
+            Ok((
+                WorkerSingletonLease {
+                    key: singleton_key.to_string(),
+                    generation,
+                    worker: RuntimeWorkerRef::new(runtime_id, worker_id),
+                },
+                state,
+            ))
+        })
+        .transpose()
+}
+
+fn require_current_worker_singleton_lease(
+    conn: &Connection,
+    workspace_id: &str,
+    expected: &WorkerSingletonLease,
+) -> Result<()> {
+    let current =
+        current_worker_singleton_owner(conn, workspace_id, &expected.key)?.map(|(lease, _)| lease);
+    if current.as_ref() != Some(expected) {
+        let current_worker = current
+            .map(|lease| {
+                format!(
+                    "{}:{} generation {}",
+                    lease.worker.runtime_id, lease.worker.worker_id, lease.generation
+                )
+            })
+            .unwrap_or_else(|| "no current owner".to_string());
+        return Err(Error::RepositoryConflict(format!(
+            "worker_singleton_fenced: Worker {}:{} generation {} no longer owns singleton key {:?}; current owner is {current_worker}",
+            expected.worker.runtime_id,
+            expected.worker.worker_id,
+            expected.generation,
+            expected.key
+        )));
+    }
+    Ok(())
 }
 
 fn bound_worker_create_fingerprint(
@@ -15627,6 +16102,10 @@ mod tests {
                     version: 72,
                     name: BACKEND_JOB_DISPATCH_QUEUE_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 73,
+                    name: WORKER_SINGLETON_OWNERSHIP_MIGRATION_NAME.to_string(),
+                },
             ]
         );
 
@@ -15703,6 +16182,7 @@ mod tests {
                             BACKEND_JOB_DELIVERY_CLAIM_MIGRATION_NAME.to_string(),
                         ),
                         (72, BACKEND_JOB_DISPATCH_QUEUE_MIGRATION_NAME.to_string()),
+                        (73, WORKER_SINGLETON_OWNERSHIP_MIGRATION_NAME.to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -15988,7 +16468,8 @@ mod tests {
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
             vec![
-                52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72
+                52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72,
+                73
             ]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
@@ -15997,10 +16478,158 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 23);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 24);
         assert!(column_exists(&conn, "worker_workdir_links", "alias").unwrap());
         assert!(column_exists(&conn, "worker_workdir_links", "capabilities").unwrap());
         assert!(!column_exists(&conn, "worker_workdir_links", "role").unwrap());
+    }
+
+    #[test]
+    fn singleton_migration_backfills_a_fenceable_reservation_for_legacy_workers() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        prepare_schema_v50(&path, Some("workspace-a"));
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > 50 && migration.version <= 72)
+        {
+            (migration.apply)(&conn).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO workspace_memory_settings(\
+                 workspace_id, settings_revision, language, created_at, updated_at\
+             ) VALUES ('workspace-a', 1, 'English', '1', '1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            r#"INSERT INTO worker_registry(
+                   workspace_id, worker_id, runtime_id, display_name, profile, retention_state,
+                   created_at, updated_at
+               ) VALUES (
+                   'workspace-a', 'legacy-orchestrator', 'legacy-runtime',
+                   'Workspace Orchestrator', 'builtin:orchestrator', 'normal', '1', '2'
+               )"#,
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            r#"INSERT INTO worker_registry(
+                   workspace_id, worker_id, runtime_id, display_name, profile, retention_state,
+                   created_at, updated_at
+               ) VALUES (
+                   'workspace-a', 'legacy-orchestrator-duplicate', 'other-runtime',
+                   'Workspace Orchestrator', 'builtin:orchestrator', 'normal', '3', '4'
+               )"#,
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            r#"
+            INSERT INTO worker_registry(
+                workspace_id, worker_id, runtime_id, display_name, profile, retention_state,
+                created_at, updated_at
+            ) VALUES (
+                'workspace-a', 'legacy-memory', 'memory-runtime', 'Memory Consolidation',
+                'builtin:memory-consolidation', 'normal', '1', '2'
+            );
+            INSERT INTO worker_registry(
+                workspace_id, worker_id, runtime_id, display_name, profile, retention_state,
+                created_at, updated_at
+            ) VALUES (
+                'workspace-a', 'legacy-memory-duplicate', 'other-memory-runtime',
+                'Memory Consolidation duplicate', 'builtin:memory-consolidation', 'normal', '3', '4'
+            );
+            INSERT INTO worker_create_reservations(
+                workspace_id, allocation_key, worker_id, runtime_id, create_fingerprint,
+                state, created_at, updated_at
+            ) VALUES (
+                'workspace-a', 'existing-memory-reservation', 'legacy-memory-duplicate',
+                'other-memory-runtime', 'existing-memory', 'created', '3', '4'
+            );
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM worker_create_reservations WHERE workspace_id = 'workspace-a'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+
+        migrate_worker_singleton_ownership_v72_to_v73(&conn).unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE worker_create_reservations SET singleton_generation = NULL \
+                 WHERE workspace_id = 'workspace-a' AND worker_id = 'legacy-orchestrator'",
+                [],
+            )
+            .is_err(),
+            "migrated databases must reject incomplete singleton leases"
+        );
+        drop(conn);
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        let legacy = RuntimeWorkerRef::new("legacy-runtime", "legacy-orchestrator");
+        let lease = store
+            .require_current_worker_singleton_owner("workspace-a", &legacy)
+            .unwrap()
+            .expect("legacy singleton lease");
+        assert_eq!(lease.key, "workspace-orchestrator");
+        assert_eq!(lease.generation, 1);
+        let duplicate = RuntimeWorkerRef::new("other-runtime", "legacy-orchestrator-duplicate");
+        assert!(
+            store
+                .require_current_worker_singleton_owner("workspace-a", &duplicate)
+                .unwrap_err()
+                .to_string()
+                .contains("worker_singleton_fenced")
+        );
+        let memory_owner = RuntimeWorkerRef::new("memory-runtime", "legacy-memory");
+        assert_eq!(
+            store
+                .require_current_worker_singleton_owner("workspace-a", &memory_owner)
+                .unwrap()
+                .unwrap()
+                .key,
+            "workspace-memory-consolidation"
+        );
+        let memory_duplicate =
+            RuntimeWorkerRef::new("other-memory-runtime", "legacy-memory-duplicate");
+        assert!(
+            store
+                .require_current_worker_singleton_owner("workspace-a", &memory_duplicate)
+                .unwrap_err()
+                .to_string()
+                .contains("worker_singleton_fenced")
+        );
+
+        store
+            .delete_worker_registry("workspace-a", &legacy)
+            .unwrap();
+        let memory = store.get_workspace_memory_settings("workspace-a").unwrap();
+        let replacement = store
+            .reserve_worker_create(
+                "workspace-a",
+                "replacement-runtime",
+                "replacement-operation",
+                "sha256:replacement",
+                Some("workspace-orchestrator"),
+                &memory,
+            )
+            .unwrap();
+        assert_eq!(replacement.singleton.unwrap().generation, 2);
+        assert!(
+            store
+                .require_current_worker_singleton_owner("workspace-a", &legacy)
+                .unwrap_err()
+                .to_string()
+                .contains("worker_singleton_fenced")
+        );
     }
 
     #[test]
@@ -17310,6 +17939,7 @@ mod tests {
                 "arcadia",
                 "operation-1",
                 "sha256:one",
+                None,
                 &memory_settings,
             )
             .unwrap();
@@ -17341,6 +17971,7 @@ mod tests {
                     "arcadia",
                     "operation-1",
                     "sha256:one",
+                    None,
                     &updated_memory_settings,
                 )
                 .unwrap(),
@@ -17353,6 +17984,7 @@ mod tests {
                     "arcadia",
                     "operation-1",
                     "sha256:different",
+                    None,
                     &updated_memory_settings,
                 )
                 .is_err()
@@ -17380,6 +18012,7 @@ mod tests {
                 "arcadia",
                 "operation-2",
                 "sha256:two",
+                None,
                 &updated_memory_settings,
             )
             .unwrap();
@@ -17538,6 +18171,7 @@ mod tests {
                     "arcadia",
                     "operation-1",
                     "sha256:one",
+                    None,
                     &updated_memory_settings,
                 )
                 .is_err()
@@ -17568,6 +18202,7 @@ mod tests {
                     "arcadia",
                     "operation-corrupt",
                     "sha256:corrupt",
+                    None,
                     &corrupt,
                 )
                 .is_err()
@@ -17583,6 +18218,189 @@ mod tests {
             })
             .unwrap();
         assert!(store.get_workspace_memory_settings("workspace-a").is_err());
+    }
+
+    #[tokio::test]
+    async fn worker_singleton_ownership_is_workspace_scoped_durable_and_fences_old_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("server.db");
+        let store = SqliteWorkspaceStore::open(&database).unwrap();
+        for workspace_id in ["workspace-a", "workspace-b"] {
+            store
+                .upsert_workspace(&WorkspaceRecord {
+                    workspace_id: workspace_id.to_string(),
+                    owner_account_id: "owner-account".to_string(),
+                    display_name: workspace_id.to_string(),
+                    state: "active".to_string(),
+                    created_at: "2026-10-01T00:00:00Z".to_string(),
+                    updated_at: "2026-10-01T00:00:00Z".to_string(),
+                })
+                .await
+                .unwrap();
+        }
+        let key = "subjektiv:主体 id/?!";
+        let memory_a = store.get_workspace_memory_settings("workspace-a").unwrap();
+        let first = store
+            .reserve_worker_create(
+                "workspace-a",
+                "runtime-a",
+                "operation-a1",
+                "sha256:a1",
+                Some(key),
+                &memory_a,
+            )
+            .unwrap();
+        let first_lease = first.singleton.clone().unwrap();
+        assert_eq!(first_lease.key, key);
+        assert_eq!(first_lease.generation, 1);
+        assert_eq!(
+            store
+                .reserve_worker_create(
+                    "workspace-a",
+                    "runtime-a",
+                    "operation-a1",
+                    "sha256:a1",
+                    Some(key),
+                    &memory_a,
+                )
+                .unwrap(),
+            first
+        );
+        let conflict = store
+            .reserve_worker_create(
+                "workspace-a",
+                "runtime-b",
+                "operation-a2",
+                "sha256:a2",
+                Some(key),
+                &memory_a,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(conflict, Error::RepositoryConflict(message) if message.contains("worker_singleton_owned"))
+        );
+
+        // The same opaque key is independent in another Workspace.
+        let memory_b = store.get_workspace_memory_settings("workspace-b").unwrap();
+        let other_workspace = store
+            .reserve_worker_create(
+                "workspace-b",
+                "runtime-b",
+                "operation-b1",
+                "sha256:b1",
+                Some(key),
+                &memory_b,
+            )
+            .unwrap();
+        assert_eq!(other_workspace.singleton.unwrap().generation, 1);
+
+        // A failed launch keeps the key pointing at the failed generation until Runtime absence is
+        // confirmed and the reservation becomes terminal. A fresh operation can then replace it.
+        store
+            .fail_worker_create_reservation(
+                "workspace-a",
+                "runtime-a",
+                first.worker_id,
+                &first.create_fingerprint,
+            )
+            .unwrap();
+        assert!(
+            store
+                .current_worker_singleton_owner("workspace-a", key)
+                .unwrap()
+                .is_none()
+        );
+        let replacement = store
+            .reserve_worker_create(
+                "workspace-a",
+                "runtime-b",
+                "operation-a3",
+                "sha256:a3",
+                Some(key),
+                &memory_a,
+            )
+            .unwrap();
+        let replacement_lease = replacement.singleton.clone().unwrap();
+        assert_eq!(replacement_lease.generation, 2);
+        assert!(
+            store
+                .require_current_worker_singleton_owner("workspace-a", &first_lease.worker)
+                .unwrap_err()
+                .to_string()
+                .contains("worker_singleton_fenced")
+        );
+        assert_eq!(
+            store
+                .require_current_worker_singleton_owner("workspace-a", &replacement_lease.worker,)
+                .unwrap(),
+            Some(replacement_lease.clone())
+        );
+        drop(store);
+
+        let reopened = SqliteWorkspaceStore::open(database).unwrap();
+        assert_eq!(
+            reopened
+                .current_worker_singleton_owner("workspace-a", key)
+                .unwrap(),
+            Some(replacement_lease)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_worker_singleton_reservations_have_one_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("server.db");
+        let store = SqliteWorkspaceStore::open(&database).unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "workspace-a".to_string(),
+                owner_account_id: "owner-account".to_string(),
+                display_name: "Workspace A".to_string(),
+                state: "active".to_string(),
+                created_at: "2026-10-01T00:00:00Z".to_string(),
+                updated_at: "2026-10-01T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+        drop(store);
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles = (0..2)
+            .map(|index| {
+                let database = database.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let store = SqliteWorkspaceStore::open(database).unwrap();
+                    let memory = store.get_workspace_memory_settings("workspace-a").unwrap();
+                    barrier.wait();
+                    store.reserve_worker_create(
+                        "workspace-a",
+                        if index == 0 { "runtime-a" } else { "runtime-b" },
+                        &format!("operation-{index}"),
+                        &format!("sha256:{index}"),
+                        Some("shared-key"),
+                        &memory,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        let store = SqliteWorkspaceStore::open(database).unwrap();
+        let owner = store
+            .current_worker_singleton_owner("workspace-a", "shared-key")
+            .unwrap()
+            .unwrap();
+        assert!(
+            results
+                .into_iter()
+                .flatten()
+                .any(|reservation| { reservation.worker_id.to_string() == owner.worker.worker_id })
+        );
     }
 
     #[tokio::test]

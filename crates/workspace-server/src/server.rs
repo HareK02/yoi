@@ -3352,6 +3352,7 @@ impl WorkspaceApi {
             EMBEDDED_WORKER_RUNTIME_ID,
             WorkerSpawnRequest {
                 requested_worker_name: Some(format!("job:{}", request.purpose)),
+                singleton_key: None,
                 intent: WorkerSpawnIntent::BackendJob {
                     job_id: request.job_id.clone(),
                     attempt_id: reservation.attempt.attempt_id.clone(),
@@ -4060,6 +4061,9 @@ impl WorkspaceApi {
         runtime_id: &str,
         mut request: WorkerSpawnRequest,
     ) -> ApiResult<WorkerSpawnResult> {
+        if let Some(singleton_key) = request.singleton_key.as_deref() {
+            crate::store::validate_worker_singleton_key(singleton_key)?;
+        }
         self.validate_worker_spawn_repository_scope(runtime_id, &mut request)?;
         let workspace_api = self.workspace_api_ref(runtime_id);
         request.resolved_workspace_api = Some(workspace_api.clone());
@@ -4099,6 +4103,7 @@ impl WorkspaceApi {
             .collect::<Vec<_>>();
         let request_fingerprint = worker_spawn_create_fingerprint(&request)
             .map_err(|message| Error::Config(message.to_string()))?;
+        let singleton_key = request.singleton_key.clone();
         let current_memory_settings = self
             .config_store
             .get_workspace_memory_settings(&self.config.workspace_id)?;
@@ -4113,20 +4118,28 @@ impl WorkspaceApi {
                     .map(|assignment| assignment.operation_id.clone())
             })
             .unwrap_or_else(|| format!("manual:{}", WorkerId::now_v7()));
-        let reservation = self
-            .config_store
-            .reserve_worker_create(
-                &self.config.workspace_id,
-                runtime_id,
-                &allocation_key,
-                &request_fingerprint,
-                &current_memory_settings,
-            )
-            .map_err(|error| Error::RuntimeOperationFailed {
-                runtime_id: runtime_id.to_string(),
-                code: "workspace_worker_allocation_conflict".to_string(),
-                message: error.to_string(),
-            })?;
+        let reservation = match self.config_store.reserve_worker_create(
+            &self.config.workspace_id,
+            runtime_id,
+            &allocation_key,
+            &request_fingerprint,
+            singleton_key.as_deref(),
+            &current_memory_settings,
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                let error = match error {
+                    Error::RepositoryConflict(message) => Error::RepositoryConflict(message),
+                    error => Error::RuntimeOperationFailed {
+                        runtime_id: runtime_id.to_string(),
+                        code: "workspace_worker_allocation_conflict".to_string(),
+                        message: error.to_string(),
+                    },
+                };
+                let diagnostics = cleanup_spawn_created_workdirs(self, &spawned_workdir_ids);
+                return Err(ApiError::with_diagnostics(error, diagnostics));
+            }
+        };
         let worker_id = reservation.worker_id;
         request.resolved_memory_settings = Some(reservation.memory_settings);
         let reservation_fingerprint = reservation.create_fingerprint.clone();
@@ -4189,6 +4202,35 @@ impl WorkspaceApi {
         {
             Ok(result) => result,
             Err(error) => {
+                if matches!(&error, RuntimeRegistryError::UnknownRuntime(_)) {
+                    // Registry lookup failed before dispatch, so no Runtime could have created this
+                    // Worker. Terminalize the reservation immediately instead of retaining an
+                    // uncertain singleton generation forever.
+                    let mut diagnostics =
+                        release_worker_workdir_attachment_reservations(self, &reserved_attachments);
+                    if let Err(cleanup_error) = self.config_store.fail_worker_create_reservation(
+                        &self.config.workspace_id,
+                        runtime_id,
+                        worker_id,
+                        &reservation_fingerprint,
+                    ) {
+                        diagnostics.push(spawn_compensation_diagnostic(
+                            "worker_spawn_compensation_create_reservation_release_failed",
+                            format!(
+                                "Failed to terminalize undispatched Worker create reservation {}: {}",
+                                worker_id,
+                                sanitize_backend_error(&cleanup_error.to_string())
+                            ),
+                        ));
+                    }
+                    write_workspace_worker_create_failure(
+                        runtime_id,
+                        worker_id,
+                        "runtime_spawn_undispatched",
+                        &diagnostics,
+                    );
+                    return Err(ApiError::with_diagnostics(error.into_error(), diagnostics));
+                }
                 let diagnostics = compensate_failed_workspace_worker_create(
                     self,
                     runtime_id,
@@ -4202,7 +4244,7 @@ impl WorkspaceApi {
                 return Err(ApiError::with_diagnostics(error.into_error(), diagnostics));
             }
         };
-        let Some(worker) = result.worker.as_ref() else {
+        let Some(worker) = result.worker.as_mut() else {
             result
                 .diagnostics
                 .extend(compensate_failed_workspace_worker_create(
@@ -4217,6 +4259,12 @@ impl WorkspaceApi {
                 ));
             return Ok(result);
         };
+        // Runtime metadata is display-only. The lease returned by the same DB transaction that
+        // reserved creation is the sole authority for the projected singleton key.
+        worker.singleton_key = reservation
+            .singleton
+            .as_ref()
+            .map(|lease| lease.key.clone());
         let worker_ref = worker.worker.clone();
         if worker_ref.worker_id != worker_id.to_string() {
             let diagnostics = compensate_failed_workspace_worker_create(
@@ -4401,6 +4449,11 @@ impl WorkspaceApi {
         &self,
         worker: &RuntimeWorkerRef,
     ) -> ApiResult<InternalWorkerRestoreResult> {
+        // Fence displaced singleton generations before renewing credentials, replacing bindings,
+        // or asking any Runtime to launch execution.
+        let singleton_lease = self
+            .store
+            .require_current_worker_singleton_owner(&self.config.workspace_id, worker)?;
         for link in self
             .store
             .list_worker_workdir_links(&self.config.workspace_id, worker)?
@@ -4464,10 +4517,13 @@ impl WorkspaceApi {
                 }
             }
         }
-        let binding = self
+        let mut binding = self
             .runtime
             .replace_worker_workspace_api(worker, self.workspace_api_ref(&worker.runtime_id))
             .map_err(|error| error.into_error())?;
+        if let Some(summary) = binding.worker.as_mut() {
+            summary.singleton_key = singleton_lease.as_ref().map(|lease| lease.key.clone());
+        }
         if binding.state != InternalWorkerOperationState::Accepted {
             return Ok(InternalWorkerRestoreResult {
                 state: server_api::WorkerRestoreState::Rejected,
@@ -4476,10 +4532,14 @@ impl WorkspaceApi {
             });
         }
         sync_runtime_worker_workdir_attachments(self, worker)?;
-        Ok(self
+        let mut restored = self
             .runtime
             .restore_worker(worker)
-            .map_err(|error| error.into_error())?)
+            .map_err(|error| error.into_error())?;
+        if let Some(summary) = restored.worker.as_mut() {
+            summary.singleton_key = singleton_lease.as_ref().map(|lease| lease.key.clone());
+        }
+        Ok(restored)
     }
 
     fn repository_reader(&self) -> RepositoryRegistryReader {
@@ -5819,6 +5879,7 @@ fn worker_spawn_request_from_api(
     Ok(WorkerSpawnRequest {
         intent,
         requested_worker_name: request.requested_worker_name,
+        singleton_key: request.singleton_key,
         acceptance,
         profile,
         ticket_assignment: request
@@ -16162,37 +16223,33 @@ fn require_online_workspace_orchestrator_source(
 }
 
 fn find_online_workspace_orchestrator(api: &WorkspaceApi) -> Option<InternalWorkerSummary> {
-    api.runtime
-        .list_workers(1000)
-        .items
-        .into_iter()
-        .find(|worker| {
-            worker.singleton_key.as_deref()
-                == Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY)
-                && worker.workspace.workspace_id.as_deref()
-                    == Some(api.config.workspace_id.as_str())
-                && matches!(worker.state.as_str(), "idle" | "running" | "paused")
-        })
+    let owner = api
+        .store
+        .current_worker_singleton_owner(
+            &api.config.workspace_id,
+            crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY,
+        )
+        .ok()
+        .flatten()?;
+    let mut worker = api.runtime.worker(&owner.worker).ok()?;
+    worker.singleton_key = Some(owner.key);
+    (worker.workspace.workspace_id.as_deref() == Some(api.config.workspace_id.as_str())
+        && matches!(worker.state.as_str(), "idle" | "running" | "paused"))
+    .then_some(worker)
 }
 
 fn find_workspace_orchestrator(api: &WorkspaceApi) -> Option<InternalWorkerSummary> {
-    let is_orchestrator = |worker: &InternalWorkerSummary| {
-        worker.singleton_key.as_deref() == Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY)
-    };
-    if let Some(worker) = find_online_workspace_orchestrator(api) {
-        return Some(worker);
-    }
-    for runtime in api.runtime.list_runtimes(1000).items {
-        if let Ok(stopped) = api
-            .runtime
-            .list_stopped_workers_for_runtime(&runtime.runtime_id, 1000)
-        {
-            if let Some(worker) = stopped.items.into_iter().find(is_orchestrator) {
-                return Some(worker);
-            }
-        }
-    }
-    None
+    let owner = api
+        .store
+        .current_worker_singleton_owner(
+            &api.config.workspace_id,
+            crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY,
+        )
+        .ok()
+        .flatten()?;
+    let mut worker = api.runtime.worker(&owner.worker).ok()?;
+    worker.singleton_key = Some(owner.key);
+    Some(worker)
 }
 
 async fn scoped_get_memory_document(
@@ -16242,7 +16299,6 @@ async fn scoped_memory_backend_operation(
 
 const MEMORY_CONSOLIDATION_PROFILE: &str = "memory-consolidation";
 const MEMORY_CONSOLIDATION_SINGLETON_KEY: &str = "workspace-memory-consolidation";
-const MEMORY_CONSOLIDATION_WORKER_SCAN_LIMIT: usize = 100;
 
 async fn scoped_memory_consolidation(
     State(api): State<WorkspaceApi>,
@@ -16302,6 +16358,7 @@ fn start_memory_staging_consolidation(
         &runtime_id,
         WorkerSpawnRequest {
             requested_worker_name: Some(MEMORY_CONSOLIDATION_PROFILE.to_string()),
+            singleton_key: Some(MEMORY_CONSOLIDATION_SINGLETON_KEY.to_string()),
             intent: WorkerSpawnIntent::WorkspaceOrchestrator,
             acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                 expected_segments: 1,
@@ -16351,25 +16408,24 @@ fn start_memory_staging_consolidation(
 
 fn try_reuse_memory_consolidation_worker(
     api: &WorkspaceApi,
-    runtime_id: &str,
+    _runtime_id: &str,
     input_content: &str,
     candidate_count: usize,
     total_bytes: u64,
 ) -> ApiResult<Option<MemoryConsolidationOutput>> {
-    let workers = api
-        .runtime
-        .list_workers_for_runtime(runtime_id, MEMORY_CONSOLIDATION_WORKER_SCAN_LIMIT)
-        .map_err(|err| err.into_error())?;
-    let mut consolidaters = workers
-        .items
-        .into_iter()
-        .filter(is_memory_consolidation_worker)
-        .collect::<Vec<_>>();
-    if consolidaters.is_empty() {
+    let Some(owner) = api.store.current_worker_singleton_owner(
+        &api.config.workspace_id,
+        MEMORY_CONSOLIDATION_SINGLETON_KEY,
+    )?
+    else {
         return Ok(None);
-    }
-    consolidaters.sort_by(|a, b| a.worker.worker_id.cmp(&b.worker.worker_id));
-    if let Some(worker) = consolidaters.iter().find(|worker| worker.state != "idle") {
+    };
+    let mut worker = api
+        .runtime
+        .worker(&owner.worker)
+        .map_err(|error| error.into_error())?;
+    worker.singleton_key = Some(owner.key);
+    if worker.state != "idle" {
         return Ok(Some(MemoryConsolidationOutput {
             status: "skipped_existing_not_idle".to_string(),
             summary: format!(
@@ -16380,10 +16436,6 @@ fn try_reuse_memory_consolidation_worker(
             total_bytes,
         }));
     }
-    let worker = consolidaters
-        .first()
-        .expect("non-empty consolidater list")
-        .clone();
     let input = api
         .runtime
         .send_input(
@@ -16416,11 +16468,6 @@ fn try_reuse_memory_consolidation_worker(
         candidate_count,
         total_bytes,
     }))
-}
-
-fn is_memory_consolidation_worker(worker: &InternalWorkerSummary) -> bool {
-    worker.singleton_key.as_deref() == Some(MEMORY_CONSOLIDATION_SINGLETON_KEY)
-        || worker.profile.as_deref() == Some(MEMORY_CONSOLIDATION_PROFILE)
 }
 
 fn memory_consolidation_input_content(candidate_count: usize, total_bytes: u64) -> String {
@@ -17780,10 +17827,7 @@ async fn scoped_start_workspace_orchestrator(
         if workspace_orchestrator_is_online(&existing) {
             return Ok(Json(workspace_orchestrator_response(&api, "existing")));
         }
-        let restored = api
-            .runtime
-            .restore_worker(&existing.worker)
-            .map_err(|error| error.into_error())?;
+        let restored = api.restore_workspace_worker(&existing.worker)?;
         if restored.state == server_api::WorkerRestoreState::Accepted {
             *api.orchestrator_attention_fingerprint
                 .lock()
@@ -17805,7 +17849,7 @@ async fn scoped_start_workspace_orchestrator(
             .runtime
             .delete_worker(&existing.worker)
             .map_err(|error| error.into_error())?;
-        if deleted.state != InternalWorkerOperationState::Accepted {
+        if deleted.state != InternalWorkerOperationState::Accepted || !deleted.deleted {
             return Err(ApiError::with_diagnostics(
                 Error::RuntimeOperationFailed {
                     runtime_id: existing.worker.runtime_id.clone(),
@@ -17815,6 +17859,10 @@ async fn scoped_start_workspace_orchestrator(
                 deleted.diagnostics,
             ));
         }
+        let removal = api
+            .store
+            .delete_worker_registry(&api.config.workspace_id, &existing.worker)?;
+        api.worker_projection.publish_commit(removal)?;
         disposition = "recreated";
     }
 
@@ -17824,6 +17872,7 @@ async fn scoped_start_workspace_orchestrator(
             requested_worker_name: Some(
                 crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string(),
             ),
+            singleton_key: Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string()),
             intent: WorkerSpawnIntent::WorkspaceOrchestrator,
             acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                 expected_segments: 0,
@@ -22296,6 +22345,22 @@ async fn execute_runtime_removal(
                 .await;
             return Err(error.into());
         }
+        if api.store.has_reserved_worker_create_for_runtime(
+            &operation.workspace_id,
+            &operation.runtime_id,
+        )? {
+            let _ = api
+                .store
+                .mark_runtime_removal_failed(
+                    &operation.operation_id,
+                    "runtime_removal_reserved_worker_create_blocked",
+                )
+                .await;
+            return Err(Error::RuntimeBindingConflict(
+                "runtime_removal_reserved_worker_create_blocked".to_string(),
+            )
+            .into());
+        }
         let binding = api
             .store
             .get_workspace_runtime_binding(&operation.workspace_id, &operation.runtime_id)
@@ -22984,6 +23049,7 @@ async fn create_workspace_worker_inner(
     let CreateWorkspaceWorkerRequest {
         runtime_id,
         display_name,
+        singleton_key,
         profile,
         ticket_assignment,
         initial_submit,
@@ -23069,6 +23135,7 @@ async fn create_workspace_worker_inner(
         browser_worker_spawn_policy(ticket_assignment, &initial_submit)?;
     let request = WorkerSpawnRequest {
         requested_worker_name: Some(display_name.clone()),
+        singleton_key,
         intent,
         acceptance,
         profile: profile_selector,
@@ -24009,6 +24076,38 @@ fn finalize_spawn_compensation_after_worker_delete(
     diagnostics
 }
 
+fn cleanup_spawn_created_workdirs(
+    api: &WorkspaceApi,
+    workdir_ids: &[String],
+) -> Vec<RuntimeDiagnostic> {
+    let mut diagnostics = Vec::new();
+    for workdir_id in workdir_ids {
+        match execute_workdir_removal(
+            api,
+            workdir_id,
+            "backend:worker_spawn_compensation",
+            "remove Workdir created before rejected Worker spawn",
+        ) {
+            Ok(result) if result.disposition == WorkingDirectoryRemovalDisposition::Removed => {}
+            Ok(result) => diagnostics.push(spawn_compensation_diagnostic(
+                "worker_spawn_compensation_workdir_cleanup_failed",
+                format!(
+                    "Durable removal retained pre-spawn Workdir `{workdir_id}`: disposition={:?}, retryable={}",
+                    result.disposition, result.retryable,
+                ),
+            )),
+            Err(error) => diagnostics.push(spawn_compensation_diagnostic(
+                "worker_spawn_compensation_workdir_cleanup_failed",
+                format!(
+                    "Failed to reserve durable removal for pre-spawn Workdir `{workdir_id}`: {}",
+                    sanitize_backend_error(&error.to_string())
+                ),
+            )),
+        }
+    }
+    diagnostics
+}
+
 fn lifecycle_failure_detail(
     action: &str,
     result: &std::result::Result<WorkerLifecycleResult, RuntimeRegistryError>,
@@ -24049,6 +24148,9 @@ async fn create_runtime_worker(
     Json(request): Json<server_api::RuntimeWorkerSpawnRequest>,
 ) -> ApiResult<Json<server_api::RuntimeWorkerSpawnResponse>> {
     let mut request = worker_spawn_request_from_api(request)?;
+    if let Some(singleton_key) = request.singleton_key.as_deref() {
+        crate::store::validate_worker_singleton_key(singleton_key)?;
+    }
     validate_worker_initial_submit(&request.initial_submit)?;
     if let Some(assignment) = request.ticket_assignment.as_ref()
         && let Some(worker) = existing_lifecycle_assignment_worker(&api, assignment, &runtime_id)?
@@ -24098,18 +24200,24 @@ async fn create_runtime_worker(
                 .as_ref()
                 .map(|assignment| assignment.operation_id.clone())
         });
+    let mut created_workdir_ids = Vec::new();
     for attachment in &mut request.resolved_workdir_attachment_requests {
         let workdir_id =
             upsert_pending_backend_workdir(&api, &runtime_id, &mut attachment.working_directory)?;
+        created_workdir_ids.push(workdir_id.clone());
         let operation_id = repository_operation_id
             .clone()
             .unwrap_or_else(|| format!("worker-spawn-workdir:{workdir_id}"));
-        authorize_worker_spawn_workdir_materialization(
+        if let Err(error) = authorize_worker_spawn_workdir_materialization(
             &api,
             &runtime_id,
             &operation_id,
             &mut attachment.working_directory,
-        )?;
+        ) {
+            let mut diagnostics = error.diagnostics;
+            diagnostics.extend(cleanup_spawn_created_workdirs(&api, &created_workdir_ids));
+            return Err(ApiError::with_diagnostics(error.error, diagnostics));
+        }
     }
     let requested_worker_name = request.requested_worker_name.clone();
     let spawn_idempotency =
@@ -24117,7 +24225,7 @@ async fn create_runtime_worker(
     if let (Some(assignment), Some((_, fingerprint))) =
         (lifecycle_assignment.as_ref(), spawn_idempotency.as_ref())
     {
-        api.store.reserve_ticket_assignment_operation(
+        if let Err(error) = api.store.reserve_ticket_assignment_operation(
             &api.config.workspace_id,
             &assignment.operation_id,
             &assignment.ticket_id,
@@ -24125,13 +24233,11 @@ async fn create_runtime_worker(
             None,
             fingerprint,
             &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-        )?;
+        ) {
+            let diagnostics = cleanup_spawn_created_workdirs(&api, &created_workdir_ids);
+            return Err(ApiError::with_diagnostics(error, diagnostics));
+        }
     }
-    let created_workdir_ids = request
-        .resolved_workdir_attachment_requests
-        .iter()
-        .filter_map(|attachment| attachment.working_directory.backend_workdir_id.clone())
-        .collect::<Vec<_>>();
     let result = api.spawn_workspace_worker(&runtime_id, request)?;
     if let Some(worker) = result.worker.as_ref() {
         let compensation = WorkerSpawnCompensationContext {
@@ -24909,9 +25015,31 @@ fn project_workspace_worker(
 
 fn project_workspace_worker_with_attachments(
     api: &WorkspaceApi,
-    summary: InternalWorkerSummary,
+    mut summary: InternalWorkerSummary,
     workdir_attachments: Vec<server_api::WorkerWorkdirAttachmentSummary>,
 ) -> ApiResult<server_api::WorkerSummary> {
+    match api
+        .store
+        .require_current_worker_singleton_owner(&api.config.workspace_id, &summary.worker)
+    {
+        Ok(lease) => summary.singleton_key = lease.map(|lease| lease.key),
+        Err(Error::RepositoryConflict(message))
+            if message.starts_with("worker_singleton_fenced:") =>
+        {
+            summary.singleton_key = None;
+            summary.availability =
+                protocol::subscription::SubscriptionWorkerAvailability::Unavailable;
+            summary.state = "unavailable".to_string();
+            summary.worker_state = None;
+            summary.diagnostics.push(RuntimeDiagnostic {
+                code: "worker_singleton_fenced".to_string(),
+                severity: HostDiagnosticSeverity::Warning,
+                message: "This historical singleton generation is fenced by Backend ownership."
+                    .to_string(),
+            });
+        }
+        Err(error) => return Err(error.into()),
+    }
     let resource_key = api
         .store
         .resource_key(
@@ -28427,6 +28555,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: "External expiry Worker".to_string(),
+                singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -28992,6 +29121,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.to_string(),
                 display_name: "External multi-attachment Worker".to_string(),
+                singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -29239,6 +29369,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: "External analysis Worker".to_string(),
+                singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -31654,6 +31785,7 @@ mod tests {
         foreign_repository.id = "foreign".to_string();
         let mut workdir_flow_launch = WorkerSpawnRequest {
             requested_worker_name: Some("cross-workspace-workdir".to_string()),
+            singleton_key: None,
             intent: WorkerSpawnIntent::WorkspaceCoding,
             acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                 expected_segments: 1,
@@ -31913,6 +32045,7 @@ mod tests {
                 ticket_id: ticket.id.clone(),
                 role: TicketWorkerRole::Coder,
             },
+            singleton_key: None,
             acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                 expected_segments: 1,
             },
@@ -32013,6 +32146,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: "missing-runtime".to_string(),
                 display_name: "Rejected Coder".to_string(),
+                singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
                 ticket_assignment: Some(CreateWorkspaceWorkerTicketAssignmentRequest {
                     ticket_id: ticket.id.clone(),
@@ -32051,6 +32185,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: "Scoped Worker".to_string(),
+                singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -32085,6 +32220,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: "Cross-runtime Worker".to_string(),
+                singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -32173,6 +32309,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: "Generic Worker".to_string(),
+                singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -32430,6 +32567,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: "Guarded spawn controller".to_string(),
+                singleton_key: None,
                 profile: Some("builtin:orchestrator".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -32911,6 +33049,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: "Strict remote spawn controller".to_string(),
+                singleton_key: None,
                 profile: Some("builtin:orchestrator".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -33133,6 +33272,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: "Control caller".to_string(),
+                singleton_key: None,
                 profile: None,
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -33164,6 +33304,7 @@ mod tests {
         let request = || CreateWorkspaceWorkerRequest {
             runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
             display_name: "Idempotent controlled child".to_string(),
+            singleton_key: None,
             profile: None,
             ticket_assignment: None,
             initial_submit: Vec::new(),
@@ -33231,6 +33372,267 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn arbitrary_singleton_create_conflicts_while_idle_or_stopped_and_restore_keeps_key() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let request = || CreateWorkspaceWorkerRequest {
+            runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+            display_name: "Subject Worker".to_string(),
+            singleton_key: Some("subjektiv:subject-42".to_string()),
+            profile: Some("builtin:companion".to_string()),
+            ticket_assignment: None,
+            initial_submit: Vec::new(),
+            workdir_attachments: Vec::new(),
+            control_operation_id: None,
+        };
+
+        let Json(created) =
+            create_workspace_worker(State(api.clone()), HeaderMap::new(), Json(request()))
+                .await
+                .unwrap();
+        assert_eq!(
+            created.worker.singleton_key.as_deref(),
+            Some("subjektiv:subject-42")
+        );
+        let duplicate =
+            create_workspace_worker(State(api.clone()), HeaderMap::new(), Json(request()))
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(duplicate.error, Error::RepositoryConflict(message) if message.contains("worker_singleton_owned"))
+        );
+
+        let worker = RuntimeWorkerRef::new(&created.runtime_id, &created.worker_id);
+        let stopped = api
+            .runtime
+            .stop_worker(
+                &worker,
+                WorkerLifecycleRequest {
+                    reason: Some("singleton restore test".to_string()),
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
+        let stopped_duplicate =
+            create_workspace_worker(State(api.clone()), HeaderMap::new(), Json(request()))
+                .await
+                .unwrap_err();
+        assert!(matches!(
+            stopped_duplicate.error,
+            Error::RepositoryConflict(_)
+        ));
+
+        let restored = api.restore_workspace_worker(&worker).unwrap();
+        assert_eq!(restored.state, server_api::WorkerRestoreState::Rejected);
+        assert_eq!(
+            api.store
+                .current_worker_singleton_owner(&api.config.workspace_id, "subjektiv:subject-42",)
+                .unwrap()
+                .unwrap()
+                .worker,
+            worker
+        );
+    }
+
+    #[tokio::test]
+    async fn singleton_retry_disconnect_replacement_and_restore_are_generation_fenced() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
+        let runtime = WorkdirlessFixtureRuntime::default();
+        api.runtime.register_or_replace(runtime.clone());
+        let request = |operation_id: &str| WorkerSpawnRequest {
+            requested_worker_name: Some("Subject Worker".to_string()),
+            singleton_key: Some("subjektiv:subject-retry".to_string()),
+            intent: WorkerSpawnIntent::WorkspaceCompanion,
+            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                expected_segments: 0,
+            },
+            profile: ProfileSelector::Builtin("builtin:companion".to_string()),
+            ticket_assignment: None,
+            initial_submit: Vec::new(),
+            workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachments: Vec::new(),
+            resolved_config_bundle: None,
+            resolved_worker_observation_enabled: false,
+            resolved_worker_observation_grants: Vec::new(),
+            resolved_workspace_api: None,
+            resolved_memory_settings: None,
+            resolved_control_operation: Some(WorkerControlOperation {
+                operation_id: operation_id.to_string(),
+                input_fingerprint: format!("sha256:{operation_id}"),
+            }),
+        };
+
+        let mut invalid_request = request("singleton-create-invalid");
+        invalid_request.singleton_key = Some(String::new());
+        assert!(matches!(
+            api.spawn_workspace_worker(WorkdirlessFixtureRuntime::RUNTIME_ID, invalid_request)
+                .unwrap_err()
+                .error,
+            Error::InvalidInput(_)
+        ));
+        assert!(runtime.spawn_requests().is_empty());
+
+        assert!(matches!(
+            api.spawn_workspace_worker("missing-runtime", request("singleton-create-undispatched"))
+                .unwrap_err()
+                .error,
+            Error::UnknownRuntime(_)
+        ));
+
+        // A rejected attempt is terminalized only after the Runtime confirms that its reserved
+        // Worker is absent. A fresh retry then takes the next generation without leaving the key
+        // permanently wedged.
+        runtime.reject_next_spawn();
+        let rejected = api
+            .spawn_workspace_worker(
+                WorkdirlessFixtureRuntime::RUNTIME_ID,
+                request("singleton-create-1"),
+            )
+            .unwrap();
+        assert_eq!(rejected.state, InternalWorkerOperationState::Rejected);
+        assert!(
+            api.store
+                .current_worker_singleton_owner(&api.config.workspace_id, "subjektiv:subject-retry")
+                .unwrap()
+                .is_none()
+        );
+        let created = api
+            .spawn_workspace_worker(
+                WorkdirlessFixtureRuntime::RUNTIME_ID,
+                request("singleton-create-retry"),
+            )
+            .unwrap();
+        assert_eq!(created.state, InternalWorkerOperationState::Accepted);
+        let worker = created.worker.unwrap();
+        let current_owner = api
+            .store
+            .current_worker_singleton_owner(&api.config.workspace_id, "subjektiv:subject-retry")
+            .unwrap()
+            .unwrap();
+        assert_eq!(current_owner.worker, worker.worker);
+        assert_eq!(current_owner.generation, 3);
+        assert_eq!(
+            worker.singleton_key,
+            Some("subjektiv:subject-retry".to_string())
+        );
+
+        // Idle and paused Runtime metadata never releases Backend ownership, and a conflict is
+        // decided before the Runtime sees another spawn request.
+        runtime
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[0]
+            .state = "paused".to_string();
+        let spawn_count = runtime.spawn_requests().len();
+        assert!(matches!(
+            api.spawn_workspace_worker(
+                WorkdirlessFixtureRuntime::RUNTIME_ID,
+                request("singleton-create-conflict"),
+            )
+            .unwrap_err()
+            .error,
+            Error::RepositoryConflict(message) if message.contains("worker_singleton_owned")
+        ));
+        assert_eq!(runtime.spawn_requests().len(), spawn_count);
+        let restored = api.restore_workspace_worker(&worker.worker).unwrap();
+        assert_eq!(restored.state, server_api::WorkerRestoreState::Accepted);
+        assert_eq!(
+            restored.worker.unwrap().singleton_key.as_deref(),
+            Some("subjektiv:subject-retry")
+        );
+
+        // Replacing the connected Runtime with an empty instance models an unavailable/restarted
+        // Runtime. Ownership remains durable while restore cannot observe the Worker.
+        let disconnected_runtime = WorkdirlessFixtureRuntime::default();
+        api.runtime
+            .register_or_replace(disconnected_runtime.clone());
+        let disconnected_restore = api.restore_workspace_worker(&worker.worker).unwrap();
+        assert_eq!(
+            disconnected_restore.state,
+            server_api::WorkerRestoreState::Rejected
+        );
+        assert_eq!(
+            api.store
+                .current_worker_singleton_owner(
+                    &api.config.workspace_id,
+                    "subjektiv:subject-retry",
+                )
+                .unwrap()
+                .unwrap()
+                .worker,
+            worker.worker
+        );
+        assert!(
+            api.spawn_workspace_worker(
+                WorkdirlessFixtureRuntime::RUNTIME_ID,
+                request("singleton-create-disconnected"),
+            )
+            .is_err()
+        );
+
+        // Reconnection restores the current generation. Only confirmed terminal deletion permits
+        // a replacement, after which even a stale Runtime copy of the old Worker is fenced before
+        // any Runtime restore side effect.
+        api.runtime.register_or_replace(runtime.clone());
+        assert_eq!(
+            api.restore_workspace_worker(&worker.worker).unwrap().state,
+            server_api::WorkerRestoreState::Accepted
+        );
+        let stale_worker = runtime
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|candidate| candidate.worker == worker.worker)
+            .cloned()
+            .unwrap();
+        let deleted = api.runtime.delete_worker(&worker.worker).unwrap();
+        assert!(deleted.deleted);
+        api.store
+            .delete_worker_registry(&api.config.workspace_id, &worker.worker)
+            .unwrap();
+        runtime
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(stale_worker);
+        assert!(matches!(
+            api.restore_workspace_worker(&worker.worker).unwrap_err().error,
+            Error::RepositoryConflict(message) if message.contains("worker_singleton_fenced")
+        ));
+        let replacement = api
+            .spawn_workspace_worker(
+                WorkdirlessFixtureRuntime::RUNTIME_ID,
+                request("singleton-create-2"),
+            )
+            .unwrap()
+            .worker
+            .unwrap();
+        assert_ne!(replacement.worker.worker_id, worker.worker.worker_id);
+        assert!(matches!(
+            api.restore_workspace_worker(&worker.worker).unwrap_err().error,
+            Error::RepositoryConflict(message) if message.contains("worker_singleton_fenced")
+        ));
+        assert_eq!(
+            api.store
+                .current_worker_singleton_owner(
+                    &api.config.workspace_id,
+                    "subjektiv:subject-retry",
+                )
+                .unwrap()
+                .unwrap()
+                .worker,
+            replacement.worker
+        );
+    }
+
+    #[tokio::test]
     async fn explicit_orchestrator_launch_marks_only_the_dedicated_worker() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
@@ -33243,6 +33645,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: "Generic Orchestrator Profile Worker".to_string(),
+                singleton_key: None,
                 profile: Some("builtin:orchestrator".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -33260,6 +33663,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string(),
+                singleton_key: None,
                 profile: Some("builtin:orchestrator".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -34425,6 +34829,7 @@ mod tests {
             WorkerSpawnRequest {
                 requested_worker_name: Some(name.to_string()),
                 intent: WorkerSpawnIntent::WorkspaceCompanion,
+                singleton_key: None,
                 acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                     expected_segments: 0,
                 },
@@ -35329,6 +35734,7 @@ mod tests {
                 WorkerSpawnRequest {
                     requested_worker_name: Some("job-notification-target".to_string()),
                     intent: WorkerSpawnIntent::WorkspaceCompanion,
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -37564,13 +37970,12 @@ mod tests {
 
         let resolved_config_bundle = None;
         let existing = api
-            .runtime
-            .spawn_worker(
+            .spawn_workspace_worker(
                 EMBEDDED_WORKER_RUNTIME_ID,
-                test_create_binding(),
                 WorkerSpawnRequest {
                     requested_worker_name: Some(MEMORY_CONSOLIDATION_PROFILE.to_string()),
                     intent: WorkerSpawnIntent::WorkspaceOrchestrator,
+                    singleton_key: Some(MEMORY_CONSOLIDATION_SINGLETON_KEY.to_string()),
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -37630,10 +38035,48 @@ mod tests {
         let consolidaters_after_second = workers_after_second
             .items
             .iter()
-            .filter(|worker| is_memory_consolidation_worker(worker))
+            .filter(|worker| {
+                worker.singleton_key.as_deref() == Some(MEMORY_CONSOLIDATION_SINGLETON_KEY)
+            })
             .collect::<Vec<_>>();
         assert_eq!(consolidaters_after_second.len(), 1);
         assert_eq!(consolidaters_after_second[0].worker.worker_id, worker_id);
+
+        let singleton_worker = RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, &worker_id);
+        let stopped = api
+            .runtime
+            .stop_worker(
+                &singleton_worker,
+                WorkerLifecycleRequest {
+                    reason: Some("replace completed Memory singleton".to_string()),
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
+        let removed = api.runtime.delete_worker(&singleton_worker).unwrap();
+        assert!(removed.deleted);
+        api.store
+            .delete_worker_registry(&api.config.workspace_id, &singleton_worker)
+            .unwrap();
+        let replacement = start_memory_staging_consolidation(
+            api.clone(),
+            MemoryConsolidateStagingOperation { force: true },
+        )
+        .unwrap();
+        assert_eq!(replacement.status, "started");
+        let replacement_owner = api
+            .store
+            .current_worker_singleton_owner(
+                &api.config.workspace_id,
+                MEMORY_CONSOLIDATION_SINGLETON_KEY,
+            )
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            replacement_owner.worker.worker_id, worker_id,
+            "removed singleton generation must be replaceable"
+        );
     }
 
     fn init_clean_git_workspace(path: &std::path::Path) {
@@ -37836,6 +38279,7 @@ mod tests {
                         ticket_id: "notification-source".to_string(),
                         role: TicketWorkerRole::Coder,
                     },
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -38019,6 +38463,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.to_string(),
                 display_name: "Manual Coder candidate".to_string(),
+                singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -38577,6 +39022,7 @@ mod tests {
                         ticket_id: "implementation-cancellation".to_string(),
                         role: TicketWorkerRole::Coder,
                     },
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -38680,6 +39126,7 @@ mod tests {
                 ticket_id: name.to_string(),
                 role: TicketWorkerRole::Coder,
             },
+            singleton_key: None,
             acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                 expected_segments: 0,
             },
@@ -39295,6 +39742,7 @@ mod tests {
                         ticket_id: "source-ticket".to_string(),
                         role: TicketWorkerRole::Coder,
                     },
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -39361,6 +39809,7 @@ mod tests {
                         ticket_id: "source-ticket".to_string(),
                         role: TicketWorkerRole::Coder,
                     },
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -39705,6 +40154,7 @@ mod tests {
                 ticket_id: ticket.id.clone(),
                 role: server_api::RuntimeTicketWorkerRole::Coder,
             },
+            singleton_key: None,
             acceptance: server_api::RuntimeWorkerSpawnAcceptanceRequirement::RunAccepted {
                 expected_segments: 1,
             },
@@ -40675,6 +41125,7 @@ mod tests {
                 WorkerSpawnRequest {
                     intent: WorkerSpawnIntent::WorkspaceCompanion,
                     requested_worker_name: Some("guard-target".to_string()),
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -40733,6 +41184,7 @@ mod tests {
                 WorkerSpawnRequest {
                     intent: WorkerSpawnIntent::WorkspaceCompanion,
                     requested_worker_name: Some("remove-target".to_string()),
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -40845,6 +41297,7 @@ mod tests {
                 WorkerSpawnRequest {
                     intent: WorkerSpawnIntent::WorkspaceCompanion,
                     requested_worker_name: Some("compensation-target".to_string()),
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -42781,6 +43234,7 @@ mod tests {
                 WorkerSpawnRequest {
                     intent: WorkerSpawnIntent::WorkspaceCompanion,
                     requested_worker_name: Some("cleanup-projection-target".to_string()),
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -43320,6 +43774,7 @@ mod tests {
                 "runtime-test",
                 "spawn-flow-race",
                 &"f".repeat(64),
+                None,
                 &memory_settings,
             )
             .unwrap();
@@ -45057,6 +45512,7 @@ mod tests {
             Json(server_api::RuntimeWorkerSpawnRequest {
                 intent: server_api::RuntimeWorkerSpawnIntent::WorkspaceCompanion,
                 requested_worker_name: Some("Runtime Worker".to_string()),
+                singleton_key: None,
                 acceptance: server_api::RuntimeWorkerSpawnAcceptanceRequirement::RunAccepted {
                     expected_segments: 0,
                 },
@@ -45085,6 +45541,7 @@ mod tests {
             CreateWorkspaceWorkerRequest {
                 runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.to_string(),
                 display_name: "Remote Worker".to_string(),
+                singleton_key: None,
                 profile: Some("builtin:companion".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -45860,6 +46317,7 @@ mod tests {
                         role: TicketWorkerRole::Coder,
                     },
                     requested_worker_name: None,
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -46516,6 +46974,7 @@ mod tests {
         let spawn_request = WorkerSpawnRequest {
             intent: WorkerSpawnIntent::WorkspaceCompanion,
             requested_worker_name: Some("multiplexed-console".to_string()),
+            singleton_key: None,
             acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                 expected_segments: 0,
             },

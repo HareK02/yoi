@@ -127,6 +127,7 @@ impl Tool for SpawnTicketCoderTool {
                 runtime_id,
                 workdir_attachments,
                 profile: CODER_PROFILE.to_string(),
+                singleton_key: None,
                 ticket_id: Some(ticket.id.clone()),
                 operation_id: Some(format!("spawn-ticket-coder:{}:{call_id}", ticket.id)),
                 display_name: format!("Coder · {}", ticket.resource_key),

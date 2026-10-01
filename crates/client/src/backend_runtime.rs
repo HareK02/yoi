@@ -878,6 +878,7 @@ mod tests {
         let create = BackendCreateWorkerRequest {
             runtime_id: "embedded".to_string(),
             display_name: "Coder one".to_string(),
+            singleton_key: None,
             profile: Some("builtin:coder".to_string()),
             ticket_assignment: None,
             initial_submit: Vec::new(),

@@ -162,6 +162,7 @@ fn request_from_selection(selection: Selection) -> BackendCreateWorkerRequest {
     BackendCreateWorkerRequest {
         runtime_id: selection.runtime_id,
         display_name: selection.display_name,
+        singleton_key: None,
         profile: Some(selection.profile),
         initial_submit: Vec::new(),
         workdir_attachments: Vec::new(),

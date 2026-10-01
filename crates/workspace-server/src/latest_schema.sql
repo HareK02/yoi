@@ -768,7 +768,36 @@ CREATE TABLE worker_create_reservations (
             state TEXT NOT NULL CHECK (state IN ('reserved', 'created', 'removed')),
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL, request_fingerprint TEXT, memory_settings_revision INTEGER, memory_language TEXT,
+            singleton_key TEXT,
+            singleton_generation INTEGER CHECK (singleton_generation IS NULL OR singleton_generation > 0),
             PRIMARY KEY (workspace_id, allocation_key),
+            UNIQUE (workspace_id, worker_id),
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+            CHECK ((singleton_key IS NULL) = (singleton_generation IS NULL))
+        );
+CREATE TRIGGER worker_create_reservation_singleton_lease_insert
+BEFORE INSERT ON worker_create_reservations
+WHEN (NEW.singleton_key IS NULL AND NEW.singleton_generation IS NOT NULL)
+  OR (NEW.singleton_key IS NOT NULL AND NEW.singleton_generation IS NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'worker_singleton_lease_incomplete');
+END;
+CREATE TRIGGER worker_create_reservation_singleton_lease_update
+BEFORE UPDATE OF singleton_key, singleton_generation ON worker_create_reservations
+WHEN (NEW.singleton_key IS NULL AND NEW.singleton_generation IS NOT NULL)
+  OR (NEW.singleton_key IS NOT NULL AND NEW.singleton_generation IS NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'worker_singleton_lease_incomplete');
+END;
+CREATE TABLE worker_singleton_owners (
+            workspace_id TEXT NOT NULL,
+            singleton_key TEXT NOT NULL,
+            runtime_id TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            generation INTEGER NOT NULL CHECK (generation > 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (workspace_id, singleton_key),
             UNIQUE (workspace_id, worker_id),
             FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
         );

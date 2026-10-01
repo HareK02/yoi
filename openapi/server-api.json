@@ -1545,6 +1545,14 @@
           "runtime_id": {
             "type": "string"
           },
+          "singleton_key": {
+            "default": null,
+            "description": "Opaque Workspace-scoped singleton identity. Possession does not grant Worker access.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "ticket_assignment": {
             "anyOf": [
               {
@@ -7685,6 +7693,13 @@
             "$ref": "#/components/schemas/RuntimeProfileSelector"
           },
           "requested_worker_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "singleton_key": {
+            "description": "Opaque Workspace-scoped singleton identity. The Backend, not the Runtime, owns this lease.",
             "type": [
               "string",
               "null"
@@ -13989,7 +14004,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:ae559492220ec118f04c2c0c9593e8b3cb44c3cb857be3ae85715ace26da8043"
+    "x-yoi-source-digest": "sha256:a0956070b29f49aafac3b19a0fa54626f285bdf01337f26afc4389ff6d23495a"
   },
   "openapi": "3.1.0",
   "paths": {

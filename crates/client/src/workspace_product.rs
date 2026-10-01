@@ -431,6 +431,7 @@ impl BackendWorkspaceProductClient {
         let request = CreateWorkspaceWorkerRequest {
             runtime_id: runtime.runtime_id.clone(),
             display_name: format!("intake-{ticket_id}"),
+            singleton_key: None,
             profile: Some("builtin:intake".to_string()),
             ticket_assignment: None,
             initial_submit: vec![protocol::Segment::Text {

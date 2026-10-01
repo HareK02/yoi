@@ -6859,6 +6859,9 @@ pub struct RuntimeWorkerSpawnRequest {
     pub intent: RuntimeWorkerSpawnIntent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_worker_name: Option<String>,
+    /// Opaque Workspace-scoped singleton identity. The Backend, not the Runtime, owns this lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub singleton_key: Option<String>,
     pub acceptance: RuntimeWorkerSpawnAcceptanceRequirement,
     pub profile: RuntimeProfileSelector,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -8230,6 +8233,9 @@ pub struct CreateWorkspaceWorkerTicketAssignmentRequest {
 pub struct CreateWorkspaceWorkerRequest {
     pub runtime_id: String,
     pub display_name: String,
+    /// Opaque Workspace-scoped singleton identity. Possession does not grant Worker access.
+    #[serde(default)]
+    pub singleton_key: Option<String>,
     #[serde(default)]
     pub profile: Option<String>,
     #[serde(default)]
@@ -10372,6 +10378,7 @@ mod tests {
         let request = serde_json::to_value(CreateWorkspaceWorkerRequest {
             runtime_id: "runtime-a".to_string(),
             display_name: "Worker A".to_string(),
+            singleton_key: Some("subjektiv:subject-a".to_string()),
             profile: None,
             ticket_assignment: None,
             initial_submit: Vec::new(),
@@ -10384,6 +10391,7 @@ mod tests {
             serde_json::json!({
                 "runtime_id": "runtime-a",
                 "display_name": "Worker A",
+                "singleton_key": "subjektiv:subject-a",
                 "profile": null,
                 "ticket_assignment": null,
                 "initial_submit": [],

@@ -108,6 +108,9 @@ pub async fn verify_runtime_request_source_proof_with_store(
         if member.is_none() && !reserved {
             return Err(WorkerMutationSourceProofError::WorkerCatalogMembership);
         }
+        store
+            .require_current_worker_singleton_owner(workspace_id, &worker)
+            .map_err(|error| WorkerMutationSourceProofError::Authority(error.to_string()))?;
     }
     Ok(VerifiedRuntimeRequestSource {
         runtime_id: claims.iss,
@@ -254,6 +257,9 @@ async fn verify_worker_remove_source_with(
     if member.is_none() {
         return Err(WorkerMutationSourceProofError::WorkerCatalogMembership);
     }
+    store
+        .require_current_worker_singleton_owner(&config.workspace_id, &worker)
+        .map_err(|error| WorkerMutationSourceProofError::Authority(error.to_string()))?;
 
     let consumed_at = chrono::Utc::now().to_rfc3339();
     let consumed = store
