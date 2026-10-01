@@ -28,6 +28,7 @@ pub mod runtime_subscription;
 pub mod server;
 pub mod skills;
 pub mod store;
+pub mod subjektiv;
 mod ticket_item_checker;
 pub mod workdir_create_operations;
 mod workdir_removal;

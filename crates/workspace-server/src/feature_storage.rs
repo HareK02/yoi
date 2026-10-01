@@ -540,14 +540,32 @@ impl FeatureDatabase {
         &self,
         operation: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<T> {
-        self.inner.ensure_accepting()?;
-        let connection = self.inner.connection.lock().map_err(|_| {
-            FeatureStorageError::Operation("Feature database lock was poisoned".to_string())
-        })?;
-        self.inner.ensure_accepting()?;
+        self.try_with_connection(operation)
+    }
+
+    /// Variant of [`Self::with_connection`] that lets a typed Feature repository
+    /// retain its own domain errors without encoding them as storage strings.
+    pub fn try_with_connection<T, E>(
+        &self,
+        operation: impl FnOnce(&Connection) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<FeatureStorageError>,
+    {
+        self.inner.ensure_accepting().map_err(E::from)?;
+        let connection = self
+            .inner
+            .connection
+            .lock()
+            .map_err(|_| {
+                FeatureStorageError::Operation("Feature database lock was poisoned".to_string())
+            })
+            .map_err(E::from)?;
+        self.inner.ensure_accepting().map_err(E::from)?;
         let connection = connection
             .as_ref()
-            .ok_or(FeatureStorageError::DatabaseClosed)?;
+            .ok_or(FeatureStorageError::DatabaseClosed)
+            .map_err(E::from)?;
         operation(connection)
     }
 
@@ -557,17 +575,41 @@ impl FeatureDatabase {
         &self,
         operation: impl FnOnce(&Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
-        self.inner.ensure_accepting()?;
-        let mut connection = self.inner.connection.lock().map_err(|_| {
-            FeatureStorageError::Operation("Feature database lock was poisoned".to_string())
-        })?;
-        self.inner.ensure_accepting()?;
+        self.try_transaction(operation)
+    }
+
+    /// Variant of [`Self::transaction`] that preserves a Feature repository's
+    /// typed domain errors while still rolling every failure back atomically.
+    pub fn try_transaction<T, E>(
+        &self,
+        operation: impl FnOnce(&Transaction<'_>) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<FeatureStorageError>,
+    {
+        self.inner.ensure_accepting().map_err(E::from)?;
+        let mut connection = self
+            .inner
+            .connection
+            .lock()
+            .map_err(|_| {
+                FeatureStorageError::Operation("Feature database lock was poisoned".to_string())
+            })
+            .map_err(E::from)?;
+        self.inner.ensure_accepting().map_err(E::from)?;
         let connection = connection
             .as_mut()
-            .ok_or(FeatureStorageError::DatabaseClosed)?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            .ok_or(FeatureStorageError::DatabaseClosed)
+            .map_err(E::from)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(FeatureStorageError::from)
+            .map_err(E::from)?;
         let value = operation(&transaction)?;
-        transaction.commit()?;
+        transaction
+            .commit()
+            .map_err(FeatureStorageError::from)
+            .map_err(E::from)?;
         Ok(value)
     }
 
@@ -923,6 +965,18 @@ mod tests {
 
     use super::*;
 
+    #[derive(Debug)]
+    enum TestDomainError {
+        Storage,
+        Rejected,
+    }
+
+    impl From<FeatureStorageError> for TestDomainError {
+        fn from(_error: FeatureStorageError) -> Self {
+            Self::Storage
+        }
+    }
+
     fn create_items(transaction: &Transaction<'_>) -> Result<()> {
         transaction.execute_batch(
             "CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL UNIQUE);",
@@ -1005,6 +1059,24 @@ mod tests {
         let database = workspace.open(&feature).unwrap();
         assert_eq!(values(&database).unwrap(), ["committed"]);
         assert_eq!(database.schema_version().unwrap(), 2);
+    }
+
+    #[test]
+    fn typed_domain_error_rolls_back_transaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = FeatureStorage::new(temp.path().join("storage"));
+        let workspace = manager.workspace("workspace-a").unwrap();
+        let feature = workspace.register(registration("feature-a")).unwrap();
+        let database = workspace.open(&feature).unwrap();
+
+        let result = database.try_transaction::<(), TestDomainError>(|transaction| {
+            transaction
+                .execute("INSERT INTO items (value) VALUES ('must-roll-back')", [])
+                .map_err(FeatureStorageError::from)?;
+            Err(TestDomainError::Rejected)
+        });
+        assert!(matches!(result, Err(TestDomainError::Rejected)));
+        assert!(values(&database).unwrap().is_empty());
     }
 
     #[test]
