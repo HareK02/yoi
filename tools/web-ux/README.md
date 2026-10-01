@@ -183,9 +183,11 @@ approved immutable artifact channel when durable review evidence is required.
 
 ## Workspace Home fixture
 
-`scenarios/workspace-home.json` captures the production Home with owner, non-owner, empty-resource,
-and long-name Workspace projections at 1440px, 768px, and 390px. It uses no real account or private
-Workspace data. Build `web/workspace` first, then run from `tools/web-ux`:
+`scenarios/workspace-home.json` captures the production work dashboard with owner, non-owner,
+long-name, empty, and intentionally failing-review Workspace projections at 1440px, 768px, and 390px.
+The partial-error route deliberately returns HTTP 503 only for Merge Requests; captures should retain
+that request/console/visible error while showing successful active-work and recent-update feeds.
+It uses no real account or private Workspace data. Build `web/workspace` first, then run from `tools/web-ux`:
 
 ```sh
 deno task web-ux capture --scenario scenarios/workspace-home.json --output ../../target/web-ux --run-id home-review
@@ -193,7 +195,8 @@ deno task web-ux capture --scenario scenarios/workspace-home.json --output ../..
 
 The scenario owns a fixture server on localhost port 15281 and stops only that server. The production
 Home browser regression (`browser-tests/workspace_home_shell_test.ts`, included in `test:browser`)
-also checks 320px, both themes, keyboard navigation, permission-gated links, and absence of Host requests.
+also checks 320px, both themes, keyboard record navigation, bounded loading, independent slow/error
+feeds, explicit refresh, and absence of Host requests.
 
 ## Adding a scenario
 

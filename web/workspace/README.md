@@ -94,6 +94,7 @@ Use semantic tokens from `app.css`. Do not introduce component-local color, spac
 - `src/routes/+layout.svelte`: root application shell and override contexts.
 - `src/routes/w/[workspaceId]/+layout.svelte`: Workspace Header and Sidebar registration.
 - `src/routes/w/[workspaceId]/settings/+layout.svelte`: Settings Sidebar registration.
+- `src/lib/workspace/home/`: bounded, read-only work dashboard feeds and their presentation.
 - `src/lib/workspace/header/`: Header frame, context, and overrides.
 - `src/lib/workspace/sidebar/`: Sidebar frame, scoped content, contexts, and override stack.
 - `src/lib/workspace/markdown/`: shared safe Markdown parsing plus presentation-specific document renderers.

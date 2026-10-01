@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "workspace-home",
-  "title": "Workspace Home task entry and permission boundaries",
+  "title": "Workspace Home operational dashboard",
   "baseUrl": "http://127.0.0.1:15281",
   "colorScheme": "light",
   "reducedMotion": "reduce",
@@ -22,28 +22,61 @@
       "id": "owner",
       "label": "Owner Home",
       "path": "/w/home-owner",
-      "goal": "Choose a daily resource without exposing infrastructure details; settings remain secondary.",
-      "dataState": "Workspace owner; empty repositories and workers; one Host available for before-change comparison.",
-      "ready": { "kind": "selector", "selector": "main a[href='/w/home-owner/tickets']" },
-      "capturePoints": [{ "id": "initial", "label": "Home" }]
+      "goal": "Identify review work, blocked or assigned active tickets, and recent updates; open an actual record.",
+      "dataState": "Mixed review states, in-progress/queued tickets with a coder and dependency blocker, done/closed tickets and an Objective.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".workspace-home:has([data-feed-ready='home-attention']):has([data-feed-ready='home-active']):has([data-feed-ready='home-recent'])"
+      },
+      "capturePoints": [{ "id": "initial", "label": "Dashboard" }]
     },
     {
       "id": "non-owner",
       "label": "Non-owner Home",
       "path": "/w/home-member",
-      "goal": "Reach daily resources without seeing owner-only management links.",
-      "dataState": "All management permissions false; empty resource collections.",
-      "ready": { "kind": "selector", "selector": "main a[href='/w/home-member/tickets']" },
-      "capturePoints": [{ "id": "initial", "label": "Home" }]
+      "goal": "Read the same work records without owner-only management controls.",
+      "dataState": "All management permissions false; same authorized read-only work projections as owner.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".workspace-home:has([data-feed-ready='home-attention']):has([data-feed-ready='home-active']):has([data-feed-ready='home-recent'])"
+      },
+      "capturePoints": [{ "id": "initial", "label": "Dashboard" }]
     },
     {
       "id": "long-name",
-      "label": "Long Workspace name",
+      "label": "Long names and selectors",
       "path": "/w/home-long",
-      "goal": "Keep resource navigation visible and avoid horizontal page overflow with long Workspace identity.",
-      "dataState": "Owner with a long Workspace name.",
-      "ready": { "kind": "selector", "selector": "main a[href='/w/home-long/tickets']" },
-      "capturePoints": [{ "id": "initial", "label": "Home" }]
+      "goal": "Read long record titles and branch selectors without page-wide overflow.",
+      "dataState": "Owner with long Workspace name, Objective title, and Merge Request selectors.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".workspace-home:has([data-feed-ready='home-attention']):has([data-feed-ready='home-active']):has([data-feed-ready='home-recent'])"
+      },
+      "capturePoints": [{ "id": "initial", "label": "Dashboard" }]
+    },
+    {
+      "id": "empty",
+      "label": "Empty Workspace",
+      "path": "/w/home-empty",
+      "goal": "Distinguish empty work scopes without fabricated status totals.",
+      "dataState": "All dashboard resource queries successfully return empty collections.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".workspace-home:has([data-feed-ready='home-attention']):has([data-feed-ready='home-active']):has([data-feed-ready='home-recent'])"
+      },
+      "capturePoints": [{ "id": "initial", "label": "Empty scopes" }]
+    },
+    {
+      "id": "partial-error",
+      "label": "Reviews unavailable",
+      "path": "/w/home-error",
+      "goal": "Keep active work and recent updates usable when reviews fail; never claim all-clear.",
+      "dataState": "Intentional HTTP 503 from Merge Requests. Expected visible error and browser HTTP console diagnostic; other resource requests succeed.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".workspace-home:has([data-feed-ready='home-attention']):has([data-feed-ready='home-active']):has([data-feed-ready='home-recent'])"
+      },
+      "capturePoints": [{ "id": "initial", "label": "Scoped review failure" }]
     }
   ],
   "processes": [{

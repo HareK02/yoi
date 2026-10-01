@@ -1,4 +1,5 @@
 import { extname, join, normalize } from "jsr:@std/path@1.1.4";
+import { dashboardFixture } from "../../../web/workspace/src/lib/workspace/home/dashboard.test-fixtures.ts";
 
 const port = Number(Deno.args[0]);
 const buildRoot = Deno.args[1];
@@ -6,6 +7,8 @@ if (!Number.isInteger(port) || !buildRoot) throw new Error("usage: server <port>
 const names: Record<string, string> = {
   "home-owner": "Workspace Home Review",
   "home-member": "Shared Workspace",
+  "home-empty": "New Workspace",
+  "home-error": "Partial failure Workspace",
   "home-long":
     "Workspace with a long name — international documentation and distributed development",
 };
@@ -38,6 +41,11 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
   if (match) {
     const [, workspaceId, path] = match;
     const owner = workspaceId !== "home-member";
+    if (workspaceId === "home-error" && path === "/merge-requests") {
+      return json({ error: "fixture unavailable" }, 503);
+    }
+    const dashboardData = dashboardFixture(path, url.searchParams, workspaceId);
+    if (dashboardData) return json(dashboardData);
     if (path === "/workspace") {
       return json({
         workspace_id: workspaceId,

@@ -1,175 +1,266 @@
 // @vitest-environment happy-dom
-import { cleanup, render, screen, within } from "@testing-library/svelte";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/svelte";
 import { afterEach, expect, test, vi } from "vitest";
 import type { ComponentProps } from "svelte";
+import { invalidate } from "$app/navigation";
 import Home from "./+page.svelte";
 import { load } from "./+page";
-import { parseWorkspaceResponse } from "$lib/workspace/api/workspace-model";
+import {
+  type Dashboard,
+  type DashboardFeed,
+  loadDashboard,
+  recentRows,
+} from "$lib/workspace/home/dashboard";
+import {
+  dashboardFixture,
+  fixtureDetail,
+} from "$lib/workspace/home/dashboard.test-fixtures";
 
+vi.mock("$app/navigation", () => ({ invalidate: vi.fn(async () => {}) }));
 type Data = ComponentProps<typeof Home>["data"];
-function homeData(owner = true, id = "home-review"): Data {
+function fixtureFetch(failPath?: string) {
+  return vi.fn(async (path: RequestInfo | URL, _init?: RequestInit) => {
+    const url = new URL(String(path), "https://example.test");
+    const [, id, resource] = url.pathname.match(/^\/api\/w\/([^/]+)(\/.*)$/)!;
+    return resource === failPath
+      ? Response.json({}, { status: 503 })
+      : Response.json(
+        dashboardFixture(resource, url.searchParams, decodeURIComponent(id)),
+      );
+  });
+}
+function data(id = "home-owner", fetchFn: typeof fetch = fixtureFetch()): Data {
   return {
     workspaceId: id,
-    workspace: parseWorkspaceResponse({
-      workspace_id: id,
-      display_name: "Workspace Home Review",
-      record_authority: "private-authority",
-      schema_version: 1,
-      auth: {
-        Passkey: {
-          rp_id: "example.test",
-          origin: "https://example.test",
-          public_base_url: "https://example.test",
-          cookie_name: "fixture",
-        },
-      },
-      permissions: {
-        manage_repositories: owner,
-        manage_secrets: owner,
-        manage_runtimes: owner,
-        delete_workspace: owner,
-      },
-      extension_points: {
-        store: "private-store",
-        event_stream: { status: "ready", note: "", diagnostics: [] },
-        host_worker_bridge: { status: "ready", note: "", diagnostics: [] },
-        companion_console: { status: "ready", note: "", diagnostics: [] },
-      },
-    }),
-    workspaceError: null,
-    repositories: null,
-    repositoriesError: null,
-    accessibleWorkspaces: [],
-    workspaceCatalogError: null,
-  } as Data;
+    workspace: { workspace_id: id, display_name: "Home review" },
+    dashboard: loadDashboard(fetchFn, id),
+  } as unknown as Data;
 }
-afterEach(cleanup);
-
-test("Home presents daily resources in product order, without internal metadata or repeated identity", () => {
-  const { container } = render(Home, {
-    props: { params: { workspaceId: "home-review" }, data: homeData() },
+function mount(value = data()) {
+  return render(Home, {
+    props: { params: { workspaceId: value.workspaceId }, data: value },
   });
-  const work = screen.getByRole("navigation", { name: "Work" });
-  expect(
-    within(work).getAllByRole("link").map((link) => link.textContent?.trim()),
-  ).toEqual([
-    "Tickets",
-    "Objectives",
-    "Merge Requests",
-    "Memory",
-    "Workers",
-  ]);
-  expect(
-    within(work).getAllByRole("link").map((link) => link.getAttribute("href")),
-  ).toEqual([
-    "/w/home-review/tickets",
-    "/w/home-review/objectives",
-    "/w/home-review/merge-requests",
-    "/w/home-review/memory",
-    "/w/home-review/workers",
-  ]);
-  expect(container.querySelectorAll("h1")).toHaveLength(1);
-  expect(container.textContent).not.toMatch(
-    /private-authority|private-store|home-review|Workspace Home Review|Hosts|Record authority|API/,
+}
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
+
+test("Home shows actual reviews, active assignments/blockers, and recent records, not navigation tiles", async () => {
+  mount();
+  expect(await screen.findByText("Changes requested")).toBeTruthy();
+  expect(await screen.findByText("Blocked by T-99")).toBeTruthy();
+  expect(screen.getByText("W-7")).toBeTruthy();
+  expect(await screen.findByText("Improve daily Workspace operation"))
+    .toBeTruthy();
+  expect(screen.getByText("Review pending")).toBeTruthy();
+  expect(screen.getByText("Approved")).toBeTruthy();
+  expect(screen.queryByRole("navigation")).toBeNull();
+  expect(screen.queryByRole("heading", { name: "Settings" })).toBeNull();
+  expect(screen.getAllByRole("button")).toHaveLength(1);
+  expect(document.body.textContent).not.toMatch(
+    /internal-worker|internal-merge|internal-runtime|Record authority/,
   );
-  expect(
-    container.querySelectorAll(
-      "button, .card, .workspace-action-card, .state-pill",
-    ),
-  ).toHaveLength(0);
-});
-
-test("owner management destinations are separate from daily resources", () => {
-  render(Home, {
-    props: { params: { workspaceId: "home-review" }, data: homeData() },
-  });
-  const settings = screen.getByRole("navigation", { name: "Settings" });
-  expect(within(settings).getAllByRole("link").map((link) => link.textContent))
-    .toEqual([
-      "Runtimes",
-      "Configuration Sources",
-      "Repositories",
-      "Repository Access",
-      "Profile Sources",
-      "Workspace Identity",
-    ]);
-});
-
-test("non-owner retains read destinations without owner-only controls", () => {
-  render(Home, {
-    props: { params: { workspaceId: "home-review" }, data: homeData(false) },
-  });
-  const settings = screen.getByRole("navigation", { name: "Settings" });
-  expect(within(settings).getAllByRole("link").map((link) => link.textContent))
-    .toEqual(["Configuration Sources", "Profile Sources"]);
-  expect(screen.getAllByRole("link")).toHaveLength(7);
-});
-
-test.each(
-  [
-    ["manage_runtimes", "Runtimes"],
-    ["manage_repositories", "Repositories"],
-    ["manage_secrets", "Repository Access"],
-    ["delete_workspace", "Workspace Identity"],
-  ] as const,
-)(
-  "%s alone exposes only its matching management destination",
-  (permission, label) => {
-    const data = homeData(false);
-    data.workspace!.permissions[permission] = true;
-    render(Home, { props: { params: { workspaceId: "home-review" }, data } });
-    const settings = screen.getByRole("navigation", { name: "Settings" });
-    expect(within(settings).getAllByRole("link")).toHaveLength(3);
-    expect(within(settings).getByRole("link", { name: label })).toBeTruthy();
-  },
-);
-
-test("route reuse updates all destinations and permissions from the new Workspace", async () => {
-  const view = render(Home, {
-    props: { params: { workspaceId: "home-review" }, data: homeData() },
-  });
-  await view.rerender({ data: homeData(false, "space / 日本") });
-  expect(screen.queryByRole("link", { name: "Runtimes" })).toBeNull();
   for (const link of screen.getAllByRole("link")) {
     expect(link.getAttribute("href")).toMatch(
-      /^\/w\/space%20%2F%20%E6%97%A5%E6%9C%AC\//,
+      /^\/w\/home-owner\/(tickets|objectives|merge-requests)\/[^/]+$/,
     );
   }
 });
 
-test("loading and failure do not invent resources or management permissions", async () => {
-  const data = { ...homeData(), workspace: null } as unknown as Data;
-  const view = render(Home, {
-    props: { params: { workspaceId: "home-review" }, data },
-  });
-  expect(screen.getByRole("status").textContent).toBe("Loading workspace…");
-  expect(screen.queryAllByRole("link")).toHaveLength(0);
-  await view.rerender({
-    data: {
-      ...data,
-      workspaceError: "Workspace access unavailable",
-    } as unknown as Data,
-  });
-  expect(screen.getByRole("alert").textContent).toBe(
-    "Workspace access unavailable",
+test("loader only uses bounded read-only supported endpoints and advertises explicit refresh dependency", async () => {
+  const fetch = fixtureFetch();
+  const depends = vi.fn();
+  const result = await load(
+    {
+      fetch,
+      params: { workspaceId: "home-owner" },
+      depends,
+    } as unknown as Parameters<typeof load>[0],
   );
+  await Promise.all(Object.values(result!.dashboard));
+  expect(depends).toHaveBeenCalledWith("workspace:home");
+  expect(fetch).toHaveBeenCalledTimes(7);
+  for (const [path, init] of fetch.mock.calls) {
+    const url = new URL(String(path), "https://example.test");
+    expect(init?.method ?? "GET").toBe("GET");
+    expect(init?.signal).toBeTruthy();
+    expect(url.pathname).not.toMatch(/query|hosts|workers|settings/);
+    if (!url.pathname.includes("/tickets/T-")) {
+      expect(url.searchParams.get("limit")).toBe("5");
+    }
+  }
+  expect(fetch.mock.calls.some(([url]) => String(url).includes("states=done")))
+    .toBe(true);
   expect(
-    screen.getByRole("link", { name: "Choose a workspace" }).getAttribute(
-      "href",
-    ),
-  ).toBe("/");
-  expect(screen.queryByRole("navigation")).toBeNull();
+    fetch.mock.calls.some(([url]) => String(url).includes("states=closed")),
+  ).toBe(true);
 });
 
-test("Home does not fetch infrastructure inventories", async () => {
-  const fetch = vi.fn();
+test("recent updates merge independently limited sources in actual update order, not state priority", async () => {
+  const feed = await data().dashboard.recent;
+  expect(feed.errors).toEqual([]);
+  expect(feed.rows.map((row) => row.reference)).toEqual([
+    "T-105",
+    "O-12",
+    "T-103",
+    "T-104",
+  ]);
+  const rows = Array.from(
+    { length: 10 },
+    (_, index) => ({
+      ...feed.rows[0],
+      key: String(index),
+      updatedAt: index === 9 ? null : `2026-01-01T0${index}:00:00Z`,
+    }),
+  );
   expect(
-    await load(
-      {
-        params: { workspaceId: "home-review" },
-        fetch,
-      } as unknown as Parameters<typeof load>[0],
-    ),
-  ).toEqual({ workspaceId: "home-review" });
-  expect(fetch).not.toHaveBeenCalled();
+    recentRows([...rows, { ...rows[8], updatedAt: rows[0].updatedAt }]).map((
+      row,
+    ) => row.key),
+  ).toEqual([
+    "8",
+    "7",
+    "6",
+    "5",
+    "4",
+  ]);
+});
+
+test("partial failure is not an empty/all-clear state and leaves sibling sections usable", async () => {
+  mount(data("home-owner", fixtureFetch("/merge-requests")));
+  expect((await screen.findByRole("alert")).textContent).toContain(
+    "Merge Requests",
+  );
+  expect(screen.queryByText("No open Merge Requests.")).toBeNull();
+  expect(await screen.findByText("Blocked by T-99")).toBeTruthy();
+  expect(await screen.findByText("Improve daily Workspace operation"))
+    .toBeTruthy();
+});
+
+test("one recent source failure preserves the other records and does not assert an empty feed", async () => {
+  const value = data("home-owner", fixtureFetch("/objectives"));
+  mount(value);
+  expect((await value.dashboard.recent).rows.map((row) => row.reference))
+    .toEqual(["T-105", "T-103", "T-104"]);
+  expect((await screen.findByRole("alert")).textContent).toContain(
+    "Objectives",
+  );
+  expect(screen.queryByText("No done / closed tickets or Objectives yet."))
+    .toBeNull();
+});
+
+test("a failed Ticket detail preserves the summary without inventing no-assignee or unblocked state", async () => {
+  const feed = await data("home-owner", fixtureFetch("/tickets/T-101"))
+    .dashboard.active;
+  expect(feed.rows[0].detail).toBe("Assignment and blockers unavailable");
+  expect(feed.rows[0].workerKey).toBeUndefined();
+  expect(feed.rows[0].attention).toBeUndefined();
+  expect(feed.errors[0]).toContain("T-101");
+});
+
+test("a concurrent Ticket transition leaves the active scope with a refresh notice", async () => {
+  const fallback = fixtureFetch();
+  const fetchFn: typeof fetch = (path, init) =>
+    String(path).endsWith("/tickets/T-101")
+      ? Promise.resolve(Response.json({ ...fixtureDetail(), state: "done" }))
+      : fallback(path, init);
+  const feed = await data("home-owner", fetchFn).dashboard.active;
+  expect(feed.rows.map((row) => row.reference)).toEqual(["T-102"]);
+  expect(feed.notice).toContain("Work changed");
+});
+
+test("empty resources have scoped empty states and no fabricated totals", async () => {
+  mount(data("home-empty"));
+  expect(await screen.findByText("No open Merge Requests.")).toBeTruthy();
+  expect(await screen.findByText("No in-progress or queued tickets."))
+    .toBeTruthy();
+  expect(await screen.findByText("No done / closed tickets or Objectives yet."))
+    .toBeTruthy();
+  expect(screen.queryAllByRole("link")).toHaveLength(0);
+});
+
+test("slow review loading does not hide the other completed sections", async () => {
+  const value = data();
+  value.dashboard.reviews = new Promise(() => {});
+  mount(value);
+  expect(
+    within(screen.getByRole("region", { name: "Needs attention" })).getByRole(
+      "status",
+    ).textContent,
+  ).toContain("Loading needs attention");
+  expect(await screen.findByText("Blocked by T-99")).toBeTruthy();
+  expect(await screen.findByText("Improve daily Workspace operation"))
+    .toBeTruthy();
+});
+
+test("route reuse drops pending old Workspace results and updates scoped links", async () => {
+  let finish!: (feed: DashboardFeed) => void;
+  const value = data();
+  value.dashboard.reviews = new Promise((resolve) => {
+    finish = resolve;
+  });
+  const view = mount(value);
+  await view.rerender({ data: data("space / 日本") });
+  await screen.findByText("Changes requested");
+  finish({ rows: [], errors: ["OLD WORKSPACE ERROR"] });
+  await Promise.resolve();
+  expect(screen.queryByText("OLD WORKSPACE ERROR")).toBeNull();
+  for (const link of screen.getAllByRole("link")) {
+    expect(link.getAttribute("href")).toContain(
+      "/w/space%20%2F%20%E6%97%A5%E6%9C%AC/",
+    );
+  }
+});
+
+test("malformed review responses are unavailable rather than empty", async () => {
+  const fallback = fixtureFetch();
+  const fetchFn: typeof fetch = (path, init) =>
+    String(path).includes("/merge-requests?")
+      ? Promise.resolve(Response.json({ items: "invalid" }))
+      : fallback(path, init);
+  const feed = await data("home-owner", fetchFn).dashboard.reviews;
+  expect(feed.rows).toEqual([]);
+  expect(feed.errors).toEqual([
+    "Merge Requests unavailable. Refresh to retry.",
+  ]);
+});
+
+test("unknown review states are preserved and branch text never becomes HTML", async () => {
+  const fallback = fixtureFetch();
+  const fetchFn: typeof fetch = async (path, init) => {
+    const response = await fallback(path, init);
+    if (!String(path).includes("/merge-requests?")) return response;
+    const body = await response.json();
+    body.items[0].summary.review_status = "future_status";
+    body.items[0].summary.selector_from = '<img src=x onerror="alert(1)">';
+    return Response.json(body);
+  };
+  const view = mount(data("home-owner", fetchFn));
+  expect(await screen.findByText("future_status")).toBeTruthy();
+  expect(view.container.querySelector("img")).toBeNull();
+  expect(await screen.findByText(/<img src=x/)).toBeTruthy();
+});
+
+test("unavailable timestamps are not presented as current activity", async () => {
+  const value = data();
+  const feed = await value.dashboard.recent;
+  feed.rows[0].updatedAt = "invalid";
+  value.dashboard.recent = Promise.resolve(feed);
+  mount(value);
+  expect(await screen.findByText("Update time unavailable")).toBeTruthy();
+});
+
+test("Refresh invalidates only the Home data dependency", async () => {
+  const value = data();
+  mount(value);
+  await Promise.all(Object.values(value.dashboard));
+  await fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+  expect(invalidate).toHaveBeenCalledWith("workspace:home");
 });

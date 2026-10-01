@@ -245,12 +245,10 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
   );
 
   assert(
-    workspacePage.includes("path: '/tickets'") &&
-      workspacePage.includes("path: '/settings/runtimes'") &&
-      workspacePage.includes("permissions.manage_runtimes === true") &&
-      workspacePage.includes("path: '/workers'") &&
-      workspacePage.includes("workspaceRoute(data.workspace.workspace_id, resource.path)"),
-    "Home should link to daily resources and permission-gated Settings without owning their inventories",
+    workspacePage.includes("DashboardSection") &&
+      !workspacePage.includes("<nav") &&
+      !workspacePage.includes("/settings/runtimes"),
+    "Home should show work records without duplicating Sidebar navigation",
   );
   assert(
     !workspacePage.includes("workerConsoleHref") &&
