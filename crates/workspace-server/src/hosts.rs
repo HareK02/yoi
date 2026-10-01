@@ -6342,6 +6342,28 @@ mod tests {
     }
 
     #[test]
+    fn runtime_input_contract_preserves_every_input_kind() {
+        for kind in [
+            EmbeddedWorkerInputKind::User,
+            EmbeddedWorkerInputKind::UserIfIdle,
+            EmbeddedWorkerInputKind::Notify,
+            EmbeddedWorkerInputKind::Compact,
+            EmbeddedWorkerInputKind::ListRewindTargets,
+            EmbeddedWorkerInputKind::RegisterPeer,
+        ] {
+            let input = EmbeddedWorkerInput {
+                kind,
+                content: "contract test".to_string(),
+                submission_request_id: Some("contract-request".to_string()),
+                segments: Some(vec![protocol::Segment::text("contract test")]),
+            };
+            let wire: runtime_api::WorkerInput = runtime_contract_convert(input.clone()).unwrap();
+            let decoded: EmbeddedWorkerInput = runtime_contract_convert(wire).unwrap();
+            assert_eq!(decoded, input);
+        }
+    }
+
+    #[test]
     fn remote_profile_source_uses_workspace_config_archive_reference() {
         let request = embedded_spawn_request();
         let profile = ProfileSelector::Builtin("builtin:coder".to_string());
