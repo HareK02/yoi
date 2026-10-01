@@ -101,24 +101,30 @@ impl BackendJobAttemptState {
 #[serde(rename_all = "snake_case")]
 pub enum BackendJobDeliveryState {
     Pending,
+    Sending,
     Completed,
     Failed,
+    Unknown,
 }
 
 impl BackendJobDeliveryState {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::Sending => "sending",
             Self::Completed => "completed",
             Self::Failed => "failed",
+            Self::Unknown => "unknown",
         }
     }
 
     pub(crate) fn parse(value: &str) -> Result<Self> {
         match value {
             "pending" => Ok(Self::Pending),
+            "sending" => Ok(Self::Sending),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
+            "unknown" => Ok(Self::Unknown),
             other => Err(Error::Store(format!(
                 "unknown Backend Job delivery state `{other}`"
             ))),

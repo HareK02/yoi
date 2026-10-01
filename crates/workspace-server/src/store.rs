@@ -27,7 +27,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 70;
+const LATEST_SCHEMA_VERSION: i64 = 71;
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
@@ -62,6 +62,8 @@ const WORKDIR_COMMAND_ATTACHMENT_CAPABILITIES_MIGRATION_NAME: &str =
     "External Workdir command attachment capabilities";
 const BACKEND_JOB_RUNNER_MIGRATION_NAME: &str =
     "Backend-owned Runtime Worker jobs and structured results";
+const BACKEND_JOB_DELIVERY_CLAIM_MIGRATION_NAME: &str =
+    "atomic Backend Job notification delivery claims";
 const TICKET_SCHEMA_VERSION_WITH_TARGETS: i64 = 7;
 const TICKET_SCHEMA_BASELINE_NAME: &str = "ticket schema baseline";
 const WORKER_REGISTRY_PROJECTION_SCHEMA: &str = r#"
@@ -208,6 +210,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 70,
         name: BACKEND_JOB_RUNNER_MIGRATION_NAME,
         apply: migrate_backend_job_runner_v69_to_v70,
+    },
+    Migration {
+        version: 71,
+        name: BACKEND_JOB_DELIVERY_CLAIM_MIGRATION_NAME,
+        apply: migrate_backend_job_delivery_claims_v70_to_v71,
     },
 ];
 
@@ -1491,6 +1498,15 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         runtime_run_id: Option<&str>,
         now: &str,
     ) -> Result<(WorkerRegistryProjectionCommit, bool)>;
+    fn bind_backend_job_attempt_runtime_run(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+        attempt_id: &str,
+        worker: &RuntimeWorkerRef,
+        runtime_run_id: &str,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord>;
     fn accept_backend_job_result(
         &self,
         workspace_id: &str,
@@ -1515,7 +1531,8 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         job_id: &str,
         target: &RuntimeWorkerRef,
         now: &str,
-    ) -> Result<BackendJobDeliveryRecord>;
+    ) -> Result<(BackendJobDeliveryRecord, bool)>;
+    fn recover_backend_job_deliveries(&self, workspace_id: &str, now: &str) -> Result<usize>;
     fn finish_backend_job_delivery(
         &self,
         workspace_id: &str,
@@ -5989,7 +6006,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 ));
             }
             if let Some(bound) = &attempt.worker {
-                if bound != worker || attempt.runtime_run_id.as_deref() != runtime_run_id {
+                let conflicting_run = runtime_run_id
+                    .is_some_and(|run_id| attempt.runtime_run_id.as_deref() != Some(run_id));
+                if bound != worker || conflicting_run {
                     return Err(Error::InvalidInput(
                         "Backend Job attempt is already bound to different Runtime evidence".to_string(),
                     ));
@@ -6023,6 +6042,64 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn bind_backend_job_attempt_runtime_run(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+        attempt_id: &str,
+        worker: &RuntimeWorkerRef,
+        runtime_run_id: &str,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord> {
+        if runtime_run_id.is_empty()
+            || runtime_run_id.len() > 512
+            || runtime_run_id.chars().any(char::is_control)
+        {
+            return Err(Error::InvalidInput(
+                "Backend Job Runtime run identity is invalid".to_string(),
+            ));
+        }
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, attempt_id)?
+                .ok_or_else(|| {
+                    Error::InvalidInput(format!("unknown Backend Job attempt `{attempt_id}`"))
+                })?;
+            if attempt.state != BackendJobAttemptState::Dispatched
+                || attempt.worker.as_ref() != Some(worker)
+            {
+                return Err(Error::InvalidInput(
+                    "Backend Job Runtime run does not match the dispatched attempt".to_string(),
+                ));
+            }
+            if let Some(existing) = attempt.runtime_run_id.as_deref() {
+                if existing != runtime_run_id {
+                    return Err(Error::InvalidInput(
+                        "Backend Job attempt is already bound to a different Runtime run"
+                            .to_string(),
+                    ));
+                }
+                tx.commit()?;
+                return Ok(attempt);
+            }
+            let changed = tx.execute(
+                "UPDATE backend_job_attempts SET runtime_run_id = ?4, updated_at = ?5 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND state = 'dispatched' AND runtime_id = ?6 AND worker_id = ?7 AND runtime_run_id IS NULL",
+                params![workspace_id, job_id, attempt_id, runtime_run_id, now, worker.runtime_id, worker.worker_id],
+            )?;
+            if changed != 1 {
+                return Err(Error::Store(
+                    "Backend Job Runtime run binding compare-and-set failed".to_string(),
+                ));
+            }
+            let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, attempt_id)?
+                .ok_or_else(|| {
+                    Error::Store("bound Backend Job Runtime run disappeared".to_string())
+                })?;
+            tx.commit()?;
+            Ok(attempt)
+        })
+    }
+
     fn accept_backend_job_result(
         &self,
         workspace_id: &str,
@@ -6048,6 +6125,11 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             if attempt.worker.as_ref() != Some(source_worker) {
                 return Err(Error::InvalidInput(
                     "Backend Job result source is not the attempt Worker".to_string(),
+                ));
+            }
+            if attempt.runtime_run_id.is_none() {
+                return Err(Error::InvalidInput(
+                    "Backend Job result source has no fenced Runtime run".to_string(),
                 ));
             }
             if attempt.state == BackendJobAttemptState::Completed {
@@ -6152,7 +6234,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         job_id: &str,
         target: &RuntimeWorkerRef,
         now: &str,
-    ) -> Result<BackendJobDeliveryRecord> {
+    ) -> Result<(BackendJobDeliveryRecord, bool)> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             if let Some(existing) = read_backend_job_delivery(&tx, workspace_id, delivery_id)? {
@@ -6161,8 +6243,23 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                         "Backend Job delivery id was reused with different intent".to_string(),
                     ));
                 }
+                if existing.state != BackendJobDeliveryState::Pending {
+                    tx.commit()?;
+                    return Ok((existing, false));
+                }
+                let claimed = tx.execute(
+                    "UPDATE backend_job_deliveries SET state = 'sending', updated_at = ?3 WHERE workspace_id = ?1 AND delivery_id = ?2 AND state = 'pending'",
+                    params![workspace_id, delivery_id, now],
+                )?;
+                if claimed != 1 {
+                    return Err(Error::Store(
+                        "Backend Job delivery claim lost inside immediate transaction".to_string(),
+                    ));
+                }
+                let delivery = read_backend_job_delivery(&tx, workspace_id, delivery_id)?
+                    .ok_or_else(|| Error::Store("claimed Backend Job delivery disappeared".to_string()))?;
                 tx.commit()?;
-                return Ok(existing);
+                return Ok((delivery, true));
             }
             let job = read_backend_job(&tx, workspace_id, job_id)?
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job `{job_id}`")))?;
@@ -6178,13 +6275,27 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             }
             let current_attempt_id = attempt_id(job_id, job.current_attempt);
             tx.execute(
-                "INSERT INTO backend_job_deliveries (workspace_id, delivery_id, job_id, attempt_id, target_runtime_id, target_worker_id, state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?7)",
+                "INSERT INTO backend_job_deliveries (workspace_id, delivery_id, job_id, attempt_id, target_runtime_id, target_worker_id, state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'sending', ?7, ?7)",
                 params![workspace_id, delivery_id, job_id, current_attempt_id, target.runtime_id, target.worker_id, now],
             )?;
             let delivery = read_backend_job_delivery(&tx, workspace_id, delivery_id)?
                 .ok_or_else(|| Error::Store("reserved Backend Job delivery disappeared".to_string()))?;
             tx.commit()?;
-            Ok(delivery)
+            Ok((delivery, true))
+        })
+    }
+
+    fn recover_backend_job_deliveries(&self, workspace_id: &str, now: &str) -> Result<usize> {
+        self.with_conn_mut(|conn| {
+            conn.execute(
+                "UPDATE backend_job_deliveries
+                 SET state = 'unknown', failure_category = 'restart_ambiguous',
+                     failure_detail = 'delivery was in progress when the Backend restarted; notification will not be replayed',
+                     updated_at = ?2
+                 WHERE workspace_id = ?1 AND state = 'sending'",
+                params![workspace_id, now],
+            )
+            .map_err(Into::into)
         })
     }
 
@@ -6197,9 +6308,12 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         failure_detail: Option<&str>,
         now: &str,
     ) -> Result<BackendJobDeliveryRecord> {
-        if state == BackendJobDeliveryState::Pending {
+        if matches!(
+            state,
+            BackendJobDeliveryState::Pending | BackendJobDeliveryState::Sending
+        ) {
             return Err(Error::InvalidInput(
-                "Backend Job delivery completion cannot remain pending".to_string(),
+                "Backend Job delivery completion must be terminal".to_string(),
             ));
         }
         let detail = failure_detail.map(bounded_failure_detail);
@@ -6207,14 +6321,16 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let current = read_backend_job_delivery(&tx, workspace_id, delivery_id)?
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job delivery `{delivery_id}`")))?;
-            if current.state == BackendJobDeliveryState::Completed {
-                if state != BackendJobDeliveryState::Completed {
-                    return Err(Error::InvalidInput(
-                        "completed Backend Job delivery cannot be replaced".to_string(),
-                    ));
+            if current.state != BackendJobDeliveryState::Sending {
+                if current.state == state {
+                    tx.commit()?;
+                    return Ok(current);
                 }
-                tx.commit()?;
-                return Ok(current);
+                return Err(Error::InvalidInput(format!(
+                    "Backend Job delivery in state `{}` cannot be finished as `{}`",
+                    current.state.as_str(),
+                    state.as_str()
+                )));
             }
             tx.execute(
                 "UPDATE backend_job_deliveries SET state = ?3, failure_category = ?4, failure_detail = ?5, delivered_at = CASE WHEN ?3 = 'completed' THEN ?6 ELSE delivered_at END, updated_at = ?6 WHERE workspace_id = ?1 AND delivery_id = ?2",
@@ -13103,6 +13219,57 @@ fn migrate_backend_job_runner_v69_to_v70(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_backend_job_delivery_claims_v70_to_v71(conn: &Connection) -> Result<()> {
+    let current = current_schema_version(conn)?;
+    if current != 70 {
+        return Err(Error::Store(format!(
+            "expected schema version 70 before {BACKEND_JOB_DELIVERY_CLAIM_MIGRATION_NAME} migration, found {current}"
+        )));
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    tx.execute_batch(
+        r#"
+        DROP INDEX backend_job_deliveries_pending;
+        ALTER TABLE backend_job_deliveries RENAME TO backend_job_deliveries_v70;
+        CREATE TABLE backend_job_deliveries (
+            workspace_id TEXT NOT NULL,
+            delivery_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            target_runtime_id TEXT NOT NULL,
+            target_worker_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('pending', 'sending', 'completed', 'failed', 'unknown')),
+            failure_category TEXT,
+            failure_detail TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            delivered_at TEXT,
+            PRIMARY KEY (workspace_id, delivery_id),
+            FOREIGN KEY (workspace_id, job_id, attempt_id)
+                REFERENCES backend_job_attempts(workspace_id, job_id, attempt_id) ON DELETE CASCADE
+        );
+        INSERT INTO backend_job_deliveries (
+            workspace_id, delivery_id, job_id, attempt_id, target_runtime_id,
+            target_worker_id, state, failure_category, failure_detail,
+            created_at, updated_at, delivered_at
+        )
+        SELECT workspace_id, delivery_id, job_id, attempt_id, target_runtime_id,
+               target_worker_id, state, failure_category, failure_detail,
+               created_at, updated_at, delivered_at
+        FROM backend_job_deliveries_v70;
+        DROP TABLE backend_job_deliveries_v70;
+        CREATE INDEX backend_job_deliveries_pending
+            ON backend_job_deliveries(workspace_id, state, updated_at);
+        "#,
+    )?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+        params![71_i64, BACKEND_JOB_DELIVERY_CLAIM_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("DROP TABLE IF EXISTS typed_ticket_targets;")?;
     conn.execute_batch(include_str!("latest_schema.sql"))?;
@@ -15278,6 +15445,10 @@ mod tests {
                     version: 70,
                     name: BACKEND_JOB_RUNNER_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 71,
+                    name: BACKEND_JOB_DELIVERY_CLAIM_MIGRATION_NAME.to_string(),
+                },
             ]
         );
 
@@ -15349,6 +15520,10 @@ mod tests {
                             WORKDIR_COMMAND_ATTACHMENT_CAPABILITIES_MIGRATION_NAME.to_string(),
                         ),
                         (70, BACKEND_JOB_RUNNER_MIGRATION_NAME.to_string()),
+                        (
+                            71,
+                            BACKEND_JOB_DELIVERY_CLAIM_MIGRATION_NAME.to_string(),
+                        ),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -15548,6 +15723,75 @@ mod tests {
     }
 
     #[test]
+    fn schema_v71_adds_delivery_claim_states_without_losing_existing_intent() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        prepare_schema_v50(&path, Some("workspace-a"));
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 70)
+        {
+            (migration.apply)(&conn).unwrap();
+        }
+        conn.execute_batch(
+            r#"
+            INSERT INTO backend_jobs (
+                workspace_id, job_id, purpose, input_revision, input_ref, request_json,
+                intent_fingerprint, state, current_attempt, created_at, updated_at
+            ) VALUES (
+                'workspace-a', 'job-a', 'check', 'revision-a', 'test://job-a', '{}',
+                'sha256:test', 'pending', 1, '1', '1'
+            );
+            INSERT INTO backend_job_attempts (
+                workspace_id, job_id, attempt_id, attempt, input_revision, state,
+                deadline_at, created_at, updated_at
+            ) VALUES (
+                'workspace-a', 'job-a', 'job-a:attempt:1', 1, 'revision-a', 'reserved',
+                '2', '1', '1'
+            );
+            INSERT INTO backend_job_deliveries (
+                workspace_id, delivery_id, job_id, attempt_id, target_runtime_id,
+                target_worker_id, state, created_at, updated_at
+            ) VALUES (
+                'workspace-a', 'delivery-a', 'job-a', 'job-a:attempt:1', 'runtime-a',
+                'worker-a', 'pending', '1', '1'
+            );
+            "#,
+        )
+        .unwrap();
+
+        migrate_backend_job_delivery_claims_v70_to_v71(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 71);
+        assert_eq!(
+            conn.query_row(
+                "SELECT state FROM backend_job_deliveries WHERE delivery_id = 'delivery-a'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "pending"
+        );
+        assert_eq!(
+            conn.execute(
+                "UPDATE backend_job_deliveries SET state = 'sending' WHERE delivery_id = 'delivery-a'",
+                [],
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.execute(
+                "UPDATE backend_job_deliveries SET state = 'unknown' WHERE delivery_id = 'delivery-a'",
+                [],
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn migration_resumes_from_a_valid_partially_applied_chain() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("server.db");
@@ -15565,7 +15809,7 @@ mod tests {
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
             vec![
-                52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70
+                52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71
             ]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
@@ -15574,7 +15818,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 21);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 22);
         assert!(column_exists(&conn, "worker_workdir_links", "alias").unwrap());
         assert!(column_exists(&conn, "worker_workdir_links", "capabilities").unwrap());
         assert!(!column_exists(&conn, "worker_workdir_links", "role").unwrap());
@@ -19263,10 +19507,49 @@ INSERT INTO worker_registry (
                 &request.job_id,
                 &first.attempt.attempt_id,
                 &worker,
-                Some("runtime-run-1"),
+                None,
                 "2026-09-01T00:00:02Z",
             )
             .unwrap();
+        let submission = BackendJobResultSubmission {
+            job_id: request.job_id.clone(),
+            attempt_id: first.attempt.attempt_id.clone(),
+            input_revision: request.input_revision.clone(),
+            result: serde_json::json!({"valid": true}),
+        };
+        assert!(
+            store
+                .accept_backend_job_result(
+                    workspace_id,
+                    &worker,
+                    &submission,
+                    "2026-09-01T00:00:02Z",
+                )
+                .is_err(),
+            "Worker identity without Runtime run evidence must not accept a result"
+        );
+        store
+            .bind_backend_job_attempt_runtime_run(
+                workspace_id,
+                &request.job_id,
+                &first.attempt.attempt_id,
+                &worker,
+                "runtime-run-1",
+                "2026-09-01T00:00:02Z",
+            )
+            .unwrap();
+        assert!(
+            store
+                .bind_backend_job_attempt_runtime_run(
+                    workspace_id,
+                    &request.job_id,
+                    &first.attempt.attempt_id,
+                    &worker,
+                    "runtime-run-2",
+                    "2026-09-01T00:00:02Z",
+                )
+                .is_err()
+        );
         assert_eq!(
             store
                 .worker_registry_projection(workspace_id, &worker)
@@ -19279,12 +19562,6 @@ INSERT INTO worker_registry (
                 purpose: request.purpose.clone(),
             })
         );
-        let submission = BackendJobResultSubmission {
-            job_id: request.job_id.clone(),
-            attempt_id: first.attempt.attempt_id.clone(),
-            input_revision: request.input_revision.clone(),
-            result: serde_json::json!({"valid": true}),
-        };
         assert!(
             store
                 .accept_backend_job_result(
@@ -19324,9 +19601,43 @@ INSERT INTO worker_registry (
                 .is_err()
         );
 
-        // Missing notification targets are durable delivery failures and do
-        // not alter the already-committed Job result.
-        store
+        // Delivery is claimed atomically before transport I/O. Concurrent
+        // callers converge on one sender, and replays cannot send while that
+        // claim is active or after it reaches a terminal state.
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let claims = std::thread::scope(|scope| {
+            let handles = (0..2)
+                .map(|_| {
+                    let store = store.clone();
+                    let source = source.clone();
+                    let job_id = request.job_id.clone();
+                    let barrier = barrier.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        store
+                            .reserve_backend_job_delivery(
+                                workspace_id,
+                                "delivery-1",
+                                &job_id,
+                                &source,
+                                "2026-09-01T00:00:05Z",
+                            )
+                            .unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(claims.iter().filter(|(_, claimed)| *claimed).count(), 1);
+        assert!(
+            claims
+                .iter()
+                .all(|(delivery, _)| delivery.state == BackendJobDeliveryState::Sending)
+        );
+        let (delivery, claimed) = store
             .reserve_backend_job_delivery(
                 workspace_id,
                 "delivery-1",
@@ -19335,6 +19646,8 @@ INSERT INTO worker_registry (
                 "2026-09-01T00:00:05Z",
             )
             .unwrap();
+        assert!(!claimed);
+        assert_eq!(delivery.state, BackendJobDeliveryState::Sending);
         store
             .finish_backend_job_delivery(
                 workspace_id,
@@ -19345,6 +19658,62 @@ INSERT INTO worker_registry (
                 "2026-09-01T00:00:06Z",
             )
             .unwrap();
+        let (_, claimed) = store
+            .reserve_backend_job_delivery(
+                workspace_id,
+                "delivery-1",
+                &request.job_id,
+                &source,
+                "2026-09-01T00:00:07Z",
+            )
+            .unwrap();
+        assert!(!claimed);
+
+        // A restart cannot know whether an in-flight transport completed, so
+        // it terminalizes the claim as unknown instead of sending twice.
+        let (_, claimed) = store
+            .reserve_backend_job_delivery(
+                workspace_id,
+                "delivery-2",
+                &request.job_id,
+                &source,
+                "2026-09-01T00:00:08Z",
+            )
+            .unwrap();
+        assert!(claimed);
+        assert_eq!(
+            store
+                .recover_backend_job_deliveries(workspace_id, "2026-09-01T00:00:09Z")
+                .unwrap(),
+            1
+        );
+        let (delivery, claimed) = store
+            .reserve_backend_job_delivery(
+                workspace_id,
+                "delivery-2",
+                &request.job_id,
+                &source,
+                "2026-09-01T00:00:10Z",
+            )
+            .unwrap();
+        assert!(!claimed);
+        assert_eq!(delivery.state, BackendJobDeliveryState::Unknown);
+        assert_eq!(
+            delivery.failure_category.as_deref(),
+            Some("restart_ambiguous")
+        );
+        assert!(
+            store
+                .finish_backend_job_delivery(
+                    workspace_id,
+                    "delivery-2",
+                    BackendJobDeliveryState::Completed,
+                    None,
+                    None,
+                    "2026-09-01T00:00:11Z",
+                )
+                .is_err()
+        );
         assert_eq!(
             store
                 .get_backend_job(workspace_id, &request.job_id)

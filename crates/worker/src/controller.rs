@@ -1178,39 +1178,42 @@ where
         ),
         None => durable_parent_notifications,
     };
+    let backend_job_profile = worker.manifest().engine.instruction == "internal.backend_job_system";
     let prompts = worker.prompts().clone();
-    let paste_store = worker.store().clone();
-    let paste_session_id = worker.session_id();
-    worker
-        .engine_mut()
-        .register_tool(crate::paste_artifact_tool::search_input_artifact_tool(
-            paste_store.clone(),
-            paste_session_id,
-        ));
-    worker
-        .engine_mut()
-        .register_tool(crate::paste_artifact_tool::read_input_artifact_tool(
-            paste_store,
-            paste_session_id,
-        ));
-    // Keep the alias-routed schemas installed for the Worker lifetime. The
-    // attachment set may be empty or mutate after registration, so target
-    // resolution and provider capability checks happen per invocation.
     let tracker = tools::Tracker::new();
-    let workdir_tools = if restrict_workdir_tools_to_current_capabilities {
-        tools::routed_builtin_tools_for_current_capabilities(
-            workdir_sessions.clone(),
-            tracker.clone(),
-            bash_output_dir.clone(),
-        )
-    } else {
-        tools::routed_builtin_tools(
-            workdir_sessions.clone(),
-            tracker.clone(),
-            bash_output_dir.clone(),
-        )
-    };
-    worker.engine_mut().register_tools(workdir_tools);
+    if !backend_job_profile {
+        let paste_store = worker.store().clone();
+        let paste_session_id = worker.session_id();
+        worker
+            .engine_mut()
+            .register_tool(crate::paste_artifact_tool::search_input_artifact_tool(
+                paste_store.clone(),
+                paste_session_id,
+            ));
+        worker
+            .engine_mut()
+            .register_tool(crate::paste_artifact_tool::read_input_artifact_tool(
+                paste_store,
+                paste_session_id,
+            ));
+        // Keep the alias-routed schemas installed for the Worker lifetime. The
+        // attachment set may be empty or mutate after registration, so target
+        // resolution and provider capability checks happen per invocation.
+        let workdir_tools = if restrict_workdir_tools_to_current_capabilities {
+            tools::routed_builtin_tools_for_current_capabilities(
+                workdir_sessions.clone(),
+                tracker.clone(),
+                bash_output_dir.clone(),
+            )
+        } else {
+            tools::routed_builtin_tools(
+                workdir_sessions.clone(),
+                tracker.clone(),
+                bash_output_dir.clone(),
+            )
+        };
+        worker.engine_mut().register_tools(workdir_tools);
+    }
     if feature_config.image.enabled && model_supports_image_attachments(&spawner_manifest.model) {
         worker
             .engine_mut()
@@ -1225,7 +1228,7 @@ where
     let worker_enabled = feature_config.worker.enabled;
     let sub_worker_enabled = feature_config.sub_worker.enabled;
     let mut feature_registry = FeatureRegistryBuilder::new();
-    if worker.manifest().engine.instruction == "internal.backend_job_system" {
+    if backend_job_profile {
         let workspace_client = worker.workspace_client_handle();
         if !workspace_client.is_available() || workspace_client.workspace_id().is_none() {
             return Err(std::io::Error::new(

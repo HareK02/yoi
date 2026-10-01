@@ -867,7 +867,7 @@ CREATE TABLE backend_job_deliveries (
             attempt_id TEXT NOT NULL,
             target_runtime_id TEXT NOT NULL,
             target_worker_id TEXT NOT NULL,
-            state TEXT NOT NULL CHECK (state IN ('pending', 'completed', 'failed')),
+            state TEXT NOT NULL CHECK (state IN ('pending', 'sending', 'completed', 'failed', 'unknown')),
             failure_category TEXT,
             failure_detail TEXT,
             created_at TEXT NOT NULL,

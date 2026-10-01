@@ -3244,6 +3244,9 @@ impl WorkspaceApi {
         }
         recover_workdir_removals(&api)?;
         recover_runtime_removals(&api).await;
+        let recovery_now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        api.store
+            .recover_backend_job_deliveries(&api.config.workspace_id, &recovery_now)?;
         api.recover_backend_jobs()?;
         Ok(api)
     }
@@ -3292,34 +3295,47 @@ impl WorkspaceApi {
             operation_id: allocation_key(&reservation.attempt.attempt_id),
             input_fingerprint: reservation.job.intent_fingerprint.clone(),
         };
-        let spawned = self
-            .spawn_workspace_worker(
-                EMBEDDED_WORKER_RUNTIME_ID,
-                WorkerSpawnRequest {
-                    requested_worker_name: Some(format!("job:{}", request.purpose)),
-                    intent: WorkerSpawnIntent::BackendJob {
-                        job_id: request.job_id.clone(),
-                        attempt_id: reservation.attempt.attempt_id.clone(),
-                        purpose: request.purpose.clone(),
-                    },
-                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                        expected_segments: 0,
-                    },
-                    profile: ProfileSelector::Builtin(request.profile.clone()),
-                    ticket_assignment: None,
-                    initial_submit: Vec::new(),
-                    workdir_attachment_requests: Vec::new(),
-                    resolved_workdir_attachment_requests: Vec::new(),
-                    resolved_workdir_attachments: Vec::new(),
-                    resolved_config_bundle: None,
-                    resolved_worker_observation_enabled: false,
-                    resolved_worker_observation_grants: Vec::new(),
-                    resolved_workspace_api: None,
-                    resolved_memory_settings: None,
-                    resolved_control_operation: Some(control_operation),
+        let spawned = match self.spawn_workspace_worker(
+            EMBEDDED_WORKER_RUNTIME_ID,
+            WorkerSpawnRequest {
+                requested_worker_name: Some(format!("job:{}", request.purpose)),
+                intent: WorkerSpawnIntent::BackendJob {
+                    job_id: request.job_id.clone(),
+                    attempt_id: reservation.attempt.attempt_id.clone(),
+                    purpose: request.purpose.clone(),
                 },
-            )
-            .map_err(|error| error.error)?;
+                acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                    expected_segments: 0,
+                },
+                profile: ProfileSelector::Builtin(request.profile.clone()),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachments: Vec::new(),
+                resolved_config_bundle: None,
+                resolved_worker_observation_enabled: false,
+                resolved_worker_observation_grants: Vec::new(),
+                resolved_workspace_api: None,
+                resolved_memory_settings: None,
+                resolved_control_operation: Some(control_operation),
+            },
+        ) {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                let detail = error.error.to_string();
+                self.store.finish_backend_job_attempt(
+                    &self.config.workspace_id,
+                    &request.job_id,
+                    &reservation.attempt.attempt_id,
+                    BackendJobAttemptState::Failed,
+                    "dispatch_error",
+                    &detail,
+                    &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                )?;
+                return Err(error.error);
+            }
+        };
         let worker = match (spawned.state, spawned.worker) {
             (InternalWorkerOperationState::Accepted, Some(worker)) => worker,
             _ => {
@@ -3375,17 +3391,35 @@ impl WorkspaceApi {
             });
         }
 
-        let submitted = self
-            .runtime
-            .send_input(
-                &worker.worker,
-                WorkerInputRequest {
-                    kind: WorkerInputKind::User,
-                    content: worker_input,
-                    segments: None,
-                },
-            )
-            .map_err(RuntimeRegistryError::into_error)?;
+        self.schedule_backend_job_timeout(
+            &request.job_id,
+            &reservation.attempt.attempt_id,
+            &reservation.attempt.deadline_at,
+        );
+
+        let submitted = match self.runtime.send_input(
+            &worker.worker,
+            WorkerInputRequest {
+                kind: WorkerInputKind::User,
+                content: worker_input,
+                segments: None,
+            },
+        ) {
+            Ok(submitted) => submitted,
+            Err(error) => {
+                let detail = error.message();
+                self.store.finish_backend_job_attempt(
+                    &self.config.workspace_id,
+                    &request.job_id,
+                    &reservation.attempt.attempt_id,
+                    BackendJobAttemptState::Unknown,
+                    "input_outcome_unknown",
+                    &detail,
+                    &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                )?;
+                return Err(error.into_error());
+            }
+        };
         if submitted.state != InternalWorkerOperationState::Accepted {
             let detail = submitted
                 .diagnostics
@@ -3407,11 +3441,43 @@ impl WorkspaceApi {
                 message: detail.to_string(),
             });
         }
-        self.schedule_backend_job_timeout(
+        let Some(runtime_run_id) = submitted.runtime_run_id.as_deref() else {
+            self.store.finish_backend_job_attempt(
+                &self.config.workspace_id,
+                &request.job_id,
+                &reservation.attempt.attempt_id,
+                BackendJobAttemptState::Unknown,
+                "runtime_run_missing",
+                "embedded Runtime accepted Backend Job input without run evidence",
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )?;
+            return Err(Error::RuntimeOperationFailed {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                code: "backend_job_runtime_run_missing".to_string(),
+                message: "embedded Runtime accepted Backend Job input without run evidence"
+                    .to_string(),
+            });
+        };
+        if let Err(error) = self.store.bind_backend_job_attempt_runtime_run(
+            &self.config.workspace_id,
             &request.job_id,
             &reservation.attempt.attempt_id,
-            &reservation.attempt.deadline_at,
-        );
+            &worker.worker,
+            runtime_run_id,
+            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+        ) {
+            let detail = error.to_string();
+            self.store.finish_backend_job_attempt(
+                &self.config.workspace_id,
+                &request.job_id,
+                &reservation.attempt.attempt_id,
+                BackendJobAttemptState::Unknown,
+                "runtime_run_persistence_failed",
+                &detail,
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )?;
+            return Err(error);
+        }
         let job = self
             .store
             .get_backend_job(&self.config.workspace_id, &request.job_id)?
@@ -3462,6 +3528,18 @@ impl WorkspaceApi {
                     }
                 }
                 BackendJobAttemptState::Dispatched => {
+                    if attempt.runtime_run_id.is_none() {
+                        self.store.finish_backend_job_attempt(
+                            &self.config.workspace_id,
+                            &attempt.job_id,
+                            &attempt.attempt_id,
+                            BackendJobAttemptState::Unknown,
+                            "recovery_runtime_run_unknown",
+                            "the Runtime accepted Worker dispatch without durable run evidence",
+                            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                        )?;
+                        continue;
+                    }
                     let worker_known = attempt
                         .worker
                         .as_ref()
@@ -3575,7 +3653,7 @@ impl WorkspaceApi {
             acceptance.job.request.job_id, acceptance.attempt.attempt_id
         );
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
-        let Ok(delivery) = self.store.reserve_backend_job_delivery(
+        let Ok((delivery, claimed)) = self.store.reserve_backend_job_delivery(
             &self.config.workspace_id,
             &delivery_id,
             &acceptance.job.request.job_id,
@@ -3584,7 +3662,7 @@ impl WorkspaceApi {
         ) else {
             return;
         };
-        if delivery.state == BackendJobDeliveryState::Completed {
+        if !claimed || delivery.state != BackendJobDeliveryState::Sending {
             return;
         }
         let content = format!(
@@ -23747,6 +23825,17 @@ async fn send_runtime_worker_input(
 ) -> ApiResult<Json<server_api::RuntimeWorkerInputResult>> {
     let request = worker_input_request_from_api(request)?;
     let worker = resolve_workspace_worker_reference(&api, &runtime_id, &worker_id)?;
+    if api
+        .store
+        .worker_registry_projection(&api.config.workspace_id, &worker)?
+        .and_then(|projection| projection.job)
+        .is_some()
+    {
+        return Err(Error::InvalidInput(
+            "Backend Job Workers accept only their Backend-owned immutable input".to_string(),
+        )
+        .into());
+    }
     let result = api
         .runtime
         .send_input(&worker, request)
@@ -23858,6 +23947,13 @@ async fn worker_protocol_ws(
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     let worker = RuntimeWorkerRef::new(&runtime_id, &worker_id);
+    let job_read_only = match api
+        .store
+        .worker_registry_projection(&api.config.workspace_id, &worker)
+    {
+        Ok(projection) => projection.and_then(|projection| projection.job).is_some(),
+        Err(error) => return ApiError::from(error).into_response(),
+    };
     let source = match api.observation_proxy.source(&worker) {
         Ok(source) => source,
         Err(ObservationProxyError::WorkerNotFound(_)) => {
@@ -23878,7 +23974,9 @@ async fn worker_protocol_ws(
         }
     };
     let input_source = authenticated_browser_input_source(&actor);
-    ws.on_upgrade(move |socket| worker_protocol_ws_session(source, socket, input_source))
+    ws.on_upgrade(move |socket| {
+        worker_protocol_ws_session(source, socket, input_source, job_read_only)
+    })
 }
 
 pub(crate) struct WorkspaceWorkerProtocolConnection {
@@ -24035,13 +24133,14 @@ async fn worker_protocol_ws_session(
     source: RuntimeObservationSource,
     socket: WebSocket,
     input_source: protocol::AuthenticatedInputSource,
+    read_only: bool,
 ) {
     match source {
         RuntimeObservationSource::RemoteWs(config) => {
-            remote_worker_protocol_ws_session(config, socket, input_source).await;
+            remote_worker_protocol_ws_session(config, socket, input_source, read_only).await;
         }
         RuntimeObservationSource::Embedded(source) => {
-            embedded_worker_protocol_ws_session(source, socket, input_source).await;
+            embedded_worker_protocol_ws_session(source, socket, input_source, read_only).await;
         }
     }
 }
@@ -24050,6 +24149,7 @@ async fn remote_worker_protocol_ws_session(
     config: RuntimeObservationSourceConfig,
     socket: WebSocket,
     input_source: protocol::AuthenticatedInputSource,
+    read_only: bool,
 ) {
     let mut request = match config.endpoint.clone().into_client_request() {
         Ok(request) => request,
@@ -24108,6 +24208,14 @@ async fn remote_worker_protocol_ws_session(
             inbound = client_stream.next() => {
                 match inbound {
                     Some(Ok(WsMessage::Text(text))) => {
+                        if read_only {
+                            if let Ok(event) = protocol::stream::encode_event(&protocol_error_event(
+                                "Backend Job Worker Console is read-only",
+                            )) {
+                                let _ = client_sink.send(WsMessage::Text(event.into())).await;
+                            }
+                            continue;
+                        }
                         let method = match protocol::stream::decode_method(text.as_ref()) {
                             Ok(method) => match authorize_browser_worker_method(method, &input_source) {
                                 Ok(method) => method,
@@ -24191,6 +24299,7 @@ async fn embedded_worker_protocol_ws_session(
     source: crate::observation::EmbeddedRuntimeObservationSource,
     mut socket: WebSocket,
     input_source: protocol::AuthenticatedInputSource,
+    read_only: bool,
 ) {
     let mut upstream = match RuntimeObservationClient::connect(&RuntimeObservationSource::Embedded(
         source.clone(),
@@ -24209,6 +24318,12 @@ async fn embedded_worker_protocol_ws_session(
         tokio::select! {
             inbound = socket.next() => {
                 match inbound {
+                    Some(Ok(WsMessage::Text(_))) if read_only => {
+                        let event = protocol_error_event("Backend Job Worker Console is read-only");
+                        if !send_protocol_event(&mut socket, &event).await {
+                            return;
+                        }
+                    }
                     Some(Ok(WsMessage::Text(text))) => match decode_method(&text) {
                         Ok(method) => match authorize_browser_worker_method(method, &input_source) {
                             Ok(method) => match source.runtime.send_protocol_method(&source.worker_ref, method) {
@@ -33877,6 +33992,10 @@ mod tests {
             "a stale concurrent dispatch replay must not submit the attempt twice"
         );
         assert_eq!(dispatched.attempt.state, BackendJobAttemptState::Dispatched);
+        assert!(
+            dispatched.attempt.runtime_run_id.is_some(),
+            "accepted Job input must be fenced to durable Runtime run evidence"
+        );
         let worker = dispatched.attempt.worker.clone().expect("bound Job Worker");
         assert_eq!(worker.runtime_id, EMBEDDED_WORKER_RUNTIME_ID);
         assert!(
@@ -33898,6 +34017,25 @@ mod tests {
                 purpose: request.purpose.clone(),
             })
         );
+        let input_error = send_runtime_worker_input(
+            State(api.clone()),
+            AxumPath((worker.runtime_id.clone(), worker.worker_id.clone())),
+            Json(server_api::RuntimeWorkerInputRequest {
+                kind: Some("user".to_string()),
+                content: "attempt to rerun immutable Job input".to_string(),
+                segments: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            input_error.into_response().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(
+            execution.take_inputs().is_empty(),
+            "Job-owned Workers must reject interactive reruns"
+        );
         let replay = api.dispatch_backend_job(&request).unwrap();
         assert!(replay.replayed);
         assert_eq!(replay.attempt.worker, Some(worker.clone()));
@@ -33914,6 +34052,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(accepted.job.state, BackendJobState::Completed);
+    }
+
+    #[tokio::test]
+    async fn backend_job_spawn_transport_error_terminalizes_reserved_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        api.runtime
+            .unregister_if_idle(EMBEDDED_WORKER_RUNTIME_ID, 10)
+            .unwrap();
+        let request = BackendJobRequest {
+            job_id: "runner-spawn-error-1".to_string(),
+            purpose: "spawn_error_contract_check".to_string(),
+            input_revision: "revision-1".to_string(),
+            input_ref: "test://runner/spawn-error/1".to_string(),
+            input: serde_json::json!({"value": "immutable"}),
+            instruction: "Return a structured check result.".to_string(),
+            profile: "builtin:backend-job".to_string(),
+            source_worker: None,
+            notification_target: None,
+            limits: crate::backend_job::BackendJobLimits::default(),
+        };
+
+        assert!(api.dispatch_backend_job(&request).is_err());
+        let attempt = api
+            .store
+            .get_backend_job_attempt(
+                TEST_WORKSPACE_ID,
+                &request.job_id,
+                &crate::backend_job::attempt_id(&request.job_id, 1),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.state, BackendJobAttemptState::Failed);
+        assert_eq!(attempt.failure_category.as_deref(), Some("dispatch_error"));
     }
 
     #[tokio::test]

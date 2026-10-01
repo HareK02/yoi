@@ -735,6 +735,8 @@ pub struct WorkerInputResult {
     pub state: InternalWorkerOperationState,
     #[serde(flatten)]
     pub worker: RuntimeWorkerRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_run_id: Option<String>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -1206,6 +1208,7 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         WorkerInputResult {
             state: InternalWorkerOperationState::Unsupported,
             worker: RuntimeWorkerRef::new(self.runtime_id().to_string(), worker_id.to_string()),
+            runtime_run_id: None,
             diagnostics: vec![diagnostic(
                 "worker_input_pending",
                 HostDiagnosticSeverity::Info,
@@ -3023,9 +3026,10 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             segments: request.segments,
         };
         match self.runtime.send_input(&worker_ref, input) {
-            Ok(_) => WorkerInputResult {
+            Ok(ack) => WorkerInputResult {
                 state: InternalWorkerOperationState::Accepted,
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
+                runtime_run_id: ack.submission.map(|submission| submission.submission_id),
                 diagnostics: Vec::new(),
             },
             Err(error) => embedded_input_rejected(
@@ -5005,6 +5009,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 return WorkerInputResult {
                     state: InternalWorkerOperationState::Rejected,
                     worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
+                    runtime_run_id: None,
                     diagnostics: vec![diagnostic],
                 };
             }
@@ -5015,9 +5020,13 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
             move |client| async move { client.send_worker_input(worker_id_owned, input).await },
         ) {
-            Ok(_) => WorkerInputResult {
+            Ok(response) => WorkerInputResult {
                 state: InternalWorkerOperationState::Accepted,
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
+                runtime_run_id: response
+                    .ack
+                    .submission
+                    .map(|submission| submission.submission_id),
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => remote_input_rejected(&self.runtime_id, worker_id, diagnostic),
@@ -5406,6 +5415,7 @@ fn embedded_input_rejected(
     WorkerInputResult {
         state: InternalWorkerOperationState::Rejected,
         worker: RuntimeWorkerRef::new(runtime_id.to_string(), worker_id.to_string()),
+        runtime_run_id: None,
         diagnostics: vec![diagnostic],
     }
 }
@@ -5418,6 +5428,7 @@ fn remote_input_rejected(
     WorkerInputResult {
         state: InternalWorkerOperationState::Rejected,
         worker: RuntimeWorkerRef::new(runtime_id.to_string(), worker_id.to_string()),
+        runtime_run_id: None,
         diagnostics: vec![diagnostic],
     }
 }
