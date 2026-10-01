@@ -43,8 +43,11 @@ context_window = 1050000
 max_context_window = 272000
 capability = { tool_calling = "parallel", structured_output = "json_schema", reasoning = "effort", vision = true, prompt_caching = { kind = "auto" } }
 
+# https://developers.openai.com/api/docs/models/gpt-6.1-sol
+# Tool calling requires Responses; reasoning effort supports low through max,
+# but not none or minimal. Preserve the Codex route's effective limit above.
 [[model]]
-id = "gpt-6-sol"
+id = "gpt-6.1-sol"
 provider = "codex-oauth"
 context_window = 1050000
 max_context_window = 272000

@@ -570,10 +570,16 @@ mod tests {
     }
 
     #[test]
-    fn builtin_codex_catalog_includes_gpt_6_sol_and_luna() {
+    fn builtin_codex_catalog_replaces_gpt_6_sol_with_6_1_and_keeps_astra_and_luna() {
         let models = load_builtin_models().unwrap();
+        let providers = load_builtin_providers().unwrap();
+        assert!(
+            !models
+                .iter()
+                .any(|model| model.provider == "codex-oauth" && model.id == "gpt-6-sol")
+        );
 
-        for model_id in ["gpt-6-sol", "gpt-6-luna"] {
+        for model_id in ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna"] {
             let model = models
                 .iter()
                 .find(|model| model.provider == "codex-oauth" && model.id == model_id)
@@ -581,6 +587,23 @@ mod tests {
             assert_eq!(model.context_window, Some(1_050_000));
             assert_eq!(model.max_context_window, Some(272_000));
             assert!(model.capability.is_some());
+
+            let config = resolve_with_catalogs(
+                &ModelManifest {
+                    ref_: Some(format!("codex-oauth/{model_id}")),
+                    context_window: Some(1_050_000),
+                    ..Default::default()
+                },
+                &providers,
+                &models,
+            )
+            .unwrap();
+            assert_eq!(config.model_id, model_id);
+            assert_eq!(config.scheme, SchemeKind::OpenaiResponses);
+            assert_eq!(config.auth, AuthRef::CodexOAuth);
+            assert_eq!(config.context_window, 272_000);
+            assert_eq!(config.max_context_window, Some(272_000));
+            assert_eq!(config.capability, model.capability);
         }
     }
 
