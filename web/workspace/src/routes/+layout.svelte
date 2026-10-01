@@ -1,6 +1,7 @@
 <script lang="ts">
   import { page } from '$app/state';
   import { setContext } from 'svelte';
+  import { MediaQuery } from 'svelte/reactivity';
   import WorkspaceAlerts from '$lib/workspace/alerts/WorkspaceAlerts.svelte';
   import Bevel from '$lib/workspace/ui/Bevel.svelte';
   import {
@@ -36,6 +37,7 @@
   }
 
   let sidebarFolded = $state(loadSidebarFolded());
+  const mobileLayout = new MediaQuery('(max-width: 760px)');
 
   $effect(() => {
     const folded = sidebarFolded;
@@ -102,7 +104,7 @@
       </nav>
     </header>
   </Bevel>
-  <main class="app-shell__main">
+  <main class="app-shell__main" inert={mobileLayout.current && !sidebarFolded}>
     {@render children()}
   </main>
 </div>
@@ -229,10 +231,6 @@
       grid-row: 2;
       overflow-y: auto;
       padding: var(--space-4);
-    }
-
-    .app-shell.sidebar-open .app-shell__main {
-      display: none;
     }
   }
 </style>

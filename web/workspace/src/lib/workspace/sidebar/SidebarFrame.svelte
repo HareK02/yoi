@@ -18,11 +18,9 @@
 <div class="sidebar-frame" class:folded>
   <Bevel as="div" class="sidebar-frame__bevel" top={false} bottom={false} left={false} fill>
     <aside class="sidebar-frame__surface" aria-label="Sidebar">
-      {#if !folded}
-        <div class="sidebar-frame-content">
-          {@render children()}
-        </div>
-      {/if}
+      <div class="sidebar-frame-content" inert={folded} aria-hidden={folded}>
+        {@render children()}
+      </div>
 
       <div class="sidebar-control-row">
         <button

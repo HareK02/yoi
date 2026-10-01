@@ -1,7 +1,7 @@
 /// <reference lib="dom" />
 import { assert, assertEquals } from "@std/assert";
 import { dirname, fromFileUrl, join } from "@std/path";
-import { chromium } from "playwright";
+import { chromium, type Page } from "playwright";
 
 const repositoryRoot = join(dirname(fromFileUrl(import.meta.url)), "../../..");
 const workspaceRoot = join(repositoryRoot, "web/workspace");
@@ -39,6 +39,54 @@ async function historyRequestCount(baseUrl: string): Promise<number> {
   const response = await fetch(`${baseUrl}/fixture-state`);
   const state = await response.json();
   return state.history_requests;
+}
+
+async function checkSidebarSlide(page: Page, mobile: boolean, opening: boolean): Promise<void> {
+  const toggle = page.locator(mobile ? ".app-shell__mobile-sidebar-toggle" : ".sidebar-fold-button");
+  const result = await toggle.evaluate(async (button, mobile) => {
+    const frame = document.querySelector<HTMLElement>(".sidebar-frame")!;
+    const content = frame.querySelector<HTMLElement>(".sidebar-frame-content")!;
+    const main = document.querySelector<HTMLElement>(".app-shell__main")!;
+    const moving = mobile ? frame : content;
+    const sample = () => ({
+      x: moving.getBoundingClientRect().x,
+      width: moving.getBoundingClientRect().width,
+      frameWidth: frame.getBoundingClientRect().width,
+      mainWidth: main.getBoundingClientRect().width,
+      mainHeight: main.getBoundingClientRect().height,
+    });
+    const before = sample();
+    (button as HTMLButtonElement).click();
+    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+    const animations = frame.getAnimations({ subtree: true });
+    const slides = animations.filter((animation) => animation instanceof CSSTransition &&
+      ["width", "transform"].includes(animation.transitionProperty));
+    const durations = slides.map((animation) => animation.effect!.getTiming().duration);
+    for (const animation of animations) {
+      animation.pause();
+      animation.currentTime = 110;
+    }
+    const middle = sample();
+    for (const animation of animations) animation.finish();
+    await Promise.all(animations.map((animation) => animation.finished));
+    return { before, middle, after: sample(), durations, contentInert: content.inert, mainInert: main.inert };
+  }, mobile);
+  assert(result.durations.length >= (mobile ? 1 : 2));
+  assert(result.durations.every((duration) => duration === 220));
+  const { before, middle, after } = result;
+  assert(opening ? before.x < middle.x && middle.x < after.x : before.x > middle.x && middle.x > after.x,
+    `sidebar must slide horizontally through an intermediate position: ${JSON.stringify(result)}`);
+  assertEquals(before.width, after.width, "sidebar contents must slide without reflowing");
+  assertEquals(result.contentInert, !opening);
+  assertEquals(result.mainInert, mobile && opening);
+  if (mobile) {
+    assertEquals(before.mainWidth, after.mainWidth);
+    assertEquals(before.mainHeight, after.mainHeight);
+    assertEquals(after.frameWidth, before.frameWidth);
+  } else {
+    assert(opening ? before.frameWidth < middle.frameWidth && middle.frameWidth < after.frameWidth
+      : before.frameWidth > middle.frameWidth && middle.frameWidth > after.frameWidth);
+  }
 }
 
 async function checkConsoleHistory(viewportHeight: number): Promise<void> {
@@ -336,17 +384,33 @@ async function checkConsoleHistory(viewportHeight: number): Promise<void> {
       assertEquals(new Set(rowIds).size, rowIds.length);
       await page.getByRole("button", { name: "Overview", exact: true }).click();
       assertEquals(await transcript.getByText("searched 1 time・ran 1 command", { exact: true }).count(), 12);
-      await page.getByRole("button", { name: "Fold sidebar", exact: true }).click();
+      await checkSidebarSlide(page, false, false);
+      await checkSidebarSlide(page, false, true);
+      await checkSidebarSlide(page, false, false);
       assertEquals(await page.evaluate(() => localStorage.getItem("yoi.sidebar.folded.v1")), "true");
       await page.reload();
       await page.getByRole("button", { name: "Unfold sidebar", exact: true }).waitFor();
       assertEquals(await page.locator(".app-shell.sidebar-open").count(), 0);
       await page.setViewportSize({ width: 600, height: viewportHeight });
-      await page.getByRole("button", { name: "Show sidebar", exact: true }).click();
+      await page.locator(".sidebar-frame").evaluate(async (element) => {
+        await Promise.all(element.getAnimations({ subtree: true }).map((animation) => animation.finished));
+      });
+      await checkSidebarSlide(page, true, true);
+      await checkSidebarSlide(page, true, false);
+      await checkSidebarSlide(page, true, true);
       assertEquals(await page.evaluate(() => localStorage.getItem("yoi.sidebar.folded.v1")), "false");
       await page.reload();
       await page.getByRole("button", { name: "Hide sidebar", exact: true }).waitFor();
       assertEquals(await page.locator(".app-shell.sidebar-open").count(), 1);
+      await page.emulateMedia({ reducedMotion: "reduce" });
+      await page.getByRole("button", { name: "Hide sidebar", exact: true }).click();
+      const reducedSidebar = await page.locator(".sidebar-frame").evaluate((element) => ({
+        animations: element.getAnimations({ subtree: true }).length,
+        right: element.getBoundingClientRect().right,
+        visibility: getComputedStyle(element).visibility,
+      }));
+      assertEquals(reducedSidebar, { animations: 0, right: 0, visibility: "hidden" });
+      assertEquals(await page.locator(".app-shell__main").evaluate((element) => (element as HTMLElement).inert), false);
       assertEquals(errors, []);
       await context.close();
     } finally {

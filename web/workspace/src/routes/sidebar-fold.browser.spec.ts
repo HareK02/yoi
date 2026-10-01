@@ -26,10 +26,17 @@ afterEach(() => {
 test("sidebar starts unfolded and persists both desktop and mobile toggles", async () => {
   const view = render(Layout, { props });
   expect(screen.getByRole("button", { name: "Fold sidebar" }).getAttribute("aria-expanded")).toBe("true");
+  const content = view.container.querySelector<HTMLElement>(".sidebar-frame-content")!;
+  expect(content.inert).toBe(false);
   await fireEvent.click(screen.getByRole("button", { name: "Fold sidebar" }));
+  expect(view.container.querySelector(".sidebar-frame-content")).toBe(content);
+  expect(content.inert).toBe(true);
+  expect(content.getAttribute("aria-hidden")).toBe("true");
   expect(localStorage.getItem(storageKey)).toBe("true");
   expect(view.container.querySelector(".app-shell")?.classList.contains("sidebar-open")).toBe(false);
   await fireEvent.click(screen.getByRole("button", { name: "Show sidebar" }));
+  expect(content.inert).toBe(false);
+  expect(content.getAttribute("aria-hidden")).toBe("false");
   expect(localStorage.getItem(storageKey)).toBe("false");
   expect(screen.getByRole("button", { name: "Fold sidebar" })).not.toBeNull();
   await fireEvent.click(screen.getByRole("button", { name: "Hide sidebar" }));
