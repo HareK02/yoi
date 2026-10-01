@@ -1329,7 +1329,7 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
       sidebarFrame.includes("sidebar-fold-button") &&
       sidebarFrame.includes("Fold sidebar") &&
       sidebarFrame.includes("Unfold sidebar") &&
-      rootLayout.includes("let sidebarFolded = $state(false)") &&
+      rootLayout.includes("let sidebarFolded = $state(loadSidebarFolded())") &&
       rootLayout.includes("<SidebarFrame bind:folded={sidebarFolded}>") &&
       !workspaceLayout.includes("sidebarFolded") &&
       !workspaceLayout.includes("onToggleFold") &&

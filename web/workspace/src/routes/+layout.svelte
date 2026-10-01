@@ -24,7 +24,27 @@
   const headerOverrides = createOverrideStack<HeaderSnippet>((activeHeader) => {
     header = activeHeader;
   });
-  let sidebarFolded = $state(false);
+  // Browser-wide layout preference; independent of authentication and Workspace.
+  const sidebarFoldStorageKey = 'yoi.sidebar.folded.v1';
+  function loadSidebarFolded(): boolean {
+    if (typeof window === 'undefined') return false;
+    try {
+      return window.localStorage.getItem(sidebarFoldStorageKey) === 'true';
+    } catch {
+      return false;
+    }
+  }
+
+  let sidebarFolded = $state(loadSidebarFolded());
+
+  $effect(() => {
+    const folded = sidebarFolded;
+    try {
+      window.localStorage.setItem(sidebarFoldStorageKey, String(folded));
+    } catch {
+      // Storage can be blocked or full; folding must still work for this page.
+    }
+  });
 
   function toggleSidebar() {
     sidebarFolded = !sidebarFolded;

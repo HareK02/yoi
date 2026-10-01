@@ -24,7 +24,9 @@ async function freePort(): Promise<number> {
 async function waitForServer(url: string): Promise<void> {
   for (let attempt = 0; attempt < 200; attempt += 1) {
     try {
-      if ((await fetch(url)).ok) return;
+      const response = await fetch(url);
+      await response.body?.cancel();
+      if (response.ok) return;
     } catch {
       // Retry until the bounded deadline while the owned server starts.
     }
@@ -334,6 +336,17 @@ async function checkConsoleHistory(viewportHeight: number): Promise<void> {
       assertEquals(new Set(rowIds).size, rowIds.length);
       await page.getByRole("button", { name: "Overview", exact: true }).click();
       assertEquals(await transcript.getByText("searched 1 time・ran 1 command", { exact: true }).count(), 12);
+      await page.getByRole("button", { name: "Fold sidebar", exact: true }).click();
+      assertEquals(await page.evaluate(() => localStorage.getItem("yoi.sidebar.folded.v1")), "true");
+      await page.reload();
+      await page.getByRole("button", { name: "Unfold sidebar", exact: true }).waitFor();
+      assertEquals(await page.locator(".app-shell.sidebar-open").count(), 0);
+      await page.setViewportSize({ width: 600, height: viewportHeight });
+      await page.getByRole("button", { name: "Show sidebar", exact: true }).click();
+      assertEquals(await page.evaluate(() => localStorage.getItem("yoi.sidebar.folded.v1")), "false");
+      await page.reload();
+      await page.getByRole("button", { name: "Hide sidebar", exact: true }).waitFor();
+      assertEquals(await page.locator(".app-shell.sidebar-open").count(), 1);
       assertEquals(errors, []);
       await context.close();
     } finally {
