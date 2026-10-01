@@ -1387,6 +1387,7 @@ pub struct WorkspaceApi {
     signing_identities: WorkspaceSigningIdentityService,
     config_schema_registry: crate::config_source::WorkspaceConfigSchemaRegistry,
     prompt_projection_cache: crate::prompt_settings::WorkspacePromptProjectionCache,
+    feature_storage: crate::WorkspaceFeatureStorage,
     authority: SqliteWorkspaceAuthority,
     _worker_projection_shutdown: Arc<WorkerProjectionShutdownGuard>,
     runtime: Arc<RuntimeRegistry>,
@@ -2257,6 +2258,11 @@ impl WorkspaceServerApi {
                 None,
             );
         }
+        api.feature_storage.delete().map_err(|error| {
+            Error::Store(format!(
+                "failed to delete Workspace Feature storage: {error}"
+            ))
+        })?;
         WorkspaceSigningIdentityService::new(self.store.clone(), self.signing_materials.clone())
             .delete_material(&operation.workspace_id)?;
         let completed = self.store.finalize_workspace_deletion(operation_id)?;
@@ -2301,6 +2307,16 @@ impl WorkspaceServerApi {
         let router = build_inner_router(api);
         routers.insert(workspace_id.to_string(), router.clone());
         Ok(Some(router))
+    }
+
+    async fn shutdown_feature_storage(&self) -> Result<()> {
+        let apis = self.apis.lock().await.values().cloned().collect::<Vec<_>>();
+        for api in apis {
+            api.feature_storage.shutdown().map_err(|error| {
+                Error::Store(format!("failed to shut down Feature storage: {error}"))
+            })?;
+        }
+        Ok(())
     }
 
     async fn preload(&self) -> Result<()> {
@@ -2836,6 +2852,10 @@ pub async fn build_workspace_server_router(
     let api = WorkspaceServerApi::new(template, store);
     api.preload().await?;
     api.recover_workspace_deletions().await?;
+    Ok(workspace_server_router(api))
+}
+
+fn workspace_server_router(api: WorkspaceServerApi) -> Router {
     let contract_service = ServerApiContractService::Server(api.clone());
     let catalog = Router::new()
         .fallback(dispatch_workspace_request)
@@ -2847,10 +2867,10 @@ pub async fn build_workspace_server_router(
         .merge(generated_workspace_catalog_contract_router(
             contract_service,
         ));
-    Ok(catalog.layer(axum::middleware::from_fn_with_state(
+    catalog.layer(axum::middleware::from_fn_with_state(
         api,
         enforce_server_cookie_mutation_origin,
-    )))
+    ))
 }
 
 #[cfg(test)]
@@ -2928,6 +2948,12 @@ fn embedded_runtime_request_audience(config: &ServerConfig) -> crate::Result<Str
 }
 
 impl WorkspaceApi {
+    /// Server-managed, Workspace-scoped storage for trusted Feature repositories.
+    /// Feature registration and SQL access stay inside the Server process.
+    pub fn feature_storage(&self) -> &crate::WorkspaceFeatureStorage {
+        &self.feature_storage
+    }
+
     pub fn with_config_schema_provider(
         mut self,
         provider: Arc<dyn crate::config_source::WorkspaceConfigSchemaProvider>,
@@ -3184,6 +3210,11 @@ impl WorkspaceApi {
                 .await
                 .map_err(|error| Error::InvalidInput(error.to_string()))?;
         }
+        let feature_storage = crate::FeatureStorage::for_server_database(&config.database_path)
+            .and_then(|storage| storage.workspace(&config.workspace_id))
+            .map_err(|error| {
+                Error::Store(format!("failed to initialize Feature storage: {error}"))
+            })?;
         let api = Self {
             config_store,
             repository_secrets,
@@ -3191,6 +3222,7 @@ impl WorkspaceApi {
             config_schema_registry,
             prompt_projection_cache:
                 crate::prompt_settings::WorkspacePromptProjectionCache::default(),
+            feature_storage,
             authority: SqliteWorkspaceAuthority::new(
                 config.database_path.clone(),
                 config.workspace_id.clone(),
@@ -10025,10 +10057,15 @@ pub async fn serve_workspace_catalog_with_shutdown<F>(
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let router = build_workspace_server_router(template, store).await?;
-    axum::serve(listener, router)
+    let api = WorkspaceServerApi::new(template, store);
+    api.preload().await?;
+    api.recover_workspace_deletions().await?;
+    let result = axum::serve(listener, workspace_server_router(api.clone()))
         .with_graceful_shutdown(shutdown)
-        .await?;
+        .await;
+    let storage_result = api.shutdown_feature_storage().await;
+    result?;
+    storage_result?;
     Ok(())
 }
 
@@ -10037,8 +10074,13 @@ pub async fn serve_workspace_catalog(
     store: Arc<dyn ControlPlaneStore>,
     listener: TcpListener,
 ) -> Result<()> {
-    let router = build_workspace_server_router(template, store).await?;
-    axum::serve(listener, router).await?;
+    let api = WorkspaceServerApi::new(template, store);
+    api.preload().await?;
+    api.recover_workspace_deletions().await?;
+    let result = axum::serve(listener, workspace_server_router(api.clone())).await;
+    let storage_result = api.shutdown_feature_storage().await;
+    result?;
+    storage_result?;
     Ok(())
 }
 
@@ -10056,9 +10098,14 @@ pub async fn serve(
 ) -> Result<()> {
     let api = WorkspaceApi::new(config, store).await?;
     let orchestrator_hook = tokio::spawn(run_orchestrator_turn_end_hook(api.clone()));
-    let result = axum::serve(listener, build_router(api)).await;
+    let result = axum::serve(listener, build_router(api.clone())).await;
     orchestrator_hook.abort();
+    let storage_result = api
+        .feature_storage
+        .shutdown()
+        .map_err(|error| Error::Store(format!("failed to shut down Feature storage: {error}")));
     result?;
+    storage_result?;
     Ok(())
 }
 

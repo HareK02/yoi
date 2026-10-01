@@ -29,6 +29,7 @@ It is not a dumping ground for external research, old plans, API inventories, or
 21. [`development/validation.md`](development/validation.md) — how to check changes.
 22. [`development/workspace-schema-migrations.md`](development/workspace-schema-migrations.md) — how to preflight, apply, verify, and roll back control-plane SQLite schema changes.
 23. [`design/standalone-agent-host.md`](design/standalone-agent-host.md) — in-process standalone Worker host の依存方向、authority、lifecycle、非目標。
+24. [`design/server-feature-storage.md`](design/server-feature-storage.md) — Server管理のWorkspace/Feature専用SQLite、migration、transaction、backup/restore、削除・shutdown境界。
 
 ## What belongs here
 
