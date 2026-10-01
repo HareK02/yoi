@@ -2104,6 +2104,12 @@ impl Runtime {
                 .clone()
                 .expect("User input request id must be assigned before dispatch")
         });
+        let expected_notification_id = (input.kind == WorkerInputKind::Notify).then(|| {
+            input
+                .submission_request_id
+                .clone()
+                .expect("Notify request id must be assigned before dispatch")
+        });
         self.ensure_worker_execution(worker_ref)?;
         let (backend, handle) = {
             let state = self.lock()?;
@@ -2160,7 +2166,28 @@ impl Runtime {
             });
         }
 
+        if let Some(expected_notification_id) = expected_notification_id
+            && dispatch_result
+                .notification
+                .as_ref()
+                .is_none_or(|ack| ack.notification_request_id != expected_notification_id)
+        {
+            let result = WorkerExecutionResult::rejected(
+                WorkerExecutionOperation::Input,
+                "execution backend did not acknowledge the durable Runtime notification request id",
+            );
+            self.record_execution_result(worker_ref, result.clone())?;
+            return Err(RuntimeError::WorkerExecutionRejected {
+                worker_id: worker_ref.worker_id.clone(),
+                operation: result.operation,
+                outcome: result.outcome,
+                message: result.message_or_default(),
+                result,
+            });
+        }
+
         let submission = dispatch_result.submission.clone();
+        let notification = dispatch_result.notification.clone();
         let mut state = self.lock()?;
         state.ensure_running()?;
         let worker = state.worker_mut(worker_ref)?;
@@ -2180,6 +2207,7 @@ impl Runtime {
             worker_ref: worker_ref.clone(),
             status,
             submission,
+            notification,
         })
     }
 
@@ -4180,6 +4208,7 @@ impl RuntimeState {
             workspace_id: worker.workspace_id.clone(),
             display_name: worker.display_name.clone(),
             profile,
+            job: None,
             workdir_attachments,
         })
     }
@@ -6450,7 +6479,8 @@ mod tests {
             _handle: &WorkerExecutionHandle,
             input: WorkerInput,
         ) -> WorkerExecutionResult {
-            let submission_id = input.submission_request_id.clone();
+            let request_id = input.submission_request_id.clone();
+            let input_kind = input.kind.clone();
             self.dispatched_inputs.lock().unwrap().push(input);
             let mut result = self
                 .dispatch_result
@@ -6458,20 +6488,28 @@ mod tests {
                 .unwrap()
                 .clone()
                 .unwrap_or_else(|| {
-                    WorkerExecutionResult::accepted_submission(
-                        WorkerExecutionOperation::Input,
-                        "request-test",
-                        "test-submission",
-                        protocol::SubmissionDisposition::Started,
-                    )
+                    if input_kind == WorkerInputKind::Notify {
+                        WorkerExecutionResult::accepted_notification(
+                            WorkerExecutionOperation::Input,
+                            request_id
+                                .clone()
+                                .expect("Runtime assigns Notify request identity before dispatch"),
+                        )
+                    } else {
+                        WorkerExecutionResult::accepted_submission(
+                            WorkerExecutionOperation::Input,
+                            "request-test",
+                            "test-submission",
+                            protocol::SubmissionDisposition::Started,
+                        )
+                    }
                 });
             if !self
                 .preserve_submission_acknowledgement_id
                 .load(Ordering::SeqCst)
-                && let (Some(ack), Some(submission_id)) =
-                    (result.submission.as_mut(), submission_id)
+                && let (Some(ack), Some(request_id)) = (result.submission.as_mut(), request_id)
             {
-                ack.submission_request_id = submission_id;
+                ack.submission_request_id = request_id;
             }
             result
         }
@@ -7911,6 +7949,29 @@ mod tests {
     }
 
     #[test]
+    fn notify_rejects_backend_enqueue_without_durable_worker_receipt() {
+        let (runtime, backend) = runtime_and_backend();
+        backend.set_dispatch_result(WorkerExecutionResult::accepted(
+            WorkerExecutionOperation::Input,
+        ));
+        let detail = runtime
+            .create_worker(task_request("notify receipt"))
+            .unwrap();
+        let mut input = WorkerInput::notify("do not acknowledge enqueue alone");
+        input.submission_request_id = Some("notification-request".to_string());
+
+        let error = runtime.send_input(&detail.worker_ref, input).unwrap_err();
+
+        assert!(matches!(
+            error,
+            RuntimeError::WorkerExecutionRejected {
+                outcome: crate::execution::WorkerExecutionOutcome::Rejected,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn connected_backend_busy_dispatch_is_typed_and_not_transcribed() {
         let (runtime, backend) = runtime_and_backend();
         backend.set_dispatch_result(WorkerExecutionResult::busy(
@@ -7981,6 +8042,7 @@ mod tests {
                         derived_from: Vec::new(),
                         data: protocol::SessionSnapshotEntryData::RunError {
                             message: expected_entry.to_string(),
+                            failure: None,
                         },
                     }],
                 },

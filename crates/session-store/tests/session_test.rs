@@ -179,14 +179,13 @@ async fn run_and_persist(
     session_store::save_turn_end(store, session_id, segment_id, worker.turn_count()).unwrap();
 
     match &result {
-        agen::EngineRunExit::Finished
-        | agen::EngineRunExit::Paused
-        | agen::EngineRunExit::Yielded => {
+        agen::EngineRunExit::Finished | agen::EngineRunExit::Paused => {
             let (legacy_result, interrupted) = match &result {
                 agen::EngineRunExit::Finished => (agen::EngineResult::Finished, false),
                 agen::EngineRunExit::Paused => (agen::EngineResult::Paused, true),
-                agen::EngineRunExit::Yielded => (agen::EngineResult::Yielded, true),
-                agen::EngineRunExit::Interrupted(_) => unreachable!(),
+                agen::EngineRunExit::Yielded | agen::EngineRunExit::Interrupted(_) => {
+                    unreachable!()
+                }
             };
             session_store::save_run_completed(
                 store,
@@ -195,6 +194,18 @@ async fn run_and_persist(
                 legacy_result,
                 interrupted,
                 worker.active_run_turn_count(),
+            )
+            .unwrap();
+        }
+        agen::EngineRunExit::Yielded => {
+            session_store::save_run_yielded(
+                store,
+                session_id,
+                segment_id,
+                protocol::RunYieldReason::Compaction,
+                worker
+                    .active_run_turn_count()
+                    .expect("yielded test run retains its turn budget"),
             )
             .unwrap();
         }

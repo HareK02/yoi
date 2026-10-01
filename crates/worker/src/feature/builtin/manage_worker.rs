@@ -474,6 +474,7 @@ pub struct WorkerLifecycleSpawnRequest {
     /// Ordered alias-keyed selections forwarded as canonical Workdir attachments.
     pub workdir_attachments: Vec<WorkerLifecycleWorkdirAttachment>,
     pub profile: String,
+    pub singleton_key: Option<String>,
     pub ticket_id: Option<String>,
     pub operation_id: Option<String>,
     pub display_name: String,
@@ -508,6 +509,7 @@ fn workspace_worker_create_request(
     Ok(CreateWorkspaceWorkerRequest {
         runtime_id: request.runtime_id,
         display_name: request.display_name,
+        singleton_key: request.singleton_key,
         profile: Some(request.profile),
         ticket_assignment,
         initial_submit: request.initial_submit,
@@ -716,6 +718,9 @@ struct WorkerSpawnInput {
     /// under the stable `workdir` alias.
     working_directory_id: String,
     profile: String,
+    /// Optional opaque Workspace singleton key. Prefixes are caller-owned and uninterpreted.
+    #[serde(default)]
+    singleton_key: Option<String>,
     /// Optional inprogress Ticket already accepted by the Orchestrator. Set
     /// this with one Flow segment to assign the new Coder atomically.
     #[serde(default)]
@@ -910,6 +915,7 @@ impl Tool for WorkspaceWorkerTool {
                                 .transpose()?,
                         }],
                         profile: non_empty(input.profile, "profile")?,
+                        singleton_key: input.singleton_key,
                         ticket_id,
                         operation_id,
                         display_name: input
@@ -1751,6 +1757,7 @@ mod tests {
                 },
             ],
             profile: "builtin:coder".to_string(),
+            singleton_key: Some("subjektiv:subject-1".to_string()),
             ticket_id: None,
             operation_id: None,
             display_name: "Coder".to_string(),

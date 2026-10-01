@@ -1,0 +1,33 @@
+import "./base.dcdl" // {
+    slug = "backend-job";
+    description = "Backend-owned bounded Job Worker profile.";
+    scope = "workspace_read";
+    model = { ref = "codex-oauth/gpt-5.6-luna"; };
+    engine = {
+        instruction = "internal.backend_job_system";
+        reasoning = "medium";
+        max_tokens = 8192;
+    };
+
+    feature = {
+        task = { enabled = false; };
+        memory = { enabled = false; };
+        web = { enabled = false; };
+        image = { enabled = false; };
+        sub_worker = { enabled = false; };
+        flow = { enabled = false; };
+        worker = { enabled = false; direct_spawn = false; };
+        workspace_worker_discovery = { enabled = false; };
+        objective = { enabled = false; };
+        manage_workdir = { enabled = false; };
+        ticket = { enabled = false; authoring = false; thread = false; intake = false; };
+        merge_request = {
+            show = false;
+            open = false;
+            review = false;
+            readiness_check = false;
+            complete = false;
+        };
+        orchestration = { enabled = false; };
+    };
+}

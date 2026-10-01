@@ -107,7 +107,8 @@ pub use segment::{
     SegmentStartState, append_entry, append_system_item, classify_logged_history_entry,
     create_compacted_segment, create_segment, create_segment_with_ids, ensure_head_or_fork, fork,
     fork_at, restore, restore_by_segment, save_config_changed, save_delta, save_extension,
-    save_run_completed, save_run_errored, save_turn_end, save_usage, save_user_input,
+    save_run_completed, save_run_errored, save_run_resumed, save_run_yielded, save_turn_end,
+    save_usage, save_user_input,
 };
 pub use segment_log::{LogEntry, RestoredState, SegmentOrigin, SessionExtension, collect_state};
 pub use store::{Store, StoreError};

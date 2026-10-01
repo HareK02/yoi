@@ -632,7 +632,7 @@ fn extraction_disposition(
             ExtractionDisposition::Failed(error.source.to_string())
         }
         Ok(run) => match &run.lifecycle {
-            WorkerRunResult::RolledBack => {
+            WorkerRunResult::Cancelled | WorkerRunResult::RolledBack => {
                 ExtractionDisposition::Cancelled("memory-extract cancelled".to_string())
             }
             WorkerRunResult::Interrupted { message, .. } => {

@@ -213,6 +213,7 @@ where
     let outcome = match worker.run_text(&input).await {
         Ok(lifecycle @ WorkerRunResult::Finished)
         | Ok(lifecycle @ WorkerRunResult::Paused)
+        | Ok(lifecycle @ WorkerRunResult::Cancelled)
         | Ok(lifecycle @ WorkerRunResult::RolledBack) => Ok(InternalWorkerResult {
             usage: last_usage.lock().ok().and_then(|slot| slot.clone()),
             identity,
@@ -333,6 +334,10 @@ fn classify_internal_turn_result(
         Ok(WorkerRunResult::Interrupted { message, .. }) => {
             (InternalWorkerSessionStatus::Stopped, Some(message))
         }
+        Ok(WorkerRunResult::Cancelled) => (
+            InternalWorkerSessionStatus::Stopped,
+            Some("internal Worker run was cancelled".to_string()),
+        ),
         Ok(WorkerRunResult::RolledBack) => (
             InternalWorkerSessionStatus::Stopped,
             Some("internal Worker run was cancelled before AI output".to_string()),

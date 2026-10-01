@@ -13,9 +13,7 @@ use axum::http::header::{CONTENT_TYPE, LOCATION, ORIGIN};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-#[cfg(test)]
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{Duration, SecondsFormat, Utc};
 use config_source::ConfigTreeSnapshot;
@@ -145,6 +143,11 @@ use crate::authority::{
     MemoryAuthority, ObjectiveAuthority, ObjectiveCreateInput, ObjectiveEditInput,
     SqliteWorkspaceAuthority, TicketAuthority, TicketMergeRevisionSource, merge_request_summary,
 };
+use crate::backend_job::{
+    ABSOLUTE_MAX_CONCURRENT_JOBS, BackendJobAttemptState, BackendJobDeliveryState,
+    BackendJobRequest, BackendJobReservation, BackendJobResultAcceptance,
+    BackendJobResultSubmission, BackendJobState, MAX_JOB_DELIVERY_BYTES, allocation_key,
+};
 use crate::companion::{
     CompanionCancelRequest, CompanionConsole, CompanionMessageRequest, CompanionMessageResponse,
     CompanionStatusResponse, CompanionTranscriptProjection,
@@ -157,11 +160,12 @@ use crate::hosts::{
     RemoteWorkerRuntime, RuntimeDiagnostic, RuntimePingFailureKind, RuntimeRegistry,
     RuntimeRegistryError, RuntimeRegistryUnregisterResult, TicketWorkerRole,
     WorkerCompletionsRequest, WorkerCompletionsResult, WorkerControlOperation, WorkerCreateBinding,
-    WorkerInputKind, WorkerInputRequest, WorkerInputResult, WorkerLifecycleRequest,
-    WorkerLifecycleResult, WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest,
-    WorkerSpawnResult, WorkerSpawnWorkingDirectoryRequest, WorkerTicketAssignmentRequest,
-    WorkspaceRuntimeAuthorization, is_disallowed_remote_runtime_address,
-    is_loopback_runtime_origin, worker_spawn_create_fingerprint, workspace_worker_summary,
+    WorkerInputDisposition, WorkerInputKind, WorkerInputRequest, WorkerInputResult,
+    WorkerLifecycleRequest, WorkerLifecycleResult, WorkerSpawnAcceptanceRequirement,
+    WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult, WorkerSpawnWorkingDirectoryRequest,
+    WorkerTicketAssignmentRequest, WorkspaceRuntimeAuthorization,
+    is_disallowed_remote_runtime_address, is_loopback_runtime_origin,
+    worker_spawn_create_fingerprint, workspace_worker_summary,
 };
 use crate::memory_backend::execute_memory_backend_operation_with_authority;
 use crate::memory_staging::{
@@ -202,6 +206,7 @@ use crate::store::{
     WorkspaceRuntimeBinding, WorkspaceRuntimeBindingAuditRecord, WorkspaceRuntimeBindingMutation,
     WorkspaceRuntimeBindingState as StoredRuntimeBindingState,
 };
+use crate::ticket_item_checker::{self, TicketItemCheckBodyReplacement, TicketItemCheckEdit};
 use crate::workdir_removal::{
     WorkdirRemovalAttemptOwner, WorkdirRemovalDisposition, WorkdirRemovalOperation,
     WorkdirRemovalOperationState, workdir_removal_intent,
@@ -1382,6 +1387,7 @@ pub struct WorkspaceApi {
     signing_identities: WorkspaceSigningIdentityService,
     config_schema_registry: crate::config_source::WorkspaceConfigSchemaRegistry,
     prompt_projection_cache: crate::prompt_settings::WorkspacePromptProjectionCache,
+    feature_storage: crate::WorkspaceFeatureStorage,
     authority: SqliteWorkspaceAuthority,
     _worker_projection_shutdown: Arc<WorkerProjectionShutdownGuard>,
     runtime: Arc<RuntimeRegistry>,
@@ -1389,6 +1395,7 @@ pub struct WorkspaceApi {
     companion: Arc<CompanionConsole>,
     orchestrator_spawn_lock: Arc<std::sync::Mutex<()>>,
     orchestrator_attention_fingerprint: Arc<Mutex<Option<String>>>,
+    backend_job_drain_requests: Arc<AtomicU64>,
     observation_proxy: BackendObservationProxy,
     runtime_subscription_broker: RuntimeSubscriptionBroker,
     pub(crate) worker_projection: Arc<crate::worker_projection::WorkerProjectionService>,
@@ -2251,6 +2258,11 @@ impl WorkspaceServerApi {
                 None,
             );
         }
+        api.feature_storage.delete().map_err(|error| {
+            Error::Store(format!(
+                "failed to delete Workspace Feature storage: {error}"
+            ))
+        })?;
         WorkspaceSigningIdentityService::new(self.store.clone(), self.signing_materials.clone())
             .delete_material(&operation.workspace_id)?;
         let completed = self.store.finalize_workspace_deletion(operation_id)?;
@@ -2295,6 +2307,16 @@ impl WorkspaceServerApi {
         let router = build_inner_router(api);
         routers.insert(workspace_id.to_string(), router.clone());
         Ok(Some(router))
+    }
+
+    async fn shutdown_feature_storage(&self) -> Result<()> {
+        let apis = self.apis.lock().await.values().cloned().collect::<Vec<_>>();
+        for api in apis {
+            api.feature_storage.shutdown().map_err(|error| {
+                Error::Store(format!("failed to shut down Feature storage: {error}"))
+            })?;
+        }
+        Ok(())
     }
 
     async fn preload(&self) -> Result<()> {
@@ -2830,6 +2852,10 @@ pub async fn build_workspace_server_router(
     let api = WorkspaceServerApi::new(template, store);
     api.preload().await?;
     api.recover_workspace_deletions().await?;
+    Ok(workspace_server_router(api))
+}
+
+fn workspace_server_router(api: WorkspaceServerApi) -> Router {
     let contract_service = ServerApiContractService::Server(api.clone());
     let catalog = Router::new()
         .fallback(dispatch_workspace_request)
@@ -2841,10 +2867,10 @@ pub async fn build_workspace_server_router(
         .merge(generated_workspace_catalog_contract_router(
             contract_service,
         ));
-    Ok(catalog.layer(axum::middleware::from_fn_with_state(
+    catalog.layer(axum::middleware::from_fn_with_state(
         api,
         enforce_server_cookie_mutation_origin,
-    )))
+    ))
 }
 
 #[cfg(test)]
@@ -2922,6 +2948,12 @@ fn embedded_runtime_request_audience(config: &ServerConfig) -> crate::Result<Str
 }
 
 impl WorkspaceApi {
+    /// Server-managed, Workspace-scoped storage for trusted Feature repositories.
+    /// Feature registration and SQL access stay inside the Server process.
+    pub fn feature_storage(&self) -> &crate::WorkspaceFeatureStorage {
+        &self.feature_storage
+    }
+
     pub fn with_config_schema_provider(
         mut self,
         provider: Arc<dyn crate::config_source::WorkspaceConfigSchemaProvider>,
@@ -3178,6 +3210,11 @@ impl WorkspaceApi {
                 .await
                 .map_err(|error| Error::InvalidInput(error.to_string()))?;
         }
+        let feature_storage = crate::FeatureStorage::for_server_database(&config.database_path)
+            .and_then(|storage| storage.workspace(&config.workspace_id))
+            .map_err(|error| {
+                Error::Store(format!("failed to initialize Feature storage: {error}"))
+            })?;
         let api = Self {
             config_store,
             repository_secrets,
@@ -3185,6 +3222,7 @@ impl WorkspaceApi {
             config_schema_registry,
             prompt_projection_cache:
                 crate::prompt_settings::WorkspacePromptProjectionCache::default(),
+            feature_storage,
             authority: SqliteWorkspaceAuthority::new(
                 config.database_path.clone(),
                 config.workspace_id.clone(),
@@ -3203,6 +3241,7 @@ impl WorkspaceApi {
             companion,
             orchestrator_spawn_lock: Arc::new(std::sync::Mutex::new(())),
             orchestrator_attention_fingerprint: Arc::new(Mutex::new(None)),
+            backend_job_drain_requests: Arc::new(AtomicU64::new(0)),
             observation_proxy,
             runtime_subscription_broker,
             worker_projection,
@@ -3241,11 +3280,753 @@ impl WorkspaceApi {
         }
         recover_workdir_removals(&api)?;
         recover_runtime_removals(&api).await;
+        let recovery_now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let deliveries = api
+            .store
+            .recover_backend_job_deliveries(&api.config.workspace_id, &recovery_now)?;
+        for delivery in deliveries {
+            let Some(job) = api
+                .store
+                .get_backend_job(&api.config.workspace_id, &delivery.job_id)?
+            else {
+                continue;
+            };
+            let Some(attempt) = api.store.get_backend_job_attempt(
+                &api.config.workspace_id,
+                &delivery.job_id,
+                &delivery.attempt_id,
+            )?
+            else {
+                continue;
+            };
+            if job.state == BackendJobState::Completed
+                && attempt.state == BackendJobAttemptState::Completed
+            {
+                api.deliver_backend_job_result(
+                    &BackendJobResultAcceptance {
+                        job,
+                        attempt,
+                        replayed: true,
+                    },
+                    &delivery.target,
+                );
+            }
+        }
+        api.recover_backend_jobs()?;
         Ok(api)
     }
 
     pub fn workspace_id(&self) -> &str {
         self.config.workspace_id.as_str()
+    }
+
+    /// Reserve durable Job intent and dispatch its current attempt through the
+    /// ordinary embedded Runtime Worker path. Replaying the same request
+    /// converges on the same attempt and Worker allocation.
+    pub fn dispatch_backend_job(
+        &self,
+        request: &BackendJobRequest,
+    ) -> Result<BackendJobReservation> {
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let reservation =
+            self.store
+                .reserve_backend_job(&self.config.workspace_id, request, &now)?;
+        let result = self.dispatch_backend_job_reservation(reservation);
+        if result.is_err() {
+            self.drain_reserved_backend_jobs();
+        }
+        result
+    }
+
+    /// Explicit re-evaluation creates a new bounded attempt only after a
+    /// definitive failure. Unknown execution outcomes require manual attention
+    /// and cannot be replayed because the original tracked run may still execute.
+    /// Transport replay must call `dispatch_backend_job` with the original
+    /// immutable request.
+    pub fn retry_backend_job(&self, job_id: &str) -> Result<BackendJobReservation> {
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let reservation =
+            self.store
+                .reserve_backend_job_retry(&self.config.workspace_id, job_id, &now)?;
+        let result = self.dispatch_backend_job_reservation(reservation);
+        if result.is_err() {
+            self.drain_reserved_backend_jobs();
+        }
+        result
+    }
+
+    fn dispatch_backend_job_reservation(
+        &self,
+        reservation: BackendJobReservation,
+    ) -> Result<BackendJobReservation> {
+        if reservation.job.state != BackendJobState::Pending
+            || reservation.attempt.state != BackendJobAttemptState::Reserved
+            || reservation.attempt.worker.is_some()
+        {
+            return Ok(reservation);
+        }
+        let (reservation, claimed) = self.store.claim_backend_job_attempt_dispatch(
+            &self.config.workspace_id,
+            &reservation.job.request.job_id,
+            &reservation.attempt.attempt_id,
+            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+        )?;
+        if !claimed {
+            return Ok(reservation);
+        }
+        let request = &reservation.job.request;
+        let worker_input = request.worker_input(&reservation.attempt.attempt_id)?;
+        let control_operation = WorkerControlOperation {
+            operation_id: allocation_key(&reservation.attempt.attempt_id),
+            input_fingerprint: reservation.job.intent_fingerprint.clone(),
+        };
+        let spawned = match self.spawn_workspace_worker(
+            EMBEDDED_WORKER_RUNTIME_ID,
+            WorkerSpawnRequest {
+                requested_worker_name: Some(format!("job:{}", request.purpose)),
+                singleton_key: None,
+                intent: WorkerSpawnIntent::BackendJob {
+                    job_id: request.job_id.clone(),
+                    attempt_id: reservation.attempt.attempt_id.clone(),
+                    purpose: request.purpose.clone(),
+                },
+                acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                    expected_segments: 0,
+                },
+                profile: ProfileSelector::Builtin(request.profile.clone()),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachments: Vec::new(),
+                resolved_config_bundle: None,
+                resolved_worker_observation_enabled: false,
+                resolved_worker_observation_grants: Vec::new(),
+                resolved_workspace_api: None,
+                resolved_memory_settings: None,
+                resolved_control_operation: Some(control_operation),
+            },
+        ) {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                let detail = error.error.to_string();
+                self.store.finish_backend_job_attempt(
+                    &self.config.workspace_id,
+                    &request.job_id,
+                    &reservation.attempt.attempt_id,
+                    BackendJobAttemptState::Failed,
+                    "dispatch_error",
+                    &detail,
+                    &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                )?;
+                return Err(error.error);
+            }
+        };
+        let worker = match (spawned.state, spawned.worker) {
+            (InternalWorkerOperationState::Accepted, Some(worker)) => worker,
+            _ => {
+                let detail = spawned
+                    .diagnostics
+                    .first()
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .unwrap_or("embedded Runtime rejected Backend Job Worker dispatch");
+                self.store.finish_backend_job_attempt(
+                    &self.config.workspace_id,
+                    &request.job_id,
+                    &reservation.attempt.attempt_id,
+                    BackendJobAttemptState::Failed,
+                    "dispatch_rejected",
+                    detail,
+                    &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                )?;
+                return Err(Error::RuntimeOperationFailed {
+                    runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                    code: "backend_job_dispatch_rejected".to_string(),
+                    message: detail.to_string(),
+                });
+            }
+        };
+        let bound_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let runtime_run_id = crate::backend_job::runtime_run_id(&reservation.attempt.attempt_id);
+        let (commit, newly_bound) = self.store.bind_backend_job_attempt_worker(
+            &self.config.workspace_id,
+            &request.job_id,
+            &reservation.attempt.attempt_id,
+            &worker.worker,
+            Some(&runtime_run_id),
+            &bound_at,
+        )?;
+        if newly_bound {
+            self.worker_projection.publish_commit(commit)?;
+        } else {
+            let job = self
+                .store
+                .get_backend_job(&self.config.workspace_id, &request.job_id)?
+                .ok_or_else(|| Error::Store("bound Backend Job disappeared".to_string()))?;
+            let attempt = self
+                .store
+                .get_backend_job_attempt(
+                    &self.config.workspace_id,
+                    &request.job_id,
+                    &reservation.attempt.attempt_id,
+                )?
+                .ok_or_else(|| Error::Store("bound Backend Job attempt disappeared".to_string()))?;
+            return Ok(BackendJobReservation {
+                job,
+                attempt,
+                replayed: true,
+            });
+        }
+
+        self.schedule_backend_job_timeout(
+            &request.job_id,
+            &reservation.attempt.attempt_id,
+            &reservation.attempt.deadline_at,
+        );
+
+        let submitted = match self.runtime.send_input(
+            &worker.worker,
+            WorkerInputRequest {
+                kind: WorkerInputKind::User,
+                content: worker_input,
+                submission_request_id: Some(runtime_run_id.clone()),
+                segments: None,
+            },
+        ) {
+            Ok(submitted) => submitted,
+            Err(error) => {
+                let detail = error.message();
+                self.store.finish_backend_job_attempt(
+                    &self.config.workspace_id,
+                    &request.job_id,
+                    &reservation.attempt.attempt_id,
+                    BackendJobAttemptState::Unknown,
+                    "input_outcome_unknown",
+                    &detail,
+                    &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                )?;
+                return Err(error.into_error());
+            }
+        };
+        if submitted.state != InternalWorkerOperationState::Accepted {
+            let detail = submitted
+                .diagnostics
+                .first()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .unwrap_or("embedded Runtime rejected Backend Job input");
+            let (state, category) = match submitted.disposition {
+                WorkerInputDisposition::Unknown => {
+                    (BackendJobAttemptState::Unknown, "input_outcome_unknown")
+                }
+                WorkerInputDisposition::Accepted | WorkerInputDisposition::Rejected => {
+                    (BackendJobAttemptState::Failed, "input_rejected")
+                }
+            };
+            self.store.finish_backend_job_attempt(
+                &self.config.workspace_id,
+                &request.job_id,
+                &reservation.attempt.attempt_id,
+                state,
+                category,
+                detail,
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )?;
+            return Err(Error::RuntimeOperationFailed {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                code: format!("backend_job_{category}"),
+                message: detail.to_string(),
+            });
+        }
+        if submitted.runtime_run_id.as_deref() != Some(runtime_run_id.as_str()) {
+            self.store.finish_backend_job_attempt(
+                &self.config.workspace_id,
+                &request.job_id,
+                &reservation.attempt.attempt_id,
+                BackendJobAttemptState::Unknown,
+                "runtime_run_mismatch",
+                "embedded Runtime accepted Backend Job input without matching tracked run evidence",
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )?;
+            return Err(Error::RuntimeOperationFailed {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                code: "backend_job_runtime_run_mismatch".to_string(),
+                message: "embedded Runtime accepted Backend Job input without matching tracked run evidence"
+                    .to_string(),
+            });
+        }
+        let job = self
+            .store
+            .get_backend_job(&self.config.workspace_id, &request.job_id)?
+            .ok_or_else(|| Error::Store("dispatched Backend Job disappeared".to_string()))?;
+        let attempt = self
+            .store
+            .get_backend_job_attempt(
+                &self.config.workspace_id,
+                &request.job_id,
+                &reservation.attempt.attempt_id,
+            )?
+            .ok_or_else(|| {
+                Error::Store("dispatched Backend Job attempt disappeared".to_string())
+            })?;
+        Ok(BackendJobReservation {
+            job,
+            attempt,
+            replayed: reservation.replayed,
+        })
+    }
+
+    fn drain_reserved_backend_jobs(&self) {
+        if self
+            .backend_job_drain_requests
+            .fetch_add(1, Ordering::AcqRel)
+            != 0
+        {
+            return;
+        }
+        loop {
+            self.drain_reserved_backend_jobs_inner();
+            let requests = self.backend_job_drain_requests.swap(0, Ordering::AcqRel);
+            if requests <= 1 {
+                return;
+            }
+            // A synchronous fast result can request another drain while this
+            // runner is dispatching. Re-run without recursion, unless a caller
+            // arriving after the swap has already become the next runner.
+            if self
+                .backend_job_drain_requests
+                .fetch_add(1, Ordering::AcqRel)
+                != 0
+            {
+                return;
+            }
+        }
+    }
+
+    fn drain_reserved_backend_jobs_inner(&self) {
+        let page_limit = usize::from(ABSOLUTE_MAX_CONCURRENT_JOBS);
+        loop {
+            let attempts = match self
+                .store
+                .list_reserved_backend_job_attempts(&self.config.workspace_id, page_limit)
+            {
+                Ok(attempts) => attempts,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to load queued Backend Job attempts");
+                    return;
+                }
+            };
+            if attempts.is_empty() {
+                return;
+            }
+            let mut made_progress = false;
+            for attempt in &attempts {
+                let job = match self
+                    .store
+                    .get_backend_job(&self.config.workspace_id, &attempt.job_id)
+                {
+                    Ok(Some(job)) => job,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(%error, job_id = %attempt.job_id, "failed to load queued Backend Job");
+                        continue;
+                    }
+                };
+                match self.dispatch_backend_job_reservation(BackendJobReservation {
+                    job,
+                    attempt: attempt.clone(),
+                    replayed: true,
+                }) {
+                    Ok(reservation) => {
+                        made_progress |=
+                            reservation.attempt.state != BackendJobAttemptState::Reserved;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "queued Backend Job dispatch failed");
+                        made_progress |= self
+                            .store
+                            .get_backend_job_attempt(
+                                &self.config.workspace_id,
+                                &attempt.job_id,
+                                &attempt.attempt_id,
+                            )
+                            .ok()
+                            .flatten()
+                            .is_some_and(|current| {
+                                current.state != BackendJobAttemptState::Reserved
+                            });
+                    }
+                }
+            }
+            if attempts.len() < page_limit || !made_progress {
+                return;
+            }
+        }
+    }
+
+    /// Reconcile durable non-terminal attempts after Backend restart. Reserved
+    /// attempts are replay-dispatched through their deterministic allocation;
+    /// dispatched attempts keep running only while their bound Worker remains
+    /// known, and always receive a fresh deadline task.
+    pub fn recover_backend_jobs(&self) -> Result<()> {
+        let attempts = self.store.list_recoverable_backend_job_attempts(
+            &self.config.workspace_id,
+            usize::from(ABSOLUTE_MAX_CONCURRENT_JOBS),
+        )?;
+        for attempt in attempts {
+            match attempt.state {
+                BackendJobAttemptState::Reserved => {
+                    let job = self
+                        .store
+                        .get_backend_job(&self.config.workspace_id, &attempt.job_id)?
+                        .ok_or_else(|| {
+                            Error::Store("recoverable Backend Job disappeared".to_string())
+                        })?;
+                    if let Err(error) =
+                        self.dispatch_backend_job_reservation(BackendJobReservation {
+                            job,
+                            attempt,
+                            replayed: true,
+                        })
+                    {
+                        tracing::warn!(%error, "Backend Job reserved-attempt recovery failed");
+                    }
+                }
+                BackendJobAttemptState::Dispatching => {
+                    self.store.finish_backend_job_attempt(
+                        &self.config.workspace_id,
+                        &attempt.job_id,
+                        &attempt.attempt_id,
+                        BackendJobAttemptState::Unknown,
+                        "recovery_dispatch_claim_unknown",
+                        "a Backend Job dispatch claim could not be safely replayed after restart",
+                        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    )?;
+                }
+                BackendJobAttemptState::Dispatched => {
+                    if attempt.runtime_run_id.is_none() {
+                        self.store.finish_backend_job_attempt(
+                            &self.config.workspace_id,
+                            &attempt.job_id,
+                            &attempt.attempt_id,
+                            BackendJobAttemptState::Unknown,
+                            "recovery_runtime_run_unknown",
+                            "the Runtime accepted Worker dispatch without durable run evidence",
+                            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                        )?;
+                        continue;
+                    }
+                    let worker_known = attempt
+                        .worker
+                        .as_ref()
+                        .is_some_and(|worker| self.runtime.worker(worker).is_ok());
+                    if !worker_known {
+                        self.store.finish_backend_job_attempt(
+                            &self.config.workspace_id,
+                            &attempt.job_id,
+                            &attempt.attempt_id,
+                            BackendJobAttemptState::Unknown,
+                            "recovery_worker_unknown",
+                            "the bound Runtime Worker was not recoverable after Backend restart",
+                            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                        )?;
+                    } else {
+                        self.schedule_backend_job_timeout(
+                            &attempt.job_id,
+                            &attempt.attempt_id,
+                            &attempt.deadline_at,
+                        );
+                    }
+                }
+                BackendJobAttemptState::Completed
+                | BackendJobAttemptState::Failed
+                | BackendJobAttemptState::Unknown => {}
+            }
+        }
+        self.drain_reserved_backend_jobs();
+        Ok(())
+    }
+
+    fn schedule_backend_job_timeout(&self, job_id: &str, attempt_id: &str, deadline_at: &str) {
+        let Ok(deadline) = chrono::DateTime::parse_from_rfc3339(deadline_at) else {
+            return;
+        };
+        let delay = (deadline.with_timezone(&Utc) - Utc::now())
+            .to_std()
+            .unwrap_or_default();
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let api = self.clone();
+        let store = api.store.clone();
+        let runtime = api.runtime.clone();
+        let workspace_id = api.config.workspace_id.clone();
+        let job_id = job_id.to_string();
+        let attempt_id = attempt_id.to_string();
+        handle.spawn(async move {
+            tokio::time::sleep(delay).await;
+            let Ok(Some(attempt)) =
+                store.get_backend_job_attempt(&workspace_id, &job_id, &attempt_id)
+            else {
+                return;
+            };
+            if attempt.state != BackendJobAttemptState::Dispatched {
+                return;
+            }
+            // Fence result acceptance before stopping the Worker so a late
+            // completion cannot turn a timed-out attempt into success.
+            if store
+                .finish_backend_job_attempt(
+                    &workspace_id,
+                    &job_id,
+                    &attempt_id,
+                    BackendJobAttemptState::Failed,
+                    "timeout",
+                    "Backend Job attempt exceeded its durable deadline",
+                    &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                )
+                .is_ok()
+            {
+                if let Some(worker) = attempt.worker {
+                    let _ = runtime.stop_worker(
+                        &worker,
+                        WorkerLifecycleRequest {
+                            reason: Some("Backend Job attempt timed out".to_string()),
+                            ticket_assignment: None,
+                        },
+                    );
+                }
+                api.drain_reserved_backend_jobs();
+            }
+        });
+    }
+
+    /// Accept the only authoritative success signal for a Job attempt. The
+    /// source identity is fenced against the durable Worker binding. Result
+    /// persistence precedes best-effort notification delivery.
+    pub fn accept_backend_job_result(
+        &self,
+        source_worker: &RuntimeWorkerRef,
+        submission: &BackendJobResultSubmission,
+    ) -> Result<BackendJobResultAcceptance> {
+        let accepted_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        if let Some(job) = self
+            .store
+            .get_backend_job(&self.config.workspace_id, &submission.job_id)?
+            && job.request.purpose == ticket_item_checker::PURPOSE
+        {
+            let attempt = self
+                .store
+                .get_backend_job_attempt(
+                    &self.config.workspace_id,
+                    &submission.job_id,
+                    &submission.attempt_id,
+                )?
+                .ok_or_else(|| Error::InvalidInput("unknown Backend Job attempt".to_string()))?;
+            if !matches!(
+                attempt.state,
+                BackendJobAttemptState::Dispatched | BackendJobAttemptState::Completed
+            ) || attempt.worker.as_ref() != Some(source_worker)
+                || attempt.input_revision != submission.input_revision
+                || job.current_attempt != attempt.attempt
+            {
+                return Err(Error::InvalidInput(
+                    "Ticket item checker result does not match the active fenced attempt"
+                        .to_string(),
+                ));
+            }
+            if let Err(error) =
+                ticket_item_checker::validate_result(&job.request.input, &submission.result)
+            {
+                let detail = error.to_string();
+                if attempt.state == BackendJobAttemptState::Dispatched {
+                    self.store.finish_backend_job_attempt(
+                        &self.config.workspace_id,
+                        &submission.job_id,
+                        &submission.attempt_id,
+                        BackendJobAttemptState::Failed,
+                        "invalid_result",
+                        &detail,
+                        &accepted_at,
+                    )?;
+                    self.drain_reserved_backend_jobs();
+                }
+                return Err(error);
+            }
+        }
+        let acceptance = self.store.accept_backend_job_result(
+            &self.config.workspace_id,
+            source_worker,
+            submission,
+            &accepted_at,
+        )?;
+        if let Some(target) = acceptance.job.request.notification_target.as_ref() {
+            self.deliver_backend_job_result(&acceptance, target);
+        }
+        self.drain_reserved_backend_jobs();
+        Ok(acceptance)
+    }
+
+    fn deliver_backend_job_result(
+        &self,
+        acceptance: &BackendJobResultAcceptance,
+        target: &RuntimeWorkerRef,
+    ) {
+        let delivery_id = crate::backend_job::delivery_id(
+            &acceptance.job.request.job_id,
+            &acceptance.attempt.attempt_id,
+        );
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let Ok((delivery, claimed)) = self.store.reserve_backend_job_delivery(
+            &self.config.workspace_id,
+            &delivery_id,
+            &acceptance.job.request.job_id,
+            target,
+            &now,
+        ) else {
+            return;
+        };
+        if !claimed || delivery.state != BackendJobDeliveryState::Sending {
+            return;
+        }
+
+        let content = if acceptance.job.request.purpose == ticket_item_checker::PURPOSE {
+            let checker_input =
+                match ticket_item_checker::parse_input(&acceptance.job.request.input) {
+                    Ok(input) => input,
+                    Err(error) => {
+                        let _ = self.store.finish_backend_job_delivery(
+                            &self.config.workspace_id,
+                            &delivery_id,
+                            BackendJobDeliveryState::Failed,
+                            Some("invalid_checker_input"),
+                            Some(&error.to_string()),
+                            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                        );
+                        return;
+                    }
+                };
+            let current_ticket = match browser_ticket_backend(self).and_then(|backend| {
+                backend
+                    .show(checker_input.ticket_id.clone().into())
+                    .map_err(Error::from)
+            }) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    let _ = self.store.finish_backend_job_delivery(
+                        &self.config.workspace_id,
+                        &delivery_id,
+                        BackendJobDeliveryState::Failed,
+                        Some("current_revision_unavailable"),
+                        Some(&error.to_string()),
+                        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    );
+                    return;
+                }
+            };
+            match ticket_item_checker::notification(acceptance, &current_ticket) {
+                Ok(ticket_item_checker::TicketItemCheckNotification::Deliver(content)) => content,
+                Ok(ticket_item_checker::TicketItemCheckNotification::NoFindings) => {
+                    let _ = self.store.finish_backend_job_delivery(
+                        &self.config.workspace_id,
+                        &delivery_id,
+                        BackendJobDeliveryState::Completed,
+                        Some("notification_suppressed_no_findings"),
+                        None,
+                        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    );
+                    return;
+                }
+                Ok(ticket_item_checker::TicketItemCheckNotification::Stale) => {
+                    let detail = format!(
+                        "checked revision {} is no longer current ({})",
+                        checker_input.revision,
+                        ticket_item_checker::item_revision(&current_ticket)
+                    );
+                    let _ = self.store.finish_backend_job_delivery(
+                        &self.config.workspace_id,
+                        &delivery_id,
+                        BackendJobDeliveryState::Completed,
+                        Some("notification_suppressed_stale_revision"),
+                        Some(&detail),
+                        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    );
+                    return;
+                }
+                Err(error) => {
+                    let _ = self.store.finish_backend_job_delivery(
+                        &self.config.workspace_id,
+                        &delivery_id,
+                        BackendJobDeliveryState::Failed,
+                        Some("invalid_checker_result"),
+                        Some(&error.to_string()),
+                        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    );
+                    return;
+                }
+            }
+        } else {
+            format!(
+                "Backend Job `{}` completed attempt `{}` for `{}`. Durable result digest: {}.",
+                acceptance.job.request.job_id,
+                acceptance.attempt.attempt_id,
+                acceptance.job.request.purpose,
+                acceptance
+                    .job
+                    .result_digest
+                    .as_deref()
+                    .unwrap_or("unavailable")
+            )
+        };
+        if content.len() > MAX_JOB_DELIVERY_BYTES {
+            let _ = self.store.finish_backend_job_delivery(
+                &self.config.workspace_id,
+                &delivery_id,
+                BackendJobDeliveryState::Failed,
+                Some("notification_too_large"),
+                Some("Backend Job notification content exceeded its configured byte limit"),
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            );
+            return;
+        }
+        let delivery_result = self.runtime.send_input(
+            target,
+            WorkerInputRequest {
+                kind: WorkerInputKind::Notify,
+                content,
+                submission_request_id: Some(delivery.delivery_id.clone()),
+                segments: None,
+            },
+        );
+        let (state, category, detail): (_, Option<String>, Option<String>) = match delivery_result {
+            Ok(result) if result.state == InternalWorkerOperationState::Accepted => {
+                (BackendJobDeliveryState::Completed, None, None)
+            }
+            Ok(result) if result.disposition == WorkerInputDisposition::Unknown => (
+                BackendJobDeliveryState::Unknown,
+                Some("notification_outcome_unknown".to_string()),
+                result.diagnostics.first().map(|item| item.message.clone()),
+            ),
+            Ok(result) => (
+                BackendJobDeliveryState::Failed,
+                Some("notification_rejected".to_string()),
+                result.diagnostics.first().map(|item| item.message.clone()),
+            ),
+            Err(error) => (
+                BackendJobDeliveryState::Unknown,
+                Some("notification_outcome_unknown".to_string()),
+                Some(error.message()),
+            ),
+        };
+        // Delivery is intentionally separate from result authority. A delivery
+        // bookkeeping failure must never roll back or re-run completed work.
+        let _ = self.store.finish_backend_job_delivery(
+            &self.config.workspace_id,
+            &delivery_id,
+            state,
+            category.as_deref(),
+            detail.as_deref(),
+            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+        );
     }
 
     fn register_workspace_runtime_binding(
@@ -3312,6 +4093,9 @@ impl WorkspaceApi {
         runtime_id: &str,
         mut request: WorkerSpawnRequest,
     ) -> ApiResult<WorkerSpawnResult> {
+        if let Some(singleton_key) = request.singleton_key.as_deref() {
+            crate::store::validate_worker_singleton_key(singleton_key)?;
+        }
         self.validate_worker_spawn_repository_scope(runtime_id, &mut request)?;
         let workspace_api = self.workspace_api_ref(runtime_id);
         request.resolved_workspace_api = Some(workspace_api.clone());
@@ -3351,6 +4135,7 @@ impl WorkspaceApi {
             .collect::<Vec<_>>();
         let request_fingerprint = worker_spawn_create_fingerprint(&request)
             .map_err(|message| Error::Config(message.to_string()))?;
+        let singleton_key = request.singleton_key.clone();
         let current_memory_settings = self
             .config_store
             .get_workspace_memory_settings(&self.config.workspace_id)?;
@@ -3365,20 +4150,28 @@ impl WorkspaceApi {
                     .map(|assignment| assignment.operation_id.clone())
             })
             .unwrap_or_else(|| format!("manual:{}", WorkerId::now_v7()));
-        let reservation = self
-            .config_store
-            .reserve_worker_create(
-                &self.config.workspace_id,
-                runtime_id,
-                &allocation_key,
-                &request_fingerprint,
-                &current_memory_settings,
-            )
-            .map_err(|error| Error::RuntimeOperationFailed {
-                runtime_id: runtime_id.to_string(),
-                code: "workspace_worker_allocation_conflict".to_string(),
-                message: error.to_string(),
-            })?;
+        let reservation = match self.config_store.reserve_worker_create(
+            &self.config.workspace_id,
+            runtime_id,
+            &allocation_key,
+            &request_fingerprint,
+            singleton_key.as_deref(),
+            &current_memory_settings,
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                let error = match error {
+                    Error::RepositoryConflict(message) => Error::RepositoryConflict(message),
+                    error => Error::RuntimeOperationFailed {
+                        runtime_id: runtime_id.to_string(),
+                        code: "workspace_worker_allocation_conflict".to_string(),
+                        message: error.to_string(),
+                    },
+                };
+                let diagnostics = cleanup_spawn_created_workdirs(self, &spawned_workdir_ids);
+                return Err(ApiError::with_diagnostics(error, diagnostics));
+            }
+        };
         let worker_id = reservation.worker_id;
         request.resolved_memory_settings = Some(reservation.memory_settings);
         let reservation_fingerprint = reservation.create_fingerprint.clone();
@@ -3441,6 +4234,35 @@ impl WorkspaceApi {
         {
             Ok(result) => result,
             Err(error) => {
+                if matches!(&error, RuntimeRegistryError::UnknownRuntime(_)) {
+                    // Registry lookup failed before dispatch, so no Runtime could have created this
+                    // Worker. Terminalize the reservation immediately instead of retaining an
+                    // uncertain singleton generation forever.
+                    let mut diagnostics =
+                        release_worker_workdir_attachment_reservations(self, &reserved_attachments);
+                    if let Err(cleanup_error) = self.config_store.fail_worker_create_reservation(
+                        &self.config.workspace_id,
+                        runtime_id,
+                        worker_id,
+                        &reservation_fingerprint,
+                    ) {
+                        diagnostics.push(spawn_compensation_diagnostic(
+                            "worker_spawn_compensation_create_reservation_release_failed",
+                            format!(
+                                "Failed to terminalize undispatched Worker create reservation {}: {}",
+                                worker_id,
+                                sanitize_backend_error(&cleanup_error.to_string())
+                            ),
+                        ));
+                    }
+                    write_workspace_worker_create_failure(
+                        runtime_id,
+                        worker_id,
+                        "runtime_spawn_undispatched",
+                        &diagnostics,
+                    );
+                    return Err(ApiError::with_diagnostics(error.into_error(), diagnostics));
+                }
                 let diagnostics = compensate_failed_workspace_worker_create(
                     self,
                     runtime_id,
@@ -3454,7 +4276,7 @@ impl WorkspaceApi {
                 return Err(ApiError::with_diagnostics(error.into_error(), diagnostics));
             }
         };
-        let Some(worker) = result.worker.as_ref() else {
+        let Some(worker) = result.worker.as_mut() else {
             result
                 .diagnostics
                 .extend(compensate_failed_workspace_worker_create(
@@ -3469,6 +4291,12 @@ impl WorkspaceApi {
                 ));
             return Ok(result);
         };
+        // Runtime metadata is display-only. The lease returned by the same DB transaction that
+        // reserved creation is the sole authority for the projected singleton key.
+        worker.singleton_key = reservation
+            .singleton
+            .as_ref()
+            .map(|lease| lease.key.clone());
         let worker_ref = worker.worker.clone();
         if worker_ref.worker_id != worker_id.to_string() {
             let diagnostics = compensate_failed_workspace_worker_create(
@@ -3653,6 +4481,11 @@ impl WorkspaceApi {
         &self,
         worker: &RuntimeWorkerRef,
     ) -> ApiResult<InternalWorkerRestoreResult> {
+        // Fence displaced singleton generations before renewing credentials, replacing bindings,
+        // or asking any Runtime to launch execution.
+        let singleton_lease = self
+            .store
+            .require_current_worker_singleton_owner(&self.config.workspace_id, worker)?;
         for link in self
             .store
             .list_worker_workdir_links(&self.config.workspace_id, worker)?
@@ -3716,10 +4549,13 @@ impl WorkspaceApi {
                 }
             }
         }
-        let binding = self
+        let mut binding = self
             .runtime
             .replace_worker_workspace_api(worker, self.workspace_api_ref(&worker.runtime_id))
             .map_err(|error| error.into_error())?;
+        if let Some(summary) = binding.worker.as_mut() {
+            summary.singleton_key = singleton_lease.as_ref().map(|lease| lease.key.clone());
+        }
         if binding.state != InternalWorkerOperationState::Accepted {
             return Ok(InternalWorkerRestoreResult {
                 state: server_api::WorkerRestoreState::Rejected,
@@ -3728,10 +4564,14 @@ impl WorkspaceApi {
             });
         }
         sync_runtime_worker_workdir_attachments(self, worker)?;
-        Ok(self
+        let mut restored = self
             .runtime
             .restore_worker(worker)
-            .map_err(|error| error.into_error())?)
+            .map_err(|error| error.into_error())?;
+        if let Some(summary) = restored.worker.as_mut() {
+            summary.singleton_key = singleton_lease.as_ref().map(|lease| lease.key.clone());
+        }
+        Ok(restored)
     }
 
     fn repository_reader(&self) -> RepositoryRegistryReader {
@@ -5071,6 +5911,7 @@ fn worker_spawn_request_from_api(
     Ok(WorkerSpawnRequest {
         intent,
         requested_worker_name: request.requested_worker_name,
+        singleton_key: request.singleton_key,
         acceptance,
         profile,
         ticket_assignment: request
@@ -5119,6 +5960,7 @@ fn worker_input_request_from_api(
     Ok(WorkerInputRequest {
         kind,
         content: request.content,
+        submission_request_id: None,
         segments,
     })
 }
@@ -9123,6 +9965,10 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
         _,
         _,
     >(workspace, scoped_worker_protocol_ws)
+    .route(
+        "/api/w/{workspace_id}/workers/self/backend-job-result",
+        post(scoped_submit_backend_job_result),
+    )
     .fallback(get(static_or_spa_fallback))
     .with_state(api)
     .merge(generated_workspace_contract_router(contract_service));
@@ -9211,10 +10057,15 @@ pub async fn serve_workspace_catalog_with_shutdown<F>(
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let router = build_workspace_server_router(template, store).await?;
-    axum::serve(listener, router)
+    let api = WorkspaceServerApi::new(template, store);
+    api.preload().await?;
+    api.recover_workspace_deletions().await?;
+    let result = axum::serve(listener, workspace_server_router(api.clone()))
         .with_graceful_shutdown(shutdown)
-        .await?;
+        .await;
+    let storage_result = api.shutdown_feature_storage().await;
+    result?;
+    storage_result?;
     Ok(())
 }
 
@@ -9223,8 +10074,13 @@ pub async fn serve_workspace_catalog(
     store: Arc<dyn ControlPlaneStore>,
     listener: TcpListener,
 ) -> Result<()> {
-    let router = build_workspace_server_router(template, store).await?;
-    axum::serve(listener, router).await?;
+    let api = WorkspaceServerApi::new(template, store);
+    api.preload().await?;
+    api.recover_workspace_deletions().await?;
+    let result = axum::serve(listener, workspace_server_router(api.clone())).await;
+    let storage_result = api.shutdown_feature_storage().await;
+    result?;
+    storage_result?;
     Ok(())
 }
 
@@ -9242,9 +10098,14 @@ pub async fn serve(
 ) -> Result<()> {
     let api = WorkspaceApi::new(config, store).await?;
     let orchestrator_hook = tokio::spawn(run_orchestrator_turn_end_hook(api.clone()));
-    let result = axum::serve(listener, build_router(api)).await;
+    let result = axum::serve(listener, build_router(api.clone())).await;
     orchestrator_hook.abort();
+    let storage_result = api
+        .feature_storage
+        .shutdown()
+        .map_err(|error| Error::Store(format!("failed to shut down Feature storage: {error}")));
     result?;
+    storage_result?;
     Ok(())
 }
 
@@ -11619,6 +12480,100 @@ fn validate_ticket_operation_repository_keys(
     }
 }
 
+fn ticket_item_check_edit(
+    operation: &TicketBackendOperation,
+    before: Option<&ticket::Ticket>,
+) -> Option<TicketItemCheckEdit> {
+    match operation {
+        TicketBackendOperation::Create { .. } => Some(TicketItemCheckEdit::Create),
+        TicketBackendOperation::EditItem { edit, .. } => Some(TicketItemCheckEdit::Edit {
+            title_changed: edit.title.is_some(),
+            body_changed: edit.body.is_some() || edit.body_replacement.is_some(),
+            previous_title: edit
+                .title
+                .as_ref()
+                .and_then(|_| before.map(|ticket| ticket.meta.title.clone())),
+            previous_body: (edit.body.is_some() || edit.body_replacement.is_some())
+                .then(|| before.map(|ticket| ticket.document.body.as_str().to_string()))
+                .flatten(),
+            body_replacement: edit.body_replacement.as_ref().map(|replacement| {
+                TicketItemCheckBodyReplacement {
+                    old_string: replacement.old_string.clone(),
+                    new_string: replacement.new_string.clone(),
+                    replace_all: replacement.replace_all,
+                }
+            }),
+        }),
+        _ => None,
+    }
+}
+
+fn ticket_item_checker_instruction(api: &WorkspaceApi) -> Result<String> {
+    let config_state = api
+        .config_store
+        .load_workspace_config(&api.config.workspace_id)?
+        .ok_or_else(|| Error::Config("Workspace config is unavailable".to_string()))?;
+    let projection = api
+        .prompt_projection_cache
+        .resolve(&api.config.workspace_id, &config_state)
+        .map_err(|error| Error::Config(format!("resolve Ticket item checker Prompt: {error}")))?;
+    let catalog = worker::PromptCatalog::from_projection(projection.catalog().clone())
+        .map_err(|error| Error::Config(format!("load Ticket item checker Prompt: {error}")))?;
+    catalog
+        .ticket_item_checker()
+        .map_err(|error| Error::Config(format!("render Ticket item checker Prompt: {error}")))
+}
+
+fn schedule_ticket_item_check(
+    api: &WorkspaceApi,
+    ticket: &ticket::Ticket,
+    edit: TicketItemCheckEdit,
+    source_worker: RuntimeWorkerRef,
+) {
+    let request = ticket_item_checker_instruction(api).and_then(|instruction| {
+        ticket_item_checker::request(ticket, edit, source_worker, instruction)
+    });
+    let request = match request {
+        Ok(request) => request,
+        Err(error) => {
+            tracing::warn!(
+                ticket_id = %ticket.meta.id,
+                %error,
+                "Ticket item was saved but its asynchronous checker could not be prepared"
+            );
+            return;
+        }
+    };
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+    let reservation = match api
+        .store
+        .reserve_backend_job(&api.config.workspace_id, &request, &now)
+    {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            tracing::warn!(
+                ticket_id = %ticket.meta.id,
+                revision = %request.input_revision,
+                %error,
+                "Ticket item was saved but its asynchronous checker could not be reserved"
+            );
+            return;
+        }
+    };
+    let api = api.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) = api.dispatch_backend_job_reservation(reservation) {
+            tracing::warn!(
+                job_id = %request.job_id,
+                ticket_revision = %request.input_revision,
+                %error,
+                "asynchronous Ticket item checker dispatch failed"
+            );
+            api.drain_reserved_backend_jobs();
+        }
+    });
+}
+
 async fn execute_ticket_rest_operation(
     api: &WorkspaceApi,
     workspace_id: &str,
@@ -11645,6 +12600,10 @@ async fn execute_ticket_rest_operation(
     reject_unguarded_ticket_completion(&operation)?;
     validate_ticket_repository_operation(api, &operation)?;
     let before = target.as_ref().and_then(|id| backend.show(id.clone()).ok());
+    let mut ticket_item_check = source
+        .as_ref()
+        .cloned()
+        .zip(ticket_item_check_edit(&operation, before.as_ref()));
     let previous_state = before
         .as_ref()
         .map(|ticket| ticket.meta.workflow_state.as_str().to_string())
@@ -11728,7 +12687,40 @@ async fn execute_ticket_rest_operation(
         backend = backend.with_event_attributes(event_attributes);
     }
 
-    let result = execute_ticket_backend_operation(&backend, operation).map_err(Error::from)?;
+    let (result, created_ticket) = match operation {
+        TicketBackendOperation::Create { input } => {
+            let (reference, ticket) = backend.create_with_snapshot(input).map_err(Error::from)?;
+            (
+                TicketBackendOperationResult::TicketRef(reference),
+                Some(ticket),
+            )
+        }
+        TicketBackendOperation::EditItem { id, edit } => {
+            let (previous, ticket) = backend
+                .edit_item_with_snapshots(id, edit)
+                .map_err(Error::from)?;
+            if let Some((
+                _,
+                TicketItemCheckEdit::Edit {
+                    title_changed,
+                    body_changed,
+                    previous_title,
+                    previous_body,
+                    ..
+                },
+            )) = ticket_item_check.as_mut()
+            {
+                *previous_title = (*title_changed).then(|| previous.meta.title.clone());
+                *previous_body =
+                    (*body_changed).then(|| previous.document.body.as_str().to_string());
+            }
+            (TicketBackendOperationResult::Ticket(ticket), None)
+        }
+        operation => (
+            execute_ticket_backend_operation(&backend, operation).map_err(Error::from)?,
+            None,
+        ),
+    };
     if is_mutation {
         if let TicketBackendOperationResult::QueueOutcome(outcome) = &result {
             for ticket_id in &outcome.queued_tickets {
@@ -11750,8 +12742,17 @@ async fn execute_ticket_rest_operation(
                 &ticket.meta.id,
                 &previous_state,
                 ticket.meta.workflow_state.as_str(),
-                source,
+                source.clone(),
             );
+        }
+    }
+    if let Some((source_worker, edit)) = ticket_item_check {
+        let checked_ticket = created_ticket.or_else(|| match &result {
+            TicketBackendOperationResult::Ticket(ticket) => Some(ticket.clone()),
+            _ => None,
+        });
+        if let Some(ticket) = checked_ticket {
+            schedule_ticket_item_check(api, &ticket, edit, source_worker);
         }
     }
     Ok(result)
@@ -14116,6 +15117,7 @@ fn notify_ticket_recipients(
             WorkerInputRequest {
                 kind: WorkerInputKind::Notify,
                 content: content.clone(),
+                submission_request_id: None,
                 segments: None,
             },
         );
@@ -14472,6 +15474,49 @@ async fn refresh_current_worker_session_locked(
         open_current_worker_workdir_session_locked(api, worker, &remaining[0]).await?;
     }
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubmitBackendJobResultRequest {
+    result: serde_json::Value,
+}
+
+async fn scoped_submit_backend_job_result(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    headers: HeaderMap,
+    Json(request): Json<SubmitBackendJobResultRequest>,
+) -> ApiResult<Json<BackendJobResultAcceptance>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let worker = current_worker_identity(&api, &path.workspace_id, &headers)?;
+    let binding = api
+        .store
+        .worker_registry_projection(&api.config.workspace_id, &worker)?
+        .and_then(|projection| projection.job)
+        .ok_or_else(|| {
+            Error::InvalidInput(
+                "current Worker is not bound to an active Backend Job attempt".to_string(),
+            )
+        })?;
+    let attempt = api
+        .store
+        .get_backend_job_attempt(
+            &api.config.workspace_id,
+            &binding.job_id,
+            &binding.attempt_id,
+        )?
+        .ok_or_else(|| Error::Store("Backend Job attempt binding disappeared".to_string()))?;
+    let acceptance = api.accept_backend_job_result(
+        &worker,
+        &BackendJobResultSubmission {
+            job_id: binding.job_id,
+            attempt_id: binding.attempt_id,
+            input_revision: attempt.input_revision,
+            result: request.result,
+        },
+    )?;
+    Ok(Json(acceptance))
 }
 
 async fn scoped_attach_current_worker_workdir(
@@ -15173,6 +16218,7 @@ fn dispatch_orchestrator_queue_attention(api: &WorkspaceApi) {
             WorkerInputRequest {
                 kind: WorkerInputKind::Notify,
                 content,
+                submission_request_id: None,
                 segments: None,
             },
         )
@@ -15224,37 +16270,41 @@ fn require_online_workspace_orchestrator_source(
 }
 
 fn find_online_workspace_orchestrator(api: &WorkspaceApi) -> Option<InternalWorkerSummary> {
-    api.runtime
-        .list_workers(1000)
-        .items
-        .into_iter()
-        .find(|worker| {
-            worker.singleton_key.as_deref()
-                == Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY)
-                && worker.workspace.workspace_id.as_deref()
-                    == Some(api.config.workspace_id.as_str())
-                && matches!(worker.state.as_str(), "idle" | "running" | "paused")
-        })
+    let owner = api
+        .store
+        .current_worker_singleton_owner(
+            &api.config.workspace_id,
+            crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY,
+        )
+        .ok()
+        .flatten()?;
+    let mut worker = api.runtime.worker(&owner.worker).ok()?;
+    worker.singleton_key = Some(owner.key);
+    (is_dedicated_workspace_orchestrator(&worker, &api.config.workspace_id)
+        && matches!(worker.state.as_str(), "idle" | "running" | "paused"))
+    .then_some(worker)
 }
 
 fn find_workspace_orchestrator(api: &WorkspaceApi) -> Option<InternalWorkerSummary> {
-    let is_orchestrator = |worker: &InternalWorkerSummary| {
-        worker.singleton_key.as_deref() == Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY)
-    };
-    if let Some(worker) = find_online_workspace_orchestrator(api) {
-        return Some(worker);
-    }
-    for runtime in api.runtime.list_runtimes(1000).items {
-        if let Ok(stopped) = api
-            .runtime
-            .list_stopped_workers_for_runtime(&runtime.runtime_id, 1000)
-        {
-            if let Some(worker) = stopped.items.into_iter().find(is_orchestrator) {
-                return Some(worker);
-            }
-        }
-    }
-    None
+    let owner = api
+        .store
+        .current_worker_singleton_owner(
+            &api.config.workspace_id,
+            crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY,
+        )
+        .ok()
+        .flatten()?;
+    let mut worker = api.runtime.worker(&owner.worker).ok()?;
+    worker.singleton_key = Some(owner.key);
+    is_dedicated_workspace_orchestrator(&worker, &api.config.workspace_id).then_some(worker)
+}
+
+fn is_dedicated_workspace_orchestrator(worker: &InternalWorkerSummary, workspace_id: &str) -> bool {
+    worker.workspace.workspace_id.as_deref() == Some(workspace_id)
+        && worker.singleton_key.as_deref()
+            == Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY)
+        && worker.tags.iter().any(|tag| tag == "orchestrator")
+        && worker.tags.iter().any(|tag| tag == "singleton")
 }
 
 async fn scoped_get_memory_document(
@@ -15304,7 +16354,6 @@ async fn scoped_memory_backend_operation(
 
 const MEMORY_CONSOLIDATION_PROFILE: &str = "memory-consolidation";
 const MEMORY_CONSOLIDATION_SINGLETON_KEY: &str = "workspace-memory-consolidation";
-const MEMORY_CONSOLIDATION_WORKER_SCAN_LIMIT: usize = 100;
 
 async fn scoped_memory_consolidation(
     State(api): State<WorkspaceApi>,
@@ -15364,6 +16413,7 @@ fn start_memory_staging_consolidation(
         &runtime_id,
         WorkerSpawnRequest {
             requested_worker_name: Some(MEMORY_CONSOLIDATION_PROFILE.to_string()),
+            singleton_key: Some(MEMORY_CONSOLIDATION_SINGLETON_KEY.to_string()),
             intent: WorkerSpawnIntent::WorkspaceOrchestrator,
             acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                 expected_segments: 1,
@@ -15413,25 +16463,24 @@ fn start_memory_staging_consolidation(
 
 fn try_reuse_memory_consolidation_worker(
     api: &WorkspaceApi,
-    runtime_id: &str,
+    _runtime_id: &str,
     input_content: &str,
     candidate_count: usize,
     total_bytes: u64,
 ) -> ApiResult<Option<MemoryConsolidationOutput>> {
-    let workers = api
-        .runtime
-        .list_workers_for_runtime(runtime_id, MEMORY_CONSOLIDATION_WORKER_SCAN_LIMIT)
-        .map_err(|err| err.into_error())?;
-    let mut consolidaters = workers
-        .items
-        .into_iter()
-        .filter(is_memory_consolidation_worker)
-        .collect::<Vec<_>>();
-    if consolidaters.is_empty() {
+    let Some(owner) = api.store.current_worker_singleton_owner(
+        &api.config.workspace_id,
+        MEMORY_CONSOLIDATION_SINGLETON_KEY,
+    )?
+    else {
         return Ok(None);
-    }
-    consolidaters.sort_by(|a, b| a.worker.worker_id.cmp(&b.worker.worker_id));
-    if let Some(worker) = consolidaters.iter().find(|worker| worker.state != "idle") {
+    };
+    let mut worker = api
+        .runtime
+        .worker(&owner.worker)
+        .map_err(|error| error.into_error())?;
+    worker.singleton_key = Some(owner.key);
+    if worker.state != "idle" {
         return Ok(Some(MemoryConsolidationOutput {
             status: "skipped_existing_not_idle".to_string(),
             summary: format!(
@@ -15442,10 +16491,6 @@ fn try_reuse_memory_consolidation_worker(
             total_bytes,
         }));
     }
-    let worker = consolidaters
-        .first()
-        .expect("non-empty consolidater list")
-        .clone();
     let input = api
         .runtime
         .send_input(
@@ -15453,6 +16498,7 @@ fn try_reuse_memory_consolidation_worker(
             WorkerInputRequest {
                 kind: WorkerInputKind::User,
                 content: input_content.to_string(),
+                submission_request_id: None,
                 segments: None,
             },
         )
@@ -15477,11 +16523,6 @@ fn try_reuse_memory_consolidation_worker(
         candidate_count,
         total_bytes,
     }))
-}
-
-fn is_memory_consolidation_worker(worker: &InternalWorkerSummary) -> bool {
-    worker.singleton_key.as_deref() == Some(MEMORY_CONSOLIDATION_SINGLETON_KEY)
-        || worker.profile.as_deref() == Some(MEMORY_CONSOLIDATION_PROFILE)
 }
 
 fn memory_consolidation_input_content(candidate_count: usize, total_bytes: u64) -> String {
@@ -16841,10 +17882,7 @@ async fn scoped_start_workspace_orchestrator(
         if workspace_orchestrator_is_online(&existing) {
             return Ok(Json(workspace_orchestrator_response(&api, "existing")));
         }
-        let restored = api
-            .runtime
-            .restore_worker(&existing.worker)
-            .map_err(|error| error.into_error())?;
+        let restored = api.restore_workspace_worker(&existing.worker)?;
         if restored.state == server_api::WorkerRestoreState::Accepted {
             *api.orchestrator_attention_fingerprint
                 .lock()
@@ -16866,7 +17904,7 @@ async fn scoped_start_workspace_orchestrator(
             .runtime
             .delete_worker(&existing.worker)
             .map_err(|error| error.into_error())?;
-        if deleted.state != InternalWorkerOperationState::Accepted {
+        if deleted.state != InternalWorkerOperationState::Accepted || !deleted.deleted {
             return Err(ApiError::with_diagnostics(
                 Error::RuntimeOperationFailed {
                     runtime_id: existing.worker.runtime_id.clone(),
@@ -16876,6 +17914,10 @@ async fn scoped_start_workspace_orchestrator(
                 deleted.diagnostics,
             ));
         }
+        let removal = api
+            .store
+            .delete_worker_registry(&api.config.workspace_id, &existing.worker)?;
+        api.worker_projection.publish_commit(removal)?;
         disposition = "recreated";
     }
 
@@ -16885,6 +17927,7 @@ async fn scoped_start_workspace_orchestrator(
             requested_worker_name: Some(
                 crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string(),
             ),
+            singleton_key: Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string()),
             intent: WorkerSpawnIntent::WorkspaceOrchestrator,
             acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                 expected_segments: 0,
@@ -21357,6 +22400,22 @@ async fn execute_runtime_removal(
                 .await;
             return Err(error.into());
         }
+        if api.store.has_reserved_worker_create_for_runtime(
+            &operation.workspace_id,
+            &operation.runtime_id,
+        )? {
+            let _ = api
+                .store
+                .mark_runtime_removal_failed(
+                    &operation.operation_id,
+                    "runtime_removal_reserved_worker_create_blocked",
+                )
+                .await;
+            return Err(Error::RuntimeBindingConflict(
+                "runtime_removal_reserved_worker_create_blocked".to_string(),
+            )
+            .into());
+        }
         let binding = api
             .store
             .get_workspace_runtime_binding(&operation.workspace_id, &operation.runtime_id)
@@ -22028,6 +23087,19 @@ fn browser_worker_console_href(workspace_id: &str, resource_key: &str) -> String
     )
 }
 
+fn validate_caller_worker_singleton_key(singleton_key: Option<&str>) -> Result<()> {
+    let Some(singleton_key) = singleton_key else {
+        return Ok(());
+    };
+    crate::store::validate_worker_singleton_key(singleton_key)?;
+    if crate::hosts::is_reserved_internal_worker_singleton_key(singleton_key) {
+        return Err(Error::InvalidInput(format!(
+            "Worker singleton key {singleton_key:?} is reserved for a Backend-managed Worker"
+        )));
+    }
+    Ok(())
+}
+
 async fn create_workspace_worker(
     State(api): State<WorkspaceApi>,
     headers: HeaderMap,
@@ -22045,12 +23117,14 @@ async fn create_workspace_worker_inner(
     let CreateWorkspaceWorkerRequest {
         runtime_id,
         display_name,
+        singleton_key,
         profile,
         ticket_assignment,
         initial_submit,
         workdir_attachments,
         control_operation_id: _,
     } = request;
+    validate_caller_worker_singleton_key(singleton_key.as_deref())?;
     let config_state = api
         .config_store
         .load_workspace_config(&api.config.workspace_id)?
@@ -22130,6 +23204,7 @@ async fn create_workspace_worker_inner(
         browser_worker_spawn_policy(ticket_assignment, &initial_submit)?;
     let request = WorkerSpawnRequest {
         requested_worker_name: Some(display_name.clone()),
+        singleton_key,
         intent,
         acceptance,
         profile: profile_selector,
@@ -23070,6 +24145,38 @@ fn finalize_spawn_compensation_after_worker_delete(
     diagnostics
 }
 
+fn cleanup_spawn_created_workdirs(
+    api: &WorkspaceApi,
+    workdir_ids: &[String],
+) -> Vec<RuntimeDiagnostic> {
+    let mut diagnostics = Vec::new();
+    for workdir_id in workdir_ids {
+        match execute_workdir_removal(
+            api,
+            workdir_id,
+            "backend:worker_spawn_compensation",
+            "remove Workdir created before rejected Worker spawn",
+        ) {
+            Ok(result) if result.disposition == WorkingDirectoryRemovalDisposition::Removed => {}
+            Ok(result) => diagnostics.push(spawn_compensation_diagnostic(
+                "worker_spawn_compensation_workdir_cleanup_failed",
+                format!(
+                    "Durable removal retained pre-spawn Workdir `{workdir_id}`: disposition={:?}, retryable={}",
+                    result.disposition, result.retryable,
+                ),
+            )),
+            Err(error) => diagnostics.push(spawn_compensation_diagnostic(
+                "worker_spawn_compensation_workdir_cleanup_failed",
+                format!(
+                    "Failed to reserve durable removal for pre-spawn Workdir `{workdir_id}`: {}",
+                    sanitize_backend_error(&error.to_string())
+                ),
+            )),
+        }
+    }
+    diagnostics
+}
+
 fn lifecycle_failure_detail(
     action: &str,
     result: &std::result::Result<WorkerLifecycleResult, RuntimeRegistryError>,
@@ -23110,6 +24217,7 @@ async fn create_runtime_worker(
     Json(request): Json<server_api::RuntimeWorkerSpawnRequest>,
 ) -> ApiResult<Json<server_api::RuntimeWorkerSpawnResponse>> {
     let mut request = worker_spawn_request_from_api(request)?;
+    validate_caller_worker_singleton_key(request.singleton_key.as_deref())?;
     validate_worker_initial_submit(&request.initial_submit)?;
     if let Some(assignment) = request.ticket_assignment.as_ref()
         && let Some(worker) = existing_lifecycle_assignment_worker(&api, assignment, &runtime_id)?
@@ -23159,18 +24267,24 @@ async fn create_runtime_worker(
                 .as_ref()
                 .map(|assignment| assignment.operation_id.clone())
         });
+    let mut created_workdir_ids = Vec::new();
     for attachment in &mut request.resolved_workdir_attachment_requests {
         let workdir_id =
             upsert_pending_backend_workdir(&api, &runtime_id, &mut attachment.working_directory)?;
+        created_workdir_ids.push(workdir_id.clone());
         let operation_id = repository_operation_id
             .clone()
             .unwrap_or_else(|| format!("worker-spawn-workdir:{workdir_id}"));
-        authorize_worker_spawn_workdir_materialization(
+        if let Err(error) = authorize_worker_spawn_workdir_materialization(
             &api,
             &runtime_id,
             &operation_id,
             &mut attachment.working_directory,
-        )?;
+        ) {
+            let mut diagnostics = error.diagnostics;
+            diagnostics.extend(cleanup_spawn_created_workdirs(&api, &created_workdir_ids));
+            return Err(ApiError::with_diagnostics(error.error, diagnostics));
+        }
     }
     let requested_worker_name = request.requested_worker_name.clone();
     let spawn_idempotency =
@@ -23178,7 +24292,7 @@ async fn create_runtime_worker(
     if let (Some(assignment), Some((_, fingerprint))) =
         (lifecycle_assignment.as_ref(), spawn_idempotency.as_ref())
     {
-        api.store.reserve_ticket_assignment_operation(
+        if let Err(error) = api.store.reserve_ticket_assignment_operation(
             &api.config.workspace_id,
             &assignment.operation_id,
             &assignment.ticket_id,
@@ -23186,13 +24300,11 @@ async fn create_runtime_worker(
             None,
             fingerprint,
             &Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-        )?;
+        ) {
+            let diagnostics = cleanup_spawn_created_workdirs(&api, &created_workdir_ids);
+            return Err(ApiError::with_diagnostics(error, diagnostics));
+        }
     }
-    let created_workdir_ids = request
-        .resolved_workdir_attachment_requests
-        .iter()
-        .filter_map(|attachment| attachment.working_directory.backend_workdir_id.clone())
-        .collect::<Vec<_>>();
     let result = api.spawn_workspace_worker(&runtime_id, request)?;
     if let Some(worker) = result.worker.as_ref() {
         let compensation = WorkerSpawnCompensationContext {
@@ -23315,6 +24427,17 @@ async fn send_runtime_worker_input(
 ) -> ApiResult<Json<server_api::RuntimeWorkerInputResult>> {
     let request = worker_input_request_from_api(request)?;
     let worker = resolve_workspace_worker_reference(&api, &runtime_id, &worker_id)?;
+    if api
+        .store
+        .worker_registry_projection(&api.config.workspace_id, &worker)?
+        .and_then(|projection| projection.job)
+        .is_some()
+    {
+        return Err(Error::InvalidInput(
+            "Backend Job Workers accept only their Backend-owned immutable input".to_string(),
+        )
+        .into());
+    }
     let result = api
         .runtime
         .send_input(&worker, request)
@@ -23426,6 +24549,13 @@ async fn worker_protocol_ws(
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     let worker = RuntimeWorkerRef::new(&runtime_id, &worker_id);
+    let job_read_only = match api
+        .store
+        .worker_registry_projection(&api.config.workspace_id, &worker)
+    {
+        Ok(projection) => projection.and_then(|projection| projection.job).is_some(),
+        Err(error) => return ApiError::from(error).into_response(),
+    };
     let source = match api.observation_proxy.source(&worker) {
         Ok(source) => source,
         Err(ObservationProxyError::WorkerNotFound(_)) => {
@@ -23446,7 +24576,9 @@ async fn worker_protocol_ws(
         }
     };
     let input_source = authenticated_browser_input_source(&actor);
-    ws.on_upgrade(move |socket| worker_protocol_ws_session(source, socket, input_source))
+    ws.on_upgrade(move |socket| {
+        worker_protocol_ws_session(source, socket, input_source, job_read_only)
+    })
 }
 
 pub(crate) struct WorkspaceWorkerProtocolConnection {
@@ -23603,13 +24735,14 @@ async fn worker_protocol_ws_session(
     source: RuntimeObservationSource,
     socket: WebSocket,
     input_source: protocol::AuthenticatedInputSource,
+    read_only: bool,
 ) {
     match source {
         RuntimeObservationSource::RemoteWs(config) => {
-            remote_worker_protocol_ws_session(config, socket, input_source).await;
+            remote_worker_protocol_ws_session(config, socket, input_source, read_only).await;
         }
         RuntimeObservationSource::Embedded(source) => {
-            embedded_worker_protocol_ws_session(source, socket, input_source).await;
+            embedded_worker_protocol_ws_session(source, socket, input_source, read_only).await;
         }
     }
 }
@@ -23618,6 +24751,7 @@ async fn remote_worker_protocol_ws_session(
     config: RuntimeObservationSourceConfig,
     socket: WebSocket,
     input_source: protocol::AuthenticatedInputSource,
+    read_only: bool,
 ) {
     let mut request = match config.endpoint.clone().into_client_request() {
         Ok(request) => request,
@@ -23676,6 +24810,14 @@ async fn remote_worker_protocol_ws_session(
             inbound = client_stream.next() => {
                 match inbound {
                     Some(Ok(WsMessage::Text(text))) => {
+                        if read_only {
+                            if let Ok(event) = protocol::stream::encode_event(&protocol_error_event(
+                                "Backend Job Worker Console is read-only",
+                            )) {
+                                let _ = client_sink.send(WsMessage::Text(event.into())).await;
+                            }
+                            continue;
+                        }
                         let method = match protocol::stream::decode_method(text.as_ref()) {
                             Ok(method) => match authorize_browser_worker_method(method, &input_source) {
                                 Ok(method) => method,
@@ -23759,6 +24901,7 @@ async fn embedded_worker_protocol_ws_session(
     source: crate::observation::EmbeddedRuntimeObservationSource,
     mut socket: WebSocket,
     input_source: protocol::AuthenticatedInputSource,
+    read_only: bool,
 ) {
     let mut upstream = match RuntimeObservationClient::connect(&RuntimeObservationSource::Embedded(
         source.clone(),
@@ -23777,6 +24920,12 @@ async fn embedded_worker_protocol_ws_session(
         tokio::select! {
             inbound = socket.next() => {
                 match inbound {
+                    Some(Ok(WsMessage::Text(_))) if read_only => {
+                        let event = protocol_error_event("Backend Job Worker Console is read-only");
+                        if !send_protocol_event(&mut socket, &event).await {
+                            return;
+                        }
+                    }
                     Some(Ok(WsMessage::Text(text))) => match decode_method(&text) {
                         Ok(method) => match authorize_browser_worker_method(method, &input_source) {
                             Ok(method) => match source.runtime.send_protocol_method(&source.worker_ref, method) {
@@ -23933,9 +25082,31 @@ fn project_workspace_worker(
 
 fn project_workspace_worker_with_attachments(
     api: &WorkspaceApi,
-    summary: InternalWorkerSummary,
+    mut summary: InternalWorkerSummary,
     workdir_attachments: Vec<server_api::WorkerWorkdirAttachmentSummary>,
 ) -> ApiResult<server_api::WorkerSummary> {
+    match api
+        .store
+        .require_current_worker_singleton_owner(&api.config.workspace_id, &summary.worker)
+    {
+        Ok(lease) => summary.singleton_key = lease.map(|lease| lease.key),
+        Err(Error::RepositoryConflict(message))
+            if message.starts_with("worker_singleton_fenced:") =>
+        {
+            summary.singleton_key = None;
+            summary.availability =
+                protocol::subscription::SubscriptionWorkerAvailability::Unavailable;
+            summary.state = "unavailable".to_string();
+            summary.worker_state = None;
+            summary.diagnostics.push(RuntimeDiagnostic {
+                code: "worker_singleton_fenced".to_string(),
+                severity: HostDiagnosticSeverity::Warning,
+                message: "This historical singleton generation is fenced by Backend ownership."
+                    .to_string(),
+            });
+        }
+        Err(error) => return Err(error.into()),
+    }
     let resource_key = api
         .store
         .resource_key(
@@ -24800,6 +25971,7 @@ fn record_worker_summary(
             workspace_id: worker.workspace.workspace_id.clone(),
             display_name: Some(worker.display_name.clone()),
             profile: worker.profile.clone(),
+            job: None,
             workdir_attachments: Vec::new(),
         };
         api.worker_projection
@@ -26714,6 +27886,7 @@ mod tests {
                     workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
                     display_name: Some("Worker A".to_string()),
                     profile: Some("builtin:coder".to_string()),
+                    job: None,
                     workdir_attachments: Vec::new(),
                 },
                 availability,
@@ -26723,6 +27896,7 @@ mod tests {
                 projection_revision: 9,
                 observed_at: "2026-09-24T00:00:01Z".to_string(),
             }),
+            job: None,
         };
 
         let unavailable = worker_summary_from_projection(&projection).unwrap();
@@ -27448,6 +28622,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: "External expiry Worker".to_string(),
+                singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -28013,6 +29188,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.to_string(),
                 display_name: "External multi-attachment Worker".to_string(),
+                singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -28260,6 +29436,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: "External analysis Worker".to_string(),
+                singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -30275,6 +31452,7 @@ mod tests {
                     workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
                     display_name: Some("Paused Worker".to_string()),
                     profile: Some("builtin:coder".to_string()),
+                    job: None,
                     workdir_attachments: Vec::new(),
                 },
                 "4",
@@ -30674,6 +31852,7 @@ mod tests {
         foreign_repository.id = "foreign".to_string();
         let mut workdir_flow_launch = WorkerSpawnRequest {
             requested_worker_name: Some("cross-workspace-workdir".to_string()),
+            singleton_key: None,
             intent: WorkerSpawnIntent::WorkspaceCoding,
             acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                 expected_segments: 1,
@@ -30933,6 +32112,7 @@ mod tests {
                 ticket_id: ticket.id.clone(),
                 role: TicketWorkerRole::Coder,
             },
+            singleton_key: None,
             acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                 expected_segments: 1,
             },
@@ -31033,6 +32213,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: "missing-runtime".to_string(),
                 display_name: "Rejected Coder".to_string(),
+                singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
                 ticket_assignment: Some(CreateWorkspaceWorkerTicketAssignmentRequest {
                     ticket_id: ticket.id.clone(),
@@ -31071,6 +32252,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: "Scoped Worker".to_string(),
+                singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -31105,6 +32287,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: "Cross-runtime Worker".to_string(),
+                singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -31193,6 +32376,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: "Generic Worker".to_string(),
+                singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -31450,6 +32634,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: "Guarded spawn controller".to_string(),
+                singleton_key: None,
                 profile: Some("builtin:orchestrator".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -31931,6 +33116,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: "Strict remote spawn controller".to_string(),
+                singleton_key: None,
                 profile: Some("builtin:orchestrator".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -32153,6 +33339,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: "Control caller".to_string(),
+                singleton_key: None,
                 profile: None,
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -32184,6 +33371,7 @@ mod tests {
         let request = || CreateWorkspaceWorkerRequest {
             runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
             display_name: "Idempotent controlled child".to_string(),
+            singleton_key: None,
             profile: None,
             ticket_assignment: None,
             initial_submit: Vec::new(),
@@ -32251,6 +33439,318 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn arbitrary_singleton_exact_retry_replays_while_competing_create_conflicts() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let request = || CreateWorkspaceWorkerRequest {
+            runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+            display_name: "Subject Worker".to_string(),
+            singleton_key: Some("subjektiv:subject-42".to_string()),
+            profile: Some("builtin:companion".to_string()),
+            ticket_assignment: None,
+            initial_submit: Vec::new(),
+            workdir_attachments: Vec::new(),
+            control_operation_id: None,
+        };
+
+        let Json(created) =
+            create_workspace_worker(State(api.clone()), HeaderMap::new(), Json(request()))
+                .await
+                .unwrap();
+        assert_eq!(
+            created.worker.singleton_key.as_deref(),
+            Some("subjektiv:subject-42")
+        );
+        let Json(duplicate) =
+            create_workspace_worker(State(api.clone()), HeaderMap::new(), Json(request()))
+                .await
+                .unwrap();
+        assert_eq!(duplicate.worker_id, created.worker_id);
+        let mut competing_request = request();
+        competing_request.display_name = "Competing Subject Worker".to_string();
+        let competing = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(competing_request),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(competing.error, Error::RepositoryConflict(message) if message.contains("worker_singleton_owned"))
+        );
+
+        let worker = RuntimeWorkerRef::new(&created.runtime_id, &created.worker_id);
+        let stopped = api
+            .runtime
+            .stop_worker(
+                &worker,
+                WorkerLifecycleRequest {
+                    reason: Some("singleton restore test".to_string()),
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
+        let Json(stopped_retry) =
+            create_workspace_worker(State(api.clone()), HeaderMap::new(), Json(request()))
+                .await
+                .unwrap();
+        assert_eq!(stopped_retry.worker_id, created.worker_id);
+        let mut stopped_competing_request = request();
+        stopped_competing_request.display_name = "Stopped competing Worker".to_string();
+        let stopped_competing = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(stopped_competing_request),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            stopped_competing.error,
+            Error::RepositoryConflict(_)
+        ));
+
+        let restored = api.restore_workspace_worker(&worker).unwrap();
+        assert_eq!(restored.state, server_api::WorkerRestoreState::Rejected);
+        assert_eq!(
+            api.store
+                .current_worker_singleton_owner(&api.config.workspace_id, "subjektiv:subject-42",)
+                .unwrap()
+                .unwrap()
+                .worker,
+            worker
+        );
+    }
+
+    #[tokio::test]
+    async fn singleton_retry_disconnect_replacement_and_restore_are_generation_fenced() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
+        let runtime = WorkdirlessFixtureRuntime::default();
+        api.runtime.register_or_replace(runtime.clone());
+        let request = |operation_id: &str| WorkerSpawnRequest {
+            requested_worker_name: Some("Subject Worker".to_string()),
+            singleton_key: Some("subjektiv:subject-retry".to_string()),
+            intent: WorkerSpawnIntent::WorkspaceCompanion,
+            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                expected_segments: 0,
+            },
+            profile: ProfileSelector::Builtin("builtin:companion".to_string()),
+            ticket_assignment: None,
+            initial_submit: Vec::new(),
+            workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachments: Vec::new(),
+            resolved_config_bundle: None,
+            resolved_worker_observation_enabled: false,
+            resolved_worker_observation_grants: Vec::new(),
+            resolved_workspace_api: None,
+            resolved_memory_settings: None,
+            resolved_control_operation: Some(WorkerControlOperation {
+                operation_id: operation_id.to_string(),
+                input_fingerprint: format!("sha256:{operation_id}"),
+            }),
+        };
+
+        let mut invalid_request = request("singleton-create-invalid");
+        invalid_request.singleton_key = Some(String::new());
+        assert!(matches!(
+            api.spawn_workspace_worker(WorkdirlessFixtureRuntime::RUNTIME_ID, invalid_request)
+                .unwrap_err()
+                .error,
+            Error::InvalidInput(_)
+        ));
+        assert!(runtime.spawn_requests().is_empty());
+
+        // Simulate a Backend crash after the durable singleton reservation commits but before
+        // Runtime dispatch. The restarted request receives a fresh manual allocation key, yet its
+        // identical singleton intent replays the reserved Worker and dispatches that generation.
+        let mut restart_request = request("ignored-manual-operation");
+        restart_request.singleton_key = Some("subjektiv:restart-retry".to_string());
+        restart_request.resolved_control_operation = None;
+        let restart_fingerprint = worker_spawn_create_fingerprint(&restart_request).unwrap();
+        let memory = api
+            .config_store
+            .get_workspace_memory_settings(&api.config.workspace_id)
+            .unwrap();
+        let pre_crash_reservation = api
+            .config_store
+            .reserve_worker_create(
+                &api.config.workspace_id,
+                WorkdirlessFixtureRuntime::RUNTIME_ID,
+                "manual:lost-before-dispatch",
+                &restart_fingerprint,
+                restart_request.singleton_key.as_deref(),
+                &memory,
+            )
+            .unwrap();
+        let recovered = api
+            .spawn_workspace_worker(WorkdirlessFixtureRuntime::RUNTIME_ID, restart_request)
+            .unwrap();
+        assert_eq!(recovered.state, InternalWorkerOperationState::Accepted);
+        assert_eq!(
+            recovered.worker.unwrap().worker.worker_id,
+            pre_crash_reservation.worker_id.to_string()
+        );
+
+        assert!(matches!(
+            api.spawn_workspace_worker("missing-runtime", request("singleton-create-undispatched"))
+                .unwrap_err()
+                .error,
+            Error::UnknownRuntime(_)
+        ));
+
+        // A rejected attempt is terminalized only after the Runtime confirms that its reserved
+        // Worker is absent. A fresh retry then takes the next generation without leaving the key
+        // permanently wedged.
+        runtime.reject_next_spawn();
+        let rejected = api
+            .spawn_workspace_worker(
+                WorkdirlessFixtureRuntime::RUNTIME_ID,
+                request("singleton-create-1"),
+            )
+            .unwrap();
+        assert_eq!(rejected.state, InternalWorkerOperationState::Rejected);
+        assert!(
+            api.store
+                .current_worker_singleton_owner(&api.config.workspace_id, "subjektiv:subject-retry")
+                .unwrap()
+                .is_none()
+        );
+        let created = api
+            .spawn_workspace_worker(
+                WorkdirlessFixtureRuntime::RUNTIME_ID,
+                request("singleton-create-retry"),
+            )
+            .unwrap();
+        assert_eq!(created.state, InternalWorkerOperationState::Accepted);
+        let worker = created.worker.unwrap();
+        let current_owner = api
+            .store
+            .current_worker_singleton_owner(&api.config.workspace_id, "subjektiv:subject-retry")
+            .unwrap()
+            .unwrap();
+        assert_eq!(current_owner.worker, worker.worker);
+        assert_eq!(current_owner.generation, 3);
+        assert_eq!(
+            worker.singleton_key,
+            Some("subjektiv:subject-retry".to_string())
+        );
+
+        // Idle and paused Runtime metadata never releases Backend ownership, and a conflict is
+        // decided before the Runtime sees another spawn request.
+        runtime
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[0]
+            .state = "paused".to_string();
+        let spawn_count = runtime.spawn_requests().len();
+        assert!(matches!(
+            api.spawn_workspace_worker(
+                WorkdirlessFixtureRuntime::RUNTIME_ID,
+                request("singleton-create-conflict"),
+            )
+            .unwrap_err()
+            .error,
+            Error::RepositoryConflict(message) if message.contains("worker_singleton_owned")
+        ));
+        assert_eq!(runtime.spawn_requests().len(), spawn_count);
+        let restored = api.restore_workspace_worker(&worker.worker).unwrap();
+        assert_eq!(restored.state, server_api::WorkerRestoreState::Accepted);
+        assert_eq!(
+            restored.worker.unwrap().singleton_key.as_deref(),
+            Some("subjektiv:subject-retry")
+        );
+
+        // Replacing the connected Runtime with an empty instance models an unavailable/restarted
+        // Runtime. Ownership remains durable while restore cannot observe the Worker.
+        let disconnected_runtime = WorkdirlessFixtureRuntime::default();
+        api.runtime
+            .register_or_replace(disconnected_runtime.clone());
+        let disconnected_restore = api.restore_workspace_worker(&worker.worker).unwrap();
+        assert_eq!(
+            disconnected_restore.state,
+            server_api::WorkerRestoreState::Rejected
+        );
+        assert_eq!(
+            api.store
+                .current_worker_singleton_owner(
+                    &api.config.workspace_id,
+                    "subjektiv:subject-retry",
+                )
+                .unwrap()
+                .unwrap()
+                .worker,
+            worker.worker
+        );
+        assert!(
+            api.spawn_workspace_worker(
+                WorkdirlessFixtureRuntime::RUNTIME_ID,
+                request("singleton-create-disconnected"),
+            )
+            .is_err()
+        );
+
+        // Reconnection restores the current generation. Only confirmed terminal deletion permits
+        // a replacement, after which even a stale Runtime copy of the old Worker is fenced before
+        // any Runtime restore side effect.
+        api.runtime.register_or_replace(runtime.clone());
+        assert_eq!(
+            api.restore_workspace_worker(&worker.worker).unwrap().state,
+            server_api::WorkerRestoreState::Accepted
+        );
+        let stale_worker = runtime
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|candidate| candidate.worker == worker.worker)
+            .cloned()
+            .unwrap();
+        let deleted = api.runtime.delete_worker(&worker.worker).unwrap();
+        assert!(deleted.deleted);
+        api.store
+            .delete_worker_registry(&api.config.workspace_id, &worker.worker)
+            .unwrap();
+        runtime
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(stale_worker);
+        assert!(matches!(
+            api.restore_workspace_worker(&worker.worker).unwrap_err().error,
+            Error::RepositoryConflict(message) if message.contains("worker_singleton_fenced")
+        ));
+        let replacement = api
+            .spawn_workspace_worker(
+                WorkdirlessFixtureRuntime::RUNTIME_ID,
+                request("singleton-create-2"),
+            )
+            .unwrap()
+            .worker
+            .unwrap();
+        assert_ne!(replacement.worker.worker_id, worker.worker.worker_id);
+        assert!(matches!(
+            api.restore_workspace_worker(&worker.worker).unwrap_err().error,
+            Error::RepositoryConflict(message) if message.contains("worker_singleton_fenced")
+        ));
+        assert_eq!(
+            api.store
+                .current_worker_singleton_owner(
+                    &api.config.workspace_id,
+                    "subjektiv:subject-retry",
+                )
+                .unwrap()
+                .unwrap()
+                .worker,
+            replacement.worker
+        );
+    }
+
+    #[tokio::test]
     async fn explicit_orchestrator_launch_marks_only_the_dedicated_worker() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
@@ -32263,6 +33763,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: "Generic Orchestrator Profile Worker".to_string(),
+                singleton_key: None,
                 profile: Some("builtin:orchestrator".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -32274,12 +33775,97 @@ mod tests {
         .unwrap();
         assert_eq!(generic.worker.singleton_key, None);
         assert!(find_workspace_orchestrator(&api).is_none());
+
+        let forged_public = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(CreateWorkspaceWorkerRequest {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                display_name: "Generic singleton key claimant".to_string(),
+                singleton_key: Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string()),
+                profile: Some("builtin:companion".to_string()),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachments: Vec::new(),
+                control_operation_id: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(forged_public.error, Error::InvalidInput(_)));
+        assert!(
+            api.store
+                .current_worker_singleton_owner(
+                    &workspace_id,
+                    crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY,
+                )
+                .unwrap()
+                .is_none()
+        );
+
+        // Even a trusted internal caller that accidentally assigns the legacy key cannot turn
+        // generic Worker metadata into Orchestrator completion authority.
+        let forged_internal = api
+            .spawn_workspace_worker(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                WorkerSpawnRequest {
+                    requested_worker_name: Some("Forged Orchestrator claimant".to_string()),
+                    singleton_key: Some(
+                        crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string(),
+                    ),
+                    intent: WorkerSpawnIntent::WorkspaceCompanion,
+                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                        expected_segments: 0,
+                    },
+                    profile: ProfileSelector::Builtin("builtin:companion".to_string()),
+                    ticket_assignment: None,
+                    initial_submit: Vec::new(),
+                    workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachments: Vec::new(),
+                    resolved_config_bundle: None,
+                    resolved_worker_observation_enabled: false,
+                    resolved_worker_observation_grants: Vec::new(),
+                    resolved_workspace_api: None,
+                    resolved_memory_settings: None,
+                    resolved_control_operation: None,
+                },
+            )
+            .unwrap()
+            .worker
+            .unwrap();
+        assert!(find_workspace_orchestrator(&api).is_none());
+        assert!(
+            require_online_workspace_orchestrator_source(&api, &forged_internal.worker).is_err()
+        );
+        let stopped = api
+            .runtime
+            .stop_worker(
+                &forged_internal.worker,
+                WorkerLifecycleRequest {
+                    reason: Some("remove forged Orchestrator claimant".to_string()),
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
+        assert!(
+            api.runtime
+                .delete_worker(&forged_internal.worker)
+                .unwrap()
+                .deleted
+        );
+        api.store
+            .delete_worker_registry(&workspace_id, &forged_internal.worker)
+            .unwrap();
+
         let reserved = create_workspace_worker(
             State(api.clone()),
             HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                 display_name: crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string(),
+                singleton_key: None,
                 profile: Some("builtin:orchestrator".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -33039,6 +34625,10 @@ mod tests {
         materializer: worker_runtime::working_directory::RuntimeGitMaterializer,
         spawn_failure: std::sync::Mutex<Option<String>>,
         input_failure: std::sync::Mutex<Option<String>>,
+        input_hook: std::sync::Mutex<
+            Option<Box<dyn FnOnce(&worker_runtime::identity::WorkerRef) + Send + 'static>>,
+        >,
+        input_request_ids: std::sync::Mutex<Vec<Option<String>>>,
         inputs: std::sync::Mutex<Vec<(worker_runtime::identity::WorkerRef, String)>>,
         protocol_methods:
             std::sync::Mutex<Vec<(worker_runtime::identity::WorkerRef, protocol::Method)>>,
@@ -33061,6 +34651,8 @@ mod tests {
                 ),
                 spawn_failure: std::sync::Mutex::new(None),
                 input_failure: std::sync::Mutex::new(None),
+                input_hook: std::sync::Mutex::new(None),
+                input_request_ids: std::sync::Mutex::new(Vec::new()),
                 inputs: std::sync::Mutex::new(Vec::new()),
                 protocol_methods: std::sync::Mutex::new(Vec::new()),
             }
@@ -33070,6 +34662,22 @@ mod tests {
     impl DeterministicExecutionBackend {
         fn reject_inputs(&self, message: impl Into<String>) {
             *self.input_failure.lock().unwrap() = Some(message.into());
+        }
+
+        fn before_input_returns(
+            &self,
+            hook: impl FnOnce(&worker_runtime::identity::WorkerRef) + Send + 'static,
+        ) {
+            *self.input_hook.lock().unwrap() = Some(Box::new(hook));
+        }
+
+        fn take_input_request_ids(&self) -> Vec<Option<String>> {
+            std::mem::take(
+                &mut *self
+                    .input_request_ids
+                    .lock()
+                    .expect("input request ids lock"),
+            )
         }
 
         fn take_inputs(&self) -> Vec<(worker_runtime::identity::WorkerRef, String)> {
@@ -33232,10 +34840,17 @@ mod tests {
             handle: &worker_runtime::execution::WorkerExecutionHandle,
             input: worker_runtime::interaction::WorkerInput,
         ) -> worker_runtime::execution::WorkerExecutionResult {
+            self.input_request_ids
+                .lock()
+                .expect("input request ids lock")
+                .push(input.submission_request_id.clone());
             self.inputs
                 .lock()
                 .expect("inputs lock")
                 .push((handle.worker_ref().clone(), input.content.clone()));
+            if let Some(hook) = self.input_hook.lock().unwrap().take() {
+                hook(handle.worker_ref());
+            }
             if let Some(message) = self.input_failure.lock().unwrap().clone() {
                 return worker_runtime::execution::WorkerExecutionResult::errored(
                     worker_runtime::execution::WorkerExecutionOperation::Input,
@@ -33250,6 +34865,7 @@ mod tests {
                 .cloned()
                 .expect("execution context");
             let submission_request_id = input.submission_request_id.clone();
+            let input_kind = input.kind.clone();
             let content = input.content.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(25));
@@ -33257,7 +34873,13 @@ mod tests {
                     text: format!("server companion echoed: {content}"),
                 });
             });
-            if let Some(submission_request_id) = submission_request_id {
+            if input_kind == worker_runtime::interaction::WorkerInputKind::Notify {
+                worker_runtime::execution::WorkerExecutionResult::accepted_notification(
+                    worker_runtime::execution::WorkerExecutionOperation::Input,
+                    submission_request_id.expect("Notify test input has a Runtime request id"),
+                )
+                .with_worker_state(protocol::WorkerStateSnapshot::initial())
+            } else if let Some(submission_request_id) = submission_request_id {
                 worker_runtime::execution::WorkerExecutionResult::accepted_submission(
                     worker_runtime::execution::WorkerExecutionOperation::Input,
                     submission_request_id,
@@ -33401,6 +35023,1327 @@ mod tests {
             default_selector: Some("HEAD".to_string()),
         }];
         config
+    }
+
+    fn spawn_ticket_check_source(api: &WorkspaceApi, name: &str) -> RuntimeWorkerRef {
+        api.spawn_workspace_worker(
+            EMBEDDED_WORKER_RUNTIME_ID,
+            WorkerSpawnRequest {
+                requested_worker_name: Some(name.to_string()),
+                intent: WorkerSpawnIntent::WorkspaceCompanion,
+                singleton_key: None,
+                acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                    expected_segments: 0,
+                },
+                profile: ProfileSelector::Builtin("builtin:companion".to_string()),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachments: Vec::new(),
+                resolved_config_bundle: None,
+                resolved_worker_observation_enabled: false,
+                resolved_worker_observation_grants: Vec::new(),
+                resolved_workspace_api: None,
+                resolved_memory_settings: None,
+                resolved_control_operation: None,
+            },
+        )
+        .unwrap()
+        .worker
+        .unwrap()
+        .worker
+    }
+
+    fn ticket_check_headers(worker: &RuntimeWorkerRef) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-yoi-runtime-id",
+            axum::http::HeaderValue::from_str(&worker.runtime_id).unwrap(),
+        );
+        headers.insert(
+            "x-yoi-worker-id",
+            axum::http::HeaderValue::from_str(&worker.worker_id).unwrap(),
+        );
+        headers
+    }
+
+    fn ticket_check_job(
+        api: &WorkspaceApi,
+        ticket_id: &str,
+    ) -> crate::backend_job::BackendJobRecord {
+        let ticket = browser_ticket_backend(api)
+            .unwrap()
+            .show(ticket_id.to_string().into())
+            .unwrap();
+        let revision = ticket_item_checker::item_revision(&ticket);
+        api.store
+            .get_backend_job(
+                TEST_WORKSPACE_ID,
+                &format!("ticket-item-check:{ticket_id}:{revision}"),
+            )
+            .unwrap()
+            .expect("Ticket item checker Job was reserved after save")
+    }
+
+    async fn wait_for_ticket_check_attempt(
+        api: &WorkspaceApi,
+        job: &crate::backend_job::BackendJobRecord,
+    ) -> crate::backend_job::BackendJobAttemptRecord {
+        let attempt_id = crate::backend_job::attempt_id(&job.request.job_id, job.current_attempt);
+        for _ in 0..500 {
+            let attempt = api
+                .store
+                .get_backend_job_attempt(TEST_WORKSPACE_ID, &job.request.job_id, &attempt_id)
+                .unwrap()
+                .unwrap();
+            if !matches!(
+                attempt.state,
+                BackendJobAttemptState::Reserved | BackendJobAttemptState::Dispatching
+            ) {
+                return attempt;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("Ticket item checker attempt remained reserved")
+    }
+
+    #[tokio::test]
+    async fn worker_ticket_create_returns_before_checker_and_delivers_grounded_advisory() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        let source = spawn_ticket_check_source(&api, "ticket-check-author");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        execution.before_input_returns(move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        let mut input = ticket::NewTicket::new("Post-save check");
+        input.body = MarkdownText::new(
+            "This turn only creates the Ticket; I will not implement it. Production deployment requires approval.",
+        );
+        let Json(result) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            execute_worker_ticket_test_operation(
+                State(api.clone()),
+                AxumPath(ScopedWorkspacePath {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                }),
+                ticket_check_headers(&source),
+                Json(TicketBackendOperation::Create { input }),
+            ),
+        )
+        .await
+        .expect("Ticket save must not wait for the checker model")
+        .unwrap();
+        let TicketBackendOperationResult::TicketRef(ticket_ref) = result else {
+            panic!("unexpected Ticket create result")
+        };
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("checker dispatch reached the held fake model");
+        let job = ticket_check_job(&api, &ticket_ref.id);
+        let checker_input = ticket_item_checker::parse_input(&job.request.input).unwrap();
+        assert_eq!(
+            checker_input.ticket_resource_key,
+            ticket_ref.resource_key.unwrap()
+        );
+        assert_eq!(checker_input.title, "Post-save check");
+        assert_eq!(
+            checker_input.body,
+            "This turn only creates the Ticket; I will not implement it. Production deployment requires approval."
+        );
+        assert_eq!(checker_input.revision, job.request.input_revision);
+        assert_eq!(job.request.source_worker.as_ref(), Some(&source));
+        assert_eq!(job.request.notification_target.as_ref(), Some(&source));
+        assert_eq!(job.request.limits.max_attempts, 1);
+        assert_eq!(job.request.limits.timeout_seconds, 45);
+        assert!(job.request.instruction.contains("Do not infer user intent"));
+        let dispatched_inputs = execution.take_inputs();
+        assert_eq!(dispatched_inputs.len(), 1);
+        assert!(dispatched_inputs[0].1.contains(&checker_input.revision));
+
+        release_tx.send(()).unwrap();
+        let attempt = wait_for_ticket_check_attempt(&api, &job).await;
+        assert_eq!(attempt.state, BackendJobAttemptState::Dispatched);
+        let worker = attempt.worker.clone().unwrap();
+        let submission = BackendJobResultSubmission {
+            job_id: job.request.job_id.clone(),
+            attempt_id: attempt.attempt_id.clone(),
+            input_revision: job.request.input_revision.clone(),
+            result: serde_json::json!({"findings": [{
+                "category": "writer_scope",
+                "quote": "I will not implement it",
+                "reason": "The writer's current-turn boundary appears as a durable requirement.",
+                "suggestion": "Remove the writer-specific boundary from the active requirements."
+            }]}),
+        };
+        let accepted = api.accept_backend_job_result(&worker, &submission).unwrap();
+        assert_eq!(accepted.job.state, BackendJobState::Completed);
+        let notifications = execution.take_inputs();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].0.worker_id.to_string(), source.worker_id);
+        assert!(
+            notifications[0]
+                .1
+                .contains("[Ticket item checker advisory]")
+        );
+        assert!(notifications[0].1.contains(&checker_input.revision));
+        assert!(notifications[0].1.contains("I will not implement it"));
+        assert!(notifications[0].1.contains("not a new user request"));
+        assert!(
+            !notifications[0]
+                .1
+                .contains("Production deployment requires approval")
+        );
+
+        let replay = api.accept_backend_job_result(&worker, &submission).unwrap();
+        assert!(replay.replayed);
+        assert!(execution.take_inputs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ticket_checker_fake_model_regressions_preserve_classification_boundaries() {
+        struct FakeTicketCheckerModel;
+
+        impl FakeTicketCheckerModel {
+            fn respond(request: &BackendJobRequest) -> Value {
+                let input = ticket_item_checker::parse_input(&request.input).unwrap();
+                assert!(request.instruction.contains("writer_scope"));
+                assert!(request.instruction.contains("internal_inconsistency"));
+                assert!(request.instruction.contains("ambiguous_boundary"));
+                assert!(
+                    request
+                        .instruction
+                        .contains("Production deployment requires approval")
+                );
+                assert!(request.instruction.contains("background, quotations"));
+                if input
+                    .body
+                    .contains("This time I only create the Ticket; I will not implement it.")
+                    && !input.body.starts_with("Background bug example:")
+                {
+                    serde_json::json!({"findings": [{
+                        "category": "writer_scope",
+                        "quote": "I will not implement it",
+                        "reason": "The active requirement records the writer's own implementation boundary.",
+                        "suggestion": "Remove the writer-specific action boundary."
+                    }]})
+                } else if input.body.contains("The rollout region is undecided.")
+                    && input.body.contains("The rollout region is us-east-1.")
+                {
+                    serde_json::json!({"findings": [{
+                        "category": "internal_inconsistency",
+                        "quote": "The rollout region is undecided.",
+                        "reason": "The same active text also settles the rollout region as us-east-1.",
+                        "suggestion": "Choose either the unresolved or settled rollout-region statement."
+                    }]})
+                } else if input.body == "Implementation stops after Ticket creation." {
+                    serde_json::json!({"findings": [{
+                        "category": "ambiguous_boundary",
+                        "quote": "Implementation stops after Ticket creation.",
+                        "reason": "The text alone does not establish whether this is a delivery constraint or the writer's current action boundary.",
+                        "suggestion": "Confirm whether this limits the product workflow or only the current writer."
+                    }]})
+                } else {
+                    serde_json::json!({"findings": []})
+                }
+            }
+        }
+
+        struct Case {
+            name: &'static str,
+            body: &'static str,
+            advisory_quote: Option<&'static str>,
+        }
+        let cases = vec![
+            Case {
+                name: "writer-scope-positive",
+                body: "This time I only create the Ticket; I will not implement it.",
+                advisory_quote: Some("I will not implement it"),
+            },
+            Case {
+                name: "production-approval-negative",
+                body: "Production deployment requires approval.",
+                advisory_quote: None,
+            },
+            Case {
+                name: "quoted-background-negative",
+                body: "Background bug example: a generated Ticket once said “I will not implement it.” Do not reproduce that sentence in generated requirements.",
+                advisory_quote: None,
+            },
+            Case {
+                name: "unresolved-versus-settled-positive",
+                body: "The rollout region is undecided. The rollout region is us-east-1.",
+                advisory_quote: Some("The rollout region is undecided."),
+            },
+            Case {
+                name: "ambiguous-boundary-confirmation",
+                body: "Implementation stops after Ticket creation.",
+                advisory_quote: Some("Implementation stops after Ticket creation."),
+            },
+        ];
+
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        let source = spawn_ticket_check_source(&api, "ticket-check-boundary-author");
+        for case in cases {
+            let mut input = ticket::NewTicket::new(format!("Boundary case: {}", case.name));
+            input.body = MarkdownText::new(case.body);
+            let Json(TicketBackendOperationResult::TicketRef(reference)) =
+                execute_worker_ticket_test_operation(
+                    State(api.clone()),
+                    AxumPath(ScopedWorkspacePath {
+                        workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    }),
+                    ticket_check_headers(&source),
+                    Json(TicketBackendOperation::Create { input }),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("{}: unexpected Ticket create result", case.name);
+            };
+            let job = ticket_check_job(&api, &reference.id);
+            let attempt = wait_for_ticket_check_attempt(&api, &job).await;
+            execution.take_inputs();
+            api.accept_backend_job_result(
+                attempt.worker.as_ref().unwrap(),
+                &BackendJobResultSubmission {
+                    job_id: job.request.job_id.clone(),
+                    attempt_id: attempt.attempt_id,
+                    input_revision: job.request.input_revision.clone(),
+                    result: FakeTicketCheckerModel::respond(&job.request),
+                },
+            )
+            .unwrap_or_else(|error| panic!("{}: {error}", case.name));
+            let notifications = execution.take_inputs();
+            let advisories = notifications
+                .iter()
+                .filter(|(_, content)| content.contains("[Ticket item checker advisory]"))
+                .collect::<Vec<_>>();
+            match case.advisory_quote {
+                Some(quote) => {
+                    assert_eq!(advisories.len(), 1, "{}", case.name);
+                    assert!(advisories[0].1.contains(quote), "{}", case.name);
+                }
+                None => assert!(advisories.is_empty(), "{}", case.name),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ticket_checker_burst_keeps_excess_revisions_durable_and_drains_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, _execution) = test_api_with_recording_backend(temp.path()).await;
+        let source = spawn_ticket_check_source(&api, "ticket-check-burst-author");
+        let mut jobs = Vec::new();
+        for index in 0..6 {
+            let mut input = ticket::NewTicket::new(format!("Burst check {index}"));
+            input.body = MarkdownText::new(format!("Durable requirement {index}."));
+            let Json(result) = execute_worker_ticket_test_operation(
+                State(api.clone()),
+                AxumPath(ScopedWorkspacePath {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                }),
+                ticket_check_headers(&source),
+                Json(TicketBackendOperation::Create { input }),
+            )
+            .await
+            .unwrap();
+            let TicketBackendOperationResult::TicketRef(reference) = result else {
+                panic!("unexpected Ticket create result");
+            };
+            jobs.push(ticket_check_job(&api, &reference.id));
+        }
+
+        let mut initial = Vec::new();
+        for _ in 0..200 {
+            initial = jobs
+                .iter()
+                .map(|job| {
+                    api.store
+                        .get_backend_job_attempt(
+                            TEST_WORKSPACE_ID,
+                            &job.request.job_id,
+                            &crate::backend_job::attempt_id(&job.request.job_id, 1),
+                        )
+                        .unwrap()
+                        .unwrap()
+                })
+                .collect();
+            let dispatched = initial
+                .iter()
+                .filter(|attempt| attempt.state == BackendJobAttemptState::Dispatched)
+                .count();
+            let reserved = initial
+                .iter()
+                .filter(|attempt| attempt.state == BackendJobAttemptState::Reserved)
+                .count();
+            if dispatched == 4 && reserved == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            initial
+                .iter()
+                .filter(|attempt| attempt.state == BackendJobAttemptState::Dispatched)
+                .count(),
+            4
+        );
+        assert_eq!(
+            initial
+                .iter()
+                .filter(|attempt| attempt.state == BackendJobAttemptState::Reserved)
+                .count(),
+            2,
+            "capacity must leave excess successful saves durably queued"
+        );
+
+        // Restart reconciliation is idempotent for running attempts and retains
+        // the queued revisions until a slot becomes available.
+        api.recover_backend_jobs().unwrap();
+        let mut completed = std::collections::BTreeSet::new();
+        for _ in 0..300 {
+            for job in &jobs {
+                let attempt = api
+                    .store
+                    .get_backend_job_attempt(
+                        TEST_WORKSPACE_ID,
+                        &job.request.job_id,
+                        &crate::backend_job::attempt_id(&job.request.job_id, 1),
+                    )
+                    .unwrap()
+                    .unwrap();
+                if attempt.state == BackendJobAttemptState::Dispatched
+                    && !completed.contains(&job.request.job_id)
+                {
+                    api.accept_backend_job_result(
+                        attempt.worker.as_ref().unwrap(),
+                        &BackendJobResultSubmission {
+                            job_id: job.request.job_id.clone(),
+                            attempt_id: attempt.attempt_id,
+                            input_revision: job.request.input_revision.clone(),
+                            result: serde_json::json!({"findings": []}),
+                        },
+                    )
+                    .unwrap();
+                    completed.insert(job.request.job_id.clone());
+                }
+            }
+            if completed.len() == jobs.len() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(completed.len(), jobs.len());
+        assert!(jobs.iter().all(|job| {
+            api.store
+                .get_backend_job(TEST_WORKSPACE_ID, &job.request.job_id)
+                .unwrap()
+                .is_some_and(|job| job.state == BackendJobState::Completed)
+        }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_worker_edits_bind_exact_saved_snapshots_to_their_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, _execution) = test_api_with_recording_backend(temp.path()).await;
+        let source_a = spawn_ticket_check_source(&api, "ticket-check-editor-a");
+        let source_b = spawn_ticket_check_source(&api, "ticket-check-editor-b");
+        let ticket_ref = browser_ticket_backend(&api)
+            .unwrap()
+            .create(ticket::NewTicket::new("Concurrent checker snapshots"))
+            .unwrap();
+        let initial_body = browser_ticket_backend(&api)
+            .unwrap()
+            .show(ticket_ref.id.clone().into())
+            .unwrap()
+            .document
+            .body
+            .as_str()
+            .to_string();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let run_edit = |source: RuntimeWorkerRef, body: &'static str| {
+            let api = api.clone();
+            let ticket_id = ticket_ref.id.clone();
+            let barrier = barrier.clone();
+            tokio::task::spawn_blocking(move || {
+                barrier.wait();
+                tokio::runtime::Handle::current().block_on(execute_worker_ticket_test_operation(
+                    State(api),
+                    AxumPath(ScopedWorkspacePath {
+                        workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    }),
+                    ticket_check_headers(&source),
+                    Json(TicketBackendOperation::EditItem {
+                        id: ticket_id.into(),
+                        edit: TicketItemEdit {
+                            body: Some(MarkdownText::new(body)),
+                            ..Default::default()
+                        },
+                    }),
+                ))
+            })
+        };
+        let (result_a, result_b) = tokio::join!(
+            run_edit(source_a.clone(), "Exact body from worker A."),
+            run_edit(source_b.clone(), "Exact body from worker B.")
+        );
+        let Json(TicketBackendOperationResult::Ticket(ticket_a)) = result_a.unwrap().unwrap()
+        else {
+            panic!("unexpected first edit result");
+        };
+        let Json(TicketBackendOperationResult::Ticket(ticket_b)) = result_b.unwrap().unwrap()
+        else {
+            panic!("unexpected second edit result");
+        };
+        let snapshots = [
+            (ticket_a, source_a, "Exact body from worker A."),
+            (ticket_b, source_b, "Exact body from worker B."),
+        ];
+        let mut checked_inputs = Vec::new();
+        for (ticket, source, expected_body) in snapshots {
+            let revision = ticket_item_checker::item_revision(&ticket);
+            let job = api
+                .store
+                .get_backend_job(
+                    TEST_WORKSPACE_ID,
+                    &format!("ticket-item-check:{}:{revision}", ticket.meta.id),
+                )
+                .unwrap()
+                .expect("each successful edit has its own checker Job");
+            let input = ticket_item_checker::parse_input(&job.request.input).unwrap();
+            assert_eq!(input.revision, revision);
+            assert_eq!(input.body, expected_body);
+            assert_eq!(job.request.source_worker.as_ref(), Some(&source));
+            assert_eq!(job.request.notification_target.as_ref(), Some(&source));
+            checked_inputs.push(input);
+        }
+        let first = checked_inputs
+            .iter()
+            .find(|input| {
+                matches!(
+                    &input.edit,
+                    TicketItemCheckEdit::Edit {
+                        previous_body: Some(previous),
+                        ..
+                    } if previous == &initial_body
+                )
+            })
+            .expect("one edit must atomically observe the initial preimage");
+        let second = checked_inputs
+            .iter()
+            .find(|input| input.revision != first.revision)
+            .unwrap();
+        assert!(matches!(
+            &second.edit,
+            TicketItemCheckEdit::Edit {
+                previous_body: Some(previous),
+                ..
+            } if previous == &first.body
+        ));
+    }
+
+    #[tokio::test]
+    async fn ticket_checker_suppresses_stale_and_clean_results_and_diagnoses_invalid_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        let source = spawn_ticket_check_source(&api, "ticket-check-editor");
+        let backend = browser_ticket_backend(&api).unwrap();
+        let ticket_ref = backend
+            .create(ticket::NewTicket::new("Checker revision fencing"))
+            .unwrap();
+
+        let edit = |body: &str| TicketBackendOperation::EditItem {
+            id: ticket_ref.id.clone().into(),
+            edit: TicketItemEdit {
+                body: Some(MarkdownText::new(body)),
+                ..Default::default()
+            },
+        };
+        let Json(_) = execute_worker_ticket_test_operation(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            ticket_check_headers(&source),
+            Json(edit("I will not implement this Ticket.")),
+        )
+        .await
+        .unwrap();
+        let stale_job = ticket_check_job(&api, &ticket_ref.id);
+        let stale_attempt = wait_for_ticket_check_attempt(&api, &stale_job).await;
+
+        let Json(_) = execute_worker_ticket_test_operation(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            ticket_check_headers(&source),
+            Json(edit("Production deployment requires approval.")),
+        )
+        .await
+        .unwrap();
+        let current_job = ticket_check_job(&api, &ticket_ref.id);
+        let current_attempt = wait_for_ticket_check_attempt(&api, &current_job).await;
+        execution.take_inputs();
+
+        api.accept_backend_job_result(
+            stale_attempt.worker.as_ref().unwrap(),
+            &BackendJobResultSubmission {
+                job_id: stale_job.request.job_id.clone(),
+                attempt_id: stale_attempt.attempt_id.clone(),
+                input_revision: stale_job.request.input_revision.clone(),
+                result: serde_json::json!({"findings": [{
+                    "category": "writer_scope",
+                    "quote": "I will not implement this Ticket",
+                    "reason": "Writer scope is mixed into requirements.",
+                    "suggestion": "Remove the writer-specific sentence."
+                }]}),
+            },
+        )
+        .unwrap();
+        assert!(execution.take_inputs().is_empty());
+        let stale_delivery_id =
+            crate::backend_job::delivery_id(&stale_job.request.job_id, &stale_attempt.attempt_id);
+        let (stale_delivery, claimed) = api
+            .store
+            .reserve_backend_job_delivery(
+                TEST_WORKSPACE_ID,
+                &stale_delivery_id,
+                &stale_job.request.job_id,
+                &source,
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+        assert!(!claimed);
+        assert_eq!(stale_delivery.state, BackendJobDeliveryState::Completed);
+        assert_eq!(
+            stale_delivery.failure_category.as_deref(),
+            Some("notification_suppressed_stale_revision")
+        );
+
+        api.accept_backend_job_result(
+            current_attempt.worker.as_ref().unwrap(),
+            &BackendJobResultSubmission {
+                job_id: current_job.request.job_id.clone(),
+                attempt_id: current_attempt.attempt_id.clone(),
+                input_revision: current_job.request.input_revision.clone(),
+                result: serde_json::json!({"findings": []}),
+            },
+        )
+        .unwrap();
+        assert!(execution.take_inputs().is_empty());
+        let clean_delivery_id = crate::backend_job::delivery_id(
+            &current_job.request.job_id,
+            &current_attempt.attempt_id,
+        );
+        let (clean_delivery, claimed) = api
+            .store
+            .reserve_backend_job_delivery(
+                TEST_WORKSPACE_ID,
+                &clean_delivery_id,
+                &current_job.request.job_id,
+                &source,
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+        assert!(!claimed);
+        assert_eq!(
+            clean_delivery.failure_category.as_deref(),
+            Some("notification_suppressed_no_findings")
+        );
+
+        let Json(_) = execute_worker_ticket_test_operation(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            ticket_check_headers(&source),
+            Json(edit("A final exact body.")),
+        )
+        .await
+        .unwrap();
+        let invalid_job = ticket_check_job(&api, &ticket_ref.id);
+        let invalid_attempt = wait_for_ticket_check_attempt(&api, &invalid_job).await;
+        assert!(
+            api.accept_backend_job_result(
+                invalid_attempt.worker.as_ref().unwrap(),
+                &BackendJobResultSubmission {
+                    job_id: invalid_job.request.job_id.clone(),
+                    attempt_id: invalid_attempt.attempt_id.clone(),
+                    input_revision: invalid_job.request.input_revision.clone(),
+                    result: serde_json::json!({"findings": [{
+                        "category": "internal_inconsistency",
+                        "quote": "invented quote",
+                        "reason": "Not grounded.",
+                        "suggestion": "No action."
+                    }]}),
+                },
+            )
+            .is_err()
+        );
+        let failed = api
+            .store
+            .get_backend_job_attempt(
+                TEST_WORKSPACE_ID,
+                &invalid_job.request.job_id,
+                &invalid_attempt.attempt_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.state, BackendJobAttemptState::Failed);
+        assert_eq!(failed.failure_category.as_deref(), Some("invalid_result"));
+        assert!(
+            execution
+                .take_inputs()
+                .iter()
+                .all(|(_, content)| { !content.contains("[Ticket item checker advisory]") })
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_and_failed_ticket_edits_do_not_claim_checker_coverage() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        let source = spawn_ticket_check_source(&api, "ticket-check-failure-source");
+        let ticket_ref = browser_ticket_backend(&api)
+            .unwrap()
+            .create(ticket::NewTicket::new("Browser edit coverage"))
+            .unwrap();
+        let Json(_) = scoped_edit_ticket_item(
+            State(api.clone()),
+            AxumPath(ScopedRecordPath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                id: ticket_ref.id.clone(),
+            }),
+            Json(server_api::BrowserEditTicketRequest {
+                title: None,
+                body: Some("Edited directly in the browser.".to_string()),
+                old_string: None,
+                new_string: None,
+                replace_all: false,
+                target: None,
+                author: Some("browser-user".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        let browser_ticket = browser_ticket_backend(&api)
+            .unwrap()
+            .show(ticket_ref.id.clone().into())
+            .unwrap();
+        let browser_revision = ticket_item_checker::item_revision(&browser_ticket);
+        assert!(
+            api.store
+                .get_backend_job(
+                    TEST_WORKSPACE_ID,
+                    &format!("ticket-item-check:{}:{browser_revision}", ticket_ref.id),
+                )
+                .unwrap()
+                .is_none(),
+            "direct browser edits are explicitly outside the Worker advisory path"
+        );
+
+        let failed = execute_worker_ticket_test_operation(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            ticket_check_headers(&source),
+            Json(TicketBackendOperation::EditItem {
+                id: "missing-ticket".into(),
+                edit: TicketItemEdit {
+                    body: Some(MarkdownText::new("must not be checked")),
+                    ..Default::default()
+                },
+            }),
+        )
+        .await;
+        assert!(failed.is_err());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(execution.take_inputs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn backend_job_runner_uses_registered_embedded_worker_and_structured_result_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        let request = BackendJobRequest {
+            job_id: "runner-check-1".to_string(),
+            purpose: "runner_contract_check".to_string(),
+            input_revision: "revision-1".to_string(),
+            input_ref: "test://runner/input/1".to_string(),
+            input: serde_json::json!({"value": "immutable"}),
+            instruction: "Return a structured check result.".to_string(),
+            profile: "builtin:backend-job".to_string(),
+            source_worker: None,
+            notification_target: None,
+            limits: crate::backend_job::BackendJobLimits::default(),
+        };
+
+        let stale_reservation = api
+            .store
+            .reserve_backend_job(
+                TEST_WORKSPACE_ID,
+                &request,
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+        let dispatched = api
+            .dispatch_backend_job_reservation(stale_reservation.clone())
+            .unwrap();
+        let concurrent_replay = api
+            .dispatch_backend_job_reservation(stale_reservation)
+            .unwrap();
+        assert!(concurrent_replay.replayed);
+        assert_eq!(
+            execution.take_inputs().len(),
+            1,
+            "a stale concurrent dispatch replay must not submit the attempt twice"
+        );
+        assert_eq!(dispatched.attempt.state, BackendJobAttemptState::Dispatched);
+        assert!(
+            dispatched.attempt.runtime_run_id.is_some(),
+            "accepted Job input must be fenced to durable Runtime run evidence"
+        );
+        let worker = dispatched.attempt.worker.clone().expect("bound Job Worker");
+        assert_eq!(worker.runtime_id, EMBEDDED_WORKER_RUNTIME_ID);
+        assert!(
+            api.store
+                .get_worker_registry(TEST_WORKSPACE_ID, &worker)
+                .unwrap()
+                .is_some(),
+            "Job dispatch must use the ordinary Workspace Worker registry"
+        );
+        assert_eq!(
+            api.store
+                .worker_registry_projection(TEST_WORKSPACE_ID, &worker)
+                .unwrap()
+                .unwrap()
+                .job,
+            Some(crate::backend_job::BackendJobWorkerBinding {
+                job_id: request.job_id.clone(),
+                attempt_id: dispatched.attempt.attempt_id.clone(),
+                purpose: request.purpose.clone(),
+            })
+        );
+        let input_error = send_runtime_worker_input(
+            State(api.clone()),
+            AxumPath((worker.runtime_id.clone(), worker.worker_id.clone())),
+            Json(server_api::RuntimeWorkerInputRequest {
+                kind: Some("user".to_string()),
+                content: "attempt to rerun immutable Job input".to_string(),
+                segments: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            input_error.into_response().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(
+            execution.take_inputs().is_empty(),
+            "Job-owned Workers must reject interactive reruns"
+        );
+        let replay = api.dispatch_backend_job(&request).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.attempt.worker, Some(worker.clone()));
+
+        let accepted = api
+            .accept_backend_job_result(
+                &worker,
+                &BackendJobResultSubmission {
+                    job_id: request.job_id.clone(),
+                    attempt_id: dispatched.attempt.attempt_id,
+                    input_revision: request.input_revision,
+                    result: serde_json::json!({"valid": true}),
+                },
+            )
+            .unwrap();
+        assert_eq!(accepted.job.state, BackendJobState::Completed);
+    }
+
+    #[tokio::test]
+    async fn backend_job_fast_result_is_accepted_after_prebound_tracked_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        let request = BackendJobRequest {
+            job_id: "r".repeat(256),
+            purpose: "fast_result_contract_check".to_string(),
+            input_revision: "revision-1".to_string(),
+            input_ref: "test://runner/fast-result/1".to_string(),
+            input: serde_json::json!({"value": "immutable"}),
+            instruction: "Return a structured check result.".to_string(),
+            profile: "builtin:backend-job".to_string(),
+            source_worker: None,
+            notification_target: None,
+            limits: crate::backend_job::BackendJobLimits::default(),
+        };
+        let acceptance_observed = Arc::new(std::sync::Mutex::new(None));
+        let hook_api = api.clone();
+        let hook_request = request.clone();
+        let hook_observed = acceptance_observed.clone();
+        execution.before_input_returns(move |worker| {
+            let source =
+                RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, worker.worker_id.to_string());
+            let accepted = hook_api
+                .accept_backend_job_result(
+                    &source,
+                    &BackendJobResultSubmission {
+                        job_id: hook_request.job_id.clone(),
+                        attempt_id: crate::backend_job::attempt_id(&hook_request.job_id, 1),
+                        input_revision: hook_request.input_revision.clone(),
+                        result: serde_json::json!({"valid": true}),
+                    },
+                )
+                .is_ok();
+            *hook_observed.lock().unwrap() = Some(accepted);
+        });
+
+        let dispatched = api.dispatch_backend_job(&request).unwrap();
+        assert_eq!(*acceptance_observed.lock().unwrap(), Some(true));
+        assert_eq!(dispatched.job.state, BackendJobState::Completed);
+        let expected_run_id =
+            crate::backend_job::runtime_run_id(&crate::backend_job::attempt_id(&request.job_id, 1));
+        assert_eq!(
+            dispatched.attempt.runtime_run_id.as_deref(),
+            Some(expected_run_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_job_delivery_recovery_replays_same_tracked_notification_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = test_server_config(temp.path());
+        let store = SqliteWorkspaceStore::open(config.database_path.clone()).unwrap();
+        let execution = Arc::new(DeterministicExecutionBackend::default());
+        let api = WorkspaceApi::new_with_execution_backend(
+            config.clone(),
+            Arc::new(store),
+            execution.clone(),
+        )
+        .await
+        .unwrap();
+        let target = api
+            .spawn_workspace_worker(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                WorkerSpawnRequest {
+                    requested_worker_name: Some("job-notification-target".to_string()),
+                    intent: WorkerSpawnIntent::WorkspaceCompanion,
+                    singleton_key: None,
+                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                        expected_segments: 0,
+                    },
+                    profile: ProfileSelector::Builtin("builtin:companion".to_string()),
+                    ticket_assignment: None,
+                    initial_submit: Vec::new(),
+                    workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachments: Vec::new(),
+                    resolved_config_bundle: Some(runtime_test_bundle()),
+                    resolved_worker_observation_enabled: false,
+                    resolved_worker_observation_grants: Vec::new(),
+                    resolved_workspace_api: None,
+                    resolved_memory_settings: None,
+                    resolved_control_operation: None,
+                },
+            )
+            .unwrap()
+            .worker
+            .unwrap()
+            .worker;
+        let request = BackendJobRequest {
+            job_id: "n".repeat(256),
+            purpose: "delivery_recovery_contract_check".to_string(),
+            input_revision: "revision-1".to_string(),
+            input_ref: "test://runner/delivery-recovery/1".to_string(),
+            input: serde_json::json!({"value": "immutable"}),
+            instruction: "Return a structured check result.".to_string(),
+            profile: "builtin:backend-job".to_string(),
+            source_worker: None,
+            notification_target: Some(target.clone()),
+            limits: crate::backend_job::BackendJobLimits {
+                timeout_seconds: 1,
+                ..Default::default()
+            },
+        };
+        let dispatched = api.dispatch_backend_job(&request).unwrap();
+        let worker = dispatched.attempt.worker.clone().unwrap();
+        let acceptance = api
+            .store
+            .accept_backend_job_result(
+                TEST_WORKSPACE_ID,
+                &worker,
+                &BackendJobResultSubmission {
+                    job_id: request.job_id.clone(),
+                    attempt_id: dispatched.attempt.attempt_id.clone(),
+                    input_revision: request.input_revision.clone(),
+                    result: serde_json::json!({"valid": true}),
+                },
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+        let delivery_id =
+            crate::backend_job::delivery_id(&request.job_id, &acceptance.attempt.attempt_id);
+        let (_, claimed) = api
+            .store
+            .reserve_backend_job_delivery(
+                TEST_WORKSPACE_ID,
+                &delivery_id,
+                &request.job_id,
+                &target,
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+        assert!(claimed);
+        let recoverable = api
+            .store
+            .recover_backend_job_deliveries(
+                TEST_WORKSPACE_ID,
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+        assert_eq!(recoverable.len(), 1);
+        execution.take_input_request_ids();
+        api.deliver_backend_job_result(&acceptance, &target);
+        let request_ids = execution.take_input_request_ids();
+        assert!(
+            request_ids
+                .iter()
+                .any(|request_id| request_id.as_deref() == Some(delivery_id.as_str())),
+            "recovery must replay the durable delivery id as the tracked notification id: {request_ids:?}"
+        );
+        let (delivery, claimed) = api
+            .store
+            .reserve_backend_job_delivery(
+                TEST_WORKSPACE_ID,
+                &delivery_id,
+                &request.job_id,
+                &target,
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+        assert!(!claimed);
+        assert_eq!(delivery.state, BackendJobDeliveryState::Completed);
+    }
+
+    #[tokio::test]
+    async fn backend_job_spawn_transport_error_terminalizes_reserved_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        api.runtime
+            .unregister_if_idle(EMBEDDED_WORKER_RUNTIME_ID, 10)
+            .unwrap();
+        let request = BackendJobRequest {
+            job_id: "runner-spawn-error-1".to_string(),
+            purpose: "spawn_error_contract_check".to_string(),
+            input_revision: "revision-1".to_string(),
+            input_ref: "test://runner/spawn-error/1".to_string(),
+            input: serde_json::json!({"value": "immutable"}),
+            instruction: "Return a structured check result.".to_string(),
+            profile: "builtin:backend-job".to_string(),
+            source_worker: None,
+            notification_target: None,
+            limits: crate::backend_job::BackendJobLimits::default(),
+        };
+
+        assert!(api.dispatch_backend_job(&request).is_err());
+        let attempt = api
+            .store
+            .get_backend_job_attempt(
+                TEST_WORKSPACE_ID,
+                &request.job_id,
+                &crate::backend_job::attempt_id(&request.job_id, 1),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.state, BackendJobAttemptState::Failed);
+        assert_eq!(attempt.failure_category.as_deref(), Some("dispatch_error"));
+    }
+
+    #[tokio::test]
+    async fn backend_job_input_error_is_durable_unknown_and_not_automatically_retried() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        execution.reject_inputs("model transport unavailable");
+        let request = BackendJobRequest {
+            job_id: "runner-input-failure-1".to_string(),
+            purpose: "failure_contract_check".to_string(),
+            input_revision: "revision-1".to_string(),
+            input_ref: "test://runner/failure/1".to_string(),
+            input: serde_json::json!({"value": "immutable"}),
+            instruction: "Return a structured check result.".to_string(),
+            profile: "builtin:backend-job".to_string(),
+            source_worker: None,
+            notification_target: None,
+            limits: crate::backend_job::BackendJobLimits::default(),
+        };
+
+        assert!(api.dispatch_backend_job(&request).is_err());
+        let failed = api
+            .store
+            .get_backend_job_attempt(
+                TEST_WORKSPACE_ID,
+                &request.job_id,
+                &crate::backend_job::attempt_id(&request.job_id, 1),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.state, BackendJobAttemptState::Unknown);
+        assert_eq!(
+            failed.failure_category.as_deref(),
+            Some("input_outcome_unknown")
+        );
+        assert!(
+            api.retry_backend_job(&request.job_id).is_err(),
+            "an ambiguous input outcome must not be retried automatically"
+        );
+        assert!(
+            api.store
+                .get_backend_job_attempt(
+                    TEST_WORKSPACE_ID,
+                    &request.job_id,
+                    &crate::backend_job::attempt_id(&request.job_id, 2),
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_job_recovery_drains_more_than_one_reserved_page() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        api.runtime
+            .unregister_if_idle(EMBEDDED_WORKER_RUNTIME_ID, 10)
+            .unwrap();
+        let mut jobs = Vec::new();
+        for index in 0..(usize::from(ABSOLUTE_MAX_CONCURRENT_JOBS) + 6) {
+            let request = BackendJobRequest {
+                job_id: format!("restart-page-{index:03}"),
+                purpose: "restart_page_contract_check".to_string(),
+                input_revision: "1".to_string(),
+                input_ref: format!("fixture://restart-page/{index}"),
+                input: serde_json::json!({"index": index}),
+                instruction: "Return a structured fixture result.".to_string(),
+                profile: "builtin:backend-job".to_string(),
+                source_worker: None,
+                notification_target: None,
+                limits: crate::backend_job::BackendJobLimits {
+                    max_concurrent_jobs: ABSOLUTE_MAX_CONCURRENT_JOBS,
+                    ..Default::default()
+                },
+            };
+            api.store
+                .reserve_backend_job(
+                    TEST_WORKSPACE_ID,
+                    &request,
+                    &format!("2026-09-01T00:{:02}:{:02}Z", index / 60, index % 60),
+                )
+                .unwrap();
+            jobs.push(request.job_id);
+        }
+
+        api.recover_backend_jobs().unwrap();
+        assert!(
+            api.store
+                .list_reserved_backend_job_attempts(TEST_WORKSPACE_ID, jobs.len())
+                .unwrap()
+                .is_empty(),
+            "restart recovery must continue beyond its first bounded page when dispatches terminalize"
+        );
+        assert!(jobs.iter().all(|job_id| {
+            api.store
+                .get_backend_job(TEST_WORKSPACE_ID, job_id)
+                .unwrap()
+                .is_some_and(|job| job.state == BackendJobState::Failed)
+        }));
+    }
+
+    #[tokio::test]
+    async fn backend_job_recovery_dispatches_reserved_attempt_without_duplicate_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        let request = BackendJobRequest {
+            job_id: "runner-restart-1".to_string(),
+            purpose: "restart_contract_check".to_string(),
+            input_revision: "revision-1".to_string(),
+            input_ref: "test://runner/restart/1".to_string(),
+            input: serde_json::json!({"value": "immutable"}),
+            instruction: "Return a structured check result.".to_string(),
+            profile: "builtin:backend-job".to_string(),
+            source_worker: None,
+            notification_target: None,
+            limits: crate::backend_job::BackendJobLimits::default(),
+        };
+        let reserved = api
+            .store
+            .reserve_backend_job(
+                TEST_WORKSPACE_ID,
+                &request,
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+        assert_eq!(reserved.attempt.state, BackendJobAttemptState::Reserved);
+        api.recover_backend_jobs().unwrap();
+
+        let recovered = api
+            .store
+            .get_backend_job_attempt(
+                TEST_WORKSPACE_ID,
+                &request.job_id,
+                &reserved.attempt.attempt_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.state, BackendJobAttemptState::Dispatched);
+        let recovered_worker = recovered.worker.clone().expect("recovered Job Worker");
+        let replay = api.dispatch_backend_job(&request).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.attempt.worker, Some(recovered_worker));
+    }
+
+    #[tokio::test]
+    async fn backend_job_recovery_marks_unreconcilable_worker_execution_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        let request = BackendJobRequest {
+            job_id: "runner-unknown-1".to_string(),
+            purpose: "unknown_contract_check".to_string(),
+            input_revision: "revision-1".to_string(),
+            input_ref: "test://runner/unknown/1".to_string(),
+            input: serde_json::json!({"value": "immutable"}),
+            instruction: "Return a structured check result.".to_string(),
+            profile: "builtin:backend-job".to_string(),
+            source_worker: None,
+            notification_target: None,
+            limits: crate::backend_job::BackendJobLimits::default(),
+        };
+        let reserved = api
+            .store
+            .reserve_backend_job(
+                TEST_WORKSPACE_ID,
+                &request,
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+        let missing_worker = RuntimeWorkerRef::new(
+            EMBEDDED_WORKER_RUNTIME_ID,
+            "0199a3ae-ecdf-7eb2-883e-a5b7b5f04a0d",
+        );
+        api.store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                worker: missing_worker.clone(),
+                display_name: "Missing Job Worker".to_string(),
+                profile: Some("builtin:backend-job".to_string()),
+                retention_state: "normal".to_string(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: "2026-09-01T00:00:00Z".to_string(),
+                updated_at: "2026-09-01T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        let (_, claimed) = api
+            .store
+            .claim_backend_job_attempt_dispatch(
+                TEST_WORKSPACE_ID,
+                &request.job_id,
+                &reserved.attempt.attempt_id,
+                "2026-09-01T00:00:00Z",
+            )
+            .unwrap();
+        assert!(claimed);
+        api.store
+            .bind_backend_job_attempt_worker(
+                TEST_WORKSPACE_ID,
+                &request.job_id,
+                &reserved.attempt.attempt_id,
+                &missing_worker,
+                Some("missing-runtime-run"),
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+
+        api.recover_backend_jobs().unwrap();
+        let attempt = api
+            .store
+            .get_backend_job_attempt(
+                TEST_WORKSPACE_ID,
+                &request.job_id,
+                &reserved.attempt.attempt_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.state, BackendJobAttemptState::Unknown);
+        assert_eq!(
+            attempt.failure_category.as_deref(),
+            Some("recovery_worker_unknown")
+        );
+        assert_eq!(
+            api.store
+                .get_backend_job(TEST_WORKSPACE_ID, &request.job_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            BackendJobState::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_job_timeout_fences_late_structured_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        let request = BackendJobRequest {
+            job_id: "runner-timeout-1".to_string(),
+            purpose: "timeout_contract_check".to_string(),
+            input_revision: "revision-1".to_string(),
+            input_ref: "test://runner/timeout/1".to_string(),
+            input: serde_json::json!({"value": "immutable"}),
+            instruction: "Wait for a structured result.".to_string(),
+            profile: "builtin:backend-job".to_string(),
+            source_worker: None,
+            notification_target: None,
+            limits: crate::backend_job::BackendJobLimits {
+                timeout_seconds: 1,
+                max_attempts: 1,
+                ..Default::default()
+            },
+        };
+        let dispatched = api.dispatch_backend_job(&request).unwrap();
+        let worker = dispatched.attempt.worker.clone().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+        let attempt = api
+            .store
+            .get_backend_job_attempt(
+                TEST_WORKSPACE_ID,
+                &request.job_id,
+                &dispatched.attempt.attempt_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.state, BackendJobAttemptState::Failed);
+        assert_eq!(attempt.failure_category.as_deref(), Some("timeout"));
+        assert!(
+            api.accept_backend_job_result(
+                &worker,
+                &BackendJobResultSubmission {
+                    job_id: request.job_id,
+                    attempt_id: dispatched.attempt.attempt_id,
+                    input_revision: request.input_revision,
+                    result: serde_json::json!({"late": true}),
+                },
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -35229,13 +38172,12 @@ mod tests {
 
         let resolved_config_bundle = None;
         let existing = api
-            .runtime
-            .spawn_worker(
+            .spawn_workspace_worker(
                 EMBEDDED_WORKER_RUNTIME_ID,
-                test_create_binding(),
                 WorkerSpawnRequest {
                     requested_worker_name: Some(MEMORY_CONSOLIDATION_PROFILE.to_string()),
                     intent: WorkerSpawnIntent::WorkspaceOrchestrator,
+                    singleton_key: Some(MEMORY_CONSOLIDATION_SINGLETON_KEY.to_string()),
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -35295,10 +38237,48 @@ mod tests {
         let consolidaters_after_second = workers_after_second
             .items
             .iter()
-            .filter(|worker| is_memory_consolidation_worker(worker))
+            .filter(|worker| {
+                worker.singleton_key.as_deref() == Some(MEMORY_CONSOLIDATION_SINGLETON_KEY)
+            })
             .collect::<Vec<_>>();
         assert_eq!(consolidaters_after_second.len(), 1);
         assert_eq!(consolidaters_after_second[0].worker.worker_id, worker_id);
+
+        let singleton_worker = RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, &worker_id);
+        let stopped = api
+            .runtime
+            .stop_worker(
+                &singleton_worker,
+                WorkerLifecycleRequest {
+                    reason: Some("replace completed Memory singleton".to_string()),
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
+        let removed = api.runtime.delete_worker(&singleton_worker).unwrap();
+        assert!(removed.deleted);
+        api.store
+            .delete_worker_registry(&api.config.workspace_id, &singleton_worker)
+            .unwrap();
+        let replacement = start_memory_staging_consolidation(
+            api.clone(),
+            MemoryConsolidateStagingOperation { force: true },
+        )
+        .unwrap();
+        assert_eq!(replacement.status, "started");
+        let replacement_owner = api
+            .store
+            .current_worker_singleton_owner(
+                &api.config.workspace_id,
+                MEMORY_CONSOLIDATION_SINGLETON_KEY,
+            )
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            replacement_owner.worker.worker_id, worker_id,
+            "removed singleton generation must be replaceable"
+        );
     }
 
     fn init_clean_git_workspace(path: &std::path::Path) {
@@ -35501,6 +38481,7 @@ mod tests {
                         ticket_id: "notification-source".to_string(),
                         role: TicketWorkerRole::Coder,
                     },
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -35684,6 +38665,7 @@ mod tests {
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.to_string(),
                 display_name: "Manual Coder candidate".to_string(),
+                singleton_key: None,
                 profile: Some("builtin:coder".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -36242,6 +39224,7 @@ mod tests {
                         ticket_id: "implementation-cancellation".to_string(),
                         role: TicketWorkerRole::Coder,
                     },
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -36345,6 +39328,7 @@ mod tests {
                 ticket_id: name.to_string(),
                 role: TicketWorkerRole::Coder,
             },
+            singleton_key: None,
             acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                 expected_segments: 0,
             },
@@ -36960,6 +39944,7 @@ mod tests {
                         ticket_id: "source-ticket".to_string(),
                         role: TicketWorkerRole::Coder,
                     },
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -37026,6 +40011,7 @@ mod tests {
                         ticket_id: "source-ticket".to_string(),
                         role: TicketWorkerRole::Coder,
                     },
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -37354,6 +40340,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_worker_create_rejects_reserved_singleton_key_squatting_and_authority_forgery()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let api = test_api(dir.path()).await;
+        let request = |requested_worker_name: &str,
+                       intent: server_api::RuntimeWorkerSpawnIntent,
+                       profile: &str| server_api::RuntimeWorkerSpawnRequest {
+            requested_worker_name: Some(requested_worker_name.to_string()),
+            intent,
+            singleton_key: Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string()),
+            acceptance: server_api::RuntimeWorkerSpawnAcceptanceRequirement::RunAccepted {
+                expected_segments: 0,
+            },
+            profile: server_api::RuntimeProfileSelector::Builtin(profile.to_string()),
+            ticket_assignment: None,
+            initial_submit: Vec::new(),
+            workdir_attachment_requests: Vec::new(),
+        };
+
+        for candidate in [
+            request(
+                "Generic key squatter",
+                server_api::RuntimeWorkerSpawnIntent::WorkspaceCompanion,
+                "builtin:companion",
+            ),
+            request(
+                crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY,
+                server_api::RuntimeWorkerSpawnIntent::WorkspaceOrchestrator,
+                "builtin:orchestrator",
+            ),
+        ] {
+            let error = scoped_create_runtime_worker(
+                State(api.clone()),
+                AxumPath(ScopedRuntimePath {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                }),
+                Json(candidate),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+        }
+        assert!(
+            api.store
+                .current_worker_singleton_owner(
+                    TEST_WORKSPACE_ID,
+                    crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY,
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(find_workspace_orchestrator(&api).is_none());
+    }
+
+    #[tokio::test]
     async fn runtime_worker_ticket_assignment_rejects_missing_target_attachments() {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
@@ -37370,6 +40413,7 @@ mod tests {
                 ticket_id: ticket.id.clone(),
                 role: server_api::RuntimeTicketWorkerRole::Coder,
             },
+            singleton_key: None,
             acceptance: server_api::RuntimeWorkerSpawnAcceptanceRequirement::RunAccepted {
                 expected_segments: 1,
             },
@@ -38340,6 +41384,7 @@ mod tests {
                 WorkerSpawnRequest {
                     intent: WorkerSpawnIntent::WorkspaceCompanion,
                     requested_worker_name: Some("guard-target".to_string()),
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -38398,6 +41443,7 @@ mod tests {
                 WorkerSpawnRequest {
                     intent: WorkerSpawnIntent::WorkspaceCompanion,
                     requested_worker_name: Some("remove-target".to_string()),
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -38510,6 +41556,7 @@ mod tests {
                 WorkerSpawnRequest {
                     intent: WorkerSpawnIntent::WorkspaceCompanion,
                     requested_worker_name: Some("compensation-target".to_string()),
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -40446,6 +43493,7 @@ mod tests {
                 WorkerSpawnRequest {
                     intent: WorkerSpawnIntent::WorkspaceCompanion,
                     requested_worker_name: Some("cleanup-projection-target".to_string()),
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -40985,6 +44033,7 @@ mod tests {
                 "runtime-test",
                 "spawn-flow-race",
                 &"f".repeat(64),
+                None,
                 &memory_settings,
             )
             .unwrap();
@@ -42722,6 +45771,7 @@ mod tests {
             Json(server_api::RuntimeWorkerSpawnRequest {
                 intent: server_api::RuntimeWorkerSpawnIntent::WorkspaceCompanion,
                 requested_worker_name: Some("Runtime Worker".to_string()),
+                singleton_key: None,
                 acceptance: server_api::RuntimeWorkerSpawnAcceptanceRequirement::RunAccepted {
                     expected_segments: 0,
                 },
@@ -42750,6 +45800,7 @@ mod tests {
             CreateWorkspaceWorkerRequest {
                 runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.to_string(),
                 display_name: "Remote Worker".to_string(),
+                singleton_key: None,
                 profile: Some("builtin:companion".to_string()),
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
@@ -43525,6 +46576,7 @@ mod tests {
                         role: TicketWorkerRole::Coder,
                     },
                     requested_worker_name: None,
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -43555,6 +46607,7 @@ mod tests {
                 WorkerInputRequest {
                     kind: WorkerInputKind::User,
                     content: "persist me".to_string(),
+                    submission_request_id: None,
                     segments: None,
                 },
             )
@@ -43615,6 +46668,7 @@ mod tests {
                 WorkerInputRequest {
                     kind: WorkerInputKind::User,
                     content: "should not be routed to corrupted handle".to_string(),
+                    submission_request_id: None,
                     segments: None,
                 },
             )
@@ -44179,6 +47233,7 @@ mod tests {
         let spawn_request = WorkerSpawnRequest {
             intent: WorkerSpawnIntent::WorkspaceCompanion,
             requested_worker_name: Some("multiplexed-console".to_string()),
+            singleton_key: None,
             acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                 expected_segments: 0,
             },

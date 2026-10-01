@@ -143,6 +143,7 @@ function projectWorker(
     display_name: displayName,
     label: displayName,
     profile: worker.profile ?? null,
+    job: worker.job ?? null,
     tags: [],
     workspace: {
       visibility: "workspace",

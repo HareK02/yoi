@@ -123,6 +123,10 @@ impl SegmentLogSink {
                 | LogEntry::AnnotatedToolResult { .. }
                 | LogEntry::AnnotatedSystemItem { .. }
                 | LogEntry::Invoke { .. }
+                | LogEntry::RunYielded { .. }
+                | LogEntry::RunResumed { .. }
+                | LogEntry::RunCancelled { .. }
+                | LogEntry::RunErrored { .. }
         )
     }
 
@@ -323,9 +327,17 @@ mod tests {
             other => panic!("expected SystemItem, got {other:?}"),
         }
 
+        // Durable logical-Run transitions share the committed-entry lane.
+        sink.publish(LogEntry::RunResumed {
+            ts: now_millis(),
+            source: protocol::RunResumeSource::Compaction,
+            active_run_turn_count: 1,
+        });
+        assert!(matches!(rx.try_recv(), Ok(LogEntry::RunResumed { .. })));
+
         // Mirror still grew with all entries (snapshot completeness).
         let (after_snapshot, _) = sink.subscribe_with_snapshot();
-        assert_eq!(after_snapshot.len(), 4);
+        assert_eq!(after_snapshot.len(), 5);
     }
 
     #[test]

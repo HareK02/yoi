@@ -132,12 +132,22 @@ function canonicalSession(logEntries: unknown[]): Event extends {
         });
         break;
       }
+      case "run_yielded":
+      case "run_resumed":
+      case "run_cancelled":
+        entries.push({
+          entry_id: `legacy-test-${sequence++}`,
+          provenance: "legacy_unknown",
+          ...entry,
+        });
+        break;
       case "run_errored":
         entries.push({
           entry_id: `legacy-test-${sequence++}`,
           provenance: "legacy_unknown",
           kind: "run_error",
           message: entry["message"] ?? "Worker run failed.",
+          failure: entry["failure"],
         });
         break;
     }
@@ -289,6 +299,138 @@ Deno.test("Worker state events and acknowledgements replace the full state", () 
     ),
     "full snapshots must not be rejected by a client-side version comparison",
   );
+});
+
+Deno.test("durable compaction failure reconciles live alert and error in both views", () => {
+  const message = "mid-run compaction failed: summary unavailable";
+  const transition = (
+    entryId: string,
+    data: Record<string, unknown>,
+  ): Event => ({
+    event: "session_entry_committed",
+    data: {
+      entry: {
+        entry_id: entryId,
+        timestamp: 10,
+        provenance: "legacy_unknown",
+        ...data,
+      },
+    },
+  } as Event);
+  const projection = projectConsole([
+    {
+      eventId: "yielded",
+      event: transition("yielded-entry", {
+        kind: "run_yielded",
+        reason: "compaction",
+        active_run_turn_count: 2,
+      }),
+    },
+    {
+      eventId: "alert",
+      event: {
+        event: "alert",
+        data: {
+          level: "error",
+          source: "compactor",
+          message,
+          timestamp_ms: 10,
+        },
+      },
+    },
+    {
+      eventId: "failed",
+      event: transition("failed-entry", {
+        kind: "run_error",
+        message,
+        failure: "compaction",
+      }),
+    },
+    {
+      eventId: "controller-error",
+      event: {
+        event: "error",
+        data: { code: "internal", message: "summary unavailable" },
+      },
+    },
+  ]);
+
+  const errors = projection.lines.filter((line) => line.kind === "error");
+  assertEquals(errors.length, 1);
+  assertEquals(errors[0].title, "Compaction failed");
+  assertEquals(errors[0].body, message);
+  assertEquals(errors[0].entryId, "failed-entry");
+  assertEquals(projectConsoleLines(projection.lines, "normal"), errors);
+  assertEquals(projectConsoleLines(projection.lines, "overview"), errors);
+});
+
+Deno.test("snapshot restores compaction terminal without reviving transition progress", () => {
+  const projection = projectConsole([{
+    eventId: "snapshot",
+    event: snapshotEvent("/repo", [
+      {
+        kind: "run_yielded",
+        timestamp: 1,
+        reason: "compaction",
+        active_run_turn_count: 2,
+      },
+      {
+        kind: "run_resumed",
+        timestamp: 2,
+        source: "compaction",
+        active_run_turn_count: 2,
+      },
+      {
+        kind: "run_errored",
+        timestamp: 3,
+        interrupted: false,
+        message: "mid-run compaction failed: summary unavailable",
+        failure: "compaction",
+      },
+    ]),
+  }]);
+
+  assertEquals(projection.compaction, null);
+  assertEquals(projection.lines.length, 1);
+  assertEquals(projection.lines[0].title, "Compaction failed");
+  assertEquals(projection.lines[0].kind, "error");
+});
+
+Deno.test("intentional cancellation stays non-error in live and snapshot projections", () => {
+  const live = projectConsole([
+    {
+      eventId: "cancelled-terminal",
+      event: {
+        event: "session_entry_committed",
+        data: {
+          entry: {
+            entry_id: "cancelled-entry",
+            timestamp: 10,
+            provenance: "legacy_unknown",
+            kind: "run_cancelled",
+          },
+        },
+      } as Event,
+    },
+    {
+      eventId: "cancelled-run-end",
+      event: {
+        event: "run_end",
+        data: { result: "cancelled" },
+      } as Event,
+    },
+  ]);
+  assertEquals(live.lines.some((line) => line.kind === "error"), false);
+
+  const restored = projectConsole([{
+    eventId: "snapshot",
+    event: snapshotEvent("/repo", [{
+      kind: "run_cancelled",
+      timestamp: 10,
+    }]),
+  }]);
+  assertEquals(restored.lines.some((line) => line.kind === "error"), false);
+  assertEquals(restored.compaction, null);
 });
 
 Deno.test("snapshot replaces a live error with one durable run_errored row", () => {

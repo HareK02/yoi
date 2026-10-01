@@ -919,6 +919,32 @@ pub struct SessionSnapshotEntry {
     pub data: SessionSnapshotEntryData,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum RunYieldReason {
+    Compaction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum RunResumeSource {
+    Compaction,
+    Pause,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum RunFailureKind {
+    Engine,
+    Compaction,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
@@ -952,8 +978,26 @@ pub enum SessionSnapshotEntryData {
         #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
         data: Option<serde_json::Value>,
     },
+    /// Durable, non-terminal control return from one logical Run. This is not a
+    /// completed run and must not be used to infer the current Worker state.
+    RunYielded {
+        reason: RunYieldReason,
+        active_run_turn_count: usize,
+    },
+    /// Durable boundary immediately before Engine execution resumes. The source
+    /// distinguishes automatic compaction continuation from an intentional
+    /// user-pause resume; it does not prove that later model output occurred.
+    RunResumed {
+        source: RunResumeSource,
+        active_run_turn_count: usize,
+    },
+    /// Durable terminal for an intentional cancellation. Consumers must not
+    /// present this lifecycle result as an execution failure.
+    RunCancelled,
     RunError {
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<RunFailureKind>,
     },
 }
 
@@ -1003,6 +1047,18 @@ pub enum Event {
     /// Correlated rejection before durable acceptance.
     SubmissionRejected {
         submission_request_id: String,
+        message: String,
+    },
+    /// Durable notification acceptance. The request identity is persisted with
+    /// the notification receipt before this event is emitted. Repeating the
+    /// same request id and exact payload returns the same acknowledgement
+    /// without appending the notification twice.
+    NotificationAccepted {
+        notification_request_id: String,
+    },
+    /// Correlated notification rejection before durable acceptance.
+    NotificationRejected {
+        notification_request_id: String,
         message: String,
     },
     /// Revisioned FIFO replacement following enqueue, activation, cancel, or clear.
@@ -1684,6 +1740,9 @@ pub enum RunResult {
     Finished,
     Paused,
     LimitReached,
+    /// The logical Run ended because the user intentionally cancelled it after
+    /// observable work. Unlike `RolledBack`, committed history is retained.
+    Cancelled,
     /// The accepted Method::Submit produced no assistant/tool output before
     /// user interruption, so the Worker rolled the submit-time turn state back
     /// to its pre-submit snapshot. Clients should treat the Worker as Idle and
@@ -2806,6 +2865,32 @@ mod tests {
                 assert!(is_error);
             }
             other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notification_receipt_events_roundtrip_with_request_identity() {
+        for event in [
+            Event::NotificationAccepted {
+                notification_request_id: "notification-1".into(),
+            },
+            Event::NotificationRejected {
+                notification_request_id: "notification-1".into(),
+                message: "invalid notification".into(),
+            },
+        ] {
+            let json = serde_json::to_string(&event).unwrap();
+            let decoded: Event = serde_json::from_str(&json).unwrap();
+            match decoded {
+                Event::NotificationAccepted {
+                    notification_request_id,
+                }
+                | Event::NotificationRejected {
+                    notification_request_id,
+                    ..
+                } => assert_eq!(notification_request_id, "notification-1"),
+                other => panic!("expected notification receipt, got {other:?}"),
+            }
         }
     }
 

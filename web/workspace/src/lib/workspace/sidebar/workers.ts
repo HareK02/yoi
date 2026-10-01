@@ -22,15 +22,15 @@ export function sidebarWorkerActivity(
 }
 
 export function canShowWorkerInSidebar(
-  worker: Pick<Worker, 'implementation'>,
+  worker: Pick<Worker, 'implementation' | 'job'>,
 ): boolean {
-  return worker.implementation.kind !== 'backend_worker_registry';
+  return !worker.job && worker.implementation.kind !== 'backend_worker_registry';
 }
 
 export function canOpenWorkerConsole(
   worker: Pick<Worker, 'implementation'>,
 ): boolean {
-  return canShowWorkerInSidebar(worker);
+  return worker.implementation.kind !== 'backend_worker_registry';
 }
 
 type SidebarWorkerLink = Pick<Worker, 'resource_key' | 'display_name'>;

@@ -11,7 +11,7 @@
 
 use agen::llm_client::types::{Item, RequestConfig};
 use agen::{EngineResult, UsageRecord};
-use protocol::{InvokeKind, Segment};
+use protocol::{InvokeKind, RunFailureKind, RunResumeSource, RunYieldReason, Segment};
 use serde::{Deserialize, Serialize};
 
 use crate::history::{LoggedHistoryEntry, LoggedSystemHistoryEntry};
@@ -28,7 +28,7 @@ use crate::logged_item::LoggedItem;
 ///   `run()`/`resume()` (current callers persist a single TurnEnd at
 ///   run completion); the fork-point seq for `at_turn_index` is the
 ///   preceding `Invoke` entry, not the TurnEnd.
-/// - `RunCompleted` / `RunErrored` — marks end of a `run()` or `resume()` call
+/// - `RunCompleted` / `RunCancelled` / `RunErrored` — terminal run outcomes
 /// - `PausedTurnAbandoned` — explicit abandon/cancel of a paused interrupted turn
 /// - `ConfigChanged` — `RequestConfig` mutation
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -86,9 +86,10 @@ pub enum LogEntry {
     /// serde tag already occupies `"kind"`.
     ///
     /// Replay marks the run interrupted until a terminal `RunCompleted`,
-    /// `RunErrored`, or `PausedTurnAbandoned` entry proves how it ended. This
-    /// makes a process/disk failure between Invoke and its terminal record
-    /// restore conservatively instead of re-running a dangling tool call.
+    /// `RunCancelled`, `RunErrored`, or `PausedTurnAbandoned` entry proves how
+    /// it ended. This makes a process/disk failure between Invoke and its
+    /// terminal record restore conservatively instead of re-running a dangling
+    /// tool call.
     Invoke { ts: u64, trigger: InvokeKind },
 
     /// Canonical user submission with its exact model-visible entries. Typed
@@ -126,11 +127,35 @@ pub enum LogEntry {
         ts: u64,
         interrupted: bool,
         result: EngineResult,
-        /// AgentTurns consumed by a paused/yielded logical run. Terminal
-        /// outcomes persist `None`.
+        /// AgentTurns consumed by a paused legacy logical run. Terminal
+        /// outcomes persist `None`. Legacy logs may also contain Yielded here;
+        /// new yields use `RunYielded` below.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         active_run_turn_count: Option<usize>,
     },
+
+    /// The current logical Run returned control so compaction can prepare a new
+    /// Segment. This is an intermediate transition, not a successful terminal
+    /// result. Ordering plus Session/Segment lineage correlate it with the
+    /// preceding Invoke and a later RunResumed or terminal record.
+    RunYielded {
+        ts: u64,
+        reason: RunYieldReason,
+        active_run_turn_count: usize,
+    },
+
+    /// Resume preparation has completed and Engine execution is about to begin.
+    /// A committed record is required before control is handed back to Engine.
+    /// It deliberately does not assert that a subsequent model call occurred.
+    RunResumed {
+        ts: u64,
+        source: RunResumeSource,
+        active_run_turn_count: usize,
+    },
+
+    /// The logical Run ended because the user intentionally cancelled it.
+    /// This is terminal, but is not an execution failure.
+    RunCancelled { ts: u64 },
 
     /// `run()` / `resume()` が `EngineError` で終了した。
     /// `EngineError` は `Serialize` 不可なので `message` のみ lossy 保持する。
@@ -139,6 +164,10 @@ pub enum LogEntry {
         ts: u64,
         interrupted: bool,
         message: String,
+        /// Older records omit this field. New records distinguish failures in
+        /// Engine execution from failure to continue after a compaction yield.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<RunFailureKind>,
     },
 
     /// Restores an active logical-run budget at a segment boundary, notably
@@ -350,6 +379,24 @@ pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
                 } else {
                     state.active_run_turn_count = None;
                 }
+            }
+            LogEntry::RunYielded {
+                active_run_turn_count,
+                ..
+            }
+            | LogEntry::RunResumed {
+                active_run_turn_count,
+                ..
+            } => {
+                // Both are resumable boundaries of the same logical Run. A log
+                // ending at RunResumed proves only that the resume boundary was
+                // committed, not that Engine produced later output.
+                state.last_run_interrupted = true;
+                state.active_run_turn_count = Some(*active_run_turn_count);
+            }
+            LogEntry::RunCancelled { .. } => {
+                state.last_run_interrupted = false;
+                state.active_run_turn_count = None;
             }
             LogEntry::RunErrored { interrupted, .. } => {
                 state.last_run_interrupted = *interrupted;
@@ -816,6 +863,83 @@ mod tests {
         assert_eq!(state.turn_count, 9);
         assert_eq!(state.active_run_turn_count, Some(3));
         assert!(state.last_run_interrupted);
+    }
+
+    #[test]
+    fn replay_new_yield_and_resume_keep_one_logical_run_budget() {
+        let state = collect_state(&[
+            LogEntry::Invoke {
+                ts: 100,
+                trigger: InvokeKind::UserSend,
+            },
+            LogEntry::TurnEnd {
+                ts: 200,
+                turn_count: 2,
+            },
+            LogEntry::RunYielded {
+                ts: 300,
+                reason: RunYieldReason::Compaction,
+                active_run_turn_count: 2,
+            },
+            LogEntry::ActiveRunCheckpoint {
+                ts: 400,
+                active_turn_count: 2,
+                total_turn_count: 2,
+            },
+            LogEntry::RunResumed {
+                ts: 500,
+                source: RunResumeSource::Compaction,
+                active_run_turn_count: 2,
+            },
+        ]);
+
+        assert!(state.last_run_interrupted);
+        assert_eq!(state.turn_count, 2);
+        assert_eq!(state.active_run_turn_count, Some(2));
+    }
+
+    #[test]
+    fn replay_cancelled_run_is_terminal_without_becoming_a_failure() {
+        let state = collect_state(&[
+            LogEntry::Invoke {
+                ts: 100,
+                trigger: InvokeKind::UserSend,
+            },
+            LogEntry::TurnEnd {
+                ts: 200,
+                turn_count: 1,
+            },
+            LogEntry::RunCancelled { ts: 300 },
+        ]);
+
+        assert!(!state.last_run_interrupted);
+        assert_eq!(state.active_run_turn_count, None);
+        assert_eq!(state.turn_count, 1);
+    }
+
+    #[test]
+    fn legacy_yielded_run_completed_remains_resumable_but_is_not_terminal_success() {
+        let entry: LogEntry = serde_json::from_value(serde_json::json!({
+            "kind": "run_completed",
+            "ts": 300,
+            "interrupted": true,
+            "result": "yielded"
+        }))
+        .expect("legacy yielded run-completed entry");
+        let state = collect_state(&[
+            LogEntry::Invoke {
+                ts: 100,
+                trigger: InvokeKind::UserSend,
+            },
+            LogEntry::TurnEnd {
+                ts: 200,
+                turn_count: 3,
+            },
+            entry,
+        ]);
+
+        assert!(state.last_run_interrupted);
+        assert_eq!(state.active_run_turn_count, Some(3));
     }
 
     #[test]

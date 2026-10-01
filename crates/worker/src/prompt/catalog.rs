@@ -95,6 +95,7 @@ pub enum WorkerPrompt {
     MemoryExtractSystem,
     MemoryConsolidationSystem,
     FlowVerifierSystem,
+    BackendJobSystem,
     NotifyWrapper,
     InterruptToolResultSummary,
     InterruptSystemNote,
@@ -112,6 +113,7 @@ impl WorkerPrompt {
             Self::MemoryExtractSystem => "internal.memory_extract_system",
             Self::MemoryConsolidationSystem => "internal.memory_consolidation_system",
             Self::FlowVerifierSystem => "internal.flow_verifier_system",
+            Self::BackendJobSystem => "internal.backend_job_system",
             Self::NotifyWrapper => "internal.notify_wrapper",
             Self::InterruptToolResultSummary => "internal.interrupt_tool_result_summary",
             Self::InterruptSystemNote => "internal.interrupt_system_note",
@@ -130,6 +132,7 @@ impl WorkerPrompt {
         WorkerPrompt::MemoryExtractSystem,
         WorkerPrompt::MemoryConsolidationSystem,
         WorkerPrompt::FlowVerifierSystem,
+        WorkerPrompt::BackendJobSystem,
         WorkerPrompt::NotifyWrapper,
         WorkerPrompt::InterruptToolResultSummary,
         WorkerPrompt::InterruptSystemNote,
@@ -402,6 +405,10 @@ impl PromptCatalog {
         context: &T,
     ) -> Result<String, CatalogError> {
         self.render_name(key, Value::from_serialize(context))
+    }
+
+    pub fn ticket_item_checker(&self) -> Result<String, CatalogError> {
+        self.render_name("internal.ticket_item_checker", Value::UNDEFINED)
     }
 
     pub fn orchestrator_queue_attention(
@@ -689,6 +696,22 @@ mod tests {
                 .templates
                 .contains_key("worker.ticket_event_companion_notice")
         );
+    }
+
+    #[test]
+    fn ticket_item_checker_prompt_keeps_text_only_scope_and_output_contract_separate() {
+        let prompt = PromptCatalog::builtins_only()
+            .unwrap()
+            .ticket_item_checker()
+            .unwrap();
+        assert!(prompt.contains("writer_scope"));
+        assert!(prompt.contains("internal_inconsistency"));
+        assert!(prompt.contains("ambiguous_boundary"));
+        assert!(prompt.contains("Production deployment requires approval"));
+        assert!(prompt.contains("not a finding merely"));
+        assert!(prompt.contains("background, quotations, and bug examples"));
+        assert!(prompt.contains("Do not infer user intent"));
+        assert!(prompt.contains("SubmitBackendJobResult"));
     }
 
     #[test]

@@ -1909,7 +1909,21 @@ pub trait TicketBackend {
     fn list(&self, filter: TicketListQuery) -> Result<Vec<TicketSummary>>;
     fn show(&self, id: TicketIdOrSlug) -> Result<Ticket>;
     fn create(&self, input: NewTicket) -> Result<TicketRef>;
+    fn create_with_snapshot(&self, input: NewTicket) -> Result<(TicketRef, Ticket)> {
+        let reference = self.create(input)?;
+        let ticket = self.show(reference.id.clone().into())?;
+        Ok((reference, ticket))
+    }
     fn edit_item(&self, id: TicketIdOrSlug, edit: TicketItemEdit) -> Result<Ticket>;
+    fn edit_item_with_snapshots(
+        &self,
+        id: TicketIdOrSlug,
+        edit: TicketItemEdit,
+    ) -> Result<(Ticket, Ticket)> {
+        let previous = self.show(id.clone())?;
+        let current = self.edit_item(id, edit)?;
+        Ok((previous, current))
+    }
     fn dependency_check(&self, id: TicketIdOrSlug) -> Result<TicketDependencyCheck>;
     fn add_event(&self, id: TicketIdOrSlug, event: NewTicketEvent) -> Result<()>;
     fn add_state_changed(&self, id: TicketIdOrSlug, change: TicketStateChange) -> Result<()>;
@@ -3087,6 +3101,11 @@ impl TicketBackend for SqliteTicketBackend {
     }
 
     fn create(&self, input: NewTicket) -> Result<TicketRef> {
+        self.create_with_snapshot(input)
+            .map(|(reference, _)| reference)
+    }
+
+    fn create_with_snapshot(&self, input: NewTicket) -> Result<(TicketRef, Ticket)> {
         self.with_write(|conn| {
             if input.title.trim().is_empty() {
                 return Err(TicketError::Conflict(
@@ -3167,16 +3186,27 @@ impl TicketBackend for SqliteTicketBackend {
             };
             let resource_key = Self::allocate_resource_key(conn, &self.workspace_id, &id, &now)?;
             self.insert_ticket(conn, &ticket)?;
-            Ok(TicketRef {
+            let reference = TicketRef {
                 id: id.clone(),
                 resource_key: Some(resource_key),
-                slug: id,
+                slug: id.clone(),
                 status: TicketStatus::Open,
-            })
+            };
+            let persisted = self.load_ticket(conn, &id)?;
+            Ok((reference, persisted))
         })
     }
 
     fn edit_item(&self, id: TicketIdOrSlug, edit: TicketItemEdit) -> Result<Ticket> {
+        self.edit_item_with_snapshots(id, edit)
+            .map(|(_, current)| current)
+    }
+
+    fn edit_item_with_snapshots(
+        &self,
+        id: TicketIdOrSlug,
+        edit: TicketItemEdit,
+    ) -> Result<(Ticket, Ticket)> {
         self.with_write(|conn| {
             edit.validate_body_edit_request()?;
             if !edit.has_changes() {
@@ -3192,8 +3222,9 @@ impl TicketBackend for SqliteTicketBackend {
                 validate_required_event_value("author", author)?;
             }
             let ticket_id = self.resolve_ticket_id(conn, id)?;
+            let previous = self.load_ticket(conn, &ticket_id)?;
             if edit.targets.is_some() {
-                let current = self.load_ticket(conn, &ticket_id)?.meta.workflow_state;
+                let current = previous.meta.workflow_state;
                 if current != TicketWorkflowState::Planning {
                     return Err(TicketError::Conflict(format!(
                         "ticket implementation target is locked after planning (current state: {})",
@@ -3274,7 +3305,8 @@ impl TicketBackend for SqliteTicketBackend {
             };
             let event = TicketEvent { kind: TicketEventKind::Other("item_edit".to_string()), author: Some(edit.author.unwrap_or_else(default_author)), at: Some(now), status: None, from: None, to: None, reason: None, state_field: None, heading: Some("Item edit".to_string()), body, references: Vec::new(), attributes };
             self.insert_event(conn, &ticket_id, &event)?;
-            self.load_ticket(conn, &ticket_id)
+            let current = self.load_ticket(conn, &ticket_id)?;
+            Ok((previous, current))
         })
     }
 

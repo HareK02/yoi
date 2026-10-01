@@ -94,6 +94,9 @@ pub struct WorkerInteractionAck {
     pub worker_ref: WorkerRef,
     pub status: WorkerStatus,
     /// Present for User Submit and absent for non-Submit interactions.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submission: Option<crate::execution::WorkerSubmissionAck>,
+    /// Present only after a Notify request reaches the Worker's durable receipt boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification: Option<crate::execution::WorkerNotificationAck>,
 }

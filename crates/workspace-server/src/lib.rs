@@ -6,9 +6,11 @@
 
 pub mod auth;
 pub mod authority;
+pub mod backend_job;
 pub mod companion;
 pub mod config;
 pub mod config_source;
+pub mod feature_storage;
 pub mod hosts;
 pub mod memory_backend;
 pub mod memory_staging;
@@ -26,6 +28,8 @@ pub mod runtime_subscription;
 pub mod server;
 pub mod skills;
 pub mod store;
+pub mod subjektiv;
+mod ticket_item_checker;
 pub mod workdir_create_operations;
 mod workdir_removal;
 mod worker_projection;
@@ -41,6 +45,10 @@ pub use authority::{
     WorkspaceAuthority,
 };
 pub use config::{ResolvedWorkspaceBackendConfig, ServerHostConfigFile};
+pub use feature_storage::{
+    FeatureDatabase, FeatureMigration, FeatureRegistration, FeatureStorage, FeatureStorageError,
+    RegisteredFeature, WorkspaceFeatureStorage,
+};
 pub use records::{ObjectiveDetail, ObjectiveSummary, TicketDetail, TicketSummary};
 pub use repositories::{ConfiguredRepository, RepositoryLogRead, RepositoryRegistryReader};
 pub use server::{

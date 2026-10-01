@@ -66,6 +66,12 @@ pub struct WorkerSubmissionAck {
     pub disposition: protocol::SubmissionDisposition,
 }
 
+/// Evidence that a notification request reached the durable Worker session boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerNotificationAck {
+    pub notification_request_id: String,
+}
+
 /// Typed execution result class. Results are transient operation outcomes and
 /// are not persisted as Worker lifecycle authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +84,8 @@ pub struct WorkerExecutionResult {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submission: Option<WorkerSubmissionAck>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification: Option<WorkerNotificationAck>,
 }
 
 /// Backend result class for a Worker execution operation.
@@ -99,6 +107,7 @@ impl WorkerExecutionResult {
             worker_state: None,
             message: None,
             submission: None,
+            notification: None,
         }
     }
 
@@ -123,6 +132,23 @@ impl WorkerExecutionResult {
                 submission_id: submission_id.into(),
                 disposition,
             }),
+            notification: None,
+        }
+    }
+
+    pub fn accepted_notification(
+        operation: WorkerExecutionOperation,
+        notification_request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            operation,
+            outcome: WorkerExecutionOutcome::Accepted,
+            worker_state: None,
+            message: None,
+            submission: None,
+            notification: Some(WorkerNotificationAck {
+                notification_request_id: notification_request_id.into(),
+            }),
         }
     }
 
@@ -133,6 +159,7 @@ impl WorkerExecutionResult {
             worker_state: None,
             message: Some(message.into()),
             submission: None,
+            notification: None,
         }
     }
 
@@ -143,6 +170,7 @@ impl WorkerExecutionResult {
             worker_state: None,
             message: Some(message.into()),
             submission: None,
+            notification: None,
         }
     }
 
@@ -153,6 +181,7 @@ impl WorkerExecutionResult {
             worker_state: None,
             message: Some(message.into()),
             submission: None,
+            notification: None,
         }
     }
 
@@ -163,6 +192,7 @@ impl WorkerExecutionResult {
             worker_state: None,
             message: Some(message.into()),
             submission: None,
+            notification: None,
         }
     }
 

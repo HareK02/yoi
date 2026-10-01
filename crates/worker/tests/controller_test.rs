@@ -838,6 +838,39 @@ async fn feature_flags_default_to_core_tool_surface_only() {
 }
 
 #[tokio::test]
+async fn backend_job_profile_exposes_only_structured_result_capability() {
+    let workspace = tempfile::tempdir().unwrap();
+    let resolved = ProfileResolver::new()
+        .with_workspace_base(workspace.path())
+        .resolve(
+            &ProfileSelector::source_named(ProfileRegistrySource::Builtin, "backend-job"),
+            ProfileResolveOptions::with_worker_name("backend-job-worker"),
+        )
+        .unwrap();
+    let client = MockClient::new(simple_text_events());
+    let client_for_assert = client.clone();
+    let (worker, _pwd) = make_worker_with_manifest_and_workspace_context(
+        client,
+        resolved.manifest,
+        WorkerWorkspaceContext::with_client(None, Arc::new(AvailableWorkspaceClient)),
+    )
+    .await;
+    let handle = spawn_controller(worker).await;
+
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "Run the bounded Backend Job.",
+        ))
+        .await
+        .unwrap();
+    wait_for_status(&handle, WorkerStatus::Idle).await;
+
+    let request = wait_for_captured_request(&client_for_assert).await;
+    assert_eq!(request_tool_names(&request), vec!["SubmitBackendJobResult"]);
+}
+
+#[tokio::test]
 async fn enabled_task_and_web_features_register_their_tools() {
     let manifest = r#"
 [worker]
@@ -3657,6 +3690,71 @@ async fn empty_turn_rollback_removes_only_the_most_recent_turn() {
             .iter()
             .any(|item| item_text_contains(item, "second rolled back")),
         "rollback must affect only the most recent empty turn: {history:?}"
+    );
+}
+
+#[tokio::test]
+async fn cancel_after_assistant_output_is_a_non_failure_terminal() {
+    let client = MockClient::sequential(vec![MockResponse::Hang(vec![
+        LlmEvent::text_block_start(0),
+        LlmEvent::text_delta(0, "committed before cancel"),
+        LlmEvent::text_block_stop(0, None),
+    ])]);
+    let worker = make_worker(client).await;
+    let handle = spawn_controller(worker).await;
+    let mut rx = handle.subscribe();
+
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "cancel this active turn",
+        ))
+        .await
+        .unwrap();
+    assert!(
+        drain_until(
+            &mut rx,
+            std::time::Duration::from_secs(2),
+            |event| matches!(event, Event::TextDone { .. })
+        )
+        .await,
+        "assistant output should be durable before cancellation"
+    );
+    handle
+        .send(Method::Cancel {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        drain_until(
+            &mut rx,
+            std::time::Duration::from_secs(2),
+            |event| matches!(
+                event,
+                Event::RunEnd {
+                    result: protocol::RunResult::Cancelled
+                }
+            )
+        )
+        .await,
+        "intentional cancellation must emit RunEnd::Cancelled, not Event::Error"
+    );
+    wait_for_status(&handle, WorkerStatus::Idle).await;
+
+    let (entries, _) = handle.sink.subscribe_with_snapshot();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| matches!(entry, LogEntry::RunCancelled { .. })),
+        "cancelled run must keep a durable non-failure terminal: {entries:?}"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| matches!(entry, LogEntry::RunErrored { .. })),
+        "intentional cancellation must not be restored as a run error: {entries:?}"
     );
 }
 

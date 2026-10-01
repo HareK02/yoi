@@ -10,8 +10,9 @@ use crate::{
     InFlightCompaction, InFlightSnapshot, InFlightToolCallState, InternalWorkerKind,
     InternalWorkerRef, InternalWorkerSnapshot, InvokeKind, MemoryWorkerEvent, Method,
     PasteArtifactAvailability, PasteArtifactMediaType, PasteArtifactRef, PendingSubmissionSummary,
-    PendingSubmissionsSnapshot, Permission, RewindSummary, RewindTarget, RewindTargetId, RunResult,
-    ScopeRule, Segment, SessionContentPart, SessionConversationTurn, SessionEntryProvenance,
+    PendingSubmissionsSnapshot, Permission, RewindSummary, RewindTarget, RewindTargetId,
+    RunFailureKind, RunResult, RunResumeSource, RunYieldReason, ScopeRule, Segment,
+    SessionContentPart, SessionConversationTurn, SessionEntryProvenance,
     SessionHistoryLineageBoundary, SessionHistoryPage, SessionMessageRole, SessionSnapshot,
     SessionSnapshotEntry, SessionSnapshotEntryData, SessionToolAttachment, SubmissionDisposition,
     SymlinkPolicy, ToolResultDisposition, TurnResult, UploadedFileAvailability, UploadedFileRef,
@@ -28,7 +29,7 @@ use crate::{
         SubscriptionRequest, SubscriptionRequestId, SubscriptionResponse, SubscriptionSnapshot,
         SubscriptionTerminationCode, SubscriptionWorkdirId, SubscriptionWorker,
         SubscriptionWorkerAvailability, SubscriptionWorkerId, SubscriptionWorkerIds,
-        SubscriptionWorkerProtocolMethod, SubscriptionWorkerState,
+        SubscriptionWorkerJob, SubscriptionWorkerProtocolMethod, SubscriptionWorkerState,
         SubscriptionWorkerWorkdirAttachment, WorkspaceSubscriptionWorkdir,
     },
 };
@@ -103,6 +104,9 @@ pub fn generated_protocol_types() -> String {
     push_decl::<SessionMessageRole>(&cfg, &mut output);
     push_decl::<SessionContentPart>(&cfg, &mut output);
     push_decl::<SessionToolAttachment>(&cfg, &mut output);
+    push_decl::<RunYieldReason>(&cfg, &mut output);
+    push_decl::<RunResumeSource>(&cfg, &mut output);
+    push_decl::<RunFailureKind>(&cfg, &mut output);
     push_decl::<SessionSnapshotEntryData>(&cfg, &mut output);
     push_decl::<SessionSnapshotEntry>(&cfg, &mut output);
     push_decl::<SessionConversationTurn>(&cfg, &mut output);
@@ -132,6 +136,7 @@ pub fn generated_protocol_types() -> String {
     push_decl::<SubscriptionWorkerAvailability>(&cfg, &mut output);
     push_decl::<EventSubscriptionSelector>(&cfg, &mut output);
     push_decl::<SubscriptionWorkerWorkdirAttachment>(&cfg, &mut output);
+    push_decl::<SubscriptionWorkerJob>(&cfg, &mut output);
     push_decl::<SubscriptionWorker>(&cfg, &mut output);
     push_decl::<WorkspaceSubscriptionWorkdir>(&cfg, &mut output);
     push_decl::<SubscriptionSnapshot>(&cfg, &mut output);
@@ -232,6 +237,7 @@ fn rust_serialized_subscription_frame_fixtures() -> Vec<SubscriptionFrame> {
         workspace_id: Some("fixture-workspace".to_string()),
         display_name: None,
         profile: None,
+        job: None,
         workdir_attachments: vec![SubscriptionWorkerWorkdirAttachment {
             alias: "external".to_string(),
             repository_id: None,

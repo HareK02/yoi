@@ -60,8 +60,12 @@ pub fn live_log_entry_event(entry: LogEntry) -> Option<Event> {
                 .map(|entry| entry.entry_id.clone());
             Some(Event::UserMessage { entry_id, segments })
         }
-        entry
-        @ (LogEntry::AnnotatedAssistantItem { .. } | LogEntry::AnnotatedToolResult { .. }) => {
+        entry @ (LogEntry::AnnotatedAssistantItem { .. }
+        | LogEntry::AnnotatedToolResult { .. }
+        | LogEntry::RunYielded { .. }
+        | LogEntry::RunResumed { .. }
+        | LogEntry::RunCancelled { .. }
+        | LogEntry::RunErrored { .. }) => {
             let mut projected =
                 session_store::public_snapshot::project_current_session_snapshot(&[entry]);
             projected
@@ -113,6 +117,30 @@ pub async fn dispatch_worker_protocol_method(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_run_transition_maps_to_session_entry_committed() {
+        let event = live_log_entry_event(LogEntry::RunYielded {
+            ts: 42,
+            reason: protocol::RunYieldReason::Compaction,
+            active_run_turn_count: 3,
+        })
+        .expect("RunYielded must be live-relevant");
+
+        match event {
+            Event::SessionEntryCommitted { entry } => {
+                assert_eq!(entry.timestamp, 42);
+                assert!(matches!(
+                    entry.data,
+                    protocol::SessionSnapshotEntryData::RunYielded {
+                        reason: protocol::RunYieldReason::Compaction,
+                        active_run_turn_count: 3,
+                    }
+                ));
+            }
+            other => panic!("expected SessionEntryCommitted, got {other:?}"),
+        }
+    }
 
     #[test]
     fn user_input_log_entry_maps_to_user_message_event() {

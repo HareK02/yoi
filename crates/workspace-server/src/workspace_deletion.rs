@@ -18,6 +18,9 @@ use crate::{Error, Result};
 const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "artifacts",
     "audit_events",
+    "backend_job_deliveries",
+    "backend_job_attempts",
+    "backend_jobs",
     "external_workdir_grants",
     "flow_source_revisions",
     "flow_sources",
@@ -77,6 +80,7 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "worker_removal_operations",
     "worker_retention_audit_events",
     "worker_session_archives",
+    "worker_singleton_owners",
     "worker_tombstones",
     "worker_workdir_attachment_reservations",
     "worker_workdir_links",

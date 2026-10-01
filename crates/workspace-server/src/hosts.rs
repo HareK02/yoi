@@ -457,7 +457,11 @@ pub struct WorkerTicketAssignmentRequest {
 pub(crate) fn worker_spawn_create_fingerprint(
     request: &WorkerSpawnRequest,
 ) -> Result<String, String> {
-    let encoded = serde_json::to_vec(request)
+    // WorkerSpawnRequest intentionally omits Backend-resolved fields from its wire encoding.
+    // Existing Workdir claims are nevertheless caller-visible create intent and must be bound to
+    // a manual singleton retry. Trusted operation identity and ephemeral Backend launch material
+    // remain separate from this semantic create fingerprint.
+    let encoded = serde_json::to_vec(&(request, request.resolved_workdir_attachments.as_slice()))
         .map_err(|error| format!("serialize Worker create input: {error}"))?;
     Ok(format!("sha256:{}", digest_hex(&encoded, 64)))
 }
@@ -507,6 +511,9 @@ pub struct WorkerSpawnRequest {
     pub intent: WorkerSpawnIntent,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_worker_name: Option<String>,
+    /// Opaque Backend-owned singleton key. Runtime providers must not infer semantics from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub singleton_key: Option<String>,
     pub acceptance: WorkerSpawnAcceptanceRequirement,
     pub profile: ProfileSelector,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -544,6 +551,11 @@ pub enum WorkerSpawnIntent {
     WorkspaceCompanion,
     WorkspaceOrchestrator,
     WorkspaceCoding,
+    BackendJob {
+        job_id: String,
+        attempt_id: String,
+        purpose: String,
+    },
     TicketRole {
         ticket_id: String,
         role: TicketWorkerRole,
@@ -705,6 +717,8 @@ pub struct WorkerInputRequest {
     pub kind: WorkerInputKind,
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub segments: Option<Vec<protocol::Segment>>,
 }
 
@@ -725,11 +739,22 @@ pub struct WorkerCompletionsResult {
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerInputDisposition {
+    Accepted,
+    Rejected,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerInputResult {
     pub state: InternalWorkerOperationState,
+    pub disposition: WorkerInputDisposition,
     #[serde(flatten)]
     pub worker: RuntimeWorkerRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_run_id: Option<String>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -1200,7 +1225,9 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
     fn send_input(&self, worker_id: &str, _request: WorkerInputRequest) -> WorkerInputResult {
         WorkerInputResult {
             state: InternalWorkerOperationState::Unsupported,
+            disposition: WorkerInputDisposition::Rejected,
             worker: RuntimeWorkerRef::new(self.runtime_id().to_string(), worker_id.to_string()),
+            runtime_run_id: None,
             diagnostics: vec![diagnostic(
                 "worker_input_pending",
                 HostDiagnosticSeverity::Info,
@@ -2985,6 +3012,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             return embedded_input_rejected(
                 &self.runtime_id,
                 worker_id,
+                WorkerInputDisposition::Rejected,
                 diagnostic(
                     "embedded_worker_execution_unavailable",
                     HostDiagnosticSeverity::Info,
@@ -2998,6 +3026,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             return embedded_input_rejected(
                 &self.runtime_id,
                 worker_id,
+                WorkerInputDisposition::Rejected,
                 diagnostic(
                     "embedded_worker_id_invalid",
                     HostDiagnosticSeverity::Warning,
@@ -3014,20 +3043,34 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 WorkerInputKind::RegisterPeer => EmbeddedWorkerInputKind::RegisterPeer,
             },
             content: request.content,
-            submission_request_id: None,
+            submission_request_id: request.submission_request_id,
             segments: request.segments,
         };
         match self.runtime.send_input(&worker_ref, input) {
-            Ok(_) => WorkerInputResult {
+            Ok(ack) => WorkerInputResult {
                 state: InternalWorkerOperationState::Accepted,
+                disposition: WorkerInputDisposition::Accepted,
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
+                runtime_run_id: ack
+                    .submission
+                    .map(|submission| submission.submission_request_id),
                 diagnostics: Vec::new(),
             },
-            Err(error) => embedded_input_rejected(
-                &self.runtime_id,
-                worker_id,
-                embedded_runtime_diagnostic(&error),
-            ),
+            Err(error) => {
+                let disposition = match &error {
+                    EmbeddedRuntimeError::WorkerExecutionRejected {
+                        outcome: worker_runtime::execution::WorkerExecutionOutcome::Errored,
+                        ..
+                    } => WorkerInputDisposition::Unknown,
+                    _ => WorkerInputDisposition::Rejected,
+                };
+                embedded_input_rejected(
+                    &self.runtime_id,
+                    worker_id,
+                    disposition,
+                    embedded_runtime_diagnostic(&error),
+                )
+            }
         }
     }
 
@@ -4991,7 +5034,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 WorkerInputKind::RegisterPeer => EmbeddedWorkerInputKind::RegisterPeer,
             },
             content: request.content,
-            submission_request_id: None,
+            submission_request_id: request.submission_request_id,
             segments: request.segments,
         };
         let input = match runtime_contract_convert(input) {
@@ -4999,7 +5042,9 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             Err(diagnostic) => {
                 return WorkerInputResult {
                     state: InternalWorkerOperationState::Rejected,
+                    disposition: WorkerInputDisposition::Rejected,
                     worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
+                    runtime_run_id: None,
                     diagnostics: vec![diagnostic],
                 };
             }
@@ -5010,9 +5055,14 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
             move |client| async move { client.send_worker_input(worker_id_owned, input).await },
         ) {
-            Ok(_) => WorkerInputResult {
+            Ok(response) => WorkerInputResult {
                 state: InternalWorkerOperationState::Accepted,
+                disposition: WorkerInputDisposition::Accepted,
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
+                runtime_run_id: response
+                    .ack
+                    .submission
+                    .map(|submission| submission.submission_request_id),
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => remote_input_rejected(&self.runtime_id, worker_id, diagnostic),
@@ -5315,9 +5365,16 @@ fn embedded_profile_label(profile: &ProfileSelector) -> Option<String> {
 }
 
 const MEMORY_CONSOLIDATION_PROFILE: &str = "memory-consolidation";
-const MEMORY_CONSOLIDATION_SINGLETON_KEY: &str = "workspace-memory-consolidation";
+pub(crate) const MEMORY_CONSOLIDATION_SINGLETON_KEY: &str = "workspace-memory-consolidation";
 const WORKSPACE_ORCHESTRATOR_PROFILE: &str = "orchestrator";
 pub(crate) const WORKSPACE_ORCHESTRATOR_SINGLETON_KEY: &str = "workspace-orchestrator";
+
+pub(crate) fn is_reserved_internal_worker_singleton_key(key: &str) -> bool {
+    matches!(
+        key,
+        MEMORY_CONSOLIDATION_SINGLETON_KEY | WORKSPACE_ORCHESTRATOR_SINGLETON_KEY
+    )
+}
 
 struct WorkerDisplayMetadata {
     display_name: String,
@@ -5396,11 +5453,14 @@ fn profile_display_name(profile_label: &str) -> String {
 fn embedded_input_rejected(
     runtime_id: &str,
     worker_id: &str,
+    disposition: WorkerInputDisposition,
     diagnostic: RuntimeDiagnostic,
 ) -> WorkerInputResult {
     WorkerInputResult {
         state: InternalWorkerOperationState::Rejected,
+        disposition,
         worker: RuntimeWorkerRef::new(runtime_id.to_string(), worker_id.to_string()),
+        runtime_run_id: None,
         diagnostics: vec![diagnostic],
     }
 }
@@ -5412,7 +5472,9 @@ fn remote_input_rejected(
 ) -> WorkerInputResult {
     WorkerInputResult {
         state: InternalWorkerOperationState::Rejected,
+        disposition: WorkerInputDisposition::Unknown,
         worker: RuntimeWorkerRef::new(runtime_id.to_string(), worker_id.to_string()),
+        runtime_run_id: None,
         diagnostics: vec![diagnostic],
     }
 }
@@ -5890,6 +5952,7 @@ fn worker_spawn_intent_label(intent: &WorkerSpawnIntent) -> &'static str {
         WorkerSpawnIntent::WorkspaceCompanion => "workspace_companion",
         WorkerSpawnIntent::WorkspaceOrchestrator => "workspace_orchestrator",
         WorkerSpawnIntent::WorkspaceCoding => "workspace_coding",
+        WorkerSpawnIntent::BackendJob { .. } => "backend_job",
         WorkerSpawnIntent::TicketRole { role, .. } => match role {
             TicketWorkerRole::Intake => "ticket_intake",
             TicketWorkerRole::Orchestrator => "ticket_orchestrator",
@@ -6862,6 +6925,7 @@ mod tests {
                 role: TicketWorkerRole::Coder,
             },
             requested_worker_name: None,
+            singleton_key: None,
             acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                 expected_segments: 0,
             },
@@ -7088,10 +7152,13 @@ mod tests {
             WorkerInputRequest {
                 kind: WorkerInputKind::User,
                 content: "hello".to_string(),
+                submission_request_id: Some("tracked-input-1".to_string()),
                 segments: None,
             },
         );
         assert_eq!(input.state, InternalWorkerOperationState::Accepted);
+        assert_eq!(input.disposition, WorkerInputDisposition::Accepted);
+        assert_eq!(input.runtime_run_id.as_deref(), Some("tracked-input-1"));
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
@@ -7146,6 +7213,7 @@ mod tests {
                         role: TicketWorkerRole::Coder,
                     },
                     requested_worker_name: Some("friendly-name-is-not-authority".to_string()),
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -7183,6 +7251,7 @@ mod tests {
                 WorkerInputRequest {
                     kind: WorkerInputKind::User,
                     content: "hello embedded runtime".to_string(),
+                    submission_request_id: None,
                     segments: None,
                 },
             )
@@ -7246,6 +7315,7 @@ mod tests {
                         role: TicketWorkerRole::Coder,
                     },
                     requested_worker_name: None,
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
@@ -7287,6 +7357,7 @@ mod tests {
                 WorkerSpawnRequest {
                     intent: WorkerSpawnIntent::WorkspaceCompanion,
                     requested_worker_name: None,
+                    singleton_key: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::SocketReady,
                     profile: ProfileSelector::Builtin("builtin:companion".to_string()),
                     ticket_assignment: None,
@@ -7467,6 +7538,7 @@ mod tests {
                 WorkerInputRequest {
                     kind: WorkerInputKind::User,
                     content: "hello remote".to_string(),
+                    submission_request_id: None,
                     segments: None,
                 },
             )
