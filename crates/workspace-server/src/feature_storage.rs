@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -221,6 +222,9 @@ impl FeatureStorage {
                 .values()
                 .filter_map(Weak::upgrade)
                 .collect::<Vec<_>>();
+            for connection in &connections {
+                connection.fence();
+            }
             state.connections.clear();
             connections
         };
@@ -270,6 +274,7 @@ impl FeatureStorage {
         let connection = Arc::new(FeatureDatabaseInner {
             workspace_id: workspace_id.to_string(),
             feature_id: registration.feature_id.clone(),
+            accepting_operations: AtomicBool::new(true),
             connection: Mutex::new(Some(connection)),
         });
         state.connections.insert(key, Arc::downgrade(&connection));
@@ -381,6 +386,9 @@ impl FeatureStorage {
                 .filter(|((candidate, _), _)| candidate == workspace_id)
                 .filter_map(|(_, connection)| connection.upgrade())
                 .collect::<Vec<_>>();
+            for connection in &connections {
+                connection.fence();
+            }
             state
                 .connections
                 .retain(|(candidate, _), _| candidate != workspace_id);
@@ -513,6 +521,7 @@ pub struct FeatureDatabase {
 struct FeatureDatabaseInner {
     workspace_id: String,
     feature_id: String,
+    accepting_operations: AtomicBool,
     connection: Mutex<Option<Connection>>,
 }
 
@@ -531,9 +540,11 @@ impl FeatureDatabase {
         &self,
         operation: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<T> {
+        self.inner.ensure_accepting()?;
         let connection = self.inner.connection.lock().map_err(|_| {
             FeatureStorageError::Operation("Feature database lock was poisoned".to_string())
         })?;
+        self.inner.ensure_accepting()?;
         let connection = connection
             .as_ref()
             .ok_or(FeatureStorageError::DatabaseClosed)?;
@@ -546,9 +557,11 @@ impl FeatureDatabase {
         &self,
         operation: impl FnOnce(&Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
+        self.inner.ensure_accepting()?;
         let mut connection = self.inner.connection.lock().map_err(|_| {
             FeatureStorageError::Operation("Feature database lock was poisoned".to_string())
         })?;
+        self.inner.ensure_accepting()?;
         let connection = connection
             .as_mut()
             .ok_or(FeatureStorageError::DatabaseClosed)?;
@@ -572,7 +585,20 @@ impl FeatureDatabase {
 }
 
 impl FeatureDatabaseInner {
+    fn ensure_accepting(&self) -> Result<()> {
+        if self.accepting_operations.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(FeatureStorageError::DatabaseClosed)
+        }
+    }
+
+    fn fence(&self) {
+        self.accepting_operations.store(false, Ordering::Release);
+    }
+
     fn close(&self) -> Result<()> {
+        self.fence();
         let mut connection = self.connection.lock().map_err(|_| {
             FeatureStorageError::Operation("Feature database lock was poisoned".to_string())
         })?;
@@ -1264,8 +1290,14 @@ mod tests {
             let manager = manager.clone();
             thread::spawn(move || manager.shutdown())
         };
-        thread::sleep(Duration::from_millis(20));
+        while database.inner.accepting_operations.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
         assert!(!shutdown.is_finished());
+        assert!(matches!(
+            values(&database).unwrap_err(),
+            FeatureStorageError::DatabaseClosed
+        ));
         release.wait();
         operation.join().unwrap().unwrap();
         shutdown.join().unwrap().unwrap();
