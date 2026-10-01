@@ -18297,7 +18297,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_singleton_reservation_retry_survives_restart_and_new_allocation_key() {
+    async fn worker_singleton_restart_retry_replays_exact_workdir_intent_and_rejects_changes() {
         let dir = tempfile::tempdir().unwrap();
         let database = dir.path().join("server.db");
         let store = SqliteWorkspaceStore::open(&database).unwrap();
@@ -18313,12 +18313,46 @@ mod tests {
             .await
             .unwrap();
         let memory = store.get_workspace_memory_settings("workspace-a").unwrap();
+        let request = |relative_cwd: Option<&str>| crate::hosts::WorkerSpawnRequest {
+            requested_worker_name: Some("Subject Worker".to_string()),
+            singleton_key: Some("subjektiv:restart-retry".to_string()),
+            intent: crate::hosts::WorkerSpawnIntent::WorkspaceCompanion,
+            acceptance: crate::hosts::WorkerSpawnAcceptanceRequirement::RunAccepted {
+                expected_segments: 0,
+            },
+            profile: worker_runtime::catalog::ProfileSelector::Builtin(
+                "builtin:companion".to_string(),
+            ),
+            ticket_assignment: None,
+            initial_submit: Vec::new(),
+            workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachments: vec![
+                worker_runtime::catalog::WorkingDirectoryAttachmentClaim {
+                    alias: workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
+                    working_directory_id: "workdir-a".to_string(),
+                    relative_cwd: relative_cwd.map(ToOwned::to_owned),
+                    capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+                },
+            ],
+            resolved_config_bundle: None,
+            resolved_worker_observation_enabled: false,
+            resolved_worker_observation_grants: Vec::new(),
+            resolved_control_operation: None,
+            resolved_workspace_api: None,
+            resolved_memory_settings: None,
+        };
+        let stable_fingerprint =
+            crate::hosts::worker_spawn_create_fingerprint(&request(Some("src"))).unwrap();
+        let changed_workdir_fingerprint =
+            crate::hosts::worker_spawn_create_fingerprint(&request(Some("tests"))).unwrap();
+        assert_ne!(stable_fingerprint, changed_workdir_fingerprint);
         let reserved = store
             .reserve_worker_create(
                 "workspace-a",
                 "runtime-a",
                 "manual:lost-before-dispatch",
-                "sha256:stable-request",
+                &stable_fingerprint,
                 Some("subjektiv:restart-retry"),
                 &memory,
             )
@@ -18331,7 +18365,7 @@ mod tests {
                 "workspace-a",
                 "runtime-a",
                 "manual:new-after-restart",
-                "sha256:stable-request",
+                &stable_fingerprint,
                 Some("subjektiv:restart-retry"),
                 &memory,
             )
@@ -18354,7 +18388,7 @@ mod tests {
                 "workspace-a",
                 "runtime-a",
                 "manual:different-request",
-                "sha256:different-request",
+                &changed_workdir_fingerprint,
                 Some("subjektiv:restart-retry"),
                 &memory,
             )

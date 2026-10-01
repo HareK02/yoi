@@ -23040,6 +23040,19 @@ fn browser_worker_console_href(workspace_id: &str, resource_key: &str) -> String
     )
 }
 
+fn validate_caller_worker_singleton_key(singleton_key: Option<&str>) -> Result<()> {
+    let Some(singleton_key) = singleton_key else {
+        return Ok(());
+    };
+    crate::store::validate_worker_singleton_key(singleton_key)?;
+    if crate::hosts::is_reserved_internal_worker_singleton_key(singleton_key) {
+        return Err(Error::InvalidInput(format!(
+            "Worker singleton key {singleton_key:?} is reserved for a Backend-managed Worker"
+        )));
+    }
+    Ok(())
+}
+
 async fn create_workspace_worker(
     State(api): State<WorkspaceApi>,
     headers: HeaderMap,
@@ -23064,14 +23077,7 @@ async fn create_workspace_worker_inner(
         workdir_attachments,
         control_operation_id: _,
     } = request;
-    if let Some(singleton_key) = singleton_key.as_deref()
-        && crate::hosts::is_reserved_internal_worker_singleton_key(singleton_key)
-    {
-        return Err(Error::InvalidInput(format!(
-            "Worker singleton key {singleton_key:?} is reserved for a Backend-managed Worker"
-        ))
-        .into());
-    }
+    validate_caller_worker_singleton_key(singleton_key.as_deref())?;
     let config_state = api
         .config_store
         .load_workspace_config(&api.config.workspace_id)?
@@ -24164,9 +24170,7 @@ async fn create_runtime_worker(
     Json(request): Json<server_api::RuntimeWorkerSpawnRequest>,
 ) -> ApiResult<Json<server_api::RuntimeWorkerSpawnResponse>> {
     let mut request = worker_spawn_request_from_api(request)?;
-    if let Some(singleton_key) = request.singleton_key.as_deref() {
-        crate::store::validate_worker_singleton_key(singleton_key)?;
-    }
+    validate_caller_worker_singleton_key(request.singleton_key.as_deref())?;
     validate_worker_initial_submit(&request.initial_submit)?;
     if let Some(assignment) = request.ticket_assignment.as_ref()
         && let Some(worker) = existing_lifecycle_assignment_worker(&api, assignment, &runtime_id)?
@@ -40286,6 +40290,63 @@ mod tests {
             .unwrap_err(),
             "foreign_workspace_ticket_projection"
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_worker_create_rejects_reserved_singleton_key_squatting_and_authority_forgery()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let api = test_api(dir.path()).await;
+        let request = |requested_worker_name: &str,
+                       intent: server_api::RuntimeWorkerSpawnIntent,
+                       profile: &str| server_api::RuntimeWorkerSpawnRequest {
+            requested_worker_name: Some(requested_worker_name.to_string()),
+            intent,
+            singleton_key: Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string()),
+            acceptance: server_api::RuntimeWorkerSpawnAcceptanceRequirement::RunAccepted {
+                expected_segments: 0,
+            },
+            profile: server_api::RuntimeProfileSelector::Builtin(profile.to_string()),
+            ticket_assignment: None,
+            initial_submit: Vec::new(),
+            workdir_attachment_requests: Vec::new(),
+        };
+
+        for candidate in [
+            request(
+                "Generic key squatter",
+                server_api::RuntimeWorkerSpawnIntent::WorkspaceCompanion,
+                "builtin:companion",
+            ),
+            request(
+                crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY,
+                server_api::RuntimeWorkerSpawnIntent::WorkspaceOrchestrator,
+                "builtin:orchestrator",
+            ),
+        ] {
+            let error = scoped_create_runtime_worker(
+                State(api.clone()),
+                AxumPath(ScopedRuntimePath {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                }),
+                Json(candidate),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+        }
+        assert!(
+            api.store
+                .current_worker_singleton_owner(
+                    TEST_WORKSPACE_ID,
+                    crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY,
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(find_workspace_orchestrator(&api).is_none());
     }
 
     #[tokio::test]

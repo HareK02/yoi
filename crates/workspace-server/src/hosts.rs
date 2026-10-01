@@ -457,7 +457,11 @@ pub struct WorkerTicketAssignmentRequest {
 pub(crate) fn worker_spawn_create_fingerprint(
     request: &WorkerSpawnRequest,
 ) -> Result<String, String> {
-    let encoded = serde_json::to_vec(request)
+    // WorkerSpawnRequest intentionally omits Backend-resolved fields from its wire encoding.
+    // Existing Workdir claims are nevertheless caller-visible create intent and must be bound to
+    // a manual singleton retry. Trusted operation identity and ephemeral Backend launch material
+    // remain separate from this semantic create fingerprint.
+    let encoded = serde_json::to_vec(&(request, request.resolved_workdir_attachments.as_slice()))
         .map_err(|error| format!("serialize Worker create input: {error}"))?;
     Ok(format!("sha256:{}", digest_hex(&encoded, 64)))
 }
