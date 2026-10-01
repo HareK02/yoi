@@ -1,0 +1,63 @@
+{
+  "schemaVersion": 1,
+  "id": "workspace-home",
+  "title": "Workspace Home task entry and permission boundaries",
+  "baseUrl": "http://127.0.0.1:15281",
+  "colorScheme": "light",
+  "reducedMotion": "reduce",
+  "personas": [
+    {
+      "id": "fixture",
+      "label": "Fixture account; permission projection varies by Workspace",
+      "auth": { "kind": "anonymous" }
+    }
+  ],
+  "viewports": [
+    { "label": "desktop", "width": 1440, "height": 900 },
+    { "label": "narrow", "width": 768, "height": 900 },
+    { "label": "mobile", "width": 390, "height": 844 }
+  ],
+  "routes": [
+    {
+      "id": "owner",
+      "label": "Owner Home",
+      "path": "/w/home-owner",
+      "goal": "Choose a daily resource without exposing infrastructure details; settings remain secondary.",
+      "dataState": "Workspace owner; empty repositories and workers; one Host available for before-change comparison.",
+      "ready": { "kind": "selector", "selector": "main a[href='/w/home-owner/tickets']" },
+      "capturePoints": [{ "id": "initial", "label": "Home" }]
+    },
+    {
+      "id": "non-owner",
+      "label": "Non-owner Home",
+      "path": "/w/home-member",
+      "goal": "Reach daily resources without seeing owner-only management links.",
+      "dataState": "All management permissions false; empty resource collections.",
+      "ready": { "kind": "selector", "selector": "main a[href='/w/home-member/tickets']" },
+      "capturePoints": [{ "id": "initial", "label": "Home" }]
+    },
+    {
+      "id": "long-name",
+      "label": "Long Workspace name",
+      "path": "/w/home-long",
+      "goal": "Keep resource navigation visible and avoid horizontal page overflow with long Workspace identity.",
+      "dataState": "Owner with a long Workspace name.",
+      "ready": { "kind": "selector", "selector": "main a[href='/w/home-long/tickets']" },
+      "capturePoints": [{ "id": "initial", "label": "Home" }]
+    }
+  ],
+  "processes": [{
+    "id": "home-fixture",
+    "command": "deno",
+    "cwd": "..",
+    "args": [
+      "run",
+      "--allow-net",
+      "--allow-read",
+      "browser-tests/workspace_home_fixture_server.ts",
+      "15281",
+      "../../web/workspace/build"
+    ],
+    "readyUrl": "http://127.0.0.1:15281/health"
+  }]
+}

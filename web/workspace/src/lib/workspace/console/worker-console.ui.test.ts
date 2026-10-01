@@ -245,15 +245,12 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
   );
 
   assert(
-    workspacePage.includes("ticketsHref") &&
-      workspacePage.includes("runtimeSettingsHref") &&
-      workspacePage.includes("workersHref") &&
-      workspacePage.includes("workspaceRoute(workspaceId, '/tickets')") &&
-      workspacePage.includes(
-        "workspaceRoute(workspaceId, '/settings/runtimes')",
-      ) &&
-      workspacePage.includes("workspaceRoute(workspaceId, '/workers')"),
-    "top workspace page should link to Tickets, Runtimes under Settings, and the Workers page",
+    workspacePage.includes("path: '/tickets'") &&
+      workspacePage.includes("path: '/settings/runtimes'") &&
+      workspacePage.includes("permissions.manage_runtimes === true") &&
+      workspacePage.includes("path: '/workers'") &&
+      workspacePage.includes("workspaceRoute(data.workspace.workspace_id, resource.path)"),
+    "Home should link to daily resources and permission-gated Settings without owning their inventories",
   );
   assert(
     !workspacePage.includes("workerConsoleHref") &&

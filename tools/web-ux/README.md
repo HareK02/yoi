@@ -181,6 +181,20 @@ is ignored by Git, while authentication state remains outside the repository. `c
 `target/web-ux` when `--output` is omitted. Keep a bundle outside Git or publish it through the
 approved immutable artifact channel when durable review evidence is required.
 
+## Workspace Home fixture
+
+`scenarios/workspace-home.json` captures the production Home with owner, non-owner, empty-resource,
+and long-name Workspace projections at 1440px, 768px, and 390px. It uses no real account or private
+Workspace data. Build `web/workspace` first, then run from `tools/web-ux`:
+
+```sh
+deno task web-ux capture --scenario scenarios/workspace-home.json --output ../../target/web-ux --run-id home-review
+```
+
+The scenario owns a fixture server on localhost port 15281 and stops only that server. The production
+Home browser regression (`browser-tests/workspace_home_shell_test.ts`, included in `test:browser`)
+also checks 320px, both themes, keyboard navigation, permission-gated links, and absence of Host requests.
+
 ## Adding a scenario
 
 1. Name the concrete user task and expected data state; do not write “looks correct”.
