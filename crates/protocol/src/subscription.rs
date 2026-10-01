@@ -634,6 +634,24 @@ impl SubscriptionWorkerWorkdirAttachment {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionWorkerJob {
+    pub job_id: String,
+    pub attempt_id: String,
+    pub purpose: String,
+}
+
+impl SubscriptionWorkerJob {
+    pub fn validate(&self) -> Result<(), SubscriptionValidationError> {
+        validate_identifier("job_id", &self.job_id, MAX_RESOURCE_ID_BYTES)?;
+        validate_identifier("attempt_id", &self.attempt_id, MAX_RESOURCE_ID_BYTES)?;
+        validate_identifier("job_purpose", &self.purpose, MAX_RESOURCE_ID_BYTES)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct SubscriptionWorker {
     pub worker_id: SubscriptionWorkerId,
     /// Set by the Workspace Server when projecting a Runtime-owned Worker to clients.
@@ -664,6 +682,10 @@ pub struct SubscriptionWorker {
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// Backend-owned Job binding. Runtime producers leave this unset; the
+    /// Workspace projection enriches both snapshots and live updates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<SubscriptionWorkerJob>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workdir_attachments: Vec<SubscriptionWorkerWorkdirAttachment>,
 }
@@ -676,6 +698,9 @@ impl SubscriptionWorker {
         }
         if let Some(resource_key) = &self.resource_key {
             validate_identifier("resource_key", resource_key, MAX_RESOURCE_ID_BYTES)?;
+        }
+        if let Some(job) = &self.job {
+            job.validate()?;
         }
         let mut aliases = HashSet::new();
         let mut workdir_ids = HashSet::new();
@@ -952,6 +977,7 @@ mod tests {
             workspace_id: Some("workspace-1".to_string()),
             display_name: Some(format!("Worker {value}")),
             profile: Some("builtin:coder".to_string()),
+            job: None,
             workdir_attachments: Vec::new(),
         }
     }

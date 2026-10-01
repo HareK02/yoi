@@ -1143,8 +1143,9 @@ impl App {
         }
 
         match event {
-            Event::SubmissionAccepted { .. } => {}
-            Event::SubmissionRejected { message, .. } => self.push_error(message),
+            Event::SubmissionAccepted { .. } | Event::NotificationAccepted { .. } => {}
+            Event::SubmissionRejected { message, .. }
+            | Event::NotificationRejected { message, .. } => self.push_error(message),
             Event::PendingSubmissionsChanged { pending } => {
                 self.pending_submissions = pending;
             }

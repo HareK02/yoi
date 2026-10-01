@@ -1005,6 +1005,18 @@ pub enum Event {
         submission_request_id: String,
         message: String,
     },
+    /// Durable notification acceptance. The request identity is persisted with
+    /// the notification receipt before this event is emitted. Repeating the
+    /// same request id and exact payload returns the same acknowledgement
+    /// without appending the notification twice.
+    NotificationAccepted {
+        notification_request_id: String,
+    },
+    /// Correlated notification rejection before durable acceptance.
+    NotificationRejected {
+        notification_request_id: String,
+        message: String,
+    },
     /// Revisioned FIFO replacement following enqueue, activation, cancel, or clear.
     PendingSubmissionsChanged {
         pending: PendingSubmissionsSnapshot,
@@ -2806,6 +2818,32 @@ mod tests {
                 assert!(is_error);
             }
             other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notification_receipt_events_roundtrip_with_request_identity() {
+        for event in [
+            Event::NotificationAccepted {
+                notification_request_id: "notification-1".into(),
+            },
+            Event::NotificationRejected {
+                notification_request_id: "notification-1".into(),
+                message: "invalid notification".into(),
+            },
+        ] {
+            let json = serde_json::to_string(&event).unwrap();
+            let decoded: Event = serde_json::from_str(&json).unwrap();
+            match decoded {
+                Event::NotificationAccepted {
+                    notification_request_id,
+                }
+                | Event::NotificationRejected {
+                    notification_request_id,
+                    ..
+                } => assert_eq!(notification_request_id, "notification-1"),
+                other => panic!("expected notification receipt, got {other:?}"),
+            }
         }
     }
 

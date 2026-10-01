@@ -449,6 +449,7 @@ fn project_registry_worker(
             workspace_id: Some(record.registry.workspace_id.clone()),
             display_name: Some(record.registry.display_name.clone()),
             profile: record.registry.profile.clone(),
+            job: None,
             workdir_attachments: Vec::new(),
         }
     };
@@ -457,6 +458,13 @@ fn project_registry_worker(
     worker.workspace_id = Some(record.registry.workspace_id);
     worker.display_name = Some(record.registry.display_name);
     worker.profile = record.registry.profile;
+    worker.job = record
+        .job
+        .map(|job| protocol::subscription::SubscriptionWorkerJob {
+            job_id: job.job_id,
+            attempt_id: job.attempt_id,
+            purpose: job.purpose,
+        });
     if !project_working_directory(api, &record.registry.worker, &mut worker) {
         return None;
     }
@@ -616,6 +624,7 @@ mod tests {
             workspace_id: Some("workspace-1".to_string()),
             display_name: Some("Companion".to_string()),
             profile: Some("builtin:companion".to_string()),
+            job: None,
             workdir_attachments: vec![
                 protocol::subscription::SubscriptionWorkerWorkdirAttachment {
                     alias: "external".to_string(),

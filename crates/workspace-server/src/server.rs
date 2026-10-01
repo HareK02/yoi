@@ -13,9 +13,7 @@ use axum::http::header::{CONTENT_TYPE, LOCATION, ORIGIN};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-#[cfg(test)]
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{Duration, SecondsFormat, Utc};
 use config_source::ConfigTreeSnapshot;
@@ -145,6 +143,11 @@ use crate::authority::{
     MemoryAuthority, ObjectiveAuthority, ObjectiveCreateInput, ObjectiveEditInput,
     SqliteWorkspaceAuthority, TicketAuthority, TicketMergeRevisionSource, merge_request_summary,
 };
+use crate::backend_job::{
+    ABSOLUTE_MAX_CONCURRENT_JOBS, BackendJobAttemptState, BackendJobDeliveryState,
+    BackendJobRequest, BackendJobReservation, BackendJobResultAcceptance,
+    BackendJobResultSubmission, BackendJobState, allocation_key,
+};
 use crate::companion::{
     CompanionCancelRequest, CompanionConsole, CompanionMessageRequest, CompanionMessageResponse,
     CompanionStatusResponse, CompanionTranscriptProjection,
@@ -157,11 +160,12 @@ use crate::hosts::{
     RemoteWorkerRuntime, RuntimeDiagnostic, RuntimePingFailureKind, RuntimeRegistry,
     RuntimeRegistryError, RuntimeRegistryUnregisterResult, TicketWorkerRole,
     WorkerCompletionsRequest, WorkerCompletionsResult, WorkerControlOperation, WorkerCreateBinding,
-    WorkerInputKind, WorkerInputRequest, WorkerInputResult, WorkerLifecycleRequest,
-    WorkerLifecycleResult, WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest,
-    WorkerSpawnResult, WorkerSpawnWorkingDirectoryRequest, WorkerTicketAssignmentRequest,
-    WorkspaceRuntimeAuthorization, is_disallowed_remote_runtime_address,
-    is_loopback_runtime_origin, worker_spawn_create_fingerprint, workspace_worker_summary,
+    WorkerInputDisposition, WorkerInputKind, WorkerInputRequest, WorkerInputResult,
+    WorkerLifecycleRequest, WorkerLifecycleResult, WorkerSpawnAcceptanceRequirement,
+    WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult, WorkerSpawnWorkingDirectoryRequest,
+    WorkerTicketAssignmentRequest, WorkspaceRuntimeAuthorization,
+    is_disallowed_remote_runtime_address, is_loopback_runtime_origin,
+    worker_spawn_create_fingerprint, workspace_worker_summary,
 };
 use crate::memory_backend::execute_memory_backend_operation_with_authority;
 use crate::memory_staging::{
@@ -3241,11 +3245,499 @@ impl WorkspaceApi {
         }
         recover_workdir_removals(&api)?;
         recover_runtime_removals(&api).await;
+        let recovery_now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let deliveries = api
+            .store
+            .recover_backend_job_deliveries(&api.config.workspace_id, &recovery_now)?;
+        for delivery in deliveries {
+            let Some(job) = api
+                .store
+                .get_backend_job(&api.config.workspace_id, &delivery.job_id)?
+            else {
+                continue;
+            };
+            let Some(attempt) = api.store.get_backend_job_attempt(
+                &api.config.workspace_id,
+                &delivery.job_id,
+                &delivery.attempt_id,
+            )?
+            else {
+                continue;
+            };
+            if job.state == BackendJobState::Completed
+                && attempt.state == BackendJobAttemptState::Completed
+            {
+                api.deliver_backend_job_result(
+                    &BackendJobResultAcceptance {
+                        job,
+                        attempt,
+                        replayed: true,
+                    },
+                    &delivery.target,
+                );
+            }
+        }
+        api.recover_backend_jobs()?;
         Ok(api)
     }
 
     pub fn workspace_id(&self) -> &str {
         self.config.workspace_id.as_str()
+    }
+
+    /// Reserve durable Job intent and dispatch its current attempt through the
+    /// ordinary embedded Runtime Worker path. Replaying the same request
+    /// converges on the same attempt and Worker allocation.
+    pub fn dispatch_backend_job(
+        &self,
+        request: &BackendJobRequest,
+    ) -> Result<BackendJobReservation> {
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let reservation =
+            self.store
+                .reserve_backend_job(&self.config.workspace_id, request, &now)?;
+        self.dispatch_backend_job_reservation(reservation)
+    }
+
+    /// Explicit re-evaluation creates a new bounded attempt only after a
+    /// definitive failure. Unknown execution outcomes require manual attention
+    /// and cannot be replayed because the original tracked run may still execute.
+    /// Transport replay must call `dispatch_backend_job` with the original
+    /// immutable request.
+    pub fn retry_backend_job(&self, job_id: &str) -> Result<BackendJobReservation> {
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let reservation =
+            self.store
+                .reserve_backend_job_retry(&self.config.workspace_id, job_id, &now)?;
+        self.dispatch_backend_job_reservation(reservation)
+    }
+
+    fn dispatch_backend_job_reservation(
+        &self,
+        reservation: BackendJobReservation,
+    ) -> Result<BackendJobReservation> {
+        if reservation.job.state != BackendJobState::Pending
+            || reservation.attempt.state != BackendJobAttemptState::Reserved
+            || reservation.attempt.worker.is_some()
+        {
+            return Ok(reservation);
+        }
+        let request = &reservation.job.request;
+        let worker_input = request.worker_input(&reservation.attempt.attempt_id)?;
+        let control_operation = WorkerControlOperation {
+            operation_id: allocation_key(&reservation.attempt.attempt_id),
+            input_fingerprint: reservation.job.intent_fingerprint.clone(),
+        };
+        let spawned = match self.spawn_workspace_worker(
+            EMBEDDED_WORKER_RUNTIME_ID,
+            WorkerSpawnRequest {
+                requested_worker_name: Some(format!("job:{}", request.purpose)),
+                intent: WorkerSpawnIntent::BackendJob {
+                    job_id: request.job_id.clone(),
+                    attempt_id: reservation.attempt.attempt_id.clone(),
+                    purpose: request.purpose.clone(),
+                },
+                acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                    expected_segments: 0,
+                },
+                profile: ProfileSelector::Builtin(request.profile.clone()),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachments: Vec::new(),
+                resolved_config_bundle: None,
+                resolved_worker_observation_enabled: false,
+                resolved_worker_observation_grants: Vec::new(),
+                resolved_workspace_api: None,
+                resolved_memory_settings: None,
+                resolved_control_operation: Some(control_operation),
+            },
+        ) {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                let detail = error.error.to_string();
+                self.store.finish_backend_job_attempt(
+                    &self.config.workspace_id,
+                    &request.job_id,
+                    &reservation.attempt.attempt_id,
+                    BackendJobAttemptState::Failed,
+                    "dispatch_error",
+                    &detail,
+                    &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                )?;
+                return Err(error.error);
+            }
+        };
+        let worker = match (spawned.state, spawned.worker) {
+            (InternalWorkerOperationState::Accepted, Some(worker)) => worker,
+            _ => {
+                let detail = spawned
+                    .diagnostics
+                    .first()
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .unwrap_or("embedded Runtime rejected Backend Job Worker dispatch");
+                self.store.finish_backend_job_attempt(
+                    &self.config.workspace_id,
+                    &request.job_id,
+                    &reservation.attempt.attempt_id,
+                    BackendJobAttemptState::Failed,
+                    "dispatch_rejected",
+                    detail,
+                    &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                )?;
+                return Err(Error::RuntimeOperationFailed {
+                    runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                    code: "backend_job_dispatch_rejected".to_string(),
+                    message: detail.to_string(),
+                });
+            }
+        };
+        let bound_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let runtime_run_id = crate::backend_job::runtime_run_id(&reservation.attempt.attempt_id);
+        let (commit, newly_bound) = self.store.bind_backend_job_attempt_worker(
+            &self.config.workspace_id,
+            &request.job_id,
+            &reservation.attempt.attempt_id,
+            &worker.worker,
+            Some(&runtime_run_id),
+            &bound_at,
+        )?;
+        if newly_bound {
+            self.worker_projection.publish_commit(commit)?;
+        } else {
+            let job = self
+                .store
+                .get_backend_job(&self.config.workspace_id, &request.job_id)?
+                .ok_or_else(|| Error::Store("bound Backend Job disappeared".to_string()))?;
+            let attempt = self
+                .store
+                .get_backend_job_attempt(
+                    &self.config.workspace_id,
+                    &request.job_id,
+                    &reservation.attempt.attempt_id,
+                )?
+                .ok_or_else(|| Error::Store("bound Backend Job attempt disappeared".to_string()))?;
+            return Ok(BackendJobReservation {
+                job,
+                attempt,
+                replayed: true,
+            });
+        }
+
+        self.schedule_backend_job_timeout(
+            &request.job_id,
+            &reservation.attempt.attempt_id,
+            &reservation.attempt.deadline_at,
+        );
+
+        let submitted = match self.runtime.send_input(
+            &worker.worker,
+            WorkerInputRequest {
+                kind: WorkerInputKind::User,
+                content: worker_input,
+                submission_request_id: Some(runtime_run_id.clone()),
+                segments: None,
+            },
+        ) {
+            Ok(submitted) => submitted,
+            Err(error) => {
+                let detail = error.message();
+                self.store.finish_backend_job_attempt(
+                    &self.config.workspace_id,
+                    &request.job_id,
+                    &reservation.attempt.attempt_id,
+                    BackendJobAttemptState::Unknown,
+                    "input_outcome_unknown",
+                    &detail,
+                    &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                )?;
+                return Err(error.into_error());
+            }
+        };
+        if submitted.state != InternalWorkerOperationState::Accepted {
+            let detail = submitted
+                .diagnostics
+                .first()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .unwrap_or("embedded Runtime rejected Backend Job input");
+            let (state, category) = match submitted.disposition {
+                WorkerInputDisposition::Unknown => {
+                    (BackendJobAttemptState::Unknown, "input_outcome_unknown")
+                }
+                WorkerInputDisposition::Accepted | WorkerInputDisposition::Rejected => {
+                    (BackendJobAttemptState::Failed, "input_rejected")
+                }
+            };
+            self.store.finish_backend_job_attempt(
+                &self.config.workspace_id,
+                &request.job_id,
+                &reservation.attempt.attempt_id,
+                state,
+                category,
+                detail,
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )?;
+            return Err(Error::RuntimeOperationFailed {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                code: format!("backend_job_{category}"),
+                message: detail.to_string(),
+            });
+        }
+        if submitted.runtime_run_id.as_deref() != Some(runtime_run_id.as_str()) {
+            self.store.finish_backend_job_attempt(
+                &self.config.workspace_id,
+                &request.job_id,
+                &reservation.attempt.attempt_id,
+                BackendJobAttemptState::Unknown,
+                "runtime_run_mismatch",
+                "embedded Runtime accepted Backend Job input without matching tracked run evidence",
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )?;
+            return Err(Error::RuntimeOperationFailed {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                code: "backend_job_runtime_run_mismatch".to_string(),
+                message: "embedded Runtime accepted Backend Job input without matching tracked run evidence"
+                    .to_string(),
+            });
+        }
+        let job = self
+            .store
+            .get_backend_job(&self.config.workspace_id, &request.job_id)?
+            .ok_or_else(|| Error::Store("dispatched Backend Job disappeared".to_string()))?;
+        let attempt = self
+            .store
+            .get_backend_job_attempt(
+                &self.config.workspace_id,
+                &request.job_id,
+                &reservation.attempt.attempt_id,
+            )?
+            .ok_or_else(|| {
+                Error::Store("dispatched Backend Job attempt disappeared".to_string())
+            })?;
+        Ok(BackendJobReservation {
+            job,
+            attempt,
+            replayed: reservation.replayed,
+        })
+    }
+
+    /// Reconcile durable non-terminal attempts after Backend restart. Reserved
+    /// attempts are replay-dispatched through their deterministic allocation;
+    /// dispatched attempts keep running only while their bound Worker remains
+    /// known, and always receive a fresh deadline task.
+    pub fn recover_backend_jobs(&self) -> Result<()> {
+        let attempts = self.store.list_recoverable_backend_job_attempts(
+            &self.config.workspace_id,
+            usize::from(ABSOLUTE_MAX_CONCURRENT_JOBS),
+        )?;
+        for attempt in attempts {
+            match attempt.state {
+                BackendJobAttemptState::Reserved => {
+                    let job = self
+                        .store
+                        .get_backend_job(&self.config.workspace_id, &attempt.job_id)?
+                        .ok_or_else(|| {
+                            Error::Store("recoverable Backend Job disappeared".to_string())
+                        })?;
+                    if let Err(error) =
+                        self.dispatch_backend_job_reservation(BackendJobReservation {
+                            job,
+                            attempt,
+                            replayed: true,
+                        })
+                    {
+                        tracing::warn!(%error, "Backend Job reserved-attempt recovery failed");
+                    }
+                }
+                BackendJobAttemptState::Dispatched => {
+                    if attempt.runtime_run_id.is_none() {
+                        self.store.finish_backend_job_attempt(
+                            &self.config.workspace_id,
+                            &attempt.job_id,
+                            &attempt.attempt_id,
+                            BackendJobAttemptState::Unknown,
+                            "recovery_runtime_run_unknown",
+                            "the Runtime accepted Worker dispatch without durable run evidence",
+                            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                        )?;
+                        continue;
+                    }
+                    let worker_known = attempt
+                        .worker
+                        .as_ref()
+                        .is_some_and(|worker| self.runtime.worker(worker).is_ok());
+                    if !worker_known {
+                        self.store.finish_backend_job_attempt(
+                            &self.config.workspace_id,
+                            &attempt.job_id,
+                            &attempt.attempt_id,
+                            BackendJobAttemptState::Unknown,
+                            "recovery_worker_unknown",
+                            "the bound Runtime Worker was not recoverable after Backend restart",
+                            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                        )?;
+                    } else {
+                        self.schedule_backend_job_timeout(
+                            &attempt.job_id,
+                            &attempt.attempt_id,
+                            &attempt.deadline_at,
+                        );
+                    }
+                }
+                BackendJobAttemptState::Completed
+                | BackendJobAttemptState::Failed
+                | BackendJobAttemptState::Unknown => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn schedule_backend_job_timeout(&self, job_id: &str, attempt_id: &str, deadline_at: &str) {
+        let Ok(deadline) = chrono::DateTime::parse_from_rfc3339(deadline_at) else {
+            return;
+        };
+        let delay = (deadline.with_timezone(&Utc) - Utc::now())
+            .to_std()
+            .unwrap_or_default();
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let store = self.store.clone();
+        let runtime = self.runtime.clone();
+        let workspace_id = self.config.workspace_id.clone();
+        let job_id = job_id.to_string();
+        let attempt_id = attempt_id.to_string();
+        handle.spawn(async move {
+            tokio::time::sleep(delay).await;
+            let Ok(Some(attempt)) =
+                store.get_backend_job_attempt(&workspace_id, &job_id, &attempt_id)
+            else {
+                return;
+            };
+            if attempt.state != BackendJobAttemptState::Dispatched {
+                return;
+            }
+            // Fence result acceptance before stopping the Worker so a late
+            // completion cannot turn a timed-out attempt into success.
+            if store
+                .finish_backend_job_attempt(
+                    &workspace_id,
+                    &job_id,
+                    &attempt_id,
+                    BackendJobAttemptState::Failed,
+                    "timeout",
+                    "Backend Job attempt exceeded its durable deadline",
+                    &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                )
+                .is_ok()
+            {
+                if let Some(worker) = attempt.worker {
+                    let _ = runtime.stop_worker(
+                        &worker,
+                        WorkerLifecycleRequest {
+                            reason: Some("Backend Job attempt timed out".to_string()),
+                            ticket_assignment: None,
+                        },
+                    );
+                }
+            }
+        });
+    }
+
+    /// Accept the only authoritative success signal for a Job attempt. The
+    /// source identity is fenced against the durable Worker binding. Result
+    /// persistence precedes best-effort notification delivery.
+    pub fn accept_backend_job_result(
+        &self,
+        source_worker: &RuntimeWorkerRef,
+        submission: &BackendJobResultSubmission,
+    ) -> Result<BackendJobResultAcceptance> {
+        let accepted_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let acceptance = self.store.accept_backend_job_result(
+            &self.config.workspace_id,
+            source_worker,
+            submission,
+            &accepted_at,
+        )?;
+        if let Some(target) = acceptance.job.request.notification_target.as_ref() {
+            self.deliver_backend_job_result(&acceptance, target);
+        }
+        Ok(acceptance)
+    }
+
+    fn deliver_backend_job_result(
+        &self,
+        acceptance: &BackendJobResultAcceptance,
+        target: &RuntimeWorkerRef,
+    ) {
+        let delivery_id = crate::backend_job::delivery_id(
+            &acceptance.job.request.job_id,
+            &acceptance.attempt.attempt_id,
+        );
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let Ok((delivery, claimed)) = self.store.reserve_backend_job_delivery(
+            &self.config.workspace_id,
+            &delivery_id,
+            &acceptance.job.request.job_id,
+            target,
+            &now,
+        ) else {
+            return;
+        };
+        if !claimed || delivery.state != BackendJobDeliveryState::Sending {
+            return;
+        }
+        let content = format!(
+            "Backend Job `{}` completed attempt `{}` for `{}`. Durable result digest: {}.",
+            acceptance.job.request.job_id,
+            acceptance.attempt.attempt_id,
+            acceptance.job.request.purpose,
+            acceptance
+                .job
+                .result_digest
+                .as_deref()
+                .unwrap_or("unavailable")
+        );
+        let delivery_result = self.runtime.send_input(
+            target,
+            WorkerInputRequest {
+                kind: WorkerInputKind::Notify,
+                content,
+                submission_request_id: Some(delivery.delivery_id.clone()),
+                segments: None,
+            },
+        );
+        let (state, category, detail): (_, Option<String>, Option<String>) = match delivery_result {
+            Ok(result) if result.state == InternalWorkerOperationState::Accepted => {
+                (BackendJobDeliveryState::Completed, None, None)
+            }
+            Ok(result) if result.disposition == WorkerInputDisposition::Unknown => (
+                BackendJobDeliveryState::Unknown,
+                Some("notification_outcome_unknown".to_string()),
+                result.diagnostics.first().map(|item| item.message.clone()),
+            ),
+            Ok(result) => (
+                BackendJobDeliveryState::Failed,
+                Some("notification_rejected".to_string()),
+                result.diagnostics.first().map(|item| item.message.clone()),
+            ),
+            Err(error) => (
+                BackendJobDeliveryState::Unknown,
+                Some("notification_outcome_unknown".to_string()),
+                Some(error.message()),
+            ),
+        };
+        // Delivery is intentionally separate from result authority. A delivery
+        // bookkeeping failure must never roll back or re-run completed work.
+        let _ = self.store.finish_backend_job_delivery(
+            &self.config.workspace_id,
+            &delivery_id,
+            state,
+            category.as_deref(),
+            detail.as_deref(),
+            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+        );
     }
 
     fn register_workspace_runtime_binding(
@@ -5119,6 +5611,7 @@ fn worker_input_request_from_api(
     Ok(WorkerInputRequest {
         kind,
         content: request.content,
+        submission_request_id: None,
         segments,
     })
 }
@@ -9123,6 +9616,10 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
         _,
         _,
     >(workspace, scoped_worker_protocol_ws)
+    .route(
+        "/api/w/{workspace_id}/workers/self/backend-job-result",
+        post(scoped_submit_backend_job_result),
+    )
     .fallback(get(static_or_spa_fallback))
     .with_state(api)
     .merge(generated_workspace_contract_router(contract_service));
@@ -14116,6 +14613,7 @@ fn notify_ticket_recipients(
             WorkerInputRequest {
                 kind: WorkerInputKind::Notify,
                 content: content.clone(),
+                submission_request_id: None,
                 segments: None,
             },
         );
@@ -14472,6 +14970,49 @@ async fn refresh_current_worker_session_locked(
         open_current_worker_workdir_session_locked(api, worker, &remaining[0]).await?;
     }
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubmitBackendJobResultRequest {
+    result: serde_json::Value,
+}
+
+async fn scoped_submit_backend_job_result(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    headers: HeaderMap,
+    Json(request): Json<SubmitBackendJobResultRequest>,
+) -> ApiResult<Json<BackendJobResultAcceptance>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let worker = current_worker_identity(&api, &path.workspace_id, &headers)?;
+    let binding = api
+        .store
+        .worker_registry_projection(&api.config.workspace_id, &worker)?
+        .and_then(|projection| projection.job)
+        .ok_or_else(|| {
+            Error::InvalidInput(
+                "current Worker is not bound to an active Backend Job attempt".to_string(),
+            )
+        })?;
+    let attempt = api
+        .store
+        .get_backend_job_attempt(
+            &api.config.workspace_id,
+            &binding.job_id,
+            &binding.attempt_id,
+        )?
+        .ok_or_else(|| Error::Store("Backend Job attempt binding disappeared".to_string()))?;
+    let acceptance = api.accept_backend_job_result(
+        &worker,
+        &BackendJobResultSubmission {
+            job_id: binding.job_id,
+            attempt_id: binding.attempt_id,
+            input_revision: attempt.input_revision,
+            result: request.result,
+        },
+    )?;
+    Ok(Json(acceptance))
 }
 
 async fn scoped_attach_current_worker_workdir(
@@ -15173,6 +15714,7 @@ fn dispatch_orchestrator_queue_attention(api: &WorkspaceApi) {
             WorkerInputRequest {
                 kind: WorkerInputKind::Notify,
                 content,
+                submission_request_id: None,
                 segments: None,
             },
         )
@@ -15453,6 +15995,7 @@ fn try_reuse_memory_consolidation_worker(
             WorkerInputRequest {
                 kind: WorkerInputKind::User,
                 content: input_content.to_string(),
+                submission_request_id: None,
                 segments: None,
             },
         )
@@ -23315,6 +23858,17 @@ async fn send_runtime_worker_input(
 ) -> ApiResult<Json<server_api::RuntimeWorkerInputResult>> {
     let request = worker_input_request_from_api(request)?;
     let worker = resolve_workspace_worker_reference(&api, &runtime_id, &worker_id)?;
+    if api
+        .store
+        .worker_registry_projection(&api.config.workspace_id, &worker)?
+        .and_then(|projection| projection.job)
+        .is_some()
+    {
+        return Err(Error::InvalidInput(
+            "Backend Job Workers accept only their Backend-owned immutable input".to_string(),
+        )
+        .into());
+    }
     let result = api
         .runtime
         .send_input(&worker, request)
@@ -23426,6 +23980,13 @@ async fn worker_protocol_ws(
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     let worker = RuntimeWorkerRef::new(&runtime_id, &worker_id);
+    let job_read_only = match api
+        .store
+        .worker_registry_projection(&api.config.workspace_id, &worker)
+    {
+        Ok(projection) => projection.and_then(|projection| projection.job).is_some(),
+        Err(error) => return ApiError::from(error).into_response(),
+    };
     let source = match api.observation_proxy.source(&worker) {
         Ok(source) => source,
         Err(ObservationProxyError::WorkerNotFound(_)) => {
@@ -23446,7 +24007,9 @@ async fn worker_protocol_ws(
         }
     };
     let input_source = authenticated_browser_input_source(&actor);
-    ws.on_upgrade(move |socket| worker_protocol_ws_session(source, socket, input_source))
+    ws.on_upgrade(move |socket| {
+        worker_protocol_ws_session(source, socket, input_source, job_read_only)
+    })
 }
 
 pub(crate) struct WorkspaceWorkerProtocolConnection {
@@ -23603,13 +24166,14 @@ async fn worker_protocol_ws_session(
     source: RuntimeObservationSource,
     socket: WebSocket,
     input_source: protocol::AuthenticatedInputSource,
+    read_only: bool,
 ) {
     match source {
         RuntimeObservationSource::RemoteWs(config) => {
-            remote_worker_protocol_ws_session(config, socket, input_source).await;
+            remote_worker_protocol_ws_session(config, socket, input_source, read_only).await;
         }
         RuntimeObservationSource::Embedded(source) => {
-            embedded_worker_protocol_ws_session(source, socket, input_source).await;
+            embedded_worker_protocol_ws_session(source, socket, input_source, read_only).await;
         }
     }
 }
@@ -23618,6 +24182,7 @@ async fn remote_worker_protocol_ws_session(
     config: RuntimeObservationSourceConfig,
     socket: WebSocket,
     input_source: protocol::AuthenticatedInputSource,
+    read_only: bool,
 ) {
     let mut request = match config.endpoint.clone().into_client_request() {
         Ok(request) => request,
@@ -23676,6 +24241,14 @@ async fn remote_worker_protocol_ws_session(
             inbound = client_stream.next() => {
                 match inbound {
                     Some(Ok(WsMessage::Text(text))) => {
+                        if read_only {
+                            if let Ok(event) = protocol::stream::encode_event(&protocol_error_event(
+                                "Backend Job Worker Console is read-only",
+                            )) {
+                                let _ = client_sink.send(WsMessage::Text(event.into())).await;
+                            }
+                            continue;
+                        }
                         let method = match protocol::stream::decode_method(text.as_ref()) {
                             Ok(method) => match authorize_browser_worker_method(method, &input_source) {
                                 Ok(method) => method,
@@ -23759,6 +24332,7 @@ async fn embedded_worker_protocol_ws_session(
     source: crate::observation::EmbeddedRuntimeObservationSource,
     mut socket: WebSocket,
     input_source: protocol::AuthenticatedInputSource,
+    read_only: bool,
 ) {
     let mut upstream = match RuntimeObservationClient::connect(&RuntimeObservationSource::Embedded(
         source.clone(),
@@ -23777,6 +24351,12 @@ async fn embedded_worker_protocol_ws_session(
         tokio::select! {
             inbound = socket.next() => {
                 match inbound {
+                    Some(Ok(WsMessage::Text(_))) if read_only => {
+                        let event = protocol_error_event("Backend Job Worker Console is read-only");
+                        if !send_protocol_event(&mut socket, &event).await {
+                            return;
+                        }
+                    }
                     Some(Ok(WsMessage::Text(text))) => match decode_method(&text) {
                         Ok(method) => match authorize_browser_worker_method(method, &input_source) {
                             Ok(method) => match source.runtime.send_protocol_method(&source.worker_ref, method) {
@@ -24800,6 +25380,7 @@ fn record_worker_summary(
             workspace_id: worker.workspace.workspace_id.clone(),
             display_name: Some(worker.display_name.clone()),
             profile: worker.profile.clone(),
+            job: None,
             workdir_attachments: Vec::new(),
         };
         api.worker_projection
@@ -26714,6 +27295,7 @@ mod tests {
                     workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
                     display_name: Some("Worker A".to_string()),
                     profile: Some("builtin:coder".to_string()),
+                    job: None,
                     workdir_attachments: Vec::new(),
                 },
                 availability,
@@ -26723,6 +27305,7 @@ mod tests {
                 projection_revision: 9,
                 observed_at: "2026-09-24T00:00:01Z".to_string(),
             }),
+            job: None,
         };
 
         let unavailable = worker_summary_from_projection(&projection).unwrap();
@@ -30275,6 +30858,7 @@ mod tests {
                     workspace_id: Some(TEST_WORKSPACE_ID.to_string()),
                     display_name: Some("Paused Worker".to_string()),
                     profile: Some("builtin:coder".to_string()),
+                    job: None,
                     workdir_attachments: Vec::new(),
                 },
                 "4",
@@ -33039,6 +33623,10 @@ mod tests {
         materializer: worker_runtime::working_directory::RuntimeGitMaterializer,
         spawn_failure: std::sync::Mutex<Option<String>>,
         input_failure: std::sync::Mutex<Option<String>>,
+        input_hook: std::sync::Mutex<
+            Option<Box<dyn FnOnce(&worker_runtime::identity::WorkerRef) + Send + 'static>>,
+        >,
+        input_request_ids: std::sync::Mutex<Vec<Option<String>>>,
         inputs: std::sync::Mutex<Vec<(worker_runtime::identity::WorkerRef, String)>>,
         protocol_methods:
             std::sync::Mutex<Vec<(worker_runtime::identity::WorkerRef, protocol::Method)>>,
@@ -33061,6 +33649,8 @@ mod tests {
                 ),
                 spawn_failure: std::sync::Mutex::new(None),
                 input_failure: std::sync::Mutex::new(None),
+                input_hook: std::sync::Mutex::new(None),
+                input_request_ids: std::sync::Mutex::new(Vec::new()),
                 inputs: std::sync::Mutex::new(Vec::new()),
                 protocol_methods: std::sync::Mutex::new(Vec::new()),
             }
@@ -33070,6 +33660,22 @@ mod tests {
     impl DeterministicExecutionBackend {
         fn reject_inputs(&self, message: impl Into<String>) {
             *self.input_failure.lock().unwrap() = Some(message.into());
+        }
+
+        fn before_input_returns(
+            &self,
+            hook: impl FnOnce(&worker_runtime::identity::WorkerRef) + Send + 'static,
+        ) {
+            *self.input_hook.lock().unwrap() = Some(Box::new(hook));
+        }
+
+        fn take_input_request_ids(&self) -> Vec<Option<String>> {
+            std::mem::take(
+                &mut *self
+                    .input_request_ids
+                    .lock()
+                    .expect("input request ids lock"),
+            )
         }
 
         fn take_inputs(&self) -> Vec<(worker_runtime::identity::WorkerRef, String)> {
@@ -33232,10 +33838,17 @@ mod tests {
             handle: &worker_runtime::execution::WorkerExecutionHandle,
             input: worker_runtime::interaction::WorkerInput,
         ) -> worker_runtime::execution::WorkerExecutionResult {
+            self.input_request_ids
+                .lock()
+                .expect("input request ids lock")
+                .push(input.submission_request_id.clone());
             self.inputs
                 .lock()
                 .expect("inputs lock")
                 .push((handle.worker_ref().clone(), input.content.clone()));
+            if let Some(hook) = self.input_hook.lock().unwrap().take() {
+                hook(handle.worker_ref());
+            }
             if let Some(message) = self.input_failure.lock().unwrap().clone() {
                 return worker_runtime::execution::WorkerExecutionResult::errored(
                     worker_runtime::execution::WorkerExecutionOperation::Input,
@@ -33250,6 +33863,7 @@ mod tests {
                 .cloned()
                 .expect("execution context");
             let submission_request_id = input.submission_request_id.clone();
+            let input_kind = input.kind.clone();
             let content = input.content.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(25));
@@ -33257,7 +33871,13 @@ mod tests {
                     text: format!("server companion echoed: {content}"),
                 });
             });
-            if let Some(submission_request_id) = submission_request_id {
+            if input_kind == worker_runtime::interaction::WorkerInputKind::Notify {
+                worker_runtime::execution::WorkerExecutionResult::accepted_notification(
+                    worker_runtime::execution::WorkerExecutionOperation::Input,
+                    submission_request_id.expect("Notify test input has a Runtime request id"),
+                )
+                .with_worker_state(protocol::WorkerStateSnapshot::initial())
+            } else if let Some(submission_request_id) = submission_request_id {
                 worker_runtime::execution::WorkerExecutionResult::accepted_submission(
                     worker_runtime::execution::WorkerExecutionOperation::Input,
                     submission_request_id,
@@ -33401,6 +34021,522 @@ mod tests {
             default_selector: Some("HEAD".to_string()),
         }];
         config
+    }
+
+    #[tokio::test]
+    async fn backend_job_runner_uses_registered_embedded_worker_and_structured_result_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        let request = BackendJobRequest {
+            job_id: "runner-check-1".to_string(),
+            purpose: "runner_contract_check".to_string(),
+            input_revision: "revision-1".to_string(),
+            input_ref: "test://runner/input/1".to_string(),
+            input: serde_json::json!({"value": "immutable"}),
+            instruction: "Return a structured check result.".to_string(),
+            profile: "builtin:backend-job".to_string(),
+            source_worker: None,
+            notification_target: None,
+            limits: crate::backend_job::BackendJobLimits::default(),
+        };
+
+        let stale_reservation = api
+            .store
+            .reserve_backend_job(
+                TEST_WORKSPACE_ID,
+                &request,
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+        let dispatched = api
+            .dispatch_backend_job_reservation(stale_reservation.clone())
+            .unwrap();
+        let concurrent_replay = api
+            .dispatch_backend_job_reservation(stale_reservation)
+            .unwrap();
+        assert!(concurrent_replay.replayed);
+        assert_eq!(
+            execution.take_inputs().len(),
+            1,
+            "a stale concurrent dispatch replay must not submit the attempt twice"
+        );
+        assert_eq!(dispatched.attempt.state, BackendJobAttemptState::Dispatched);
+        assert!(
+            dispatched.attempt.runtime_run_id.is_some(),
+            "accepted Job input must be fenced to durable Runtime run evidence"
+        );
+        let worker = dispatched.attempt.worker.clone().expect("bound Job Worker");
+        assert_eq!(worker.runtime_id, EMBEDDED_WORKER_RUNTIME_ID);
+        assert!(
+            api.store
+                .get_worker_registry(TEST_WORKSPACE_ID, &worker)
+                .unwrap()
+                .is_some(),
+            "Job dispatch must use the ordinary Workspace Worker registry"
+        );
+        assert_eq!(
+            api.store
+                .worker_registry_projection(TEST_WORKSPACE_ID, &worker)
+                .unwrap()
+                .unwrap()
+                .job,
+            Some(crate::backend_job::BackendJobWorkerBinding {
+                job_id: request.job_id.clone(),
+                attempt_id: dispatched.attempt.attempt_id.clone(),
+                purpose: request.purpose.clone(),
+            })
+        );
+        let input_error = send_runtime_worker_input(
+            State(api.clone()),
+            AxumPath((worker.runtime_id.clone(), worker.worker_id.clone())),
+            Json(server_api::RuntimeWorkerInputRequest {
+                kind: Some("user".to_string()),
+                content: "attempt to rerun immutable Job input".to_string(),
+                segments: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            input_error.into_response().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(
+            execution.take_inputs().is_empty(),
+            "Job-owned Workers must reject interactive reruns"
+        );
+        let replay = api.dispatch_backend_job(&request).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.attempt.worker, Some(worker.clone()));
+
+        let accepted = api
+            .accept_backend_job_result(
+                &worker,
+                &BackendJobResultSubmission {
+                    job_id: request.job_id.clone(),
+                    attempt_id: dispatched.attempt.attempt_id,
+                    input_revision: request.input_revision,
+                    result: serde_json::json!({"valid": true}),
+                },
+            )
+            .unwrap();
+        assert_eq!(accepted.job.state, BackendJobState::Completed);
+    }
+
+    #[tokio::test]
+    async fn backend_job_fast_result_is_accepted_after_prebound_tracked_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        let request = BackendJobRequest {
+            job_id: "r".repeat(256),
+            purpose: "fast_result_contract_check".to_string(),
+            input_revision: "revision-1".to_string(),
+            input_ref: "test://runner/fast-result/1".to_string(),
+            input: serde_json::json!({"value": "immutable"}),
+            instruction: "Return a structured check result.".to_string(),
+            profile: "builtin:backend-job".to_string(),
+            source_worker: None,
+            notification_target: None,
+            limits: crate::backend_job::BackendJobLimits::default(),
+        };
+        let acceptance_observed = Arc::new(std::sync::Mutex::new(None));
+        let hook_api = api.clone();
+        let hook_request = request.clone();
+        let hook_observed = acceptance_observed.clone();
+        execution.before_input_returns(move |worker| {
+            let source =
+                RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, worker.worker_id.to_string());
+            let accepted = hook_api
+                .accept_backend_job_result(
+                    &source,
+                    &BackendJobResultSubmission {
+                        job_id: hook_request.job_id.clone(),
+                        attempt_id: crate::backend_job::attempt_id(&hook_request.job_id, 1),
+                        input_revision: hook_request.input_revision.clone(),
+                        result: serde_json::json!({"valid": true}),
+                    },
+                )
+                .is_ok();
+            *hook_observed.lock().unwrap() = Some(accepted);
+        });
+
+        let dispatched = api.dispatch_backend_job(&request).unwrap();
+        assert_eq!(*acceptance_observed.lock().unwrap(), Some(true));
+        assert_eq!(dispatched.job.state, BackendJobState::Completed);
+        let expected_run_id =
+            crate::backend_job::runtime_run_id(&crate::backend_job::attempt_id(&request.job_id, 1));
+        assert_eq!(
+            dispatched.attempt.runtime_run_id.as_deref(),
+            Some(expected_run_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_job_delivery_recovery_replays_same_tracked_notification_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = test_server_config(temp.path());
+        let store = SqliteWorkspaceStore::open(config.database_path.clone()).unwrap();
+        let execution = Arc::new(DeterministicExecutionBackend::default());
+        let api = WorkspaceApi::new_with_execution_backend(
+            config.clone(),
+            Arc::new(store),
+            execution.clone(),
+        )
+        .await
+        .unwrap();
+        let target = api
+            .spawn_workspace_worker(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                WorkerSpawnRequest {
+                    requested_worker_name: Some("job-notification-target".to_string()),
+                    intent: WorkerSpawnIntent::WorkspaceCompanion,
+                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                        expected_segments: 0,
+                    },
+                    profile: ProfileSelector::Builtin("builtin:companion".to_string()),
+                    ticket_assignment: None,
+                    initial_submit: Vec::new(),
+                    workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachments: Vec::new(),
+                    resolved_config_bundle: Some(runtime_test_bundle()),
+                    resolved_worker_observation_enabled: false,
+                    resolved_worker_observation_grants: Vec::new(),
+                    resolved_workspace_api: None,
+                    resolved_memory_settings: None,
+                    resolved_control_operation: None,
+                },
+            )
+            .unwrap()
+            .worker
+            .unwrap()
+            .worker;
+        let request = BackendJobRequest {
+            job_id: "n".repeat(256),
+            purpose: "delivery_recovery_contract_check".to_string(),
+            input_revision: "revision-1".to_string(),
+            input_ref: "test://runner/delivery-recovery/1".to_string(),
+            input: serde_json::json!({"value": "immutable"}),
+            instruction: "Return a structured check result.".to_string(),
+            profile: "builtin:backend-job".to_string(),
+            source_worker: None,
+            notification_target: Some(target.clone()),
+            limits: crate::backend_job::BackendJobLimits {
+                timeout_seconds: 1,
+                ..Default::default()
+            },
+        };
+        let dispatched = api.dispatch_backend_job(&request).unwrap();
+        let worker = dispatched.attempt.worker.clone().unwrap();
+        let acceptance = api
+            .store
+            .accept_backend_job_result(
+                TEST_WORKSPACE_ID,
+                &worker,
+                &BackendJobResultSubmission {
+                    job_id: request.job_id.clone(),
+                    attempt_id: dispatched.attempt.attempt_id.clone(),
+                    input_revision: request.input_revision.clone(),
+                    result: serde_json::json!({"valid": true}),
+                },
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+        let delivery_id =
+            crate::backend_job::delivery_id(&request.job_id, &acceptance.attempt.attempt_id);
+        let (_, claimed) = api
+            .store
+            .reserve_backend_job_delivery(
+                TEST_WORKSPACE_ID,
+                &delivery_id,
+                &request.job_id,
+                &target,
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+        assert!(claimed);
+        let recoverable = api
+            .store
+            .recover_backend_job_deliveries(
+                TEST_WORKSPACE_ID,
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+        assert_eq!(recoverable.len(), 1);
+        execution.take_input_request_ids();
+        api.deliver_backend_job_result(&acceptance, &target);
+        let request_ids = execution.take_input_request_ids();
+        assert!(
+            request_ids
+                .iter()
+                .any(|request_id| request_id.as_deref() == Some(delivery_id.as_str())),
+            "recovery must replay the durable delivery id as the tracked notification id: {request_ids:?}"
+        );
+        let (delivery, claimed) = api
+            .store
+            .reserve_backend_job_delivery(
+                TEST_WORKSPACE_ID,
+                &delivery_id,
+                &request.job_id,
+                &target,
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+        assert!(!claimed);
+        assert_eq!(delivery.state, BackendJobDeliveryState::Completed);
+    }
+
+    #[tokio::test]
+    async fn backend_job_spawn_transport_error_terminalizes_reserved_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        api.runtime
+            .unregister_if_idle(EMBEDDED_WORKER_RUNTIME_ID, 10)
+            .unwrap();
+        let request = BackendJobRequest {
+            job_id: "runner-spawn-error-1".to_string(),
+            purpose: "spawn_error_contract_check".to_string(),
+            input_revision: "revision-1".to_string(),
+            input_ref: "test://runner/spawn-error/1".to_string(),
+            input: serde_json::json!({"value": "immutable"}),
+            instruction: "Return a structured check result.".to_string(),
+            profile: "builtin:backend-job".to_string(),
+            source_worker: None,
+            notification_target: None,
+            limits: crate::backend_job::BackendJobLimits::default(),
+        };
+
+        assert!(api.dispatch_backend_job(&request).is_err());
+        let attempt = api
+            .store
+            .get_backend_job_attempt(
+                TEST_WORKSPACE_ID,
+                &request.job_id,
+                &crate::backend_job::attempt_id(&request.job_id, 1),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.state, BackendJobAttemptState::Failed);
+        assert_eq!(attempt.failure_category.as_deref(), Some("dispatch_error"));
+    }
+
+    #[tokio::test]
+    async fn backend_job_input_error_is_durable_unknown_and_not_automatically_retried() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        execution.reject_inputs("model transport unavailable");
+        let request = BackendJobRequest {
+            job_id: "runner-input-failure-1".to_string(),
+            purpose: "failure_contract_check".to_string(),
+            input_revision: "revision-1".to_string(),
+            input_ref: "test://runner/failure/1".to_string(),
+            input: serde_json::json!({"value": "immutable"}),
+            instruction: "Return a structured check result.".to_string(),
+            profile: "builtin:backend-job".to_string(),
+            source_worker: None,
+            notification_target: None,
+            limits: crate::backend_job::BackendJobLimits::default(),
+        };
+
+        assert!(api.dispatch_backend_job(&request).is_err());
+        let failed = api
+            .store
+            .get_backend_job_attempt(
+                TEST_WORKSPACE_ID,
+                &request.job_id,
+                &crate::backend_job::attempt_id(&request.job_id, 1),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.state, BackendJobAttemptState::Unknown);
+        assert_eq!(
+            failed.failure_category.as_deref(),
+            Some("input_outcome_unknown")
+        );
+        assert!(
+            api.retry_backend_job(&request.job_id).is_err(),
+            "an ambiguous input outcome must not be retried automatically"
+        );
+        assert!(
+            api.store
+                .get_backend_job_attempt(
+                    TEST_WORKSPACE_ID,
+                    &request.job_id,
+                    &crate::backend_job::attempt_id(&request.job_id, 2),
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_job_recovery_dispatches_reserved_attempt_without_duplicate_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        let request = BackendJobRequest {
+            job_id: "runner-restart-1".to_string(),
+            purpose: "restart_contract_check".to_string(),
+            input_revision: "revision-1".to_string(),
+            input_ref: "test://runner/restart/1".to_string(),
+            input: serde_json::json!({"value": "immutable"}),
+            instruction: "Return a structured check result.".to_string(),
+            profile: "builtin:backend-job".to_string(),
+            source_worker: None,
+            notification_target: None,
+            limits: crate::backend_job::BackendJobLimits::default(),
+        };
+        let reserved = api
+            .store
+            .reserve_backend_job(
+                TEST_WORKSPACE_ID,
+                &request,
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+        assert_eq!(reserved.attempt.state, BackendJobAttemptState::Reserved);
+        api.recover_backend_jobs().unwrap();
+
+        let recovered = api
+            .store
+            .get_backend_job_attempt(
+                TEST_WORKSPACE_ID,
+                &request.job_id,
+                &reserved.attempt.attempt_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.state, BackendJobAttemptState::Dispatched);
+        let recovered_worker = recovered.worker.clone().expect("recovered Job Worker");
+        let replay = api.dispatch_backend_job(&request).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.attempt.worker, Some(recovered_worker));
+    }
+
+    #[tokio::test]
+    async fn backend_job_recovery_marks_unreconcilable_worker_execution_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        let request = BackendJobRequest {
+            job_id: "runner-unknown-1".to_string(),
+            purpose: "unknown_contract_check".to_string(),
+            input_revision: "revision-1".to_string(),
+            input_ref: "test://runner/unknown/1".to_string(),
+            input: serde_json::json!({"value": "immutable"}),
+            instruction: "Return a structured check result.".to_string(),
+            profile: "builtin:backend-job".to_string(),
+            source_worker: None,
+            notification_target: None,
+            limits: crate::backend_job::BackendJobLimits::default(),
+        };
+        let reserved = api
+            .store
+            .reserve_backend_job(
+                TEST_WORKSPACE_ID,
+                &request,
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+        let missing_worker = RuntimeWorkerRef::new(
+            EMBEDDED_WORKER_RUNTIME_ID,
+            "0199a3ae-ecdf-7eb2-883e-a5b7b5f04a0d",
+        );
+        api.store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                worker: missing_worker.clone(),
+                display_name: "Missing Job Worker".to_string(),
+                profile: Some("builtin:backend-job".to_string()),
+                retention_state: "normal".to_string(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: "2026-09-01T00:00:00Z".to_string(),
+                updated_at: "2026-09-01T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        api.store
+            .bind_backend_job_attempt_worker(
+                TEST_WORKSPACE_ID,
+                &request.job_id,
+                &reserved.attempt.attempt_id,
+                &missing_worker,
+                Some("missing-runtime-run"),
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+
+        api.recover_backend_jobs().unwrap();
+        let attempt = api
+            .store
+            .get_backend_job_attempt(
+                TEST_WORKSPACE_ID,
+                &request.job_id,
+                &reserved.attempt.attempt_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.state, BackendJobAttemptState::Unknown);
+        assert_eq!(
+            attempt.failure_category.as_deref(),
+            Some("recovery_worker_unknown")
+        );
+        assert_eq!(
+            api.store
+                .get_backend_job(TEST_WORKSPACE_ID, &request.job_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            BackendJobState::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_job_timeout_fences_late_structured_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        let request = BackendJobRequest {
+            job_id: "runner-timeout-1".to_string(),
+            purpose: "timeout_contract_check".to_string(),
+            input_revision: "revision-1".to_string(),
+            input_ref: "test://runner/timeout/1".to_string(),
+            input: serde_json::json!({"value": "immutable"}),
+            instruction: "Wait for a structured result.".to_string(),
+            profile: "builtin:backend-job".to_string(),
+            source_worker: None,
+            notification_target: None,
+            limits: crate::backend_job::BackendJobLimits {
+                timeout_seconds: 1,
+                max_attempts: 1,
+                ..Default::default()
+            },
+        };
+        let dispatched = api.dispatch_backend_job(&request).unwrap();
+        let worker = dispatched.attempt.worker.clone().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+        let attempt = api
+            .store
+            .get_backend_job_attempt(
+                TEST_WORKSPACE_ID,
+                &request.job_id,
+                &dispatched.attempt.attempt_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.state, BackendJobAttemptState::Failed);
+        assert_eq!(attempt.failure_category.as_deref(), Some("timeout"));
+        assert!(
+            api.accept_backend_job_result(
+                &worker,
+                &BackendJobResultSubmission {
+                    job_id: request.job_id,
+                    attempt_id: dispatched.attempt.attempt_id,
+                    input_revision: request.input_revision,
+                    result: serde_json::json!({"late": true}),
+                },
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -43555,6 +44691,7 @@ mod tests {
                 WorkerInputRequest {
                     kind: WorkerInputKind::User,
                     content: "persist me".to_string(),
+                    submission_request_id: None,
                     segments: None,
                 },
             )
@@ -43615,6 +44752,7 @@ mod tests {
                 WorkerInputRequest {
                     kind: WorkerInputKind::User,
                     content: "should not be routed to corrupted handle".to_string(),
+                    submission_request_id: None,
                     segments: None,
                 },
             )

@@ -30,6 +30,7 @@ import type {
   Event as PodProtocolEvent,
   Method as PodProtocolMethod,
   Segment as PodProtocolSegment,
+  SubscriptionWorkerJob,
   WorkerStateSnapshot,
 } from "$lib/generated/protocol";
 import type {
@@ -88,6 +89,7 @@ export type Worker =
     display_name: string;
     tags: string[];
     worker_state?: WorkerStateSnapshot | null;
+    job?: SubscriptionWorkerJob | null;
     diagnostics: Diagnostic[];
   };
 

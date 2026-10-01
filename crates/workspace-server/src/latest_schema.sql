@@ -806,6 +806,79 @@ CREATE TABLE "worker_registry" (
             PRIMARY KEY (workspace_id, worker_id),
             FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
         );
+CREATE TABLE backend_jobs (
+            workspace_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            purpose TEXT NOT NULL,
+            input_revision TEXT NOT NULL,
+            input_ref TEXT NOT NULL,
+            request_json TEXT NOT NULL,
+            intent_fingerprint TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('pending', 'completed', 'failed', 'unknown')),
+            current_attempt INTEGER NOT NULL CHECK (current_attempt > 0 AND current_attempt <= 3),
+            result_json TEXT,
+            result_digest TEXT,
+            failure_category TEXT,
+            failure_detail TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            PRIMARY KEY (workspace_id, job_id),
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+            CHECK ((result_json IS NULL) = (result_digest IS NULL)),
+            CHECK ((state = 'completed') = (result_json IS NOT NULL))
+        );
+CREATE INDEX backend_jobs_active
+        ON backend_jobs(workspace_id, state, updated_at);
+CREATE TABLE backend_job_attempts (
+            workspace_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            attempt INTEGER NOT NULL CHECK (attempt > 0 AND attempt <= 3),
+            input_revision TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('reserved', 'dispatched', 'completed', 'failed', 'unknown')),
+            runtime_id TEXT,
+            worker_id TEXT,
+            runtime_run_id TEXT,
+            dispatched_at TEXT,
+            deadline_at TEXT NOT NULL,
+            result_json TEXT,
+            result_digest TEXT,
+            failure_category TEXT,
+            failure_detail TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            PRIMARY KEY (workspace_id, job_id, attempt_id),
+            UNIQUE (workspace_id, job_id, attempt),
+            UNIQUE (workspace_id, runtime_id, worker_id),
+            FOREIGN KEY (workspace_id, job_id)
+                REFERENCES backend_jobs(workspace_id, job_id) ON DELETE CASCADE,
+            CHECK ((runtime_id IS NULL) = (worker_id IS NULL)),
+            CHECK ((result_json IS NULL) = (result_digest IS NULL)),
+            CHECK ((state = 'completed') = (result_json IS NOT NULL))
+        );
+CREATE INDEX backend_job_attempts_recovery
+        ON backend_job_attempts(workspace_id, state, deadline_at);
+CREATE TABLE backend_job_deliveries (
+            workspace_id TEXT NOT NULL,
+            delivery_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            target_runtime_id TEXT NOT NULL,
+            target_worker_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('pending', 'sending', 'completed', 'failed', 'unknown')),
+            failure_category TEXT,
+            failure_detail TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            delivered_at TEXT,
+            PRIMARY KEY (workspace_id, delivery_id),
+            FOREIGN KEY (workspace_id, job_id, attempt_id)
+                REFERENCES backend_job_attempts(workspace_id, job_id, attempt_id) ON DELETE CASCADE
+        );
+CREATE INDEX backend_job_deliveries_pending
+        ON backend_job_deliveries(workspace_id, state, updated_at);
 CREATE TABLE worker_registry_observations (
     workspace_id TEXT NOT NULL,
     runtime_id TEXT NOT NULL,

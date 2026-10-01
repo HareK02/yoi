@@ -88,6 +88,47 @@ Deno.test('workspace Worker snapshot keeps equal local ids from different Runtim
   assertEquals([...projection.workers.keys()].sort(), ['runtime-a:1', 'runtime-b:1']);
 });
 
+Deno.test('workspace Worker snapshot and live update preserve canonical Job metadata', () => {
+  const projection = createWorkspaceWorkersProjection();
+  const snapshotWorker = worker('runtime-a', 'job-worker', 1);
+  snapshotWorker.job = {
+    job_id: 'check:T-1:r1',
+    attempt_id: 'check:T-1:r1:attempt:1',
+    purpose: 'ticket_item_check',
+  };
+  applyWorkspaceWorkersFrame(projection, {
+    protocol_version: 1,
+    frame: 'response',
+    message: {
+      result: 'subscribed',
+      payload: {
+        request_id: 'request-1',
+        subscription_id: 'subscription-1',
+        selector: { topic: 'workspace_workers' },
+        snapshot_revision: 1,
+        snapshot: { topic: 'workers', data: { workers: [snapshotWorker] } },
+      },
+    },
+  });
+  assertEquals(projection.workers.get('runtime-a:job-worker')?.job, snapshotWorker.job);
+
+  const updated = { ...snapshotWorker, subject_revision: 2 };
+  updated.job = { ...snapshotWorker.job, attempt_id: 'check:T-1:r1:attempt:2' };
+  applyWorkspaceWorkersFrame(projection, {
+    protocol_version: 1,
+    frame: 'event',
+    message: {
+      event: 'event',
+      data: {
+        subscription_id: 'subscription-1',
+        subject_revision: 2,
+        payload: { event: 'worker_upserted', data: { worker: updated } },
+      },
+    },
+  });
+  assertEquals(projection.workers.get('runtime-a:job-worker')?.job, updated.job);
+});
+
 Deno.test('workspace Worker reducer ignores stale events and removes composite subject', () => {
   const projection = createWorkspaceWorkersProjection();
   projection.workers.set('runtime-a:1', worker('runtime-a', '1', 3));
