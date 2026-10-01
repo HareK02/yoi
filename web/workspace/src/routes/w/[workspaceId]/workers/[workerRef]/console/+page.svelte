@@ -1531,6 +1531,12 @@
         handleHistoryTopEdge(consoleBodyElement.scrollTop <= 1);
     }
 
+    function jumpToLatest() {
+        if (!consoleWorkerViewSelectionIsResolved()) return;
+        autoFollowConsole = true;
+        void scrollConsoleToBottom();
+    }
+
     async function scrollConsoleToBottom() {
         if (!consoleWorkerViewSelectionIsResolved()) return;
         const sessionId = selectedWorkerView.sessionId;
@@ -1765,6 +1771,19 @@
                 historyAvailable={selectedWorkerViewSessionId === null}
                 bind:element={turnNavigationElement}
             />
+            {#if !autoFollowConsole && lines.length > 0 && (consoleDisplayState.kind === "ready" || consoleDisplayState.kind === "stale")}
+                <button
+                    class="console-jump-latest"
+                    type="button"
+                    aria-label="Jump to latest"
+                    title="Jump to latest"
+                    onclick={jumpToLatest}
+                >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M12 4V16M7 11L12 16L17 11M5 20H19" />
+                    </svg>
+                </button>
+            {/if}
         </section>
 
         {#if taskPaneOpen}
@@ -2193,11 +2212,51 @@
     }
 
     .console-scroll {
+        grid-area: 1 / 1;
         height: 100%;
         min-width: 0;
         min-height: 0;
         overflow-y: auto;
         scrollbar-width: none;
+    }
+
+    .console-jump-latest {
+        grid-area: 1 / 1;
+        align-self: end;
+        justify-self: center;
+        z-index: 2;
+        display: grid;
+        place-items: center;
+        width: 36px;
+        height: 36px;
+        padding: 0;
+        margin-bottom: var(--space-3);
+        border: 1px solid var(--line);
+        border-radius: 50%;
+        background: var(--bg-raised);
+        color: var(--text-strong);
+        box-shadow: var(--shadow-overlay);
+        cursor: pointer;
+    }
+
+    .console-jump-latest:hover {
+        color: var(--tui-cyan);
+        border-color: var(--tui-cyan);
+    }
+
+    .console-jump-latest:focus-visible {
+        outline: 2px solid var(--tui-cyan);
+        outline-offset: 2px;
+    }
+
+    .console-jump-latest svg {
+        width: 20px;
+        height: 20px;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.75;
+        stroke-linecap: round;
+        stroke-linejoin: round;
     }
 
     .console-scroll::-webkit-scrollbar {

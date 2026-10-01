@@ -248,6 +248,32 @@ async function checkConsoleHistory(viewportHeight: number): Promise<void> {
       assert(jumpGeometry.itemTop >= jumpGeometry.viewportTop - 1);
       assert(jumpGeometry.itemTop < jumpGeometry.viewportBottom);
 
+      const latest = page.getByRole("button", { name: "Jump to latest", exact: true });
+      await latest.waitFor();
+      assertEquals((await latest.textContent())?.trim(), "");
+      const viewportBeforeJump = await consoleScroll.boundingBox();
+      const latestGeometry = await latest.boundingBox();
+      assert(viewportBeforeJump && latestGeometry);
+      assert(Math.abs(latestGeometry.x + latestGeometry.width / 2 - viewportBeforeJump.x - viewportBeforeJump.width / 2) <= 1,
+        "latest icon must be centered over the transcript, not the rail or Composer");
+      const bottomGap = viewportBeforeJump.y + viewportBeforeJump.height - latestGeometry.y - latestGeometry.height;
+      assert(bottomGap >= 8 && bottomGap <= 24, `unexpected latest icon bottom gap: ${bottomGap}`);
+      const railTop = await turnList.evaluate((element) => element.scrollTop);
+      await latest.click();
+      await latest.waitFor({ state: "detached" });
+      assert(await consoleScroll.evaluate((element) => element.scrollHeight - element.clientHeight - element.scrollTop <= 1));
+      assertEquals(await consoleScroll.boundingBox(), viewportBeforeJump, "overlay must not resize the transcript");
+      assertEquals(await turnList.evaluate((element) => element.scrollTop), railTop);
+      await consoleScroll.evaluate((element) => { element.scrollTop = element.scrollHeight / 2; });
+      await latest.waitFor();
+      await latest.focus();
+      await page.keyboard.press("Enter");
+      await latest.waitFor({ state: "detached" });
+      await consoleScroll.evaluate((element) => { element.scrollTop = element.scrollHeight / 2; });
+      await latest.waitFor();
+      await consoleScroll.evaluate((element) => { element.scrollTop = element.scrollHeight; });
+      await latest.waitFor({ state: "detached" });
+
       const centering = await question12.evaluate((button) => {
         const turn = button.getBoundingClientRect();
         const bar = button.querySelector(".turn-bar")!.getBoundingClientRect();

@@ -481,6 +481,53 @@ test("mini task summary opens and closes details without a header Tasks button",
   expect(summary.getAttribute("aria-expanded")).toBe("false");
 });
 
+test("latest jump is icon-only, hidden at the bottom, and resumes following streamed output", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ availability: "live_protocol" })));
+  const view = render(ConsolePage, { data: pageData() });
+  expect(screen.queryByRole("button", { name: "Jump to latest" })).toBeNull();
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
+  latestListener().onFrame(subscribedFrame(sessionWithUserMessage("Follow question")));
+  await screen.findByRole("button", { name: "Turn 1: Follow question" });
+  expect(screen.queryByRole("button", { name: "Jump to latest" })).toBeNull();
+  const scroll = view.container.querySelector<HTMLElement>(".console-scroll")!;
+  let height = 2000;
+  Object.defineProperties(scroll, {
+    scrollHeight: { configurable: true, get: () => height },
+    clientHeight: { configurable: true, value: 400 },
+  });
+  scroll.scrollTop = 400;
+  await fireEvent.scroll(scroll);
+  const jump = await screen.findByRole("button", { name: "Jump to latest" });
+  expect(jump.textContent?.trim()).toBe("");
+  expect(jump.querySelector('svg[aria-hidden="true"]')).not.toBeNull();
+  expect(jump.closest(".console-body")).not.toBeNull();
+  expect(jump.closest(".console-scroll, .console-composer")).toBeNull();
+  const emitDelta = (text: string) => latestListener().onFrame({
+    frame: "event", message: { event: "event", data: { payload: {
+      event: "worker_protocol", data: { event: { event: "text_delta", data: { text } } },
+    } } },
+  });
+  height = 2500;
+  emitDelta("new output");
+  await screen.findByText("new output");
+  expect(scroll.scrollTop).toBe(400);
+  await fireEvent.click(jump);
+  await waitFor(() => expect(scroll.scrollTop).toBe(2500));
+  expect(screen.queryByRole("button", { name: "Jump to latest" })).toBeNull();
+  height = 3000;
+  emitDelta(" continues");
+  await waitFor(() => expect(scroll.scrollTop).toBe(3000));
+  scroll.scrollTop = 400;
+  await fireEvent.scroll(scroll);
+  await screen.findByRole("button", { name: "Jump to latest" });
+  scroll.scrollTop = height - 400;
+  await fireEvent.scroll(scroll);
+  expect(screen.queryByRole("button", { name: "Jump to latest" })).toBeNull();
+  height = 3500;
+  emitDelta(" after manual return");
+  await waitFor(() => expect(scroll.scrollTop).toBe(3500));
+});
+
 test("turn navigation jumps only the transcript to its user message and stops bottom-follow", async () => {
   vi.stubGlobal("fetch", vi.fn(async () => Response.json({ availability: "live_protocol" })));
   const view = render(ConsolePage, { data: pageData() });
@@ -500,6 +547,7 @@ test("turn navigation jumps only the transcript to its user message and stops bo
   expect(scroll.scrollTop).toBe(800);
   await settleMicrotasks();
   expect(scroll.scrollTop).toBe(800);
+  expect(screen.getByRole("button", { name: "Jump to latest" })).not.toBeNull();
 });
 
 test("does not call Runtime APIs before the Worker execution target resolves", async () => {
