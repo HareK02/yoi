@@ -1141,6 +1141,23 @@ pub(crate) fn wire_event_bridges_on_engine<C, St>(
     // per-item commit channel is wired at the top of this function.
 }
 
+fn validate_automatic_memory_extraction_targets(
+    memory: &manifest::MemoryFeatureProfileConfig,
+    subjektiv: &manifest::SubjektivFeatureProfileConfig,
+) -> std::io::Result<()> {
+    if memory.enabled
+        && memory.extraction.enabled
+        && subjektiv.enabled
+        && subjektiv.extraction.enabled
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Workspace Memory and subjektiv automatic extraction cannot both be enabled for one Worker",
+        ));
+    }
+    Ok(())
+}
+
 /// Register the builtin file-manipulation tools, optional memory tools,
 /// and the Worker-orchestration tools (SubWorkerSpawn + comm) on the Worker's
 /// Engine. Returns the WorkdirSession handle used to attach a `WorkerFsView` to
@@ -1252,16 +1269,7 @@ where
     }
     let memory_profile = &worker.manifest().feature.memory.profile;
     let subjektiv_profile = &worker.manifest().feature.subjektiv.profile;
-    if memory_profile.enabled
-        && memory_profile.extraction.enabled
-        && subjektiv_profile.enabled
-        && subjektiv_profile.extraction.enabled
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Workspace Memory and subjektiv automatic extraction cannot both be enabled for one Worker",
-        ));
-    }
+    validate_automatic_memory_extraction_targets(memory_profile, subjektiv_profile)?;
     let memory_install_plan = crate::feature::builtin::memory::MemoryFeatureInstallPlan::prepare(
         worker.manifest(),
         worker.workspace_client_handle(),
@@ -3437,6 +3445,23 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio::net::UnixListener;
+
+    #[test]
+    fn automatic_memory_extraction_destinations_are_mutually_exclusive() {
+        let mut memory = manifest::MemoryFeatureProfileConfig::default();
+        memory.enabled = true;
+        memory.extraction.enabled = true;
+        let mut subjektiv = manifest::SubjektivFeatureProfileConfig::default();
+        subjektiv.enabled = true;
+        subjektiv.extraction.enabled = true;
+
+        let error = validate_automatic_memory_extraction_targets(&memory, &subjektiv).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("cannot both be enabled"));
+
+        subjektiv.extraction.enabled = false;
+        validate_automatic_memory_extraction_targets(&memory, &subjektiv).unwrap();
+    }
 
     #[test]
     fn no_controller_parent_notification_uses_durable_pending_authority() {

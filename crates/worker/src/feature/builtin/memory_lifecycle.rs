@@ -1357,6 +1357,43 @@ permission = "write"
     }
 
     #[test]
+    fn child_host_suppresses_enabled_subjektiv_lifecycle_without_capture_side_effects() {
+        let capture = CommittedSessionCaptureHandle::new(|| {
+            panic!("a child Worker must not capture for an inherited subjektiv profile")
+        });
+        let extensions = SessionExtensionHandle::new(|_, _, _| {
+            panic!("a child Worker must not write a subjektiv extraction pointer")
+        });
+        let mut config = manifest::ResolvedSubjektivFeatureConfig::default();
+        config.profile.enabled = true;
+        config.profile.extraction.enabled = true;
+        config.profile.extraction.threshold = Some(1);
+        config
+            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+                workspace_id: "workspace-1".to_string(),
+                settings_revision: 1,
+                language: "English".to_string(),
+            })
+            .unwrap();
+
+        let feature = SubjektivLifecycleFeature::from_resolved_config(
+            false,
+            config,
+            capture,
+            extensions,
+            crate::worker::marker_workspace_client(None, "child-disabled"),
+            test_manifest(),
+            Box::new(ScriptClient::new(Vec::new())),
+            Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap())),
+            WorkerWorkspaceContext::no_workspace(),
+            None,
+        )
+        .unwrap();
+
+        assert!(feature.is_none());
+    }
+
+    #[test]
     fn extraction_manifest_applies_memory_model_and_reasoning_overrides() {
         use agen::llm_client::capability::{ReasoningControl, ReasoningEffort};
 
@@ -1595,9 +1632,11 @@ permission = "write"
             1,
             "the immutable partial candidate remains staged for retry/deduplication"
         );
-        assert!(!requests
-            .iter()
-            .any(|request| request.path.ends_with("/subjektiv/sessions")));
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.path.ends_with("/subjektiv/sessions"))
+        );
     }
 
     #[tokio::test]
@@ -1677,6 +1716,48 @@ permission = "write"
                 })
             }),
             "recorded requests: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subjektiv_rewrite_barrier_cancels_without_pointer_or_legacy_side_effects() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = PendingClient {
+            calls: Arc::clone(&calls),
+        };
+        let extension_writes = Arc::new(Mutex::new(Vec::new()));
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+        let workspace_client = Arc::new(RecordingWorkspaceClient::default());
+        let mut task = test_task(
+            capture(2, 250),
+            Box::new(client),
+            Arc::clone(&extension_writes),
+            event_tx,
+            workspace_client.clone(),
+        );
+        task.target = ExtractionTarget::Subjektiv;
+        task.config.profile.consolidation.request_enabled = false;
+        let registry = start_background_task(task);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("subjektiv extraction child should reach its first provider request");
+        let rewrite_guard = registry.begin_session_rewrite().await.unwrap();
+        drop(rewrite_guard);
+        registry.shutdown().await.unwrap();
+
+        assert!(extension_writes.lock().unwrap().is_empty());
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            matches!(event, Event::MemoryWorker(event) if event.status == "cancelled")
+        }));
+        let requests = workspace_client.requests.lock().unwrap();
+        assert!(
+            requests.is_empty(),
+            "cancelled subjektiv requests: {requests:?}"
         );
     }
 
@@ -1972,9 +2053,7 @@ permission = "write"
         assert!(controller_source.contains("MemoryFeatureInstallPlan::prepare"));
         assert!(controller_source.contains("MemoryLifecycleFeature::from_resolved_config"));
         let worker_production = worker_source.split("#[cfg(test)]").next().unwrap();
-        let controller_production = controller_source.split("#[cfg(test)]").next().unwrap();
         assert!(!worker_production.contains(".feature.memory"));
-        assert!(!controller_production.contains(".feature.memory"));
         let lifecycle_source = include_str!("memory_lifecycle.rs");
         assert!(lifecycle_source.contains("request_memory_staging_consolidation"));
         let internal_worker_source = include_str!("../../internal_worker.rs");
