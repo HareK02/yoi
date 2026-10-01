@@ -24,6 +24,7 @@
   .sidebar-frame .bevel.sidebar-frame__bevel {
     /* Keep the open panel's width identical in pinned and overlay modes. */
     width: var(--sidebar-width);
+    transition: width var(--sidebar-motion-duration) var(--sidebar-motion-easing);
     background: var(--bg);
     min-width: 0;
     min-height: 0;
@@ -84,7 +85,6 @@
     width: var(--sidebar-width);
     overflow: hidden;
     background: var(--bg);
-    transition: width var(--sidebar-motion-duration) var(--sidebar-motion-easing);
   }
   .sidebar-frame.hover-mode.folded .bevel.sidebar-frame__bevel {
     width: var(--sidebar-rail-width);

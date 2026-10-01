@@ -61,10 +61,14 @@
   function toggleMode(event: MouseEvent) {
     const next = mode === 'pinned' ? 'hover' : 'pinned';
     // A pointer click should not leave keyboard focus holding the preview open.
-    if (event.detail > 0) (event.currentTarget as HTMLButtonElement).blur();
+    if (event.detail > 0 && document.activeElement instanceof HTMLElement && frame.contains(document.activeElement)) {
+      document.activeElement.blur();
+    }
+    clearCloseTimer();
     onModeChange(next);
-    if (!mobile) onOpenChange(next === 'hover');
-    scheduleClose();
+    // Footer clicks close immediately with the layout change; only a real
+    // hover or keyboard focus keeps an existing preview open.
+    if (!mobile) onOpenChange(next === 'hover' && (pointerInside || focusInside));
   }
 
   $effect(() => {
@@ -105,6 +109,11 @@
           aria-label={mode === 'pinned' ? 'Unpin sidebar' : 'Pin sidebar'}
           aria-pressed={mode === 'pinned'}
           title={mode === 'pinned' ? 'Always visible — switch to show on hover' : 'Show on hover — pin sidebar'}
+          onpointerdown={(event) => {
+            // Do not open a focus preview before a pointer click changes mode.
+            // Keyboard focus still opens and holds the preview as usual.
+            if (event.button === 0) event.preventDefault();
+          }}
           onclick={toggleMode}
         >
           <SidebarToggleIcon open={mode === 'pinned'} />

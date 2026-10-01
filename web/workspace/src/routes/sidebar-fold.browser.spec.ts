@@ -43,6 +43,38 @@ test("unpinning changes mode, and pointer departure closes the preview", async (
   expect(folded()).toBe(true);
 });
 
+test("footer unpin closes in the same update as the mode change, without the hover delay", async () => {
+  render(Layout, { props });
+  const button = screen.getByRole("button", { name: "Unpin sidebar" });
+  button.focus();
+  await fireEvent.click(button, { detail: 1 });
+  expect(localStorage.getItem(storageKey)).toBe("hover");
+  expect(folded()).toBe(true);
+  await delay();
+  expect(folded()).toBe(true);
+  await fireEvent.click(button, { detail: 1 });
+  expect(localStorage.getItem(storageKey)).toBe("pinned");
+  expect(folded()).toBe(false);
+});
+
+test("footer pointer clicks release previous sidebar link focus before unpinning", async () => {
+  render(Layout, { props });
+  frame().querySelector<HTMLAnchorElement>("a")!.focus();
+  await tick();
+  await fireEvent.click(screen.getByRole("button", { name: "Unpin sidebar" }), { detail: 1 });
+  expect(folded()).toBe(true);
+});
+
+test("keyboard mode switching preserves the focused preview", async () => {
+  render(Layout, { props });
+  const button = screen.getByRole("button", { name: "Unpin sidebar" });
+  button.focus();
+  await fireEvent.click(button, { detail: 0 });
+  expect(localStorage.getItem(storageKey)).toBe("hover");
+  await delay();
+  expect(folded()).toBe(false);
+});
+
 test.each(["pinned", "hover"])("restores %s mode without persisting a transient open state", (mode) => {
   localStorage.setItem(storageKey, mode);
   render(Layout, { props });

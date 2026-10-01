@@ -89,6 +89,53 @@ async function checkSidebarModeSwitch(page: Page, name: string): Promise<void> {
   await page.locator(".sidebar-fold-button").evaluate((button) => (button as HTMLButtonElement).blur());
 }
 
+async function checkSidebarPointerModeSwitch(page: Page, pinning: boolean): Promise<void> {
+  const button = page.getByRole("button", { name: pinning ? "Pin sidebar" : "Unpin sidebar", exact: true });
+  await button.hover();
+  await page.mouse.down();
+  await page.waitForTimeout(100);
+  assertEquals(await page.locator(".sidebar-frame.folded").count(), pinning ? 1 : 0,
+    "pointer-down must not open a preview before the mode changes on click");
+  const sampling = button.evaluate(async (button) => {
+    const frame = button.closest<HTMLElement>(".sidebar-frame")!;
+    const panel = frame.querySelector<HTMLElement>(".sidebar-frame__bevel")!;
+    const main = document.querySelector<HTMLElement>(".app-shell__main")!;
+    const content = frame.querySelector<HTMLElement>(".sidebar-frame-content")!;
+    const sample = () => ({
+      frameWidth: frame.getBoundingClientRect().width,
+      panelWidth: panel.getBoundingClientRect().width,
+      mainWidth: main.getBoundingClientRect().width,
+      expectedMainWidth: Math.min(parseFloat(getComputedStyle(main).maxWidth), innerWidth - panel.getBoundingClientRect().right),
+      contentWidth: content.getBoundingClientRect().width,
+      buttonLeft: button.getBoundingClientRect().left,
+      buttonBottom: button.getBoundingClientRect().bottom,
+    });
+    const samples = [sample()];
+    const start = performance.now();
+    do {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      samples.push(sample());
+    } while (performance.now() - start < 450);
+    return samples;
+  });
+  await page.mouse.up();
+  const samples = await sampling;
+  for (const sample of samples) {
+    assert(Math.abs(sample.frameWidth - sample.panelWidth) <= 1,
+      `sidebar and main must move together throughout the click: ${JSON.stringify(sample)}`);
+    assert(Math.abs(sample.mainWidth - sample.expectedMainWidth) <= 1);
+    assertEquals(sample.contentWidth, samples[0].contentWidth);
+    assertEquals(sample.buttonLeft, samples[0].buttonLeft);
+    assertEquals(sample.buttonBottom, samples[0].buttonBottom);
+  }
+  const first = samples[0].frameWidth;
+  const last = samples.at(-1)!.frameWidth;
+  assert(pinning ? last > first : last < first);
+  assert(samples.some((sample) => sample.frameWidth > Math.min(first, last) && sample.frameWidth < Math.max(first, last)),
+    "mode switch must animate through intermediate widths");
+  assertEquals(await page.locator(".sidebar-frame.folded").count(), pinning ? 0 : 1);
+}
+
 async function checkSidebarSlide(page: Page, mobile: boolean, opening: boolean): Promise<void> {
   const toggle = page.locator(mobile ? ".app-shell__mobile-sidebar-toggle" : ".sidebar-hover-region");
   const result = await toggle.evaluate(async (button, { mobile, opening }) => {
@@ -486,6 +533,8 @@ async function checkConsoleHistory(viewportHeight: number): Promise<void> {
       await footer.hover({ position: { x: 4, y: 4 } });
       await page.locator(".sidebar-frame.folded").waitFor();
       await settleSidebar();
+      await checkSidebarPointerModeSwitch(page, true);
+      await checkSidebarPointerModeSwitch(page, false);
       // Use real mouse and keyboard events as well as deterministic motion sampling.
       await sidebar.hover({ position: { x: 10, y: 40 } });
       await page.locator(".sidebar-frame:not(.folded)").waitFor();
