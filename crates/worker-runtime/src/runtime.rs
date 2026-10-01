@@ -4180,6 +4180,7 @@ impl RuntimeState {
             workspace_id: worker.workspace_id.clone(),
             display_name: worker.display_name.clone(),
             profile,
+            job: None,
             workdir_attachments,
         })
     }

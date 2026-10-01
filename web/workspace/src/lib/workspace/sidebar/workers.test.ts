@@ -63,6 +63,19 @@ Deno.test("live runtime workers are sidebar targets and console targets", () => 
   assertEquals(canOpenWorkerConsole(liveWorker), true);
 });
 
+Deno.test("Backend Job Workers are hidden only from the sidebar View", () => {
+  const jobWorker = worker({
+    state: "running",
+    job: {
+      job_id: "check:T-1:r1",
+      attempt_id: "check:T-1:r1:attempt:1",
+      purpose: "ticket_item_check",
+    },
+  });
+  assertEquals(canShowWorkerInSidebar(jobWorker), false);
+  assertEquals(canOpenWorkerConsole(jobWorker), true);
+});
+
 Deno.test("sidebar workers sort running then idle then stopped", () => {
   const workers = [
     worker({ worker_id: "3", display_name: "Stopped", state: "stopped" }),

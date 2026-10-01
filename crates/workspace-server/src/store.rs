@@ -17,11 +17,17 @@ use uuid::Uuid;
 use server_api::{RepositoryObservedStatus, RepositorySource};
 use worker_runtime::identity::{RuntimeWorkerRef, WorkerId};
 
+use crate::backend_job::{
+    BackendJobAttemptRecord, BackendJobAttemptState, BackendJobDeliveryRecord,
+    BackendJobDeliveryState, BackendJobRecord, BackendJobRequest, BackendJobReservation,
+    BackendJobResultAcceptance, BackendJobResultSubmission, BackendJobState,
+    BackendJobWorkerBinding, attempt_id, bounded_failure_detail, result_digest,
+};
 use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 69;
+const LATEST_SCHEMA_VERSION: i64 = 70;
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
@@ -54,6 +60,8 @@ const EXTERNAL_WORKDIR_COMMAND_PERMISSION_MIGRATION_NAME: &str =
     "External Workdir explicit command permission";
 const WORKDIR_COMMAND_ATTACHMENT_CAPABILITIES_MIGRATION_NAME: &str =
     "External Workdir command attachment capabilities";
+const BACKEND_JOB_RUNNER_MIGRATION_NAME: &str =
+    "Backend-owned Runtime Worker jobs and structured results";
 const TICKET_SCHEMA_VERSION_WITH_TARGETS: i64 = 7;
 const TICKET_SCHEMA_BASELINE_NAME: &str = "ticket schema baseline";
 const WORKER_REGISTRY_PROJECTION_SCHEMA: &str = r#"
@@ -195,6 +203,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 69,
         name: WORKDIR_COMMAND_ATTACHMENT_CAPABILITIES_MIGRATION_NAME,
         apply: migrate_workdir_command_attachment_capabilities_v68_to_v69,
+    },
+    Migration {
+        version: 70,
+        name: BACKEND_JOB_RUNNER_MIGRATION_NAME,
+        apply: migrate_backend_job_runner_v69_to_v70,
     },
 ];
 
@@ -611,6 +624,7 @@ pub struct WorkerRegistryProjectionRecord {
     pub registry: WorkerRegistryRecord,
     pub resource_key: Option<String>,
     pub observation: Option<WorkerRegistryObservationRecord>,
+    pub job: Option<BackendJobWorkerBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1442,6 +1456,75 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         device_code: &str,
         consumed_at: &str,
     ) -> Result<Option<DeviceLoginFlowRecord>>;
+
+    fn reserve_backend_job(
+        &self,
+        workspace_id: &str,
+        request: &BackendJobRequest,
+        now: &str,
+    ) -> Result<BackendJobReservation>;
+    fn reserve_backend_job_retry(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+        now: &str,
+    ) -> Result<BackendJobReservation>;
+    fn get_backend_job(&self, workspace_id: &str, job_id: &str)
+    -> Result<Option<BackendJobRecord>>;
+    fn get_backend_job_attempt(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+        attempt_id: &str,
+    ) -> Result<Option<BackendJobAttemptRecord>>;
+    fn list_recoverable_backend_job_attempts(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<BackendJobAttemptRecord>>;
+    fn bind_backend_job_attempt_worker(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+        attempt_id: &str,
+        worker: &RuntimeWorkerRef,
+        runtime_run_id: Option<&str>,
+        now: &str,
+    ) -> Result<(WorkerRegistryProjectionCommit, bool)>;
+    fn accept_backend_job_result(
+        &self,
+        workspace_id: &str,
+        source_worker: &RuntimeWorkerRef,
+        submission: &BackendJobResultSubmission,
+        now: &str,
+    ) -> Result<BackendJobResultAcceptance>;
+    fn finish_backend_job_attempt(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+        attempt_id: &str,
+        state: BackendJobAttemptState,
+        failure_category: &str,
+        failure_detail: &str,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord>;
+    fn reserve_backend_job_delivery(
+        &self,
+        workspace_id: &str,
+        delivery_id: &str,
+        job_id: &str,
+        target: &RuntimeWorkerRef,
+        now: &str,
+    ) -> Result<BackendJobDeliveryRecord>;
+    fn finish_backend_job_delivery(
+        &self,
+        workspace_id: &str,
+        delivery_id: &str,
+        state: BackendJobDeliveryState,
+        failure_category: Option<&str>,
+        failure_detail: Option<&str>,
+        now: &str,
+    ) -> Result<BackendJobDeliveryRecord>;
 
     fn upsert_worker_registry(
         &self,
@@ -5743,6 +5826,407 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn reserve_backend_job(
+        &self,
+        workspace_id: &str,
+        request: &BackendJobRequest,
+        now: &str,
+    ) -> Result<BackendJobReservation> {
+        request.validate()?;
+        let fingerprint = request.fingerprint()?;
+        let request_json = serde_json::to_string(request).map_err(|error| {
+            Error::InvalidInput(format!("serialize Backend Job request: {error}"))
+        })?;
+        let deadline = backend_job_deadline(now, request.limits.timeout_seconds)?;
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(job) = read_backend_job(&tx, workspace_id, &request.job_id)? {
+                if job.intent_fingerprint != fingerprint {
+                    return Err(Error::InvalidInput(format!(
+                        "Backend Job id `{}` was reused with different intent",
+                        request.job_id
+                    )));
+                }
+                let attempt_id = attempt_id(&request.job_id, job.current_attempt);
+                let attempt = read_backend_job_attempt(&tx, workspace_id, &request.job_id, &attempt_id)?
+                    .ok_or_else(|| Error::Store("Backend Job current attempt is missing".to_string()))?;
+                tx.commit()?;
+                return Ok(BackendJobReservation { job, attempt, replayed: true });
+            }
+            for (role, worker) in [
+                ("source", request.source_worker.as_ref()),
+                ("notification target", request.notification_target.as_ref()),
+            ] {
+                if let Some(worker) = worker
+                    && !worker_registry_identity_exists(&tx, workspace_id, worker)?
+                {
+                    return Err(Error::InvalidInput(format!(
+                        "Backend Job {role} Worker does not belong to this Workspace"
+                    )));
+                }
+            }
+            ensure_backend_job_capacity(&tx, workspace_id, request.limits.max_concurrent_jobs)?;
+            let current_attempt = 1_u8;
+            let attempt_id = attempt_id(&request.job_id, current_attempt);
+            tx.execute(
+                "INSERT INTO backend_jobs (workspace_id, job_id, purpose, input_revision, input_ref, request_json, intent_fingerprint, state, current_attempt, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?9)",
+                params![workspace_id, request.job_id, request.purpose, request.input_revision, request.input_ref, request_json, fingerprint, current_attempt as i64, now],
+            )?;
+            tx.execute(
+                "INSERT INTO backend_job_attempts (workspace_id, job_id, attempt_id, attempt, input_revision, state, deadline_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?7, ?7)",
+                params![workspace_id, request.job_id, attempt_id, current_attempt as i64, request.input_revision, deadline, now],
+            )?;
+            let job = read_backend_job(&tx, workspace_id, &request.job_id)?
+                .ok_or_else(|| Error::Store("reserved Backend Job is missing".to_string()))?;
+            let attempt = read_backend_job_attempt(&tx, workspace_id, &request.job_id, &attempt_id)?
+                .ok_or_else(|| Error::Store("reserved Backend Job attempt is missing".to_string()))?;
+            tx.commit()?;
+            Ok(BackendJobReservation { job, attempt, replayed: false })
+        })
+    }
+
+    fn reserve_backend_job_retry(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+        now: &str,
+    ) -> Result<BackendJobReservation> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut job = read_backend_job(&tx, workspace_id, job_id)?
+                .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job `{job_id}`")))?;
+            let previous_id = attempt_id(job_id, job.current_attempt);
+            let previous = read_backend_job_attempt(&tx, workspace_id, job_id, &previous_id)?
+                .ok_or_else(|| Error::Store("Backend Job current attempt is missing".to_string()))?;
+            if !matches!(previous.state, BackendJobAttemptState::Failed | BackendJobAttemptState::Unknown) {
+                return Err(Error::InvalidInput(
+                    "Backend Job re-evaluation requires a failed or unknown current attempt".to_string(),
+                ));
+            }
+            if job.current_attempt >= job.request.limits.max_attempts {
+                return Err(Error::InvalidInput(format!(
+                    "Backend Job `{job_id}` reached its attempt limit"
+                )));
+            }
+            ensure_backend_job_capacity(&tx, workspace_id, job.request.limits.max_concurrent_jobs)?;
+            let next = job.current_attempt + 1;
+            let next_id = attempt_id(job_id, next);
+            let deadline = backend_job_deadline(now, job.request.limits.timeout_seconds)?;
+            let changed = tx.execute(
+                "UPDATE backend_jobs SET state = 'pending', current_attempt = ?3, result_json = NULL, result_digest = NULL, failure_category = NULL, failure_detail = NULL, completed_at = NULL, updated_at = ?4 WHERE workspace_id = ?1 AND job_id = ?2 AND current_attempt = ?5",
+                params![workspace_id, job_id, next as i64, now, job.current_attempt as i64],
+            )?;
+            if changed != 1 {
+                return Err(Error::Store("Backend Job retry compare-and-set failed".to_string()));
+            }
+            tx.execute(
+                "INSERT INTO backend_job_attempts (workspace_id, job_id, attempt_id, attempt, input_revision, state, deadline_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?7, ?7)",
+                params![workspace_id, job_id, next_id, next as i64, job.request.input_revision, deadline, now],
+            )?;
+            job = read_backend_job(&tx, workspace_id, job_id)?
+                .ok_or_else(|| Error::Store("retried Backend Job is missing".to_string()))?;
+            let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, &next_id)?
+                .ok_or_else(|| Error::Store("retried Backend Job attempt is missing".to_string()))?;
+            tx.commit()?;
+            Ok(BackendJobReservation { job, attempt, replayed: false })
+        })
+    }
+
+    fn get_backend_job(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+    ) -> Result<Option<BackendJobRecord>> {
+        self.with_conn(|conn| read_backend_job(conn, workspace_id, job_id))
+    }
+
+    fn get_backend_job_attempt(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+        attempt_id: &str,
+    ) -> Result<Option<BackendJobAttemptRecord>> {
+        self.with_conn(|conn| read_backend_job_attempt(conn, workspace_id, job_id, attempt_id))
+    }
+
+    fn list_recoverable_backend_job_attempts(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<BackendJobAttemptRecord>> {
+        self.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT job_id, attempt_id FROM backend_job_attempts WHERE workspace_id = ?1 AND state IN ('reserved', 'dispatched') ORDER BY created_at LIMIT ?2",
+            )?;
+            let identities = statement.query_map(params![workspace_id, limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?.collect::<rusqlite::Result<Vec<_>>>()?;
+            identities.into_iter().map(|(job_id, attempt_id)| {
+                read_backend_job_attempt(conn, workspace_id, &job_id, &attempt_id)?
+                    .ok_or_else(|| Error::Store("recoverable Backend Job attempt disappeared".to_string()))
+            }).collect()
+        })
+    }
+
+    fn bind_backend_job_attempt_worker(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+        attempt_id: &str,
+        worker: &RuntimeWorkerRef,
+        runtime_run_id: Option<&str>,
+        now: &str,
+    ) -> Result<(WorkerRegistryProjectionCommit, bool)> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let job = read_backend_job(&tx, workspace_id, job_id)?
+                .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job `{job_id}`")))?;
+            let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, attempt_id)?
+                .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job attempt `{attempt_id}`")))?;
+            if attempt.attempt != job.current_attempt || attempt.input_revision != job.request.input_revision {
+                return Err(Error::InvalidInput(
+                    "Backend Job attempt is stale for the current input revision".to_string(),
+                ));
+            }
+            if let Some(bound) = &attempt.worker {
+                if bound != worker || attempt.runtime_run_id.as_deref() != runtime_run_id {
+                    return Err(Error::InvalidInput(
+                        "Backend Job attempt is already bound to different Runtime evidence".to_string(),
+                    ));
+                }
+                let commit = WorkerRegistryProjectionCommit {
+                    revision: current_worker_projection_revision(&tx, workspace_id)?,
+                    changes: Vec::new(),
+                };
+                tx.commit()?;
+                return Ok((commit, false));
+            }
+            if !worker_registry_identity_exists(&tx, workspace_id, worker)? {
+                return Err(Error::InvalidInput(
+                    "Backend Job Worker must be registered before binding".to_string(),
+                ));
+            }
+            let changed = tx.execute(
+                "UPDATE backend_job_attempts SET state = 'dispatched', runtime_id = ?4, worker_id = ?5, runtime_run_id = ?6, dispatched_at = ?7, updated_at = ?7 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND state = 'reserved' AND worker_id IS NULL",
+                params![workspace_id, job_id, attempt_id, worker.runtime_id, worker.worker_id, runtime_run_id, now],
+            )?;
+            if changed != 1 {
+                return Err(Error::InvalidInput(
+                    "Backend Job attempt is not available for Worker binding".to_string(),
+                ));
+            }
+            let changed_workers = vec![worker.clone()];
+            let revision = commit_worker_projection_changes(&tx, workspace_id, &changed_workers)?;
+            let changes = worker_catalog_upsert_changes(&tx, workspace_id, &changed_workers)?;
+            tx.commit()?;
+            Ok((WorkerRegistryProjectionCommit { revision, changes }, true))
+        })
+    }
+
+    fn accept_backend_job_result(
+        &self,
+        workspace_id: &str,
+        source_worker: &RuntimeWorkerRef,
+        submission: &BackendJobResultSubmission,
+        now: &str,
+    ) -> Result<BackendJobResultAcceptance> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let job = read_backend_job(&tx, workspace_id, &submission.job_id)?
+                .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job `{}`", submission.job_id)))?;
+            let attempt = read_backend_job_attempt(&tx, workspace_id, &submission.job_id, &submission.attempt_id)?
+                .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job attempt `{}`", submission.attempt_id)))?;
+            let (digest, result_json) = result_digest(&submission.result, job.request.limits.max_result_bytes)?;
+            if submission.input_revision != job.request.input_revision
+                || attempt.input_revision != submission.input_revision
+                || attempt.attempt != job.current_attempt
+            {
+                return Err(Error::InvalidInput(
+                    "Backend Job result is stale for the current attempt or input revision".to_string(),
+                ));
+            }
+            if attempt.worker.as_ref() != Some(source_worker) {
+                return Err(Error::InvalidInput(
+                    "Backend Job result source is not the attempt Worker".to_string(),
+                ));
+            }
+            if attempt.state == BackendJobAttemptState::Completed {
+                if attempt.result_digest.as_deref() != Some(digest.as_str()) {
+                    return Err(Error::InvalidInput(
+                        "Backend Job result replay conflicts with the accepted result".to_string(),
+                    ));
+                }
+                tx.commit()?;
+                return Ok(BackendJobResultAcceptance { job, attempt, replayed: true });
+            }
+            if attempt.state != BackendJobAttemptState::Dispatched || job.state != BackendJobState::Pending {
+                return Err(Error::InvalidInput(
+                    "Backend Job attempt no longer accepts results".to_string(),
+                ));
+            }
+            let attempt_changed = tx.execute(
+                "UPDATE backend_job_attempts SET state = 'completed', result_json = ?4, result_digest = ?5, failure_category = NULL, failure_detail = NULL, completed_at = ?6, updated_at = ?6 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND state = 'dispatched'",
+                params![workspace_id, submission.job_id, submission.attempt_id, result_json, digest, now],
+            )?;
+            let job_changed = tx.execute(
+                "UPDATE backend_jobs SET state = 'completed', result_json = ?3, result_digest = ?4, failure_category = NULL, failure_detail = NULL, completed_at = ?5, updated_at = ?5 WHERE workspace_id = ?1 AND job_id = ?2 AND state = 'pending'",
+                params![workspace_id, submission.job_id, result_json, digest, now],
+            )?;
+            if attempt_changed != 1 || job_changed != 1 {
+                return Err(Error::Store("Backend Job result acceptance compare-and-set failed".to_string()));
+            }
+            let job = read_backend_job(&tx, workspace_id, &submission.job_id)?
+                .ok_or_else(|| Error::Store("accepted Backend Job disappeared".to_string()))?;
+            let attempt = read_backend_job_attempt(&tx, workspace_id, &submission.job_id, &submission.attempt_id)?
+                .ok_or_else(|| Error::Store("accepted Backend Job attempt disappeared".to_string()))?;
+            tx.commit()?;
+            Ok(BackendJobResultAcceptance { job, attempt, replayed: false })
+        })
+    }
+
+    fn finish_backend_job_attempt(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+        attempt_id: &str,
+        state: BackendJobAttemptState,
+        failure_category: &str,
+        failure_detail: &str,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord> {
+        if !matches!(
+            state,
+            BackendJobAttemptState::Failed | BackendJobAttemptState::Unknown
+        ) {
+            return Err(Error::InvalidInput(
+                "Backend Job failure completion requires failed or unknown state".to_string(),
+            ));
+        }
+        let detail = bounded_failure_detail(failure_detail);
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let job = read_backend_job(&tx, workspace_id, job_id)?
+                .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job `{job_id}`")))?;
+            let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, attempt_id)?
+                .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job attempt `{attempt_id}`")))?;
+            if attempt.state == BackendJobAttemptState::Completed {
+                return Err(Error::InvalidInput(
+                    "accepted Backend Job result cannot be replaced by failure".to_string(),
+                ));
+            }
+            if attempt.state.terminal() {
+                if attempt.state != state || attempt.failure_category.as_deref() != Some(failure_category) {
+                    return Err(Error::InvalidInput(
+                        "Backend Job terminal attempt replay conflicts with stored failure".to_string(),
+                    ));
+                }
+                tx.commit()?;
+                return Ok(attempt);
+            }
+            tx.execute(
+                "UPDATE backend_job_attempts SET state = ?4, failure_category = ?5, failure_detail = ?6, completed_at = ?7, updated_at = ?7 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND state IN ('reserved', 'dispatched')",
+                params![workspace_id, job_id, attempt_id, state.as_str(), failure_category, detail, now],
+            )?;
+            if attempt.attempt == job.current_attempt && job.state == BackendJobState::Pending {
+                let job_state = match state {
+                    BackendJobAttemptState::Failed => BackendJobState::Failed,
+                    BackendJobAttemptState::Unknown => BackendJobState::Unknown,
+                    _ => unreachable!(),
+                };
+                tx.execute(
+                    "UPDATE backend_jobs SET state = ?3, failure_category = ?4, failure_detail = ?5, completed_at = ?6, updated_at = ?6 WHERE workspace_id = ?1 AND job_id = ?2 AND state = 'pending'",
+                    params![workspace_id, job_id, job_state.as_str(), failure_category, detail, now],
+                )?;
+            }
+            let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, attempt_id)?
+                .ok_or_else(|| Error::Store("finished Backend Job attempt disappeared".to_string()))?;
+            tx.commit()?;
+            Ok(attempt)
+        })
+    }
+
+    fn reserve_backend_job_delivery(
+        &self,
+        workspace_id: &str,
+        delivery_id: &str,
+        job_id: &str,
+        target: &RuntimeWorkerRef,
+        now: &str,
+    ) -> Result<BackendJobDeliveryRecord> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(existing) = read_backend_job_delivery(&tx, workspace_id, delivery_id)? {
+                if existing.job_id != job_id || existing.target != *target {
+                    return Err(Error::InvalidInput(
+                        "Backend Job delivery id was reused with different intent".to_string(),
+                    ));
+                }
+                tx.commit()?;
+                return Ok(existing);
+            }
+            let job = read_backend_job(&tx, workspace_id, job_id)?
+                .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job `{job_id}`")))?;
+            if job.state != BackendJobState::Completed {
+                return Err(Error::InvalidInput(
+                    "Backend Job result must be committed before delivery".to_string(),
+                ));
+            }
+            if job.request.notification_target.as_ref() != Some(target) {
+                return Err(Error::InvalidInput(
+                    "Backend Job delivery target does not match durable notification intent".to_string(),
+                ));
+            }
+            let current_attempt_id = attempt_id(job_id, job.current_attempt);
+            tx.execute(
+                "INSERT INTO backend_job_deliveries (workspace_id, delivery_id, job_id, attempt_id, target_runtime_id, target_worker_id, state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?7)",
+                params![workspace_id, delivery_id, job_id, current_attempt_id, target.runtime_id, target.worker_id, now],
+            )?;
+            let delivery = read_backend_job_delivery(&tx, workspace_id, delivery_id)?
+                .ok_or_else(|| Error::Store("reserved Backend Job delivery disappeared".to_string()))?;
+            tx.commit()?;
+            Ok(delivery)
+        })
+    }
+
+    fn finish_backend_job_delivery(
+        &self,
+        workspace_id: &str,
+        delivery_id: &str,
+        state: BackendJobDeliveryState,
+        failure_category: Option<&str>,
+        failure_detail: Option<&str>,
+        now: &str,
+    ) -> Result<BackendJobDeliveryRecord> {
+        if state == BackendJobDeliveryState::Pending {
+            return Err(Error::InvalidInput(
+                "Backend Job delivery completion cannot remain pending".to_string(),
+            ));
+        }
+        let detail = failure_detail.map(bounded_failure_detail);
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current = read_backend_job_delivery(&tx, workspace_id, delivery_id)?
+                .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job delivery `{delivery_id}`")))?;
+            if current.state == BackendJobDeliveryState::Completed {
+                if state != BackendJobDeliveryState::Completed {
+                    return Err(Error::InvalidInput(
+                        "completed Backend Job delivery cannot be replaced".to_string(),
+                    ));
+                }
+                tx.commit()?;
+                return Ok(current);
+            }
+            tx.execute(
+                "UPDATE backend_job_deliveries SET state = ?3, failure_category = ?4, failure_detail = ?5, delivered_at = CASE WHEN ?3 = 'completed' THEN ?6 ELSE delivered_at END, updated_at = ?6 WHERE workspace_id = ?1 AND delivery_id = ?2",
+                params![workspace_id, delivery_id, state.as_str(), failure_category, detail, now],
+            )?;
+            let delivery = read_backend_job_delivery(&tx, workspace_id, delivery_id)?
+                .ok_or_else(|| Error::Store("finished Backend Job delivery disappeared".to_string()))?;
+            tx.commit()?;
+            Ok(delivery)
+        })
+    }
+
     fn upsert_worker_registry(
         &self,
         record: &WorkerRegistryRecord,
@@ -9281,6 +9765,206 @@ fn read_memory_staging_resolution_record(
     })
 }
 
+fn backend_job_deadline(now: &str, timeout_seconds: u32) -> Result<String> {
+    let now = chrono::DateTime::parse_from_rfc3339(now)
+        .map_err(|error| Error::InvalidInput(format!("invalid Backend Job timestamp: {error}")))?;
+    Ok((now + chrono::Duration::seconds(i64::from(timeout_seconds))).to_rfc3339())
+}
+
+fn ensure_backend_job_capacity(
+    conn: &Connection,
+    workspace_id: &str,
+    max_concurrent: u16,
+) -> Result<()> {
+    let active: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM backend_job_attempts WHERE workspace_id = ?1 AND state IN ('reserved', 'dispatched')",
+        params![workspace_id],
+        |row| row.get(0),
+    )?;
+    if active >= i64::from(max_concurrent) {
+        return Err(Error::InvalidInput(format!(
+            "Backend Job concurrency limit {max_concurrent} is reached"
+        )));
+    }
+    Ok(())
+}
+
+fn read_backend_job(
+    conn: &Connection,
+    workspace_id: &str,
+    job_id: &str,
+) -> Result<Option<BackendJobRecord>> {
+    let row = conn.query_row(
+        "SELECT request_json, intent_fingerprint, state, current_attempt, result_json, result_digest, failure_category, failure_detail, created_at, updated_at, completed_at FROM backend_jobs WHERE workspace_id = ?1 AND job_id = ?2",
+        params![workspace_id, job_id],
+        |row| Ok((
+            row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?, row.get::<_, Option<String>>(7)?, row.get::<_, String>(8)?,
+            row.get::<_, String>(9)?, row.get::<_, Option<String>>(10)?,
+        )),
+    ).optional()?;
+    let Some((
+        request_json,
+        intent_fingerprint,
+        state,
+        current_attempt,
+        result_json,
+        result_digest,
+        failure_category,
+        failure_detail,
+        created_at,
+        updated_at,
+        completed_at,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let request: BackendJobRequest = serde_json::from_str(&request_json)
+        .map_err(|error| Error::Store(format!("invalid stored Backend Job request: {error}")))?;
+    let result = result_json
+        .map(|value| serde_json::from_str(&value))
+        .transpose()
+        .map_err(|error| Error::Store(format!("invalid stored Backend Job result: {error}")))?;
+    let current_attempt = u8::try_from(current_attempt)
+        .map_err(|_| Error::Store("Backend Job attempt number is out of range".to_string()))?;
+    Ok(Some(BackendJobRecord {
+        workspace_id: workspace_id.to_string(),
+        request,
+        intent_fingerprint,
+        state: BackendJobState::parse(&state)?,
+        current_attempt,
+        result,
+        result_digest,
+        failure_category,
+        failure_detail,
+        created_at,
+        updated_at,
+        completed_at,
+    }))
+}
+
+fn read_backend_job_attempt(
+    conn: &Connection,
+    workspace_id: &str,
+    job_id: &str,
+    attempt_id: &str,
+) -> Result<Option<BackendJobAttemptRecord>> {
+    let row = conn.query_row(
+        "SELECT attempt, input_revision, state, runtime_id, worker_id, runtime_run_id, dispatched_at, deadline_at, result_json, result_digest, failure_category, failure_detail, created_at, updated_at, completed_at FROM backend_job_attempts WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3",
+        params![workspace_id, job_id, attempt_id],
+        |row| Ok((
+            row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?, row.get::<_, String>(7)?, row.get::<_, Option<String>>(8)?,
+            row.get::<_, Option<String>>(9)?, row.get::<_, Option<String>>(10)?, row.get::<_, Option<String>>(11)?,
+            row.get::<_, String>(12)?, row.get::<_, String>(13)?, row.get::<_, Option<String>>(14)?,
+        )),
+    ).optional()?;
+    let Some((
+        attempt,
+        input_revision,
+        state,
+        runtime_id,
+        worker_id,
+        runtime_run_id,
+        dispatched_at,
+        deadline_at,
+        result_json,
+        result_digest,
+        failure_category,
+        failure_detail,
+        created_at,
+        updated_at,
+        completed_at,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let worker = match (runtime_id, worker_id) {
+        (Some(runtime_id), Some(worker_id)) => Some(RuntimeWorkerRef::new(runtime_id, worker_id)),
+        (None, None) => None,
+        _ => {
+            return Err(Error::Store(
+                "Backend Job attempt has a partial Worker binding".to_string(),
+            ));
+        }
+    };
+    let result = result_json
+        .map(|value| serde_json::from_str(&value))
+        .transpose()
+        .map_err(|error| {
+            Error::Store(format!(
+                "invalid stored Backend Job attempt result: {error}"
+            ))
+        })?;
+    let attempt = u8::try_from(attempt)
+        .map_err(|_| Error::Store("Backend Job attempt number is out of range".to_string()))?;
+    Ok(Some(BackendJobAttemptRecord {
+        workspace_id: workspace_id.to_string(),
+        job_id: job_id.to_string(),
+        attempt_id: attempt_id.to_string(),
+        attempt,
+        input_revision,
+        state: BackendJobAttemptState::parse(&state)?,
+        worker,
+        runtime_run_id,
+        dispatched_at,
+        deadline_at,
+        result,
+        result_digest,
+        failure_category,
+        failure_detail,
+        created_at,
+        updated_at,
+        completed_at,
+    }))
+}
+
+fn read_backend_job_delivery(
+    conn: &Connection,
+    workspace_id: &str,
+    delivery_id: &str,
+) -> Result<Option<BackendJobDeliveryRecord>> {
+    let row = conn.query_row(
+        "SELECT job_id, attempt_id, target_runtime_id, target_worker_id, state, failure_category, failure_detail, created_at, updated_at, delivered_at FROM backend_job_deliveries WHERE workspace_id = ?1 AND delivery_id = ?2",
+        params![workspace_id, delivery_id],
+        |row| Ok((
+            row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?,
+            row.get::<_, String>(7)?, row.get::<_, String>(8)?, row.get::<_, Option<String>>(9)?,
+        )),
+    ).optional()?;
+    let Some((
+        job_id,
+        attempt_id,
+        runtime_id,
+        worker_id,
+        state,
+        failure_category,
+        failure_detail,
+        created_at,
+        updated_at,
+        delivered_at,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    Ok(Some(BackendJobDeliveryRecord {
+        workspace_id: workspace_id.to_string(),
+        delivery_id: delivery_id.to_string(),
+        job_id,
+        attempt_id,
+        target: RuntimeWorkerRef::new(runtime_id, worker_id),
+        state: BackendJobDeliveryState::parse(&state)?,
+        failure_category,
+        failure_detail,
+        created_at,
+        updated_at,
+        delivered_at,
+    }))
+}
+
 fn worker_registry_select_sql(where_clause: &str) -> String {
     format!(
         "SELECT workspace_id, runtime_id, worker_id, display_name, profile, \
@@ -9378,6 +10062,7 @@ fn read_worker_registry_projection(
                         workspace_id: Some(workspace_id.to_string()),
                         display_name: Some(registry.display_name.clone()),
                         profile: registry.profile.clone(),
+                        job: None,
                         workdir_attachments: Vec::new(),
                     }
                 };
@@ -9395,10 +10080,27 @@ fn read_worker_registry_projection(
             },
         )
         .transpose()?;
+    let job = conn
+        .query_row(
+            "SELECT attempt.job_id, attempt.attempt_id, job.purpose \
+             FROM backend_job_attempts attempt \
+             JOIN backend_jobs job ON job.workspace_id = attempt.workspace_id AND job.job_id = attempt.job_id \
+             WHERE attempt.workspace_id = ?1 AND attempt.runtime_id = ?2 AND attempt.worker_id = ?3",
+            params![workspace_id, worker.runtime_id, worker.worker_id],
+            |row| {
+                Ok(BackendJobWorkerBinding {
+                    job_id: row.get(0)?,
+                    attempt_id: row.get(1)?,
+                    purpose: row.get(2)?,
+                })
+            },
+        )
+        .optional()?;
     Ok(Some(WorkerRegistryProjectionRecord {
         registry,
         resource_key,
         observation,
+        job,
     }))
 }
 
@@ -12308,6 +13010,99 @@ fn migrate_workdir_command_attachment_capabilities_v68_to_v69(conn: &Connection)
     }
 }
 
+fn migrate_backend_job_runner_v69_to_v70(conn: &Connection) -> Result<()> {
+    let current = current_schema_version(conn)?;
+    if current != 69 {
+        return Err(Error::Store(format!(
+            "expected schema version 69 before {BACKEND_JOB_RUNNER_MIGRATION_NAME} migration, found {current}"
+        )));
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    tx.execute_batch(
+        r#"
+        CREATE TABLE backend_jobs (
+            workspace_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            purpose TEXT NOT NULL,
+            input_revision TEXT NOT NULL,
+            input_ref TEXT NOT NULL,
+            request_json TEXT NOT NULL,
+            intent_fingerprint TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('pending', 'completed', 'failed', 'unknown')),
+            current_attempt INTEGER NOT NULL CHECK (current_attempt > 0 AND current_attempt <= 3),
+            result_json TEXT,
+            result_digest TEXT,
+            failure_category TEXT,
+            failure_detail TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            PRIMARY KEY (workspace_id, job_id),
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+            CHECK ((result_json IS NULL) = (result_digest IS NULL)),
+            CHECK ((state = 'completed') = (result_json IS NOT NULL))
+        );
+        CREATE INDEX backend_jobs_active
+            ON backend_jobs(workspace_id, state, updated_at);
+        CREATE TABLE backend_job_attempts (
+            workspace_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            attempt INTEGER NOT NULL CHECK (attempt > 0 AND attempt <= 3),
+            input_revision TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('reserved', 'dispatched', 'completed', 'failed', 'unknown')),
+            runtime_id TEXT,
+            worker_id TEXT,
+            runtime_run_id TEXT,
+            dispatched_at TEXT,
+            deadline_at TEXT NOT NULL,
+            result_json TEXT,
+            result_digest TEXT,
+            failure_category TEXT,
+            failure_detail TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            PRIMARY KEY (workspace_id, job_id, attempt_id),
+            UNIQUE (workspace_id, job_id, attempt),
+            UNIQUE (workspace_id, runtime_id, worker_id),
+            FOREIGN KEY (workspace_id, job_id)
+                REFERENCES backend_jobs(workspace_id, job_id) ON DELETE CASCADE,
+            CHECK ((runtime_id IS NULL) = (worker_id IS NULL)),
+            CHECK ((result_json IS NULL) = (result_digest IS NULL)),
+            CHECK ((state = 'completed') = (result_json IS NOT NULL))
+        );
+        CREATE INDEX backend_job_attempts_recovery
+            ON backend_job_attempts(workspace_id, state, deadline_at);
+        CREATE TABLE backend_job_deliveries (
+            workspace_id TEXT NOT NULL,
+            delivery_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            target_runtime_id TEXT NOT NULL,
+            target_worker_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('pending', 'completed', 'failed')),
+            failure_category TEXT,
+            failure_detail TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            delivered_at TEXT,
+            PRIMARY KEY (workspace_id, delivery_id),
+            FOREIGN KEY (workspace_id, job_id, attempt_id)
+                REFERENCES backend_job_attempts(workspace_id, job_id, attempt_id) ON DELETE CASCADE
+        );
+        CREATE INDEX backend_job_deliveries_pending
+            ON backend_job_deliveries(workspace_id, state, updated_at);
+        "#,
+    )?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+        params![70_i64, BACKEND_JOB_RUNNER_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("DROP TABLE IF EXISTS typed_ticket_targets;")?;
     conn.execute_batch(include_str!("latest_schema.sql"))?;
@@ -13057,7 +13852,10 @@ mod tests {
 
     fn downgrade_schema_66_ticket_and_workdir_authority(conn: &Connection) -> Result<()> {
         conn.execute_batch(
-            "DROP TABLE typed_ticket_targets;
+            "DROP TABLE backend_job_deliveries;
+             DROP TABLE backend_job_attempts;
+             DROP TABLE backend_jobs;
+             DROP TABLE typed_ticket_targets;
              ALTER TABLE typed_tickets ADD COLUMN repository_id TEXT;
              ALTER TABLE typed_tickets ADD COLUMN ref_selector TEXT;
              ALTER TABLE worker_workdir_links DROP COLUMN capabilities;
@@ -14476,6 +15274,10 @@ mod tests {
                     version: 69,
                     name: WORKDIR_COMMAND_ATTACHMENT_CAPABILITIES_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 70,
+                    name: BACKEND_JOB_RUNNER_MIGRATION_NAME.to_string(),
+                },
             ]
         );
 
@@ -14546,6 +15348,7 @@ mod tests {
                             69,
                             WORKDIR_COMMAND_ATTACHMENT_CAPABILITIES_MIGRATION_NAME.to_string(),
                         ),
+                        (70, BACKEND_JOB_RUNNER_MIGRATION_NAME.to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -14762,7 +15565,7 @@ mod tests {
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
             vec![
-                52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69
+                52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70
             ]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
@@ -14771,7 +15574,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 20);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 21);
         assert!(column_exists(&conn, "worker_workdir_links", "alias").unwrap());
         assert!(column_exists(&conn, "worker_workdir_links", "capabilities").unwrap());
         assert!(!column_exists(&conn, "worker_workdir_links", "role").unwrap());
@@ -17759,6 +18562,7 @@ INSERT INTO worker_registry (
             workspace_id: Some("local-dev".to_string()),
             display_name: Some("Known Worker".to_string()),
             profile: None,
+            job: None,
             workdir_attachments: Vec::new(),
         };
         let orphan = SubscriptionWorker {
@@ -17934,6 +18738,7 @@ INSERT INTO worker_registry (
             workspace_id: Some("local-dev".to_string()),
             display_name: None,
             profile: None,
+            job: None,
             workdir_attachments: Vec::new(),
         };
         let commit = store
@@ -18316,6 +19121,321 @@ INSERT INTO worker_registry (
                 .consume_device_login_token("device", "2026-07-22T00:05:00Z")
                 .unwrap(),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_jobs_fence_results_project_ownership_and_bound_retries() {
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let workspace_id = "workspace-job";
+        store
+            .upsert_account(&AccountRecord {
+                account_id: "owner-job".to_string(),
+                kind: "user".to_string(),
+                handle: "job-owner".to_string(),
+                display_name: "Job Owner".to_string(),
+                created_at: "2026-09-01T00:00:00Z".to_string(),
+                updated_at: "2026-09-01T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: workspace_id.to_string(),
+                owner_account_id: "owner-job".to_string(),
+                display_name: "Job Workspace".to_string(),
+                state: "active".to_string(),
+                created_at: "2026-09-01T00:00:00Z".to_string(),
+                updated_at: "2026-09-01T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+        let source = RuntimeWorkerRef::new("embedded-worker-runtime", "source");
+        let worker = RuntimeWorkerRef::new("embedded-worker-runtime", "job-worker");
+        let retry_worker = RuntimeWorkerRef::new("embedded-worker-runtime", "retry-worker");
+        let worker_record = |worker: RuntimeWorkerRef, display_name: &str| WorkerRegistryRecord {
+            workspace_id: workspace_id.to_string(),
+            worker,
+            display_name: display_name.to_string(),
+            profile: Some("builtin:backend-job".to_string()),
+            retention_state: "normal".to_string(),
+            transcript_ref: None,
+            session_ref: None,
+            summary_ref: None,
+            diagnostics_ref: None,
+            created_at: "2026-09-01T00:00:00Z".to_string(),
+            updated_at: "2026-09-01T00:00:00Z".to_string(),
+        };
+        store
+            .upsert_worker_registry(&worker_record(source.clone(), "Source Worker"))
+            .unwrap();
+        store
+            .upsert_worker_registry(&worker_record(worker.clone(), "Job Worker"))
+            .unwrap();
+        store
+            .upsert_worker_registry(&worker_record(retry_worker.clone(), "Retry Worker"))
+            .unwrap();
+        store
+            .upsert_account(&AccountRecord {
+                account_id: "owner-other".to_string(),
+                kind: "user".to_string(),
+                handle: "other-owner".to_string(),
+                display_name: "Other Owner".to_string(),
+                created_at: "2026-09-01T00:00:00Z".to_string(),
+                updated_at: "2026-09-01T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "workspace-other".to_string(),
+                owner_account_id: "owner-other".to_string(),
+                display_name: "Other Workspace".to_string(),
+                state: "active".to_string(),
+                created_at: "2026-09-01T00:00:00Z".to_string(),
+                updated_at: "2026-09-01T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+        let cross_workspace_target =
+            RuntimeWorkerRef::new("embedded-worker-runtime", "cross-workspace-target");
+        let mut cross_workspace_record =
+            worker_record(cross_workspace_target.clone(), "Cross Workspace Target");
+        cross_workspace_record.workspace_id = "workspace-other".to_string();
+        store
+            .upsert_worker_registry(&cross_workspace_record)
+            .unwrap();
+        let request = BackendJobRequest {
+            job_id: "check:T-1:r1".to_string(),
+            purpose: "ticket_item_check".to_string(),
+            input_revision: "1".to_string(),
+            input_ref: "ticket://T-1/revisions/1".to_string(),
+            input: serde_json::json!({"title": "check"}),
+            instruction: "Check the immutable input.".to_string(),
+            profile: "builtin:backend-job".to_string(),
+            source_worker: Some(source.clone()),
+            notification_target: Some(source.clone()),
+            limits: crate::backend_job::BackendJobLimits {
+                max_attempts: 2,
+                ..Default::default()
+            },
+        };
+
+        let mut cross_workspace_notification = request.clone();
+        cross_workspace_notification.job_id = "cross-workspace-notification".to_string();
+        cross_workspace_notification.notification_target = Some(cross_workspace_target);
+        assert!(
+            store
+                .reserve_backend_job(
+                    workspace_id,
+                    &cross_workspace_notification,
+                    "2026-09-01T00:00:00Z",
+                )
+                .is_err(),
+            "notification intent must not target a Worker from another Workspace"
+        );
+        assert!(
+            store
+                .accept_backend_job_result(
+                    "workspace-other",
+                    &worker,
+                    &BackendJobResultSubmission {
+                        job_id: request.job_id.clone(),
+                        attempt_id: attempt_id(&request.job_id, 1),
+                        input_revision: request.input_revision.clone(),
+                        result: serde_json::json!({"cross_workspace": true}),
+                    },
+                    "2026-09-01T00:00:00Z",
+                )
+                .is_err(),
+            "result acceptance must be scoped to the Job Workspace"
+        );
+
+        let first = store
+            .reserve_backend_job(workspace_id, &request, "2026-09-01T00:00:00Z")
+            .unwrap();
+        let replay = store
+            .reserve_backend_job(workspace_id, &request, "2026-09-01T00:00:01Z")
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.attempt.attempt_id, first.attempt.attempt_id);
+        store
+            .bind_backend_job_attempt_worker(
+                workspace_id,
+                &request.job_id,
+                &first.attempt.attempt_id,
+                &worker,
+                Some("runtime-run-1"),
+                "2026-09-01T00:00:02Z",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .worker_registry_projection(workspace_id, &worker)
+                .unwrap()
+                .unwrap()
+                .job,
+            Some(BackendJobWorkerBinding {
+                job_id: request.job_id.clone(),
+                attempt_id: first.attempt.attempt_id.clone(),
+                purpose: request.purpose.clone(),
+            })
+        );
+        let submission = BackendJobResultSubmission {
+            job_id: request.job_id.clone(),
+            attempt_id: first.attempt.attempt_id.clone(),
+            input_revision: request.input_revision.clone(),
+            result: serde_json::json!({"valid": true}),
+        };
+        assert!(
+            store
+                .accept_backend_job_result(
+                    workspace_id,
+                    &RuntimeWorkerRef::new("embedded-worker-runtime", "wrong"),
+                    &submission,
+                    "2026-09-01T00:00:03Z",
+                )
+                .is_err()
+        );
+        let accepted = store
+            .accept_backend_job_result(workspace_id, &worker, &submission, "2026-09-01T00:00:03Z")
+            .unwrap();
+        assert_eq!(accepted.job.state, BackendJobState::Completed);
+        assert!(
+            store
+                .accept_backend_job_result(
+                    workspace_id,
+                    &worker,
+                    &submission,
+                    "2026-09-01T00:00:04Z",
+                )
+                .unwrap()
+                .replayed
+        );
+        assert!(
+            store
+                .accept_backend_job_result(
+                    workspace_id,
+                    &worker,
+                    &BackendJobResultSubmission {
+                        result: serde_json::json!({"valid": false}),
+                        ..submission.clone()
+                    },
+                    "2026-09-01T00:00:04Z",
+                )
+                .is_err()
+        );
+
+        // Missing notification targets are durable delivery failures and do
+        // not alter the already-committed Job result.
+        store
+            .reserve_backend_job_delivery(
+                workspace_id,
+                "delivery-1",
+                &request.job_id,
+                &source,
+                "2026-09-01T00:00:05Z",
+            )
+            .unwrap();
+        store
+            .finish_backend_job_delivery(
+                workspace_id,
+                "delivery-1",
+                BackendJobDeliveryState::Failed,
+                Some("target_missing"),
+                Some("target is gone"),
+                "2026-09-01T00:00:06Z",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .get_backend_job(workspace_id, &request.job_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            BackendJobState::Completed
+        );
+        assert!(
+            !store
+                .delete_worker_registry(workspace_id, &worker)
+                .unwrap()
+                .changes
+                .is_empty(),
+            "Job result retention must not prevent canonical Worker removal"
+        );
+        assert_eq!(
+            store
+                .get_backend_job(workspace_id, &request.job_id)
+                .unwrap()
+                .unwrap()
+                .result,
+            Some(serde_json::json!({"valid": true})),
+            "Worker removal must not discard the durable Job result"
+        );
+
+        let mut retry_request = request;
+        retry_request.job_id = "bounded-retry".to_string();
+        retry_request.notification_target = None;
+        let failed = store
+            .reserve_backend_job(workspace_id, &retry_request, "2026-09-01T00:01:00Z")
+            .unwrap();
+        store
+            .bind_backend_job_attempt_worker(
+                workspace_id,
+                &retry_request.job_id,
+                &failed.attempt.attempt_id,
+                &retry_worker,
+                None,
+                "2026-09-01T00:01:01Z",
+            )
+            .unwrap();
+        store
+            .finish_backend_job_attempt(
+                workspace_id,
+                &retry_request.job_id,
+                &failed.attempt.attempt_id,
+                BackendJobAttemptState::Failed,
+                "timeout",
+                "deadline exceeded",
+                "2026-09-01T00:01:02Z",
+            )
+            .unwrap();
+        assert!(
+            store
+                .accept_backend_job_result(
+                    workspace_id,
+                    &retry_worker,
+                    &BackendJobResultSubmission {
+                        job_id: retry_request.job_id.clone(),
+                        attempt_id: failed.attempt.attempt_id.clone(),
+                        input_revision: retry_request.input_revision.clone(),
+                        result: serde_json::json!({"late": true}),
+                    },
+                    "2026-09-01T00:01:03Z",
+                )
+                .is_err()
+        );
+        let second = store
+            .reserve_backend_job_retry(workspace_id, &retry_request.job_id, "2026-09-01T00:01:04Z")
+            .unwrap();
+        assert_eq!(second.attempt.attempt, 2);
+        store
+            .finish_backend_job_attempt(
+                workspace_id,
+                &retry_request.job_id,
+                &second.attempt.attempt_id,
+                BackendJobAttemptState::Unknown,
+                "worker_unknown",
+                "worker unavailable",
+                "2026-09-01T00:01:05Z",
+            )
+            .unwrap();
+        assert!(
+            store
+                .reserve_backend_job_retry(
+                    workspace_id,
+                    &retry_request.job_id,
+                    "2026-09-01T00:01:06Z",
+                )
+                .is_err()
         );
     }
 }

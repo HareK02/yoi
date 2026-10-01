@@ -20,6 +20,7 @@ roleOrchestrator = import "./role/orchestrator.md";
 roleReviewer = import "./role/reviewer.md";
 internalCompactSystem = import "./internal/compact_system.md";
 internalFlowVerifierSystem = import "./internal/flow_verifier_system.md";
+internalBackendJobSystem = import "./internal/backend_job_system.md";
 internalMemoryConsolidationSystem = import "./internal/memory_consolidation_system.md";
 internalMemoryExtractSystem = import "./internal/memory_extract_system.md";
 internalWorkspaceOrchestratorQueueAttention = import "./internal/workspace_orchestrator_queue_attention.md";
@@ -55,6 +56,7 @@ in
     internal = {
         compact_system = internalCompactSystem.content;
         flow_verifier_system = internalFlowVerifierSystem.content;
+        backend_job_system = internalBackendJobSystem.content;
         memory_consolidation_system = internalMemoryConsolidationSystem.content;
         memory_extract_system = internalMemoryExtractSystem.content;
         workspace_orchestrator_queue_attention = internalWorkspaceOrchestratorQueueAttention.content;

@@ -544,6 +544,11 @@ pub enum WorkerSpawnIntent {
     WorkspaceCompanion,
     WorkspaceOrchestrator,
     WorkspaceCoding,
+    BackendJob {
+        job_id: String,
+        attempt_id: String,
+        purpose: String,
+    },
     TicketRole {
         ticket_id: String,
         role: TicketWorkerRole,
@@ -5890,6 +5895,7 @@ fn worker_spawn_intent_label(intent: &WorkerSpawnIntent) -> &'static str {
         WorkerSpawnIntent::WorkspaceCompanion => "workspace_companion",
         WorkerSpawnIntent::WorkspaceOrchestrator => "workspace_orchestrator",
         WorkerSpawnIntent::WorkspaceCoding => "workspace_coding",
+        WorkerSpawnIntent::BackendJob { .. } => "backend_job",
         WorkerSpawnIntent::TicketRole { role, .. } => match role {
             TicketWorkerRole::Intake => "ticket_intake",
             TicketWorkerRole::Orchestrator => "ticket_orchestrator",

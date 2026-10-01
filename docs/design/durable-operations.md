@@ -301,6 +301,55 @@ The public result contains only the Workdir ID,
 failure category. Internal operation identifiers, checkpoints, provider paths,
 and credentials are not public DTO fields.
 
+## Backend-owned bounded Jobs
+
+A Backend Job is durable side-effect intent whose model execution is delegated to
+one ordinary Runtime-managed Worker per attempt. The Workspace Server owns the
+Job; `source_worker` and `notification_target` are provenance and delivery
+addresses, not parent ownership. Stopping or losing either Worker does not revoke
+Job intent. Attempt records retain the bound Worker identity as historical
+evidence without foreign-keying Worker retention to Job retention; normal Worker
+stop, archive, pin/hold, and removal policy remains authoritative.
+
+The durable split is deliberate:
+
+- `backend_jobs` stores immutable bounded input, its fingerprint, the current
+  attempt number, and the final structured result or terminal failure;
+- `backend_job_attempts` binds one attempt and input revision to one dedicated
+  `(Workspace, Runtime, Worker)` identity, optional Runtime run evidence, a
+  deadline, and its bounded outcome;
+- `backend_job_deliveries` records best-effort notification separately from the
+  result, so a missing or stopped recipient never discards a result or reruns
+  model work.
+
+Exact dispatch retry reuses the deterministic attempt and Worker allocation key.
+Only explicit re-evaluation increments the bounded attempt number. The runner
+uses the existing embedded Runtime spawn, Worker registry, Session input,
+observation, usage, and lifecycle paths with no Workdir attachment. It uses the
+dedicated `builtin:backend-job` profile, whose tools cannot mutate Workspace
+state, recursively create Workers or Jobs, or inherit caller Workdir authority.
+
+Success is accepted only by the structured result boundary. The submission is
+fenced by Workspace, Job ID, attempt ID, input revision, and the bound Runtime
+Worker identity, and its JSON bytes are bounded before persistence. Worker final
+prose, Idle, Stopped, or a successful model call are not success evidence.
+Identical structured submission is idempotent; conflicting replay, stale or late
+attempts, wrong revisions, and other Workers fail closed.
+
+On restart, an unbound reservation is redispatched with its stable allocation.
+A dispatched attempt continues only when its bound Worker remains observable;
+otherwise it becomes `unknown`. Durable deadlines fence acceptance before the
+runner requests Worker stop. The design does not claim general exactly-once
+model execution: a crash between Runtime creation and durable binding converges
+through stable allocation where available, and unrecoverable external evidence
+is surfaced as `unknown` rather than guessed. Historical attempts preserve the
+reason for retry without duplicating the Runtime Worker lifecycle state machine.
+
+Workspace Worker subscriptions expose an explicit Job binding (`job_id`,
+`attempt_id`, and `purpose`) in snapshot and live projections. Sidebar hiding is
+a Web View policy over that canonical metadata; the Worker remains registered,
+observable, and eligible for its canonical Console route.
+
 ## Diagnostics and audit
 
 Persist bounded error categories and identifiers needed to investigate or retry.

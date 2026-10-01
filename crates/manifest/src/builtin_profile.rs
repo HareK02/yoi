@@ -95,6 +95,13 @@ pub const BUILTIN_PROFILE_RESOURCES: &[BuiltinProfileResource] = &[
         imports: BASE_IMPORT,
     },
     BuiltinProfileResource {
+        selector: Some("builtin:backend-job"),
+        path: "profiles/backend-job.dcdl",
+        source: include_str!("../../../resources/profiles/backend-job.dcdl"),
+        description: "Backend-owned bounded Job Worker.",
+        imports: BASE_IMPORT,
+    },
+    BuiltinProfileResource {
         selector: Some("builtin:memory-consolidation"),
         path: "profiles/memory-consolidation.dcdl",
         source: include_str!("../../../resources/profiles/memory-consolidation.dcdl"),

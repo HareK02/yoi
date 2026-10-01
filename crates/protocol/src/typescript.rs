@@ -28,7 +28,7 @@ use crate::{
         SubscriptionRequest, SubscriptionRequestId, SubscriptionResponse, SubscriptionSnapshot,
         SubscriptionTerminationCode, SubscriptionWorkdirId, SubscriptionWorker,
         SubscriptionWorkerAvailability, SubscriptionWorkerId, SubscriptionWorkerIds,
-        SubscriptionWorkerProtocolMethod, SubscriptionWorkerState,
+        SubscriptionWorkerJob, SubscriptionWorkerProtocolMethod, SubscriptionWorkerState,
         SubscriptionWorkerWorkdirAttachment, WorkspaceSubscriptionWorkdir,
     },
 };
@@ -132,6 +132,7 @@ pub fn generated_protocol_types() -> String {
     push_decl::<SubscriptionWorkerAvailability>(&cfg, &mut output);
     push_decl::<EventSubscriptionSelector>(&cfg, &mut output);
     push_decl::<SubscriptionWorkerWorkdirAttachment>(&cfg, &mut output);
+    push_decl::<SubscriptionWorkerJob>(&cfg, &mut output);
     push_decl::<SubscriptionWorker>(&cfg, &mut output);
     push_decl::<WorkspaceSubscriptionWorkdir>(&cfg, &mut output);
     push_decl::<SubscriptionSnapshot>(&cfg, &mut output);
@@ -232,6 +233,7 @@ fn rust_serialized_subscription_frame_fixtures() -> Vec<SubscriptionFrame> {
         workspace_id: Some("fixture-workspace".to_string()),
         display_name: None,
         profile: None,
+        job: None,
         workdir_attachments: vec![SubscriptionWorkerWorkdirAttachment {
             alias: "external".to_string(),
             repository_id: None,

@@ -279,6 +279,8 @@ export type SubscriptionWorkerWorkdirAttachment = {
  */
 alias: string, repository_key?: string | null, working_directory_id: SubscriptionWorkdirId, };
 
+export type SubscriptionWorkerJob = { job_id: string, attempt_id: string, purpose: string, };
+
 export type SubscriptionWorker = { worker_id: SubscriptionWorkerId,
 /**
  * Set by the Workspace Server when projecting a Runtime-owned Worker to clients.
@@ -307,7 +309,12 @@ worker_state?: WorkerStateSnapshot | null,
 /**
  * Runtime catalog lifecycle compatibility projection; not foreground-state authority.
  */
-state: SubscriptionWorkerState, has_running_internal_workers: boolean, workspace_id?: string | null, display_name?: string | null, profile?: string | null, workdir_attachments?: Array<SubscriptionWorkerWorkdirAttachment>, };
+state: SubscriptionWorkerState, has_running_internal_workers: boolean, workspace_id?: string | null, display_name?: string | null, profile?: string | null,
+/**
+ * Backend-owned Job binding. Runtime producers leave this unset; the
+ * Workspace projection enriches both snapshots and live updates.
+ */
+job?: SubscriptionWorkerJob | null, workdir_attachments?: Array<SubscriptionWorkerWorkdirAttachment>, };
 
 export type WorkspaceSubscriptionWorkdir = { working_directory_id: SubscriptionWorkdirId, repository_key: string, state: string, };
 

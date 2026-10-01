@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod authority;
+pub mod backend_job;
 pub mod companion;
 pub mod config;
 pub mod config_source;

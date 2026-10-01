@@ -1225,6 +1225,20 @@ where
     let worker_enabled = feature_config.worker.enabled;
     let sub_worker_enabled = feature_config.sub_worker.enabled;
     let mut feature_registry = FeatureRegistryBuilder::new();
+    if worker.manifest().engine.instruction == "internal.backend_job_system" {
+        let workspace_client = worker.workspace_client_handle();
+        if !workspace_client.is_available() || workspace_client.workspace_id().is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Backend Job result capability requires Backend Workspace API authority",
+            ));
+        }
+        feature_registry.add_module(
+            crate::feature::builtin::backend_job_result::BackendJobResultFeature::new(
+                workspace_client,
+            ),
+        );
+    }
     let memory_install_plan = crate::feature::builtin::memory::MemoryFeatureInstallPlan::prepare(
         worker.manifest(),
         worker.workspace_client_handle(),
