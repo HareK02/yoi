@@ -1,9 +1,14 @@
 import { extname, join, normalize } from "jsr:@std/path@1.1.4";
 import { dashboardFixture } from "../../../web/workspace/src/lib/workspace/home/dashboard.test-fixtures.ts";
 
+import { settingsFixtureHandler } from "../../../web/workspace/src/lib/workspace/settings/identity.test-fixtures.ts";
+const settingsFixture = settingsFixtureHandler();
+
 const port = Number(Deno.args[0]);
 const buildRoot = Deno.args[1];
-if (!Number.isInteger(port) || !buildRoot) throw new Error("usage: server <port> <build-root>");
+if (!Number.isInteger(port) || !buildRoot) {
+  throw new Error("usage: server <port> <build-root>");
+}
 const names: Record<string, string> = {
   "home-owner": "Workspace Home Review",
   "home-member": "Shared Workspace",
@@ -25,6 +30,8 @@ const mime: Record<string, string> = {
 Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
   const url = new URL(request.url);
   if (url.pathname === "/health") return new Response("ok");
+  const settingsResponse = await settingsFixture(request);
+  if (settingsResponse) return settingsResponse;
   if (url.pathname === "/api/workspaces") {
     return json(
       Object.entries(names).map(([workspace_id, display_name]) => ({
@@ -69,13 +76,26 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
         extension_points: {
           store: "fixture",
           event_stream: { status: "ready", note: "fixture", diagnostics: [] },
-          host_worker_bridge: { status: "ready", note: "fixture", diagnostics: [] },
-          companion_console: { status: "ready", note: "fixture", diagnostics: [] },
+          host_worker_bridge: {
+            status: "ready",
+            note: "fixture",
+            diagnostics: [],
+          },
+          companion_console: {
+            status: "ready",
+            note: "fixture",
+            diagnostics: [],
+          },
         },
       });
     }
     if (path === "/repositories") {
-      return json({ workspace_id: workspaceId, items: [], source: "fixture", diagnostics: [] });
+      return json({
+        workspace_id: workspaceId,
+        items: [],
+        source: "fixture",
+        diagnostics: [],
+      });
     }
     if (path === "/working-directories") {
       return json({ workspace_id: workspaceId, items: [], diagnostics: [] });
@@ -110,7 +130,9 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
         record_source: "fixture",
       });
     }
-    if (path === "/protocol/ws" && request.headers.get("upgrade") === "websocket") {
+    if (
+      path === "/protocol/ws" && request.headers.get("upgrade") === "websocket"
+    ) {
       const { socket, response } = Deno.upgradeWebSocket(request);
       socket.onmessage = (event) => {
         const frame = JSON.parse(String(event.data));
@@ -135,12 +157,16 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
     return json({ error: "Unexpected fixture API request" }, 404);
   }
   const relative = normalize(url.pathname.replace(/^\/+/, "") || "index.html");
-  if (relative.startsWith("..")) return new Response("not found", { status: 404 });
+  if (relative.startsWith("..")) {
+    return new Response("not found", { status: 404 });
+  }
   let file = join(buildRoot, relative);
   try {
     if ((await Deno.stat(file)).isDirectory) file = join(file, "index.html");
     return new Response(await Deno.readFile(file), {
-      headers: { "content-type": mime[extname(file)] ?? "application/octet-stream" },
+      headers: {
+        "content-type": mime[extname(file)] ?? "application/octet-stream",
+      },
     });
   } catch {
     return new Response(await Deno.readFile(join(buildRoot, "index.html")), {

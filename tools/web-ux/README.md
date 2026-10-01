@@ -198,6 +198,16 @@ Home browser regression (`browser-tests/workspace_home_shell_test.ts`, included 
 also checks 320px, both themes, keyboard record navigation, bounded loading, independent slow/error
 feeds, explicit refresh, and absence of Host requests.
 
+## Workspace Identity settings fixture
+
+`scenarios/workspace-settings.json` uses the same owned fixture server with synthetic metadata,
+public identity, and deletion-preflight responses. It covers owner, member, long name, pending
+provisioning, and intentional signing-identity HTTP503 states at 1440px, 768px, and 390px.
+Build `web/workspace` before capture. No real keys, accounts, or deletion requests are used.
+`browser-tests/workspace_settings_shell_test.ts` also checks 320px and both themes, Edit/Save/Cancel,
+keyboard disclosure/focus return, full public bundle access, scoped errors, and exact-name deletion
+confirmation. Interaction screenshots are saved under `target/web-ux/settings-interactions`.
+
 ## Adding a scenario
 
 1. Name the concrete user task and expected data state; do not write “looks correct”.

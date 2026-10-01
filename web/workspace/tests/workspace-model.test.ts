@@ -313,11 +313,11 @@ Deno.test("Workspace deletion DTOs fail closed and preserve durable operation st
 });
 
 Deno.test("Workspace settings exposes owner-gated typed destructive confirmation", async () => {
-  const source = await Deno.readTextFile(
-    new URL(
-      "../src/routes/w/[workspaceId]/settings/+page.svelte",
-      import.meta.url,
-    ),
+  const source = (await Promise.all([
+    "../src/routes/w/[workspaceId]/settings/+page.svelte",
+    "../src/lib/workspace/settings/WorkspaceIdentitySettings.svelte",
+  ].map((path) => Deno.readTextFile(new URL(path, import.meta.url))))).join(
+    "\n",
   );
   for (
     const token of [
