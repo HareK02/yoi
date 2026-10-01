@@ -407,6 +407,10 @@ impl PromptCatalog {
         self.render_name(key, Value::from_serialize(context))
     }
 
+    pub fn ticket_item_checker(&self) -> Result<String, CatalogError> {
+        self.render_name("internal.ticket_item_checker", Value::UNDEFINED)
+    }
+
     pub fn orchestrator_queue_attention(
         &self,
         prompt: OrchestratorQueueAttentionPrompt,
@@ -692,6 +696,22 @@ mod tests {
                 .templates
                 .contains_key("worker.ticket_event_companion_notice")
         );
+    }
+
+    #[test]
+    fn ticket_item_checker_prompt_keeps_text_only_scope_and_output_contract_separate() {
+        let prompt = PromptCatalog::builtins_only()
+            .unwrap()
+            .ticket_item_checker()
+            .unwrap();
+        assert!(prompt.contains("writer_scope"));
+        assert!(prompt.contains("internal_inconsistency"));
+        assert!(prompt.contains("ambiguous_boundary"));
+        assert!(prompt.contains("Production deployment requires approval"));
+        assert!(prompt.contains("not a finding merely"));
+        assert!(prompt.contains("background, quotations, and bug examples"));
+        assert!(prompt.contains("Do not infer user intent"));
+        assert!(prompt.contains("SubmitBackendJobResult"));
     }
 
     #[test]

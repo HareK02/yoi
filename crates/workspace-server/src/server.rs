@@ -146,7 +146,7 @@ use crate::authority::{
 use crate::backend_job::{
     ABSOLUTE_MAX_CONCURRENT_JOBS, BackendJobAttemptState, BackendJobDeliveryState,
     BackendJobRequest, BackendJobReservation, BackendJobResultAcceptance,
-    BackendJobResultSubmission, BackendJobState, allocation_key,
+    BackendJobResultSubmission, BackendJobState, MAX_JOB_DELIVERY_BYTES, allocation_key,
 };
 use crate::companion::{
     CompanionCancelRequest, CompanionConsole, CompanionMessageRequest, CompanionMessageResponse,
@@ -206,6 +206,7 @@ use crate::store::{
     WorkspaceRuntimeBinding, WorkspaceRuntimeBindingAuditRecord, WorkspaceRuntimeBindingMutation,
     WorkspaceRuntimeBindingState as StoredRuntimeBindingState,
 };
+use crate::ticket_item_checker::{self, TicketItemCheckBodyReplacement, TicketItemCheckEdit};
 use crate::workdir_removal::{
     WorkdirRemovalAttemptOwner, WorkdirRemovalDisposition, WorkdirRemovalOperation,
     WorkdirRemovalOperationState, workdir_removal_intent,
@@ -3654,6 +3655,49 @@ impl WorkspaceApi {
         submission: &BackendJobResultSubmission,
     ) -> Result<BackendJobResultAcceptance> {
         let accepted_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        if let Some(job) = self
+            .store
+            .get_backend_job(&self.config.workspace_id, &submission.job_id)?
+            && job.request.purpose == ticket_item_checker::PURPOSE
+        {
+            let attempt = self
+                .store
+                .get_backend_job_attempt(
+                    &self.config.workspace_id,
+                    &submission.job_id,
+                    &submission.attempt_id,
+                )?
+                .ok_or_else(|| Error::InvalidInput("unknown Backend Job attempt".to_string()))?;
+            if !matches!(
+                attempt.state,
+                BackendJobAttemptState::Dispatched | BackendJobAttemptState::Completed
+            ) || attempt.worker.as_ref() != Some(source_worker)
+                || attempt.input_revision != submission.input_revision
+                || job.current_attempt != attempt.attempt
+            {
+                return Err(Error::InvalidInput(
+                    "Ticket item checker result does not match the active fenced attempt"
+                        .to_string(),
+                ));
+            }
+            if let Err(error) =
+                ticket_item_checker::validate_result(&job.request.input, &submission.result)
+            {
+                let detail = error.to_string();
+                if attempt.state == BackendJobAttemptState::Dispatched {
+                    self.store.finish_backend_job_attempt(
+                        &self.config.workspace_id,
+                        &submission.job_id,
+                        &submission.attempt_id,
+                        BackendJobAttemptState::Failed,
+                        "invalid_result",
+                        &detail,
+                        &accepted_at,
+                    )?;
+                }
+                return Err(error);
+            }
+        }
         let acceptance = self.store.accept_backend_job_result(
             &self.config.workspace_id,
             source_worker,
@@ -3688,17 +3732,106 @@ impl WorkspaceApi {
         if !claimed || delivery.state != BackendJobDeliveryState::Sending {
             return;
         }
-        let content = format!(
-            "Backend Job `{}` completed attempt `{}` for `{}`. Durable result digest: {}.",
-            acceptance.job.request.job_id,
-            acceptance.attempt.attempt_id,
-            acceptance.job.request.purpose,
-            acceptance
-                .job
-                .result_digest
-                .as_deref()
-                .unwrap_or("unavailable")
-        );
+
+        let content = if acceptance.job.request.purpose == ticket_item_checker::PURPOSE {
+            let checker_input =
+                match ticket_item_checker::parse_input(&acceptance.job.request.input) {
+                    Ok(input) => input,
+                    Err(error) => {
+                        let _ = self.store.finish_backend_job_delivery(
+                            &self.config.workspace_id,
+                            &delivery_id,
+                            BackendJobDeliveryState::Failed,
+                            Some("invalid_checker_input"),
+                            Some(&error.to_string()),
+                            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                        );
+                        return;
+                    }
+                };
+            let current_ticket = match browser_ticket_backend(self).and_then(|backend| {
+                backend
+                    .show(checker_input.ticket_id.clone().into())
+                    .map_err(Error::from)
+            }) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    let _ = self.store.finish_backend_job_delivery(
+                        &self.config.workspace_id,
+                        &delivery_id,
+                        BackendJobDeliveryState::Failed,
+                        Some("current_revision_unavailable"),
+                        Some(&error.to_string()),
+                        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    );
+                    return;
+                }
+            };
+            match ticket_item_checker::notification(acceptance, &current_ticket) {
+                Ok(ticket_item_checker::TicketItemCheckNotification::Deliver(content)) => content,
+                Ok(ticket_item_checker::TicketItemCheckNotification::NoFindings) => {
+                    let _ = self.store.finish_backend_job_delivery(
+                        &self.config.workspace_id,
+                        &delivery_id,
+                        BackendJobDeliveryState::Completed,
+                        Some("notification_suppressed_no_findings"),
+                        None,
+                        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    );
+                    return;
+                }
+                Ok(ticket_item_checker::TicketItemCheckNotification::Stale) => {
+                    let detail = format!(
+                        "checked revision {} is no longer current ({})",
+                        checker_input.revision,
+                        ticket_item_checker::item_revision(&current_ticket)
+                    );
+                    let _ = self.store.finish_backend_job_delivery(
+                        &self.config.workspace_id,
+                        &delivery_id,
+                        BackendJobDeliveryState::Completed,
+                        Some("notification_suppressed_stale_revision"),
+                        Some(&detail),
+                        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    );
+                    return;
+                }
+                Err(error) => {
+                    let _ = self.store.finish_backend_job_delivery(
+                        &self.config.workspace_id,
+                        &delivery_id,
+                        BackendJobDeliveryState::Failed,
+                        Some("invalid_checker_result"),
+                        Some(&error.to_string()),
+                        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    );
+                    return;
+                }
+            }
+        } else {
+            format!(
+                "Backend Job `{}` completed attempt `{}` for `{}`. Durable result digest: {}.",
+                acceptance.job.request.job_id,
+                acceptance.attempt.attempt_id,
+                acceptance.job.request.purpose,
+                acceptance
+                    .job
+                    .result_digest
+                    .as_deref()
+                    .unwrap_or("unavailable")
+            )
+        };
+        if content.len() > MAX_JOB_DELIVERY_BYTES {
+            let _ = self.store.finish_backend_job_delivery(
+                &self.config.workspace_id,
+                &delivery_id,
+                BackendJobDeliveryState::Failed,
+                Some("notification_too_large"),
+                Some("Backend Job notification content exceeded its configured byte limit"),
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            );
+            return;
+        }
         let delivery_result = self.runtime.send_input(
             target,
             WorkerInputRequest {
@@ -12116,6 +12249,99 @@ fn validate_ticket_operation_repository_keys(
     }
 }
 
+fn ticket_item_check_edit(
+    operation: &TicketBackendOperation,
+    before: Option<&ticket::Ticket>,
+) -> Option<TicketItemCheckEdit> {
+    match operation {
+        TicketBackendOperation::Create { .. } => Some(TicketItemCheckEdit::Create),
+        TicketBackendOperation::EditItem { edit, .. } => Some(TicketItemCheckEdit::Edit {
+            title_changed: edit.title.is_some(),
+            body_changed: edit.body.is_some() || edit.body_replacement.is_some(),
+            previous_title: edit
+                .title
+                .as_ref()
+                .and_then(|_| before.map(|ticket| ticket.meta.title.clone())),
+            previous_body: (edit.body.is_some() || edit.body_replacement.is_some())
+                .then(|| before.map(|ticket| ticket.document.body.as_str().to_string()))
+                .flatten(),
+            body_replacement: edit.body_replacement.as_ref().map(|replacement| {
+                TicketItemCheckBodyReplacement {
+                    old_string: replacement.old_string.clone(),
+                    new_string: replacement.new_string.clone(),
+                    replace_all: replacement.replace_all,
+                }
+            }),
+        }),
+        _ => None,
+    }
+}
+
+fn ticket_item_checker_instruction(api: &WorkspaceApi) -> Result<String> {
+    let config_state = api
+        .config_store
+        .load_workspace_config(&api.config.workspace_id)?
+        .ok_or_else(|| Error::Config("Workspace config is unavailable".to_string()))?;
+    let projection = api
+        .prompt_projection_cache
+        .resolve(&api.config.workspace_id, &config_state)
+        .map_err(|error| Error::Config(format!("resolve Ticket item checker Prompt: {error}")))?;
+    let catalog = worker::PromptCatalog::from_projection(projection.catalog().clone())
+        .map_err(|error| Error::Config(format!("load Ticket item checker Prompt: {error}")))?;
+    catalog
+        .ticket_item_checker()
+        .map_err(|error| Error::Config(format!("render Ticket item checker Prompt: {error}")))
+}
+
+fn schedule_ticket_item_check(
+    api: &WorkspaceApi,
+    ticket: &ticket::Ticket,
+    edit: TicketItemCheckEdit,
+    source_worker: RuntimeWorkerRef,
+) {
+    let request = ticket_item_checker_instruction(api).and_then(|instruction| {
+        ticket_item_checker::request(ticket, edit, source_worker, instruction)
+    });
+    let request = match request {
+        Ok(request) => request,
+        Err(error) => {
+            tracing::warn!(
+                ticket_id = %ticket.meta.id,
+                %error,
+                "Ticket item was saved but its asynchronous checker could not be prepared"
+            );
+            return;
+        }
+    };
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+    let reservation = match api
+        .store
+        .reserve_backend_job(&api.config.workspace_id, &request, &now)
+    {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            tracing::warn!(
+                ticket_id = %ticket.meta.id,
+                revision = %request.input_revision,
+                %error,
+                "Ticket item was saved but its asynchronous checker could not be reserved"
+            );
+            return;
+        }
+    };
+    let api = api.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) = api.dispatch_backend_job_reservation(reservation) {
+            tracing::warn!(
+                job_id = %request.job_id,
+                ticket_revision = %request.input_revision,
+                %error,
+                "asynchronous Ticket item checker dispatch failed"
+            );
+        }
+    });
+}
+
 async fn execute_ticket_rest_operation(
     api: &WorkspaceApi,
     workspace_id: &str,
@@ -12142,6 +12368,10 @@ async fn execute_ticket_rest_operation(
     reject_unguarded_ticket_completion(&operation)?;
     validate_ticket_repository_operation(api, &operation)?;
     let before = target.as_ref().and_then(|id| backend.show(id.clone()).ok());
+    let ticket_item_check = source
+        .as_ref()
+        .cloned()
+        .zip(ticket_item_check_edit(&operation, before.as_ref()));
     let previous_state = before
         .as_ref()
         .map(|ticket| ticket.meta.workflow_state.as_str().to_string())
@@ -12247,8 +12477,25 @@ async fn execute_ticket_rest_operation(
                 &ticket.meta.id,
                 &previous_state,
                 ticket.meta.workflow_state.as_str(),
-                source,
+                source.clone(),
             );
+        }
+    }
+    if let Some((source_worker, edit)) = ticket_item_check {
+        let checked_ticket_id = match &result {
+            TicketBackendOperationResult::TicketRef(ticket) => Some(ticket.id.clone()),
+            TicketBackendOperationResult::Ticket(ticket) => Some(ticket.meta.id.clone()),
+            _ => None,
+        };
+        if let Some(ticket_id) = checked_ticket_id {
+            match backend.show(ticket_id.clone().into()) {
+                Ok(ticket) => schedule_ticket_item_check(api, &ticket, edit, source_worker),
+                Err(error) => tracing::warn!(
+                    %ticket_id,
+                    %error,
+                    "Ticket item was saved but could not be reloaded for asynchronous checking"
+                ),
+            }
         }
     }
     Ok(result)
@@ -34021,6 +34268,402 @@ mod tests {
             default_selector: Some("HEAD".to_string()),
         }];
         config
+    }
+
+    fn spawn_ticket_check_source(api: &WorkspaceApi, name: &str) -> RuntimeWorkerRef {
+        api.spawn_workspace_worker(
+            EMBEDDED_WORKER_RUNTIME_ID,
+            WorkerSpawnRequest {
+                requested_worker_name: Some(name.to_string()),
+                intent: WorkerSpawnIntent::WorkspaceCompanion,
+                acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                    expected_segments: 0,
+                },
+                profile: ProfileSelector::Builtin("builtin:companion".to_string()),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachments: Vec::new(),
+                resolved_config_bundle: None,
+                resolved_worker_observation_enabled: false,
+                resolved_worker_observation_grants: Vec::new(),
+                resolved_workspace_api: None,
+                resolved_memory_settings: None,
+                resolved_control_operation: None,
+            },
+        )
+        .unwrap()
+        .worker
+        .unwrap()
+        .worker
+    }
+
+    fn ticket_check_headers(worker: &RuntimeWorkerRef) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-yoi-runtime-id",
+            axum::http::HeaderValue::from_str(&worker.runtime_id).unwrap(),
+        );
+        headers.insert(
+            "x-yoi-worker-id",
+            axum::http::HeaderValue::from_str(&worker.worker_id).unwrap(),
+        );
+        headers
+    }
+
+    fn ticket_check_job(
+        api: &WorkspaceApi,
+        ticket_id: &str,
+    ) -> crate::backend_job::BackendJobRecord {
+        let ticket = browser_ticket_backend(api)
+            .unwrap()
+            .show(ticket_id.to_string().into())
+            .unwrap();
+        let revision = ticket_item_checker::item_revision(&ticket);
+        api.store
+            .get_backend_job(
+                TEST_WORKSPACE_ID,
+                &format!("ticket-item-check:{ticket_id}:{revision}"),
+            )
+            .unwrap()
+            .expect("Ticket item checker Job was reserved after save")
+    }
+
+    async fn wait_for_ticket_check_attempt(
+        api: &WorkspaceApi,
+        job: &crate::backend_job::BackendJobRecord,
+    ) -> crate::backend_job::BackendJobAttemptRecord {
+        let attempt_id = crate::backend_job::attempt_id(&job.request.job_id, job.current_attempt);
+        for _ in 0..100 {
+            let attempt = api
+                .store
+                .get_backend_job_attempt(TEST_WORKSPACE_ID, &job.request.job_id, &attempt_id)
+                .unwrap()
+                .unwrap();
+            if attempt.state != BackendJobAttemptState::Reserved {
+                return attempt;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("Ticket item checker attempt remained reserved")
+    }
+
+    #[tokio::test]
+    async fn worker_ticket_create_returns_before_checker_and_delivers_grounded_advisory() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        let source = spawn_ticket_check_source(&api, "ticket-check-author");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        execution.before_input_returns(move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        let mut input = ticket::NewTicket::new("Post-save check");
+        input.body = MarkdownText::new(
+            "This turn only creates the Ticket; I will not implement it. Production deployment requires approval.",
+        );
+        let Json(result) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            execute_worker_ticket_test_operation(
+                State(api.clone()),
+                AxumPath(ScopedWorkspacePath {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                }),
+                ticket_check_headers(&source),
+                Json(TicketBackendOperation::Create { input }),
+            ),
+        )
+        .await
+        .expect("Ticket save must not wait for the checker model")
+        .unwrap();
+        let TicketBackendOperationResult::TicketRef(ticket_ref) = result else {
+            panic!("unexpected Ticket create result")
+        };
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("checker dispatch reached the held fake model");
+        let job = ticket_check_job(&api, &ticket_ref.id);
+        let checker_input = ticket_item_checker::parse_input(&job.request.input).unwrap();
+        assert_eq!(
+            checker_input.ticket_resource_key,
+            ticket_ref.resource_key.unwrap()
+        );
+        assert_eq!(checker_input.title, "Post-save check");
+        assert_eq!(
+            checker_input.body,
+            "This turn only creates the Ticket; I will not implement it. Production deployment requires approval."
+        );
+        assert_eq!(checker_input.revision, job.request.input_revision);
+        assert_eq!(job.request.source_worker.as_ref(), Some(&source));
+        assert_eq!(job.request.notification_target.as_ref(), Some(&source));
+        assert_eq!(job.request.limits.max_attempts, 1);
+        assert_eq!(job.request.limits.timeout_seconds, 45);
+        assert!(job.request.instruction.contains("Do not infer user intent"));
+        let dispatched_inputs = execution.take_inputs();
+        assert_eq!(dispatched_inputs.len(), 1);
+        assert!(dispatched_inputs[0].1.contains(&checker_input.revision));
+
+        release_tx.send(()).unwrap();
+        let attempt = wait_for_ticket_check_attempt(&api, &job).await;
+        assert_eq!(attempt.state, BackendJobAttemptState::Dispatched);
+        let worker = attempt.worker.clone().unwrap();
+        let submission = BackendJobResultSubmission {
+            job_id: job.request.job_id.clone(),
+            attempt_id: attempt.attempt_id.clone(),
+            input_revision: job.request.input_revision.clone(),
+            result: serde_json::json!({"findings": [{
+                "category": "writer_scope",
+                "quote": "I will not implement it",
+                "reason": "The writer's current-turn boundary appears as a durable requirement.",
+                "suggestion": "Remove the writer-specific boundary from the active requirements."
+            }]}),
+        };
+        let accepted = api.accept_backend_job_result(&worker, &submission).unwrap();
+        assert_eq!(accepted.job.state, BackendJobState::Completed);
+        let notifications = execution.take_inputs();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].0.worker_id.to_string(), source.worker_id);
+        assert!(
+            notifications[0]
+                .1
+                .contains("[Ticket item checker advisory]")
+        );
+        assert!(notifications[0].1.contains(&checker_input.revision));
+        assert!(notifications[0].1.contains("I will not implement it"));
+        assert!(notifications[0].1.contains("not a new user request"));
+        assert!(
+            !notifications[0]
+                .1
+                .contains("Production deployment requires approval")
+        );
+
+        let replay = api.accept_backend_job_result(&worker, &submission).unwrap();
+        assert!(replay.replayed);
+        assert!(execution.take_inputs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ticket_checker_suppresses_stale_and_clean_results_and_diagnoses_invalid_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        let source = spawn_ticket_check_source(&api, "ticket-check-editor");
+        let backend = browser_ticket_backend(&api).unwrap();
+        let ticket_ref = backend
+            .create(ticket::NewTicket::new("Checker revision fencing"))
+            .unwrap();
+
+        let edit = |body: &str| TicketBackendOperation::EditItem {
+            id: ticket_ref.id.clone().into(),
+            edit: TicketItemEdit {
+                body: Some(MarkdownText::new(body)),
+                ..Default::default()
+            },
+        };
+        let Json(_) = execute_worker_ticket_test_operation(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            ticket_check_headers(&source),
+            Json(edit("I will not implement this Ticket.")),
+        )
+        .await
+        .unwrap();
+        let stale_job = ticket_check_job(&api, &ticket_ref.id);
+        let stale_attempt = wait_for_ticket_check_attempt(&api, &stale_job).await;
+
+        let Json(_) = execute_worker_ticket_test_operation(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            ticket_check_headers(&source),
+            Json(edit("Production deployment requires approval.")),
+        )
+        .await
+        .unwrap();
+        let current_job = ticket_check_job(&api, &ticket_ref.id);
+        let current_attempt = wait_for_ticket_check_attempt(&api, &current_job).await;
+        execution.take_inputs();
+
+        api.accept_backend_job_result(
+            stale_attempt.worker.as_ref().unwrap(),
+            &BackendJobResultSubmission {
+                job_id: stale_job.request.job_id.clone(),
+                attempt_id: stale_attempt.attempt_id.clone(),
+                input_revision: stale_job.request.input_revision.clone(),
+                result: serde_json::json!({"findings": [{
+                    "category": "writer_scope",
+                    "quote": "I will not implement this Ticket",
+                    "reason": "Writer scope is mixed into requirements.",
+                    "suggestion": "Remove the writer-specific sentence."
+                }]}),
+            },
+        )
+        .unwrap();
+        assert!(execution.take_inputs().is_empty());
+        let stale_delivery_id =
+            crate::backend_job::delivery_id(&stale_job.request.job_id, &stale_attempt.attempt_id);
+        let (stale_delivery, claimed) = api
+            .store
+            .reserve_backend_job_delivery(
+                TEST_WORKSPACE_ID,
+                &stale_delivery_id,
+                &stale_job.request.job_id,
+                &source,
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+        assert!(!claimed);
+        assert_eq!(stale_delivery.state, BackendJobDeliveryState::Completed);
+        assert_eq!(
+            stale_delivery.failure_category.as_deref(),
+            Some("notification_suppressed_stale_revision")
+        );
+
+        api.accept_backend_job_result(
+            current_attempt.worker.as_ref().unwrap(),
+            &BackendJobResultSubmission {
+                job_id: current_job.request.job_id.clone(),
+                attempt_id: current_attempt.attempt_id.clone(),
+                input_revision: current_job.request.input_revision.clone(),
+                result: serde_json::json!({"findings": []}),
+            },
+        )
+        .unwrap();
+        assert!(execution.take_inputs().is_empty());
+        let clean_delivery_id = crate::backend_job::delivery_id(
+            &current_job.request.job_id,
+            &current_attempt.attempt_id,
+        );
+        let (clean_delivery, claimed) = api
+            .store
+            .reserve_backend_job_delivery(
+                TEST_WORKSPACE_ID,
+                &clean_delivery_id,
+                &current_job.request.job_id,
+                &source,
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+        assert!(!claimed);
+        assert_eq!(
+            clean_delivery.failure_category.as_deref(),
+            Some("notification_suppressed_no_findings")
+        );
+
+        let Json(_) = execute_worker_ticket_test_operation(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            ticket_check_headers(&source),
+            Json(edit("A final exact body.")),
+        )
+        .await
+        .unwrap();
+        let invalid_job = ticket_check_job(&api, &ticket_ref.id);
+        let invalid_attempt = wait_for_ticket_check_attempt(&api, &invalid_job).await;
+        assert!(
+            api.accept_backend_job_result(
+                invalid_attempt.worker.as_ref().unwrap(),
+                &BackendJobResultSubmission {
+                    job_id: invalid_job.request.job_id.clone(),
+                    attempt_id: invalid_attempt.attempt_id.clone(),
+                    input_revision: invalid_job.request.input_revision.clone(),
+                    result: serde_json::json!({"findings": [{
+                        "category": "internal_inconsistency",
+                        "quote": "invented quote",
+                        "reason": "Not grounded.",
+                        "suggestion": "No action."
+                    }]}),
+                },
+            )
+            .is_err()
+        );
+        let failed = api
+            .store
+            .get_backend_job_attempt(
+                TEST_WORKSPACE_ID,
+                &invalid_job.request.job_id,
+                &invalid_attempt.attempt_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.state, BackendJobAttemptState::Failed);
+        assert_eq!(failed.failure_category.as_deref(), Some("invalid_result"));
+        assert!(
+            execution
+                .take_inputs()
+                .iter()
+                .all(|(_, content)| { !content.contains("[Ticket item checker advisory]") })
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_and_failed_ticket_edits_do_not_claim_checker_coverage() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        let source = spawn_ticket_check_source(&api, "ticket-check-failure-source");
+        let ticket_ref = browser_ticket_backend(&api)
+            .unwrap()
+            .create(ticket::NewTicket::new("Browser edit coverage"))
+            .unwrap();
+        let Json(_) = scoped_edit_ticket_item(
+            State(api.clone()),
+            AxumPath(ScopedRecordPath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                id: ticket_ref.id.clone(),
+            }),
+            Json(server_api::BrowserEditTicketRequest {
+                title: None,
+                body: Some("Edited directly in the browser.".to_string()),
+                old_string: None,
+                new_string: None,
+                replace_all: false,
+                target: None,
+                author: Some("browser-user".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        let browser_ticket = browser_ticket_backend(&api)
+            .unwrap()
+            .show(ticket_ref.id.clone().into())
+            .unwrap();
+        let browser_revision = ticket_item_checker::item_revision(&browser_ticket);
+        assert!(
+            api.store
+                .get_backend_job(
+                    TEST_WORKSPACE_ID,
+                    &format!("ticket-item-check:{}:{browser_revision}", ticket_ref.id),
+                )
+                .unwrap()
+                .is_none(),
+            "direct browser edits are explicitly outside the Worker advisory path"
+        );
+
+        let failed = execute_worker_ticket_test_operation(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            ticket_check_headers(&source),
+            Json(TicketBackendOperation::EditItem {
+                id: "missing-ticket".into(),
+                edit: TicketItemEdit {
+                    body: Some(MarkdownText::new("must not be checked")),
+                    ..Default::default()
+                },
+            }),
+        )
+        .await;
+        assert!(failed.is_err());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(execution.take_inputs().is_empty());
     }
 
     #[tokio::test]
