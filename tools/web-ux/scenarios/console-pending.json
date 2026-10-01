@@ -1,0 +1,137 @@
+{
+  "schemaVersion": 1,
+  "id": "console-pending",
+  "title": "Console pending inputs and notifications",
+  "baseUrl": "http://127.0.0.1:15283",
+  "colorScheme": "light",
+  "reducedMotion": "reduce",
+  "personas": [
+    {
+      "id": "fixture",
+      "label": "Retained Console fixture",
+      "auth": {
+        "kind": "anonymous"
+      }
+    }
+  ],
+  "viewports": [
+    {
+      "label": "desktop",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "label": "narrow",
+      "width": 768,
+      "height": 900
+    },
+    {
+      "label": "mobile",
+      "width": 390,
+      "height": 844
+    }
+  ],
+  "routes": [
+    {
+      "id": "both",
+      "label": "both",
+      "path": "/w/console-history-review/workers/W-900-console-fixture/console?pending=both",
+      "goal": "Only populated scopes appear; headings and previews match Tasks typography and row height.",
+      "dataState": "Synthetic retained Console: both; two long/short previews when present; one task. Cancellation is unavailable on retained sessions.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".task-mini-row"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Pending input layout"
+        }
+      ]
+    },
+    {
+      "id": "queue",
+      "label": "queue",
+      "path": "/w/console-history-review/workers/W-900-console-fixture/console?pending=queue",
+      "goal": "Only populated scopes appear; headings and previews match Tasks typography and row height.",
+      "dataState": "Synthetic retained Console: queue; two long/short previews when present; one task. Cancellation is unavailable on retained sessions.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".task-mini-row"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Pending input layout"
+        }
+      ]
+    },
+    {
+      "id": "notifications",
+      "label": "notifications",
+      "path": "/w/console-history-review/workers/W-900-console-fixture/console?pending=notifications",
+      "goal": "Only populated scopes appear; headings and previews match Tasks typography and row height.",
+      "dataState": "Synthetic retained Console: notifications; two long/short previews when present; one task. Cancellation is unavailable on retained sessions.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".task-mini-row"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Pending input layout"
+        }
+      ]
+    },
+    {
+      "id": "legacy",
+      "label": "legacy",
+      "path": "/w/console-history-review/workers/W-900-console-fixture/console?pending=legacy",
+      "goal": "Only populated scopes appear; headings and previews match Tasks typography and row height.",
+      "dataState": "Synthetic retained Console: legacy; two long/short previews when present; one task. Cancellation is unavailable on retained sessions.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".task-mini-row"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Pending input layout"
+        }
+      ]
+    },
+    {
+      "id": "empty",
+      "label": "empty",
+      "path": "/w/console-history-review/workers/W-900-console-fixture/console?pending=empty",
+      "goal": "Only populated scopes appear; headings and previews match Tasks typography and row height.",
+      "dataState": "Synthetic retained Console: empty; two long/short previews when present; one task. Cancellation is unavailable on retained sessions.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".task-mini-row"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Pending input layout"
+        }
+      ]
+    }
+  ],
+  "processes": [
+    {
+      "id": "console-fixture",
+      "command": "deno",
+      "cwd": "..",
+      "args": [
+        "run",
+        "--allow-net",
+        "--allow-read",
+        "browser-tests/console_history_fixture_server.ts",
+        "15283",
+        "../../web/workspace/build"
+      ],
+      "readyUrl": "http://127.0.0.1:15283/health"
+    }
+  ]
+}

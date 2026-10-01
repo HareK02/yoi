@@ -696,6 +696,8 @@ pub struct WorkerLifecycleResult {
 #[serde(rename_all = "snake_case")]
 pub enum WorkerInputKind {
     User,
+    /// Agent input that must never enter the human Submit queue.
+    UserIfIdle,
     Notify,
     Compact,
     ListRewindTargets,
@@ -3037,6 +3039,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         let input = EmbeddedWorkerInput {
             kind: match request.kind {
                 WorkerInputKind::User => EmbeddedWorkerInputKind::User,
+                WorkerInputKind::UserIfIdle => EmbeddedWorkerInputKind::UserIfIdle,
                 WorkerInputKind::Notify => EmbeddedWorkerInputKind::Notify,
                 WorkerInputKind::Compact => EmbeddedWorkerInputKind::Compact,
                 WorkerInputKind::ListRewindTargets => EmbeddedWorkerInputKind::ListRewindTargets,
@@ -5028,6 +5031,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         let input = EmbeddedWorkerInput {
             kind: match request.kind {
                 WorkerInputKind::User => EmbeddedWorkerInputKind::User,
+                WorkerInputKind::UserIfIdle => EmbeddedWorkerInputKind::UserIfIdle,
                 WorkerInputKind::Notify => EmbeddedWorkerInputKind::Notify,
                 WorkerInputKind::Compact => EmbeddedWorkerInputKind::Compact,
                 WorkerInputKind::ListRewindTargets => EmbeddedWorkerInputKind::ListRewindTargets,
@@ -6335,6 +6339,28 @@ mod tests {
             .expect("resolve project profile archive");
         assert_eq!(delivered.reference, archive.reference);
         assert_eq!(delivered.content, archive.content);
+    }
+
+    #[test]
+    fn runtime_input_contract_preserves_every_input_kind() {
+        for kind in [
+            EmbeddedWorkerInputKind::User,
+            EmbeddedWorkerInputKind::UserIfIdle,
+            EmbeddedWorkerInputKind::Notify,
+            EmbeddedWorkerInputKind::Compact,
+            EmbeddedWorkerInputKind::ListRewindTargets,
+            EmbeddedWorkerInputKind::RegisterPeer,
+        ] {
+            let input = EmbeddedWorkerInput {
+                kind,
+                content: "contract test".to_string(),
+                submission_request_id: Some("contract-request".to_string()),
+                segments: Some(vec![protocol::Segment::text("contract test")]),
+            };
+            let wire: runtime_api::WorkerInput = runtime_contract_convert(input.clone()).unwrap();
+            let decoded: EmbeddedWorkerInput = runtime_contract_convert(wire).unwrap();
+            assert_eq!(decoded, input);
+        }
     }
 
     #[test]

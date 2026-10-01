@@ -2895,6 +2895,97 @@ async fn drain_until<F: FnMut(&Event) -> bool>(
     }
 }
 
+fn idle_only_input(request_id: &str) -> Method {
+    Method::SubmitIfIdle {
+        submission_request_id: request_id.to_string(),
+        input: vec![protocol::Segment::text(request_id)],
+        source: protocol::AuthenticatedInputSource::Backend {
+            operation_id: request_id.to_string(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn idle_only_submit_rejects_admission_race_and_paused_without_persisting() {
+    let client = MockClient::sequential(vec![MockResponse::Hang(vec![
+        LlmEvent::text_block_start(0),
+        LlmEvent::text_delta(0, "partial"),
+    ])]);
+    let handle = spawn_controller(make_worker(client.clone()).await).await;
+    let mut rx = handle.subscribe();
+    assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Idle);
+    // Both callers can observe Idle. Admission of the first request must make
+    // the second fail rather than silently scheduling a later turn.
+    handle.send(idle_only_input("first-idle")).await.unwrap();
+    handle.send(idle_only_input("racing-input")).await.unwrap();
+    let mut accepted_first = false;
+    assert!(
+        drain_until(&mut rx, std::time::Duration::from_secs(2), |event| {
+            match event {
+                Event::SubmissionAccepted {
+                    submission_request_id,
+                    ..
+                } => {
+                    assert_eq!(submission_request_id, "first-idle");
+                    accepted_first = true;
+                    false
+                }
+                Event::SubmissionRejected {
+                    submission_request_id,
+                    message,
+                } => {
+                    assert_eq!(submission_request_id, "racing-input");
+                    assert!(message.contains("WorkerNotify"));
+                    true
+                }
+                _ => false,
+            }
+        })
+        .await
+    );
+    assert!(accepted_first);
+    wait_for_status(&handle, WorkerStatus::Running).await;
+    handle
+        .send(Method::Pause {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
+    wait_for_status(&handle, WorkerStatus::Paused).await;
+    handle.send(idle_only_input("paused-input")).await.unwrap();
+    assert!(
+        drain_until(&mut rx, std::time::Duration::from_secs(2), |event| {
+            matches!(event, Event::SubmissionRejected { submission_request_id, message }
+            if submission_request_id == "paused-input" && message.contains("WorkerNotify"))
+        })
+        .await
+    );
+    assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Paused);
+    handle.send(Method::ListPendingSubmissions).await.unwrap();
+    assert!(
+        drain_until(&mut rx, std::time::Duration::from_secs(2), |event| {
+            if let Event::PendingSubmissionsChanged { pending } = event {
+                assert!(pending.submissions.is_empty());
+                true
+            } else {
+                false
+            }
+        })
+        .await
+    );
+    assert_eq!(client.captured_requests().len(), 1);
+    let entries = serde_json::to_string(&handle.committed_entries()).unwrap();
+    assert!(!entries.contains("racing-input"));
+    assert!(!entries.contains("paused-input"));
+    handle
+        .send(Method::Cancel {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
+    wait_for_status(&handle, WorkerStatus::Idle).await;
+}
+
 /// Paused → Running → Idle. A notification accepted while Paused must not
 /// auto-resume the Worker, and explicit Resume must inject it while preserving
 /// the interrupted turn's history consistency.

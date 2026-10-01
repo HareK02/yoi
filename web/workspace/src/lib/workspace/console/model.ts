@@ -1287,15 +1287,19 @@ function hasDurableRunFailure(
 function appendDurableRunFailure(
   projection: ConsoleProjection,
   eventId: string,
+  entryId: string | undefined,
   message: string,
   failure: string | undefined,
 ): void {
+  if (
+    entryId && projection.lines.some((line) => line.entryId === entryId)
+  ) return;
   projection.lines = projection.lines.filter((line) => {
     if (isDurableRunFailure(line)) return true;
     return !(line.kind === "error" && runFailureMessagesMatch(line.body, message));
   });
-  projection.lines.push(
-    line(
+  projection.lines.push({
+    ...line(
       eventId,
       "error",
       failure === "compaction" ? "Compaction failed" : "Run error",
@@ -1304,7 +1308,8 @@ function appendDurableRunFailure(
       false,
       true,
     ),
-  );
+    entryId,
+  });
 }
 
 function appendAlertLine(
@@ -2198,6 +2203,7 @@ function applySessionEntry(
       appendDurableRunFailure(
         projection,
         eventId,
+        stringField(value, "entry_id"),
         stringField(value, "message") ?? "Worker run failed.",
         stringField(value, "failure"),
       );
@@ -2208,7 +2214,10 @@ function applySessionEntry(
   const entryId = stringField(value, "entry_id");
   if (entryId) {
     for (
-      let index = Math.max(0, lineCountBefore - 1);
+      let index = Math.max(
+        0,
+        Math.min(lineCountBefore, projection.lines.length - 1),
+      );
       index < projection.lines.length;
       index += 1
     ) {

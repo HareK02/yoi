@@ -65,6 +65,14 @@ pub struct WorkerHandle {
 
 impl WorkerHandle {
     pub async fn send(&self, method: Method) -> Result<(), mpsc::error::SendError<Method>> {
+        // Reject known-busy sends before channel dispatch, including maintenance
+        // that cannot receive methods until it finishes. The controller checks
+        // again at admission to cover an Idle -> busy race after this snapshot.
+        if self.shared_state.snapshot().state != WorkerState::Idle
+            && reject_idle_only_submission(&method, &self.working_event_tx)
+        {
+            return Ok(());
+        }
         self.method_tx.send(method).await
     }
 
@@ -1551,6 +1559,21 @@ where
     }
 }
 
+fn reject_idle_only_submission(method: &Method, events: &broadcast::Sender<Event>) -> bool {
+    let Method::SubmitIfIdle {
+        submission_request_id,
+        ..
+    } = method
+    else {
+        return false;
+    };
+    let _ = events.send(Event::SubmissionRejected {
+        submission_request_id: submission_request_id.clone(),
+        message: "WorkerSendInput requires an Idle Worker and never queues input. Use WorkerNotify for information about work already in progress.".to_string(),
+    });
+    true
+}
+
 fn durably_accept_method_while_busy<St>(
     method: Method,
     pending_submissions: &PendingSubmissionHandle<St>,
@@ -1559,6 +1582,9 @@ fn durably_accept_method_while_busy<St>(
 where
     St: session_store::Store + Clone,
 {
+    if reject_idle_only_submission(&method, working_event_tx) {
+        return None;
+    }
     match method {
         Method::Submit {
             submission_request_id,
@@ -1666,6 +1692,10 @@ fn reject_method_while_attention_locked(
             ..
         }
         | Method::SubmitTracked {
+            submission_request_id,
+            ..
+        }
+        | Method::SubmitIfIdle {
             submission_request_id,
             ..
         } => {
@@ -1974,6 +2004,12 @@ async fn controller_loop<C, St>(
             }
         };
 
+        if shared_state.snapshot().state != WorkerState::Idle
+            && reject_idle_only_submission(&method, &working_event_tx)
+        {
+            continue;
+        }
+
         if worker.has_pending_compaction_cleanup() {
             match worker.retry_pending_compaction_cleanup().await {
                 Ok(()) => {
@@ -2057,6 +2093,11 @@ async fn controller_loop<C, St>(
                 }
             }
             Method::SubmitTracked {
+                submission_request_id,
+                input,
+                source,
+            }
+            | Method::SubmitIfIdle {
                 submission_request_id,
                 input,
                 source,
@@ -2446,7 +2487,9 @@ async fn controller_loop<C, St>(
                     )
                     .await;
                 }
-                if let Err(error) = result {
+                if let Err(error) = result
+                    && !matches!(&error, WorkerError::CompactCancelled)
+                {
                     let _ = working_event_tx.send(Event::Error {
                         code: worker_error_code(&error),
                         message: error.to_string(),
@@ -2870,11 +2913,7 @@ where
                         (WorkerStatus::Paused, shutdown_requested, false)
                     }
                     Err(e) => {
-                        let status = if matches!(
-                            &e,
-                            WorkerError::SegmentActivationIncomplete { .. }
-                                | WorkerError::CompactionCleanupPending { .. }
-                        ) {
+                        let status = if worker_error_requires_attention(&e) {
                             // Metadata has already committed the replacement, but
                             // one live authority failed to publish. Keep the
                             // controller visibly busy/fail-closed; publishing Idle
@@ -2883,20 +2922,22 @@ where
                         } else {
                             WorkerStatus::Idle
                         };
-                        let code = worker_error_code(&e);
-                        let message = e.to_string();
-                        let _ = working_event_tx.send(Event::Error {
-                            code,
-                            message: message.clone(),
-                        });
-                        if parent_originated {
-                            crate::ipc::event::fire_and_forget(
-                                parent_socket.cloned(),
-                                protocol::WorkerEvent::Errored {
-                                    worker_name: self_name.to_string(),
-                                    message,
-                                },
-                            );
+                        if !matches!(&e, WorkerError::RunFailureAlreadyDelivered { .. }) {
+                            let code = worker_error_code(&e);
+                            let message = e.to_string();
+                            let _ = working_event_tx.send(Event::Error {
+                                code,
+                                message: message.clone(),
+                            });
+                            if parent_originated {
+                                crate::ipc::event::fire_and_forget(
+                                    parent_socket.cloned(),
+                                    protocol::WorkerEvent::Errored {
+                                        worker_name: self_name.to_string(),
+                                        message,
+                                    },
+                                );
+                            }
                         }
                         (status, shutdown_requested, false)
                     }
@@ -3044,6 +3085,9 @@ where
                                 });
                             }
                         }
+                    }
+                    Some(method @ Method::SubmitIfIdle { .. }) => {
+                        reject_idle_only_submission(&method, working_event_tx);
                     }
                     Some(Method::SubmitTracked {
                         submission_request_id,
@@ -3359,8 +3403,22 @@ where
     }
 }
 
+fn worker_error_requires_attention(error: &WorkerError) -> bool {
+    match error {
+        WorkerError::SegmentActivationIncomplete { .. }
+        | WorkerError::CompactionCleanupPending { .. } => true,
+        WorkerError::RunFailureAlreadyDelivered { source }
+        | WorkerError::RunTerminalPersistence {
+            run_failure: source,
+            ..
+        } => worker_error_requires_attention(source),
+        _ => false,
+    }
+}
+
 fn worker_error_code(e: &WorkerError) -> ErrorCode {
     match e {
+        WorkerError::RunFailureAlreadyDelivered { source } => worker_error_code(source),
         WorkerError::Engine(we) => match we {
             EngineError::Tool(_) => ErrorCode::ToolError,
             EngineError::Client(_) => ErrorCode::ProviderError,
@@ -3584,6 +3642,36 @@ mod tests {
             }
         };
         tokio::time::timeout(timeout, accept).await.ok().flatten()
+    }
+
+    #[tokio::test]
+    async fn idle_only_input_is_rejected_in_busy_maintenance_admission() {
+        let env = make_env().await;
+        let mut events = env.working_event_tx.subscribe();
+        let method = Method::SubmitIfIdle {
+            submission_request_id: "maintenance-input".to_string(),
+            input: vec![protocol::Segment::text("must not queue")],
+            source: protocol::AuthenticatedInputSource::Backend {
+                operation_id: "maintenance-input".to_string(),
+            },
+        };
+        assert!(
+            durably_accept_method_while_busy(
+                method,
+                &env.pending_submissions,
+                &env.working_event_tx
+            )
+            .is_none()
+        );
+        let event = events.try_recv().unwrap();
+        assert!(
+            matches!(event, Event::SubmissionRejected { submission_request_id, message }
+            if submission_request_id == "maintenance-input" && message.contains("WorkerNotify"))
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "must not emit durable acceptance or queue changes"
+        );
     }
 
     #[tokio::test]
@@ -3937,6 +4025,87 @@ mod tests {
             }
             other => panic!("expected Errored, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn delivered_run_failure_is_not_reported_again_by_controller() {
+        let mut env = make_env().await;
+        let listener = UnixListener::bind(&env.parent_socket_path).expect("bind listener");
+        let mut events = env.working_event_tx.subscribe();
+        let worker_future = async {
+            Err::<WorkerRunResult, _>(WorkerError::RunFailureAlreadyDelivered {
+                source: Box::new(WorkerError::CompactSummaryMissing),
+            })
+        };
+
+        let (status, _, may_drain_pending) = drive_turn(
+            worker_future,
+            &mut env.method_rx,
+            &env.working_event_tx,
+            &env.cancel_tx,
+            &env.pause_tx,
+            &env.shared_state,
+            &env.runtime_dir,
+            None,
+            &env.notify_buffer,
+            &env.pending_submissions,
+            Some(&env.parent_socket_path),
+            "child-worker",
+            &env.spawned_registry,
+            true,
+        )
+        .await;
+
+        assert_eq!(status, WorkerStatus::Idle);
+        assert!(!may_drain_pending, "failed runs must not become successful");
+        assert!(events.try_recv().is_err(), "must not emit a generic Error");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "must not send a second parent Errored event"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_persistence_failure_reports_both_causes_once() {
+        let mut env = make_env().await;
+        let mut events = env.working_event_tx.subscribe();
+        let worker_future = async {
+            Err::<WorkerRunResult, _>(WorkerError::RunTerminalPersistence {
+                run_failure: Box::new(WorkerError::CompactSummaryMissing),
+                persist_error: Box::new(WorkerError::Store(session_store::StoreError::Io(
+                    std::io::Error::other("terminal append failed"),
+                ))),
+            })
+        };
+
+        let (status, _, may_drain_pending) = drive_turn(
+            worker_future,
+            &mut env.method_rx,
+            &env.working_event_tx,
+            &env.cancel_tx,
+            &env.pause_tx,
+            &env.shared_state,
+            &env.runtime_dir,
+            None,
+            &env.notify_buffer,
+            &env.pending_submissions,
+            None,
+            "child-worker",
+            &env.spawned_registry,
+            false,
+        )
+        .await;
+
+        assert_eq!(status, WorkerStatus::Idle);
+        assert!(!may_drain_pending);
+        let Event::Error { message, .. } = events.try_recv().expect("one error event") else {
+            panic!("expected Error event");
+        };
+        assert!(message.contains("compact worker did not produce a summary"));
+        assert!(message.contains("terminal append failed"));
+        assert!(events.try_recv().is_err(), "must report once");
     }
 
     #[tokio::test]

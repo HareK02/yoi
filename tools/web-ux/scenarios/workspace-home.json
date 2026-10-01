@@ -1,0 +1,96 @@
+{
+  "schemaVersion": 1,
+  "id": "workspace-home",
+  "title": "Workspace Home operational dashboard",
+  "baseUrl": "http://127.0.0.1:15281",
+  "colorScheme": "light",
+  "reducedMotion": "reduce",
+  "personas": [
+    {
+      "id": "fixture",
+      "label": "Fixture account; permission projection varies by Workspace",
+      "auth": { "kind": "anonymous" }
+    }
+  ],
+  "viewports": [
+    { "label": "desktop", "width": 1440, "height": 900 },
+    { "label": "narrow", "width": 768, "height": 900 },
+    { "label": "mobile", "width": 390, "height": 844 }
+  ],
+  "routes": [
+    {
+      "id": "owner",
+      "label": "Owner Home",
+      "path": "/w/home-owner",
+      "goal": "Identify review work, blocked or assigned active tickets, and recent updates; open an actual record.",
+      "dataState": "Mixed review states, in-progress/queued tickets with a coder and dependency blocker, done/closed tickets and an Objective.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".workspace-home:has([data-feed-ready='home-attention']):has([data-feed-ready='home-active']):has([data-feed-ready='home-recent'])"
+      },
+      "capturePoints": [{ "id": "initial", "label": "Dashboard" }]
+    },
+    {
+      "id": "non-owner",
+      "label": "Non-owner Home",
+      "path": "/w/home-member",
+      "goal": "Read the same work records without owner-only management controls.",
+      "dataState": "All management permissions false; same authorized read-only work projections as owner.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".workspace-home:has([data-feed-ready='home-attention']):has([data-feed-ready='home-active']):has([data-feed-ready='home-recent'])"
+      },
+      "capturePoints": [{ "id": "initial", "label": "Dashboard" }]
+    },
+    {
+      "id": "long-name",
+      "label": "Long names and selectors",
+      "path": "/w/home-long",
+      "goal": "Read long record titles and branch selectors without page-wide overflow.",
+      "dataState": "Owner with long Workspace name, Objective title, and Merge Request selectors.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".workspace-home:has([data-feed-ready='home-attention']):has([data-feed-ready='home-active']):has([data-feed-ready='home-recent'])"
+      },
+      "capturePoints": [{ "id": "initial", "label": "Dashboard" }]
+    },
+    {
+      "id": "empty",
+      "label": "Empty Workspace",
+      "path": "/w/home-empty",
+      "goal": "Distinguish empty work scopes without fabricated status totals.",
+      "dataState": "All dashboard resource queries successfully return empty collections.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".workspace-home:has([data-feed-ready='home-attention']):has([data-feed-ready='home-active']):has([data-feed-ready='home-recent'])"
+      },
+      "capturePoints": [{ "id": "initial", "label": "Empty scopes" }]
+    },
+    {
+      "id": "partial-error",
+      "label": "Reviews unavailable",
+      "path": "/w/home-error",
+      "goal": "Keep active work and recent updates usable when reviews fail; never claim all-clear.",
+      "dataState": "Intentional HTTP 503 from Merge Requests. Expected visible error and browser HTTP console diagnostic; other resource requests succeed.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".workspace-home:has([data-feed-ready='home-attention']):has([data-feed-ready='home-active']):has([data-feed-ready='home-recent'])"
+      },
+      "capturePoints": [{ "id": "initial", "label": "Scoped review failure" }]
+    }
+  ],
+  "processes": [{
+    "id": "home-fixture",
+    "command": "deno",
+    "cwd": "..",
+    "args": [
+      "run",
+      "--allow-net",
+      "--allow-read",
+      "browser-tests/workspace_home_fixture_server.ts",
+      "15281",
+      "../../web/workspace/build"
+    ],
+    "readyUrl": "http://127.0.0.1:15281/health"
+  }]
+}

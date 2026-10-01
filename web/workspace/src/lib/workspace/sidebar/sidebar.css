@@ -5,6 +5,7 @@
     --sidebar-item-hover: oklch(96% 0 0);
     --sidebar-item-active: oklch(92.5% 0 0);
     --sidebar-width: clamp(220px, 20vw, 280px);
+    --sidebar-rail-width: calc(32px + var(--space-2) + var(--space-2) + 1px);
     --sidebar-motion-duration: 220ms;
     --sidebar-motion-easing: cubic-bezier(0.2, 0, 0, 1);
 
@@ -12,13 +13,19 @@
     grid-column: 1;
     grid-row: 1 / 3;
     width: var(--sidebar-width);
+    /* Animate reserved main-content space, independently of the panel. */
     transition: width var(--sidebar-motion-duration) var(--sidebar-motion-easing);
+    position: relative;
+    z-index: 40;
     min-width: 0;
     min-height: 0;
-    overflow: hidden;
+    overflow: visible;
   }
   .sidebar-frame .bevel.sidebar-frame__bevel {
-    width: 100%;
+    /* Keep the open panel's width identical in pinned and overlay modes. */
+    width: var(--sidebar-width);
+    transition: width var(--sidebar-motion-duration) var(--sidebar-motion-easing);
+    background: var(--bg);
     min-width: 0;
     min-height: 0;
   }
@@ -29,7 +36,7 @@
     height: 100%;
     min-width: 0;
     min-height: 0;
-    padding-block: var(--space-4);
+    padding-top: var(--space-4);
   }
   @media (prefers-color-scheme: dark) {
     .sidebar-frame {
@@ -38,11 +45,17 @@
     }
   }
   .sidebar-frame.folded {
-    width: calc(32px + var(--space-2) + var(--space-2) + 1px);
+    width: var(--sidebar-rail-width);
+    overflow: hidden;
+  }
+  .sidebar-hover-region {
+    flex: 1 1 0;
+    min-width: 0;
+    min-height: 0;
     overflow: hidden;
   }
   .sidebar-frame-content {
-    flex: 1 1 auto;
+    height: 100%;
     width: calc(var(--sidebar-width) - 1px);
     transform: translateX(0);
     visibility: visible;
@@ -57,6 +70,24 @@
     transform: translateX(-100%);
     visibility: hidden;
     transition-delay: 0s, var(--sidebar-motion-duration);
+  }
+  .sidebar-frame.hover-mode {
+    position: relative;
+    z-index: 40;
+    width: var(--sidebar-rail-width);
+    overflow: visible;
+  }
+  .sidebar-frame.hover-mode .bevel.sidebar-frame__bevel {
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 100%;
+    width: var(--sidebar-width);
+    overflow: hidden;
+    background: var(--bg);
+  }
+  .sidebar-frame.hover-mode.folded .bevel.sidebar-frame__bevel {
+    width: var(--sidebar-rail-width);
   }
   .sidebar-frame-content,
   .global-sidebar,
@@ -112,13 +143,21 @@
     outline-offset: 1px;
   }
   .sidebar-control-row {
+    position: relative;
     display: flex;
-    justify-content: flex-end;
+    flex: 0 0 auto;
+    justify-content: flex-start;
     gap: var(--space-1);
+    padding: var(--space-2);
   }
-  .sidebar-control-row {
-    margin-top: auto;
-    padding: var(--space-4) var(--space-2) 0;
+  .sidebar-control-row::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    inset-inline: var(--space-2);
+    height: 1px;
+    background: var(--line);
+    pointer-events: none;
   }
   .workspace-label {
     flex: 1 1 auto;
@@ -647,7 +686,8 @@
   }
 
   @media (max-width: 760px) {
-    .sidebar-frame {
+    .sidebar-frame,
+    .sidebar-frame.hover-mode {
       --sidebar-width: 100%;
       z-index: 20;
       grid-column: 1;
@@ -660,7 +700,8 @@
       transition: transform var(--sidebar-motion-duration) var(--sidebar-motion-easing),
         visibility 0s;
     }
-    .sidebar-frame.folded {
+    .sidebar-frame.folded,
+    .sidebar-frame.hover-mode.folded {
       width: 100%;
       transform: translateX(-100%);
       visibility: hidden;
@@ -673,8 +714,11 @@
       visibility: inherit;
       transition: none;
     }
-    .sidebar-control-row {
-      display: none;
+    .sidebar-frame.hover-mode .bevel.sidebar-frame__bevel,
+    .sidebar-frame.hover-mode.folded .bevel.sidebar-frame__bevel {
+      position: static;
+      width: 100%;
+      transition: none;
     }
   }
 

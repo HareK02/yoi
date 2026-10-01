@@ -339,19 +339,19 @@ Deno.test("durable compaction failure reconciles live alert and error in both vi
       },
     },
     {
+      eventId: "controller-error",
+      event: {
+        event: "error",
+        data: { code: "internal", message: "summary unavailable" },
+      },
+    },
+    {
       eventId: "failed",
       event: transition("failed-entry", {
         kind: "run_error",
         message,
         failure: "compaction",
       }),
-    },
-    {
-      eventId: "controller-error",
-      event: {
-        event: "error",
-        data: { code: "internal", message: "summary unavailable" },
-      },
     },
   ]);
 
@@ -362,6 +362,47 @@ Deno.test("durable compaction failure reconciles live alert and error in both vi
   assertEquals(errors[0].entryId, "failed-entry");
   assertEquals(projectConsoleLines(projection.lines, "normal"), errors);
   assertEquals(projectConsoleLines(projection.lines, "overview"), errors);
+
+  const history = projectSessionHistoryEntries([{
+    entry_id: "failed-entry",
+    timestamp: 10,
+    provenance: "legacy_unknown",
+    kind: "run_error",
+    message,
+    failure: "compaction",
+  }], null);
+  const merged = mergeCommittedHistoryLines(history, projection.lines);
+  assertEquals(merged.filter((line) => line.kind === "error").length, 1);
+  assertEquals(merged.find((line) => line.kind === "error")?.entryId, "failed-entry");
+});
+
+Deno.test("reapplying one committed run_error entry is idempotent in both views", () => {
+  const committed = (eventId: string): ConsoleEventInput => ({
+    eventId,
+    event: {
+      event: "session_entry_committed",
+      data: {
+        entry: {
+          entry_id: "same-run-error",
+          timestamp: 10,
+          provenance: "legacy_unknown",
+          kind: "run_error",
+          message: "mid-run compaction failed: summary unavailable",
+          failure: "compaction",
+        },
+      },
+    },
+  });
+
+  const projection = projectConsole([
+    committed("live-delivery"),
+    committed("snapshot-replay"),
+  ]);
+  const errors = projection.lines.filter((line) => line.kind === "error");
+  assertEquals(errors.length, 1);
+  assertEquals(errors[0].entryId, "same-run-error");
+  assertEquals(projectConsoleLines(projection.lines, "normal").length, 1);
+  assertEquals(projectConsoleLines(projection.lines, "overview").length, 1);
 });
 
 Deno.test("snapshot restores compaction terminal without reviving transition progress", () => {
@@ -3230,6 +3271,26 @@ Deno.test("committed history reconciles overlapping Read groups before counting 
     assertEquals(projectOverviewLines(merged)[0].body, "3 files read");
     assertEquals(mergeCommittedHistoryLines(history, merged)[0].toolCallCount, 3);
   }
+});
+
+Deno.test("committed history keeps identical run failures with distinct entry identities", () => {
+  const message = "the same failure happened again";
+  const runError = (entryId: string): SessionSnapshotEntry => ({
+    kind: "run_error",
+    entry_id: entryId,
+    timestamp: 1,
+    provenance: "legacy_unknown",
+    message,
+    failure: "compaction",
+  });
+  const retained = projectSessionHistoryEntries([runError("run-error-1")], null);
+  const current = projectSessionHistoryEntries([runError("run-error-2")], null);
+
+  const merged = mergeCommittedHistoryLines(retained, current);
+  assertEquals(merged.map((line) => line.entryId), ["run-error-1", "run-error-2"]);
+  assertEquals(merged.map((line) => line.body), [message, message]);
+  assertEquals(projectConsoleLines(merged, "normal").length, 2);
+  assertEquals(projectConsoleLines(merged, "overview").length, 2);
 });
 
 Deno.test("committed history matches tool calls across live and durable result identities", () => {

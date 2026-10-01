@@ -402,6 +402,8 @@ pub struct WorkingDirectoryStatus {
 #[serde(rename_all = "snake_case")]
 pub enum WorkerInputKind {
     User,
+    /// Agent input accepted only while Idle; never enters the human Submit queue.
+    UserIfIdle,
     Notify,
     Compact,
     ListRewindTargets,

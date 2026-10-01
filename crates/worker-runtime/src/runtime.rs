@@ -2090,7 +2090,10 @@ impl Runtime {
         mut input: WorkerInput,
     ) -> Result<WorkerInteractionAck, RuntimeError> {
         validate_worker_input(&input)?;
-        if matches!(input.kind, WorkerInputKind::User | WorkerInputKind::Notify) {
+        if matches!(
+            input.kind,
+            WorkerInputKind::User | WorkerInputKind::UserIfIdle | WorkerInputKind::Notify
+        ) {
             let request_id = input
                 .submission_request_id
                 .clone()
@@ -2098,7 +2101,11 @@ impl Runtime {
                 .unwrap_or_else(|| Uuid::now_v7().to_string());
             input.submission_request_id = Some(request_id);
         }
-        let expected_submission_id = (input.kind == WorkerInputKind::User).then(|| {
+        let expected_submission_id = matches!(
+            input.kind,
+            WorkerInputKind::User | WorkerInputKind::UserIfIdle
+        )
+        .then(|| {
             input
                 .submission_request_id
                 .clone()
@@ -2110,6 +2117,17 @@ impl Runtime {
                 .clone()
                 .expect("Notify request id must be assigned before dispatch")
         });
+        if input.kind == WorkerInputKind::UserIfIdle {
+            let state = self.lock()?;
+            let worker = state.worker(worker_ref)?;
+            // Stopped/restoring Workers have no controller to enforce admission.
+            // Live busy state is checked atomically by the controller, not here.
+            if worker.status == WorkerStatus::Stopped || worker.has_pending_lifecycle_operation() {
+                return Err(RuntimeError::InvalidRequest(
+                    "WorkerSendInput requires an Idle Worker and never queues input. Use WorkerNotify for information about work already in progress.".to_string(),
+                ));
+            }
+        }
         self.ensure_worker_execution(worker_ref)?;
         let (backend, handle) = {
             let state = self.lock()?;
@@ -5319,7 +5337,7 @@ fn input_protocol_event(input: &WorkerInput) -> Option<protocol::Event> {
     match input.kind {
         // Submit is projected only after the Worker commits UserInput. Queued
         // payloads must never become model- or client-visible history early.
-        WorkerInputKind::User | WorkerInputKind::Notify => None,
+        WorkerInputKind::User | WorkerInputKind::UserIfIdle | WorkerInputKind::Notify => None,
         WorkerInputKind::Compact
         | WorkerInputKind::ListRewindTargets
         | WorkerInputKind::RegisterPeer => Some(protocol::Event::SystemItem {

@@ -18051,7 +18051,30 @@ async fn send_known_worker_input(
         &path.worker,
         permission,
     )?;
-    scoped_send_runtime_worker_input(State(api), AxumPath(path), Json(request)).await
+    let mut request = worker_input_request_from_api(request)?;
+    let idle_only = request.kind == WorkerInputKind::User;
+    if idle_only {
+        request.kind = WorkerInputKind::UserIfIdle;
+    }
+    let Json(result) =
+        dispatch_runtime_worker_input(api, path.worker.runtime_id, path.worker.worker_id, request)?;
+    if result.state != server_api::WorkerOperationState::Accepted {
+        let detail = result
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        let message = if idle_only {
+            format!(
+                "WorkerSendInput requires an Idle Worker and never queues input. Use WorkerNotify for information about work already in progress. {detail}"
+            )
+        } else {
+            detail
+        };
+        return Err(Error::InvalidInput(message).into());
+    }
+    Ok(Json(result))
 }
 
 async fn cancel_known_worker(
@@ -24818,6 +24841,15 @@ async fn send_runtime_worker_input(
     Json(request): Json<server_api::RuntimeWorkerInputRequest>,
 ) -> ApiResult<Json<server_api::RuntimeWorkerInputResult>> {
     let request = worker_input_request_from_api(request)?;
+    dispatch_runtime_worker_input(api, runtime_id, worker_id, request)
+}
+
+fn dispatch_runtime_worker_input(
+    api: WorkspaceApi,
+    runtime_id: String,
+    worker_id: String,
+    request: WorkerInputRequest,
+) -> ApiResult<Json<server_api::RuntimeWorkerInputResult>> {
     let worker = resolve_workspace_worker_reference(&api, &runtime_id, &worker_id)?;
     if api
         .store
@@ -24927,7 +24959,9 @@ pub(crate) fn authorize_browser_worker_method(
             message,
             source: source.clone(),
         }),
-        protocol::Method::SubmitTracked { .. } | protocol::Method::NotifyTracked { .. } => {
+        protocol::Method::SubmitTracked { .. }
+        | protocol::Method::SubmitIfIdle { .. }
+        | protocol::Method::NotifyTracked { .. } => {
             Err("authenticated Worker input source is server-owned")
         }
         other => Ok(other),
@@ -30254,6 +30288,7 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct WorkdirlessFixtureRuntime {
+        input_requests: Arc<Mutex<Vec<WorkerInputRequest>>>,
         workers: Arc<Mutex<Vec<InternalWorkerSummary>>>,
         spawn_requests: Arc<Mutex<Vec<WorkerSpawnRequest>>>,
         reject_next_spawn: Arc<Mutex<bool>>,
@@ -30380,6 +30415,30 @@ mod tests {
     }
 
     impl crate::hosts::WorkspaceWorkerRuntime for WorkdirlessFixtureRuntime {
+        fn send_input(
+            &self,
+            worker_id: &str,
+            request: WorkerInputRequest,
+        ) -> crate::hosts::WorkerInputResult {
+            let idle_only = request.kind == WorkerInputKind::UserIfIdle;
+            self.input_requests.lock().unwrap().push(request);
+            crate::hosts::WorkerInputResult {
+                state: if idle_only {
+                    InternalWorkerOperationState::Rejected
+                } else {
+                    InternalWorkerOperationState::Accepted
+                },
+                disposition: if idle_only {
+                    crate::hosts::WorkerInputDisposition::Rejected
+                } else {
+                    crate::hosts::WorkerInputDisposition::Accepted
+                },
+                worker: RuntimeWorkerRef::new(Self::RUNTIME_ID, worker_id),
+                runtime_run_id: None,
+                diagnostics: Vec::new(),
+            }
+        }
+
         fn runtime_id(&self) -> &str {
             Self::RUNTIME_ID
         }
@@ -33717,6 +33776,76 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(current.assignment_id, "existing-coder-assignment");
+    }
+
+    #[tokio::test]
+    async fn worker_control_input_is_idle_only_and_returns_rejection_as_http_error() {
+        let fixture = guarded_spawn_fixture().await;
+        let response = post_guarded_spawn(
+            &fixture,
+            guarded_spawn_payload(&fixture, "idle-only-control"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let created: BrowserCreateWorkerResponse = serde_json::from_slice(&bytes).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-yoi-runtime-id",
+            fixture.controller.runtime_id.parse().unwrap(),
+        );
+        headers.insert(
+            "x-yoi-worker-id",
+            fixture.controller.worker_id.parse().unwrap(),
+        );
+        let path = || ScopedRuntimeWorkerPath {
+            workspace_id: TEST_WORKSPACE_ID.to_string(),
+            worker: RuntimeWorkerRef::new(&created.runtime_id, &created.worker_id),
+        };
+        let request = |kind: &str| server_api::RuntimeWorkerInputRequest {
+            kind: Some(kind.to_string()),
+            content: "follow-up".to_string(),
+            segments: None,
+        };
+        let error = send_known_worker_input(
+            State(fixture.api.clone()),
+            AxumPath(path()),
+            headers.clone(),
+            Json(request("user")),
+        )
+        .await
+        .unwrap_err();
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("WorkerNotify"));
+        // Machine Notify is unchanged; the human endpoint must still use User.
+        let Json(notify) = send_known_worker_input(
+            State(fixture.api.clone()),
+            AxumPath(path()),
+            headers,
+            Json(request("notify")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(notify.state, server_api::WorkerOperationState::Accepted);
+        let Json(human) = scoped_send_runtime_worker_input(
+            State(fixture.api.clone()),
+            AxumPath(path()),
+            Json(request("user")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(human.state, server_api::WorkerOperationState::Accepted);
+        let requests = fixture.runtime.input_requests.lock().unwrap();
+        assert_eq!(
+            requests.iter().map(|r| r.kind.clone()).collect::<Vec<_>>(),
+            vec![
+                WorkerInputKind::UserIfIdle,
+                WorkerInputKind::Notify,
+                WorkerInputKind::User
+            ]
+        );
     }
 
     #[tokio::test]

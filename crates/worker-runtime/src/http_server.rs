@@ -1556,6 +1556,19 @@ fn authorize_runtime_protocol_method(
             submission_request_id,
             input,
         },
+        protocol::Method::SubmitIfIdle {
+            submission_request_id,
+            input,
+            ..
+        } => protocol::Method::SubmitIfIdle {
+            source: transport_source.cloned().unwrap_or_else(|| {
+                protocol::AuthenticatedInputSource::Backend {
+                    operation_id: submission_request_id.clone(),
+                }
+            }),
+            submission_request_id,
+            input,
+        },
         protocol::Method::NotifyTracked {
             notification_request_id,
             message,
@@ -3477,14 +3490,31 @@ mod tests {
         conflicting_request.create_fingerprint = "different-fingerprint".to_string();
         let generated = client.create_worker(generated_request).await.unwrap();
         assert_eq!(generated.worker.worker_id.to_string(), generated_worker_id);
-        let generated_input: runtime_api::WorkerInput = serde_json::from_value(
-            serde_json::to_value(WorkerInput::user("generated client input")).unwrap(),
-        )
-        .unwrap();
-        client
-            .send_worker_input(generated_worker_id.clone(), generated_input)
-            .await
-            .unwrap();
+        for kind in [
+            crate::interaction::WorkerInputKind::User,
+            crate::interaction::WorkerInputKind::UserIfIdle,
+        ] {
+            let mut input = WorkerInput::user("generated client input");
+            input.kind = kind.clone();
+            input.submission_request_id = Some(format!("generated-{kind:?}"));
+            // The remote adapter performs this same conversion before sending.
+            // Both the generated API contract and the HTTP receiver must retain
+            // Idle-only admission rather than silently downgrading it to User.
+            let generated_input: runtime_api::WorkerInput =
+                serde_json::from_value(serde_json::to_value(&input).unwrap()).unwrap();
+            assert_eq!(
+                serde_json::to_value(&generated_input).unwrap(),
+                serde_json::to_value(&input).unwrap()
+            );
+            let response = client
+                .send_worker_input(generated_worker_id.clone(), generated_input)
+                .await
+                .unwrap();
+            assert_eq!(
+                Some(response.ack.submission.unwrap().submission_request_id),
+                input.submission_request_id
+            );
+        }
         client
             .stop_worker(
                 generated_worker_id.clone(),

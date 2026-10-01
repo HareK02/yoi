@@ -245,11 +245,11 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                             "unknown Worker or permission not granted".to_string(),
                         )
                     })?;
-                record
-                    .session
-                    .send(content)
-                    .await
-                    .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
+                record.session.send(content).await.map_err(|error| {
+                    WorkspaceClientError::Request(format!(
+                        "WorkerSendInput requires an Idle SubWorker and never queues input: {error}"
+                    ))
+                })?;
                 Ok(WorkspaceResponse {
                     status: 200,
                     body: serde_json::json!({
@@ -855,7 +855,7 @@ impl WorkerOperation {
                 "Spawn a Backend/Runtime Worker session in one existing Workspace Workdir. The model-facing input remains singular and the shared lifecycle wraps it as the canonical attachment collection under the stable `workdir` alias. The Workdir id is authority; filesystem paths and Runtime URLs are not accepted. `initial_submit` carries the normal typed user submission. After the Orchestrator has committed a Ticket to `inprogress`, set `ticket_id` with a Flow segment in `initial_submit` to atomically assign the new Coder Worker; the operation id is derived from the durable tool call rather than model input."
             }
             Self::SendInput => {
-                "Send user input to a known Runtime Worker. Idle Workers can start a fresh turn; Running or Paused Workers durably queue it for a later turn. Use WorkerNotify for advisory information during work already in progress. Direct SubWorkers require Idle."
+                "Start a fresh turn for an Idle Worker. Non-Idle Workers reject WorkerSendInput without queueing. Use WorkerNotify for advisory information during work already in progress. Direct SubWorkers also require Idle."
             }
             Self::Notify => {
                 "Send an advisory notification to a known Runtime Worker so information can be incorporated into work already in progress without creating a queued Submit."
@@ -1534,6 +1534,17 @@ mod tests {
             })
         );
         assert_eq!(client.requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn send_input_rejection_is_a_tool_error_with_notify_guidance() {
+        let error = tool_output(WorkerOperation::SendInput, WorkspaceResponse {
+            status: 400,
+            body: "WorkerSendInput requires an Idle Worker. Use WorkerNotify for work already in progress.".to_string(),
+        }).unwrap_err();
+        assert!(matches!(error, ToolError::ExecutionFailed(_)));
+        assert!(error.to_string().contains("WorkerNotify"));
+        assert!(!error.to_string().contains("completed"));
     }
 
     #[tokio::test]

@@ -271,6 +271,17 @@ pub(crate) enum InternalWorkerSessionStatus {
     Failed,
 }
 
+/// Typed result of the most recent reusable Internal Worker turn.
+///
+/// Session status intentionally remains a compact presentation state. Owners that
+/// make domain decisions (such as Compaction) must use this result instead of
+/// guessing a stop cause from `Stopped` or parsing the presentation error string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InternalWorkerTurnOutcome {
+    Completed(WorkerRunResult),
+    Failed { message: String },
+}
+
 impl InternalWorkerSessionStatus {
     fn encode(self) -> u8 {
         match self {
@@ -323,26 +334,53 @@ fn send_internal_worker_state(
 
 fn classify_internal_turn_result(
     result: Result<WorkerRunResult, WorkerError>,
-) -> (InternalWorkerSessionStatus, Option<String>) {
+) -> (
+    InternalWorkerSessionStatus,
+    Option<String>,
+    InternalWorkerTurnOutcome,
+) {
     match result {
-        Ok(WorkerRunResult::Finished) => (InternalWorkerSessionStatus::Idle, None),
-        Ok(WorkerRunResult::Paused) => (InternalWorkerSessionStatus::Paused, None),
-        Ok(WorkerRunResult::LimitReached) => (
-            InternalWorkerSessionStatus::Stopped,
-            Some("internal Worker reached its turn limit".to_string()),
+        Ok(result @ WorkerRunResult::Finished) => (
+            InternalWorkerSessionStatus::Idle,
+            None,
+            InternalWorkerTurnOutcome::Completed(result),
         ),
-        Ok(WorkerRunResult::Interrupted { message, .. }) => {
-            (InternalWorkerSessionStatus::Stopped, Some(message))
+        Ok(result @ WorkerRunResult::Paused) => (
+            InternalWorkerSessionStatus::Paused,
+            None,
+            InternalWorkerTurnOutcome::Completed(result),
+        ),
+        Ok(result @ WorkerRunResult::LimitReached) => {
+            let message = "internal Worker reached its turn limit".to_string();
+            (
+                InternalWorkerSessionStatus::Stopped,
+                Some(message),
+                InternalWorkerTurnOutcome::Completed(result),
+            )
         }
-        Ok(WorkerRunResult::Cancelled) => (
+        Ok(WorkerRunResult::Interrupted { code, message }) => (
+            InternalWorkerSessionStatus::Stopped,
+            Some(message.clone()),
+            InternalWorkerTurnOutcome::Completed(WorkerRunResult::Interrupted { code, message }),
+        ),
+        Ok(result @ WorkerRunResult::Cancelled) => (
             InternalWorkerSessionStatus::Stopped,
             Some("internal Worker run was cancelled".to_string()),
+            InternalWorkerTurnOutcome::Completed(result),
         ),
-        Ok(WorkerRunResult::RolledBack) => (
+        Ok(result @ WorkerRunResult::RolledBack) => (
             InternalWorkerSessionStatus::Stopped,
             Some("internal Worker run was cancelled before AI output".to_string()),
+            InternalWorkerTurnOutcome::Completed(result),
         ),
-        Err(error) => (InternalWorkerSessionStatus::Failed, Some(error.to_string())),
+        Err(error) => {
+            let message = error.to_string();
+            (
+                InternalWorkerSessionStatus::Failed,
+                Some(message.clone()),
+                InternalWorkerTurnOutcome::Failed { message },
+            )
+        }
     }
 }
 
@@ -389,6 +427,7 @@ pub(crate) struct InternalWorkerSessionHandle {
     event_tx: broadcast::Sender<Event>,
     visibility: InternalWorkerVisibility,
     last_error: Arc<Mutex<Option<String>>>,
+    last_outcome: Arc<Mutex<Option<InternalWorkerTurnOutcome>>>,
     child_registry: Option<Arc<SpawnedWorkerRegistry>>,
     sink: SegmentLogSink,
     #[cfg(test)]
@@ -488,6 +527,8 @@ impl InternalWorkerSessionHandle {
                     InternalWorkerSessionStatus::Idle => InternalWorkerSessionError::Unavailable,
                 },
             )?;
+        *self.last_error.lock().unwrap() = None;
+        *self.last_outcome.lock().unwrap() = None;
         if self
             .command_tx
             .send(InternalWorkerSessionCommand::Run(input.into()))
@@ -501,6 +542,9 @@ impl InternalWorkerSessionHandle {
             self.state_changed.notify_waiters();
             let message = "internal Worker session actor is unavailable".to_owned();
             *self.last_error.lock().unwrap() = Some(message.clone());
+            *self.last_outcome.lock().unwrap() = Some(InternalWorkerTurnOutcome::Failed {
+                message: message.clone(),
+            });
             let _ = self.event_tx.send(Event::Error {
                 code: protocol::ErrorCode::Internal,
                 message,
@@ -522,6 +566,15 @@ impl InternalWorkerSessionHandle {
             }
             notified.await;
         }
+    }
+
+    /// Wait for the active turn and return its typed outcome.
+    ///
+    /// `None` means the actor stopped without publishing a turn result; callers
+    /// must treat that as unknown rather than manufacturing a cancellation.
+    pub(crate) async fn wait_for_turn_outcome(&self) -> Option<InternalWorkerTurnOutcome> {
+        self.wait_until_idle().await;
+        self.last_outcome.lock().unwrap().clone()
     }
 
     #[cfg(test)]
@@ -808,6 +861,7 @@ pub(crate) async fn prepare_internal_worker_session(
     ));
     let state_changed = Arc::new(tokio::sync::Notify::new());
     let last_error = Arc::new(Mutex::new(None));
+    let last_outcome = Arc::new(Mutex::new(None));
     let handle = InternalWorkerSessionHandle {
         command_tx,
         status: status.clone(),
@@ -819,6 +873,7 @@ pub(crate) async fn prepare_internal_worker_session(
         event_tx: event_tx.clone(),
         visibility,
         last_error: last_error.clone(),
+        last_outcome: last_outcome.clone(),
         child_registry,
         sink,
         #[cfg(test)]
@@ -836,8 +891,10 @@ pub(crate) async fn prepare_internal_worker_session(
                     loop {
                         tokio::select! {
                             result = &mut run => {
-                                let (turn_status, error) = classify_internal_turn_result(result);
+                                let (turn_status, error, outcome) =
+                                    classify_internal_turn_result(result);
                                 actor_in_flight.clear();
+                                *last_outcome.lock().unwrap() = Some(outcome);
                                 status.store(turn_status.encode(), std::sync::atomic::Ordering::Release);
                                 if let Some(message) = error {
                                     *last_error.lock().unwrap() = Some(message.clone());
@@ -1148,6 +1205,7 @@ pub(crate) fn test_internal_worker_session(
         event_tx: event_tx.clone(),
         visibility,
         last_error: Arc::new(Mutex::new(None)),
+        last_outcome: Arc::new(Mutex::new(None)),
         child_registry: None,
         sink,
         fail_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1355,6 +1413,11 @@ permission = "write"
                 true,
             ),
             (
+                WorkerRunResult::Cancelled,
+                InternalWorkerSessionStatus::Stopped,
+                true,
+            ),
+            (
                 WorkerRunResult::RolledBack,
                 InternalWorkerSessionStatus::Stopped,
                 true,
@@ -1362,16 +1425,22 @@ permission = "write"
         ];
 
         for (result, expected_status, expects_error) in cases {
-            let (status, error) = classify_internal_turn_result(Ok(result));
+            let expected_outcome = InternalWorkerTurnOutcome::Completed(result.clone());
+            let (status, error, outcome) = classify_internal_turn_result(Ok(result));
             assert_eq!(status, expected_status);
             assert_eq!(error.is_some(), expects_error);
+            assert_eq!(outcome, expected_outcome);
         }
 
-        let (status, error) = classify_internal_turn_result(Err(WorkerError::Engine(
+        let (status, error, outcome) = classify_internal_turn_result(Err(WorkerError::Engine(
             EngineError::Aborted("fatal".to_string()),
         )));
         assert_eq!(status, InternalWorkerSessionStatus::Failed);
         assert!(error.is_some_and(|message| message.contains("fatal")));
+        assert!(matches!(
+            outcome,
+            InternalWorkerTurnOutcome::Failed { message } if message.contains("fatal")
+        ));
     }
 
     #[tokio::test]

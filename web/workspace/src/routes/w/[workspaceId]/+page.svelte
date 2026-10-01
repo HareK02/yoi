@@ -1,103 +1,53 @@
 <script lang="ts">
-  import { workspaceRoute } from '$lib/workspace/api/http';
+  import { invalidate } from '$app/navigation';
+  import DashboardSection from '$lib/workspace/home/DashboardSection.svelte';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
-  let workspaceId = $derived(data.workspace?.workspace_id ?? data.workspaceId);
-  let ticketsHref = $derived(workspaceRoute(workspaceId, '/tickets'));
-  let runtimeSettingsHref = $derived(workspaceRoute(workspaceId, '/settings/runtimes'));
-  let workersHref = $derived(workspaceRoute(workspaceId, '/workers'));
+  let refreshing = $state(false);
+  let refreshError = $state<string | null>(null);
+  async function refresh() {
+    if (refreshing) return;
+    refreshing = true;
+    refreshError = null;
+    try {
+      await invalidate('workspace:home');
+      await Promise.all(Object.values(data.dashboard));
+    } catch {
+      refreshError = 'Could not refresh. Try again.';
+    } finally {
+      refreshing = false;
+    }
+  }
 </script>
 
-<svelte:head>
-  <title>Yoi Workspace Control Plane</title>
-  <meta name="description" content="Local single-workspace Yoi control plane bootstrap" />
-</svelte:head>
+<svelte:head><title>{data.workspace?.display_name ?? 'Workspace'} · Yoi</title></svelte:head>
 
-<section class="card">
-  <h2>Workspace</h2>
-  {#if data.workspace}
-    <dl>
-      <div>
-        <dt>ID</dt>
-        <dd>{data.workspace.workspace_id}</dd>
-      </div>
-      <div>
-        <dt>Name</dt>
-        <dd>{data.workspace.display_name}</dd>
-      </div>
-      <div>
-        <dt>Record authority</dt>
-        <dd>{data.workspace.record_authority}</dd>
-      </div>
-      <div>
-        <dt>Host / Worker bridge</dt>
-        <dd>{data.workspace.extension_points.host_worker_bridge.status}</dd>
-      </div>
-    </dl>
-  {:else if data.workspaceError}
-    <p class="error">{data.workspaceError}</p>
-  {:else}
-    <p>Waiting for <code>/api/workspace</code>…</p>
-  {/if}
-</section>
+<div class="workspace-home">
+  <header class="home-header">
+    <h1>Activity</h1>
+    <button type="button" onclick={refresh} disabled={refreshing}>{refreshing ? 'Refreshing…' : 'Refresh'}</button>
+  </header>
+  {#if refreshError}<p class="home-error" role="alert">{refreshError}</p>{/if}
+  <div class="home-columns">
+    <DashboardSection id="home-attention" title="Needs attention" empty="No open Merge Requests." result={data.dashboard.reviews} />
+    <DashboardSection id="home-active" title="In progress" empty="No in-progress or queued tickets." result={data.dashboard.active} />
+    <DashboardSection id="home-recent" title="Recent updates" empty="No done / closed tickets or Objectives yet." result={data.dashboard.recent} />
+  </div>
+</div>
 
-<section class="workspace-actions" aria-label="Workspace sections">
-  <a class="workspace-action-card" href={ticketsHref}>
-    <span>Tickets</span>
-    <strong>Browse workspace tickets</strong>
-    <small>Read typed Ticket records</small>
-  </a>
-  <a class="workspace-action-card" href={runtimeSettingsHref}>
-    <span>Runtimes</span>
-    <strong>Open admin Runtimes</strong>
-    <small>{data.hosts?.items.length ?? 0} host{(data.hosts?.items.length ?? 0) === 1 ? '' : 's'} visible</small>
-  </a>
-  <a class="workspace-action-card" href={workersHref}>
-    <span>Workers</span>
-    <strong>Open worker list</strong>
-    <small>Inspect status and attach to consoles</small>
-  </a>
-</section>
-
-<section class="card">
-  <h2>Hosts</h2>
-  {#if data.hosts}
-    {#if data.hosts.items.length === 0}
-      <p>No local Hosts are visible.</p>
-    {:else}
-      <div class="stack">
-        {#each data.hosts.items as host}
-          <article class="runtime-card">
-            <div class="runtime-heading">
-              <strong>{host.label}</strong>
-              <span class:warn={host.status !== 'available'}>{host.status}</span>
-            </div>
-            <dl>
-              <div>
-                <dt>ID</dt>
-                <dd><code>{host.host_id}</code></dd>
-              </div>
-              <div>
-                <dt>Kind</dt>
-                <dd>{host.kind}</dd>
-              </div>
-              <div>
-                <dt>Runtime</dt>
-                <dd><code>{host.runtime_id}</code></dd>
-              </div>
-              <div>
-                <dt>Platform</dt>
-                <dd>{host.os} / {host.arch}</dd>
-              </div>
-            </dl>
-          </article>
-        {/each}
-      </div>
-    {/if}
-  {:else if data.hostsError}
-    <p class="error">{data.hostsError}</p>
-  {:else}
-    <p>Waiting for <code>/api/hosts</code>…</p>
-  {/if}
-</section>
+<style>
+  .workspace-home { container-type: inline-size; min-width: 0; }
+  .home-header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); margin-bottom: var(--space-5); }
+  h1 { margin: 0; font-size: var(--font-size-title); line-height: var(--line-height-title); color: var(--text-strong); }
+  button { flex: 0 0 auto; padding: var(--space-2) var(--space-3); border: 1px solid var(--line); border-radius: var(--radius-soft); color: var(--text); background: transparent; cursor: pointer; }
+  button:hover:not(:disabled), button:focus-visible { background: var(--interactive-hover); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button:active:not(:disabled) { background: var(--interactive-selected); }
+  button:disabled { opacity: 0.6; cursor: wait; }
+  .home-columns { display: grid; gap: var(--space-6); align-items: start; }
+  .home-error { color: var(--danger); overflow-wrap: anywhere; }
+  @container (min-width: 52rem) {
+    .home-columns { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  }
+</style>

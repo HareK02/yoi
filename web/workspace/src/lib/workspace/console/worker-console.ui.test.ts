@@ -245,15 +245,10 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
   );
 
   assert(
-    workspacePage.includes("ticketsHref") &&
-      workspacePage.includes("runtimeSettingsHref") &&
-      workspacePage.includes("workersHref") &&
-      workspacePage.includes("workspaceRoute(workspaceId, '/tickets')") &&
-      workspacePage.includes(
-        "workspaceRoute(workspaceId, '/settings/runtimes')",
-      ) &&
-      workspacePage.includes("workspaceRoute(workspaceId, '/workers')"),
-    "top workspace page should link to Tickets, Runtimes under Settings, and the Workers page",
+    workspacePage.includes("DashboardSection") &&
+      !workspacePage.includes("<nav") &&
+      !workspacePage.includes("/settings/runtimes"),
+    "Home should show work records without duplicating Sidebar navigation",
   );
   assert(
     !workspacePage.includes("workerConsoleHref") &&
@@ -1325,12 +1320,12 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
     "Workspace layout should load workspace data, register with the parent slot, and provide the same slot contract to children",
   );
   assert(
-    sidebarFrame.includes("folded = $bindable(false)") &&
+    sidebarFrame.includes("mode: 'pinned' | 'hover'") &&
       sidebarFrame.includes("sidebar-fold-button") &&
-      sidebarFrame.includes("Fold sidebar") &&
-      sidebarFrame.includes("Unfold sidebar") &&
-      rootLayout.includes("let sidebarFolded = $state(loadSidebarFolded())") &&
-      rootLayout.includes("<SidebarFrame bind:folded={sidebarFolded}>") &&
+      sidebarFrame.includes("Pin sidebar") &&
+      sidebarFrame.includes("Unpin sidebar") &&
+      rootLayout.includes("let sidebarMode = $state(loadSidebarMode())") &&
+      rootLayout.includes("mode={sidebarMode}") &&
       !workspaceLayout.includes("sidebarFolded") &&
       !workspaceLayout.includes("onToggleFold") &&
       !sidebar.includes("folded?: boolean") &&

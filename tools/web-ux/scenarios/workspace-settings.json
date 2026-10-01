@@ -1,0 +1,137 @@
+{
+  "schemaVersion": 1,
+  "id": "workspace-settings",
+  "title": "Workspace Identity settings disclosure",
+  "baseUrl": "http://127.0.0.1:15282",
+  "colorScheme": "light",
+  "reducedMotion": "reduce",
+  "personas": [
+    {
+      "id": "fixture",
+      "label": "Synthetic Workspace permission projections",
+      "auth": {
+        "kind": "anonymous"
+      }
+    }
+  ],
+  "viewports": [
+    {
+      "label": "desktop",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "label": "narrow",
+      "width": 768,
+      "height": 900
+    },
+    {
+      "label": "mobile",
+      "width": 390,
+      "height": 844
+    }
+  ],
+  "routes": [
+    {
+      "id": "owner",
+      "label": "Owner settings",
+      "path": "/w/home-owner/settings",
+      "goal": "Read saved name and identity state without permanent edit forms or public JSON.",
+      "dataState": "Active public identity and saved name.",
+      "ready": {
+        "kind": "selector",
+        "selector": "main:has(#workspace-settings-title):not(:has-text(\"Loading\"))"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Saved settings"
+        }
+      ]
+    },
+    {
+      "id": "member",
+      "label": "Member settings",
+      "path": "/w/home-member/settings",
+      "goal": "Keep permitted metadata editing without owner identity or deletion controls.",
+      "dataState": "All owner permissions false; metadata read/write remains available under existing Backend contract.",
+      "ready": {
+        "kind": "selector",
+        "selector": "main:has(#workspace-settings-title):not(:has-text(\"Loading\"))"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Member view"
+        }
+      ]
+    },
+    {
+      "id": "long",
+      "label": "Long name",
+      "path": "/w/home-long/settings",
+      "goal": "Keep controls in the viewport and preserve complete long names.",
+      "dataState": "Long Workspace display name and active identity.",
+      "ready": {
+        "kind": "selector",
+        "selector": "main:has(#workspace-settings-title):not(:has-text(\"Loading\"))"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Long name"
+        }
+      ]
+    },
+    {
+      "id": "pending",
+      "label": "Pending identity",
+      "path": "/w/home-empty/settings",
+      "goal": "Show provisioning attention without pretending the identity is active.",
+      "dataState": "Identity pending_provisioning; metadata available.",
+      "ready": {
+        "kind": "selector",
+        "selector": "main:has(#workspace-settings-title):not(:has-text(\"Loading\"))"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Provisioning required"
+        }
+      ]
+    },
+    {
+      "id": "error",
+      "label": "Identity failure",
+      "path": "/w/home-error/settings",
+      "goal": "Keep name usable when public identity fails and offer scoped recovery.",
+      "dataState": "Intentional signing identity HTTP503 with its expected console diagnostic.",
+      "ready": {
+        "kind": "selector",
+        "selector": "main:has(#workspace-settings-title):not(:has-text(\"Loading\"))"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Scoped error"
+        }
+      ]
+    }
+  ],
+  "processes": [
+    {
+      "id": "settings-fixture",
+      "command": "deno",
+      "cwd": "..",
+      "args": [
+        "run",
+        "--allow-net",
+        "--allow-read",
+        "browser-tests/workspace_home_fixture_server.ts",
+        "15282",
+        "../../web/workspace/build"
+      ],
+      "readyUrl": "http://127.0.0.1:15282/health"
+    }
+  ]
+}

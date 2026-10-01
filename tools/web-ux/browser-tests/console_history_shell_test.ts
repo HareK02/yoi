@@ -41,22 +41,134 @@ async function historyRequestCount(baseUrl: string): Promise<number> {
   return state.history_requests;
 }
 
+async function checkSidebarModeSwitch(page: Page, name: string): Promise<void> {
+  const button = page.getByRole("button", { name, exact: true });
+  await button.hover();
+  await button.focus();
+  const samples = await button.evaluate(async (button) => {
+    const frame = button.closest<HTMLElement>(".sidebar-frame")!;
+    await Promise.all(frame.getAnimations({ subtree: true }).map((animation) => animation.finished));
+    const panel = frame.querySelector<HTMLElement>(".sidebar-frame__bevel")!;
+    const content = frame.querySelector<HTMLElement>(".sidebar-frame-content")!;
+    const main = document.querySelector<HTMLElement>(".app-shell__main")!;
+    const sample = () => ({
+      mainLeft: main.getBoundingClientRect().left,
+      mainWidth: main.getBoundingClientRect().width,
+      stationary: {
+        panel: panel.getBoundingClientRect().toJSON(),
+        content: content.getBoundingClientRect().toJSON(),
+        button: button.getBoundingClientRect().toJSON(),
+        folded: frame.classList.contains("folded"),
+        unclipped: panel.contains(document.elementFromPoint(panel.getBoundingClientRect().right - 8, 40)),
+        motion: panel.getAnimations({ subtree: true }).filter((animation) =>
+          animation instanceof CSSTransition && ["width", "transform"].includes(animation.transitionProperty)
+        ).length,
+      },
+    });
+    const samples = [sample()];
+    (button as HTMLButtonElement).click();
+    const start = performance.now();
+    do {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      samples.push(sample());
+    } while (performance.now() - start < 280);
+    return samples;
+  });
+  for (const sample of samples) {
+    assertEquals(sample.stationary, samples[0].stationary, `${name} must keep the open panel stationary without slide animation`);
+    assertEquals(sample.stationary.folded, false);
+    assertEquals(sample.stationary.motion, 0);
+    assertEquals(sample.stationary.unclipped, true);
+  }
+  const first = samples[0];
+  const last = samples.at(-1)!;
+  assert(samples.some((sample) => sample.mainLeft > Math.min(first.mainLeft, last.mainLeft) &&
+    sample.mainLeft < Math.max(first.mainLeft, last.mainLeft)), "main position must animate through intermediate coordinates");
+  assert(samples.some((sample) => sample.mainWidth > Math.min(first.mainWidth, last.mainWidth) &&
+    sample.mainWidth < Math.max(first.mainWidth, last.mainWidth)), "main width must animate through intermediate sizes");
+  await page.locator(".sidebar-fold-button").evaluate((button) => (button as HTMLButtonElement).blur());
+}
+
+async function checkSidebarPointerModeSwitch(page: Page, pinning: boolean): Promise<void> {
+  const button = page.getByRole("button", { name: pinning ? "Pin sidebar" : "Unpin sidebar", exact: true });
+  await button.hover();
+  await page.mouse.down();
+  await page.waitForTimeout(100);
+  assertEquals(await page.locator(".sidebar-frame.folded").count(), pinning ? 1 : 0,
+    "pointer-down must not open a preview before the mode changes on click");
+  const sampling = button.evaluate(async (button) => {
+    const frame = button.closest<HTMLElement>(".sidebar-frame")!;
+    const panel = frame.querySelector<HTMLElement>(".sidebar-frame__bevel")!;
+    const main = document.querySelector<HTMLElement>(".app-shell__main")!;
+    const content = frame.querySelector<HTMLElement>(".sidebar-frame-content")!;
+    const sample = () => ({
+      frameWidth: frame.getBoundingClientRect().width,
+      panelWidth: panel.getBoundingClientRect().width,
+      mainWidth: main.getBoundingClientRect().width,
+      expectedMainWidth: Math.min(parseFloat(getComputedStyle(main).maxWidth), innerWidth - panel.getBoundingClientRect().right),
+      contentWidth: content.getBoundingClientRect().width,
+      buttonLeft: button.getBoundingClientRect().left,
+      buttonBottom: button.getBoundingClientRect().bottom,
+    });
+    const samples = [sample()];
+    const start = performance.now();
+    do {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      samples.push(sample());
+    } while (performance.now() - start < 450);
+    return samples;
+  });
+  await page.mouse.up();
+  const samples = await sampling;
+  for (const sample of samples) {
+    assert(Math.abs(sample.frameWidth - sample.panelWidth) <= 1,
+      `sidebar and main must move together throughout the click: ${JSON.stringify(sample)}`);
+    assert(Math.abs(sample.mainWidth - sample.expectedMainWidth) <= 1);
+    assertEquals(sample.contentWidth, samples[0].contentWidth);
+    assertEquals(sample.buttonLeft, samples[0].buttonLeft);
+    assertEquals(sample.buttonBottom, samples[0].buttonBottom);
+  }
+  const first = samples[0].frameWidth;
+  const last = samples.at(-1)!.frameWidth;
+  assert(pinning ? last > first : last < first);
+  assert(samples.some((sample) => sample.frameWidth > Math.min(first, last) && sample.frameWidth < Math.max(first, last)),
+    "mode switch must animate through intermediate widths");
+  assertEquals(await page.locator(".sidebar-frame.folded").count(), pinning ? 0 : 1);
+}
+
 async function checkSidebarSlide(page: Page, mobile: boolean, opening: boolean): Promise<void> {
-  const toggle = page.locator(mobile ? ".app-shell__mobile-sidebar-toggle" : ".sidebar-fold-button");
-  const result = await toggle.evaluate(async (button, mobile) => {
+  const toggle = page.locator(mobile ? ".app-shell__mobile-sidebar-toggle" : ".sidebar-hover-region");
+  const result = await toggle.evaluate(async (button, { mobile, opening }) => {
     const frame = document.querySelector<HTMLElement>(".sidebar-frame")!;
     const content = frame.querySelector<HTMLElement>(".sidebar-frame-content")!;
     const main = document.querySelector<HTMLElement>(".app-shell__main")!;
     const moving = mobile ? frame : content;
+    const footer = frame.querySelector<HTMLElement>(".sidebar-control-row")!;
+    const pin = frame.querySelector<HTMLElement>(".sidebar-fold-button")!;
     const sample = () => ({
+      footerWidth: footer.getBoundingClientRect().width,
+      footerHeight: footer.getBoundingClientRect().height,
+      dividerLeft: parseFloat(getComputedStyle(footer, "::before").left),
+      dividerRight: parseFloat(getComputedStyle(footer, "::before").right),
+      footerBorder: getComputedStyle(footer).borderTopWidth,
+      pinWidth: pin.getBoundingClientRect().width,
+      pinHeight: pin.getBoundingClientRect().height,
       x: moving.getBoundingClientRect().x,
       width: moving.getBoundingClientRect().width,
       frameWidth: frame.getBoundingClientRect().width,
+      panelWidth: frame.querySelector(".sidebar-frame__bevel")!.getBoundingClientRect().width,
       mainWidth: main.getBoundingClientRect().width,
       mainHeight: main.getBoundingClientRect().height,
+      pinLeft: frame.querySelector(".sidebar-fold-button")!.getBoundingClientRect().left - frame.getBoundingClientRect().left,
+      pinBottom: frame.getBoundingClientRect().bottom - frame.querySelector(".sidebar-fold-button")!.getBoundingClientRect().bottom,
     });
     const before = sample();
-    (button as HTMLButtonElement).click();
+    if (mobile) {
+      (button as HTMLButtonElement).click();
+    } else {
+      button.dispatchEvent(new PointerEvent(opening ? "pointerenter" : "pointerleave", { pointerType: "mouse" }));
+      if (!opening) await new Promise((resolve) => setTimeout(resolve, 190));
+    }
     await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
     const animations = frame.getAnimations({ subtree: true });
     const slides = animations.filter((animation) => animation instanceof CSSTransition &&
@@ -70,22 +182,34 @@ async function checkSidebarSlide(page: Page, mobile: boolean, opening: boolean):
     for (const animation of animations) animation.finish();
     await Promise.all(animations.map((animation) => animation.finished));
     return { before, middle, after: sample(), durations, contentInert: content.inert, mainInert: main.inert };
-  }, mobile);
-  assert(result.durations.length >= (mobile ? 1 : 2));
+  }, { mobile, opening });
+  assert(result.durations.length >= (mobile ? 1 : 2), `missing sidebar motion: ${JSON.stringify({ mobile, opening, result })}`);
   assert(result.durations.every((duration) => duration === 220));
   const { before, middle, after } = result;
+  for (const sample of [before, middle, after]) {
+    assert(Math.abs(sample.pinLeft - 8) <= 1, "Pin must stay at the sidebar's left edge");
+    assert(Math.abs(sample.pinBottom - 8) <= 1, "Pin must stay at the sidebar's bottom edge");
+    assertEquals(sample.pinWidth, 32);
+    assertEquals(sample.pinHeight, 32);
+    assertEquals(sample.footerHeight, 48, "footer keeps compact, equal padding");
+    assertEquals(sample.dividerLeft, 8);
+    assertEquals(sample.dividerRight, 8);
+    assertEquals(sample.footerBorder, "0px", "divider must not touch the sidebar edges");
+  }
   assert(opening ? before.x < middle.x && middle.x < after.x : before.x > middle.x && middle.x > after.x,
     `sidebar must slide horizontally through an intermediate position: ${JSON.stringify(result)}`);
   assertEquals(before.width, after.width, "sidebar contents must slide without reflowing");
   assertEquals(result.contentInert, !opening);
   assertEquals(result.mainInert, mobile && opening);
-  if (mobile) {
-    assertEquals(before.mainWidth, after.mainWidth);
-    assertEquals(before.mainHeight, after.mainHeight);
-    assertEquals(after.frameWidth, before.frameWidth);
-  } else {
-    assert(opening ? before.frameWidth < middle.frameWidth && middle.frameWidth < after.frameWidth
-      : before.frameWidth > middle.frameWidth && middle.frameWidth > after.frameWidth);
+  assertEquals(before.mainWidth, after.mainWidth, "hover/touch previews must not resize the main content");
+  assertEquals(before.mainHeight, after.mainHeight);
+  assertEquals(after.frameWidth, before.frameWidth, "hover mode keeps a fixed rail width");
+  if (!mobile) {
+    const folded = opening ? before : after;
+    assertEquals(folded.footerWidth, folded.footerHeight, "folded footer must be square");
+    assert(opening ? before.panelWidth < middle.panelWidth && middle.panelWidth < after.panelWidth
+      : before.panelWidth > middle.panelWidth && middle.panelWidth > after.panelWidth,
+      "the overlay panel must expand past the rail and contract again");
   }
 }
 
@@ -384,24 +508,71 @@ async function checkConsoleHistory(viewportHeight: number): Promise<void> {
       assertEquals(new Set(rowIds).size, rowIds.length);
       await page.getByRole("button", { name: "Overview", exact: true }).click();
       assertEquals(await transcript.getByText("searched 1 time・ran 1 command", { exact: true }).count(), 12);
-      await checkSidebarSlide(page, false, false);
-      await checkSidebarSlide(page, false, true);
-      await checkSidebarSlide(page, false, false);
-      assertEquals(await page.evaluate(() => localStorage.getItem("yoi.sidebar.folded.v1")), "true");
-      await page.reload();
-      await page.getByRole("button", { name: "Unfold sidebar", exact: true }).waitFor();
-      assertEquals(await page.locator(".app-shell.sidebar-open").count(), 0);
-      await page.setViewportSize({ width: 600, height: viewportHeight });
-      await page.locator(".sidebar-frame").evaluate(async (element) => {
+      const sidebar = page.locator(".sidebar-frame");
+      const settleSidebar = () => sidebar.evaluate(async (element) => {
         await Promise.all(element.getAnimations({ subtree: true }).map((animation) => animation.finished));
       });
+      await checkSidebarModeSwitch(page, "Unpin sidebar");
+      await page.mouse.move(1000, 30);
+      await page.locator(".sidebar-frame.folded").waitFor();
+      await settleSidebar();
+      const mainBeforeHover = await page.locator(".app-shell__main").boundingBox();
+      await checkSidebarSlide(page, false, true);
+      await checkSidebarSlide(page, false, false);
+      // The entire footer, including its button, is outside hover activation.
+      const footer = sidebar.locator(".sidebar-control-row");
+      await footer.hover({ position: { x: 4, y: 4 } });
+      await page.waitForTimeout(250);
+      assertEquals(await page.locator(".sidebar-frame.folded").count(), 1);
+      await page.getByRole("button", { name: "Pin sidebar", exact: true }).hover();
+      await page.waitForTimeout(250);
+      assertEquals(await page.locator(".sidebar-frame.folded").count(), 1);
+      await sidebar.locator(".sidebar-hover-region").hover({ position: { x: 10, y: 24 } });
+      await page.locator(".sidebar-frame:not(.folded)").waitFor();
+      await settleSidebar();
+      await footer.hover({ position: { x: 4, y: 4 } });
+      await page.locator(".sidebar-frame.folded").waitFor();
+      await settleSidebar();
+      await checkSidebarPointerModeSwitch(page, true);
+      await checkSidebarPointerModeSwitch(page, false);
+      // Use real mouse and keyboard events as well as deterministic motion sampling.
+      await sidebar.hover({ position: { x: 10, y: 40 } });
+      await page.locator(".sidebar-frame:not(.folded)").waitFor();
+      await settleSidebar();
+      assertEquals(await page.locator(".app-shell__main").boundingBox(), mainBeforeHover);
+      const sidebarLink = sidebar.locator(".sidebar-frame-content a").first();
+      await sidebarLink.focus();
+      await page.mouse.move(1000, 30);
+      await page.waitForTimeout(250);
+      assertEquals(await page.locator(".sidebar-frame.folded").count(), 0, "keyboard focus must hold the preview open");
+      await page.getByRole("link", { name: "Open Account", exact: true }).focus();
+      await page.locator(".sidebar-frame.folded").waitFor();
+      await settleSidebar();
+      await sidebar.hover({ position: { x: 10, y: 40 } });
+      await checkSidebarModeSwitch(page, "Pin sidebar");
+      await page.mouse.move(1000, 30);
+      await page.waitForTimeout(250);
+      assertEquals(await page.locator(".sidebar-frame.folded").count(), 0);
+      assertEquals(await page.evaluate(() => localStorage.getItem("yoi.sidebar.mode.v1")), "pinned");
+      await checkSidebarModeSwitch(page, "Unpin sidebar");
+      // Hold a preview open across reload; only the mode should be restored.
+      await sidebarLink.focus();
+      await page.mouse.move(1000, 30);
+      assertEquals(await page.evaluate(() => localStorage.getItem("yoi.sidebar.mode.v1")), "hover");
+      await page.reload();
+      await page.getByRole("button", { name: "Pin sidebar", exact: true }).waitFor();
+      assertEquals(await page.locator(".app-shell.sidebar-open").count(), 0);
+      await page.setViewportSize({ width: 600, height: viewportHeight });
+      await settleSidebar();
       await checkSidebarSlide(page, true, true);
       await checkSidebarSlide(page, true, false);
       await checkSidebarSlide(page, true, true);
-      assertEquals(await page.evaluate(() => localStorage.getItem("yoi.sidebar.folded.v1")), "false");
+      assertEquals(await page.evaluate(() => localStorage.getItem("yoi.sidebar.mode.v1")), "hover");
       await page.reload();
-      await page.getByRole("button", { name: "Hide sidebar", exact: true }).waitFor();
-      assertEquals(await page.locator(".app-shell.sidebar-open").count(), 1);
+      await page.getByRole("button", { name: "Show sidebar", exact: true }).waitFor();
+      assertEquals(await page.locator(".app-shell.sidebar-open").count(), 0);
+      await page.getByRole("button", { name: "Show sidebar", exact: true }).click();
+      await settleSidebar();
       await page.emulateMedia({ reducedMotion: "reduce" });
       await page.getByRole("button", { name: "Hide sidebar", exact: true }).click();
       const reducedSidebar = await page.locator(".sidebar-frame").evaluate((element) => ({
@@ -411,6 +582,31 @@ async function checkConsoleHistory(viewportHeight: number): Promise<void> {
       }));
       assertEquals(reducedSidebar, { animations: 0, right: 0, visibility: "hidden" });
       assertEquals(await page.locator(".app-shell__main").evaluate((element) => (element as HTMLElement).inert), false);
+      if (viewportHeight === 600) {
+        const touchContext = await browser.newContext({
+          viewport: { width: 600, height: 600 }, hasTouch: true, isMobile: true,
+          storageState: await context.storageState(),
+        });
+        const touchPage = await touchContext.newPage();
+        await touchPage.goto(page.url());
+        await touchPage.getByRole("button", { name: "Show sidebar", exact: true }).tap();
+        await touchPage.getByRole("button", { name: "Pin sidebar", exact: true }).tap();
+        assertEquals(await touchPage.evaluate(() => localStorage.getItem("yoi.sidebar.mode.v1")), "pinned");
+        await touchPage.getByRole("button", { name: "Hide sidebar", exact: true }).tap();
+        await touchPage.reload();
+        await touchPage.getByRole("button", { name: "Show sidebar", exact: true }).waitFor();
+        assertEquals(await touchPage.evaluate(() => localStorage.getItem("yoi.sidebar.mode.v1")), "pinned");
+        // A wide touchscreen still has a temporary-open control in hover mode.
+        await touchPage.setViewportSize({ width: 1024, height: 600 });
+        await touchPage.getByRole("button", { name: "Unpin sidebar", exact: true }).tap();
+        await touchPage.locator(".sidebar-frame.folded").waitFor();
+        await touchPage.getByRole("button", { name: "Show sidebar", exact: true }).tap();
+        await touchPage.locator(".sidebar-frame:not(.folded)").waitFor();
+        await touchPage.getByRole("button", { name: "Hide sidebar", exact: true }).tap();
+        await touchPage.locator(".sidebar-frame.folded").waitFor();
+        assertEquals(await touchPage.evaluate(() => localStorage.getItem("yoi.sidebar.mode.v1")), "hover");
+        await touchContext.close();
+      }
       assertEquals(errors, []);
       await context.close();
     } finally {

@@ -991,12 +991,16 @@ async fn compact_failure_and_cancellation_emit_bounded_categories() {
     let encoded = serde_json::to_string(&failure.metric).unwrap();
     assert!(!encoded.contains("missing summary"));
 
-    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(true);
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    cancel_tx.send(true).unwrap();
     let error = worker
         .manual_compact_with_cancel(cancel_rx)
         .await
         .unwrap_err();
-    assert!(matches!(error, worker::WorkerError::CompactCancelled));
+    assert!(
+        matches!(error, worker::WorkerError::CompactCancelled),
+        "unexpected cancellation error: {error:?}"
+    );
     let metrics = session_metrics::read_session_metrics(worker.store(), session_id).unwrap();
     let cancelled = metrics
         .iter()
@@ -1503,7 +1507,14 @@ async fn compacted_context_above_request_threshold_fails_before_provider_request
         .await
         .expect_err("unsafe compacted context must fail closed");
 
-    assert!(matches!(error, WorkerError::CompactThrash));
+    assert!(
+        matches!(
+            error,
+            WorkerError::RunFailureAlreadyDelivered { ref source }
+                if matches!(**source, WorkerError::CompactThrash)
+        ),
+        "unexpected error: {error:?}"
+    );
     assert_eq!(
         call_count.load(Ordering::SeqCst),
         3,
@@ -1524,6 +1535,100 @@ async fn compacted_context_above_request_threshold_fails_before_provider_request
             } if message.contains("mid-run compaction could not continue")
         )
     }));
+}
+
+#[tokio::test]
+async fn controller_does_not_repeat_a_persisted_mid_run_compaction_failure() {
+    let client = MockClient::new(vec![
+        grow_tool_use_events("grow-before-compaction", 1_000),
+        single_text_events("missing summary"),
+        single_text_events("still missing summary"),
+    ]);
+    let (worker, store) = make_worker_with_manifest_and_store(MID_TURN_MANIFEST_TOML, client).await;
+    let session_id = worker.session_id();
+    let runtime_tmp = tempfile::tempdir().unwrap();
+    let bash_output_dir = runtime_tmp.path().join("bash-output");
+    let (handle, shutdown_receiver) =
+        WorkerController::spawn(worker, runtime_tmp.path(), &bash_output_dir)
+            .await
+            .unwrap();
+    let mut rx = handle.subscribe();
+
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "trigger failing compaction",
+        ))
+        .await
+        .unwrap();
+    let mut observed = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let event = rx.recv().await.expect("event");
+            let idle = matches!(
+                event,
+                Event::WorkerState {
+                    snapshot: protocol::WorkerStateSnapshot {
+                        state: protocol::WorkerState::Idle,
+                        ..
+                    }
+                }
+            );
+            observed.push(event);
+            if idle {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for failed compaction and Idle");
+    tokio::task::yield_now().await;
+    while let Ok(event) = rx.try_recv() {
+        observed.push(event);
+    }
+
+    let delivered = handle
+        .committed_entries()
+        .into_iter()
+        .filter(|entry| matches!(entry, LogEntry::RunErrored { .. }))
+        .count();
+    assert_eq!(delivered, 1, "the durable terminal is the only delivery");
+    assert!(
+        observed
+            .iter()
+            .all(|event| !matches!(event, Event::Error { .. })),
+        "Controller must not add a generic Error after durable delivery"
+    );
+    assert!(
+        observed.iter().all(|event| !matches!(
+            event,
+            Event::Alert(protocol::Alert {
+                level: protocol::AlertLevel::Error,
+                ..
+            })
+        )),
+        "mid-run terminal failure must not add an Error Alert"
+    );
+
+    let terminal_count = store
+        .list_segments(session_id)
+        .unwrap()
+        .into_iter()
+        .flat_map(|segment_id| store.read_all(session_id, segment_id).unwrap())
+        .filter(|entry| matches!(entry, LogEntry::RunErrored { .. }))
+        .count();
+    assert_eq!(terminal_count, 1);
+
+    handle
+        .send(Method::Shutdown {
+            command: protocol::WorkerCommandEnvelope::new(1),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), shutdown_receiver)
+        .await
+        .expect("controller shutdown timeout")
+        .expect("shutdown confirmation");
 }
 
 #[tokio::test]
@@ -1621,6 +1726,7 @@ async fn manual_compact_cancel_clears_progress_before_returning_idle() {
         .expect("send compact cancel");
     let mut saw_interrupted = false;
     let mut saw_idle = false;
+    let mut saw_cancel_error = false;
     while !(saw_interrupted && saw_idle) {
         match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
@@ -1630,6 +1736,11 @@ async fn manual_compact_cancel_clears_progress_before_returning_idle() {
             Event::CompactionProgress { compaction: None } => {
                 saw_interrupted = true;
             }
+            Event::Error { .. }
+            | Event::Alert(protocol::Alert {
+                level: protocol::AlertLevel::Error,
+                ..
+            }) => saw_cancel_error = true,
             Event::WorkerState { snapshot }
                 if snapshot.catalog_status() == protocol::WorkerStatus::Idle =>
             {
@@ -1642,6 +1753,10 @@ async fn manual_compact_cancel_clears_progress_before_returning_idle() {
             _ => {}
         }
     }
+    assert!(
+        !saw_cancel_error,
+        "intentional manual cancellation must not be reported as an Error"
+    );
 
     let compact = protocol::WorkerCommandEnvelope::new(3);
     handle
