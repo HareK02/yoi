@@ -1002,6 +1002,7 @@ export function applyProtocolEvent(
       next.usage = usageText(event.data);
       break;
     case "error":
+      if (hasDurableRunFailure(next, event.data.message)) break;
       next.lines.push(
         line(
           envelope.eventId,
@@ -1264,12 +1265,55 @@ function upsertStatusLine(
   }
 }
 
+function runFailureMessagesMatch(left: string, right: string): boolean {
+  return left.length > 0 && right.length > 0 &&
+    (left === right || left.endsWith(right) || right.endsWith(left));
+}
+
+function isDurableRunFailure(line: ConsoleLine): boolean {
+  return line.kind === "error" &&
+    (line.title === "Run error" || line.title === "Compaction failed");
+}
+
+function hasDurableRunFailure(
+  projection: ConsoleProjection,
+  message: string,
+): boolean {
+  return projection.lines.some((line) =>
+    isDurableRunFailure(line) && runFailureMessagesMatch(line.body, message)
+  );
+}
+
+function appendDurableRunFailure(
+  projection: ConsoleProjection,
+  eventId: string,
+  message: string,
+  failure: string | undefined,
+): void {
+  projection.lines = projection.lines.filter((line) => {
+    if (isDurableRunFailure(line)) return true;
+    return !(line.kind === "error" && runFailureMessagesMatch(line.body, message));
+  });
+  projection.lines.push(
+    line(
+      eventId,
+      "error",
+      failure === "compaction" ? "Compaction failed" : "Run error",
+      message,
+      undefined,
+      false,
+      true,
+    ),
+  );
+}
+
 function appendAlertLine(
   projection: ConsoleProjection,
   eventId: string,
   alert: Alert,
 ): void {
   const isError = alert.level === "error";
+  if (isError && hasDurableRunFailure(projection, alert.message)) return;
   projection.lines.push(
     line(
       eventId,
@@ -2144,17 +2188,17 @@ function applySessionEntry(
       applyTaskSystemItem(projection, item);
       break;
     }
+    case "run_yielded":
+    case "run_resumed":
+      // Durable logical-Run transitions are replayable state, not Console
+      // progress rows. Runtime compaction progress remains the spinner authority.
+      break;
     case "run_error":
-      projection.lines.push(
-        line(
-          eventId,
-          "error",
-          "Run error",
-          stringField(value, "message") ?? "Worker run failed.",
-          undefined,
-          false,
-          true,
-        ),
+      appendDurableRunFailure(
+        projection,
+        eventId,
+        stringField(value, "message") ?? "Worker run failed.",
+        stringField(value, "failure"),
       );
       break;
     default:

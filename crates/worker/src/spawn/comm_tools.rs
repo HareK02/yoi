@@ -83,6 +83,7 @@ mod tests {
                         derived_from: Vec::new(),
                         data: protocol::SessionSnapshotEntryData::RunError {
                             message: value.to_string(),
+                            failure: None,
                         },
                     })
                     .collect(),

@@ -424,7 +424,7 @@ use async_trait::async_trait;
 use protocol::{
     AlertLevel, AlertSource, CompactionLifecycle, CompactionLifecycleState, CompactionPhase,
     CompactionTrigger, ErrorCode, Event, InFlightCompaction, RewindSummary, RewindTarget,
-    RewindTargetId, Segment,
+    RewindTargetId, RunFailureKind, RunResumeSource, RunYieldReason, Segment,
 };
 use tokio::net::UnixStream;
 use tokio::sync::broadcast;
@@ -3471,7 +3471,9 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                         result: EngineResult::Finished,
                         ..
                     } => Some(CommittedRunExit::Finished),
-                    LogEntry::RunCompleted { .. } => Some(CommittedRunExit::NonFinal),
+                    LogEntry::RunCompleted { .. }
+                    | LogEntry::RunYielded { .. }
+                    | LogEntry::RunResumed { .. } => Some(CommittedRunExit::NonFinal),
                     LogEntry::RunErrored { .. } => Some(CommittedRunExit::Interrupted),
                     _ => None,
                 })
@@ -4660,12 +4662,40 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.handle_worker_result(result, history_before).await
     }
 
-    /// Resume from a paused state.
+    /// Resume from an intentional user pause. The durable transition is
+    /// committed only after preparation succeeds and immediately before Engine
+    /// receives control.
     pub async fn resume(&mut self) -> Result<WorkerRunResult, WorkerError>
     where
         St: Clone + 'static,
     {
+        self.resume_from(RunResumeSource::Pause).await
+    }
+
+    async fn resume_from(&mut self, source: RunResumeSource) -> Result<WorkerRunResult, WorkerError>
+    where
+        St: Clone + 'static,
+    {
         self.prepare_for_run().await?;
+        self.resume_prepared(source).await
+    }
+
+    async fn resume_prepared(
+        &mut self,
+        source: RunResumeSource,
+    ) -> Result<WorkerRunResult, WorkerError>
+    where
+        St: Clone + 'static,
+    {
+        let active_run_turn_count = self
+            .engine()
+            .active_run_turn_count()
+            .expect("pause/yield resume must retain the logical-run turn budget");
+        self.commit_entry(LogEntry::RunResumed {
+            ts: segment_log::now_millis(),
+            source,
+            active_run_turn_count,
+        })?;
 
         let history_before = self.session.history().len();
         let mut annotate = history_annotator(
@@ -4829,12 +4859,13 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         Ok(())
     }
 
-    /// Handle Engine result: always persist the turn first, then if
-    /// `Yielded`, perform compaction and resume.
+    /// Handle one Engine execution boundary: persist its turn and transition,
+    /// then compact and resume when Engine yielded for compaction.
     ///
-    /// Persisting before compaction ensures that if compact fails, the
-    /// turn is fully recorded in the old session (interrupted, outcome
-    /// `Yielded`), so restore remains consistent.
+    /// A yield commits `RunYielded`, never `RunCompleted`. Successful preparation
+    /// later commits `RunResumed` on the active replacement Segment immediately
+    /// before Engine regains control; a compaction failure instead commits the
+    /// same logical Run's terminal `RunErrored`.
     async fn handle_worker_result(
         &mut self,
         result: EngineRunExit,
@@ -4867,7 +4898,18 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         if matches!(&result, EngineRunExit::Interrupted(_)) {
             self.terminalize_orphan_tool_calls()?;
         }
-        self.persist_turn(history_before, &result).await?;
+        let request_block = self
+            .compact_state
+            .as_ref()
+            .and_then(|state| state.take_pending_request_block());
+        let request_block_message = request_block.map(|block| {
+            format!(
+                "mid-run compaction could not continue: {}",
+                automatic_compact_block_error(block)
+            )
+        });
+        self.persist_turn(history_before, &result, request_block_message.as_deref())
+            .await?;
         let committed_invocation = self.hook_invocation_context(Some(run_id));
         if let Some(hooks) = self.hook_registry.clone() {
             let context = RunCommittedContext {
@@ -4895,15 +4937,17 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             tracing::warn!(error = %error, "run-committed background task start failed");
         }
 
-        let request_block = self
-            .compact_state
-            .as_ref()
-            .and_then(|state| state.take_pending_request_block());
         if let Some(block) = request_block {
+            let error = automatic_compact_block_error(block);
+            if matches!(result, EngineRunExit::Yielded) {
+                self.persist_compaction_run_failure(
+                    request_block_message.expect("blocked request has a terminal reason"),
+                );
+            }
             if let Some(state) = &self.compact_state {
                 state.finish_logical_run();
             }
-            return Err(automatic_compact_block_error(block));
+            return Err(error);
         }
 
         if matches!(result, EngineRunExit::Yielded) {
@@ -4946,6 +4990,36 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             in_flight.set_compaction(compaction);
         } else if let Some(tx) = &self.working_event_tx {
             let _ = tx.send(Event::CompactionProgress { compaction });
+        }
+    }
+
+    fn persist_compaction_run_failure(&mut self, message: String) {
+        // Keep the original compaction/preparation error as controller authority.
+        // A terminal append failure is diagnosed separately and cannot publish a
+        // false persisted result through the session-log sink.
+        match self.commit_entry(LogEntry::RunErrored {
+            ts: segment_log::now_millis(),
+            interrupted: false,
+            message,
+            failure: Some(RunFailureKind::Compaction),
+        }) {
+            Ok(()) => {
+                self.last_run_interrupted = false;
+                self.engine_mut().set_active_run_turn_count(None);
+            }
+            Err(persist_error) => {
+                warn!(
+                    error = %persist_error,
+                    "failed to persist mid-run compaction terminal record"
+                );
+                self.alert(
+                    AlertLevel::Error,
+                    AlertSource::Worker,
+                    format!(
+                        "mid-run compaction failed and its Run terminal record could not be saved: {persist_error}"
+                    ),
+                );
+            }
         }
     }
 
@@ -4992,15 +5066,21 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                             "automatic compaction must complete a claimed attempt"
                         );
                     }
-                    self.resume().await
+                    if let Err(error) = self.prepare_for_run().await {
+                        if let Some(state) = &state {
+                            state.finish_logical_run();
+                        }
+                        let message =
+                            format!("mid-run resume preparation failed after compaction: {error}");
+                        self.persist_compaction_run_failure(message.clone());
+                        self.alert(AlertLevel::Error, AlertSource::Compactor, message);
+                        return Err(error);
+                    }
+                    self.resume_prepared(RunResumeSource::Compaction).await
                 }
                 Err(e) => {
                     warn!(error = %e, "Compaction failed during run");
-                    self.alert(
-                        AlertLevel::Error,
-                        AlertSource::Compactor,
-                        format!("mid-run compaction failed: {e}"),
-                    );
+                    let message = format!("mid-run compaction failed: {e}");
                     if let Some(state) = &state {
                         let outcome = if matches!(e, WorkerError::CompactCancelled) {
                             CompactionOutcome::Cancelled
@@ -5012,7 +5092,17 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                             completed,
                             "automatic compaction must complete a claimed attempt"
                         );
+                        state.finish_logical_run();
                     }
+
+                    // The yielded logical Run is no longer resumable. Commit its
+                    // durable failure before any log-derived live event can claim
+                    // the terminal transition. If storage itself is unavailable,
+                    // the helper retains the original compaction error (and its
+                    // fail-closed controller classification) while diagnosing the
+                    // missing terminal record separately.
+                    self.persist_compaction_run_failure(message.clone());
+                    self.alert(AlertLevel::Error, AlertSource::Compactor, message);
                     Err(e)
                 }
             }
@@ -5209,6 +5299,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         &mut self,
         history_before: usize,
         result: &EngineRunExit,
+        compaction_failure: Option<&str>,
     ) -> Result<(), StoreError> {
         // Per-item commits for AssistantItem / ToolResult / SystemItem
         // entries are expected to have landed synchronously: the
@@ -5314,19 +5405,37 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 | EngineRunExit::Interrupted(RunInterruptionReason::Unexpected(_))
         );
         let active_run_turn_count = self.engine.as_ref().unwrap().active_run_turn_count();
+        if let Some(message) = compaction_failure
+            && !matches!(result, EngineRunExit::Yielded)
+        {
+            self.commit_entry(LogEntry::RunErrored {
+                ts: segment_log::now_millis(),
+                interrupted: false,
+                message: message.to_string(),
+                failure: Some(RunFailureKind::Compaction),
+            })?;
+            return Ok(());
+        }
         match result {
-            EngineRunExit::Finished | EngineRunExit::Paused | EngineRunExit::Yielded => {
+            EngineRunExit::Finished | EngineRunExit::Paused => {
                 let result = match result {
                     EngineRunExit::Finished => EngineResult::Finished,
                     EngineRunExit::Paused => EngineResult::Paused,
-                    EngineRunExit::Yielded => EngineResult::Yielded,
-                    EngineRunExit::Interrupted(_) => unreachable!(),
+                    EngineRunExit::Yielded | EngineRunExit::Interrupted(_) => unreachable!(),
                 };
                 self.commit_entry(LogEntry::RunCompleted {
                     ts: segment_log::now_millis(),
                     interrupted,
                     result,
                     active_run_turn_count,
+                })?;
+            }
+            EngineRunExit::Yielded => {
+                self.commit_entry(LogEntry::RunYielded {
+                    ts: segment_log::now_millis(),
+                    reason: RunYieldReason::Compaction,
+                    active_run_turn_count: active_run_turn_count
+                        .expect("yielded logical run must retain its turn budget"),
                 })?;
             }
             EngineRunExit::Interrupted(RunInterruptionReason::LimitReached) => {
@@ -5342,6 +5451,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     ts: segment_log::now_millis(),
                     interrupted,
                     message: run_interruption_reason_message(reason),
+                    failure: Some(RunFailureKind::Engine),
                 })?;
             }
         }
@@ -9128,6 +9238,104 @@ mod build_summary_prompt_tests {
     }
 
     #[tokio::test]
+    async fn yielded_engine_exit_commits_intermediate_transition_not_run_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let mut worker = Worker::new(
+            minimal_manifest(),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+            store.clone(),
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        worker.ensure_segment_head().await.unwrap();
+        worker.engine_mut().set_active_run_turn_count(Some(2));
+
+        worker
+            .persist_turn(0, &EngineRunExit::Yielded, None)
+            .await
+            .unwrap();
+
+        let entries = store
+            .read_all(worker.session_id(), worker.segment_id())
+            .unwrap();
+        assert!(entries.iter().any(|entry| matches!(
+            entry,
+            LogEntry::RunYielded {
+                reason: RunYieldReason::Compaction,
+                active_run_turn_count: 2,
+                ..
+            }
+        )));
+        assert!(!entries.iter().any(|entry| matches!(
+            entry,
+            LogEntry::RunCompleted {
+                result: EngineResult::Yielded,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn failed_compaction_terminalizes_the_yielded_run_without_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let mut worker = Worker::new(
+            minimal_manifest(),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+            store.clone(),
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        worker.ensure_segment_head().await.unwrap();
+        worker.engine_mut().set_active_run_turn_count(Some(2));
+        worker
+            .persist_turn(0, &EngineRunExit::Yielded, None)
+            .await
+            .unwrap();
+        worker.last_run_interrupted = true;
+
+        worker.persist_compaction_run_failure(
+            "mid-run compaction failed: summary unavailable".into(),
+        );
+
+        let entries = store
+            .read_all(worker.session_id(), worker.segment_id())
+            .unwrap();
+        let yielded = entries
+            .iter()
+            .position(|entry| matches!(entry, LogEntry::RunYielded { .. }))
+            .unwrap();
+        let failed = entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry,
+                    LogEntry::RunErrored {
+                        interrupted: false,
+                        failure: Some(RunFailureKind::Compaction),
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(yielded < failed);
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| matches!(entry, LogEntry::RunResumed { .. }))
+        );
+        assert!(!worker.last_run_interrupted);
+        assert_eq!(worker.engine().active_run_turn_count(), None);
+    }
+
+    #[tokio::test]
     async fn fresh_run_clears_interrupted_budget_before_pre_run_compaction() {
         let dir = tempfile::tempdir().unwrap();
         let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
@@ -10242,7 +10450,7 @@ mod build_summary_prompt_tests {
         let mut worker = Worker::new(
             minimal_manifest(),
             engine,
-            store,
+            store.clone(),
             WorkerWorkspaceContext::no_workspace(),
             WorkerFilesystemAuthority::None,
             Scope::empty(),
@@ -10265,6 +10473,14 @@ mod build_summary_prompt_tests {
             item,
             Item::ToolResult { call_id, .. } if call_id == "call_pending"
         )));
+        let paused_entries = store
+            .read_all(worker.session_id(), worker.segment_id())
+            .unwrap();
+        assert!(
+            !paused_entries
+                .iter()
+                .any(|entry| matches!(entry, LogEntry::RunResumed { .. }))
+        );
 
         assert_eq!(worker.resume().await.unwrap(), WorkerRunResult::Finished);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -10283,6 +10499,26 @@ mod build_summary_prompt_tests {
                 .count(),
             1
         );
+        let resumed_entries = store
+            .read_all(worker.session_id(), worker.segment_id())
+            .unwrap();
+        let resume_index = resumed_entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry,
+                    LogEntry::RunResumed {
+                        source: RunResumeSource::Pause,
+                        ..
+                    }
+                )
+            })
+            .expect("pause resume transition");
+        let terminal_index = resumed_entries
+            .iter()
+            .rposition(|entry| matches!(entry, LogEntry::RunCompleted { .. }))
+            .expect("resumed run terminal");
+        assert!(resume_index < terminal_index);
     }
 
     #[tokio::test]
@@ -10962,6 +11198,7 @@ mod build_summary_prompt_tests {
                 ts: segment_log::now_millis(),
                 interrupted: true,
                 message: "cancelled".to_string(),
+                failure: Some(RunFailureKind::Engine),
             })
             .unwrap();
         assert_eq!(
@@ -10979,6 +11216,17 @@ mod build_summary_prompt_tests {
         assert_eq!(
             capture_handle.capture().unwrap().run_exit,
             CommittedRunExit::Finished
+        );
+        worker
+            .commit_entry(LogEntry::RunResumed {
+                ts: segment_log::now_millis(),
+                source: RunResumeSource::Compaction,
+                active_run_turn_count: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            capture_handle.capture().unwrap().run_exit,
+            CommittedRunExit::NonFinal
         );
     }
 

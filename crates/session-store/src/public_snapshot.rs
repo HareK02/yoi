@@ -985,6 +985,8 @@ fn project_session_snapshot_for_segment(
 ) -> SessionSnapshot {
     let mut session_key = session_id;
     let mut entries = Vec::new();
+    let mut total_turn_count = 0usize;
+    let mut active_run_turn_count = None;
 
     for (log_index, record) in log.iter().enumerate() {
         match record {
@@ -996,6 +998,8 @@ fn project_session_snapshot_for_segment(
             } => {
                 session_key = *session_id;
                 entries.clear();
+                total_turn_count = 0;
+                active_run_turn_count = None;
                 extend_history(&mut entries, history, None, *ts);
             }
             LogEntry::InputSegmentsCheckpoint { user_segments, .. } => {
@@ -1035,24 +1039,108 @@ fn project_session_snapshot_for_segment(
                 provenance(&entry.metadata.origin),
                 derivation_ids(entry),
             )),
-            LogEntry::RunErrored { ts, message, .. } => entries.push(legacy_entry(
-                &session_key,
-                segment_id.as_ref(),
-                log_index,
-                0,
-                *ts,
-                SessionSnapshotEntryData::RunError {
-                    message: message.clone(),
-                },
-            )),
-            // Run checkpoints, configuration, usage, and extension state are
-            // controller/storage authority rather than committed conversation.
-            LogEntry::Invoke { .. }
-            | LogEntry::TurnEnd { .. }
-            | LogEntry::RunCompleted { .. }
-            | LogEntry::ActiveRunCheckpoint { .. }
-            | LogEntry::PausedTurnAbandoned { .. }
-            | LogEntry::ConfigChanged { .. }
+            LogEntry::RunYielded {
+                ts,
+                reason,
+                active_run_turn_count: count,
+            } => {
+                active_run_turn_count = Some(*count);
+                entries.push(legacy_entry(
+                    &session_key,
+                    segment_id.as_ref(),
+                    log_index,
+                    0,
+                    *ts,
+                    SessionSnapshotEntryData::RunYielded {
+                        reason: *reason,
+                        active_run_turn_count: *count,
+                    },
+                ));
+            }
+            LogEntry::RunResumed {
+                ts,
+                source,
+                active_run_turn_count: count,
+            } => {
+                active_run_turn_count = Some(*count);
+                entries.push(legacy_entry(
+                    &session_key,
+                    segment_id.as_ref(),
+                    log_index,
+                    0,
+                    *ts,
+                    SessionSnapshotEntryData::RunResumed {
+                        source: *source,
+                        active_run_turn_count: *count,
+                    },
+                ));
+            }
+            LogEntry::RunErrored {
+                ts,
+                message,
+                failure,
+                ..
+            } => {
+                active_run_turn_count = None;
+                entries.push(legacy_entry(
+                    &session_key,
+                    segment_id.as_ref(),
+                    log_index,
+                    0,
+                    *ts,
+                    SessionSnapshotEntryData::RunError {
+                        message: message.clone(),
+                        failure: *failure,
+                    },
+                ));
+            }
+            LogEntry::Invoke { .. } => active_run_turn_count = Some(0),
+            LogEntry::TurnEnd { turn_count, .. } => {
+                if let Some(active) = &mut active_run_turn_count {
+                    *active += turn_count.saturating_sub(total_turn_count);
+                }
+                total_turn_count = *turn_count;
+            }
+            LogEntry::RunCompleted {
+                ts,
+                interrupted,
+                result,
+                active_run_turn_count: persisted_count,
+            } => {
+                if *interrupted && matches!(result, agen::EngineResult::Yielded) {
+                    let count = (*persisted_count)
+                        .or(active_run_turn_count)
+                        .unwrap_or_default();
+                    active_run_turn_count = Some(count);
+                    entries.push(legacy_entry(
+                        &session_key,
+                        segment_id.as_ref(),
+                        log_index,
+                        0,
+                        *ts,
+                        SessionSnapshotEntryData::RunYielded {
+                            reason: protocol::RunYieldReason::Compaction,
+                            active_run_turn_count: count,
+                        },
+                    ));
+                } else if *interrupted && matches!(result, agen::EngineResult::Paused) {
+                    active_run_turn_count = (*persisted_count).or(active_run_turn_count);
+                } else {
+                    active_run_turn_count = None;
+                }
+            }
+            LogEntry::ActiveRunCheckpoint {
+                active_turn_count,
+                total_turn_count: persisted_total,
+                ..
+            } => {
+                active_run_turn_count = Some(*active_turn_count);
+                total_turn_count = *persisted_total;
+            }
+            LogEntry::PausedTurnAbandoned { .. } => active_run_turn_count = None,
+            // Configuration, usage, and extension state are controller/storage
+            // authority rather than committed conversation.
+            LogEntry::ConfigChanged { .. }
             | LogEntry::LlmUsage { .. }
             | LogEntry::Extension { .. } => {}
         }
@@ -2676,6 +2764,89 @@ mod tests {
             snapshot.entries[0].provenance,
             SessionEntryProvenance::ModelOutput
         );
+    }
+
+    #[test]
+    fn legacy_run_completed_yield_projects_as_nonterminal_run_yielded() {
+        let session_id = crate::new_session_id();
+        let legacy: LogEntry = serde_json::from_value(serde_json::json!({
+            "kind": "run_completed",
+            "ts": 30,
+            "interrupted": true,
+            "result": "yielded"
+        }))
+        .unwrap();
+        let snapshot = project_session_snapshot(
+            session_id,
+            &[
+                LogEntry::Invoke {
+                    ts: 10,
+                    trigger: protocol::InvokeKind::UserSend,
+                },
+                LogEntry::TurnEnd {
+                    ts: 20,
+                    turn_count: 4,
+                },
+                legacy,
+            ],
+        );
+
+        assert_eq!(snapshot.entries.len(), 1);
+        assert!(matches!(
+            snapshot.entries[0].data,
+            SessionSnapshotEntryData::RunYielded {
+                reason: protocol::RunYieldReason::Compaction,
+                active_run_turn_count: 4,
+            }
+        ));
+    }
+
+    #[test]
+    fn run_transitions_project_with_timestamps_and_typed_causes() {
+        let session_id = crate::new_session_id();
+        let log = vec![
+            LogEntry::RunYielded {
+                ts: 10,
+                reason: protocol::RunYieldReason::Compaction,
+                active_run_turn_count: 2,
+            },
+            LogEntry::RunResumed {
+                ts: 20,
+                source: protocol::RunResumeSource::Compaction,
+                active_run_turn_count: 2,
+            },
+            LogEntry::RunErrored {
+                ts: 30,
+                interrupted: false,
+                message: "mid-run compaction failed: unavailable".into(),
+                failure: Some(protocol::RunFailureKind::Compaction),
+            },
+        ];
+
+        let snapshot = project_session_snapshot(session_id, &log);
+        assert_eq!(snapshot.entries.len(), 3);
+        assert_eq!(snapshot.entries[0].timestamp, 10);
+        assert!(matches!(
+            snapshot.entries[0].data,
+            SessionSnapshotEntryData::RunYielded {
+                reason: protocol::RunYieldReason::Compaction,
+                active_run_turn_count: 2,
+            }
+        ));
+        assert!(matches!(
+            snapshot.entries[1].data,
+            SessionSnapshotEntryData::RunResumed {
+                source: protocol::RunResumeSource::Compaction,
+                active_run_turn_count: 2,
+            }
+        ));
+        assert!(matches!(
+            snapshot.entries[2].data,
+            SessionSnapshotEntryData::RunError {
+                failure: Some(protocol::RunFailureKind::Compaction),
+                ..
+            }
+        ));
     }
 
     #[test]

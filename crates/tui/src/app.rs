@@ -961,6 +961,34 @@ impl App {
     }
 
     fn push_run_error(&mut self, message: String) {
+        if self
+            .run_error_messages
+            .iter()
+            .any(|existing| run_failure_messages_match(existing, &message))
+        {
+            return;
+        }
+        self.run_error_messages.push(message.clone());
+        self.blocks.push(Block::Alert {
+            level: AlertLevel::Error,
+            source: AlertSource::Worker,
+            message,
+        });
+    }
+
+    fn push_durable_run_error(&mut self, message: String) {
+        self.run_error_messages
+            .retain(|existing| !run_failure_messages_match(existing, &message));
+        self.blocks.retain(|block| {
+            !matches!(
+                block,
+                Block::Alert {
+                    level: AlertLevel::Error,
+                    message: existing,
+                    ..
+                } if run_failure_messages_match(existing, &message)
+            )
+        });
         self.run_error_messages.push(message.clone());
         self.blocks.push(Block::Alert {
             level: AlertLevel::Error,
@@ -970,6 +998,13 @@ impl App {
     }
 
     fn handle_error(&mut self, code: ErrorCode, message: String) {
+        if self
+            .run_error_messages
+            .iter()
+            .any(|existing| run_failure_messages_match(existing, &message))
+        {
+            return;
+        }
         let text = format!("[{code:?}] {message}");
         let was_applying = if let Some(picker) = self.rewind_picker.as_mut() {
             let applying = picker.applying;
@@ -1169,9 +1204,11 @@ impl App {
                 }
                 self.assistant_streaming = false;
             }
-            // The TUI already renders assistant/tool streaming events. This commit
-            // marker exists so identity-aware clients can reconcile durable history.
-            Event::SessionEntryCommitted { .. } => {}
+            Event::SessionEntryCommitted { entry } => {
+                if let protocol::SessionSnapshotEntryData::RunError { message, .. } = entry.data {
+                    self.push_durable_run_error(message);
+                }
+            }
             Event::SystemItem { item } => {
                 self.apply_system_item(&item);
                 self.assistant_streaming = false;
@@ -1495,6 +1532,14 @@ impl App {
                 }
             }
             Event::Alert(alert) => {
+                if alert.level == AlertLevel::Error
+                    && self
+                        .run_error_messages
+                        .iter()
+                        .any(|message| run_failure_messages_match(message, &alert.message))
+                {
+                    return None;
+                }
                 self.blocks.push(Block::Alert {
                     level: alert.level,
                     source: alert.source,
@@ -2499,7 +2544,12 @@ impl App {
                         self.apply_system_item(data);
                     }
                 }
-                SessionSnapshotEntryData::RunError { message } => {
+                SessionSnapshotEntryData::RunYielded { .. }
+                | SessionSnapshotEntryData::RunResumed { .. } => {
+                    // Durable logical-Run transitions are intentionally not
+                    // presentation rows and never restore runtime progress.
+                }
+                SessionSnapshotEntryData::RunError { message, .. } => {
                     self.push_run_error(message.clone());
                 }
             }
@@ -2604,6 +2654,12 @@ pub fn fmt_tokens(n: u64) -> String {
     } else {
         n.to_string()
     }
+}
+
+fn run_failure_messages_match(left: &str, right: &str) -> bool {
+    !left.is_empty()
+        && !right.is_empty()
+        && (left == right || left.ends_with(right) || right.ends_with(left))
 }
 
 fn fmt_millis(ms: u64) -> String {
@@ -3745,6 +3801,7 @@ mod completion_flow_tests {
             ts: 3,
             interrupted: false,
             message: "provider unavailable".into(),
+            failure: None,
         };
         app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
@@ -3767,6 +3824,48 @@ mod completion_flow_tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(errors, ["provider unavailable"]);
+    }
+
+    #[test]
+    fn live_durable_compaction_failure_reconciles_transient_alert_and_error() {
+        let mut app = App::new("test".into());
+        let message = "mid-run compaction failed: summary unavailable";
+        app.handle_worker_event(Event::Alert(protocol::Alert {
+            level: AlertLevel::Error,
+            source: AlertSource::Compactor,
+            message: message.into(),
+            timestamp_ms: 1,
+        }));
+        app.handle_worker_event(Event::SessionEntryCommitted {
+            entry: protocol::SessionSnapshotEntry {
+                entry_id: "run-failure".into(),
+                timestamp: 2,
+                provenance: protocol::SessionEntryProvenance::LegacyUnknown,
+                derived_from: Vec::new(),
+                data: protocol::SessionSnapshotEntryData::RunError {
+                    message: message.into(),
+                    failure: Some(protocol::RunFailureKind::Compaction),
+                },
+            },
+        });
+        app.handle_worker_event(Event::Error {
+            code: ErrorCode::Internal,
+            message: "summary unavailable".into(),
+        });
+
+        let errors = app
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Alert {
+                    level: AlertLevel::Error,
+                    message,
+                    ..
+                } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(errors, [message]);
     }
 
     #[test]

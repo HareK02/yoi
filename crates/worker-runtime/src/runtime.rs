@@ -8042,6 +8042,7 @@ mod tests {
                         derived_from: Vec::new(),
                         data: protocol::SessionSnapshotEntryData::RunError {
                             message: expected_entry.to_string(),
+                            failure: None,
                         },
                     }],
                 },
