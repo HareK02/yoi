@@ -3474,7 +3474,9 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     LogEntry::RunCompleted { .. }
                     | LogEntry::RunYielded { .. }
                     | LogEntry::RunResumed { .. } => Some(CommittedRunExit::NonFinal),
-                    LogEntry::RunErrored { .. } => Some(CommittedRunExit::Interrupted),
+                    LogEntry::RunCancelled { .. } | LogEntry::RunErrored { .. } => {
+                        Some(CommittedRunExit::Interrupted)
+                    }
                     _ => None,
                 })
                 .unwrap_or(CommittedRunExit::NonFinal);
@@ -11252,7 +11254,7 @@ mod build_summary_prompt_tests {
             .commit_entry(LogEntry::RunErrored {
                 ts: segment_log::now_millis(),
                 interrupted: true,
-                message: "cancelled".to_string(),
+                message: "provider failed".to_string(),
                 failure: Some(RunFailureKind::Engine),
             })
             .unwrap();
@@ -11271,6 +11273,22 @@ mod build_summary_prompt_tests {
         assert_eq!(
             capture_handle.capture().unwrap().run_exit,
             CommittedRunExit::Finished
+        );
+        worker
+            .commit_entry(LogEntry::Invoke {
+                ts: segment_log::now_millis(),
+                trigger: protocol::InvokeKind::UserSend,
+            })
+            .unwrap();
+        worker
+            .commit_entry(LogEntry::RunCancelled {
+                ts: segment_log::now_millis(),
+            })
+            .unwrap();
+        assert_eq!(
+            capture_handle.capture().unwrap().run_exit,
+            CommittedRunExit::Interrupted,
+            "a current cancellation must not inherit an earlier finished run"
         );
         worker
             .commit_entry(LogEntry::RunResumed {
