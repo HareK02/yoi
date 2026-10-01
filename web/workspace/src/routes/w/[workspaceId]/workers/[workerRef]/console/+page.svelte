@@ -1892,10 +1892,10 @@
     />
 
     {#if pendingSubmissionItems.length > 0 || pendingSubmissions.notification_count > 0}
-        <section class="pending-submissions" aria-label="Pending activations">
-            <div class="pending-column pending-queue" role="group" aria-label="Queued inputs">
-                <h2 class="pending-submissions-label">{pendingSubmissionItems.length} Queued</h2>
-                {#if pendingSubmissionItems.length > 0}
+        <section class="pending-submissions" class:has-both={pendingSubmissionItems.length > 0 && pendingSubmissions.notification_count > 0} aria-label="Pending activations">
+            {#if pendingSubmissionItems.length > 0}
+                <div class="pending-column pending-queue" role="group" aria-label="Queued inputs">
+                    <h2 class="pending-submissions-label">{pendingSubmissionItems.length} Queued</h2>
                     <ol aria-label="Queued inputs">
                         {#each pendingSubmissionItems as submission, index (submission.submission_id)}
                             <li>
@@ -1923,11 +1923,11 @@
                             </li>
                         {/each}
                     </ol>
-                {/if}
-            </div>
-            <div class="pending-column pending-notifications" role="group" aria-label="Notifications">
-                <h2 class="pending-submissions-label">Notifications</h2>
-                {#if pendingSubmissions.notification_count > 0}
+                </div>
+            {/if}
+            {#if pendingSubmissions.notification_count > 0}
+                <div class="pending-column pending-notifications" role="group" aria-label="Notifications">
+                    <h2 class="pending-submissions-label">Notifications</h2>
                     <ol aria-label="Pending notifications">
                         {#each pendingSubmissions.notification_previews ?? [] as preview}
                             <li>
@@ -1941,8 +1941,8 @@
                             </li>
                         {/each}
                     </ol>
-                {/if}
-            </div>
+                </div>
+            {/if}
         </section>
     {/if}
 
@@ -2309,24 +2309,34 @@
 
     .pending-submissions {
         display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-template-columns: minmax(0, 1fr);
         gap: var(--space-3);
         flex: 0 0 auto;
         min-width: 0;
         margin: 0 var(--space-3);
         color: var(--text-muted);
+        font-family: var(--font-mono);
         font-size: var(--font-size-compact);
         line-height: var(--line-height-compact);
     }
 
+    .pending-submissions.has-both {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
     .pending-column {
+        display: grid;
+        align-content: start;
+        gap: var(--space-1);
         min-width: 0;
     }
 
     .pending-submissions li {
         display: grid;
         grid-template-columns: minmax(0, 1fr);
-        min-height: var(--space-6);
+        height: var(--line-height-compact);
+        margin: 0;
+        padding: 0;
         align-items: center;
     }
 
@@ -2340,16 +2350,16 @@
     }
 
     .pending-submissions-label {
-        margin: 0 0 var(--space-1);
-        font-size: var(--font-size-compact);
-        line-height: var(--line-height-compact);
-        font-weight: 500;
+        margin: 0;
+        padding: 0;
+        font: inherit;
+        color: inherit;
     }
 
     .pending-submissions ol {
         display: grid;
         gap: var(--space-1);
-        max-height: calc(var(--space-6) * 4);
+        max-height: calc(var(--line-height-compact) * 4 + var(--space-1) * 3);
         overflow-y: auto;
         margin: 0;
         padding: 0;
@@ -2371,8 +2381,8 @@
         align-items: center;
         justify-content: center;
         width: var(--space-6);
-        height: var(--space-6);
-        padding: var(--space-2);
+        height: var(--line-height-compact);
+        padding: 0;
         border: 0;
         border-radius: var(--radius-soft);
         background: transparent;

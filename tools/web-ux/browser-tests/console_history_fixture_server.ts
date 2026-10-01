@@ -174,17 +174,30 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
     url.pathname ===
       `/api/w/${workspaceId}/runtimes/${runtimeId}/workers/${workerId}/session`
   ) {
+    const pendingMode = new URL(request.headers.get("referer") ?? request.url).searchParams.get("pending");
+    const hasQueue = pendingMode === "both" || pendingMode === "queue";
+    const hasNotifications = pendingMode === "both" || pendingMode === "notifications" || pendingMode === "legacy";
+    const submissions = hasQueue ? [
+      { submission_id: "queued-1", preview: "First queued input", accepted_at_ms: 1, segment_count: 1, byte_len: 18 },
+      { submission_id: "queued-2", preview: "Long queued input — " + "preview text ".repeat(30), accepted_at_ms: 2, segment_count: 1, byte_len: 500 },
+    ] : [];
+    const taskEntries = pendingMode ? [{
+      kind: "tool_call", entry_id: "fixture-task", timestamp: 13, provenance: "model_output",
+      call_id: "fixture-task", name: "TaskCreate",
+      arguments: JSON.stringify({ subject: "Inspect pending input layout", description: "Synthetic visual fixture" }),
+    }] : [];
     return json({
       availability: "retained_snapshot",
       identity: { session_id: "session-a", segment_id: "segment-a", entry_count: 36 },
       snapshot: {
         pending_submissions: {
           revision: 0,
-          notification_count: 0,
-          head_id: null,
-          submissions: [],
+          notification_count: hasNotifications ? 2 : 0,
+          ...(hasNotifications && pendingMode !== "legacy" ? { notification_previews: ["First notification", "Long notification — " + "notification text ".repeat(30)] } : {}),
+          head_id: submissions[0]?.submission_id ?? null,
+          submissions,
         },
-        entries: [7, 8, 9, 10, 11, 12].flatMap(historyTurnEntries),
+        entries: [...[7, 8, 9, 10, 11, 12].flatMap(historyTurnEntries), ...taskEntries],
       },
     });
   }

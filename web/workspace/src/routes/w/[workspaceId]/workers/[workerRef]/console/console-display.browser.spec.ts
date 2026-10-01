@@ -369,7 +369,8 @@ test("notification-only state displays previews without actions and supports leg
   session.pending_submissions.head_id = "notification-head";
   latestListener().onFrame(subscribedFrame(session));
   const region = await screen.findByRole("region", { name: "Pending activations" });
-  expect(region.textContent).toContain("0 Queued");
+  expect(screen.queryByRole("group", { name: "Queued inputs" })).toBeNull();
+  expect(screen.queryByRole("heading", { name: "0 Queued" })).toBeNull();
   expect(region.textContent).toContain("一件目の通知");
   expect(region.textContent).toContain("二件目の通知");
   expect(region.querySelectorAll("li")).toHaveLength(2);
@@ -382,7 +383,7 @@ test("notification-only state displays previews without actions and supports leg
   await waitFor(() => expect(screen.queryByRole("region", { name: "Pending activations" })).toBeNull());
 });
 
-test("queue-only state keeps the notification column empty and disables cancellation when disconnected", async () => {
+test("queue-only state hides notifications and disables cancellation when disconnected", async () => {
   vi.stubGlobal("fetch", vi.fn(async () => Response.json({ availability: "live_protocol" })));
   render(ConsolePage, { data: pageData() });
   await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
@@ -390,7 +391,8 @@ test("queue-only state keeps the notification column empty and disables cancella
   session.pending_submissions.submissions = [{ submission_id: "queue-1", preview: "送信内容", accepted_at_ms: 1, segment_count: 1, byte_len: 12 }];
   latestListener().onFrame(subscribedFrame(session));
   await screen.findByText("送信内容");
-  expect(screen.getByRole("group", { name: "Notifications" }).querySelector("ol")).toBeNull();
+  expect(screen.queryByRole("group", { name: "Notifications" })).toBeNull();
+  expect(screen.queryByRole("heading", { name: "Notifications" })).toBeNull();
   latestListener().onStatus?.("closed", "connection lost");
   await waitFor(() => expect((screen.getByRole("button", { name: "Cancel queued input 1" }) as HTMLButtonElement).disabled).toBe(true));
 });
@@ -1137,3 +1139,28 @@ function expectHistoryTurn(text: string) {
   expect(screen.getAllByText(text)).toHaveLength(1);
   expect(screen.getByRole("button", { name: new RegExp("^Turn \\d+: " + text + "$") })).not.toBeNull();
 }
+
+test("pending groups independently follow authoritative changes, including zero count with stale previews", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ availability: "live_protocol" })));
+  render(ConsolePage, { data: pageData() });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
+  const session = emptySession();
+  session.pending_submissions.submissions = [{ submission_id: "queue-1", preview: "Queued", accepted_at_ms: 1, segment_count: 1, byte_len: 6 }];
+  session.pending_submissions.notification_count = 1;
+  session.pending_submissions.notification_previews = ["Notice"];
+  latestListener().onFrame(subscribedFrame(session));
+  await screen.findByRole("group", { name: "Queued inputs" });
+  expect(screen.getByRole("group", { name: "Notifications" })).toBeTruthy();
+  session.pending_submissions.notification_count = 0;
+  latestListener().onFrame(subscribedFrame(session));
+  await waitFor(() => expect(screen.queryByRole("group", { name: "Notifications" })).toBeNull());
+  expect(screen.getByRole("group", { name: "Queued inputs" })).toBeTruthy();
+  session.pending_submissions.submissions = [];
+  session.pending_submissions.notification_count = 1;
+  latestListener().onFrame(subscribedFrame(session));
+  await waitFor(() => expect(screen.queryByRole("group", { name: "Queued inputs" })).toBeNull());
+  expect(screen.getByRole("group", { name: "Notifications" })).toBeTruthy();
+  session.pending_submissions.notification_count = 0;
+  latestListener().onFrame(subscribedFrame(session));
+  await waitFor(() => expect(screen.queryByRole("region", { name: "Pending activations" })).toBeNull());
+});
