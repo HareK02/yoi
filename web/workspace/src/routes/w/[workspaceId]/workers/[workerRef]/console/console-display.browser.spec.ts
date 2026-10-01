@@ -19,6 +19,9 @@ import { EditorView } from "@codemirror/view";
 import * as alerts from "$lib/workspace/alerts/store";
 import ConsolePage from "./+page.svelte";
 
+// happy-dom does not implement Web Animations. Motion itself is covered in Chromium.
+vi.mock("svelte/motion", () => ({ prefersReducedMotion: { current: true } }));
+
 const multiplexer = vi.hoisted(() => {
   type Listener = {
     onFrame(frame: unknown): void;

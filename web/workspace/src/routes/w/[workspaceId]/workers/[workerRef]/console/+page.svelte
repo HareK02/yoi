@@ -1,6 +1,8 @@
 <script lang="ts">
     import { invalidateAll } from "$app/navigation";
     import { tick, untrack, type SvelteComponent } from "svelte";
+    import { prefersReducedMotion } from "svelte/motion";
+    import { fly } from "svelte/transition";
     import ConsoleLineItem from "$lib/workspace/console/ConsoleLineItem.svelte";
     import ConsoleTurnNavigation from "$lib/workspace/console/ConsoleTurnNavigation.svelte";
     import ConsoleDisplayStateView from "$lib/workspace/console/ConsoleDisplayState.svelte";
@@ -1774,6 +1776,7 @@
             {#if !autoFollowConsole && lines.length > 0 && (consoleDisplayState.kind === "ready" || consoleDisplayState.kind === "stale")}
                 <button
                     class="console-jump-latest"
+                    transition:fly={{ y: 6, duration: prefersReducedMotion.current ? 0 : 160 }}
                     type="button"
                     aria-label="Jump to latest"
                     title="Jump to latest"
@@ -2242,6 +2245,17 @@
     .console-jump-latest:hover {
         color: var(--tui-cyan);
         border-color: var(--tui-cyan);
+    }
+
+    @media (prefers-reduced-motion: no-preference) {
+        .console-jump-latest {
+            transition: translate 140ms ease-out, color 140ms ease-out,
+                border-color 140ms ease-out;
+        }
+
+        .console-jump-latest:hover {
+            translate: 0 -2px;
+        }
     }
 
     .console-jump-latest:focus-visible {

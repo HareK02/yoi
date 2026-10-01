@@ -1,3 +1,4 @@
+/// <reference lib="dom" />
 import { assert, assertEquals } from "@std/assert";
 import { dirname, fromFileUrl, join } from "@std/path";
 import { chromium } from "playwright";
@@ -9,6 +10,9 @@ const fixtureServer = join(
   "tools/web-ux/browser-tests/console_history_fixture_server.ts",
 );
 const workspaceId = "console-history-review";
+type MotionWindow = Window & {
+  latestMotion: { from: number; to: number; duration: number }[];
+};
 
 async function freePort(): Promise<number> {
   const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
@@ -73,6 +77,20 @@ async function checkConsoleHistory(viewportHeight: number): Promise<void> {
       });
       const page = await context.newPage();
       page.setDefaultTimeout(5_000);
+      await page.addInitScript(() => {
+        (window as unknown as MotionWindow).latestMotion = [];
+        const animate = Element.prototype.animate;
+        Element.prototype.animate = function (frames, options) {
+          if (this.matches(".console-jump-latest") && Array.isArray(frames) && frames.length > 0) {
+            (window as unknown as MotionWindow).latestMotion.push({
+              from: Number(frames[0].opacity),
+              to: Number(frames.at(-1)?.opacity),
+              duration: Number(typeof options === "number" ? options : options?.duration),
+            });
+          }
+          return animate.call(this, frames, options);
+        };
+      });
       const errors: string[] = [];
       const responses: string[] = [];
       page.on("console", (message) => {
@@ -250,6 +268,16 @@ async function checkConsoleHistory(viewportHeight: number): Promise<void> {
 
       const latest = page.getByRole("button", { name: "Jump to latest", exact: true });
       await latest.waitFor();
+      await latest.evaluate(async (element) => {
+        await Promise.all(element.getAnimations().map((animation) => animation.finished));
+      });
+      await latest.hover();
+      await page.waitForFunction(() => getComputedStyle(document.querySelector(".console-jump-latest")!).translate === "0px -2px");
+      assert((await latest.evaluate((element) => getComputedStyle(element).transitionDuration)).includes("0.14s"));
+      await page.mouse.move(0, 0);
+      await latest.evaluate(async (element) => {
+        await Promise.all(element.getAnimations().map((animation) => animation.finished));
+      });
       assertEquals((await latest.textContent())?.trim(), "");
       const viewportBeforeJump = await consoleScroll.boundingBox();
       const latestGeometry = await latest.boundingBox();
@@ -273,6 +301,24 @@ async function checkConsoleHistory(viewportHeight: number): Promise<void> {
       await latest.waitFor();
       await consoleScroll.evaluate((element) => { element.scrollTop = element.scrollHeight; });
       await latest.waitFor({ state: "detached" });
+
+      const motion = await page.evaluate(() => (window as unknown as MotionWindow).latestMotion);
+      assert(motion.some((animation) => animation.from === 0 && animation.to === 1 && animation.duration === 160), "latest icon must animate in");
+      assert(motion.some((animation) => animation.from === 1 && animation.to === 0 && animation.duration === 160), "latest icon must animate out");
+      await page.emulateMedia({ reducedMotion: "reduce" });
+      await page.evaluate(() => { (window as unknown as MotionWindow).latestMotion = []; });
+      await consoleScroll.evaluate((element) => { element.scrollTop = element.scrollHeight / 2; });
+      await latest.waitFor();
+      await latest.hover();
+      const reducedStyle = await latest.evaluate((element) => {
+        const style = getComputedStyle(element);
+        return { translate: style.translate, duration: style.transitionDuration };
+      });
+      assertEquals(reducedStyle, { translate: "none", duration: "0s" });
+      await latest.click();
+      await latest.waitFor({ state: "detached" });
+      assertEquals(await page.evaluate(() => (window as unknown as MotionWindow).latestMotion), [], "reduced motion must skip enter and exit animations");
+      await page.emulateMedia({ reducedMotion: "no-preference" });
 
       const centering = await question12.evaluate((button) => {
         const turn = button.getBoundingClientRect();
