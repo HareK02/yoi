@@ -957,8 +957,9 @@ Deno.test("Worker Console keeps Notify beside Submit without persistent notices"
       !consolePage.includes("composer-notice") &&
       !consolePage.includes('class="composer-actions"') &&
       !consolePage.includes("Sent through Worker protocol.") &&
-      consolePage.includes('{#if sendError}<p class="error" role="alert">'),
-    "Composer must remove persistent notices and empty action rows but retain send errors",
+      !consolePage.includes("sendError") &&
+      consolePage.includes("reportComposerError(command.message)"),
+    "Composer must not render notices or errors below its input shell; validation uses Workspace alerts",
   );
 });
 

@@ -137,7 +137,6 @@
     let fileInput: HTMLInputElement | null = null;
     let isDraggingFiles = $state(false);
     let sending = $state(false);
-    let sendError = $state<string | null>(null);
     let rewindTargets = $state<RewindTarget[]>([]);
     let rewindHeadEntries = $state(0);
     let protocolState = $state<"connecting" | "open" | "closed" | "error">(
@@ -765,7 +764,6 @@
             );
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-            sendError = message;
             pushWorkspaceAlert("error", message, {
                 id: controlAlertId,
                 title: "Worker control failed",
@@ -780,7 +778,7 @@
     ): ProtocolMethod | null {
         const state = consoleProjection.workerState;
         if (!state) {
-            sendError = "Worker state snapshot is not available; reconnect before sending control.";
+            reportComposerError("Worker state snapshot is not available; reconnect before sending control.");
             return null;
         }
         const commandId = Math.max(
@@ -1082,21 +1080,28 @@
         if (event.dataTransfer?.files) addAttachmentFiles(event.dataTransfer.files);
     }
 
+    function reportComposerError(message: string) {
+        pushWorkspaceAlert("error", message, {
+            id: controlAlertId,
+            title: "Console input",
+        });
+    }
+
     async function submitDraft(
         value: ComposerDraftSnapshot,
         delivery: ComposerDelivery = "submit",
     ) {
         if (delivery === "notify" && attachments.length > 0) {
-            sendError = "Notify accepts text only; remove attachments or queue a Submit.";
+            reportComposerError("Notify accepts text only; remove attachments or queue a Submit.");
             return;
         }
         const incompleteAttachment = attachments.find((attachment) =>
             attachment.state !== "uploaded" || !attachment.reference
         );
         if (incompleteAttachment) {
-            sendError = incompleteAttachment.state === "uploading"
+            reportComposerError(incompleteAttachment.state === "uploading"
                 ? "Wait for file uploads to finish before sending."
-                : incompleteAttachment.error ?? "Retry or remove the failed attachment.";
+                : incompleteAttachment.error ?? "Retry or remove the failed attachment.");
             return;
         }
         const attachmentSegments: Segment[] = attachments.map((attachment) => ({
@@ -1109,7 +1114,7 @@
             preserveExactText: value.textPastes.length > 0,
         });
         if (!command.ok) {
-            sendError = command.message;
+            reportComposerError(command.message);
             return;
         }
         if (!command.request) {
@@ -1134,18 +1139,17 @@
 
         let request: WorkerConsoleInputRequest = command.request;
         if (delivery === "queue" && request.kind !== "user") {
-            sendError = "Queue accepts ordinary input, not a Composer command.";
+            reportComposerError("Queue accepts ordinary input, not a Composer command.");
             return;
         }
         if (delivery === "notify") {
             if (request.kind !== "user") {
-                sendError = "Notify accepts ordinary text, not a Composer command.";
+                reportComposerError("Notify accepts ordinary text, not a Composer command.");
                 return;
             }
             request = { kind: "notify", content: request.content };
         }
         sending = true;
-        sendError = null;
         try {
             const method = composerRequestToProtocolMethod(request);
             if (isCommand) {
@@ -1160,7 +1164,7 @@
                 liveWorkerState = "running";
             }
         } catch (error) {
-            sendError = error instanceof Error ? error.message : String(error);
+            reportComposerError(error instanceof Error ? error.message : String(error));
         } finally {
             sending = false;
         }
@@ -2065,7 +2069,6 @@
                 </div>
             </div>
         </div>
-        {#if sendError}<p class="error" role="alert">{sendError}</p>{/if}
     </form>
 </div>
 

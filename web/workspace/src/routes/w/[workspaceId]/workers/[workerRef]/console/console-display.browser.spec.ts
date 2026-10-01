@@ -16,6 +16,7 @@ import type {
 } from "$lib/generated/protocol";
 import type { Worker } from "$lib/workspace/sidebar/types";
 import { EditorView } from "@codemirror/view";
+import * as alerts from "$lib/workspace/alerts/store";
 import ConsolePage from "./+page.svelte";
 
 const multiplexer = vi.hoisted(() => {
@@ -261,6 +262,38 @@ test.each(["live_protocol", "retained_snapshot"] as const)("overlapping history 
   expect(new Set(ids).size).toBe(ids.length);
   await fireEvent.click(screen.getByRole("button", { name: "Overview" }));
   expect(view.container.querySelectorAll(".activity-summary")).toHaveLength(1);
+});
+
+test.each([
+  { text: ":peer", message: "Invalid arguments. Usage: :peer <worker-name>", transportFailure: false },
+  { text: "keep this draft", message: "test transport failure", transportFailure: true },
+])("Composer keeps $text on failure without adding any footer message", async ({ text, message, transportFailure }) => {
+  const alert = vi.spyOn(alerts, "pushWorkspaceAlert");
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ availability: "live_protocol" })));
+  const view = render(ConsolePage, { data: pageData() });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
+  latestListener().onFrame(subscribedFrame(emptySession()));
+  await screen.findByText("No conversation to display");
+  const cm = EditorView.findFromDOM(view.container.querySelector(".cm-editor") as HTMLElement)!;
+  const form = view.container.querySelector(".console-composer") as HTMLFormElement;
+  cm.dispatch({ changes: { from: 0, insert: text }, selection: { anchor: text.length } });
+  if (transportFailure) multiplexer.sendWorkerMethod.mockImplementationOnce(() => { throw new Error(message); });
+  await fireEvent.submit(form);
+  await waitFor(() => expect(alert).toHaveBeenCalledWith("error", message, expect.any(Object)));
+  expect(cm.state.doc.toString()).toBe(text);
+  expect(multiplexer.sendWorkerMethod).toHaveBeenCalledTimes(transportFailure ? 1 : 0);
+  expect(form.children).toHaveLength(1);
+  expect(form.firstElementChild?.classList.contains("composer-input-shell")).toBe(true);
+  expect(form.querySelector('[role="alert"]')).toBeNull();
+  expect(form.textContent).not.toContain(message);
+
+  cm.dispatch({ changes: { from: 0, to: cm.state.doc.length, insert: ":peer teammate" } });
+  await fireEvent.submit(form);
+  await waitFor(() => expect(multiplexer.sendWorkerMethod).toHaveBeenLastCalledWith({
+    method: "register_peer", params: { name: "teammate" },
+  }));
+  expect(cm.state.doc.toString()).toBe("");
+  expect(form.children).toHaveLength(1);
 });
 
 test("pending inputs show literal previews above Composer with revision-fenced icon actions", async () => {
