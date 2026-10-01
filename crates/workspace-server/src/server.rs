@@ -1394,6 +1394,7 @@ pub struct WorkspaceApi {
     companion: Arc<CompanionConsole>,
     orchestrator_spawn_lock: Arc<std::sync::Mutex<()>>,
     orchestrator_attention_fingerprint: Arc<Mutex<Option<String>>>,
+    backend_job_drain_requests: Arc<AtomicU64>,
     observation_proxy: BackendObservationProxy,
     runtime_subscription_broker: RuntimeSubscriptionBroker,
     pub(crate) worker_projection: Arc<crate::worker_projection::WorkerProjectionService>,
@@ -3208,6 +3209,7 @@ impl WorkspaceApi {
             companion,
             orchestrator_spawn_lock: Arc::new(std::sync::Mutex::new(())),
             orchestrator_attention_fingerprint: Arc::new(Mutex::new(None)),
+            backend_job_drain_requests: Arc::new(AtomicU64::new(0)),
             observation_proxy,
             runtime_subscription_broker,
             worker_projection,
@@ -3297,7 +3299,11 @@ impl WorkspaceApi {
         let reservation =
             self.store
                 .reserve_backend_job(&self.config.workspace_id, request, &now)?;
-        self.dispatch_backend_job_reservation(reservation)
+        let result = self.dispatch_backend_job_reservation(reservation);
+        if result.is_err() {
+            self.drain_reserved_backend_jobs();
+        }
+        result
     }
 
     /// Explicit re-evaluation creates a new bounded attempt only after a
@@ -3310,7 +3316,11 @@ impl WorkspaceApi {
         let reservation =
             self.store
                 .reserve_backend_job_retry(&self.config.workspace_id, job_id, &now)?;
-        self.dispatch_backend_job_reservation(reservation)
+        let result = self.dispatch_backend_job_reservation(reservation);
+        if result.is_err() {
+            self.drain_reserved_backend_jobs();
+        }
+        result
     }
 
     fn dispatch_backend_job_reservation(
@@ -3321,6 +3331,15 @@ impl WorkspaceApi {
             || reservation.attempt.state != BackendJobAttemptState::Reserved
             || reservation.attempt.worker.is_some()
         {
+            return Ok(reservation);
+        }
+        let (reservation, claimed) = self.store.claim_backend_job_attempt_dispatch(
+            &self.config.workspace_id,
+            &reservation.job.request.job_id,
+            &reservation.attempt.attempt_id,
+            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+        )?;
+        if !claimed {
             return Ok(reservation);
         }
         let request = &reservation.job.request;
@@ -3523,6 +3542,94 @@ impl WorkspaceApi {
         })
     }
 
+    fn drain_reserved_backend_jobs(&self) {
+        if self
+            .backend_job_drain_requests
+            .fetch_add(1, Ordering::AcqRel)
+            != 0
+        {
+            return;
+        }
+        loop {
+            self.drain_reserved_backend_jobs_inner();
+            let requests = self.backend_job_drain_requests.swap(0, Ordering::AcqRel);
+            if requests <= 1 {
+                return;
+            }
+            // A synchronous fast result can request another drain while this
+            // runner is dispatching. Re-run without recursion, unless a caller
+            // arriving after the swap has already become the next runner.
+            if self
+                .backend_job_drain_requests
+                .fetch_add(1, Ordering::AcqRel)
+                != 0
+            {
+                return;
+            }
+        }
+    }
+
+    fn drain_reserved_backend_jobs_inner(&self) {
+        let page_limit = usize::from(ABSOLUTE_MAX_CONCURRENT_JOBS);
+        loop {
+            let attempts = match self
+                .store
+                .list_reserved_backend_job_attempts(&self.config.workspace_id, page_limit)
+            {
+                Ok(attempts) => attempts,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to load queued Backend Job attempts");
+                    return;
+                }
+            };
+            if attempts.is_empty() {
+                return;
+            }
+            let mut made_progress = false;
+            for attempt in &attempts {
+                let job = match self
+                    .store
+                    .get_backend_job(&self.config.workspace_id, &attempt.job_id)
+                {
+                    Ok(Some(job)) => job,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(%error, job_id = %attempt.job_id, "failed to load queued Backend Job");
+                        continue;
+                    }
+                };
+                match self.dispatch_backend_job_reservation(BackendJobReservation {
+                    job,
+                    attempt: attempt.clone(),
+                    replayed: true,
+                }) {
+                    Ok(reservation) => {
+                        made_progress |=
+                            reservation.attempt.state != BackendJobAttemptState::Reserved;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "queued Backend Job dispatch failed");
+                        made_progress |= self
+                            .store
+                            .get_backend_job_attempt(
+                                &self.config.workspace_id,
+                                &attempt.job_id,
+                                &attempt.attempt_id,
+                            )
+                            .ok()
+                            .flatten()
+                            .is_some_and(|current| {
+                                current.state != BackendJobAttemptState::Reserved
+                            });
+                    }
+                }
+            }
+            if attempts.len() < page_limit || !made_progress {
+                return;
+            }
+        }
+    }
+
     /// Reconcile durable non-terminal attempts after Backend restart. Reserved
     /// attempts are replay-dispatched through their deterministic allocation;
     /// dispatched attempts keep running only while their bound Worker remains
@@ -3550,6 +3657,17 @@ impl WorkspaceApi {
                     {
                         tracing::warn!(%error, "Backend Job reserved-attempt recovery failed");
                     }
+                }
+                BackendJobAttemptState::Dispatching => {
+                    self.store.finish_backend_job_attempt(
+                        &self.config.workspace_id,
+                        &attempt.job_id,
+                        &attempt.attempt_id,
+                        BackendJobAttemptState::Unknown,
+                        "recovery_dispatch_claim_unknown",
+                        "a Backend Job dispatch claim could not be safely replayed after restart",
+                        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    )?;
                 }
                 BackendJobAttemptState::Dispatched => {
                     if attempt.runtime_run_id.is_none() {
@@ -3591,6 +3709,7 @@ impl WorkspaceApi {
                 | BackendJobAttemptState::Unknown => {}
             }
         }
+        self.drain_reserved_backend_jobs();
         Ok(())
     }
 
@@ -3604,9 +3723,10 @@ impl WorkspaceApi {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let store = self.store.clone();
-        let runtime = self.runtime.clone();
-        let workspace_id = self.config.workspace_id.clone();
+        let api = self.clone();
+        let store = api.store.clone();
+        let runtime = api.runtime.clone();
+        let workspace_id = api.config.workspace_id.clone();
         let job_id = job_id.to_string();
         let attempt_id = attempt_id.to_string();
         handle.spawn(async move {
@@ -3642,6 +3762,7 @@ impl WorkspaceApi {
                         },
                     );
                 }
+                api.drain_reserved_backend_jobs();
             }
         });
     }
@@ -3694,6 +3815,7 @@ impl WorkspaceApi {
                         &detail,
                         &accepted_at,
                     )?;
+                    self.drain_reserved_backend_jobs();
                 }
                 return Err(error);
             }
@@ -3707,6 +3829,7 @@ impl WorkspaceApi {
         if let Some(target) = acceptance.job.request.notification_target.as_ref() {
             self.deliver_backend_job_result(&acceptance, target);
         }
+        self.drain_reserved_backend_jobs();
         Ok(acceptance)
     }
 
@@ -12338,6 +12461,7 @@ fn schedule_ticket_item_check(
                 %error,
                 "asynchronous Ticket item checker dispatch failed"
             );
+            api.drain_reserved_backend_jobs();
         }
     });
 }
@@ -12455,7 +12579,19 @@ async fn execute_ticket_rest_operation(
         backend = backend.with_event_attributes(event_attributes);
     }
 
-    let result = execute_ticket_backend_operation(&backend, operation).map_err(Error::from)?;
+    let (result, created_ticket) = match operation {
+        TicketBackendOperation::Create { input } => {
+            let (reference, ticket) = backend.create_with_snapshot(input).map_err(Error::from)?;
+            (
+                TicketBackendOperationResult::TicketRef(reference),
+                Some(ticket),
+            )
+        }
+        operation => (
+            execute_ticket_backend_operation(&backend, operation).map_err(Error::from)?,
+            None,
+        ),
+    };
     if is_mutation {
         if let TicketBackendOperationResult::QueueOutcome(outcome) = &result {
             for ticket_id in &outcome.queued_tickets {
@@ -12482,20 +12618,12 @@ async fn execute_ticket_rest_operation(
         }
     }
     if let Some((source_worker, edit)) = ticket_item_check {
-        let checked_ticket_id = match &result {
-            TicketBackendOperationResult::TicketRef(ticket) => Some(ticket.id.clone()),
-            TicketBackendOperationResult::Ticket(ticket) => Some(ticket.meta.id.clone()),
+        let checked_ticket = created_ticket.or_else(|| match &result {
+            TicketBackendOperationResult::Ticket(ticket) => Some(ticket.clone()),
             _ => None,
-        };
-        if let Some(ticket_id) = checked_ticket_id {
-            match backend.show(ticket_id.clone().into()) {
-                Ok(ticket) => schedule_ticket_item_check(api, &ticket, edit, source_worker),
-                Err(error) => tracing::warn!(
-                    %ticket_id,
-                    %error,
-                    "Ticket item was saved but could not be reloaded for asynchronous checking"
-                ),
-            }
+        });
+        if let Some(ticket) = checked_ticket {
+            schedule_ticket_item_check(api, &ticket, edit, source_worker);
         }
     }
     Ok(result)
@@ -34335,13 +34463,16 @@ mod tests {
         job: &crate::backend_job::BackendJobRecord,
     ) -> crate::backend_job::BackendJobAttemptRecord {
         let attempt_id = crate::backend_job::attempt_id(&job.request.job_id, job.current_attempt);
-        for _ in 0..100 {
+        for _ in 0..500 {
             let attempt = api
                 .store
                 .get_backend_job_attempt(TEST_WORKSPACE_ID, &job.request.job_id, &attempt_id)
                 .unwrap()
                 .unwrap();
-            if attempt.state != BackendJobAttemptState::Reserved {
+            if !matches!(
+                attempt.state,
+                BackendJobAttemptState::Reserved | BackendJobAttemptState::Dispatching
+            ) {
                 return attempt;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -34383,7 +34514,7 @@ mod tests {
             panic!("unexpected Ticket create result")
         };
         entered_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
+            .recv_timeout(std::time::Duration::from_secs(5))
             .expect("checker dispatch reached the held fake model");
         let job = ticket_check_job(&api, &ticket_ref.id);
         let checker_input = ticket_item_checker::parse_input(&job.request.input).unwrap();
@@ -34443,6 +34574,291 @@ mod tests {
         let replay = api.accept_backend_job_result(&worker, &submission).unwrap();
         assert!(replay.replayed);
         assert!(execution.take_inputs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ticket_checker_fake_model_regressions_preserve_classification_boundaries() {
+        struct Case {
+            name: &'static str,
+            body: &'static str,
+            fake_model_result: Value,
+            advisory_quote: Option<&'static str>,
+        }
+        let cases = vec![
+            Case {
+                name: "writer-scope-positive",
+                body: "This time I only create the Ticket; I will not implement it.",
+                fake_model_result: serde_json::json!({"findings": [{
+                    "category": "writer_scope",
+                    "quote": "I will not implement it",
+                    "reason": "The active requirement records the writer's own implementation boundary.",
+                    "suggestion": "Remove the writer-specific action boundary."
+                }]}),
+                advisory_quote: Some("I will not implement it"),
+            },
+            Case {
+                name: "production-approval-negative",
+                body: "Production deployment requires approval.",
+                fake_model_result: serde_json::json!({"findings": []}),
+                advisory_quote: None,
+            },
+            Case {
+                name: "quoted-background-negative",
+                body: "Background bug example: a generated Ticket once said “I will not implement it.” Do not reproduce that sentence in generated requirements.",
+                fake_model_result: serde_json::json!({"findings": []}),
+                advisory_quote: None,
+            },
+            Case {
+                name: "unresolved-versus-settled-positive",
+                body: "The rollout region is undecided. The rollout region is us-east-1.",
+                fake_model_result: serde_json::json!({"findings": [{
+                    "category": "internal_inconsistency",
+                    "quote": "The rollout region is undecided.",
+                    "reason": "The same active text also settles the rollout region as us-east-1.",
+                    "suggestion": "Choose either the unresolved or settled rollout-region statement."
+                }]}),
+                advisory_quote: Some("The rollout region is undecided."),
+            },
+            Case {
+                name: "ambiguous-boundary-confirmation",
+                body: "Implementation stops after Ticket creation.",
+                fake_model_result: serde_json::json!({"findings": [{
+                    "category": "ambiguous_boundary",
+                    "quote": "Implementation stops after Ticket creation.",
+                    "reason": "The text alone does not establish whether this is a delivery constraint or the writer's current action boundary.",
+                    "suggestion": "Confirm whether this limits the product workflow or only the current writer."
+                }]}),
+                advisory_quote: Some("Implementation stops after Ticket creation."),
+            },
+        ];
+
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        let source = spawn_ticket_check_source(&api, "ticket-check-boundary-author");
+        for case in cases {
+            let mut input = ticket::NewTicket::new(format!("Boundary case: {}", case.name));
+            input.body = MarkdownText::new(case.body);
+            let Json(TicketBackendOperationResult::TicketRef(reference)) =
+                execute_worker_ticket_test_operation(
+                    State(api.clone()),
+                    AxumPath(ScopedWorkspacePath {
+                        workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    }),
+                    ticket_check_headers(&source),
+                    Json(TicketBackendOperation::Create { input }),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("{}: unexpected Ticket create result", case.name);
+            };
+            let job = ticket_check_job(&api, &reference.id);
+            let attempt = wait_for_ticket_check_attempt(&api, &job).await;
+            execution.take_inputs();
+            api.accept_backend_job_result(
+                attempt.worker.as_ref().unwrap(),
+                &BackendJobResultSubmission {
+                    job_id: job.request.job_id.clone(),
+                    attempt_id: attempt.attempt_id,
+                    input_revision: job.request.input_revision,
+                    result: case.fake_model_result,
+                },
+            )
+            .unwrap_or_else(|error| panic!("{}: {error}", case.name));
+            let notifications = execution.take_inputs();
+            let advisories = notifications
+                .iter()
+                .filter(|(_, content)| content.contains("[Ticket item checker advisory]"))
+                .collect::<Vec<_>>();
+            match case.advisory_quote {
+                Some(quote) => {
+                    assert_eq!(advisories.len(), 1, "{}", case.name);
+                    assert!(advisories[0].1.contains(quote), "{}", case.name);
+                }
+                None => assert!(advisories.is_empty(), "{}", case.name),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ticket_checker_burst_keeps_excess_revisions_durable_and_drains_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, _execution) = test_api_with_recording_backend(temp.path()).await;
+        let source = spawn_ticket_check_source(&api, "ticket-check-burst-author");
+        let mut jobs = Vec::new();
+        for index in 0..6 {
+            let mut input = ticket::NewTicket::new(format!("Burst check {index}"));
+            input.body = MarkdownText::new(format!("Durable requirement {index}."));
+            let Json(result) = execute_worker_ticket_test_operation(
+                State(api.clone()),
+                AxumPath(ScopedWorkspacePath {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                }),
+                ticket_check_headers(&source),
+                Json(TicketBackendOperation::Create { input }),
+            )
+            .await
+            .unwrap();
+            let TicketBackendOperationResult::TicketRef(reference) = result else {
+                panic!("unexpected Ticket create result");
+            };
+            jobs.push(ticket_check_job(&api, &reference.id));
+        }
+
+        let mut initial = Vec::new();
+        for _ in 0..200 {
+            initial = jobs
+                .iter()
+                .map(|job| {
+                    api.store
+                        .get_backend_job_attempt(
+                            TEST_WORKSPACE_ID,
+                            &job.request.job_id,
+                            &crate::backend_job::attempt_id(&job.request.job_id, 1),
+                        )
+                        .unwrap()
+                        .unwrap()
+                })
+                .collect();
+            let dispatched = initial
+                .iter()
+                .filter(|attempt| attempt.state == BackendJobAttemptState::Dispatched)
+                .count();
+            let reserved = initial
+                .iter()
+                .filter(|attempt| attempt.state == BackendJobAttemptState::Reserved)
+                .count();
+            if dispatched == 4 && reserved == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            initial
+                .iter()
+                .filter(|attempt| attempt.state == BackendJobAttemptState::Dispatched)
+                .count(),
+            4
+        );
+        assert_eq!(
+            initial
+                .iter()
+                .filter(|attempt| attempt.state == BackendJobAttemptState::Reserved)
+                .count(),
+            2,
+            "capacity must leave excess successful saves durably queued"
+        );
+
+        // Restart reconciliation is idempotent for running attempts and retains
+        // the queued revisions until a slot becomes available.
+        api.recover_backend_jobs().unwrap();
+        let mut completed = std::collections::BTreeSet::new();
+        for _ in 0..300 {
+            for job in &jobs {
+                let attempt = api
+                    .store
+                    .get_backend_job_attempt(
+                        TEST_WORKSPACE_ID,
+                        &job.request.job_id,
+                        &crate::backend_job::attempt_id(&job.request.job_id, 1),
+                    )
+                    .unwrap()
+                    .unwrap();
+                if attempt.state == BackendJobAttemptState::Dispatched
+                    && !completed.contains(&job.request.job_id)
+                {
+                    api.accept_backend_job_result(
+                        attempt.worker.as_ref().unwrap(),
+                        &BackendJobResultSubmission {
+                            job_id: job.request.job_id.clone(),
+                            attempt_id: attempt.attempt_id,
+                            input_revision: job.request.input_revision.clone(),
+                            result: serde_json::json!({"findings": []}),
+                        },
+                    )
+                    .unwrap();
+                    completed.insert(job.request.job_id.clone());
+                }
+            }
+            if completed.len() == jobs.len() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(completed.len(), jobs.len());
+        assert!(jobs.iter().all(|job| {
+            api.store
+                .get_backend_job(TEST_WORKSPACE_ID, &job.request.job_id)
+                .unwrap()
+                .is_some_and(|job| job.state == BackendJobState::Completed)
+        }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_worker_edits_bind_exact_saved_snapshots_to_their_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, _execution) = test_api_with_recording_backend(temp.path()).await;
+        let source_a = spawn_ticket_check_source(&api, "ticket-check-editor-a");
+        let source_b = spawn_ticket_check_source(&api, "ticket-check-editor-b");
+        let ticket_ref = browser_ticket_backend(&api)
+            .unwrap()
+            .create(ticket::NewTicket::new("Concurrent checker snapshots"))
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let run_edit = |source: RuntimeWorkerRef, body: &'static str| {
+            let api = api.clone();
+            let ticket_id = ticket_ref.id.clone();
+            let barrier = barrier.clone();
+            tokio::task::spawn_blocking(move || {
+                barrier.wait();
+                tokio::runtime::Handle::current().block_on(execute_worker_ticket_test_operation(
+                    State(api),
+                    AxumPath(ScopedWorkspacePath {
+                        workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    }),
+                    ticket_check_headers(&source),
+                    Json(TicketBackendOperation::EditItem {
+                        id: ticket_id.into(),
+                        edit: TicketItemEdit {
+                            body: Some(MarkdownText::new(body)),
+                            ..Default::default()
+                        },
+                    }),
+                ))
+            })
+        };
+        let (result_a, result_b) = tokio::join!(
+            run_edit(source_a.clone(), "Exact body from worker A."),
+            run_edit(source_b.clone(), "Exact body from worker B.")
+        );
+        let Json(TicketBackendOperationResult::Ticket(ticket_a)) = result_a.unwrap().unwrap()
+        else {
+            panic!("unexpected first edit result");
+        };
+        let Json(TicketBackendOperationResult::Ticket(ticket_b)) = result_b.unwrap().unwrap()
+        else {
+            panic!("unexpected second edit result");
+        };
+        let snapshots = [
+            (ticket_a, source_a, "Exact body from worker A."),
+            (ticket_b, source_b, "Exact body from worker B."),
+        ];
+        for (ticket, source, expected_body) in snapshots {
+            let revision = ticket_item_checker::item_revision(&ticket);
+            let job = api
+                .store
+                .get_backend_job(
+                    TEST_WORKSPACE_ID,
+                    &format!("ticket-item-check:{}:{revision}", ticket.meta.id),
+                )
+                .unwrap()
+                .expect("each successful edit has its own checker Job");
+            let input = ticket_item_checker::parse_input(&job.request.input).unwrap();
+            assert_eq!(input.revision, revision);
+            assert_eq!(input.body, expected_body);
+            assert_eq!(job.request.source_worker.as_ref(), Some(&source));
+            assert_eq!(job.request.notification_target.as_ref(), Some(&source));
+        }
     }
 
     #[tokio::test]
@@ -35013,6 +35429,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backend_job_recovery_drains_more_than_one_reserved_page() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = test_api(temp.path()).await;
+        api.runtime
+            .unregister_if_idle(EMBEDDED_WORKER_RUNTIME_ID, 10)
+            .unwrap();
+        let mut jobs = Vec::new();
+        for index in 0..(usize::from(ABSOLUTE_MAX_CONCURRENT_JOBS) + 6) {
+            let request = BackendJobRequest {
+                job_id: format!("restart-page-{index:03}"),
+                purpose: "restart_page_contract_check".to_string(),
+                input_revision: "1".to_string(),
+                input_ref: format!("fixture://restart-page/{index}"),
+                input: serde_json::json!({"index": index}),
+                instruction: "Return a structured fixture result.".to_string(),
+                profile: "builtin:backend-job".to_string(),
+                source_worker: None,
+                notification_target: None,
+                limits: crate::backend_job::BackendJobLimits {
+                    max_concurrent_jobs: ABSOLUTE_MAX_CONCURRENT_JOBS,
+                    ..Default::default()
+                },
+            };
+            api.store
+                .reserve_backend_job(
+                    TEST_WORKSPACE_ID,
+                    &request,
+                    &format!("2026-09-01T00:{:02}:{:02}Z", index / 60, index % 60),
+                )
+                .unwrap();
+            jobs.push(request.job_id);
+        }
+
+        api.recover_backend_jobs().unwrap();
+        assert!(
+            api.store
+                .list_reserved_backend_job_attempts(TEST_WORKSPACE_ID, jobs.len())
+                .unwrap()
+                .is_empty(),
+            "restart recovery must continue beyond its first bounded page when dispatches terminalize"
+        );
+        assert!(jobs.iter().all(|job_id| {
+            api.store
+                .get_backend_job(TEST_WORKSPACE_ID, job_id)
+                .unwrap()
+                .is_some_and(|job| job.state == BackendJobState::Failed)
+        }));
+    }
+
+    #[tokio::test]
     async fn backend_job_recovery_dispatches_reserved_attempt_without_duplicate_worker() {
         let temp = tempfile::tempdir().unwrap();
         let api = test_api(temp.path()).await;
@@ -35098,6 +35564,16 @@ mod tests {
                 updated_at: "2026-09-01T00:00:00Z".to_string(),
             })
             .unwrap();
+        let (_, claimed) = api
+            .store
+            .claim_backend_job_attempt_dispatch(
+                TEST_WORKSPACE_ID,
+                &request.job_id,
+                &reserved.attempt.attempt_id,
+                "2026-09-01T00:00:00Z",
+            )
+            .unwrap();
+        assert!(claimed);
         api.store
             .bind_backend_job_attempt_worker(
                 TEST_WORKSPACE_ID,

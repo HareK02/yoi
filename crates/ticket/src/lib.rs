@@ -1909,6 +1909,11 @@ pub trait TicketBackend {
     fn list(&self, filter: TicketListQuery) -> Result<Vec<TicketSummary>>;
     fn show(&self, id: TicketIdOrSlug) -> Result<Ticket>;
     fn create(&self, input: NewTicket) -> Result<TicketRef>;
+    fn create_with_snapshot(&self, input: NewTicket) -> Result<(TicketRef, Ticket)> {
+        let reference = self.create(input)?;
+        let ticket = self.show(reference.id.clone().into())?;
+        Ok((reference, ticket))
+    }
     fn edit_item(&self, id: TicketIdOrSlug, edit: TicketItemEdit) -> Result<Ticket>;
     fn dependency_check(&self, id: TicketIdOrSlug) -> Result<TicketDependencyCheck>;
     fn add_event(&self, id: TicketIdOrSlug, event: NewTicketEvent) -> Result<()>;
@@ -3087,6 +3092,11 @@ impl TicketBackend for SqliteTicketBackend {
     }
 
     fn create(&self, input: NewTicket) -> Result<TicketRef> {
+        self.create_with_snapshot(input)
+            .map(|(reference, _)| reference)
+    }
+
+    fn create_with_snapshot(&self, input: NewTicket) -> Result<(TicketRef, Ticket)> {
         self.with_write(|conn| {
             if input.title.trim().is_empty() {
                 return Err(TicketError::Conflict(
@@ -3167,12 +3177,14 @@ impl TicketBackend for SqliteTicketBackend {
             };
             let resource_key = Self::allocate_resource_key(conn, &self.workspace_id, &id, &now)?;
             self.insert_ticket(conn, &ticket)?;
-            Ok(TicketRef {
+            let reference = TicketRef {
                 id: id.clone(),
                 resource_key: Some(resource_key),
-                slug: id,
+                slug: id.clone(),
                 status: TicketStatus::Open,
-            })
+            };
+            let persisted = self.load_ticket(conn, &id)?;
+            Ok((reference, persisted))
         })
     }
 

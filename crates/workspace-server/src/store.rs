@@ -27,7 +27,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 71;
+const LATEST_SCHEMA_VERSION: i64 = 72;
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
@@ -64,6 +64,8 @@ const BACKEND_JOB_RUNNER_MIGRATION_NAME: &str =
     "Backend-owned Runtime Worker jobs and structured results";
 const BACKEND_JOB_DELIVERY_CLAIM_MIGRATION_NAME: &str =
     "atomic Backend Job notification delivery claims";
+const BACKEND_JOB_DISPATCH_QUEUE_MIGRATION_NAME: &str =
+    "durable bounded Backend Job dispatch queue";
 const TICKET_SCHEMA_VERSION_WITH_TARGETS: i64 = 7;
 const TICKET_SCHEMA_BASELINE_NAME: &str = "ticket schema baseline";
 const WORKER_REGISTRY_PROJECTION_SCHEMA: &str = r#"
@@ -215,6 +217,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 71,
         name: BACKEND_JOB_DELIVERY_CLAIM_MIGRATION_NAME,
         apply: migrate_backend_job_delivery_claims_v70_to_v71,
+    },
+    Migration {
+        version: 72,
+        name: BACKEND_JOB_DISPATCH_QUEUE_MIGRATION_NAME,
+        apply: migrate_backend_job_dispatch_queue_v71_to_v72,
     },
 ];
 
@@ -1485,6 +1492,18 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         attempt_id: &str,
     ) -> Result<Option<BackendJobAttemptRecord>>;
     fn list_recoverable_backend_job_attempts(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<BackendJobAttemptRecord>>;
+    fn claim_backend_job_attempt_dispatch(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+        attempt_id: &str,
+        now: &str,
+    ) -> Result<(BackendJobReservation, bool)>;
+    fn list_reserved_backend_job_attempts(
         &self,
         workspace_id: &str,
         limit: usize,
@@ -5886,7 +5905,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     )));
                 }
             }
-            ensure_backend_job_capacity(&tx, workspace_id, request.limits.max_concurrent_jobs)?;
             let current_attempt = 1_u8;
             let attempt_id = attempt_id(&request.job_id, current_attempt);
             tx.execute(
@@ -5930,7 +5948,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     "Backend Job `{job_id}` reached its attempt limit"
                 )));
             }
-            ensure_backend_job_capacity(&tx, workspace_id, job.request.limits.max_concurrent_jobs)?;
             let next = job.current_attempt + 1;
             let next_id = attempt_id(job_id, next);
             let deadline = backend_job_deadline(now, job.request.limits.timeout_seconds)?;
@@ -5976,16 +5993,87 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         workspace_id: &str,
         limit: usize,
     ) -> Result<Vec<BackendJobAttemptRecord>> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // A dispatch claim has no externally meaningful identity until the
+            // deterministic Worker allocation is bound. Startup can therefore
+            // replay an interrupted claim through the same allocation key.
+            tx.execute(
+                "UPDATE backend_job_attempts SET state = 'reserved' WHERE workspace_id = ?1 AND state = 'dispatching' AND worker_id IS NULL",
+                params![workspace_id],
+            )?;
+            let mut statement = tx.prepare(
+                "SELECT job_id, attempt_id FROM backend_job_attempts WHERE workspace_id = ?1 AND state IN ('reserved', 'dispatched') ORDER BY created_at LIMIT ?2",
+            )?;
+            let identities = statement.query_map(params![workspace_id, limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?.collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            let attempts = identities.into_iter().map(|(job_id, attempt_id)| {
+                read_backend_job_attempt(&tx, workspace_id, &job_id, &attempt_id)?
+                    .ok_or_else(|| Error::Store("recoverable Backend Job attempt disappeared".to_string()))
+            }).collect::<Result<Vec<_>>>()?;
+            tx.commit()?;
+            Ok(attempts)
+        })
+    }
+
+    fn claim_backend_job_attempt_dispatch(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+        attempt_id: &str,
+        now: &str,
+    ) -> Result<(BackendJobReservation, bool)> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let job = read_backend_job(&tx, workspace_id, job_id)?
+                .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job `{job_id}`")))?;
+            let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, attempt_id)?
+                .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job attempt `{attempt_id}`")))?;
+            if attempt.state != BackendJobAttemptState::Reserved {
+                tx.commit()?;
+                return Ok((BackendJobReservation { job, attempt, replayed: true }, false));
+            }
+            let active: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM backend_job_attempts WHERE workspace_id = ?1 AND state IN ('dispatching', 'dispatched')",
+                params![workspace_id],
+                |row| row.get(0),
+            )?;
+            if active >= i64::from(job.request.limits.max_concurrent_jobs) {
+                tx.commit()?;
+                return Ok((BackendJobReservation { job, attempt, replayed: true }, false));
+            }
+            let deadline = backend_job_deadline(now, job.request.limits.timeout_seconds)?;
+            let changed = tx.execute(
+                "UPDATE backend_job_attempts SET state = 'dispatching', deadline_at = ?4, updated_at = ?5 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND state = 'reserved' AND worker_id IS NULL",
+                params![workspace_id, job_id, attempt_id, deadline, now],
+            )?;
+            if changed != 1 {
+                return Err(Error::Store("Backend Job dispatch claim compare-and-set failed".to_string()));
+            }
+            let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, attempt_id)?
+                .ok_or_else(|| Error::Store("claimed Backend Job attempt disappeared".to_string()))?;
+            tx.commit()?;
+            Ok((BackendJobReservation { job, attempt, replayed: false }, true))
+        })
+    }
+
+    fn list_reserved_backend_job_attempts(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<BackendJobAttemptRecord>> {
         self.with_conn(|conn| {
             let mut statement = conn.prepare(
-                "SELECT job_id, attempt_id FROM backend_job_attempts WHERE workspace_id = ?1 AND state IN ('reserved', 'dispatched') ORDER BY created_at LIMIT ?2",
+                "SELECT job_id, attempt_id FROM backend_job_attempts WHERE workspace_id = ?1 AND state = 'reserved' ORDER BY created_at, attempt_id LIMIT ?2",
             )?;
             let identities = statement.query_map(params![workspace_id, limit as i64], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?.collect::<rusqlite::Result<Vec<_>>>()?;
             identities.into_iter().map(|(job_id, attempt_id)| {
                 read_backend_job_attempt(conn, workspace_id, &job_id, &attempt_id)?
-                    .ok_or_else(|| Error::Store("recoverable Backend Job attempt disappeared".to_string()))
+                    .ok_or_else(|| Error::Store("reserved Backend Job attempt disappeared".to_string()))
             }).collect()
         })
     }
@@ -6031,7 +6119,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 ));
             }
             let changed = tx.execute(
-                "UPDATE backend_job_attempts SET state = 'dispatched', runtime_id = ?4, worker_id = ?5, runtime_run_id = ?6, dispatched_at = ?7, updated_at = ?7 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND state = 'reserved' AND worker_id IS NULL",
+                "UPDATE backend_job_attempts SET state = 'dispatched', runtime_id = ?4, worker_id = ?5, runtime_run_id = ?6, dispatched_at = ?7, updated_at = ?7 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND state = 'dispatching' AND worker_id IS NULL",
                 params![workspace_id, job_id, attempt_id, worker.runtime_id, worker.worker_id, runtime_run_id, now],
             )?;
             if changed != 1 {
@@ -6211,7 +6299,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 return Ok(attempt);
             }
             tx.execute(
-                "UPDATE backend_job_attempts SET state = ?4, failure_category = ?5, failure_detail = ?6, completed_at = ?7, updated_at = ?7 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND state IN ('reserved', 'dispatched')",
+                "UPDATE backend_job_attempts SET state = ?4, failure_category = ?5, failure_detail = ?6, completed_at = ?7, updated_at = ?7 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND state IN ('reserved', 'dispatching', 'dispatched')",
                 params![workspace_id, job_id, attempt_id, state.as_str(), failure_category, detail, now],
             )?;
             if attempt.attempt == job.current_attempt && job.state == BackendJobState::Pending {
@@ -9914,24 +10002,6 @@ fn backend_job_deadline(now: &str, timeout_seconds: u32) -> Result<String> {
     Ok((now + chrono::Duration::seconds(i64::from(timeout_seconds))).to_rfc3339())
 }
 
-fn ensure_backend_job_capacity(
-    conn: &Connection,
-    workspace_id: &str,
-    max_concurrent: u16,
-) -> Result<()> {
-    let active: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM backend_job_attempts WHERE workspace_id = ?1 AND state IN ('reserved', 'dispatched')",
-        params![workspace_id],
-        |row| row.get(0),
-    )?;
-    if active >= i64::from(max_concurrent) {
-        return Err(Error::InvalidInput(format!(
-            "Backend Job concurrency limit {max_concurrent} is reached"
-        )));
-    }
-    Ok(())
-}
-
 fn read_backend_job(
     conn: &Connection,
     workspace_id: &str,
@@ -13297,6 +13367,83 @@ fn migrate_backend_job_delivery_claims_v70_to_v71(conn: &Connection) -> Result<(
     Ok(())
 }
 
+fn migrate_backend_job_dispatch_queue_v71_to_v72(conn: &Connection) -> Result<()> {
+    let current = current_schema_version(conn)?;
+    if current != 71 {
+        return Err(Error::Store(format!(
+            "expected schema version 71 before {BACKEND_JOB_DISPATCH_QUEUE_MIGRATION_NAME} migration, found {current}"
+        )));
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    tx.execute_batch(
+        r#"
+        DROP INDEX backend_job_deliveries_pending;
+        DROP INDEX backend_job_attempts_recovery;
+        ALTER TABLE backend_job_deliveries RENAME TO backend_job_deliveries_v71;
+        ALTER TABLE backend_job_attempts RENAME TO backend_job_attempts_v71;
+        CREATE TABLE backend_job_attempts (
+            workspace_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            attempt INTEGER NOT NULL CHECK (attempt > 0 AND attempt <= 3),
+            input_revision TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('reserved', 'dispatching', 'dispatched', 'completed', 'failed', 'unknown')),
+            runtime_id TEXT,
+            worker_id TEXT,
+            runtime_run_id TEXT,
+            dispatched_at TEXT,
+            deadline_at TEXT NOT NULL,
+            result_json TEXT,
+            result_digest TEXT,
+            failure_category TEXT,
+            failure_detail TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            PRIMARY KEY (workspace_id, job_id, attempt_id),
+            UNIQUE (workspace_id, job_id, attempt),
+            UNIQUE (workspace_id, runtime_id, worker_id),
+            FOREIGN KEY (workspace_id, job_id)
+                REFERENCES backend_jobs(workspace_id, job_id) ON DELETE CASCADE,
+            CHECK ((runtime_id IS NULL) = (worker_id IS NULL)),
+            CHECK ((result_json IS NULL) = (result_digest IS NULL)),
+            CHECK ((state = 'completed') = (result_json IS NOT NULL))
+        );
+        INSERT INTO backend_job_attempts SELECT * FROM backend_job_attempts_v71;
+        CREATE INDEX backend_job_attempts_recovery
+            ON backend_job_attempts(workspace_id, state, deadline_at);
+        CREATE TABLE backend_job_deliveries (
+            workspace_id TEXT NOT NULL,
+            delivery_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            target_runtime_id TEXT NOT NULL,
+            target_worker_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('pending', 'sending', 'completed', 'failed', 'unknown')),
+            failure_category TEXT,
+            failure_detail TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            delivered_at TEXT,
+            PRIMARY KEY (workspace_id, delivery_id),
+            FOREIGN KEY (workspace_id, job_id, attempt_id)
+                REFERENCES backend_job_attempts(workspace_id, job_id, attempt_id) ON DELETE CASCADE
+        );
+        INSERT INTO backend_job_deliveries SELECT * FROM backend_job_deliveries_v71;
+        CREATE INDEX backend_job_deliveries_pending
+            ON backend_job_deliveries(workspace_id, state, updated_at);
+        DROP TABLE backend_job_deliveries_v71;
+        DROP TABLE backend_job_attempts_v71;
+        "#,
+    )?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+        params![72_i64, BACKEND_JOB_DISPATCH_QUEUE_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("DROP TABLE IF EXISTS typed_ticket_targets;")?;
     conn.execute_batch(include_str!("latest_schema.sql"))?;
@@ -15476,6 +15623,10 @@ mod tests {
                     version: 71,
                     name: BACKEND_JOB_DELIVERY_CLAIM_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 72,
+                    name: BACKEND_JOB_DISPATCH_QUEUE_MIGRATION_NAME.to_string(),
+                },
             ]
         );
 
@@ -15551,6 +15702,7 @@ mod tests {
                             71,
                             BACKEND_JOB_DELIVERY_CLAIM_MIGRATION_NAME.to_string(),
                         ),
+                        (72, BACKEND_JOB_DISPATCH_QUEUE_MIGRATION_NAME.to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -15836,7 +15988,7 @@ mod tests {
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
             vec![
-                52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71
+                52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72
             ]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
@@ -15845,7 +15997,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 22);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 23);
         assert!(column_exists(&conn, "worker_workdir_links", "alias").unwrap());
         assert!(column_exists(&conn, "worker_workdir_links", "capabilities").unwrap());
         assert!(!column_exists(&conn, "worker_workdir_links", "role").unwrap());
@@ -19528,6 +19680,15 @@ INSERT INTO worker_registry (
             .unwrap();
         assert!(replay.replayed);
         assert_eq!(replay.attempt.attempt_id, first.attempt.attempt_id);
+        let (_, claimed) = store
+            .claim_backend_job_attempt_dispatch(
+                workspace_id,
+                &request.job_id,
+                &first.attempt.attempt_id,
+                "2026-09-01T00:00:02Z",
+            )
+            .unwrap();
+        assert!(claimed);
         store
             .bind_backend_job_attempt_worker(
                 workspace_id,
@@ -19762,12 +19923,101 @@ INSERT INTO worker_registry (
             "Worker removal must not discard the durable Job result"
         );
 
+        // Dispatch admission is a transactional claim: concurrent claimers may
+        // leave durable work queued, but they cannot exceed the configured cap.
+        let queued = (0..6)
+            .map(|index| {
+                let mut queued_request = request.clone();
+                queued_request.job_id = format!("concurrent-claim-{index}");
+                queued_request.source_worker = None;
+                queued_request.notification_target = None;
+                queued_request.limits.max_concurrent_jobs = 4;
+                store
+                    .reserve_backend_job(
+                        workspace_id,
+                        &queued_request,
+                        &format!("2026-09-01T00:00:{:02}Z", 20 + index),
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let barrier = Arc::new(std::sync::Barrier::new(queued.len()));
+        let claims = std::thread::scope(|scope| {
+            let handles = queued
+                .iter()
+                .map(|reservation| {
+                    let store = store.clone();
+                    let job_id = reservation.job.request.job_id.clone();
+                    let attempt_id = reservation.attempt.attempt_id.clone();
+                    let barrier = barrier.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        store
+                            .claim_backend_job_attempt_dispatch(
+                                workspace_id,
+                                &job_id,
+                                &attempt_id,
+                                "2026-09-01T00:00:30Z",
+                            )
+                            .unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(claims.iter().filter(|(_, claimed)| *claimed).count(), 4);
+        assert_eq!(
+            claims
+                .iter()
+                .filter(|(reservation, _)| {
+                    reservation.attempt.state == BackendJobAttemptState::Dispatching
+                })
+                .count(),
+            4
+        );
+        assert_eq!(
+            store
+                .list_reserved_backend_job_attempts(workspace_id, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        for reservation in claims
+            .iter()
+            .filter(|(_, claimed)| *claimed)
+            .map(|(reservation, _)| reservation)
+        {
+            store
+                .finish_backend_job_attempt(
+                    workspace_id,
+                    &reservation.job.request.job_id,
+                    &reservation.attempt.attempt_id,
+                    BackendJobAttemptState::Failed,
+                    "test_cleanup",
+                    "release test dispatch slot",
+                    "2026-09-01T00:00:31Z",
+                )
+                .unwrap();
+        }
+
         let mut retry_request = request;
         retry_request.job_id = "bounded-retry".to_string();
         retry_request.notification_target = None;
         let failed = store
             .reserve_backend_job(workspace_id, &retry_request, "2026-09-01T00:01:00Z")
             .unwrap();
+        let (_, claimed) = store
+            .claim_backend_job_attempt_dispatch(
+                workspace_id,
+                &retry_request.job_id,
+                &failed.attempt.attempt_id,
+                "2026-09-01T00:01:01Z",
+            )
+            .unwrap();
+        assert!(claimed);
         store
             .bind_backend_job_attempt_worker(
                 workspace_id,

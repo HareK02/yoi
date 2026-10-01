@@ -268,6 +268,10 @@ impl TicketBackend for TicketToolBackend {
         self.backend.create(input)
     }
 
+    fn create_with_snapshot(&self, input: NewTicket) -> TicketResult<(TicketRef, Ticket)> {
+        self.backend.create_with_snapshot(input)
+    }
+
     fn edit_item(&self, id: TicketIdOrSlug, edit: crate::TicketItemEdit) -> TicketResult<Ticket> {
         self.backend.edit_item(id, edit)
     }

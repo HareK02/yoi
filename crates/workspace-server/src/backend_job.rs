@@ -62,6 +62,7 @@ impl BackendJobState {
 #[serde(rename_all = "snake_case")]
 pub enum BackendJobAttemptState {
     Reserved,
+    Dispatching,
     Dispatched,
     Completed,
     Failed,
@@ -72,6 +73,7 @@ impl BackendJobAttemptState {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Reserved => "reserved",
+            Self::Dispatching => "dispatching",
             Self::Dispatched => "dispatched",
             Self::Completed => "completed",
             Self::Failed => "failed",
@@ -82,6 +84,7 @@ impl BackendJobAttemptState {
     pub(crate) fn parse(value: &str) -> Result<Self> {
         match value {
             "reserved" => Ok(Self::Reserved),
+            "dispatching" => Ok(Self::Dispatching),
             "dispatched" => Ok(Self::Dispatched),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),

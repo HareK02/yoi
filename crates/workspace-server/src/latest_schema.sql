@@ -836,7 +836,7 @@ CREATE TABLE backend_job_attempts (
             attempt_id TEXT NOT NULL,
             attempt INTEGER NOT NULL CHECK (attempt > 0 AND attempt <= 3),
             input_revision TEXT NOT NULL,
-            state TEXT NOT NULL CHECK (state IN ('reserved', 'dispatched', 'completed', 'failed', 'unknown')),
+            state TEXT NOT NULL CHECK (state IN ('reserved', 'dispatching', 'dispatched', 'completed', 'failed', 'unknown')),
             runtime_id TEXT,
             worker_id TEXT,
             runtime_run_id TEXT,
