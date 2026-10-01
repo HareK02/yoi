@@ -45,6 +45,11 @@ use protocol::{Event, Method, Segment, WorkerCommandEnvelope};
 
 static NEXT_INTERNAL_COMMAND_ID: AtomicU64 = AtomicU64::new(1);
 
+enum NotificationAcceptance {
+    Accepted,
+    Rejected(String),
+}
+
 fn rollback_materialized_spawn_workdirs(
     materializer: &dyn WorkingDirectoryMaterializer,
     bindings: &BTreeMap<WorkdirAttachmentAlias, WorkingDirectoryBinding>,
@@ -1883,6 +1888,75 @@ where
         .unwrap_or_else(|message| WorkerExecutionResult::errored(operation, message))
     }
 
+    fn send_notification_and_wait_for_acceptance(
+        &self,
+        operation: WorkerExecutionOperation,
+        worker: WorkerHandle,
+        method: Method,
+        notification_request_id: String,
+    ) -> WorkerExecutionResult {
+        let request_id = notification_request_id.clone();
+        let result = self.run_cancellable_on_adapter_runtime(USER_INPUT_TASK_TIMEOUT, async move {
+            // Subscribe before enqueueing so a fast durable acceptance cannot
+            // race the Runtime acknowledgement.
+            let mut events = worker.subscribe();
+            worker
+                .send(method)
+                .await
+                .map_err(|err| format!("failed to send Worker method: {err}"))?;
+
+            tokio::time::timeout(USER_INPUT_COMMIT_TIMEOUT, async move {
+                loop {
+                    match events.recv().await {
+                        Ok(Event::NotificationAccepted {
+                            notification_request_id,
+                        }) if notification_request_id == request_id => {
+                            return Ok(NotificationAcceptance::Accepted);
+                        }
+                        Ok(Event::NotificationRejected {
+                            notification_request_id,
+                            message,
+                        }) if notification_request_id == request_id => {
+                            return Ok(NotificationAcceptance::Rejected(message));
+                        }
+                        Ok(Event::Shutdown) => {
+                            return Err(
+                                "worker shut down before notification was durably accepted"
+                                    .to_string(),
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            return Err(format!(
+                                "worker notification acknowledgement lagged by {skipped} protocol event(s)"
+                            ));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            return Err(
+                                "worker event stream closed before notification was durably accepted"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+            })
+            .await
+            .map_err(|_| {
+                "timed out waiting for durable Worker notification acceptance".to_string()
+            })?
+        });
+
+        match result {
+            Ok(NotificationAcceptance::Accepted) => {
+                WorkerExecutionResult::accepted_notification(operation, notification_request_id)
+            }
+            Ok(NotificationAcceptance::Rejected(message)) => {
+                WorkerExecutionResult::rejected(operation, message)
+            }
+            Err(message) => WorkerExecutionResult::errored(operation, message),
+        }
+    }
+
     fn retain_uncertain_unconnected_controller(
         &self,
         worker_ref: &crate::identity::WorkerRef,
@@ -2879,16 +2953,17 @@ where
             let notification_request_id = input
                 .submission_request_id
                 .unwrap_or_else(protocol::new_submission_request_id);
-            return self.send_method(
+            return self.send_notification_and_wait_for_acceptance(
                 WorkerExecutionOperation::Input,
                 worker,
                 Method::NotifyTracked {
                     notification_request_id: notification_request_id.clone(),
                     message: input.content,
                     source: protocol::AuthenticatedInputSource::Backend {
-                        operation_id: notification_request_id,
+                        operation_id: notification_request_id.clone(),
                     },
                 },
+                notification_request_id,
             );
         }
 
@@ -5108,7 +5183,7 @@ mod tests {
     }
 
     #[test]
-    fn running_worker_accepts_notify_without_a_submit_receipt() {
+    fn running_worker_waits_for_durable_notify_receipt() {
         let client = MockClient::sequential(vec![MockResponse::Hang(vec![])]);
         let runtime_base = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
@@ -5143,6 +5218,13 @@ mod tests {
             .expect("Running Worker must accept Notify without a Submit receipt");
 
         assert!(acknowledgement.submission.is_none());
+        assert_eq!(
+            acknowledgement
+                .notification
+                .as_ref()
+                .map(|ack| ack.notification_request_id.as_str()),
+            Some("notification-request")
+        );
         wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Running);
     }
 

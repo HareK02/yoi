@@ -1489,6 +1489,40 @@ where
     Ok(workdir_for_view)
 }
 
+fn durably_accept_notification<St>(
+    notification_request_id: String,
+    message: String,
+    source_namespace: String,
+    provenance: session_store::LoggedSessionHistoryOrigin,
+    pending_submissions: &PendingSubmissionHandle<St>,
+    working_event_tx: &broadcast::Sender<Event>,
+) -> bool
+where
+    St: session_store::Store + Clone,
+{
+    let request_id = notification_request_id.clone();
+    match pending_submissions.accept_notification_from_source(
+        notification_request_id,
+        message,
+        source_namespace,
+        provenance,
+    ) {
+        Ok(_) => {
+            let _ = working_event_tx.send(Event::NotificationAccepted {
+                notification_request_id: request_id,
+            });
+            true
+        }
+        Err(error) => {
+            let _ = working_event_tx.send(Event::NotificationRejected {
+                notification_request_id: request_id,
+                message: error.to_string(),
+            });
+            false
+        }
+    }
+}
+
 fn durably_accept_method_while_busy<St>(
     method: Method,
     pending_submissions: &PendingSubmissionHandle<St>,
@@ -1561,17 +1595,14 @@ where
             notification_request_id,
             message,
         } => {
-            if let Err(error) = pending_submissions.accept_notification_from_source(
+            durably_accept_notification(
                 notification_request_id,
                 message,
                 pending_submissions.direct_client_namespace(),
                 session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
-            ) {
-                let _ = working_event_tx.send(Event::Error {
-                    code: ErrorCode::InvalidRequest,
-                    message: error.to_string(),
-                });
-            }
+                pending_submissions,
+                working_event_tx,
+            );
             None
         }
         Method::NotifyTracked {
@@ -1581,17 +1612,14 @@ where
         } => {
             let (source_namespace, provenance) =
                 resolved_input_source(pending_submissions, &source);
-            if let Err(error) = pending_submissions.accept_notification_from_source(
+            durably_accept_notification(
                 notification_request_id,
                 message,
                 source_namespace,
                 provenance,
-            ) {
-                let _ = working_event_tx.send(Event::Error {
-                    code: ErrorCode::InvalidRequest,
-                    message: error.to_string(),
-                });
-            }
+                pending_submissions,
+                working_event_tx,
+            );
             None
         }
         method => Some(method),
@@ -1619,9 +1647,16 @@ fn reject_method_while_attention_locked(
             });
             true
         }
-        Method::Notify { .. } | Method::NotifyTracked { .. } => {
-            let _ = working_event_tx.send(Event::Error {
-                code: ErrorCode::InvalidRequest,
+        Method::Notify {
+            notification_request_id,
+            ..
+        }
+        | Method::NotifyTracked {
+            notification_request_id,
+            ..
+        } => {
+            let _ = working_event_tx.send(Event::NotificationRejected {
+                notification_request_id: notification_request_id.clone(),
                 message: message.to_owned(),
             });
             true
@@ -2031,21 +2066,14 @@ async fn controller_loop<C, St>(
                 notification_request_id,
                 message,
             } => {
-                let source_namespace = pending_submissions.direct_client_namespace();
-                match pending_submissions.accept_notification_from_source(
+                durably_accept_notification(
                     notification_request_id,
                     message,
-                    source_namespace.clone(),
+                    pending_submissions.direct_client_namespace(),
                     session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
-                ) {
-                    Ok(_) => {}
-                    Err(error) => {
-                        let _ = working_event_tx.send(Event::Error {
-                            code: ErrorCode::InvalidRequest,
-                            message: error.to_string(),
-                        });
-                    }
-                }
+                    &pending_submissions,
+                    &working_event_tx,
+                );
             }
 
             Method::NotifyTracked {
@@ -2055,20 +2083,14 @@ async fn controller_loop<C, St>(
             } => {
                 let (source_namespace, provenance) =
                     resolved_input_source(&pending_submissions, &source);
-                match pending_submissions.accept_notification_from_source(
+                durably_accept_notification(
                     notification_request_id,
                     message,
-                    source_namespace.clone(),
+                    source_namespace,
                     provenance,
-                ) {
-                    Ok(_) => {}
-                    Err(error) => {
-                        let _ = working_event_tx.send(Event::Error {
-                            code: ErrorCode::InvalidRequest,
-                            message: error.to_string(),
-                        });
-                    }
-                }
+                    &pending_submissions,
+                    &working_event_tx,
+                );
             }
 
             Method::ListPendingSubmissions => {
@@ -3113,22 +3135,15 @@ where
                         notification_request_id,
                         message,
                     }) => {
-                        let source_namespace = pending_submissions.direct_client_namespace();
-                        match pending_submissions.accept_notification_from_source(
+                        if durably_accept_notification(
                             notification_request_id,
                             message,
-                            source_namespace.clone(),
+                            pending_submissions.direct_client_namespace(),
                             session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
+                            pending_submissions,
+                            working_event_tx,
                         ) {
-                            Ok(_) => {
-                                stage_pending_notifications(&pending_submissions, notify_buffer);
-                            }
-                            Err(error) => {
-                                let _ = working_event_tx.send(Event::Error {
-                                    code: ErrorCode::InvalidRequest,
-                                    message: error.to_string(),
-                                });
-                            }
+                            stage_pending_notifications(&pending_submissions, notify_buffer);
                         }
                         let _ = working_event_tx.send(Event::PendingSubmissionsChanged {
                             pending: pending_submissions.snapshot(),
@@ -3141,21 +3156,15 @@ where
                     }) => {
                         let (source_namespace, provenance) =
                             resolved_input_source(pending_submissions, &source);
-                        match pending_submissions.accept_notification_from_source(
+                        if durably_accept_notification(
                             notification_request_id,
                             message,
-                            source_namespace.clone(),
+                            source_namespace,
                             provenance,
+                            pending_submissions,
+                            working_event_tx,
                         ) {
-                            Ok(_) => {
-                                stage_pending_notifications(&pending_submissions, notify_buffer);
-                            }
-                            Err(error) => {
-                                let _ = working_event_tx.send(Event::Error {
-                                    code: ErrorCode::InvalidRequest,
-                                    message: error.to_string(),
-                                });
-                            }
+                            stage_pending_notifications(&pending_submissions, notify_buffer);
                         }
                         let _ = working_event_tx.send(Event::PendingSubmissionsChanged {
                             pending: pending_submissions.snapshot(),
@@ -3622,29 +3631,46 @@ mod tests {
     }
 
     #[test]
-    fn busy_notification_is_durable_before_shutdown_can_observe_it() {
+    fn busy_notification_receipt_follows_durable_idempotent_acceptance() {
         let dir = tempfile::tempdir().unwrap();
         let pending = PendingSubmissionHandle::for_test(dir.path());
-        let (event_tx, _event_rx) = broadcast::channel(4);
+        let (event_tx, mut event_rx) = broadcast::channel(4);
+        let method = Method::NotifyTracked {
+            notification_request_id: "completion-1".into(),
+            message: "subworker completed".into(),
+            source: protocol::AuthenticatedInputSource::UntrustedWire,
+        };
 
-        assert!(
-            durably_accept_method_while_busy(
-                Method::NotifyTracked {
-                    notification_request_id: "completion-1".into(),
-                    message: "subworker completed".into(),
-                    source: protocol::AuthenticatedInputSource::UntrustedWire,
-                },
-                &pending,
-                &event_tx,
-            )
-            .is_none()
+        for _ in 0..2 {
+            assert!(
+                durably_accept_method_while_busy(method.clone(), &pending, &event_tx).is_none()
+            );
+            let entries = pending.persisted_entries_for_test();
+            assert!(entries.iter().any(|entry| matches!(
+                entry,
+                LogEntry::Extension { domain, .. }
+                    if domain == "worker.pending_activations.v1"
+            )));
+            assert!(matches!(
+                event_rx.try_recv().unwrap(),
+                Event::NotificationAccepted {
+                    notification_request_id,
+                } if notification_request_id == "completion-1"
+            ));
+        }
+        assert_eq!(pending.snapshot().notification_count, 1);
+        assert_eq!(
+            pending
+                .persisted_entries_for_test()
+                .iter()
+                .filter(|entry| matches!(
+                    entry,
+                    LogEntry::Extension { domain, .. }
+                        if domain == "worker.pending_activations.v1"
+                ))
+                .count(),
+            1
         );
-        let entries = pending.persisted_entries_for_test();
-        assert!(entries.iter().any(|entry| matches!(
-            entry,
-            LogEntry::Extension { domain, .. }
-                if domain == "worker.pending_activations.v1"
-        )));
     }
 
     #[test]

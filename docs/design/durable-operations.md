@@ -319,10 +319,12 @@ The durable split is deliberate:
   `(Workspace, Runtime, Worker)` identity, a precommitted tracked Runtime
   submission request identity, a deadline, and its bounded outcome;
 - `backend_job_deliveries` records best-effort notification separately from the
-  result. Its durable delivery ID is also the Runtime's tracked notification
-  request ID, so restart recovery can replay an ambiguous `sending` claim
-  without duplicating Worker context. A missing or stopped recipient never
-  discards a result or reruns model work.
+  result. Its fixed-size collision-resistant durable delivery ID is also the
+  Runtime's tracked notification request ID. Runtime reports acceptance only
+  after the Worker has persisted the correlated notification receipt, so restart
+  recovery can replay an ambiguous `sending` claim without duplicating Worker
+  context. A missing or stopped recipient never discards a result or reruns
+  model work.
 
 Exact dispatch retry reuses the deterministic attempt and Worker allocation key.
 Only explicit re-evaluation of a definitively failed attempt increments the
@@ -334,8 +336,9 @@ state, recursively create Workers or Jobs, or inherit caller Workdir authority.
 
 Success is accepted only by the structured result boundary. Before Runtime
 input can execute, the attempt is fenced by Workspace, Job ID, attempt ID, input
-revision, bound Runtime Worker identity, and the deterministic tracked submission
-request identity. Ordinary Worker input and Console mutation are rejected for
+revision, bound Runtime Worker identity, and a fixed-size collision-resistant
+tracked submission request identity derived from the attempt. Ordinary Worker
+input and Console mutation are rejected for
 Job-owned Workers, so no later run in the same Session can exercise the result
 capability. Result JSON bytes are bounded before persistence. Worker final prose,
 Idle, Stopped, or a successful model call are not success evidence. Identical

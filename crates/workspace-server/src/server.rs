@@ -3394,7 +3394,7 @@ impl WorkspaceApi {
             }
         };
         let bound_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
-        let runtime_run_id = format!("backend-job-run:{}", reservation.attempt.attempt_id);
+        let runtime_run_id = crate::backend_job::runtime_run_id(&reservation.attempt.attempt_id);
         let (commit, newly_bound) = self.store.bind_backend_job_attempt_worker(
             &self.config.workspace_id,
             &request.job_id,
@@ -3671,9 +3671,9 @@ impl WorkspaceApi {
         acceptance: &BackendJobResultAcceptance,
         target: &RuntimeWorkerRef,
     ) {
-        let delivery_id = format!(
-            "{}:{}:notification",
-            acceptance.job.request.job_id, acceptance.attempt.attempt_id
+        let delivery_id = crate::backend_job::delivery_id(
+            &acceptance.job.request.job_id,
+            &acceptance.attempt.attempt_id,
         );
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
         let Ok((delivery, claimed)) = self.store.reserve_backend_job_delivery(
@@ -33863,6 +33863,7 @@ mod tests {
                 .cloned()
                 .expect("execution context");
             let submission_request_id = input.submission_request_id.clone();
+            let input_kind = input.kind.clone();
             let content = input.content.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(25));
@@ -33870,7 +33871,13 @@ mod tests {
                     text: format!("server companion echoed: {content}"),
                 });
             });
-            if let Some(submission_request_id) = submission_request_id {
+            if input_kind == worker_runtime::interaction::WorkerInputKind::Notify {
+                worker_runtime::execution::WorkerExecutionResult::accepted_notification(
+                    worker_runtime::execution::WorkerExecutionOperation::Input,
+                    submission_request_id.expect("Notify test input has a Runtime request id"),
+                )
+                .with_worker_state(protocol::WorkerStateSnapshot::initial())
+            } else if let Some(submission_request_id) = submission_request_id {
                 worker_runtime::execution::WorkerExecutionResult::accepted_submission(
                     worker_runtime::execution::WorkerExecutionOperation::Input,
                     submission_request_id,
@@ -34121,7 +34128,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (api, execution) = test_api_with_recording_backend(temp.path()).await;
         let request = BackendJobRequest {
-            job_id: "runner-fast-result-1".to_string(),
+            job_id: "r".repeat(256),
             purpose: "fast_result_contract_check".to_string(),
             input_revision: "revision-1".to_string(),
             input_ref: "test://runner/fast-result/1".to_string(),
@@ -34156,10 +34163,8 @@ mod tests {
         let dispatched = api.dispatch_backend_job(&request).unwrap();
         assert_eq!(*acceptance_observed.lock().unwrap(), Some(true));
         assert_eq!(dispatched.job.state, BackendJobState::Completed);
-        let expected_run_id = format!(
-            "backend-job-run:{}",
-            crate::backend_job::attempt_id(&request.job_id, 1)
-        );
+        let expected_run_id =
+            crate::backend_job::runtime_run_id(&crate::backend_job::attempt_id(&request.job_id, 1));
         assert_eq!(
             dispatched.attempt.runtime_run_id.as_deref(),
             Some(expected_run_id.as_str())
@@ -34207,7 +34212,7 @@ mod tests {
             .unwrap()
             .worker;
         let request = BackendJobRequest {
-            job_id: "runner-delivery-recovery-1".to_string(),
+            job_id: "n".repeat(256),
             purpose: "delivery_recovery_contract_check".to_string(),
             input_revision: "revision-1".to_string(),
             input_ref: "test://runner/delivery-recovery/1".to_string(),
@@ -34237,10 +34242,8 @@ mod tests {
                 &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
             )
             .unwrap();
-        let delivery_id = format!(
-            "{}:{}:notification",
-            request.job_id, acceptance.attempt.attempt_id
-        );
+        let delivery_id =
+            crate::backend_job::delivery_id(&request.job_id, &acceptance.attempt.attempt_id);
         let (_, claimed) = api
             .store
             .reserve_backend_job_delivery(

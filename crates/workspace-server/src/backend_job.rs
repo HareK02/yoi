@@ -355,6 +355,27 @@ pub fn allocation_key(attempt_id: &str) -> String {
     format!("backend-job:{attempt_id}")
 }
 
+/// Fixed-size Runtime request identity for the exact Job attempt. Caller-selected
+/// Job ids may be longer than the Worker protocol request-id bound, so never
+/// embed them directly in tracked Runtime identities.
+pub fn runtime_run_id(attempt_id: &str) -> String {
+    tracked_request_id("run", attempt_id.as_bytes())
+}
+
+/// Fixed-size durable delivery identity, also reused as the Worker's tracked
+/// notification request id so restart replay converges on one receipt.
+pub fn delivery_id(job_id: &str, attempt_id: &str) -> String {
+    let mut identity = Vec::with_capacity(job_id.len() + attempt_id.len() + 1);
+    identity.extend_from_slice(job_id.as_bytes());
+    identity.push(0);
+    identity.extend_from_slice(attempt_id.as_bytes());
+    tracked_request_id("notification", &identity)
+}
+
+fn tracked_request_id(kind: &str, identity: &[u8]) -> String {
+    format!("backend-job-{kind}:{}", sha256(identity))
+}
+
 pub fn result_digest(result: &Value, max_bytes: u32) -> Result<(String, String)> {
     let encoded = serde_json::to_string(result)
         .map_err(|error| Error::InvalidInput(format!("serialize Backend Job result: {error}")))?;
@@ -446,6 +467,28 @@ mod tests {
             mutate(&mut changed);
             assert_ne!(first, changed.fingerprint().unwrap());
         }
+    }
+
+    #[test]
+    fn tracked_runtime_ids_are_fixed_size_for_maximum_job_ids() {
+        let job_id = "j".repeat(256);
+        let attempt_id = attempt_id(&job_id, ABSOLUTE_MAX_ATTEMPTS);
+        let run_id = runtime_run_id(&attempt_id);
+        let notification_id = delivery_id(&job_id, &attempt_id);
+
+        assert!(run_id.len() <= 128, "run id was {} bytes", run_id.len());
+        assert!(
+            notification_id.len() <= 128,
+            "notification id was {} bytes",
+            notification_id.len()
+        );
+        assert_eq!(run_id, runtime_run_id(&attempt_id));
+        assert_eq!(notification_id, delivery_id(&job_id, &attempt_id));
+        assert_ne!(run_id, runtime_run_id(&format!("{attempt_id}-other")));
+        assert_ne!(
+            notification_id,
+            delivery_id(&job_id, &format!("{attempt_id}-other"))
+        );
     }
 
     #[test]
