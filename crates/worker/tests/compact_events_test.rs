@@ -1736,7 +1736,11 @@ async fn manual_compact_cancel_clears_progress_before_returning_idle() {
             Event::CompactionProgress { compaction: None } => {
                 saw_interrupted = true;
             }
-            Event::Error { .. } => saw_cancel_error = true,
+            Event::Error { .. }
+            | Event::Alert(protocol::Alert {
+                level: protocol::AlertLevel::Error,
+                ..
+            }) => saw_cancel_error = true,
             Event::WorkerState { snapshot }
                 if snapshot.catalog_status() == protocol::WorkerStatus::Idle =>
             {

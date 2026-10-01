@@ -376,6 +376,35 @@ Deno.test("durable compaction failure reconciles live alert and error in both vi
   assertEquals(merged.find((line) => line.kind === "error")?.entryId, "failed-entry");
 });
 
+Deno.test("reapplying one committed run_error entry is idempotent in both views", () => {
+  const committed = (eventId: string): ConsoleEventInput => ({
+    eventId,
+    event: {
+      event: "session_entry_committed",
+      data: {
+        entry: {
+          entry_id: "same-run-error",
+          timestamp: 10,
+          provenance: "legacy_unknown",
+          kind: "run_error",
+          message: "mid-run compaction failed: summary unavailable",
+          failure: "compaction",
+        },
+      },
+    },
+  });
+
+  const projection = projectConsole([
+    committed("live-delivery"),
+    committed("snapshot-replay"),
+  ]);
+  const errors = projection.lines.filter((line) => line.kind === "error");
+  assertEquals(errors.length, 1);
+  assertEquals(errors[0].entryId, "same-run-error");
+  assertEquals(projectConsoleLines(projection.lines, "normal").length, 1);
+  assertEquals(projectConsoleLines(projection.lines, "overview").length, 1);
+});
+
 Deno.test("snapshot restores compaction terminal without reviving transition progress", () => {
   const projection = projectConsole([{
     eventId: "snapshot",

@@ -5291,6 +5291,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 info!(new_segment_id = %new_segment_id, "Manual compaction succeeded");
                 Ok(ManualCompactResult::Compacted { new_segment_id })
             }
+            Err(WorkerError::CompactCancelled) => {
+                info!("Manual compaction was cancelled");
+                Err(WorkerError::CompactCancelled)
+            }
             Err(e) => {
                 warn!(error = %e, "Manual compaction failed");
                 self.alert(
