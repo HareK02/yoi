@@ -1176,6 +1176,20 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[body] request: SubjektivRecordSessionRequest,
     ) -> Result<SubjektivRecordSessionResponse, RepositoryApiError>;
+    #[post(
+        "/api/w/{workspace_id}/subjektiv/memory",
+        operation_id = "subjektiv_memory_backend",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        openapi = false,
+    )]
+    async fn subjektiv_memory_backend(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: SubjektivMemoryBackendRequest,
+    ) -> Result<SubjektivMemoryBackendResponse, RepositoryApiError>;
 
     #[get(
         "/api/w/{workspace_id}/skills",
@@ -4504,6 +4518,270 @@ pub struct SubjektivRecordSessionRequest {
 pub struct SubjektivRecordSessionResponse {
     pub subject_id: String,
     pub session_id: String,
+}
+
+/// Current lifecycle state of one confirmed subject Memory revision.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjektivMemoryState {
+    Active,
+    Resolved,
+    Retracted,
+}
+
+/// Requested state/change semantics for a staging-only revision proposal.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjektivMemoryRevisionIntent {
+    Revise,
+    Resolve,
+    Retract,
+    Reopen,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryRevisionRef {
+    pub memory_id: String,
+    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
+    pub revision: u64,
+}
+
+/// Typed metadata retained with a revision proposal candidate for T-670.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryRevisionProposal {
+    pub memory_id: String,
+    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
+    pub expected_revision: u64,
+    pub intent: SubjektivMemoryRevisionIntent,
+    pub change_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryProposalTarget {
+    pub memory_id: String,
+    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
+    pub expected_revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryQueryRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kinds: Option<Vec<memory::extract::CandidateKind>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub states: Option<Vec<SubjektivMemoryState>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryReadRequest {
+    pub memory_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
+    pub revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub offset: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 1000))]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryListRevisionsRequest {
+    pub memory_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryValidateProposalRequest {
+    pub memory_id: String,
+    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
+    pub expected_revision: u64,
+    pub intent: SubjektivMemoryRevisionIntent,
+}
+
+/// Host-resolved staging input. Subject scope and evidence origin are never
+/// accepted from model-visible tool arguments.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryStageExplicitRequest {
+    pub receipt_id: String,
+    pub session_id: String,
+    pub kind: memory::extract::CandidateKind,
+    pub claim: String,
+    pub why_useful: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staleness: Option<String>,
+    #[serde(default)]
+    pub evidence: Vec<memory::extract::StagingEvidence>,
+    #[serde(default)]
+    pub source_refs: Vec<memory::schema::SourceEvidenceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<SubjektivMemoryRevisionProposal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "operation", content = "input", rename_all = "snake_case")]
+pub enum SubjektivMemoryBackendOperation {
+    Query(SubjektivMemoryQueryRequest),
+    Read(SubjektivMemoryReadRequest),
+    ListRevisions(SubjektivMemoryListRevisionsRequest),
+    ValidateProposal(SubjektivMemoryValidateProposalRequest),
+    StageExplicit(SubjektivMemoryStageExplicitRequest),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryBackendRequest {
+    pub operation: SubjektivMemoryBackendOperation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryQueryItem {
+    pub id: String,
+    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
+    pub revision: u64,
+    pub kind: memory::extract::CandidateKind,
+    pub state: SubjektivMemoryState,
+    pub claim: String,
+    pub excerpt: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryQueryResponse {
+    pub items: Vec<SubjektivMemoryQueryItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryEvidenceCandidate {
+    pub candidate_id: String,
+    pub evidence: Vec<memory::extract::StagingEvidence>,
+    pub source_refs: Vec<memory::schema::SourceEvidenceRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryReadResponse {
+    pub memory_id: String,
+    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
+    pub revision: u64,
+    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
+    pub current_revision: u64,
+    pub kind: memory::extract::CandidateKind,
+    pub state: SubjektivMemoryState,
+    pub claim: String,
+    /// A line-bounded slice, never an implicit full-document claim.
+    pub body_md: String,
+    pub why_useful: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staleness: Option<String>,
+    pub change_reason: String,
+    pub created_at: String,
+    pub updated_at: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub body_offset: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub body_next_offset: Option<usize>,
+    pub body_truncated: bool,
+    /// Candidate ids on this evidence page. The corresponding bounded anchors
+    /// are returned in `source_candidates` with the same order.
+    pub source_candidate_ids: Vec<String>,
+    pub source_candidates: Vec<SubjektivMemoryEvidenceCandidate>,
+    /// Derivation references on this evidence page.
+    pub derived_from: Vec<SubjektivMemoryRevisionRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_next_cursor: Option<String>,
+    pub evidence_has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryRevisionItem {
+    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
+    pub revision: u64,
+    pub kind: memory::extract::CandidateKind,
+    pub state: SubjektivMemoryState,
+    pub claim: String,
+    pub change_reason: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryListRevisionsResponse {
+    pub memory_id: String,
+    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
+    pub current_revision: u64,
+    pub items: Vec<SubjektivMemoryRevisionItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryProposalValidationResponse {
+    pub memory_id: String,
+    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
+    pub current_revision: u64,
+    pub kind: memory::extract::CandidateKind,
+    pub state: SubjektivMemoryState,
+    pub intent: SubjektivMemoryRevisionIntent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjektivMemoryReceiptStatus {
+    Staged,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryStageExplicitResponse {
+    pub candidate_id: String,
+    pub receipt_id: String,
+    pub status: SubjektivMemoryReceiptStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<SubjektivMemoryProposalTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<SubjektivMemoryRevisionIntent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "result", content = "data", rename_all = "snake_case")]
+pub enum SubjektivMemoryBackendResponse {
+    Query(SubjektivMemoryQueryResponse),
+    Read(SubjektivMemoryReadResponse),
+    ListRevisions(SubjektivMemoryListRevisionsResponse),
+    ProposalValidated(SubjektivMemoryProposalValidationResponse),
+    Staged(SubjektivMemoryStageExplicitResponse),
 }
 
 pub const WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES: usize = 128;
@@ -11673,6 +11951,7 @@ mod openapi_artifact_tests {
             "worker_observation_sessions",
             "subjektiv_stage_candidate",
             "subjektiv_record_session",
+            "subjektiv_memory_backend",
             "workspace_worker_discovery",
             "workspace_worker_remove",
         ];

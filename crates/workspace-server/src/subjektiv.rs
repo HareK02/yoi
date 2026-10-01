@@ -161,8 +161,74 @@ impl SubjectSessionAttribution {
     }
 }
 
-/// The existing extraction schema with only host-owned subject scope and
-/// persistence time added. Model input still contains neither field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevisionProposalIntent {
+    Revise,
+    Resolve,
+    Retract,
+    Reopen,
+}
+
+/// Host-owned metadata describing how a staged candidate is expected to change
+/// one existing Memory. It is validated against the current scoped Memory when
+/// the candidate is staged; it is not model-authored and does not itself apply
+/// the revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevisionProposal {
+    pub intent: RevisionProposalIntent,
+    pub memory_id: String,
+    pub expected_revision: u64,
+    pub change_reason: String,
+}
+
+impl RevisionProposal {
+    pub fn new(
+        intent: RevisionProposalIntent,
+        memory_id: impl Into<String>,
+        expected_revision: u64,
+        change_reason: impl Into<String>,
+    ) -> Result<Self> {
+        let proposal = Self {
+            intent,
+            memory_id: memory_id.into(),
+            expected_revision,
+            change_reason: change_reason.into(),
+        };
+        validate_revision_proposal_metadata(&proposal)?;
+        Ok(proposal)
+    }
+}
+
+impl<'de> Deserialize<'de> for RevisionProposal {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireProposal {
+            intent: RevisionProposalIntent,
+            memory_id: String,
+            expected_revision: u64,
+            change_reason: String,
+        }
+
+        let proposal = WireProposal::deserialize(deserializer)?;
+        RevisionProposal::new(
+            proposal.intent,
+            proposal.memory_id,
+            proposal.expected_revision,
+            proposal.change_reason,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+/// The existing extraction schema with only host-owned subject scope,
+/// persistence time, and optional revision proposal metadata added. Model input
+/// still contains none of those fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubjectStagingRecord {
@@ -180,6 +246,8 @@ pub struct SubjectStagingRecord {
     pub evidence: Vec<StagingEvidence>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_refs: Vec<SourceEvidenceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_proposal: Option<RevisionProposal>,
     pub created_at: String,
 }
 
@@ -203,8 +271,23 @@ impl SubjectStagingRecord {
             staleness: record.staleness,
             evidence: record.evidence,
             source_refs: record.source_refs,
+            revision_proposal: None,
             created_at,
         }
+    }
+
+    /// Attaches host-owned revision proposal metadata to this candidate.
+    pub fn with_revision_proposal(mut self, proposal: RevisionProposal) -> Result<Self> {
+        validate_revision_proposal_metadata(&proposal)?;
+        self.revision_proposal = Some(proposal);
+        Ok(self)
+    }
+
+    /// Mutably attaches host-owned revision proposal metadata to this candidate.
+    pub fn attach_revision_proposal(&mut self, proposal: RevisionProposal) -> Result<()> {
+        validate_revision_proposal_metadata(&proposal)?;
+        self.revision_proposal = Some(proposal);
+        Ok(())
     }
 }
 
@@ -1119,6 +1202,95 @@ impl SubjektivStore {
         })
     }
 
+    /// Reads one current Memory while distinguishing an absent target from a
+    /// Memory id owned by another subject.
+    pub fn scoped_memory(&self, subject_id: &str, memory_id: &str) -> Result<MemoryRecord> {
+        validate_label("subject id", subject_id)?;
+        validate_label("Memory id", memory_id)?;
+        self.database.try_with_connection(|connection| {
+            require_subject_in_connection(connection, subject_id)?;
+            scoped_memory_in_connection(connection, subject_id, memory_id)
+        })
+    }
+
+    /// Reads one immutable revision after verifying that the Memory belongs to
+    /// the requested subject. A missing revision of a valid scoped Memory is
+    /// returned as `None`.
+    pub fn scoped_memory_revision(
+        &self,
+        subject_id: &str,
+        memory_id: &str,
+        revision: u64,
+    ) -> Result<Option<MemoryRecord>> {
+        validate_label("subject id", subject_id)?;
+        validate_label("Memory id", memory_id)?;
+        if revision == 0 {
+            return Err(SubjektivError::InvalidRecord(
+                "Memory revision must be greater than zero".into(),
+            ));
+        }
+        self.database.try_with_connection(|connection| {
+            require_subject_in_connection(connection, subject_id)?;
+            scoped_memory_in_connection(connection, subject_id, memory_id)?;
+            let raw = connection
+                .query_row(
+                    "SELECT record_json FROM memory_revisions
+                     WHERE subject_id = ?1 AND memory_id = ?2 AND revision = ?3",
+                    params![subject_id, memory_id, to_i64(revision)?],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            raw.map(|raw| parse_memory(&raw)).transpose()
+        })
+    }
+
+    /// Lists current Memory records for one existing subject in deterministic
+    /// most-recently-updated order.
+    pub fn list_memories(&self, subject_id: &str) -> Result<Vec<MemoryRecord>> {
+        validate_label("subject id", subject_id)?;
+        self.database.try_with_connection(|connection| {
+            require_subject_in_connection(connection, subject_id)?;
+            let mut statement = connection.prepare(
+                "SELECT record_json FROM memory_records
+                 WHERE subject_id = ?1
+                 ORDER BY updated_at DESC, memory_id ASC",
+            )?;
+            let rows = statement.query_map([subject_id], |row| row.get::<_, String>(0))?;
+            let mut records = Vec::new();
+            for row in rows {
+                records.push(parse_memory(&row?)?);
+            }
+            Ok(records)
+        })
+    }
+
+    /// Lists every immutable revision of one scoped Memory, newest first.
+    pub fn list_memory_revisions(
+        &self,
+        subject_id: &str,
+        memory_id: &str,
+    ) -> Result<Vec<MemoryRecord>> {
+        validate_label("subject id", subject_id)?;
+        validate_label("Memory id", memory_id)?;
+        self.database.try_with_connection(|connection| {
+            require_subject_in_connection(connection, subject_id)?;
+            scoped_memory_in_connection(connection, subject_id, memory_id)?;
+            let mut statement = connection.prepare(
+                "SELECT record_json FROM memory_revisions
+                 WHERE subject_id = ?1 AND memory_id = ?2
+                 ORDER BY revision DESC",
+            )?;
+            let rows = statement.query_map(params![subject_id, memory_id], |row| {
+                row.get::<_, String>(0)
+            })?;
+            let mut records = Vec::new();
+            for row in rows {
+                records.push(parse_memory(&row?)?);
+            }
+            Ok(records)
+        })
+    }
+
     pub fn create_surface_snapshot(
         &self,
         subject_id: &str,
@@ -1382,6 +1554,7 @@ fn write_staging_candidate(
         }
         return Err(SubjektivError::CandidateConflict(record.id.clone()));
     }
+    validate_staged_revision_proposal(transaction, &record)?;
     transaction.execute(
         "INSERT INTO staging_records (
             subject_id, candidate_id, kind, record_json, created_at
@@ -1571,7 +1744,14 @@ fn require_unresolved_candidate(
 }
 
 fn require_subject(transaction: &Transaction<'_>, subject_id: &str) -> Result<SubjectRecord> {
-    let raw = transaction
+    require_subject_in_connection(transaction, subject_id)
+}
+
+fn require_subject_in_connection(
+    connection: &rusqlite::Connection,
+    subject_id: &str,
+) -> Result<SubjectRecord> {
+    let raw = connection
         .query_row(
             "SELECT record_json FROM subjects WHERE subject_id = ?1",
             [subject_id],
@@ -1774,7 +1954,96 @@ fn validate_staging_record(workspace_id: &str, record: &SubjectStagingRecord) ->
             });
         }
     }
+    if let Some(proposal) = &record.revision_proposal {
+        validate_revision_proposal_metadata(proposal)?;
+    }
     Ok(())
+}
+
+fn validate_revision_proposal_metadata(proposal: &RevisionProposal) -> Result<()> {
+    validate_label("revision proposal Memory id", &proposal.memory_id)?;
+    if proposal.expected_revision == 0 {
+        return Err(SubjektivError::InvalidRecord(
+            "revision proposal expected_revision must be greater than zero".into(),
+        ));
+    }
+    validate_nonempty("revision proposal change_reason", &proposal.change_reason)
+}
+
+fn validate_staged_revision_proposal(
+    transaction: &Transaction<'_>,
+    record: &SubjectStagingRecord,
+) -> Result<()> {
+    let Some(proposal) = &record.revision_proposal else {
+        return Ok(());
+    };
+    let current =
+        scoped_memory_in_connection(transaction, &record.subject_id, &proposal.memory_id)?;
+    if current.revision != proposal.expected_revision {
+        return Err(SubjektivError::RevisionConflict {
+            memory_id: proposal.memory_id.clone(),
+            expected: proposal.expected_revision,
+            actual: current.revision,
+        });
+    }
+    let to = match proposal.intent {
+        RevisionProposalIntent::Revise => current.state,
+        RevisionProposalIntent::Resolve => MemoryState::Resolved,
+        RevisionProposalIntent::Retract => MemoryState::Retracted,
+        RevisionProposalIntent::Reopen => MemoryState::Active,
+    };
+    let allowed = match proposal.intent {
+        RevisionProposalIntent::Revise => {
+            matches!(current.state, MemoryState::Active | MemoryState::Resolved)
+        }
+        RevisionProposalIntent::Resolve => current.state == MemoryState::Active,
+        RevisionProposalIntent::Retract => {
+            matches!(current.state, MemoryState::Active | MemoryState::Resolved)
+        }
+        RevisionProposalIntent::Reopen => current.state == MemoryState::Resolved,
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(SubjektivError::InvalidStateTransition {
+            memory_id: proposal.memory_id.clone(),
+            from: current.state,
+            to,
+        })
+    }
+}
+
+fn scoped_memory_in_connection(
+    connection: &rusqlite::Connection,
+    subject_id: &str,
+    memory_id: &str,
+) -> Result<MemoryRecord> {
+    let raw = connection
+        .query_row(
+            "SELECT record_json FROM memory_records
+             WHERE subject_id = ?1 AND memory_id = ?2",
+            params![subject_id, memory_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(raw) = raw {
+        return parse_memory(&raw);
+    }
+    let foreign_owner = connection
+        .query_row(
+            "SELECT subject_id FROM memory_records WHERE memory_id = ?1 LIMIT 1",
+            [memory_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if foreign_owner.is_some() {
+        Err(SubjektivError::SubjectScopeMismatch {
+            subject_id: subject_id.to_string(),
+            reference: memory_id.to_string(),
+        })
+    } else {
+        Err(SubjektivError::MemoryNotFound(memory_id.to_string()))
+    }
 }
 
 fn validate_memory_draft(draft: &MemoryDraft) -> Result<()> {
@@ -2011,6 +2280,7 @@ fn resolution_action_name(action: StagingResolutionAction) -> &'static str {
 mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
+    use std::time::Duration;
 
     use memory::extract::{ExtractedCandidate, StagingEvidence};
     use memory::schema::{
@@ -2100,6 +2370,15 @@ mod tests {
         )
     }
 
+    fn proposal(
+        intent: RevisionProposalIntent,
+        memory_id: &str,
+        expected_revision: u64,
+        change_reason: &str,
+    ) -> RevisionProposal {
+        RevisionProposal::new(intent, memory_id, expected_revision, change_reason).unwrap()
+    }
+
     fn open_store(
         root: &std::path::Path,
         workspace_id: &str,
@@ -2122,7 +2401,51 @@ mod tests {
             decoded.source_refs[0].session_id.as_deref(),
             Some("session-1")
         );
+        assert!(decoded.revision_proposal.is_none());
+        assert!(!raw.contains("revision_proposal"));
         assert!(raw.contains("human_input"));
+
+        let proposed = staging
+            .clone()
+            .with_revision_proposal(proposal(
+                RevisionProposalIntent::Revise,
+                "memory-1",
+                3,
+                "Incorporate the new bounded evidence",
+            ))
+            .unwrap();
+        let proposed_raw = serde_json::to_string(&proposed).unwrap();
+        let proposed_decoded: SubjectStagingRecord = serde_json::from_str(&proposed_raw).unwrap();
+        assert_eq!(
+            proposed_decoded.revision_proposal,
+            Some(proposal(
+                RevisionProposalIntent::Revise,
+                "memory-1",
+                3,
+                "Incorporate the new bounded evidence",
+            ))
+        );
+        assert!(
+            RevisionProposal::new(
+                RevisionProposalIntent::Revise,
+                "memory-1",
+                0,
+                "invalid zero revision"
+            )
+            .is_err()
+        );
+        assert!(
+            RevisionProposal::new(RevisionProposalIntent::Revise, "memory-1", 1, "   ").is_err()
+        );
+        assert!(
+            serde_json::from_value::<RevisionProposal>(serde_json::json!({
+                "intent": "revise",
+                "memory_id": "memory-1",
+                "expected_revision": 0,
+                "change_reason": "invalid"
+            }))
+            .is_err()
+        );
 
         let mut value = serde_json::to_value(&staging).unwrap();
         value
@@ -2391,6 +2714,330 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn revision_proposal_roundtrips_through_staging_and_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_manager, _workspace, store) = open_store(&temp.path().join("storage"), "workspace-a");
+        let subject = store.create_subject(role()).unwrap();
+        let memory = store
+            .create_memory(&subject.id, draft("Existing memory", "initial observation"))
+            .unwrap();
+        let proposal = proposal(
+            RevisionProposalIntent::Revise,
+            &memory.id,
+            1,
+            "Refine the wording from new evidence",
+        );
+        let staged = store
+            .stage_candidate(
+                candidate(&subject.id, "candidate-proposed", "workspace-a")
+                    .with_revision_proposal(proposal.clone())
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(staged.revision_proposal, Some(proposal.clone()));
+        assert_eq!(
+            store
+                .staging_candidate(&subject.id, &staged.id)
+                .unwrap()
+                .unwrap()
+                .revision_proposal,
+            Some(proposal.clone())
+        );
+
+        let resolution = store
+            .resolve_candidate(
+                &subject.id,
+                &staged.id,
+                StagingResolutionAction::Discarded,
+                "The current wording remains preferable",
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(
+            resolution.candidate.revision_proposal,
+            Some(proposal.clone())
+        );
+        assert_eq!(
+            store
+                .staging_resolution(&subject.id, &staged.id)
+                .unwrap()
+                .unwrap()
+                .candidate
+                .revision_proposal,
+            Some(proposal)
+        );
+    }
+
+    #[test]
+    fn revision_proposals_enforce_scope_revision_and_state_transitions() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_manager, _workspace, store) = open_store(&temp.path().join("storage"), "workspace-a");
+        let subject = store.create_subject(role()).unwrap();
+        let other_subject = store.create_subject(role()).unwrap();
+        let memory = store
+            .create_memory(
+                &subject.id,
+                draft("Transition target", "initial observation"),
+            )
+            .unwrap();
+
+        let foreign = candidate(&other_subject.id, "candidate-foreign-target", "workspace-a")
+            .with_revision_proposal(proposal(
+                RevisionProposalIntent::Revise,
+                &memory.id,
+                1,
+                "Must remain subject scoped",
+            ))
+            .unwrap();
+        assert!(matches!(
+            store.stage_candidate(foreign),
+            Err(SubjektivError::SubjectScopeMismatch {
+                subject_id,
+                reference,
+            }) if subject_id == other_subject.id && reference == memory.id
+        ));
+
+        let stale = candidate(&subject.id, "candidate-stale", "workspace-a")
+            .with_revision_proposal(proposal(
+                RevisionProposalIntent::Resolve,
+                &memory.id,
+                2,
+                "Resolve the active memory",
+            ))
+            .unwrap();
+        assert!(matches!(
+            store.stage_candidate(stale),
+            Err(SubjektivError::RevisionConflict {
+                memory_id,
+                expected: 2,
+                actual: 1,
+            }) if memory_id == memory.id
+        ));
+
+        let resolve_proposal = candidate(&subject.id, "candidate-resolve", "workspace-a")
+            .with_revision_proposal(proposal(
+                RevisionProposalIntent::Resolve,
+                &memory.id,
+                1,
+                "The active condition has ended",
+            ))
+            .unwrap();
+        assert!(store.stage_candidate(resolve_proposal).is_ok());
+        let invalid_reopen = candidate(&subject.id, "candidate-invalid-reopen", "workspace-a")
+            .with_revision_proposal(proposal(
+                RevisionProposalIntent::Reopen,
+                &memory.id,
+                1,
+                "An active Memory cannot be reopened",
+            ))
+            .unwrap();
+        assert!(matches!(
+            store.stage_candidate(invalid_reopen),
+            Err(SubjektivError::InvalidStateTransition {
+                from: MemoryState::Active,
+                to: MemoryState::Active,
+                ..
+            })
+        ));
+
+        let mut resolve = draft("Resolved target", "the condition ended");
+        resolve.state = MemoryState::Resolved;
+        let resolved = store
+            .revise_memory(&subject.id, &memory.id, 1, resolve)
+            .unwrap();
+        let mut attributed_stale =
+            candidate(&subject.id, "candidate-attributed-stale", "workspace-a");
+        attributed_stale.source_refs[0].session_id = None;
+        attributed_stale
+            .attach_revision_proposal(proposal(
+                RevisionProposalIntent::Revise,
+                &memory.id,
+                1,
+                "This attribution must roll back with the stale proposal",
+            ))
+            .unwrap();
+        assert!(matches!(
+            store.stage_candidate_with_attribution(
+                attributed_stale,
+                attribution(
+                    &subject.id,
+                    "runtime-proposal",
+                    "worker-proposal",
+                    "session-proposal-stale",
+                    "2026-09-28T12:00:00.000Z",
+                ),
+            ),
+            Err(SubjektivError::RevisionConflict {
+                expected: 1,
+                actual: 2,
+                ..
+            })
+        ));
+        assert!(
+            store
+                .session_attribution("session-proposal-stale")
+                .unwrap()
+                .is_none()
+        );
+        let reopen = candidate(&subject.id, "candidate-reopen", "workspace-a")
+            .with_revision_proposal(proposal(
+                RevisionProposalIntent::Reopen,
+                &memory.id,
+                resolved.revision,
+                "The condition applies again",
+            ))
+            .unwrap();
+        assert_eq!(
+            store
+                .stage_candidate(reopen)
+                .unwrap()
+                .revision_proposal
+                .unwrap()
+                .intent,
+            RevisionProposalIntent::Reopen
+        );
+        let retract_proposal = candidate(&subject.id, "candidate-retract", "workspace-a")
+            .with_revision_proposal(proposal(
+                RevisionProposalIntent::Retract,
+                &memory.id,
+                resolved.revision,
+                "The supporting evidence was invalidated",
+            ))
+            .unwrap();
+        assert!(store.stage_candidate(retract_proposal).is_ok());
+
+        let mut retract = draft("Retracted target", "the evidence was invalidated");
+        retract.state = MemoryState::Retracted;
+        let retracted = store
+            .revise_memory(&subject.id, &memory.id, resolved.revision, retract)
+            .unwrap();
+        let terminal = candidate(&subject.id, "candidate-after-retract", "workspace-a")
+            .with_revision_proposal(proposal(
+                RevisionProposalIntent::Revise,
+                &memory.id,
+                retracted.revision,
+                "Retraction must remain terminal",
+            ))
+            .unwrap();
+        assert!(matches!(
+            store.stage_candidate(terminal),
+            Err(SubjektivError::InvalidStateTransition {
+                memory_id,
+                from: MemoryState::Retracted,
+                to: MemoryState::Retracted,
+            }) if memory_id == memory.id
+        ));
+    }
+
+    #[test]
+    fn exact_proposal_retry_remains_idempotent_after_target_advances() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_manager, _workspace, store) = open_store(&temp.path().join("storage"), "workspace-a");
+        let subject = store.create_subject(role()).unwrap();
+        let memory = store
+            .create_memory(&subject.id, draft("Retry target", "initial observation"))
+            .unwrap();
+        let staged = store
+            .stage_candidate(
+                candidate(&subject.id, "candidate-retry-proposal", "workspace-a")
+                    .with_revision_proposal(proposal(
+                        RevisionProposalIntent::Revise,
+                        &memory.id,
+                        1,
+                        "Refine the current revision",
+                    ))
+                    .unwrap(),
+            )
+            .unwrap();
+        store
+            .revise_memory(
+                &subject.id,
+                &memory.id,
+                1,
+                draft("Advanced target", "another accepted refinement"),
+            )
+            .unwrap();
+
+        let mut retry = staged.clone();
+        retry.created_at = "2026-09-28T11:00:00.000Z".into();
+        let retried = store.stage_candidate(retry).unwrap();
+        assert_eq!(retried.created_at, staged.created_at);
+        assert_eq!(retried.revision_proposal, staged.revision_proposal);
+    }
+
+    #[test]
+    fn bounded_memory_reads_are_scoped_ordered_and_immutable() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_manager, _workspace, store) = open_store(&temp.path().join("storage"), "workspace-a");
+        let subject = store.create_subject(role()).unwrap();
+        let other_subject = store.create_subject(role()).unwrap();
+        assert!(matches!(
+            store.list_memories("subject-missing"),
+            Err(SubjektivError::SubjectNotFound(subject_id)) if subject_id == "subject-missing"
+        ));
+
+        let mut first_draft = draft("First memory", "first reason");
+        first_draft.body_md = "Immutable first body".into();
+        let first = store.create_memory(&subject.id, first_draft).unwrap();
+        thread::sleep(Duration::from_millis(2));
+        let second = store
+            .create_memory(&subject.id, draft("Second memory", "second reason"))
+            .unwrap();
+        let memories = store.list_memories(&subject.id).unwrap();
+        assert_eq!(
+            memories.iter().map(|record| &record.id).collect::<Vec<_>>(),
+            vec![&second.id, &first.id]
+        );
+
+        thread::sleep(Duration::from_millis(2));
+        let mut revision = draft("First memory revised", "second revision reason");
+        revision.body_md = "New second body".into();
+        let revised = store
+            .revise_memory(&subject.id, &first.id, 1, revision)
+            .unwrap();
+        let memories = store.list_memories(&subject.id).unwrap();
+        assert_eq!(memories[0].id, first.id);
+        assert_eq!(memories[0].revision, 2);
+
+        let history = store.list_memory_revisions(&subject.id, &first.id).unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .map(|record| record.revision)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert_eq!(history[0].body_md, "New second body");
+        assert_eq!(history[0].change_reason, "second revision reason");
+        assert_eq!(history[1].body_md, "Immutable first body");
+        assert_eq!(history[1].change_reason, "first reason");
+        assert_eq!(
+            store
+                .scoped_memory_revision(&subject.id, &first.id, 1)
+                .unwrap()
+                .unwrap()
+                .body_md,
+            "Immutable first body"
+        );
+        let scoped_current = store.scoped_memory(&subject.id, &first.id).unwrap();
+        assert_eq!(scoped_current.id, revised.id);
+        assert_eq!(scoped_current.revision, revised.revision);
+        assert_eq!(scoped_current.body_md, revised.body_md);
+
+        assert!(matches!(
+            store.list_memory_revisions(&other_subject.id, &first.id),
+            Err(SubjektivError::SubjectScopeMismatch {
+                subject_id,
+                reference,
+            }) if subject_id == other_subject.id && reference == first.id
+        ));
+        assert!(matches!(
+            store.scoped_memory(&other_subject.id, &first.id),
+            Err(SubjektivError::SubjectScopeMismatch { .. })
+        ));
     }
 
     #[test]

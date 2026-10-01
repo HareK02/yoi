@@ -600,6 +600,28 @@ impl SessionCapture {
         ReadResult { entries, truncated }
     }
 
+    /// Resolves the committed tool-call input for a provider call id. This is
+    /// used by explicit-memory receipts only after the containing run is durable,
+    /// so a model-authored claim can cite its own committed tool invocation
+    /// without inventing a SessionEntryRef.
+    pub(crate) fn evidence_for_tool_call(&self, call_id: &str) -> Option<SessionEntryEvidence> {
+        let entry_index = self.entries.iter().position(|entry| {
+            matches!(
+                &entry.item,
+                Item::ToolCall {
+                    call_id: stored_call_id,
+                    ..
+                } if stored_call_id == call_id
+            )
+        })?;
+        let reference = self.index.iter().find(|entry| {
+            entry.entry_range[0] == entry_index as u64
+                && entry.kind == ReferenceKind::Tool
+                && entry.tool_part == Some(ToolPart::Input)
+        })?;
+        self.evidence_for(reference.id.as_str())
+    }
+
     pub(crate) fn evidence_for(&self, id: &str) -> Option<SessionEntryEvidence> {
         let entry = self.index.iter().find(|entry| entry.id.as_str() == id)?;
         let excerpt = self
@@ -1027,5 +1049,21 @@ mod tests {
         assert_eq!(source.segment_id, "segment-1");
         assert_eq!(source.entry_range, [0, 0]);
         assert_eq!(source.entry_ref.as_str(), "E00000000");
+    }
+
+    #[test]
+    fn committed_tool_call_can_be_resolved_by_provider_call_id() {
+        let view = SessionCapture::new(
+            "segment-1",
+            vec![Item::tool_call(
+                "call-remember",
+                "SubjektivMemoryRemember",
+                r#"{"claim":"remember this"}"#,
+            )],
+        );
+        let evidence = view.evidence_for_tool_call("call-remember").unwrap();
+        assert_eq!(evidence.entry_ref.as_str(), "E00000000");
+        assert_eq!(evidence.tool_part, Some(ToolPart::Input));
+        assert!(view.evidence_for_tool_call("missing").is_none());
     }
 }

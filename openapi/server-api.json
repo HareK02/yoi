@@ -14081,7 +14081,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:f11b2e87b1d89a62f6885000cd88b0753e4f4743abaa8cb1dbd09c682fcd1564"
+    "x-yoi-source-digest": "sha256:cacb143d65459cf22331ee637382620ae2a3462dbee51c0e5caf56752895105f"
   },
   "openapi": "3.1.0",
   "paths": {

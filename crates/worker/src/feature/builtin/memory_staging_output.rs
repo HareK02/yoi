@@ -410,7 +410,7 @@ fn evidence_origin(origin: &protocol::SessionEntryProvenance) -> EvidenceOrigin 
     }
 }
 
-fn staging_evidence(entry: &SessionEntryEvidence) -> StagingEvidence {
+pub(crate) fn staging_evidence(entry: &SessionEntryEvidence) -> StagingEvidence {
     StagingEvidence {
         id: entry.entry_ref.to_string(),
         kind: evidence_kind(entry),
@@ -421,7 +421,7 @@ fn staging_evidence(entry: &SessionEntryEvidence) -> StagingEvidence {
     }
 }
 
-fn source_evidence_ref(entry: &SessionEntryEvidence) -> SourceEvidenceRef {
+pub(crate) fn source_evidence_ref(entry: &SessionEntryEvidence) -> SourceEvidenceRef {
     SourceEvidenceRef {
         segment_id: Some(entry.segment_id.clone()),
         entry_range: Some(entry.entry_range),

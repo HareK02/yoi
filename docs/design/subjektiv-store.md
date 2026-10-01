@@ -159,3 +159,64 @@ subsequent consolidation must compare them using the existing candidate
 identity/content boundary. The system must not claim that the partial writes were
 rolled back or silently delete them. Subject recall, consolidation, and legacy
 Memory migration remain separate work.
+
+## Recall and explicit proposal tools (T-669)
+
+An enabled `feature.subjektiv` installs five names that do not overlap the legacy
+single-Markdown Memory tools: `SubjektivMemoryQuery`, `SubjektivMemoryRead`,
+`SubjektivMemoryListRevisions`, `SubjektivMemoryRemember`, and
+`SubjektivMemoryProposeRevision`. Runtime-signed Worker source plus current
+`subjektiv:<subject-id>` singleton ownership is re-evaluated for every operation;
+none of the model-visible inputs contains a subject, Runtime, Worker, Session,
+origin, or raw provenance object.
+
+Query searches only current projections. Omitted `states` means `active`; explicit
+empty `states` or `kinds` is invalid. Output defaults to 20 and is capped at 100,
+ordered by `updated_at DESC, memory_id ASC`. Its opaque cursor binds the subject,
+canonical filters, offset, and subject `store_revision`; any confirmed-Memory
+change makes it a typed stale-cursor conflict rather than silently mixing
+snapshots. Revision history is ordered by revision descending. Its first page
+fixes the maximum revision, so later revisions neither duplicate nor displace old
+page members.
+
+Read accepts a positive exact revision or resolves the current revision once. A
+missing historical revision never falls back to current. Markdown pagination is
+line-based (default 200, maximum 1000) and reports `body_truncated` plus
+`body_next_offset`. Provenance uses a separate immutable-revision-bound cursor and
+returns at most 20 candidate/derivation references per page. Candidate evidence is
+the bounded host-resolved anchor saved in staging; raw Session bodies are not
+copied into Memory responses. Resolved, retracted, and historical revisions remain
+addressable by ID.
+
+Remember and ProposeRevision only stage candidates. Entry references are resolved
+against the host's committed Session capture, and preference candidates continue
+to require exclusively `HumanInput` evidence. When no entry is supplied, a
+non-preference request returns `pending_commit`; after the run commits, the host
+uses the committed tool-call entry itself as model-origin evidence. An operation
+that never commits is not staged. Receipt identity is derived from Session and
+tool-call identity, and exact backend retries return the first candidate rather
+than creating another one. Neither path changes `memory_records`,
+`memory_revisions`, `store_revision`, or a surface snapshot.
+
+Revision proposals add optional `revision_proposal` metadata to the existing v2
+`SubjectStagingRecord` envelope; automatic extraction remains proposal-free and
+its model schema is unchanged. The metadata is serialized atomically with the
+candidate and therefore remains present in candidate reads and immutable
+resolution copies:
+
+```json
+{
+  "intent": "revise",
+  "memory_id": "memory-…",
+  "expected_revision": 3,
+  "change_reason": "The committed evidence corrects the prior condition"
+}
+```
+
+This is the T-670 handoff fixture. Consolidation must re-read this typed metadata,
+re-check subject ownership, `expected_revision`, and the requested state
+transition in the same transaction that applies the candidate, and leave a stale
+proposal unresolved/conflicted. It must not parse target information from the
+claim, retarget to the latest revision, or revive a retracted Memory. Valid
+transitions at staging are revise while active/resolved, active→resolved,
+active/resolved→retracted, and resolved→active. Retraction remains terminal.

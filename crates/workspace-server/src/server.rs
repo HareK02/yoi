@@ -5456,6 +5456,9 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::subjektiv_record_session(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::subjektiv_memory_backend(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::skill_list(service.clone()))
         .merge(server_api::server_api_axum::skill_lint(service.clone()))
         .merge(server_api::server_api_axum::skill_get(service.clone()))
@@ -7133,6 +7136,26 @@ impl server_api::ServerApi for ServerApiContractService {
         server_api::RepositoryApiError,
     > {
         scoped_record_subjektiv_session(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            context,
+            Json(request),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn subjektiv_memory_backend(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::SubjektivMemoryBackendRequest,
+    ) -> std::result::Result<
+        server_api::SubjektivMemoryBackendResponse,
+        server_api::RepositoryApiError,
+    > {
+        scoped_subjektiv_memory_backend(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedWorkspacePath { workspace_id }),
             context,
@@ -16526,21 +16549,19 @@ fn subjektiv_singleton_key(subject_id: &str) -> ApiResult<String> {
     Ok(key)
 }
 
-fn subjektiv_session_attribution(
+fn subjektiv_subject_scope(
     api: &WorkspaceApi,
     workspace_id: &str,
     context: &server_api::ServerRequestContext,
-    session_id: &str,
-) -> ApiResult<crate::subjektiv::SubjectSessionAttribution> {
+) -> ApiResult<(String, RuntimeWorkerRef)> {
     let source = context.runtime_source.as_ref().ok_or_else(|| {
         Error::WorkspacePermissionDenied(
-            "subjektiv extraction requires authenticated Runtime-owned source authority"
-                .to_string(),
+            "subjektiv operations require authenticated Runtime-owned source authority".to_string(),
         )
     })?;
     let worker_id = source.worker_id.as_deref().ok_or_else(|| {
         Error::WorkspacePermissionDenied(
-            "subjektiv extraction requires Runtime-bound Worker identity".to_string(),
+            "subjektiv operations require Runtime-bound Worker identity".to_string(),
         )
     })?;
     let worker = RuntimeWorkerRef::new(&source.runtime_id, worker_id);
@@ -16552,7 +16573,17 @@ fn subjektiv_session_attribution(
                 "current Worker has no keyed singleton ownership".to_string(),
             )
         })?;
-    let subject_id = subjektiv_subject_id_from_singleton_key(&lease.key)?;
+    let subject_id = subjektiv_subject_id_from_singleton_key(&lease.key)?.to_string();
+    Ok((subject_id, worker))
+}
+
+fn subjektiv_session_attribution(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    context: &server_api::ServerRequestContext,
+    session_id: &str,
+) -> ApiResult<crate::subjektiv::SubjectSessionAttribution> {
+    let (subject_id, worker) = subjektiv_subject_scope(api, workspace_id, context)?;
     let session_id = session_id.trim();
     if session_id.is_empty() || session_id.chars().any(char::is_control) {
         return Err(Error::InvalidInput("committed session_id is invalid".to_string()).into());
@@ -16738,6 +16769,749 @@ async fn scoped_record_subjektiv_session(
         subject_id: attribution.subject_id,
         session_id: attribution.session_id,
     }))
+}
+
+const SUBJEKTIV_QUERY_DEFAULT_LIMIT: usize = 20;
+const SUBJEKTIV_QUERY_MAX_LIMIT: usize = 100;
+const SUBJEKTIV_BODY_DEFAULT_LINES: usize = 200;
+const SUBJEKTIV_BODY_MAX_LINES: usize = 1_000;
+const SUBJEKTIV_EVIDENCE_PAGE_SIZE: usize = 20;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubjektivQueryCursor {
+    subject_id: String,
+    store_revision: u64,
+    query: Option<String>,
+    kinds: Vec<String>,
+    states: Vec<String>,
+    offset: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubjektivRevisionCursor {
+    subject_id: String,
+    memory_id: String,
+    max_revision: u64,
+    offset: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubjektivEvidenceCursor {
+    subject_id: String,
+    memory_id: String,
+    revision: u64,
+    offset: usize,
+}
+
+async fn scoped_subjektiv_memory_backend(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    context: server_api::ServerRequestContext,
+    Json(request): Json<server_api::SubjektivMemoryBackendRequest>,
+) -> ApiResult<Json<server_api::SubjektivMemoryBackendResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let (subject_id, _) = subjektiv_subject_scope(&api, &path.workspace_id, &context)?;
+    let store = open_subjektiv_store(&api)?;
+    let response = match request.operation {
+        server_api::SubjektivMemoryBackendOperation::Query(input) => {
+            server_api::SubjektivMemoryBackendResponse::Query(subjektiv_memory_query(
+                &store,
+                &subject_id,
+                input,
+            )?)
+        }
+        server_api::SubjektivMemoryBackendOperation::Read(input) => {
+            server_api::SubjektivMemoryBackendResponse::Read(subjektiv_memory_read(
+                &store,
+                &subject_id,
+                input,
+            )?)
+        }
+        server_api::SubjektivMemoryBackendOperation::ListRevisions(input) => {
+            server_api::SubjektivMemoryBackendResponse::ListRevisions(
+                subjektiv_memory_list_revisions(&store, &subject_id, input)?,
+            )
+        }
+        server_api::SubjektivMemoryBackendOperation::ValidateProposal(input) => {
+            server_api::SubjektivMemoryBackendResponse::ProposalValidated(
+                subjektiv_memory_validate_proposal(&store, &subject_id, input)?,
+            )
+        }
+        server_api::SubjektivMemoryBackendOperation::StageExplicit(input) => {
+            // Re-derive the same subject and immutable Session attribution for the
+            // write. The request never carries subject, Worker, Runtime, origin,
+            // or arbitrary source JSON from the model.
+            let attribution = subjektiv_session_attribution(
+                &api,
+                &path.workspace_id,
+                &context,
+                &input.session_id,
+            )?;
+            server_api::SubjektivMemoryBackendResponse::Staged(subjektiv_memory_stage_explicit(
+                &store,
+                input,
+                attribution,
+            )?)
+        }
+    };
+    Ok(Json(response))
+}
+
+fn subjektiv_memory_query(
+    store: &crate::subjektiv::SubjektivStore,
+    subject_id: &str,
+    input: server_api::SubjektivMemoryQueryRequest,
+) -> ApiResult<server_api::SubjektivMemoryQueryResponse> {
+    let limit = bounded_subjektiv_limit(input.limit, SUBJEKTIV_QUERY_DEFAULT_LIMIT)?;
+    let query = input
+        .query
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty());
+    let kinds = canonical_subjektiv_kinds(input.kinds)?;
+    let states = canonical_subjektiv_states(input.states)?;
+    let subject = store
+        .subject(subject_id)
+        .map_err(subjektiv_store_error)?
+        .ok_or_else(|| Error::SubjektivSubjectNotFound(subject_id.to_string()))?;
+    let mut offset = 0;
+    if let Some(cursor) = input.cursor {
+        let cursor: SubjektivQueryCursor = decode_subjektiv_cursor("query", &cursor)?;
+        if cursor.subject_id != subject_id
+            || cursor.query != query
+            || cursor.kinds != kinds
+            || cursor.states != states
+        {
+            return Err(Error::InvalidInput(
+                "subjektiv query cursor does not match subject or filters".into(),
+            )
+            .into());
+        }
+        if cursor.store_revision != subject.store_revision {
+            return Err(Error::RepositoryConflict(
+                "subjektiv query cursor is stale because Memory changed; restart the query".into(),
+            )
+            .into());
+        }
+        offset = cursor.offset;
+    }
+
+    let kind_filter = kinds.iter().cloned().collect::<HashSet<_>>();
+    let state_filter = states.iter().cloned().collect::<HashSet<_>>();
+    let records = store
+        .list_memories(subject_id)
+        .map_err(subjektiv_store_error)?
+        .into_iter()
+        .filter(|record| {
+            kind_filter.contains(record.kind.as_str())
+                && state_filter.contains(subjektiv_memory_state_name(record.state))
+                && query.as_ref().is_none_or(|query| {
+                    record.claim.to_lowercase().contains(query)
+                        || record.body_md.to_lowercase().contains(query)
+                })
+        })
+        .collect::<Vec<_>>();
+    if offset > records.len() {
+        return Err(Error::InvalidInput("subjektiv query cursor offset is invalid".into()).into());
+    }
+    let end = offset.saturating_add(limit).min(records.len());
+    let has_more = end < records.len();
+    let items = records[offset..end]
+        .iter()
+        .map(|record| server_api::SubjektivMemoryQueryItem {
+            id: record.id.clone(),
+            revision: record.revision,
+            kind: record.kind.clone(),
+            state: api_memory_state(record.state),
+            claim: record.claim.clone(),
+            excerpt: bounded_memory_excerpt(&record.body_md, 240),
+            updated_at: record.updated_at.clone(),
+        })
+        .collect();
+    let next_cursor = has_more
+        .then(|| {
+            encode_subjektiv_cursor(
+                "query",
+                &SubjektivQueryCursor {
+                    subject_id: subject_id.to_string(),
+                    store_revision: subject.store_revision,
+                    query,
+                    kinds,
+                    states,
+                    offset: end,
+                },
+            )
+        })
+        .transpose()?;
+    Ok(server_api::SubjektivMemoryQueryResponse {
+        items,
+        next_cursor,
+        has_more,
+    })
+}
+
+fn subjektiv_memory_read(
+    store: &crate::subjektiv::SubjektivStore,
+    subject_id: &str,
+    input: server_api::SubjektivMemoryReadRequest,
+) -> ApiResult<server_api::SubjektivMemoryReadResponse> {
+    let current = store
+        .scoped_memory(subject_id, &input.memory_id)
+        .map_err(subjektiv_store_error)?;
+    let record = match input.revision {
+        Some(0) => {
+            return Err(Error::InvalidInput("revision must be a positive integer".into()).into());
+        }
+        Some(revision) => store
+            .scoped_memory_revision(subject_id, &input.memory_id, revision)
+            .map_err(subjektiv_store_error)?
+            .ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "memory_revision_not_found: Memory `{}` has no revision {revision}",
+                    input.memory_id
+                ))
+            })?,
+        None => current.clone(),
+    };
+    let body_limit = input.limit.unwrap_or(SUBJEKTIV_BODY_DEFAULT_LINES);
+    if body_limit == 0 || body_limit > SUBJEKTIV_BODY_MAX_LINES {
+        return Err(Error::InvalidInput(format!(
+            "body line limit must be within 1..={SUBJEKTIV_BODY_MAX_LINES}"
+        ))
+        .into());
+    }
+    let body_offset = input.offset.unwrap_or(0);
+    let lines = memory_body_lines(&record.body_md);
+    if body_offset > lines.len() {
+        return Err(Error::InvalidInput("body line offset exceeds document length".into()).into());
+    }
+    let body_end = body_offset.saturating_add(body_limit).min(lines.len());
+    let body_truncated = body_end < lines.len();
+    let body_md = lines[body_offset..body_end].concat();
+
+    let evidence_offset = if let Some(cursor) = input.evidence_cursor {
+        let cursor: SubjektivEvidenceCursor = decode_subjektiv_cursor("evidence", &cursor)?;
+        if cursor.subject_id != subject_id
+            || cursor.memory_id != record.id
+            || cursor.revision != record.revision
+        {
+            return Err(Error::InvalidInput(
+                "subjektiv evidence cursor does not match subject, Memory, or revision".into(),
+            )
+            .into());
+        }
+        cursor.offset
+    } else {
+        0
+    };
+    let total_evidence = record
+        .source_candidate_ids
+        .len()
+        .saturating_add(record.derived_from.len());
+    if evidence_offset > total_evidence {
+        return Err(
+            Error::InvalidInput("subjektiv evidence cursor offset is invalid".into()).into(),
+        );
+    }
+    let evidence_end = evidence_offset
+        .saturating_add(SUBJEKTIV_EVIDENCE_PAGE_SIZE)
+        .min(total_evidence);
+    let mut source_candidate_ids = Vec::new();
+    let mut source_candidates = Vec::new();
+    let mut derived_from = Vec::new();
+    for index in evidence_offset..evidence_end {
+        if let Some(candidate_id) = record.source_candidate_ids.get(index) {
+            let candidate = store
+                .staging_candidate(subject_id, candidate_id)
+                .map_err(subjektiv_store_error)?
+                .ok_or_else(|| {
+                    Error::Store(format!(
+                        "subjektiv candidate provenance `{candidate_id}` is missing"
+                    ))
+                })?;
+            source_candidate_ids.push(candidate_id.clone());
+            source_candidates.push(server_api::SubjektivMemoryEvidenceCandidate {
+                candidate_id: candidate.id,
+                evidence: candidate.evidence,
+                source_refs: candidate.source_refs,
+            });
+        } else {
+            let derived_index = index - record.source_candidate_ids.len();
+            let reference = &record.derived_from[derived_index];
+            derived_from.push(server_api::SubjektivMemoryRevisionRef {
+                memory_id: reference.memory_id.clone(),
+                revision: reference.revision,
+            });
+        }
+    }
+    let evidence_has_more = evidence_end < total_evidence;
+    let evidence_next_cursor = evidence_has_more
+        .then(|| {
+            encode_subjektiv_cursor(
+                "evidence",
+                &SubjektivEvidenceCursor {
+                    subject_id: subject_id.to_string(),
+                    memory_id: record.id.clone(),
+                    revision: record.revision,
+                    offset: evidence_end,
+                },
+            )
+        })
+        .transpose()?;
+
+    Ok(server_api::SubjektivMemoryReadResponse {
+        memory_id: record.id,
+        revision: record.revision,
+        current_revision: current.revision,
+        kind: record.kind,
+        state: api_memory_state(record.state),
+        claim: record.claim,
+        body_md,
+        why_useful: record.why_useful,
+        staleness: record.staleness,
+        change_reason: record.change_reason,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+        body_offset,
+        body_next_offset: body_truncated.then_some(body_end),
+        body_truncated,
+        source_candidate_ids,
+        source_candidates,
+        derived_from,
+        evidence_next_cursor,
+        evidence_has_more,
+    })
+}
+
+fn subjektiv_memory_list_revisions(
+    store: &crate::subjektiv::SubjektivStore,
+    subject_id: &str,
+    input: server_api::SubjektivMemoryListRevisionsRequest,
+) -> ApiResult<server_api::SubjektivMemoryListRevisionsResponse> {
+    let limit = bounded_subjektiv_limit(input.limit, SUBJEKTIV_QUERY_DEFAULT_LIMIT)?;
+    let current = store
+        .scoped_memory(subject_id, &input.memory_id)
+        .map_err(subjektiv_store_error)?;
+    let (max_revision, offset) = if let Some(cursor) = input.cursor {
+        let cursor: SubjektivRevisionCursor = decode_subjektiv_cursor("revisions", &cursor)?;
+        if cursor.subject_id != subject_id || cursor.memory_id != input.memory_id {
+            return Err(Error::InvalidInput(
+                "subjektiv revision cursor does not match subject or Memory".into(),
+            )
+            .into());
+        }
+        (cursor.max_revision, cursor.offset)
+    } else {
+        (current.revision, 0)
+    };
+    let records = store
+        .list_memory_revisions(subject_id, &input.memory_id)
+        .map_err(subjektiv_store_error)?
+        .into_iter()
+        .filter(|record| record.revision <= max_revision)
+        .collect::<Vec<_>>();
+    if offset > records.len() {
+        return Err(
+            Error::InvalidInput("subjektiv revision cursor offset is invalid".into()).into(),
+        );
+    }
+    let end = offset.saturating_add(limit).min(records.len());
+    let has_more = end < records.len();
+    let items = records[offset..end]
+        .iter()
+        .map(|record| server_api::SubjektivMemoryRevisionItem {
+            revision: record.revision,
+            kind: record.kind.clone(),
+            state: api_memory_state(record.state),
+            claim: record.claim.clone(),
+            change_reason: record.change_reason.clone(),
+            updated_at: record.updated_at.clone(),
+        })
+        .collect();
+    let next_cursor = has_more
+        .then(|| {
+            encode_subjektiv_cursor(
+                "revisions",
+                &SubjektivRevisionCursor {
+                    subject_id: subject_id.to_string(),
+                    memory_id: input.memory_id.clone(),
+                    max_revision,
+                    offset: end,
+                },
+            )
+        })
+        .transpose()?;
+    Ok(server_api::SubjektivMemoryListRevisionsResponse {
+        memory_id: input.memory_id,
+        current_revision: current.revision,
+        items,
+        next_cursor,
+        has_more,
+    })
+}
+
+fn subjektiv_memory_validate_proposal(
+    store: &crate::subjektiv::SubjektivStore,
+    subject_id: &str,
+    input: server_api::SubjektivMemoryValidateProposalRequest,
+) -> ApiResult<server_api::SubjektivMemoryProposalValidationResponse> {
+    if input.expected_revision == 0 {
+        return Err(Error::InvalidInput("expected_revision must be positive".into()).into());
+    }
+    let current = store
+        .scoped_memory(subject_id, &input.memory_id)
+        .map_err(subjektiv_store_error)?;
+    if current.revision != input.expected_revision {
+        return Err(Error::RepositoryConflict(format!(
+            "revision_conflict: Memory `{}` expected {}, current {}",
+            input.memory_id, input.expected_revision, current.revision
+        ))
+        .into());
+    }
+    validate_subjektiv_proposal_transition(current.state, input.intent)?;
+    Ok(server_api::SubjektivMemoryProposalValidationResponse {
+        memory_id: input.memory_id,
+        current_revision: current.revision,
+        kind: current.kind,
+        state: api_memory_state(current.state),
+        intent: input.intent,
+    })
+}
+
+fn subjektiv_memory_stage_explicit(
+    store: &crate::subjektiv::SubjektivStore,
+    mut input: server_api::SubjektivMemoryStageExplicitRequest,
+    attribution: crate::subjektiv::SubjectSessionAttribution,
+) -> ApiResult<server_api::SubjektivMemoryStageExplicitResponse> {
+    let receipt_id = input.receipt_id.trim();
+    if receipt_id.is_empty() || receipt_id.len() > 512 || receipt_id.chars().any(char::is_control) {
+        return Err(Error::InvalidInput("explicit Memory receipt_id is invalid".into()).into());
+    }
+    if input.evidence.is_empty() || input.source_refs.is_empty() {
+        return Err(Error::InvalidInput(
+            "explicit Memory staging requires host-resolved committed evidence".into(),
+        )
+        .into());
+    }
+    if matches!(input.kind, memory::extract::CandidateKind::Preference)
+        && input.evidence.iter().any(|evidence| {
+            !matches!(
+                evidence.origin.as_ref().map(|origin| &origin.kind),
+                Some(memory::schema::EvidenceOriginKind::HumanInput)
+            )
+        })
+    {
+        return Err(Error::InvalidInput(
+            "preference candidates require exclusively HumanInput evidence".into(),
+        )
+        .into());
+    }
+    let mut range_start = u64::MAX;
+    let mut range_end = 0;
+    let mut segment_id = None;
+    for source_ref in &mut input.source_refs {
+        if source_ref
+            .session_id
+            .as_deref()
+            .is_some_and(|value| value != attribution.session_id)
+        {
+            return Err(Error::InvalidInput(
+                "explicit candidate source belongs to a different Session".into(),
+            )
+            .into());
+        }
+        source_ref.session_id = Some(attribution.session_id.clone());
+        let source_segment = source_ref.segment_id.as_deref().ok_or_else(|| {
+            Error::InvalidInput("explicit candidate source is missing segment_id".into())
+        })?;
+        if segment_id
+            .as_deref()
+            .is_some_and(|value| value != source_segment)
+        {
+            return Err(Error::InvalidInput(
+                "explicit candidate evidence spans multiple Session segments".into(),
+            )
+            .into());
+        }
+        segment_id = Some(source_segment.to_string());
+        let range = source_ref.entry_range.ok_or_else(|| {
+            Error::InvalidInput("explicit candidate source is missing entry_range".into())
+        })?;
+        range_start = range_start.min(range[0]);
+        range_end = range_end.max(range[1]);
+    }
+    let source = memory::schema::SourceRef {
+        segment_id: segment_id.ok_or_else(|| {
+            Error::InvalidInput("explicit candidate source is missing segment_id".into())
+        })?,
+        range: [range_start, range_end],
+    };
+    let proposal = input
+        .proposal
+        .as_ref()
+        .map(|proposal| {
+            crate::subjektiv::RevisionProposal::new(
+                domain_proposal_intent(proposal.intent),
+                proposal.memory_id.clone(),
+                proposal.expected_revision,
+                proposal.change_reason.clone(),
+            )
+        })
+        .transpose()
+        .map_err(subjektiv_store_error)?;
+    if let Some(proposal) = &proposal {
+        let current = store
+            .scoped_memory(&attribution.subject_id, &proposal.memory_id)
+            .map_err(subjektiv_store_error)?;
+        if current.kind != input.kind {
+            return Err(Error::InvalidInput(
+                "revision proposal kind must be derived from its target Memory".into(),
+            )
+            .into());
+        }
+    }
+    let candidate = memory::extract::ExtractedCandidate {
+        kind: input.kind,
+        claim: input.claim,
+        why_useful: input.why_useful,
+        staleness: input.staleness,
+        evidence_ids: input.evidence.iter().map(|item| item.id.clone()).collect(),
+    };
+    let staging = memory::extract::StagingRecord::from_candidate(
+        receipt_id,
+        format!("explicit:{receipt_id}"),
+        source,
+        candidate,
+        input.evidence,
+        input.source_refs,
+    );
+    let mut staging =
+        crate::subjektiv::SubjectStagingRecord::attach(&attribution.subject_id, staging);
+    if let Some(proposal) = proposal.clone() {
+        staging
+            .attach_revision_proposal(proposal)
+            .map_err(subjektiv_store_error)?;
+    }
+    let (staged, _) = store
+        .stage_candidate_with_attribution(staging, attribution)
+        .map_err(subjektiv_store_error)?;
+    Ok(server_api::SubjektivMemoryStageExplicitResponse {
+        candidate_id: staged.id,
+        receipt_id: receipt_id.to_string(),
+        status: server_api::SubjektivMemoryReceiptStatus::Staged,
+        target: proposal
+            .as_ref()
+            .map(|proposal| server_api::SubjektivMemoryProposalTarget {
+                memory_id: proposal.memory_id.clone(),
+                expected_revision: proposal.expected_revision,
+            }),
+        intent: proposal
+            .as_ref()
+            .map(|proposal| api_proposal_intent(proposal.intent)),
+    })
+}
+
+fn validate_subjektiv_proposal_transition(
+    state: crate::subjektiv::MemoryState,
+    intent: server_api::SubjektivMemoryRevisionIntent,
+) -> ApiResult<()> {
+    use crate::subjektiv::MemoryState::{Active, Resolved};
+    use server_api::SubjektivMemoryRevisionIntent::{Reopen, Resolve, Retract, Revise};
+    let valid = match intent {
+        Revise => matches!(state, Active | Resolved),
+        Resolve => state == Active,
+        Retract => matches!(state, Active | Resolved),
+        Reopen => state == Resolved,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput(format!(
+            "invalid_state_transition: {state:?} cannot accept {intent:?}"
+        ))
+        .into())
+    }
+}
+
+fn canonical_subjektiv_kinds(
+    kinds: Option<Vec<memory::extract::CandidateKind>>,
+) -> ApiResult<Vec<String>> {
+    let kinds = kinds.unwrap_or_else(|| {
+        use memory::extract::CandidateKind::*;
+        vec![
+            Preference,
+            WorkingAssumption,
+            Constraint,
+            Decision,
+            OpenQuestion,
+            Lesson,
+        ]
+    });
+    if kinds.is_empty() {
+        return Err(Error::InvalidInput("kinds must not be an empty array".into()).into());
+    }
+    let mut names = kinds
+        .iter()
+        .map(|kind| kind.as_str().to_string())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+fn canonical_subjektiv_states(
+    states: Option<Vec<server_api::SubjektivMemoryState>>,
+) -> ApiResult<Vec<String>> {
+    let states = states.unwrap_or_else(|| vec![server_api::SubjektivMemoryState::Active]);
+    if states.is_empty() {
+        return Err(Error::InvalidInput("states must not be an empty array".into()).into());
+    }
+    let mut names = states
+        .into_iter()
+        .map(|state| match state {
+            server_api::SubjektivMemoryState::Active => "active".to_string(),
+            server_api::SubjektivMemoryState::Resolved => "resolved".to_string(),
+            server_api::SubjektivMemoryState::Retracted => "retracted".to_string(),
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+fn bounded_subjektiv_limit(limit: Option<usize>, default: usize) -> ApiResult<usize> {
+    let limit = limit.unwrap_or(default);
+    if limit == 0 || limit > SUBJEKTIV_QUERY_MAX_LIMIT {
+        return Err(Error::InvalidInput(format!(
+            "limit must be within 1..={SUBJEKTIV_QUERY_MAX_LIMIT}"
+        ))
+        .into());
+    }
+    Ok(limit)
+}
+
+fn api_memory_state(state: crate::subjektiv::MemoryState) -> server_api::SubjektivMemoryState {
+    match state {
+        crate::subjektiv::MemoryState::Active => server_api::SubjektivMemoryState::Active,
+        crate::subjektiv::MemoryState::Resolved => server_api::SubjektivMemoryState::Resolved,
+        crate::subjektiv::MemoryState::Retracted => server_api::SubjektivMemoryState::Retracted,
+    }
+}
+
+fn subjektiv_memory_state_name(state: crate::subjektiv::MemoryState) -> &'static str {
+    match state {
+        crate::subjektiv::MemoryState::Active => "active",
+        crate::subjektiv::MemoryState::Resolved => "resolved",
+        crate::subjektiv::MemoryState::Retracted => "retracted",
+    }
+}
+
+fn domain_proposal_intent(
+    intent: server_api::SubjektivMemoryRevisionIntent,
+) -> crate::subjektiv::RevisionProposalIntent {
+    match intent {
+        server_api::SubjektivMemoryRevisionIntent::Revise => {
+            crate::subjektiv::RevisionProposalIntent::Revise
+        }
+        server_api::SubjektivMemoryRevisionIntent::Resolve => {
+            crate::subjektiv::RevisionProposalIntent::Resolve
+        }
+        server_api::SubjektivMemoryRevisionIntent::Retract => {
+            crate::subjektiv::RevisionProposalIntent::Retract
+        }
+        server_api::SubjektivMemoryRevisionIntent::Reopen => {
+            crate::subjektiv::RevisionProposalIntent::Reopen
+        }
+    }
+}
+
+fn api_proposal_intent(
+    intent: crate::subjektiv::RevisionProposalIntent,
+) -> server_api::SubjektivMemoryRevisionIntent {
+    match intent {
+        crate::subjektiv::RevisionProposalIntent::Revise => {
+            server_api::SubjektivMemoryRevisionIntent::Revise
+        }
+        crate::subjektiv::RevisionProposalIntent::Resolve => {
+            server_api::SubjektivMemoryRevisionIntent::Resolve
+        }
+        crate::subjektiv::RevisionProposalIntent::Retract => {
+            server_api::SubjektivMemoryRevisionIntent::Retract
+        }
+        crate::subjektiv::RevisionProposalIntent::Reopen => {
+            server_api::SubjektivMemoryRevisionIntent::Reopen
+        }
+    }
+}
+
+fn memory_body_lines(body: &str) -> Vec<&str> {
+    if body.is_empty() {
+        Vec::new()
+    } else {
+        body.split_inclusive('\n').collect()
+    }
+}
+
+fn bounded_memory_excerpt(body: &str, max_chars: usize) -> String {
+    let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = normalized.chars();
+    let excerpt = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{excerpt}…")
+    } else {
+        excerpt
+    }
+}
+
+fn encode_subjektiv_cursor<T: Serialize>(kind: &str, value: &T) -> ApiResult<String> {
+    let raw = serde_json::to_vec(value)
+        .map_err(|error| Error::Store(format!("encode subjektiv cursor: {error}")))?;
+    let encoded = raw
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("subjektiv.{kind}.{encoded}"))
+}
+
+fn decode_subjektiv_cursor<T: serde::de::DeserializeOwned>(
+    kind: &str,
+    cursor: &str,
+) -> ApiResult<T> {
+    let prefix = format!("subjektiv.{kind}.");
+    let encoded = cursor
+        .strip_prefix(&prefix)
+        .ok_or_else(|| Error::InvalidInput(format!("invalid subjektiv {kind} cursor type")))?;
+    if encoded.is_empty() || encoded.len() > 16_384 || encoded.len() % 2 != 0 {
+        return Err(Error::InvalidInput(format!("invalid subjektiv {kind} cursor")).into());
+    }
+    let mut raw = Vec::with_capacity(encoded.len() / 2);
+    for index in (0..encoded.len()).step_by(2) {
+        raw.push(
+            u8::from_str_radix(&encoded[index..index + 2], 16).map_err(|_| {
+                Error::InvalidInput(format!("invalid subjektiv {kind} cursor encoding"))
+            })?,
+        );
+    }
+    serde_json::from_slice(&raw)
+        .map_err(|_| Error::InvalidInput(format!("invalid subjektiv {kind} cursor payload")).into())
+}
+
+fn subjektiv_store_error(error: crate::subjektiv::SubjektivError) -> Error {
+    match error {
+        crate::subjektiv::SubjektivError::SubjectScopeMismatch { .. } => {
+            Error::WorkspacePermissionDenied(format!("subject_scope_mismatch: {error}"))
+        }
+        crate::subjektiv::SubjektivError::RevisionConflict { .. } => {
+            Error::RepositoryConflict(format!("revision_conflict: {error}"))
+        }
+        crate::subjektiv::SubjektivError::MemoryNotFound(_) => {
+            Error::InvalidInput(format!("memory_not_found: {error}"))
+        }
+        crate::subjektiv::SubjektivError::Storage(_) => Error::Store(error.to_string()),
+        _ => Error::InvalidInput(error.to_string()),
+    }
 }
 
 const MEMORY_CONSOLIDATION_PROFILE: &str = "memory-consolidation";
@@ -34143,7 +34917,7 @@ mod tests {
             AxumPath(ScopedWorkspacePath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
             }),
-            context,
+            context.clone(),
             Json(server_api::SubjektivStageCandidateRequest {
                 session_id: "session-1".to_string(),
                 operation,
@@ -34164,6 +34938,255 @@ mod tests {
         let attribution = store.session_attribution("session-1").unwrap().unwrap();
         assert_eq!(attribution.subject_id, subject.id);
         assert_eq!(attribution.worker_id, created.worker_id);
+
+        let target = store
+            .create_memory(
+                &subject.id,
+                crate::subjektiv::MemoryDraft::active(
+                    memory::extract::CandidateKind::Decision,
+                    "Use the first rule",
+                    "first body",
+                    "Provides a target",
+                    "initial",
+                ),
+            )
+            .unwrap();
+        let explicit_evidence = memory::extract::StagingEvidence {
+            id: "E00000000".to_string(),
+            kind: memory::schema::EvidenceKind::new(memory::schema::EvidenceKind::MESSAGE),
+            entry_range: Some([0, 0]),
+            origin: Some(memory::schema::EvidenceOrigin {
+                kind: memory::schema::EvidenceOriginKind::HumanInput,
+                account_id: None,
+                workspace_id: None,
+                runtime_id: None,
+                worker_id: None,
+                flow_selector: None,
+                flow_definition_id: None,
+                flow_definition_revision: None,
+            }),
+            excerpt: Some("Correct the first rule".to_string()),
+            summary: Some("Human correction".to_string()),
+        };
+        let Json(explicit) = scoped_subjektiv_memory_backend(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            context,
+            Json(server_api::SubjektivMemoryBackendRequest {
+                operation: server_api::SubjektivMemoryBackendOperation::StageExplicit(
+                    server_api::SubjektivMemoryStageExplicitRequest {
+                        receipt_id: "explicit:session-1:call-1".to_string(),
+                        session_id: "session-1".to_string(),
+                        kind: memory::extract::CandidateKind::Decision,
+                        claim: "Use the corrected rule".to_string(),
+                        why_useful: "Records a correction proposal".to_string(),
+                        staleness: None,
+                        evidence: vec![explicit_evidence],
+                        source_refs: vec![memory::schema::SourceEvidenceRef {
+                            segment_id: Some("segment-1".to_string()),
+                            entry_range: Some([0, 0]),
+                            evidence_id: Some("E00000000".to_string()),
+                            ..Default::default()
+                        }],
+                        proposal: Some(server_api::SubjektivMemoryRevisionProposal {
+                            memory_id: target.id.clone(),
+                            expected_revision: 1,
+                            intent: server_api::SubjektivMemoryRevisionIntent::Revise,
+                            change_reason: "The human corrected the rule".to_string(),
+                        }),
+                    },
+                ),
+            }),
+        )
+        .await
+        .unwrap();
+        let staged = match explicit {
+            server_api::SubjektivMemoryBackendResponse::Staged(staged) => staged,
+            other => panic!("unexpected explicit response: {other:?}"),
+        };
+        assert_eq!(staged.candidate_id, "explicit:session-1:call-1");
+        let candidate = store
+            .staging_candidate(&subject.id, &staged.candidate_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.revision_proposal.unwrap().memory_id, target.id);
+        assert_eq!(
+            store
+                .memory(&subject.id, &target.id)
+                .unwrap()
+                .unwrap()
+                .revision,
+            1,
+            "staging a proposal must not create a confirmed revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn subjektiv_memory_tools_filter_page_and_read_fixed_revisions() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let store = open_subjektiv_store(&api).unwrap();
+        let subject = store
+            .create_subject(crate::subjektiv::SubjectRole::new("companion").unwrap())
+            .unwrap();
+        let first = store
+            .create_memory(
+                &subject.id,
+                crate::subjektiv::MemoryDraft::active(
+                    memory::extract::CandidateKind::Decision,
+                    "Choose stable cursors",
+                    "line one\nline two\nline three\n",
+                    "Prevents mixed snapshots",
+                    "initial",
+                ),
+            )
+            .unwrap();
+        let second = store
+            .create_memory(
+                &subject.id,
+                crate::subjektiv::MemoryDraft::active(
+                    memory::extract::CandidateKind::Lesson,
+                    "Keep immutable history",
+                    "old body\n",
+                    "Supports correction",
+                    "initial",
+                ),
+            )
+            .unwrap();
+        let mut resolved = crate::subjektiv::MemoryDraft::active(
+            memory::extract::CandidateKind::Lesson,
+            "History was retained",
+            "new body\n",
+            "The question ended",
+            "resolved after verification",
+        );
+        resolved.state = crate::subjektiv::MemoryState::Resolved;
+        store
+            .revise_memory(&subject.id, &second.id, 1, resolved)
+            .unwrap();
+
+        let default_page = subjektiv_memory_query(
+            &store,
+            &subject.id,
+            server_api::SubjektivMemoryQueryRequest {
+                query: None,
+                kinds: None,
+                states: None,
+                limit: Some(1),
+                cursor: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(default_page.items.len(), 1);
+        assert_eq!(default_page.items[0].id, first.id);
+        assert!(!default_page.has_more);
+
+        let resolved_page = subjektiv_memory_query(
+            &store,
+            &subject.id,
+            server_api::SubjektivMemoryQueryRequest {
+                query: Some("new body".into()),
+                kinds: None,
+                states: Some(vec![server_api::SubjektivMemoryState::Resolved]),
+                limit: None,
+                cursor: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved_page.items.len(), 1);
+        assert_eq!(resolved_page.items[0].id, second.id);
+
+        let snapshot_page = subjektiv_memory_query(
+            &store,
+            &subject.id,
+            server_api::SubjektivMemoryQueryRequest {
+                query: None,
+                kinds: None,
+                states: Some(vec![
+                    server_api::SubjektivMemoryState::Active,
+                    server_api::SubjektivMemoryState::Resolved,
+                ]),
+                limit: Some(1),
+                cursor: None,
+            },
+        )
+        .unwrap();
+        assert!(snapshot_page.has_more);
+        store
+            .create_memory(
+                &subject.id,
+                crate::subjektiv::MemoryDraft::active(
+                    memory::extract::CandidateKind::OpenQuestion,
+                    "Will this stale the cursor?",
+                    "yes",
+                    "Tests snapshot behavior",
+                    "initial",
+                ),
+            )
+            .unwrap();
+        let stale = subjektiv_memory_query(
+            &store,
+            &subject.id,
+            server_api::SubjektivMemoryQueryRequest {
+                query: None,
+                kinds: None,
+                states: Some(vec![
+                    server_api::SubjektivMemoryState::Active,
+                    server_api::SubjektivMemoryState::Resolved,
+                ]),
+                limit: Some(1),
+                cursor: snapshot_page.next_cursor,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(stale.error, Error::RepositoryConflict(_)));
+
+        let read = subjektiv_memory_read(
+            &store,
+            &subject.id,
+            server_api::SubjektivMemoryReadRequest {
+                memory_id: first.id.clone(),
+                revision: Some(1),
+                offset: Some(1),
+                limit: Some(1),
+                evidence_cursor: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(read.body_md, "line two\n");
+        assert_eq!(read.body_next_offset, Some(2));
+        assert!(read.body_truncated);
+        assert_eq!(read.revision, 1);
+        assert_eq!(read.current_revision, 1);
+
+        let revisions = subjektiv_memory_list_revisions(
+            &store,
+            &subject.id,
+            server_api::SubjektivMemoryListRevisionsRequest {
+                memory_id: second.id.clone(),
+                limit: Some(1),
+                cursor: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(revisions.items[0].revision, 2);
+        assert!(revisions.has_more);
+        let older = subjektiv_memory_list_revisions(
+            &store,
+            &subject.id,
+            server_api::SubjektivMemoryListRevisionsRequest {
+                memory_id: second.id,
+                limit: Some(1),
+                cursor: revisions.next_cursor,
+            },
+        )
+        .unwrap();
+        assert_eq!(older.items[0].revision, 1);
+        assert_eq!(older.items[0].claim, "Keep immutable history");
+        assert!(!older.has_more);
     }
 
     #[tokio::test]

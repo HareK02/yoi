@@ -16,6 +16,7 @@ pub mod objective;
 pub mod orchestration;
 mod resource_projection;
 pub mod session_explore;
+pub(crate) mod subjektiv_memory;
 pub mod task;
 pub mod ticket;
 pub mod worker_observation;
