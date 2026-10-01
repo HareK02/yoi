@@ -12492,7 +12492,7 @@ async fn execute_ticket_rest_operation(
     reject_unguarded_ticket_completion(&operation)?;
     validate_ticket_repository_operation(api, &operation)?;
     let before = target.as_ref().and_then(|id| backend.show(id.clone()).ok());
-    let ticket_item_check = source
+    let mut ticket_item_check = source
         .as_ref()
         .cloned()
         .zip(ticket_item_check_edit(&operation, before.as_ref()));
@@ -12586,6 +12586,27 @@ async fn execute_ticket_rest_operation(
                 TicketBackendOperationResult::TicketRef(reference),
                 Some(ticket),
             )
+        }
+        TicketBackendOperation::EditItem { id, edit } => {
+            let (previous, ticket) = backend
+                .edit_item_with_snapshots(id, edit)
+                .map_err(Error::from)?;
+            if let Some((
+                _,
+                TicketItemCheckEdit::Edit {
+                    title_changed,
+                    body_changed,
+                    previous_title,
+                    previous_body,
+                    ..
+                },
+            )) = ticket_item_check.as_mut()
+            {
+                *previous_title = (*title_changed).then(|| previous.meta.title.clone());
+                *previous_body =
+                    (*body_changed).then(|| previous.document.body.as_str().to_string());
+            }
+            (TicketBackendOperationResult::Ticket(ticket), None)
         }
         operation => (
             execute_ticket_backend_operation(&backend, operation).map_err(Error::from)?,
@@ -34578,56 +34599,82 @@ mod tests {
 
     #[tokio::test]
     async fn ticket_checker_fake_model_regressions_preserve_classification_boundaries() {
+        struct FakeTicketCheckerModel;
+
+        impl FakeTicketCheckerModel {
+            fn respond(request: &BackendJobRequest) -> Value {
+                let input = ticket_item_checker::parse_input(&request.input).unwrap();
+                assert!(request.instruction.contains("writer_scope"));
+                assert!(request.instruction.contains("internal_inconsistency"));
+                assert!(request.instruction.contains("ambiguous_boundary"));
+                assert!(
+                    request
+                        .instruction
+                        .contains("Production deployment requires approval")
+                );
+                assert!(request.instruction.contains("background, quotations"));
+                if input
+                    .body
+                    .contains("This time I only create the Ticket; I will not implement it.")
+                    && !input.body.starts_with("Background bug example:")
+                {
+                    serde_json::json!({"findings": [{
+                        "category": "writer_scope",
+                        "quote": "I will not implement it",
+                        "reason": "The active requirement records the writer's own implementation boundary.",
+                        "suggestion": "Remove the writer-specific action boundary."
+                    }]})
+                } else if input.body.contains("The rollout region is undecided.")
+                    && input.body.contains("The rollout region is us-east-1.")
+                {
+                    serde_json::json!({"findings": [{
+                        "category": "internal_inconsistency",
+                        "quote": "The rollout region is undecided.",
+                        "reason": "The same active text also settles the rollout region as us-east-1.",
+                        "suggestion": "Choose either the unresolved or settled rollout-region statement."
+                    }]})
+                } else if input.body == "Implementation stops after Ticket creation." {
+                    serde_json::json!({"findings": [{
+                        "category": "ambiguous_boundary",
+                        "quote": "Implementation stops after Ticket creation.",
+                        "reason": "The text alone does not establish whether this is a delivery constraint or the writer's current action boundary.",
+                        "suggestion": "Confirm whether this limits the product workflow or only the current writer."
+                    }]})
+                } else {
+                    serde_json::json!({"findings": []})
+                }
+            }
+        }
+
         struct Case {
             name: &'static str,
             body: &'static str,
-            fake_model_result: Value,
             advisory_quote: Option<&'static str>,
         }
         let cases = vec![
             Case {
                 name: "writer-scope-positive",
                 body: "This time I only create the Ticket; I will not implement it.",
-                fake_model_result: serde_json::json!({"findings": [{
-                    "category": "writer_scope",
-                    "quote": "I will not implement it",
-                    "reason": "The active requirement records the writer's own implementation boundary.",
-                    "suggestion": "Remove the writer-specific action boundary."
-                }]}),
                 advisory_quote: Some("I will not implement it"),
             },
             Case {
                 name: "production-approval-negative",
                 body: "Production deployment requires approval.",
-                fake_model_result: serde_json::json!({"findings": []}),
                 advisory_quote: None,
             },
             Case {
                 name: "quoted-background-negative",
                 body: "Background bug example: a generated Ticket once said “I will not implement it.” Do not reproduce that sentence in generated requirements.",
-                fake_model_result: serde_json::json!({"findings": []}),
                 advisory_quote: None,
             },
             Case {
                 name: "unresolved-versus-settled-positive",
                 body: "The rollout region is undecided. The rollout region is us-east-1.",
-                fake_model_result: serde_json::json!({"findings": [{
-                    "category": "internal_inconsistency",
-                    "quote": "The rollout region is undecided.",
-                    "reason": "The same active text also settles the rollout region as us-east-1.",
-                    "suggestion": "Choose either the unresolved or settled rollout-region statement."
-                }]}),
                 advisory_quote: Some("The rollout region is undecided."),
             },
             Case {
                 name: "ambiguous-boundary-confirmation",
                 body: "Implementation stops after Ticket creation.",
-                fake_model_result: serde_json::json!({"findings": [{
-                    "category": "ambiguous_boundary",
-                    "quote": "Implementation stops after Ticket creation.",
-                    "reason": "The text alone does not establish whether this is a delivery constraint or the writer's current action boundary.",
-                    "suggestion": "Confirm whether this limits the product workflow or only the current writer."
-                }]}),
                 advisory_quote: Some("Implementation stops after Ticket creation."),
             },
         ];
@@ -34660,8 +34707,8 @@ mod tests {
                 &BackendJobResultSubmission {
                     job_id: job.request.job_id.clone(),
                     attempt_id: attempt.attempt_id,
-                    input_revision: job.request.input_revision,
-                    result: case.fake_model_result,
+                    input_revision: job.request.input_revision.clone(),
+                    result: FakeTicketCheckerModel::respond(&job.request),
                 },
             )
             .unwrap_or_else(|error| panic!("{}: {error}", case.name));
@@ -34804,6 +34851,14 @@ mod tests {
             .unwrap()
             .create(ticket::NewTicket::new("Concurrent checker snapshots"))
             .unwrap();
+        let initial_body = browser_ticket_backend(&api)
+            .unwrap()
+            .show(ticket_ref.id.clone().into())
+            .unwrap()
+            .document
+            .body
+            .as_str()
+            .to_string();
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let run_edit = |source: RuntimeWorkerRef, body: &'static str| {
             let api = api.clone();
@@ -34843,6 +34898,7 @@ mod tests {
             (ticket_a, source_a, "Exact body from worker A."),
             (ticket_b, source_b, "Exact body from worker B."),
         ];
+        let mut checked_inputs = Vec::new();
         for (ticket, source, expected_body) in snapshots {
             let revision = ticket_item_checker::item_revision(&ticket);
             let job = api
@@ -34858,7 +34914,31 @@ mod tests {
             assert_eq!(input.body, expected_body);
             assert_eq!(job.request.source_worker.as_ref(), Some(&source));
             assert_eq!(job.request.notification_target.as_ref(), Some(&source));
+            checked_inputs.push(input);
         }
+        let first = checked_inputs
+            .iter()
+            .find(|input| {
+                matches!(
+                    &input.edit,
+                    TicketItemCheckEdit::Edit {
+                        previous_body: Some(previous),
+                        ..
+                    } if previous == &initial_body
+                )
+            })
+            .expect("one edit must atomically observe the initial preimage");
+        let second = checked_inputs
+            .iter()
+            .find(|input| input.revision != first.revision)
+            .unwrap();
+        assert!(matches!(
+            &second.edit,
+            TicketItemCheckEdit::Edit {
+                previous_body: Some(previous),
+                ..
+            } if previous == &first.body
+        ));
     }
 
     #[tokio::test]

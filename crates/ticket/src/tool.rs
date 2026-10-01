@@ -276,6 +276,14 @@ impl TicketBackend for TicketToolBackend {
         self.backend.edit_item(id, edit)
     }
 
+    fn edit_item_with_snapshots(
+        &self,
+        id: TicketIdOrSlug,
+        edit: crate::TicketItemEdit,
+    ) -> TicketResult<(Ticket, Ticket)> {
+        self.backend.edit_item_with_snapshots(id, edit)
+    }
+
     fn dependency_check(&self, id: TicketIdOrSlug) -> TicketResult<crate::TicketDependencyCheck> {
         self.backend.dependency_check(id)
     }
