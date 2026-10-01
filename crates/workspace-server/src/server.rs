@@ -16619,9 +16619,7 @@ async fn scoped_get_subjektiv_subject(
     let subject = open_subjektiv_store(&api)?
         .subject(&path.subject_id)
         .map_err(|error| Error::Store(error.to_string()))?
-        .ok_or_else(|| {
-            Error::InvalidInput(format!("unknown subjektiv subject `{}`", path.subject_id))
-        })?;
+        .ok_or_else(|| Error::SubjektivSubjectNotFound(path.subject_id.clone()))?;
     Ok(Json(subjektiv_subject_response(&api, subject)))
 }
 
@@ -16648,9 +16646,7 @@ async fn scoped_start_subjektiv_subject_worker(
     let subject = open_subjektiv_store(&api)?
         .subject(&path.subject_id)
         .map_err(|error| Error::Store(error.to_string()))?
-        .ok_or_else(|| {
-            Error::InvalidInput(format!("unknown subjektiv subject `{}`", path.subject_id))
-        })?;
+        .ok_or_else(|| Error::SubjektivSubjectNotFound(path.subject_id.clone()))?;
     if subject.state != crate::subjektiv::SubjectState::Active {
         return Err(Error::InvalidInput(format!(
             "subjektiv subject `{}` is retired",
@@ -28062,6 +28058,7 @@ fn api_error_status(error: &Error) -> StatusCode {
         | Error::UnknownRuntime(_)
         | Error::UnknownWorker { .. }
         | Error::UnknownRepository(_)
+        | Error::SubjektivSubjectNotFound(_)
         | Error::RuntimeBindingNotFound { .. }
         | Error::WorkspaceIdMismatch => StatusCode::NOT_FOUND,
         Error::RuntimeOperationFailed { code, .. } if code == "skill_not_found" => {
@@ -34049,6 +34046,17 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
+        let missing = scoped_get_subjektiv_subject(
+            State(api.clone()),
+            AxumPath(ScopedSubjektivSubjectPath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                subject_id: "missing-subject".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
         let subject = open_subjektiv_store(&api)
             .unwrap()
             .create_subject(crate::subjektiv::SubjectRole::new("companion").unwrap())

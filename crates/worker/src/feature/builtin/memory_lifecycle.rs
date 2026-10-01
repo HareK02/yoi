@@ -503,9 +503,10 @@ impl MemoryLifecycleTask {
         };
         let manifest = self.extraction_manifest();
 
+        let cancellation_observer = cancellation.clone();
         let cancel_observer = move |sender: tokio::sync::mpsc::Sender<()>| {
             tokio::spawn(async move {
-                cancellation.cancelled().await;
+                cancellation_observer.cancelled().await;
                 let _ = sender.send(()).await;
             });
         };
@@ -610,6 +611,21 @@ impl MemoryLifecycleTask {
             ExtractionDisposition::Completed => {}
         }
 
+        if cancellation.is_cancelled() {
+            audit
+                .emit(
+                    self.workspace_client.as_ref(),
+                    self.event_tx.as_ref(),
+                    memory::audit::WorkerLifecycleStatus::Cancelled,
+                    "memory-extract cancelled before completion side effects",
+                    usage_audit,
+                    extract_audit,
+                    None,
+                )
+                .await;
+            return Ok(());
+        }
+
         if self.target == ExtractionTarget::Subjektiv
             && let Err(reason) = self.record_subjektiv_session(&capture.session_id)
         {
@@ -634,6 +650,20 @@ impl MemoryLifecycleTask {
             staging_id: pointer_staging_id,
         };
         let payload = serde_json::to_value(&next_pointer).map_err(hook_internal)?;
+        if cancellation.is_cancelled() {
+            audit
+                .emit(
+                    self.workspace_client.as_ref(),
+                    self.event_tx.as_ref(),
+                    memory::audit::WorkerLifecycleStatus::Cancelled,
+                    "memory-extract cancelled before pointer commit",
+                    usage_audit,
+                    extract_audit,
+                    None,
+                )
+                .await;
+            return Ok(());
+        }
         if !self
             .extensions
             .append_if_current(&capture.location(), self.pointer_domain(), payload)
@@ -1010,7 +1040,7 @@ fn model_audit_from_manifest(model: &manifest::ModelManifest) -> memory::audit::
 #[cfg(test)]
 mod tests {
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use agen::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
@@ -1107,6 +1137,52 @@ mod tests {
             Err(crate::worker::WorkspaceClientError::Unavailable(
                 "recording client".to_string(),
             ))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct BlockingSessionWorkspaceClient {
+        requests: Mutex<Vec<crate::worker::WorkspaceRequest>>,
+        session_started: AtomicBool,
+        release_session: AtomicBool,
+    }
+
+    impl WorkspaceClient for BlockingSessionWorkspaceClient {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("workspace-1")
+        }
+
+        fn kind(&self) -> &str {
+            "blocking-subjektiv-session-test"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn execute(
+            &self,
+            request: crate::worker::WorkspaceRequest,
+        ) -> Result<crate::worker::WorkspaceResponse, crate::worker::WorkspaceClientError> {
+            let is_subjektiv_session = request.path.ends_with("/subjektiv/sessions");
+            self.requests.lock().unwrap().push(request);
+            if !is_subjektiv_session {
+                return Err(crate::worker::WorkspaceClientError::Unavailable(
+                    "blocking client only accepts subject-session recording".to_string(),
+                ));
+            }
+            self.session_started.store(true, Ordering::Release);
+            while !self.release_session.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            Ok(crate::worker::WorkspaceResponse {
+                status: 200,
+                body: serde_json::to_string(&server_api::SubjektivRecordSessionResponse {
+                    subject_id: "subject-1".to_string(),
+                    session_id: "session-1".to_string(),
+                })
+                .unwrap(),
+            })
         }
     }
 
@@ -1597,6 +1673,50 @@ permission = "write"
                 .iter()
                 .any(|request| request.path.ends_with("/subjektiv/sessions"))
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_during_subject_session_recording_never_commits_pointer() {
+        let client = ScriptClient::new(vec![finish_empty_events("finish-1"), completed_events()]);
+        let extension_writes = Arc::new(Mutex::new(Vec::new()));
+        let (event_tx, mut event_rx) = broadcast::channel(32);
+        let workspace_client = Arc::new(BlockingSessionWorkspaceClient::default());
+        let mut task = test_task(
+            capture(2, 250),
+            Box::new(client),
+            Arc::clone(&extension_writes),
+            event_tx,
+            workspace_client.clone(),
+        );
+        task.target = ExtractionTarget::Subjektiv;
+        task.config.profile.consolidation.request_enabled = false;
+        let registry = start_background_task(task);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !workspace_client.session_started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("subject-session recording should begin");
+
+        let release_client = workspace_client.clone();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            release_client
+                .release_session
+                .store(true, Ordering::Release);
+        });
+        let rewrite_guard = registry.begin_session_rewrite().await.unwrap();
+        release.await.unwrap();
+        drop(rewrite_guard);
+        registry.shutdown().await.unwrap();
+
+        assert!(extension_writes.lock().unwrap().is_empty());
+        assert_eq!(workspace_client.requests.lock().unwrap().len(), 1);
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            matches!(event, Event::MemoryWorker(event) if event.status == "cancelled")
+        }));
     }
 
     #[tokio::test]
