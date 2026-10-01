@@ -10,14 +10,14 @@
     RepositorySshHostTrust,
     RepositorySshPublicKey,
     RotateRepositorySshCredentialRequest,
-  } from '$lib/generated/repository-access-api';
+  } from '#lib/generated/repository-access-api.ts';
   import {
     REPOSITORY_ACCESS_MAX_RESPONSE_BYTES,
     parseRepositorySshCredential,
     parseRepositorySshHostTrust,
     parseRepositorySshPublicKey,
-  } from '$lib/workspace/api/repository-access';
-  import { readBoundedJson } from '$lib/workspace/api/http';
+  } from '#lib/workspace/api/repository-access.ts';
+  import { readBoundedJson } from '#lib/workspace/api/http.ts';
   import {
     repositoryAccessRequestError,
     validateCredentialRotation,
@@ -25,7 +25,7 @@
     validateHostTrust,
     validateImportedCredential,
     type RepositoryAccessFieldErrors,
-  } from '$lib/workspace/repository-access/model';
+  } from '#lib/workspace/repository-access/model.ts';
   import type { PageProps } from './$types';
 
   type Notice = { tone: 'success' | 'error'; text: string };

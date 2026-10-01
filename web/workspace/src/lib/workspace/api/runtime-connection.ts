@@ -3,7 +3,7 @@ import type {
   RuntimeConnectionTestFailureKind,
   RuntimeConnectionTestResponse,
   RuntimeVerificationEvidenceSummary,
-} from "$lib/generated/runtime-api";
+} from "#lib/generated/runtime-api.ts";
 
 const RESPONSE_KEYS = [
   "workspace_id",

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { page } from "$app/state";
-  import "$lib/workspace/styles/workspace-catalog.css";
+  import "#lib/workspace/styles/workspace-catalog.css";
 
   const workspaceId = $derived(page.params.workspaceId ?? "unknown");
 </script>

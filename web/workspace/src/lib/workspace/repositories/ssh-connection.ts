@@ -1,4 +1,4 @@
-import type { WorkspaceRuntimeResource } from "$lib/generated/runtime-api";
+import type { WorkspaceRuntimeResource } from "#lib/generated/runtime-api.ts";
 
 export type RepositorySshProbeSelection<T> = Readonly<{
   changed: boolean;

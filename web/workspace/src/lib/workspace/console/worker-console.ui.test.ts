@@ -69,11 +69,11 @@ Deno.test("workspace feature css is owned outside app css", async () => {
     "app.css should not own workspace, worker, or settings page implementation classes",
   );
   assert(
-    workspaceLayout.includes("$lib/workspace/styles/workspace-pages.css") &&
-      workspaceLayout.includes("$lib/workspace/styles/workers.css") &&
-      settingsLayout.includes("$lib/workspace/styles/settings.css") &&
-      accountPage.includes("$lib/workspace/styles/settings.css") &&
-      deviceLoginPage.includes("$lib/workspace/styles/settings.css"),
+    workspaceLayout.includes("#lib/workspace/styles/workspace-pages.css") &&
+      workspaceLayout.includes("#lib/workspace/styles/workers.css") &&
+      settingsLayout.includes("#lib/workspace/styles/settings.css") &&
+      accountPage.includes("#lib/workspace/styles/settings.css") &&
+      deviceLoginPage.includes("#lib/workspace/styles/settings.css"),
     "feature-owned CSS should be imported by the layouts/pages that need it",
   );
 });

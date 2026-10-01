@@ -2,7 +2,7 @@ import type {
   MergeRequestDetailResponse,
   MergeRequestListResponse,
   MergeRequestThreadEvent,
-} from "$lib/generated/ticket-api";
+} from "#lib/generated/ticket-api.ts";
 import { workspaceApiPath } from "./http";
 
 export type MergeRequestDetail = MergeRequestDetailResponse;

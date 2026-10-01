@@ -1,6 +1,6 @@
 <script lang="ts">
-  import DocumentMarkdown from '$lib/workspace/markdown/DocumentMarkdown.svelte';
-  import { formatDate } from '$lib/workspace/api/http';
+  import DocumentMarkdown from '#lib/workspace/markdown/DocumentMarkdown.svelte';
+  import { formatDate } from '#lib/workspace/api/http.ts';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();

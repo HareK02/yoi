@@ -2,7 +2,7 @@ import type {
   SessionConversationTurn,
   SessionHistoryPage,
   SessionSnapshotEntry,
-} from "$lib/generated/protocol";
+} from "#lib/generated/protocol.ts";
 import {
   applyConsoleHistoryPage,
   beginConsoleHistoryRequest,

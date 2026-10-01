@@ -1,11 +1,11 @@
 <script lang="ts">
   import { invalidateAll } from '$app/navigation';
-  import { workspaceRoute } from '$lib/workspace/api/http';
-  import { createWorkspaceRepository } from '$lib/workspace/api/repositories';
+  import { workspaceRoute } from '#lib/workspace/api/http.ts';
+  import { createWorkspaceRepository } from '#lib/workspace/api/repositories.ts';
   import type {
     CreateWorkspaceRepositoryRequest,
     RepositorySourceKind,
-  } from '$lib/generated/repository-api';
+  } from '#lib/generated/repository-api.ts';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();

@@ -1,6 +1,6 @@
-import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
-import { parseWorkspaceRuntimeList } from "$lib/workspace/api/runtime-management";
-import { parseWorkspaceSigningIdentityResponse } from "$lib/workspace/settings/profile-api";
+import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
+import { parseWorkspaceRuntimeList } from "#lib/workspace/api/runtime-management.ts";
+import { parseWorkspaceSigningIdentityResponse } from "#lib/workspace/settings/profile-api.ts";
 import type { PageLoad } from "./$types";
 
 export const load: PageLoad = async ({ fetch, params }) => {

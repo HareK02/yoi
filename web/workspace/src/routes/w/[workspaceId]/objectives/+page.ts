@@ -1,8 +1,8 @@
-import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
+import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
 import {
   parseObjectiveListResponse,
   TICKET_BROWSER_API_LOAD_POLICY,
-} from "$lib/workspace/api/ticket-browser";
+} from "#lib/workspace/api/ticket-browser.ts";
 import type { PageLoad } from "./$types";
 
 export const load: PageLoad = async ({ fetch, params }) => {

@@ -1,4 +1,4 @@
-import { loadDashboard } from "$lib/workspace/home/dashboard";
+import { loadDashboard } from "#lib/workspace/home/dashboard.ts";
 import type { PageLoad } from "./$types";
 
 export const load: PageLoad = ({ fetch, params, depends }) => {

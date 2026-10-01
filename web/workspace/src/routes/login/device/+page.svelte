@@ -5,9 +5,9 @@
     approveDeviceLogin,
     loadWhoami,
     loginWithPasskey,
-  } from '$lib/workspace/auth/api';
-  import '$lib/workspace/styles/settings.css';
-  import type { RequestActor } from '$lib/workspace/auth/model';
+  } from '#lib/workspace/auth/api.ts';
+  import '#lib/workspace/styles/settings.css';
+  import type { RequestActor } from '#lib/workspace/auth/model.ts';
 
   let actor = $state<RequestActor | null>(null);
   let handle = $state('local');

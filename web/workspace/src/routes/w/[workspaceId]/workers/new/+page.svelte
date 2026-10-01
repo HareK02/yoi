@@ -1,29 +1,29 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { untrack } from 'svelte';
-  import { readBoundedJson, workspaceApiPath } from '$lib/workspace/api/http';
+  import { readBoundedJson, workspaceApiPath } from '#lib/workspace/api/http.ts';
   import {
     parseWorkingDirectoryCreateResponse,
     validateWorkingDirectoryCreateRequest,
-  } from '$lib/workspace/api/workdirs';
+  } from '#lib/workspace/api/workdirs.ts';
   import {
     parseBrowserCreateWorkerResponse,
     parseWorkerApiError,
     parseWorkerLaunchOptionsResponse,
-  } from '$lib/workspace/api/workers';
-  import { formatCurrentWorkdirRevision } from '$lib/workspace/settings/workdir-revision';
-  import { formatExternalGrantPermissionLevel } from '$lib/workspace/settings/workdir-permissions';
+  } from '#lib/workspace/api/workers.ts';
+  import { formatCurrentWorkdirRevision } from '#lib/workspace/settings/workdir-revision.ts';
+  import { formatExternalGrantPermissionLevel } from '#lib/workspace/settings/workdir-permissions.ts';
   import {
     buildCreateWorkspaceWorkerRequest,
     defaultWorkerLaunchForm,
     workerLaunchAttachmentError,
-  } from '$lib/workspace/sidebar/worker-launch';
-  import type { WorkerLaunchAttachmentFormState } from '$lib/workspace/sidebar/worker-launch';
+  } from '#lib/workspace/sidebar/worker-launch.ts';
+  import type { WorkerLaunchAttachmentFormState } from '#lib/workspace/sidebar/worker-launch.ts';
   import type {
     Diagnostic,
     WorkerLaunchOptionsResponse,
     WorkingDirectorySummary,
-  } from '$lib/workspace/sidebar/types';
+  } from '#lib/workspace/sidebar/types.ts';
   import type { PageProps } from './$types';
 
   type DisplayError = {

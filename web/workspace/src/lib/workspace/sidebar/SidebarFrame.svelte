@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, type Snippet } from 'svelte';
-  import Bevel from '$lib/workspace/ui/Bevel.svelte';
+  import Bevel from '#lib/workspace/ui/Bevel.svelte';
   import SidebarToggleIcon from './SidebarToggleIcon.svelte';
   import './sidebar.css';
 
@@ -93,6 +93,7 @@
     <div class="sidebar-frame__surface">
       <div
         class="sidebar-hover-region"
+        role="presentation"
         onpointerenter={enter}
         onpointerleave={leave}
         onpointercancel={leave}

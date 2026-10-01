@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { mergeRequestPagePath } from "$lib/workspace/api/merge-requests";
+  import { mergeRequestPagePath } from "#lib/workspace/api/merge-requests.ts";
 
   type Props = {
     currentPath?: string;

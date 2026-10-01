@@ -1,33 +1,33 @@
 <script lang="ts">
   import { untrack } from "svelte";
-  import RichMarkdown from "$lib/workspace/console/RichMarkdown.svelte";
+  import RichMarkdown from "#lib/workspace/console/RichMarkdown.svelte";
   import {
     workspaceApiJson,
     workspaceApiJsonWithBody,
     workspaceApiPath,
-  } from "$lib/workspace/api/http";
+  } from "#lib/workspace/api/http.ts";
   import {
     TICKET_BROWSER_API_MAX_RESPONSE_BYTES,
     parseTicketDetail,
     parseTicketQueueOutcome,
     parseTicketRoleAssignmentMutationResponse,
-  } from "$lib/workspace/api/ticket-browser";
-  import { mergeRequestPagePath } from "$lib/workspace/api/merge-requests";
+  } from "#lib/workspace/api/ticket-browser.ts";
+  import { mergeRequestPagePath } from "#lib/workspace/api/merge-requests.ts";
   import {
     relationLabel,
     TICKET_STATES,
     type WorkspaceOrchestratorStatus,
-  } from "$lib/workspace/tickets/ticket-panel";
-  import type { ApiResult } from "$lib/workspace/api/http";
+  } from "#lib/workspace/tickets/ticket-panel.ts";
+  import type { ApiResult } from "#lib/workspace/api/http.ts";
   import type {
     TicketTarget,
     TicketTargetAccess,
-  } from "$lib/generated/ticket-api";
+  } from "#lib/generated/ticket-api.ts";
   import type {
     RepositoryListResponse,
     RepositorySummary,
     TicketDetail,
-  } from "$lib/workspace/sidebar/types";
+  } from "#lib/workspace/sidebar/types.ts";
 
   type EditableTicketTarget = {
     repository_key: string;

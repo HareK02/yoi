@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { mergeRequestPagePath } from "$lib/workspace/api/merge-requests";
+  import { mergeRequestPagePath } from "#lib/workspace/api/merge-requests.ts";
   import type { PageData } from "./$types";
 
   let { data }: { data: PageData } = $props();

@@ -4,14 +4,14 @@
     RuntimeConnectionTestResponse,
     RuntimePublicIdentityBundle,
     WorkspaceRuntimeResource,
-  } from '$lib/generated/runtime-api';
+  } from '#lib/generated/runtime-api.ts';
   import {
     createRemoteRuntime,
     previewRuntimePublicKeyFingerprint,
     RuntimeTrustRequestError,
-  } from '$lib/workspace/api/runtime-management';
-  import { testRuntimeConnection } from '$lib/workspace/api/runtime-connection';
-  import { provisionWorkspaceSigningIdentity } from '$lib/workspace/settings/profile-api';
+  } from '#lib/workspace/api/runtime-management.ts';
+  import { testRuntimeConnection } from '#lib/workspace/api/runtime-connection.ts';
+  import { provisionWorkspaceSigningIdentity } from '#lib/workspace/settings/profile-api.ts';
   import type { PageProps } from './$types';
 
   const runtimeBundlePlaceholder =

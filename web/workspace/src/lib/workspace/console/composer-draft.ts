@@ -1,4 +1,4 @@
-import type { Segment } from "$lib/generated/protocol.ts";
+import type { Segment } from "#lib/generated/protocol.ts";
 
 const PASTE_TOKEN_PREFIX = "\uFFF9";
 const PASTE_TOKEN_SUFFIX = "\uFFFB";

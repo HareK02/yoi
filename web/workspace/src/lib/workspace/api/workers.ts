@@ -21,12 +21,12 @@ import type {
   WorkerWorkdirAttachmentSummary,
   WorkerWorkspaceSummary,
   WorkingDirectoryRepositoryOption,
-} from "$lib/generated/worker-launch-api";
-import type { Segment } from "$lib/generated/protocol";
+} from "#lib/generated/worker-launch-api.ts";
+import type { Segment } from "#lib/generated/protocol.ts";
 import {
   parseExternalWorkdirPermissions,
   parseWorkingDirectorySummary,
-} from "$lib/workspace/api/workdirs";
+} from "#lib/workspace/api/workdirs.ts";
 
 const DIAGNOSTIC_SEVERITIES = new Set<DiagnosticSeverity>([
   "info",

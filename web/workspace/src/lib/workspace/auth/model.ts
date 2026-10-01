@@ -12,7 +12,7 @@ import type {
   PasskeyRegistrationOptionsResponse,
   RequestActor,
   WhoamiResponse,
-} from "$lib/generated/auth-api.ts";
+} from "#lib/generated/auth-api.ts";
 
 export type AuthUser = AuthenticatedUser;
 export type PasskeyUserResponse = AuthUserResponse;

@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import './sidebar.css';
-  import { workspaceRoute } from '$lib/workspace/api/http';
+  import { workspaceRoute } from '#lib/workspace/api/http.ts';
   import { ownsRoutePath } from './route-ownership';
   import ObjectivesNavSection from './ObjectivesNavSection.svelte';
   import MemoryNavSection from './MemoryNavSection.svelte';

@@ -25,7 +25,7 @@ const settingsCss = await Deno.readTextFile(
 
 test("Repository Access consumes generated contracts and validates every response boundary", () => {
   assert(
-    source.includes("$lib/generated/repository-access-api"),
+    source.includes("#lib/generated/repository-access-api.ts"),
     "mutation code should import generated request and response contracts",
   );
   for (

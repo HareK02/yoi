@@ -1,16 +1,16 @@
 <script lang="ts">
   import { page } from '$app/state';
   import { setContext } from 'svelte';
-  import HeaderOverride from '$lib/workspace/header/HeaderOverride.svelte';
-  import SidebarOverride from '$lib/workspace/sidebar/SidebarOverride.svelte';
+  import HeaderOverride from '#lib/workspace/header/HeaderOverride.svelte';
+  import SidebarOverride from '#lib/workspace/sidebar/SidebarOverride.svelte';
   import {
     getSidebarController,
     SIDEBAR_CONTEXT,
     type SidebarController,
     type SidebarSnippet,
-  } from '$lib/workspace/sidebar/context';
-  import { createOverrideStack } from '$lib/workspace/sidebar/override-stack';
-  import { ownsRoutePath } from '$lib/workspace/sidebar/route-ownership';
+  } from '#lib/workspace/sidebar/context.ts';
+  import { createOverrideStack } from '#lib/workspace/sidebar/override-stack.ts';
+  import { ownsRoutePath } from '#lib/workspace/sidebar/route-ownership.ts';
   import WorkspaceSidebarFixture from './WorkspaceSidebarFixture.svelte';
   import { designLabBasePath } from './workspace-navigation';
   import './showroom.css';

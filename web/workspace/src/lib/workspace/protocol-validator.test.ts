@@ -1,10 +1,10 @@
-import type { EventSubscriptionSelector, SubscriptionFrame } from '$lib/generated/protocol';
+import type { EventSubscriptionSelector, SubscriptionFrame } from '#lib/generated/protocol.ts';
 import {
   decodeSubscriptionFrame,
   MAX_SUBSCRIPTION_STRING_BYTES,
   RUST_SERIALIZED_SUBSCRIPTION_FRAME_FIXTURES,
   subscriptionFrameMatchesSelector,
-} from '$lib/generated/protocol-validator';
+} from '#lib/generated/protocol-validator.ts';
 
 declare const Deno: {
   test(name: string, fn: () => void | Promise<void>): void;

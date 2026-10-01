@@ -1,16 +1,16 @@
 import { redirect } from "@sveltejs/kit";
-import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
-import { loadWorkspaceRepositoryList } from "$lib/workspace/api/repositories";
-import { parseBrowserWorkspaceOrchestratorResponse } from "$lib/workspace/api/workers";
+import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
+import { loadWorkspaceRepositoryList } from "#lib/workspace/api/repositories.ts";
+import { parseBrowserWorkspaceOrchestratorResponse } from "#lib/workspace/api/workers.ts";
 import {
   parseTicketDetail,
   TICKET_BROWSER_API_LOAD_POLICY,
-} from "$lib/workspace/api/ticket-browser";
+} from "#lib/workspace/api/ticket-browser.ts";
 import {
   canonicalResourceReference,
   resourceKey,
-} from "$lib/workspace/resource-links";
-import type { WorkspaceOrchestratorStatus } from "$lib/workspace/tickets/ticket-panel";
+} from "#lib/workspace/resource-links.ts";
+import type { WorkspaceOrchestratorStatus } from "#lib/workspace/tickets/ticket-panel.ts";
 import type { PageLoad } from "./$types";
 
 export const load = (async ({ fetch, params }) => {

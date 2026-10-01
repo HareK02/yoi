@@ -22,7 +22,7 @@
 <script lang="ts">
   import type { Renderers } from "@humanspeak/svelte-markdown";
   import { ShikiCode } from "@humanspeak/svelte-markdown/extensions/shiki";
-  import SafeMarkdown from "$lib/workspace/markdown/SafeMarkdown.svelte";
+  import SafeMarkdown from "#lib/workspace/markdown/SafeMarkdown.svelte";
 
   type Props = {
     text: string;

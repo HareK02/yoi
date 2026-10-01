@@ -2,18 +2,18 @@
   import { page } from '$app/state';
   import { setContext } from 'svelte';
   import { MediaQuery } from 'svelte/reactivity';
-  import WorkspaceAlerts from '$lib/workspace/alerts/WorkspaceAlerts.svelte';
-  import Bevel from '$lib/workspace/ui/Bevel.svelte';
+  import WorkspaceAlerts from '#lib/workspace/alerts/WorkspaceAlerts.svelte';
+  import Bevel from '#lib/workspace/ui/Bevel.svelte';
   import {
     provideHeaderController,
     type HeaderController,
     type HeaderSnippet,
-  } from '$lib/workspace/header/context';
-  import GlobalSidebar from '$lib/workspace/sidebar/GlobalSidebar.svelte';
-  import SidebarFrame from '$lib/workspace/sidebar/SidebarFrame.svelte';
-  import SidebarToggleIcon from '$lib/workspace/sidebar/SidebarToggleIcon.svelte';
-  import { SIDEBAR_CONTEXT, type SidebarController, type SidebarSnippet } from '$lib/workspace/sidebar/context';
-  import { createOverrideStack } from '$lib/workspace/sidebar/override-stack';
+  } from '#lib/workspace/header/context.ts';
+  import GlobalSidebar from '#lib/workspace/sidebar/GlobalSidebar.svelte';
+  import SidebarFrame from '#lib/workspace/sidebar/SidebarFrame.svelte';
+  import SidebarToggleIcon from '#lib/workspace/sidebar/SidebarToggleIcon.svelte';
+  import { SIDEBAR_CONTEXT, type SidebarController, type SidebarSnippet } from '#lib/workspace/sidebar/context.ts';
+  import { createOverrideStack } from '#lib/workspace/sidebar/override-stack.ts';
   import '../app.css';
   import type { LayoutProps } from './$types';
 

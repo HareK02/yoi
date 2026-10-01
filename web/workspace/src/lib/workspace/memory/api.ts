@@ -1,4 +1,4 @@
-import { MEMORY_API_LIMITS } from "$lib/generated/memory-api";
+import { MEMORY_API_LIMITS } from "#lib/generated/memory-api.ts";
 import type {
   Diagnostic,
   DiagnosticSeverity,
@@ -12,7 +12,7 @@ import type {
   MemoryStagingEvidence,
   MemoryStagingListResponse,
   MemoryStagingRecord,
-} from "$lib/generated/memory-api";
+} from "#lib/generated/memory-api.ts";
 
 const MAX_STAGING_ITEMS = MEMORY_API_LIMITS.maxCollectionItems;
 const MAX_EVIDENCE_PER_RECORD = MEMORY_API_LIMITS.maxCollectionItems;

@@ -1,4 +1,4 @@
-import type { SubscriptionFrame, SubscriptionWorker } from '$lib/generated/protocol';
+import type { SubscriptionFrame, SubscriptionWorker } from '#lib/generated/protocol.ts';
 
 function assertEquals(actual: unknown, expected: unknown): void {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {

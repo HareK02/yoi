@@ -14,7 +14,7 @@ import type {
   WorkerState,
   WorkerStateSnapshot,
   WorkerStatus,
-} from "$lib/generated/protocol";
+} from "#lib/generated/protocol.ts";
 import { stringify as stringifyYaml } from "yaml";
 import {
   applyRunActivityEvent,

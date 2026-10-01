@@ -97,6 +97,16 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
         diagnostics: [],
       });
     }
+    // Keyboard focus can preload the Tickets route before navigation.
+    if (path === "/orchestrator") {
+      return json({
+        workspace_id: workspaceId,
+        online: false,
+        disposition: "offline",
+        worker: null,
+        diagnostics: [],
+      });
+    }
     if (path === "/working-directories") {
       return json({ workspace_id: workspaceId, items: [], diagnostics: [] });
     }

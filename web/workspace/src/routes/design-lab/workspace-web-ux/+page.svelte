@@ -1,7 +1,7 @@
 <script lang="ts">
-  import Bevel from '$lib/workspace/ui/Bevel.svelte';
-  import BevelLine from '$lib/workspace/ui/BevelLine.svelte';
-  import Tooltip from '$lib/workspace/ui/Tooltip.svelte';
+  import Bevel from '#lib/workspace/ui/Bevel.svelte';
+  import BevelLine from '#lib/workspace/ui/BevelLine.svelte';
+  import Tooltip from '#lib/workspace/ui/Tooltip.svelte';
 </script>
 
 <div class="showroom">

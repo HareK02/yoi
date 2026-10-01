@@ -7,7 +7,7 @@ import {
   workspaceSkillCatalogPath,
   workspaceSkillDetailPath,
 } from "./http.ts";
-import { SKILL_API_LIMITS } from "$lib/generated/skill-api.ts";
+import { SKILL_API_LIMITS } from "#lib/generated/skill-api.ts";
 
 declare const Deno: {
   test(name: string, fn: () => Promise<void> | void): void;

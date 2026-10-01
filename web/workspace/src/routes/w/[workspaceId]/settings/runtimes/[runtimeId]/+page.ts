@@ -1,5 +1,5 @@
-import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
-import { parseWorkspaceRuntimeDetail } from "$lib/workspace/api/runtime-management";
+import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
+import { parseWorkspaceRuntimeDetail } from "#lib/workspace/api/runtime-management.ts";
 import type { PageLoad } from "./$types";
 
 export const load: PageLoad = async ({ fetch, params }) => {

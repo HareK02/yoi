@@ -1,13 +1,13 @@
-import type { Segment } from "$lib/generated/protocol.ts";
+import type { Segment } from "#lib/generated/protocol.ts";
 import {
   composerDeletionRange,
   type ComposerPaste,
   composerPasteToken,
   pasteChipLabel,
   snapshotComposerDraft,
-} from "$lib/workspace/console/composer-draft.ts";
-import { buildComposerSegmentsRequest } from "$lib/workspace/console/composer-command.ts";
-import { measureComposerPaste } from "$lib/workspace/console/composer-paste.ts";
+} from "#lib/workspace/console/composer-draft.ts";
+import { buildComposerSegmentsRequest } from "#lib/workspace/console/composer-command.ts";
+import { measureComposerPaste } from "#lib/workspace/console/composer-paste.ts";
 
 declare const Deno: {
   test(name: string, fn: () => void): void;

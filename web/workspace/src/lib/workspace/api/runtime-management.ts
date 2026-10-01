@@ -24,7 +24,7 @@ import type {
   WorkspaceRuntimeDetail,
   WorkspaceRuntimeListResponse,
   WorkspaceRuntimeResource,
-} from "$lib/generated/runtime-api.ts";
+} from "#lib/generated/runtime-api.ts";
 import { workspaceApiPath } from "./http.ts";
 
 export type WorkspaceRuntimeList = Omit<WorkspaceRuntimeListResponse, "diagnostics"> & {

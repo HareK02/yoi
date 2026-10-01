@@ -118,6 +118,7 @@
 
 <span
   class="tooltip-root"
+  role="presentation"
   bind:this={rootElement}
   onpointerenter={showAfterDelay}
   onpointerleave={handlePointerLeave}

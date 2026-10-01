@@ -9,7 +9,7 @@ import type {
   DiagnosticSeverity,
   WorkspaceWorkerDiscoveryItem,
   WorkspaceWorkerSubject,
-} from "$lib/generated/companion-api";
+} from "#lib/generated/companion-api.ts";
 
 const MAX_TRANSCRIPT_ITEMS = 200;
 const MAX_DIAGNOSTICS = 100;

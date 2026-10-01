@@ -1,17 +1,17 @@
 <script lang="ts">
-  import { pushWorkspaceAlert } from '$lib/workspace/alerts/store';
-  import { workspaceApiPath } from '$lib/workspace/api/http';
+  import { pushWorkspaceAlert } from '#lib/workspace/alerts/store.ts';
+  import { workspaceApiPath } from '#lib/workspace/api/http.ts';
   import {
     parseRuntimeCleanupExecution,
     parseRuntimeCleanupPlan,
     parseWorkerRetentionResponse,
-  } from '$lib/workspace/api/runtime-workers';
-  import { workerHref } from '$lib/workspace/resource-links';
-  import { formatWorkdirPermissions } from '$lib/workspace/settings/workdir-permissions';
-  import { formatCurrentWorkdirRevision } from '$lib/workspace/settings/workdir-revision';
-  import { canOpenWorkerConsole } from '$lib/workspace/sidebar/workers';
-  import { liveWorkerState } from '$lib/workspace/sidebar/worker-state';
-  import type { CleanupWorkerCandidate, RuntimeCleanupPlanResponse, Worker } from '$lib/workspace/sidebar/types';
+  } from '#lib/workspace/api/runtime-workers.ts';
+  import { workerHref } from '#lib/workspace/resource-links.ts';
+  import { formatWorkdirPermissions } from '#lib/workspace/settings/workdir-permissions.ts';
+  import { formatCurrentWorkdirRevision } from '#lib/workspace/settings/workdir-revision.ts';
+  import { canOpenWorkerConsole } from '#lib/workspace/sidebar/workers.ts';
+  import { liveWorkerState } from '#lib/workspace/sidebar/worker-state.ts';
+  import type { CleanupWorkerCandidate, RuntimeCleanupPlanResponse, Worker } from '#lib/workspace/sidebar/types.ts';
   import type { PageProps } from './$types';
 
   type WorkerActionKind = 'pin' | 'delete';

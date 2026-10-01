@@ -1,4 +1,4 @@
-import type { WorkingDirectorySummary } from "$lib/generated/workdir-api";
+import type { WorkingDirectorySummary } from "#lib/generated/workdir-api.ts";
 import {
   type SidebarWorkdirAttachment,
   sidebarWorkdirMeta,

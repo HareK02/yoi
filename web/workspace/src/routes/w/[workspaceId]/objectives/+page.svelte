@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { formatDate } from '$lib/workspace/api/http';
-  import { objectiveHref } from '$lib/workspace/resource-links';
+  import { formatDate } from '#lib/workspace/api/http.ts';
+  import { objectiveHref } from '#lib/workspace/resource-links.ts';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();

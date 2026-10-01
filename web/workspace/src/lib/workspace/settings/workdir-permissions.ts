@@ -1,4 +1,4 @@
-import type { ExternalWorkdirPermissions } from "$lib/generated/workdir-api";
+import type { ExternalWorkdirPermissions } from "#lib/generated/workdir-api.ts";
 
 /** Render an effective attachment/session capability intersection without widening it. */
 export function formatWorkdirPermissions(

@@ -1,19 +1,19 @@
-import { workspaceApiPath } from "$lib/workspace/api/http";
+import { workspaceApiPath } from "#lib/workspace/api/http.ts";
 import {
   parseRepositoryAccessProjection,
   parseRepositorySshCredentials,
   parseRepositorySshHostTrusts,
   parseRepositorySshPublicKey,
-} from "$lib/workspace/api/repository-access";
+} from "#lib/workspace/api/repository-access.ts";
 import {
   loadRepositoryAccessPermissionGate,
   loadRepositoryAccessSection,
-} from "$lib/workspace/api/repository-access-loader";
-import type { PageLoad } from "./$types";
+} from "#lib/workspace/api/repository-access-loader.ts";
+import type { Load } from "@sveltejs/kit";
 
 const WORKSPACE_DEFAULT_CREDENTIAL_ID = "workspace-default";
 
-export const load: PageLoad = async ({ fetch, params }) => {
+export const load = (async ({ fetch, params }) => {
   const workspaceId = params.workspaceId;
   const accessProjectionResult = await loadRepositoryAccessPermissionGate(
     fetch,
@@ -68,4 +68,4 @@ export const load: PageLoad = async ({ fetch, params }) => {
     accessProjection: accessProjectionResult.data,
     accessProjectionError: accessProjectionResult.error,
   };
-};
+}) satisfies Load<{ workspaceId: string }>;

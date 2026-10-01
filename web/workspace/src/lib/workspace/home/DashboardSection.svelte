@@ -1,5 +1,5 @@
 <script lang="ts">
-  import BevelLine from '$lib/workspace/ui/BevelLine.svelte';
+  import BevelLine from '#lib/workspace/ui/BevelLine.svelte';
   import type { DashboardFeed } from './dashboard';
 
   let { id, title, empty, result }: { id: string; title: string; empty: string; result: Promise<DashboardFeed> } = $props();

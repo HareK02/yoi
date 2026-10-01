@@ -14,11 +14,11 @@
   import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection, type ViewUpdate } from '@codemirror/view';
   import { tags } from '@lezer/highlight';
   import { decodal } from 'decodal-codemirror';
-  import { shouldStartCompletionAfterTyping } from '$lib/workspace/config-source/completion.ts';
+  import { shouldStartCompletionAfterTyping } from '#lib/workspace/config-source/completion.ts';
   import {
     fixedSchemaWrapperExtension,
     moveSelectionIntoFixedWrapper,
-  } from '$lib/workspace/config-source/fixed-schema-wrapper.ts';
+  } from '#lib/workspace/config-source/fixed-schema-wrapper.ts';
 
   let {
     value = '',

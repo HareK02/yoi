@@ -1,10 +1,10 @@
 import { redirect } from "@sveltejs/kit";
-import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
-import { parseWorkerSummary } from "$lib/workspace/api/workers";
+import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
+import { parseWorkerSummary } from "#lib/workspace/api/workers.ts";
 import {
   canonicalResourceReference,
   resourceKey,
-} from "$lib/workspace/resource-links";
+} from "#lib/workspace/resource-links.ts";
 import type { PageLoad } from "./$types";
 
 export const load = (async ({ fetch, params }) => {

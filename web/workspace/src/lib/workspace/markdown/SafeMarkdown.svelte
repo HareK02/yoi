@@ -4,7 +4,7 @@
     type Renderers,
     type SvelteMarkdownProps,
   } from "@humanspeak/svelte-markdown";
-  import MarkdownLink from "$lib/workspace/markdown/MarkdownLink.svelte";
+  import MarkdownLink from "#lib/workspace/markdown/MarkdownLink.svelte";
 
   type Props = {
     text: string;

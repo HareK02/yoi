@@ -1,13 +1,13 @@
 <script lang="ts">
-  import { pushWorkspaceAlert } from '$lib/workspace/alerts/store';
-  import { workspaceApiPath } from '$lib/workspace/api/http';
-  import { parseRuntimeCleanupExecution } from '$lib/workspace/api/runtime-workers';
-  import { formatCurrentWorkdirRevision } from '$lib/workspace/settings/workdir-revision';
+  import { pushWorkspaceAlert } from '#lib/workspace/alerts/store.ts';
+  import { workspaceApiPath } from '#lib/workspace/api/http.ts';
+  import { parseRuntimeCleanupExecution } from '#lib/workspace/api/runtime-workers.ts';
+  import { formatCurrentWorkdirRevision } from '#lib/workspace/settings/workdir-revision.ts';
   import type {
     CleanupWorkdirCandidate,
     RuntimeCleanupPlanResponse,
     WorkingDirectorySummary,
-  } from '$lib/workspace/sidebar/types';
+  } from '#lib/workspace/sidebar/types.ts';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();

@@ -1,24 +1,24 @@
 <script lang="ts">
   import { setContext } from 'svelte';
   import { page } from '$app/state';
-  import HeaderOverride from '$lib/workspace/header/HeaderOverride.svelte';
-  import WorkspaceBreadcrumbs from '$lib/workspace/header/WorkspaceBreadcrumbs.svelte';
-  import SidebarOverride from '$lib/workspace/sidebar/SidebarOverride.svelte';
+  import HeaderOverride from '#lib/workspace/header/HeaderOverride.svelte';
+  import WorkspaceBreadcrumbs from '#lib/workspace/header/WorkspaceBreadcrumbs.svelte';
+  import SidebarOverride from '#lib/workspace/sidebar/SidebarOverride.svelte';
   import {
     getSidebarController,
     SIDEBAR_CONTEXT,
     type SidebarController,
     type SidebarSnippet,
-  } from '$lib/workspace/sidebar/context';
-  import { createOverrideStack } from '$lib/workspace/sidebar/override-stack';
-  import { ownsRoutePath } from '$lib/workspace/sidebar/route-ownership';
-  import { workspaceRoute } from '$lib/workspace/api/http';
-  import { disposeWorkspaceMultiplexer } from '$lib/workspace/multiplexer';
-  import { disposeWorkspaceWorkersStore } from '$lib/workspace/sidebar/worker-subscription';
-  import WorkspaceSidebar from '$lib/workspace/sidebar/WorkspaceSidebar.svelte';
-  import '$lib/workspace/styles/workspace-pages.css';
-  import '$lib/workspace/styles/tickets.css';
-  import '$lib/workspace/styles/workers.css';
+  } from '#lib/workspace/sidebar/context.ts';
+  import { createOverrideStack } from '#lib/workspace/sidebar/override-stack.ts';
+  import { ownsRoutePath } from '#lib/workspace/sidebar/route-ownership.ts';
+  import { workspaceRoute } from '#lib/workspace/api/http.ts';
+  import { disposeWorkspaceMultiplexer } from '#lib/workspace/multiplexer.ts';
+  import { disposeWorkspaceWorkersStore } from '#lib/workspace/sidebar/worker-subscription.ts';
+  import WorkspaceSidebar from '#lib/workspace/sidebar/WorkspaceSidebar.svelte';
+  import '#lib/workspace/styles/workspace-pages.css';
+  import '#lib/workspace/styles/tickets.css';
+  import '#lib/workspace/styles/workers.css';
   import type { LayoutProps } from './$types';
 
   let { data, children }: LayoutProps = $props();

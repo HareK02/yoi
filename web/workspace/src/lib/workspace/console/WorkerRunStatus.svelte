@@ -2,7 +2,7 @@
   import type {
     InFlightCompaction,
     WorkerStateSnapshot,
-  } from "$lib/generated/protocol.ts";
+  } from "#lib/generated/protocol.ts";
   import Spinner from "./Spinner.svelte";
   import {
     formatRunElapsed,

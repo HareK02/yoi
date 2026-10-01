@@ -1,4 +1,4 @@
-import type { Segment } from "$lib/generated/protocol";
+import type { Segment } from "#lib/generated/protocol.ts";
 
 export const COMPOSER_HISTORY_LIMIT = 30;
 const COMPOSER_HISTORY_VERSION = 1;

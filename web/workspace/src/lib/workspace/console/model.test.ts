@@ -3,7 +3,7 @@ import type {
   SessionSnapshotEntry,
   WorkerStateSnapshot,
   WorkerStatus,
-} from "$lib/generated/protocol";
+} from "#lib/generated/protocol.ts";
 import {
   type ConsoleEventInput,
   type ConsoleLine,

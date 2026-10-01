@@ -5,7 +5,7 @@ import {
   type WorkerSessionRequestIdentity,
   workerSessionRequestInit,
 } from "./session-observation";
-import type { SessionSnapshot } from "$lib/generated/protocol";
+import type { SessionSnapshot } from "#lib/generated/protocol.ts";
 
 declare const Deno: {
   test(name: string, fn: () => Promise<void> | void): void;

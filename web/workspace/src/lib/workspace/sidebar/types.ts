@@ -4,7 +4,7 @@ import type {
   CleanupWorkerCandidate,
   RuntimeCleanupExecutionResponse,
   RuntimeCleanupPlanResponse,
-} from "$lib/generated/runtime-api";
+} from "#lib/generated/runtime-api.ts";
 import type {
   BrowserCreateWorkerResponse as SharedBrowserCreateWorkerResponse,
   BrowserWorkerWorkingDirectorySelection
@@ -17,7 +17,7 @@ import type {
   WorkerSummary as SharedWorkerSummary,
   WorkerWorkdirAttachmentSummary as SharedWorkerWorkdirAttachmentSummary,
   WorkingDirectoryRepositoryOption as SharedWorkingDirectoryRepositoryOption,
-} from "$lib/generated/worker-launch-api";
+} from "#lib/generated/worker-launch-api.ts";
 import type {
   WorkingDirectoryCreateRequest,
   WorkingDirectoryCreateResponse,
@@ -25,14 +25,14 @@ import type {
   WorkingDirectoryListResponse,
   WorkingDirectoryOccupancy,
   WorkingDirectorySummary,
-} from "$lib/generated/workdir-api";
+} from "#lib/generated/workdir-api.ts";
 import type {
   Event as PodProtocolEvent,
   Method as PodProtocolMethod,
   Segment as PodProtocolSegment,
   SubscriptionWorkerJob,
   WorkerStateSnapshot,
-} from "$lib/generated/protocol";
+} from "#lib/generated/protocol.ts";
 import type {
   GitCommitSummary as SharedGitCommitSummary,
   GitRemoteSummary as SharedGitRemoteSummary,
@@ -42,7 +42,7 @@ import type {
   RepositoryLogResponse as SharedRepositoryLogResponse,
   RepositorySummary as SharedRepositorySummary,
   WorkspaceResponse as SharedWorkspaceResponse,
-} from "$lib/workspace/api/workspace-model";
+} from "#lib/workspace/api/workspace-model.ts";
 
 export type {
   PodProtocolEvent,
@@ -157,7 +157,7 @@ export type {
   TicketDetail,
   TicketEventDetail,
   TicketListResponse,
-} from "$lib/generated/ticket-api";
+} from "#lib/generated/ticket-api.ts";
 export type {
   TicketDetailDerivedRelation as DerivedTicketRelation,
   TicketDetailRelation as TicketRelation,
@@ -165,7 +165,7 @@ export type {
   TicketDetailRelationNotice as TicketRelationNotice,
   TicketDetailRelationView as TicketRelationView,
   TicketListItemSummary as TicketSummary,
-} from "$lib/generated/ticket-api";
+} from "#lib/generated/ticket-api.ts";
 
 export type {
   CompanionCancelRequest,
@@ -178,4 +178,4 @@ export type {
   CompanionTranscriptProjection,
   CompanionTranscriptRole,
   CompanionTransportSummary,
-} from "$lib/generated/companion-api";
+} from "#lib/generated/companion-api.ts";

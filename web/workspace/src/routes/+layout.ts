@@ -1,9 +1,9 @@
-import { listWorkspaces } from "$lib/workspace/api/workspace-catalog";
-import type { LayoutLoad } from "./$types";
+import { listWorkspaces } from "#lib/workspace/api/workspace-catalog.ts";
+import type { Load } from "@sveltejs/kit";
 
 export const ssr = false;
 
-export const load: LayoutLoad = async ({ fetch }) => {
+export const load = (async ({ fetch }) => {
   try {
     return {
       accessibleWorkspaces: await listWorkspaces(fetch),
@@ -17,4 +17,4 @@ export const load: LayoutLoad = async ({ fetch }) => {
         : "Unable to load Workspaces",
     };
   }
-};
+}) satisfies Load;

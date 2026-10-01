@@ -1,4 +1,4 @@
-import { loadWorkspaceRepositoryList } from "$lib/workspace/api/repositories";
+import { loadWorkspaceRepositoryList } from "#lib/workspace/api/repositories.ts";
 import type { PageLoad } from "./$types";
 
 export const load: PageLoad = async ({ fetch, params }) => {

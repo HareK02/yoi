@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invalidate } from '$app/navigation';
-  import DashboardSection from '$lib/workspace/home/DashboardSection.svelte';
+  import DashboardSection from '#lib/workspace/home/DashboardSection.svelte';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();

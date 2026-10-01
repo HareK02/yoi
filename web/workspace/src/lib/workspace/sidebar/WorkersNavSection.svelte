@@ -1,7 +1,7 @@
 <script lang="ts">
-  import Spinner from '$lib/workspace/console/Spinner.svelte';
-  import { workerConsoleHref } from '$lib/workspace/resource-links';
-  import { pushWorkspaceAlert } from '$lib/workspace/alerts/store';
+  import Spinner from '#lib/workspace/console/Spinner.svelte';
+  import { workerConsoleHref } from '#lib/workspace/resource-links.ts';
+  import { pushWorkspaceAlert } from '#lib/workspace/alerts/store.ts';
   import {
     canStopSidebarWorker,
     canDeleteSidebarWorker,

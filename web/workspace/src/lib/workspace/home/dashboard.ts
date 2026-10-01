@@ -1,14 +1,14 @@
-import type { TicketListItemSummary } from "$lib/generated/ticket-api";
-import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
+import type { TicketListItemSummary } from "#lib/generated/ticket-api.ts";
+import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
 import {
   parseMergeRequestListResponse,
   parseObjectiveListResponse,
   parseTicketDetail,
   parseTicketListResponse,
   TICKET_BROWSER_API_LOAD_POLICY,
-} from "$lib/workspace/api/ticket-browser";
-import { mergeRequestPagePath } from "$lib/workspace/api/merge-requests";
-import { objectiveHref, ticketHref } from "$lib/workspace/resource-links";
+} from "#lib/workspace/api/ticket-browser.ts";
+import { mergeRequestPagePath } from "#lib/workspace/api/merge-requests.ts";
+import { objectiveHref, ticketHref } from "#lib/workspace/resource-links.ts";
 
 export const HOME_LIMIT = 5;
 export type DashboardRow = {

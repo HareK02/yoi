@@ -38,7 +38,7 @@ import type {
   TicketRoleAssignmentRecord,
   TicketRoleAssignmentSummary,
   TicketTarget,
-} from "$lib/generated/ticket-api.ts";
+} from "#lib/generated/ticket-api.ts";
 
 export const TICKET_BROWSER_API_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 export const TICKET_BROWSER_API_LOAD_POLICY = {

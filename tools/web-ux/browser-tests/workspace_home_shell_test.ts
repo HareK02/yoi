@@ -66,6 +66,9 @@ Deno.test("production Home dashboard isolates failures, shows authoritative reco
             });
             page.on("requestfailed", (request) => errors.push(request.url()));
             page.on("request", (request) => requests.push(request.url()));
+            page.on("response", (response) => {
+              if (response.status() >= 400) errors.push(`${response.status()} ${response.url()}`);
+            });
             for (const workspace of ["home-owner", "home-member", "home-long"]) {
               await page.goto(`${url}/w/${workspace}`);
               await ready(page);

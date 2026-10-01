@@ -1,5 +1,5 @@
 <script lang="ts">
-  import WorkspaceIdentitySettings from '$lib/workspace/settings/WorkspaceIdentitySettings.svelte';
+  import WorkspaceIdentitySettings from '#lib/workspace/settings/WorkspaceIdentitySettings.svelte';
   import type { PageProps } from './$types';
   let { data }: PageProps = $props();
 </script>

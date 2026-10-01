@@ -1,9 +1,9 @@
-import { workspaceApiPath } from "$lib/workspace/api/http";
+import { workspaceApiPath } from "#lib/workspace/api/http.ts";
 import {
   parseRuntimeCleanupExecution,
   parseRuntimeCleanupPlan,
   parseRuntimeWorkerLifecycleResult,
-} from "$lib/workspace/api/runtime-workers";
+} from "#lib/workspace/api/runtime-workers.ts";
 import type { Diagnostic, Worker } from "./types";
 
 type FetchFn = typeof fetch;

@@ -1,9 +1,9 @@
-import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
-import { parseWorkerListResponse } from "$lib/workspace/api/workers";
-import { parseRuntimeCleanupPlan } from "$lib/workspace/api/runtime-workers";
+import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
+import { parseWorkerListResponse } from "#lib/workspace/api/workers.ts";
+import { parseRuntimeCleanupPlan } from "#lib/workspace/api/runtime-workers.ts";
 import type {
   RuntimeCleanupPlanResponse,
-} from "$lib/workspace/sidebar/types";
+} from "#lib/workspace/sidebar/types.ts";
 import type { PageLoad } from "./$types";
 
 export const load: PageLoad = async ({ fetch, params }) => {

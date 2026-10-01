@@ -1,18 +1,18 @@
 <script lang="ts">
   import { page } from '$app/state';
   import { setContext } from 'svelte';
-  import SettingsSidebar from '$lib/workspace/sidebar/SettingsSidebar.svelte';
-  import SidebarOverride from '$lib/workspace/sidebar/SidebarOverride.svelte';
+  import SettingsSidebar from '#lib/workspace/sidebar/SettingsSidebar.svelte';
+  import SidebarOverride from '#lib/workspace/sidebar/SidebarOverride.svelte';
   import {
     getSidebarController,
     SIDEBAR_CONTEXT,
     type SidebarController,
     type SidebarSnippet,
-  } from '$lib/workspace/sidebar/context';
-  import { createOverrideStack } from '$lib/workspace/sidebar/override-stack';
-  import { ownsRoutePath } from '$lib/workspace/sidebar/route-ownership';
-  import { workspaceRoute } from '$lib/workspace/api/http';
-  import '$lib/workspace/styles/settings.css';
+  } from '#lib/workspace/sidebar/context.ts';
+  import { createOverrideStack } from '#lib/workspace/sidebar/override-stack.ts';
+  import { ownsRoutePath } from '#lib/workspace/sidebar/route-ownership.ts';
+  import { workspaceRoute } from '#lib/workspace/api/http.ts';
+  import '#lib/workspace/styles/settings.css';
   import type { LayoutProps } from './$types';
 
   let { data, children }: LayoutProps = $props();

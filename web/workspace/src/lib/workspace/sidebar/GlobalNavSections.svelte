@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { WorkspaceCatalogRecord } from "$lib/workspace/api/workspace-catalog";
+  import type { WorkspaceCatalogRecord } from "#lib/workspace/api/workspace-catalog.ts";
 
   type Props = {
     currentPath: string;

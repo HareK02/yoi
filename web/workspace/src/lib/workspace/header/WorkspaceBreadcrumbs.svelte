@@ -1,7 +1,7 @@
 <script lang="ts">
   import { page } from "$app/state";
-  import WorkspaceSwitcher from "$lib/workspace/sidebar/WorkspaceSwitcher.svelte";
-  import type { WorkspaceResponse } from "$lib/workspace/sidebar/types";
+  import WorkspaceSwitcher from "#lib/workspace/sidebar/WorkspaceSwitcher.svelte";
+  import type { WorkspaceResponse } from "#lib/workspace/sidebar/types.ts";
   import { buildWorkspaceBreadcrumbs } from "./breadcrumb-model";
 
   type Props = {

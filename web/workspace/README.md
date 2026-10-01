@@ -2,8 +2,13 @@
 
 SvelteKit static SPA for the Yoi workspace control plane.
 
-The frontend is intentionally static. Workspace authority, validation, and API
-behavior live in the Rust `yoi-server` backend.
+The frontend is intentionally static. Workspace authority, validation, and API behavior live in the Rust `yoi-server` backend.
+
+## Toolchain
+
+Dependencies are pinned in `deno.json` and `package.json`, with resolutions in `deno.lock`. Run `deno install --frozen` to reproduce the installed versions. The current toolchain is SvelteKit 3, Svelte 5, Vite 8, and Vitest 5. TypeScript is kept on 6.0.3 because SvelteKit 3.0.0 and svelte-check 4.7.6 do not yet declare support for TypeScript 7.
+
+SvelteKit and adapter settings live in `vite.config.ts`. Internal library imports use the `#lib/*` package subpath mapping with explicit file extensions, shared by Vite, TypeScript, and Deno. `tsconfig.json` extends `$app/tsconfig`; generated WASM JavaScript is consumed through its generated `.d.ts`, not checked as handwritten JavaScript. Deno-only tests under `test/` are type-checked by `deno task test`.
 
 ## Development
 
@@ -23,9 +28,7 @@ cd web/workspace
 deno task dev
 ```
 
-The Vite dev server proxies `/api/*` to `http://127.0.0.1:8787`, so frontend hot
-reload works while the Rust backend serves the workspace API. Open the Vite URL
-printed by `deno task dev`.
+The Vite dev server proxies `/api/*` to `http://127.0.0.1:8787`, so frontend hot reload works while the Rust backend serves the workspace API. Open the Vite URL printed by `deno task dev`.
 
 If you want to run the backend from the repository root instead:
 
@@ -33,10 +36,7 @@ If you want to run the backend from the repository root instead:
 cargo run -p yoi-workspace-server --bin yoi-server -- serve --listen 127.0.0.1:8787
 ```
 
-The backend reads Workspace records from the Yoi server DB at
-`<data_dir>/server/server.db`. Run
-`cargo run -p yoi-workspace-server --bin yoi-server -- init --workspace .` first when the server
-DB has not been initialized.
+The backend reads Workspace records from the Yoi server DB at `<data_dir>/server/server.db`. Run `cargo run -p yoi-workspace-server --bin yoi-server -- init --workspace .` first when the server DB has not been initialized.
 
 ## Static build
 
@@ -46,13 +46,14 @@ Build the SPA:
 deno task build
 ```
 
-Static asset packaging is a deployment concern. Local development normally uses
-the Vite dev server proxy plus the Rust backend command above.
+Static asset packaging is a deployment concern. Local development normally uses the Vite dev server proxy plus the Rust backend command above.
 
 ## Checks
 
 ```bash
 deno task check
+deno task test
+deno task test:component
 deno task build
 ```
 

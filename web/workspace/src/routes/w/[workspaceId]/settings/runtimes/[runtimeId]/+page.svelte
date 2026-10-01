@@ -3,7 +3,7 @@
   import type {
     RevokeRuntimeTrustKeyRequest,
     RuntimeTrustKeyStatus,
-  } from '$lib/generated/runtime-api';
+  } from '#lib/generated/runtime-api.ts';
   import {
     createRemoteRuntime,
     removeRemoteRuntime,
@@ -16,7 +16,7 @@
     RuntimeRemovalAttempt,
     RuntimeTrustRequestError,
     type RuntimeTrustRouteOperation,
-  } from '$lib/workspace/api/runtime-management';
+  } from '#lib/workspace/api/runtime-management.ts';
   import type { PageProps } from './$types';
 
   type TrustAction = 'create' | 'replace' | 'reactivate';
@@ -308,7 +308,7 @@
       if (!isCurrentRoute(routeOperation)) return;
       runtimeRemovalAttempt.complete(operationId);
       await goto(`/w/${encodeURIComponent(data.workspaceId)}/settings/runtimes`, {
-        replaceState: true,
+        replace: true,
       });
     } catch (error) {
       if (!isCurrentRoute(routeOperation)) return;

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { page } from '$app/state';
-  import { workspaceRoute } from '$lib/workspace/api/http';
+  import { workspaceRoute } from '#lib/workspace/api/http.ts';
 
   let settingsHref = $derived(
     page.params.workspaceId

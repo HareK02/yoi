@@ -3,15 +3,15 @@
     ConfirmRepositorySshHostTrustRequest,
     RepositorySshConnectionProbeRequest,
     RepositorySshConnectionProbeResponse
-  } from '$lib/generated/repository-api';
-  import { parseRepositorySshHostTrust } from '$lib/workspace/api/repository-access';
-  import { formatDate, workspaceApiPath } from '$lib/workspace/api/http';
-  import { parseRepositorySshConnectionProbeResponse } from '$lib/workspace/api/workspace-model';
+  } from '#lib/generated/repository-api.ts';
+  import { parseRepositorySshHostTrust } from '#lib/workspace/api/repository-access.ts';
+  import { formatDate, workspaceApiPath } from '#lib/workspace/api/http.ts';
+  import { parseRepositorySshConnectionProbeResponse } from '#lib/workspace/api/workspace-model.ts';
   import {
     changeRepositorySshProbeRuntime,
     RepositorySshProbeFence,
     repositorySshProbeRuntimes
-  } from '$lib/workspace/repositories/ssh-connection';
+  } from '#lib/workspace/repositories/ssh-connection.ts';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();

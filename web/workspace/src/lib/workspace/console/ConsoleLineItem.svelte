@@ -1,7 +1,7 @@
 <script lang="ts">
-  import AnsiText from '$lib/workspace/console/AnsiText.svelte';
-  import RichMarkdown from '$lib/workspace/console/RichMarkdown.svelte';
-  import type { ConsoleLine } from '$lib/workspace/console/model';
+  import AnsiText from '#lib/workspace/console/AnsiText.svelte';
+  import RichMarkdown from '#lib/workspace/console/RichMarkdown.svelte';
+  import type { ConsoleLine } from '#lib/workspace/console/model.ts';
 
   type Props = {
     item: ConsoleLine;

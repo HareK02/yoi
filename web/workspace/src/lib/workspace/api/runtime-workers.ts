@@ -11,7 +11,7 @@ import type {
   RuntimeWorkerLifecycleResult,
   WorkerOperationState,
   WorkerRetentionResponse,
-} from "$lib/generated/runtime-api";
+} from "#lib/generated/runtime-api.ts";
 
 const MAX_STRING_BYTES = 4_096;
 const MAX_CANDIDATES = 1_000;

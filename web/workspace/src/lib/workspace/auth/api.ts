@@ -4,7 +4,7 @@ import type {
   PasskeyLoginOptionsRequest,
   PasskeyRegistrationCompleteRequest,
   PasskeyRegistrationOptionsRequest,
-} from "$lib/generated/auth-api.ts";
+} from "#lib/generated/auth-api.ts";
 import {
   authenticationCredentialToJson,
   type AuthUser,
@@ -17,7 +17,7 @@ import {
   prepareRegistrationOptions,
   registrationCredentialToJson,
   type WhoamiResponse,
-} from "$lib/workspace/auth/model";
+} from "#lib/workspace/auth/model.ts";
 
 const MAX_AUTH_RESPONSE_BYTES = 256 * 1024;
 

@@ -1,13 +1,13 @@
-import { SKILL_API_LIMITS } from "$lib/generated/skill-api.ts";
+import { SKILL_API_LIMITS } from "#lib/generated/skill-api.ts";
 import type {
   SkillCatalogResponse,
   SkillDetailResponse,
-} from "$lib/generated/skill-api.ts";
+} from "#lib/generated/skill-api.ts";
 import {
   parseSkillCatalogResponse,
   parseSkillDetailResponse,
   SkillApiContractError,
-} from "$lib/workspace/skills/api.ts";
+} from "#lib/workspace/skills/api.ts";
 
 export type ApiResult<T> = {
   data: T | null;

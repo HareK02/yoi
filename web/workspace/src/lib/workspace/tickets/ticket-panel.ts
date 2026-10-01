@@ -1,8 +1,8 @@
-import type { BrowserWorkspaceOrchestratorResponse } from "$lib/generated/worker-launch-api";
+import type { BrowserWorkspaceOrchestratorResponse } from "#lib/generated/worker-launch-api.ts";
 import type {
   TicketDetail,
   TicketListItemSummary,
-} from "$lib/generated/ticket-api";
+} from "#lib/generated/ticket-api.ts";
 
 export const TICKET_STATES = [
   "planning",

@@ -1,6 +1,6 @@
-import { MEMORY_API_LIMITS } from "$lib/generated/memory-api";
-import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
-import { parseMemoryDocumentResponse } from "$lib/workspace/memory/api";
+import { MEMORY_API_LIMITS } from "#lib/generated/memory-api.ts";
+import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
+import { parseMemoryDocumentResponse } from "#lib/workspace/memory/api.ts";
 import type { PageLoad } from "./$types";
 
 export const load: PageLoad = async ({ fetch, params }) => {

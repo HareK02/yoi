@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { MemoryStagingEntry, MemoryStagingRecord } from '$lib/generated/memory-api';
+  import type { MemoryStagingEntry, MemoryStagingRecord } from '#lib/generated/memory-api.ts';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();

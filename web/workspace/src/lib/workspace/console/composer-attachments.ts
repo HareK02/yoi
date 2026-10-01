@@ -1,8 +1,8 @@
 import type {
   AttachmentUploadGrantResponse,
   WorkerFileUploadResponse,
-} from "$lib/generated/runtime-api.ts";
-import type { UploadedFileRef } from "$lib/generated/protocol.ts";
+} from "#lib/generated/runtime-api.ts";
+import type { UploadedFileRef } from "#lib/generated/protocol.ts";
 
 export const MAX_UPLOADED_FILE_BYTES = 10 * 1024 * 1024;
 export const MAX_FILES_PER_SUBMISSION = 8;

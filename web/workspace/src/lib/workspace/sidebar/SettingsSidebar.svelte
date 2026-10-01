@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { workspaceRoute } from '$lib/workspace/api/http';
-  import { SETTINGS_SECTIONS, settingsSectionHref } from '$lib/workspace/settings/model';
-  import type { SettingsSectionId } from '$lib/workspace/settings/model';
+  import { workspaceRoute } from '#lib/workspace/api/http.ts';
+  import { SETTINGS_SECTIONS, settingsSectionHref } from '#lib/workspace/settings/model.ts';
+  import type { SettingsSectionId } from '#lib/workspace/settings/model.ts';
   import type { SidebarSnippet } from './context';
 
   let {

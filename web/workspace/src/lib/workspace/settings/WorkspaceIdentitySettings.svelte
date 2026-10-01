@@ -4,13 +4,13 @@
   import type {
     Diagnostic, WorkspaceMetadataSettingsResponse, WorkspaceSigningIdentityResponse,
     WorkspaceDeletionPreflightResponse, WorkspaceDeletionOperationResponse, WorkspaceDeletionRequest,
-  } from '$lib/generated/legacy-server-api';
-  import { workspaceApiPath } from '$lib/workspace/api/http';
-  import { disposeWorkspaceMultiplexer } from '$lib/workspace/multiplexer';
-  import { disposeWorkspaceWorkersStore } from '$lib/workspace/sidebar/worker-subscription';
+  } from '#lib/generated/legacy-server-api.ts';
+  import { workspaceApiPath } from '#lib/workspace/api/http.ts';
+  import { disposeWorkspaceMultiplexer } from '#lib/workspace/multiplexer.ts';
+  import { disposeWorkspaceWorkersStore } from '#lib/workspace/sidebar/worker-subscription.ts';
   import { fetchWorkspaceMetadata, updateWorkspaceMetadata, fetchWorkspaceSigningIdentity, provisionWorkspaceSigningIdentity } from './profile-api';
   import { preflightWorkspaceDeletion, startWorkspaceDeletion, getWorkspaceDeletion } from './workspace-deletion-api';
-  import BevelLine from '$lib/workspace/ui/BevelLine.svelte';
+  import BevelLine from '#lib/workspace/ui/BevelLine.svelte';
 
   // The route keys this component by Workspace and owner permission. Requests from
   // a disposed scope must not publish state, focus, or navigation into a new one.

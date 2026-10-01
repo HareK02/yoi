@@ -22,12 +22,12 @@
     isolateHistory,
   } from "@codemirror/commands";
   import { onMount } from "svelte";
-  import type { Segment } from "$lib/generated/protocol.ts";
+  import type { Segment } from "#lib/generated/protocol.ts";
   import {
     handleComposerImagePaste,
     measureComposerPaste,
     type ComposerPasteMeasurement,
-  } from "$lib/workspace/console/composer-paste.ts";
+  } from "#lib/workspace/console/composer-paste.ts";
   import {
     composerDeletionRange,
     composerPasteAtoms,
@@ -37,7 +37,7 @@
     type ComposerDraftSnapshot,
     type ComposerPaste,
     type ComposerTextPaste,
-  } from "$lib/workspace/console/composer-draft.ts";
+  } from "#lib/workspace/console/composer-draft.ts";
   import {
     ComposerHistory,
     loadComposerHistory,
@@ -45,9 +45,9 @@
     shouldBrowseComposerHistory,
     type ComposerHistoryDirection,
     type ComposerHistoryEntry,
-  } from "$lib/workspace/console/composer-history.ts";
+  } from "#lib/workspace/console/composer-history.ts";
   import { applyCompletion, completionSelection, completionTokenAt, localCommandCompletions, type ComposerCompletionEntry, type ComposerCompletionToken } from "./composer-completion";
-  import { shouldSubmitChatKey } from "$lib/workspace/console/chat-submit.ts";
+  import { shouldSubmitChatKey } from "#lib/workspace/console/chat-submit.ts";
 
   interface Props {
     disabled?: boolean;

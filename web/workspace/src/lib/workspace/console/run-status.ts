@@ -2,7 +2,7 @@ import type {
   Event as ProtocolEvent,
   InFlightCompaction,
   WorkerStateSnapshot,
-} from "$lib/generated/protocol";
+} from "#lib/generated/protocol.ts";
 
 export type RunActivityStats = {
   startedAtMs: number | null;

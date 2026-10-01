@@ -1,7 +1,7 @@
 <script lang="ts">
-  import RichMarkdown from '$lib/workspace/console/RichMarkdown.svelte';
-  import { formatDate } from '$lib/workspace/api/http';
-  import { ticketHref } from '$lib/workspace/resource-links';
+  import RichMarkdown from '#lib/workspace/console/RichMarkdown.svelte';
+  import { formatDate } from '#lib/workspace/api/http.ts';
+  import { ticketHref } from '#lib/workspace/resource-links.ts';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();

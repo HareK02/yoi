@@ -1,5 +1,5 @@
 import type { PageLoad } from "./$types";
-import { loadWorkspaceCatalog } from "$lib/workspace/api/workspace-catalog";
+import { loadWorkspaceCatalog } from "#lib/workspace/api/workspace-catalog.ts";
 
 export const load: PageLoad = async ({ fetch }) => {
   try {

@@ -7,8 +7,8 @@
     loadWorkspaceCatalog,
     type CreateWorkspaceRequest,
     type WorkspaceCatalogItem,
-  } from "$lib/workspace/api/workspace-catalog";
-  import "$lib/workspace/styles/workspace-catalog.css";
+  } from "#lib/workspace/api/workspace-catalog.ts";
+  import "#lib/workspace/styles/workspace-catalog.css";
 
   let { data } = $props();
   let workspaces = $state<WorkspaceCatalogItem[]>([]);

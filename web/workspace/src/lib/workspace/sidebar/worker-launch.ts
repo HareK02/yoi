@@ -1,8 +1,8 @@
 import type {
   BrowserWorkerWorkingDirectorySelection,
   CreateWorkspaceWorkerRequest,
-} from "$lib/generated/worker-launch-api";
-import { parseCreateWorkspaceWorkerRequest } from "$lib/workspace/api/workers";
+} from "#lib/generated/worker-launch-api.ts";
+import { parseCreateWorkspaceWorkerRequest } from "#lib/workspace/api/workers.ts";
 
 import type { WorkerLaunchOptionsResponse } from "./types";
 

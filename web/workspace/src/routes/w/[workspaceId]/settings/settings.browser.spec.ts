@@ -15,17 +15,17 @@ import {
   identityFixture,
   metadataFixture,
   settingsFixtureHandler,
-} from "$lib/workspace/settings/identity.test-fixtures";
+} from "#lib/workspace/settings/identity.test-fixtures.ts";
 vi.mock(
   "$app/navigation",
   () => ({ goto: vi.fn(async () => {}), invalidate: vi.fn(async () => {}) }),
 );
 vi.mock(
-  "$lib/workspace/multiplexer",
+  "#lib/workspace/multiplexer.ts",
   () => ({ disposeWorkspaceMultiplexer: vi.fn() }),
 );
 vi.mock(
-  "$lib/workspace/sidebar/worker-subscription",
+  "#lib/workspace/sidebar/worker-subscription.ts",
   () => ({ disposeWorkspaceWorkersStore: vi.fn() }),
 );
 type Data = ComponentProps<typeof Settings>["data"];

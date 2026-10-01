@@ -2,7 +2,7 @@ import type {
   SubscriptionEventPayload,
   SubscriptionFrame,
   SubscriptionWorker,
-} from '$lib/generated/protocol';
+} from '#lib/generated/protocol.ts';
 
 export type WorkspaceWorkersProjection = {
   workers: Map<string, SubscriptionWorker>;

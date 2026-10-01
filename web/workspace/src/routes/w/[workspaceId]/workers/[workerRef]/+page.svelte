@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { workerConsoleHref } from '$lib/workspace/resource-links';
-  import { liveWorkerState } from '$lib/workspace/sidebar/worker-state';
+  import { workerConsoleHref } from '#lib/workspace/resource-links.ts';
+  import { liveWorkerState } from '#lib/workspace/sidebar/worker-state.ts';
   import type { PageData } from './$types';
   let { data }: { data: PageData } = $props();
 </script>

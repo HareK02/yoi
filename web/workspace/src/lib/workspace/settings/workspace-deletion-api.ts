@@ -2,12 +2,12 @@ import type {
   WorkspaceDeletionOperationResponse,
   WorkspaceDeletionPreflightResponse,
   WorkspaceDeletionRequest,
-} from "$lib/generated/legacy-server-api";
-import { loadJson } from "$lib/workspace/api/http";
+} from "#lib/generated/legacy-server-api.ts";
+import { loadJson } from "#lib/workspace/api/http.ts";
 import {
   parseWorkspaceDeletionOperationResponse,
   parseWorkspaceDeletionPreflightResponse,
-} from "$lib/workspace/api/workspace-model";
+} from "#lib/workspace/api/workspace-model.ts";
 
 const deletionResponsePolicy = {
   maxResponseBytes: 2 * 1024 * 1024,

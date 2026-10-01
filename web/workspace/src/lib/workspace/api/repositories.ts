@@ -3,19 +3,19 @@ import type {
   CreateWorkspaceRepositoryResponse,
   RepositoryDetailResponse,
   RepositoryListResponse,
-} from "$lib/generated/repository-api.ts";
+} from "#lib/generated/repository-api.ts";
 import {
   type ApiResult,
   loadJson,
   readBoundedJson,
   workspaceApiPath,
-} from "$lib/workspace/api/http.ts";
+} from "#lib/workspace/api/http.ts";
 import {
   parseCreateWorkspaceRepositoryResponse,
   parseRepositoryApiError,
   parseRepositoryDetailResponse,
   parseRepositoryListResponse,
-} from "$lib/workspace/api/workspace-model.ts";
+} from "#lib/workspace/api/workspace-model.ts";
 
 export const REPOSITORY_API_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 

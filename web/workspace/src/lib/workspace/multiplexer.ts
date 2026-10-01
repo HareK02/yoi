@@ -1,15 +1,15 @@
-import { browser } from '$app/environment';
+import { browser } from '$app/env';
 import type {
   EventSubscriptionSelector,
   Method,
   SubscriptionFrame,
   SubscriptionId,
-} from '$lib/generated/protocol';
+} from '#lib/generated/protocol.ts';
 import {
   decodeSubscriptionFrame,
   subscriptionFrameMatchesSelector,
-} from '$lib/generated/protocol-validator';
-import { workspaceApiPath } from '$lib/workspace/api/http';
+} from '#lib/generated/protocol-validator.ts';
+import { workspaceApiPath } from '#lib/workspace/api/http.ts';
 
 type Listener = {
   onFrame(frame: SubscriptionFrame): void;

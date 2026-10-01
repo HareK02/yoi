@@ -1,5 +1,5 @@
 <script lang="ts">
-  import ConfigSourceEditor from "$lib/workspace/config-source/ConfigSourceEditor.svelte";
+  import ConfigSourceEditor from "#lib/workspace/config-source/ConfigSourceEditor.svelte";
   import type { PageProps } from "./$types";
 
   let { data }: PageProps = $props();

@@ -3,7 +3,7 @@
   import {
     listWorkspaces,
     type WorkspaceCatalogRecord,
-  } from "$lib/workspace/api/workspace-catalog";
+  } from "#lib/workspace/api/workspace-catalog.ts";
 
   let {
     currentWorkspaceId,

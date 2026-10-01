@@ -3,7 +3,7 @@ import type {
   SessionConversationTurn,
   SessionHistoryPage,
   SessionSnapshotEntry,
-} from "$lib/generated/protocol";
+} from "#lib/generated/protocol.ts";
 
 export const CONSOLE_HISTORY_PAGE_TURNS = 5;
 

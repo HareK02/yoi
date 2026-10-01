@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { workspaceRoute } from "$lib/workspace/api/http";
+  import { workspaceRoute } from "#lib/workspace/api/http.ts";
 
   type Props = {
     currentPath?: string;

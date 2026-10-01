@@ -12,7 +12,7 @@ import {
   type SkillProvenance,
   type SkillResourceRef,
   type SkillSourceKind,
-} from "$lib/generated/skill-api.ts";
+} from "#lib/generated/skill-api.ts";
 
 export class SkillApiContractError extends Error {
   constructor(message: string) {

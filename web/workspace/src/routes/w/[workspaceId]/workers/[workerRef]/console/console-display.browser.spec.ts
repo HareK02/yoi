@@ -13,10 +13,10 @@ import type {
   Event as ProtocolEvent,
   SessionConversationTurn,
   SessionSnapshot,
-} from "$lib/generated/protocol";
-import type { Worker } from "$lib/workspace/sidebar/types";
+} from "#lib/generated/protocol.ts";
+import type { Worker } from "#lib/workspace/sidebar/types.ts";
 import { EditorView } from "@codemirror/view";
-import * as alerts from "$lib/workspace/alerts/store";
+import * as alerts from "#lib/workspace/alerts/store.ts";
 import ConsolePage from "./+page.svelte";
 
 // happy-dom does not implement Web Animations. Motion itself is covered in Chromium.
@@ -43,7 +43,7 @@ const multiplexer = vi.hoisted(() => {
   };
 });
 
-vi.mock("$lib/workspace/multiplexer", () => ({
+vi.mock("#lib/workspace/multiplexer.ts", () => ({
   workspaceMultiplexer: () => ({ subscribe: multiplexer.subscribe }),
 }));
 

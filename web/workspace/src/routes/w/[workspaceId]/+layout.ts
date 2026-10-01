@@ -1,7 +1,7 @@
 import { error } from "@sveltejs/kit";
-import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
-import { loadWorkspaceRepositoryList } from "$lib/workspace/api/repositories";
-import { parseWorkspaceResponse } from "$lib/workspace/api/workspace-model";
+import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
+import { loadWorkspaceRepositoryList } from "#lib/workspace/api/repositories.ts";
+import { parseWorkspaceResponse } from "#lib/workspace/api/workspace-model.ts";
 import type { LayoutLoad } from "./$types";
 
 export const load: LayoutLoad = async ({ fetch, params }) => {

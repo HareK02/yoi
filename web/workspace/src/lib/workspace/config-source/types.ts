@@ -10,7 +10,7 @@ export type {
   ToolchainContract,
   WorkspaceConfigSchemaBundle,
   WorkspaceConfigTreeResponse,
-} from "$lib/generated/legacy-server-api.ts";
+} from "#lib/generated/legacy-server-api.ts";
 
 // Browser-local Decodal/WASM projections remain owned by config-source.
 export type { ConfigDiagnostic } from "./generated/types/ConfigDiagnostic.ts";

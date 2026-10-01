@@ -4,8 +4,8 @@ import {
   type RepositorySummary,
   type WorkspaceCreateResponse,
   type WorkspaceSummary,
-} from "$lib/workspace/api/workspace-model";
-import { loadWorkspaceRepositoryList } from "$lib/workspace/api/repositories.ts";
+} from "#lib/workspace/api/workspace-model.ts";
+import { loadWorkspaceRepositoryList } from "#lib/workspace/api/repositories.ts";
 
 export type WorkspaceCatalogRecord = WorkspaceSummary;
 export type WorkspaceCatalogItem = WorkspaceCatalogRecord & {

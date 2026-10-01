@@ -1,9 +1,9 @@
 import { type Readable, readable } from "svelte/store";
-import type { WorkingDirectorySummary } from "$lib/generated/workdir-api";
-import type { SubscriptionWorker } from "$lib/generated/protocol";
-import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
-import { parseWorkingDirectoryListResponse } from "$lib/workspace/api/workdirs";
-import { workspaceMultiplexer } from "$lib/workspace/multiplexer";
+import type { WorkingDirectorySummary } from "#lib/generated/workdir-api.ts";
+import type { SubscriptionWorker } from "#lib/generated/protocol.ts";
+import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
+import { parseWorkingDirectoryListResponse } from "#lib/workspace/api/workdirs.ts";
+import { workspaceMultiplexer } from "#lib/workspace/multiplexer.ts";
 import {
   applyWorkspaceWorkersFrame,
   createWorkspaceWorkersProjection,

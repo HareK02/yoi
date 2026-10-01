@@ -1,4 +1,4 @@
-import type { SessionSnapshot } from "$lib/generated/protocol";
+import type { SessionSnapshot } from "#lib/generated/protocol.ts";
 
 export type WorkerSessionObservation =
   | { availability: "live_protocol" }

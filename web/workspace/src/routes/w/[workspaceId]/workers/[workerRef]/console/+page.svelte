@@ -3,25 +3,25 @@
     import { tick, untrack, type SvelteComponent } from "svelte";
     import { prefersReducedMotion } from "svelte/motion";
     import { fly } from "svelte/transition";
-    import ConsoleLineItem from "$lib/workspace/console/ConsoleLineItem.svelte";
-    import ConsoleTurnNavigation from "$lib/workspace/console/ConsoleTurnNavigation.svelte";
-    import ConsoleDisplayStateView from "$lib/workspace/console/ConsoleDisplayState.svelte";
-    import ConsoleTasks from "$lib/workspace/console/ConsoleTasks.svelte";
-    import { namePastedImage } from "$lib/workspace/console/composer-paste";
-    import ComposerInput from "$lib/workspace/console/ComposerInput.svelte";
-    import type { ComposerDraftSnapshot } from "$lib/workspace/console/composer-draft";
+    import ConsoleLineItem from "#lib/workspace/console/ConsoleLineItem.svelte";
+    import ConsoleTurnNavigation from "#lib/workspace/console/ConsoleTurnNavigation.svelte";
+    import ConsoleDisplayStateView from "#lib/workspace/console/ConsoleDisplayState.svelte";
+    import ConsoleTasks from "#lib/workspace/console/ConsoleTasks.svelte";
+    import { namePastedImage } from "#lib/workspace/console/composer-paste.ts";
+    import ComposerInput from "#lib/workspace/console/ComposerInput.svelte";
+    import type { ComposerDraftSnapshot } from "#lib/workspace/console/composer-draft.ts";
     import {
         canDeliverComposerDraft,
         sendComposerDelivery,
         type ComposerDelivery,
-    } from "$lib/workspace/console/composer-delivery";
+    } from "#lib/workspace/console/composer-delivery.ts";
     import {
         buildComposerSegmentsRequest,
         type WorkerConsoleInputRequest,
-    } from "$lib/workspace/console/composer-command";
-    import { FileCompletions } from "$lib/workspace/console/file-completions";
-    import WorkerRunStatus from "$lib/workspace/console/WorkerRunStatus.svelte";
-    import { resolveWorkerControlShortcut } from "$lib/workspace/console/worker-control-shortcuts";
+    } from "#lib/workspace/console/composer-command.ts";
+    import { FileCompletions } from "#lib/workspace/console/file-completions.ts";
+    import WorkerRunStatus from "#lib/workspace/console/WorkerRunStatus.svelte";
+    import { resolveWorkerControlShortcut } from "#lib/workspace/console/worker-control-shortcuts.ts";
     import {
         consoleWorkerViews,
         createConsoleProjector,
@@ -35,7 +35,7 @@
         type ConsoleProjection,
         type ConsoleViewMode,
         type ConsoleViewScroll,
-    } from "$lib/workspace/console/model";
+    } from "#lib/workspace/console/model.ts";
     import type {
         Event as ProtocolEvent,
         Method as ProtocolMethod,
@@ -43,22 +43,22 @@
         RewindTarget,
         Segment,
         SessionHistoryPage,
-    } from "$lib/generated/protocol";
+    } from "#lib/generated/protocol.ts";
     import {
         MAX_FILES_PER_SUBMISSION,
         uploadAttachment,
         validateAttachmentFile,
         type ComposerAttachment,
-    } from "$lib/workspace/console/composer-attachments";
-    import { pushWorkspaceAlert } from "$lib/workspace/alerts/store";
+    } from "#lib/workspace/console/composer-attachments.ts";
+    import { pushWorkspaceAlert } from "#lib/workspace/alerts/store.ts";
     import {
         boundedConsoleReason,
         displayedConsoleSource,
         type ConsoleDisplaySource,
         type ConsoleDisplayState,
-    } from "$lib/workspace/console/console-display-state";
-    import { workspaceApiPath } from "$lib/workspace/api/http";
-    import { workspaceMultiplexer, type WorkspaceMultiplexerSubscription } from "$lib/workspace/multiplexer";
+    } from "#lib/workspace/console/console-display-state.ts";
+    import { workspaceApiPath } from "#lib/workspace/api/http.ts";
+    import { workspaceMultiplexer, type WorkspaceMultiplexerSubscription } from "#lib/workspace/multiplexer.ts";
     import {
         isCurrentWorkerSessionRequest,
         resolveWorkerSessionTarget,
@@ -67,7 +67,7 @@
         type WorkerSessionObservation,
         type WorkerSessionRequestIdentity,
         type WorkerSessionTarget,
-    } from "$lib/workspace/session-observation";
+    } from "#lib/workspace/session-observation.ts";
     import {
         applyConsoleHistoryPage,
         beginConsoleHistoryRequest,
@@ -78,9 +78,9 @@
         setConsoleHistoryTopEdge,
         shouldLoadHistoryAtTop,
         type ConsoleHistoryState,
-    } from "$lib/workspace/console/history";
-    import type { TurnNavigationItem } from "$lib/workspace/console/turn-navigation";
-    import type { Diagnostic, Worker } from "$lib/workspace/sidebar/types";
+    } from "#lib/workspace/console/history.ts";
+    import type { TurnNavigationItem } from "#lib/workspace/console/turn-navigation.ts";
+    import type { Diagnostic, Worker } from "#lib/workspace/sidebar/types.ts";
 
     type Props = {
         data: {

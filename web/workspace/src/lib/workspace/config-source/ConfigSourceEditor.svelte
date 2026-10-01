@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import DecodalSourceEditor from "$lib/workspace/settings/DecodalSourceEditor.svelte";
+  import DecodalSourceEditor from "#lib/workspace/settings/DecodalSourceEditor.svelte";
   import {
     commitConfigTree,
     fetchConfigTree,

@@ -3,7 +3,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/svelte";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { createRawSnippet, tick } from "svelte";
-import { logout } from "$lib/workspace/auth/api";
+import { logout } from "#lib/workspace/auth/api.ts";
 import Layout from "./+layout.svelte";
 
 vi.mock("$app/state", () => ({ page: { url: new URL("https://example.test/") } }));

@@ -1,4 +1,4 @@
-import type { Segment } from "$lib/generated/protocol";
+import type { Segment } from "#lib/generated/protocol.ts";
 
 export type WorkerConsoleInputKind =
   | "user"

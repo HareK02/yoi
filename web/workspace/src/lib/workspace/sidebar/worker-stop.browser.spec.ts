@@ -11,7 +11,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import type {
   SubscriptionFrame,
   SubscriptionWorker,
-} from "$lib/generated/protocol";
+} from "#lib/generated/protocol.ts";
 import WorkersNavSection from "./WorkersNavSection.svelte";
 import { disposeWorkspaceWorkersStore } from "./worker-subscription";
 
@@ -19,7 +19,7 @@ const transport = vi.hoisted(() => ({
   listener: null as { onFrame(frame: SubscriptionFrame): void } | null,
   close: vi.fn(),
 }));
-vi.mock("$lib/workspace/multiplexer", () => ({
+vi.mock("#lib/workspace/multiplexer.ts", () => ({
   workspaceMultiplexer: () => ({
     subscribe: (
       _selector: unknown,

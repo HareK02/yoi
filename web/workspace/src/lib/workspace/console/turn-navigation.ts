@@ -35,7 +35,7 @@ export function consoleTurns(lines: readonly ConsoleLine[]): ConsoleTurn[] {
   return turns;
 }
 
-import type { SessionConversationTurn } from "$lib/generated/protocol";
+import type { SessionConversationTurn } from "#lib/generated/protocol.ts";
 import { type ConsoleTurnPreview, conversationTurnPreviews } from "./history";
 
 export type TurnNavigationItem = ConsoleTurnPreview;

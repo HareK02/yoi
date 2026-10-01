@@ -12,8 +12,8 @@ import type {
   WorkspaceSigningIdentityPublic,
   WorkspaceSigningIdentityResponse,
   WorkspaceSigningIdentityState,
-} from "$lib/generated/legacy-server-api";
-import { readBoundedJson } from "$lib/workspace/api/http.ts";
+} from "#lib/generated/legacy-server-api.ts";
+import { readBoundedJson } from "#lib/workspace/api/http.ts";
 
 const MAX_PROFILE_RESPONSE_BYTES = 4 * 1024 * 1024;
 const MAX_PROFILE_ERROR_BYTES = 4 * 1024;

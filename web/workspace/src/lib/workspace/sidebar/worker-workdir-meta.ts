@@ -1,5 +1,5 @@
-import type { WorkingDirectorySummary } from "$lib/generated/workdir-api";
-import type { SubscriptionWorkerWorkdirAttachment } from "$lib/generated/protocol";
+import type { WorkingDirectorySummary } from "#lib/generated/workdir-api.ts";
+import type { SubscriptionWorkerWorkdirAttachment } from "#lib/generated/protocol.ts";
 
 const SHORT_REFERENCE_LENGTH = 12;
 

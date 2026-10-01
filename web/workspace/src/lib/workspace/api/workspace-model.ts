@@ -1,4 +1,4 @@
-import type { ApiResult } from "$lib/workspace/api/http";
+import type { ApiResult } from "#lib/workspace/api/http.ts";
 import type {
   WorkspaceAuthConfig,
   WorkspaceCatalogListResponse,
@@ -15,7 +15,7 @@ import type {
   WorkspaceRepositoryRecord,
   WorkspaceResponse,
   WorkspaceSummary,
-} from "$lib/generated/legacy-server-api.ts";
+} from "#lib/generated/legacy-server-api.ts";
 import type {
   CreateWorkspaceRepositoryResponse,
   Diagnostic,
@@ -35,7 +35,7 @@ import type {
   RepositorySshConnectionTrustState,
   RepositorySshHostKeyCandidate,
   RepositorySummary,
-} from "$lib/generated/repository-api.ts";
+} from "#lib/generated/repository-api.ts";
 
 export type {
   WorkspaceCatalogListResponse,
@@ -45,7 +45,7 @@ export type {
   WorkspacePermissionSummary,
   WorkspaceResponse,
   WorkspaceSummary,
-} from "$lib/generated/legacy-server-api.ts";
+} from "#lib/generated/legacy-server-api.ts";
 export type {
   CreateWorkspaceRepositoryRequest,
   CreateWorkspaceRepositoryResponse,
@@ -63,7 +63,7 @@ export type {
   RepositorySshConnectionProbeResponse,
   RepositorySshHostKeyCandidate,
   RepositorySummary,
-} from "$lib/generated/repository-api.ts";
+} from "#lib/generated/repository-api.ts";
 
 type JsonObject = Record<string, unknown>;
 

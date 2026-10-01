@@ -1,10 +1,10 @@
 <script lang="ts">
-  import type { MergeRequestThreadEvent } from "$lib/generated/ticket-api";
-  import { mergeRequestPagePath } from "$lib/workspace/api/merge-requests";
+  import type { MergeRequestThreadEvent } from "#lib/generated/ticket-api.ts";
+  import { mergeRequestPagePath } from "#lib/workspace/api/merge-requests.ts";
   import {
     sourceReviewFreshness,
     targetIntegrationStatus,
-  } from "$lib/workspace/merge-request-status";
+  } from "#lib/workspace/merge-request-status.ts";
   import type { PageData } from "./$types";
 
   let { data }: { data: PageData } = $props();

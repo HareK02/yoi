@@ -44,7 +44,7 @@ Deno.test("sidebar running status reuses the green symbol spinner", async () => 
 
   assert(
     sidebar.includes(
-      "import Spinner from '$lib/workspace/console/Spinner.svelte'",
+      "import Spinner from '#lib/workspace/console/Spinner.svelte'",
     ),
     "Workers sidebar should import the reusable symbol Spinner",
   );

@@ -1,13 +1,13 @@
 import { redirect } from "@sveltejs/kit";
-import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
+import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
 import {
   parseObjectiveDetail,
   TICKET_BROWSER_API_LOAD_POLICY,
-} from "$lib/workspace/api/ticket-browser";
+} from "#lib/workspace/api/ticket-browser.ts";
 import {
   canonicalResourceReference,
   resourceKey,
-} from "$lib/workspace/resource-links";
+} from "#lib/workspace/resource-links.ts";
 import type { PageLoad } from "./$types";
 
 export const load: PageLoad = async ({ fetch, params }) => {

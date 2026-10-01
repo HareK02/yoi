@@ -16,11 +16,11 @@ import {
   type DashboardFeed,
   loadDashboard,
   recentRows,
-} from "$lib/workspace/home/dashboard";
+} from "#lib/workspace/home/dashboard.ts";
 import {
   dashboardFixture,
   fixtureDetail,
-} from "$lib/workspace/home/dashboard.test-fixtures";
+} from "#lib/workspace/home/dashboard.test-fixtures.ts";
 
 vi.mock("$app/navigation", () => ({ invalidate: vi.fn(async () => {}) }));
 type Data = ComponentProps<typeof Home>["data"];

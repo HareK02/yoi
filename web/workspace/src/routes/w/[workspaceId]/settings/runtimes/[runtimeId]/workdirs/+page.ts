@@ -1,7 +1,7 @@
-import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
-import { parseWorkspaceRuntimeList } from "$lib/workspace/api/runtime-management";
-import { parseRuntimeCleanupPlan } from "$lib/workspace/api/runtime-workers";
-import { parseWorkingDirectoryListResponse } from "$lib/workspace/api/workdirs";
+import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
+import { parseWorkspaceRuntimeList } from "#lib/workspace/api/runtime-management.ts";
+import { parseRuntimeCleanupPlan } from "#lib/workspace/api/runtime-workers.ts";
+import { parseWorkingDirectoryListResponse } from "#lib/workspace/api/workdirs.ts";
 import type { PageLoad } from "./$types";
 
 export const load: PageLoad = async ({ fetch, params }) => {

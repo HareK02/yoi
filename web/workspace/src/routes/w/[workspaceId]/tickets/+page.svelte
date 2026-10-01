@@ -1,31 +1,31 @@
 <script lang="ts">
   import { goto } from "$app/navigation";
   import { untrack } from "svelte";
-  import type { ApiResult } from "$lib/workspace/api/http";
+  import type { ApiResult } from "#lib/workspace/api/http.ts";
   import {
     loadJson,
     workspaceApiJsonWithBody,
     workspaceApiPath,
-  } from "$lib/workspace/api/http";
-  import { parseBrowserWorkspaceOrchestratorResponse } from "$lib/workspace/api/workers";
+  } from "#lib/workspace/api/http.ts";
+  import { parseBrowserWorkspaceOrchestratorResponse } from "#lib/workspace/api/workers.ts";
   import {
     TICKET_BROWSER_API_LOAD_POLICY,
     TICKET_BROWSER_API_MAX_RESPONSE_BYTES,
     parseTicketListResponse,
     parseTicketRecordRef,
-  } from "$lib/workspace/api/ticket-browser";
+  } from "#lib/workspace/api/ticket-browser.ts";
   import type {
     NewTicket,
     QueryPage,
     TicketListItemSummary as TicketSummary,
     TicketTarget,
     TicketTargetAccess,
-  } from "$lib/generated/ticket-api";
-  import { ticketHref } from "$lib/workspace/resource-links";
+  } from "#lib/generated/ticket-api.ts";
+  import { ticketHref } from "#lib/workspace/resource-links.ts";
   import {
     ticketLanes,
     type WorkspaceOrchestratorStatus,
-  } from "$lib/workspace/tickets/ticket-panel";
+  } from "#lib/workspace/tickets/ticket-panel.ts";
   import type { PageData } from "./$types";
 
   type LaneState = {

@@ -1,12 +1,12 @@
-import { parseBrowserWorkspaceOrchestratorResponse } from "$lib/workspace/api/workers";
-import { loadWorkspaceRepositoryList } from "$lib/workspace/api/repositories";
-import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
+import { parseBrowserWorkspaceOrchestratorResponse } from "#lib/workspace/api/workers.ts";
+import { loadWorkspaceRepositoryList } from "#lib/workspace/api/repositories.ts";
+import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
 import {
   parseTicketListResponse,
   TICKET_BROWSER_API_LOAD_POLICY,
-} from "$lib/workspace/api/ticket-browser";
-import type { TicketListResponse } from "$lib/generated/ticket-api";
-import type { WorkspaceOrchestratorStatus } from "$lib/workspace/tickets/ticket-panel";
+} from "#lib/workspace/api/ticket-browser.ts";
+import type { TicketListResponse } from "#lib/generated/ticket-api.ts";
+import type { WorkspaceOrchestratorStatus } from "#lib/workspace/tickets/ticket-panel.ts";
 import type { PageLoad } from "./$types";
 
 const LANE_STATES = {

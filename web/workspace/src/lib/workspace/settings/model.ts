@@ -1,4 +1,4 @@
-import type { Diagnostic as ServerApiDiagnostic } from "$lib/generated/legacy-server-api";
+import type { Diagnostic as ServerApiDiagnostic } from "#lib/generated/legacy-server-api.ts";
 
 export type Diagnostic = ServerApiDiagnostic;
 

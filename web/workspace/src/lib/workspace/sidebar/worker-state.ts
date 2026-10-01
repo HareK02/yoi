@@ -1,4 +1,4 @@
-import type { WorkerStateSnapshot } from "$lib/generated/protocol";
+import type { WorkerStateSnapshot } from "#lib/generated/protocol.ts";
 
 export function liveWorkerState(worker: {
   state: string;

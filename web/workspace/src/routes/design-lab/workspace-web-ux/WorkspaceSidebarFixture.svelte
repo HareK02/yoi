@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
-  import { ownsRoutePath } from '$lib/workspace/sidebar/route-ownership';
+  import { ownsRoutePath } from '#lib/workspace/sidebar/route-ownership.ts';
   import { designLabBasePath, workspaceNavigation, workspaceWorkers } from './workspace-navigation';
 
   let {
