@@ -96,7 +96,16 @@ async function checkSidebarSlide(page: Page, mobile: boolean, opening: boolean):
     const content = frame.querySelector<HTMLElement>(".sidebar-frame-content")!;
     const main = document.querySelector<HTMLElement>(".app-shell__main")!;
     const moving = mobile ? frame : content;
+    const footer = frame.querySelector<HTMLElement>(".sidebar-control-row")!;
+    const pin = frame.querySelector<HTMLElement>(".sidebar-fold-button")!;
     const sample = () => ({
+      footerWidth: footer.getBoundingClientRect().width,
+      footerHeight: footer.getBoundingClientRect().height,
+      dividerLeft: parseFloat(getComputedStyle(footer, "::before").left),
+      dividerRight: parseFloat(getComputedStyle(footer, "::before").right),
+      footerBorder: getComputedStyle(footer).borderTopWidth,
+      pinWidth: pin.getBoundingClientRect().width,
+      pinHeight: pin.getBoundingClientRect().height,
       x: moving.getBoundingClientRect().x,
       width: moving.getBoundingClientRect().width,
       frameWidth: frame.getBoundingClientRect().width,
@@ -132,7 +141,13 @@ async function checkSidebarSlide(page: Page, mobile: boolean, opening: boolean):
   const { before, middle, after } = result;
   for (const sample of [before, middle, after]) {
     assert(Math.abs(sample.pinLeft - 8) <= 1, "Pin must stay at the sidebar's left edge");
-    assert(Math.abs(sample.pinBottom - 16) <= 1, "Pin must stay at the sidebar's bottom edge");
+    assert(Math.abs(sample.pinBottom - 8) <= 1, "Pin must stay at the sidebar's bottom edge");
+    assertEquals(sample.pinWidth, 32);
+    assertEquals(sample.pinHeight, 32);
+    assertEquals(sample.footerHeight, 48, "footer keeps compact, equal padding");
+    assertEquals(sample.dividerLeft, 8);
+    assertEquals(sample.dividerRight, 8);
+    assertEquals(sample.footerBorder, "0px", "divider must not touch the sidebar edges");
   }
   assert(opening ? before.x < middle.x && middle.x < after.x : before.x > middle.x && middle.x > after.x,
     `sidebar must slide horizontally through an intermediate position: ${JSON.stringify(result)}`);
@@ -143,6 +158,8 @@ async function checkSidebarSlide(page: Page, mobile: boolean, opening: boolean):
   assertEquals(before.mainHeight, after.mainHeight);
   assertEquals(after.frameWidth, before.frameWidth, "hover mode keeps a fixed rail width");
   if (!mobile) {
+    const folded = opening ? before : after;
+    assertEquals(folded.footerWidth, folded.footerHeight, "folded footer must be square");
     assert(opening ? before.panelWidth < middle.panelWidth && middle.panelWidth < after.panelWidth
       : before.panelWidth > middle.panelWidth && middle.panelWidth > after.panelWidth,
       "the overlay panel must expand past the rail and contract again");
