@@ -41,6 +41,39 @@ async function historyRequestCount(baseUrl: string): Promise<number> {
   return state.history_requests;
 }
 
+async function checkSidebarModeSwitch(page: Page, name: string): Promise<void> {
+  const button = page.getByRole("button", { name, exact: true });
+  await button.hover();
+  const samples = await button.evaluate(async (button) => {
+    const frame = button.closest<HTMLElement>(".sidebar-frame")!;
+    await Promise.all(frame.getAnimations({ subtree: true }).map((animation) => animation.finished));
+    const panel = frame.querySelector<HTMLElement>(".sidebar-frame__bevel")!;
+    const content = frame.querySelector<HTMLElement>(".sidebar-frame-content")!;
+    const sample = () => ({
+      panel: panel.getBoundingClientRect().toJSON(),
+      content: content.getBoundingClientRect().toJSON(),
+      button: button.getBoundingClientRect().toJSON(),
+      folded: frame.classList.contains("folded"),
+      motion: frame.getAnimations({ subtree: true }).filter((animation) =>
+        animation instanceof CSSTransition && ["width", "transform"].includes(animation.transitionProperty)
+      ).length,
+    });
+    const samples = [sample()];
+    (button as HTMLButtonElement).click();
+    const start = performance.now();
+    do {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      samples.push(sample());
+    } while (performance.now() - start < 280);
+    return samples;
+  });
+  for (const sample of samples) {
+    assertEquals(sample, samples[0], `${name} must keep the open panel stationary without slide animation`);
+    assertEquals(sample.folded, false);
+    assertEquals(sample.motion, 0);
+  }
+}
+
 async function checkSidebarSlide(page: Page, mobile: boolean, opening: boolean): Promise<void> {
   const toggle = page.locator(mobile ? ".app-shell__mobile-sidebar-toggle" : ".sidebar-frame");
   const result = await toggle.evaluate(async (button, { mobile, opening }) => {
@@ -394,7 +427,7 @@ async function checkConsoleHistory(viewportHeight: number): Promise<void> {
       const settleSidebar = () => sidebar.evaluate(async (element) => {
         await Promise.all(element.getAnimations({ subtree: true }).map((animation) => animation.finished));
       });
-      await page.getByRole("button", { name: "Unpin sidebar", exact: true }).click();
+      await checkSidebarModeSwitch(page, "Unpin sidebar");
       await page.mouse.move(1000, 30);
       await page.locator(".sidebar-frame.folded").waitFor();
       await settleSidebar();
@@ -415,12 +448,12 @@ async function checkConsoleHistory(viewportHeight: number): Promise<void> {
       await page.locator(".sidebar-frame.folded").waitFor();
       await settleSidebar();
       await sidebar.hover({ position: { x: 10, y: 40 } });
-      await page.getByRole("button", { name: "Pin sidebar", exact: true }).click();
+      await checkSidebarModeSwitch(page, "Pin sidebar");
       await page.mouse.move(1000, 30);
       await page.waitForTimeout(250);
       assertEquals(await page.locator(".sidebar-frame.folded").count(), 0);
       assertEquals(await page.evaluate(() => localStorage.getItem("yoi.sidebar.mode.v1")), "pinned");
-      await page.getByRole("button", { name: "Unpin sidebar", exact: true }).click();
+      await checkSidebarModeSwitch(page, "Unpin sidebar");
       // Hold a preview open across reload; only the mode should be restored.
       await sidebarLink.focus();
       await page.mouse.move(1000, 30);
