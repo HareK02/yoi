@@ -16233,7 +16233,7 @@ fn find_online_workspace_orchestrator(api: &WorkspaceApi) -> Option<InternalWork
         .flatten()?;
     let mut worker = api.runtime.worker(&owner.worker).ok()?;
     worker.singleton_key = Some(owner.key);
-    (worker.workspace.workspace_id.as_deref() == Some(api.config.workspace_id.as_str())
+    (is_dedicated_workspace_orchestrator(&worker, &api.config.workspace_id)
         && matches!(worker.state.as_str(), "idle" | "running" | "paused"))
     .then_some(worker)
 }
@@ -16249,7 +16249,15 @@ fn find_workspace_orchestrator(api: &WorkspaceApi) -> Option<InternalWorkerSumma
         .flatten()?;
     let mut worker = api.runtime.worker(&owner.worker).ok()?;
     worker.singleton_key = Some(owner.key);
-    Some(worker)
+    is_dedicated_workspace_orchestrator(&worker, &api.config.workspace_id).then_some(worker)
+}
+
+fn is_dedicated_workspace_orchestrator(worker: &InternalWorkerSummary, workspace_id: &str) -> bool {
+    worker.workspace.workspace_id.as_deref() == Some(workspace_id)
+        && worker.singleton_key.as_deref()
+            == Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY)
+        && worker.tags.iter().any(|tag| tag == "orchestrator")
+        && worker.tags.iter().any(|tag| tag == "singleton")
 }
 
 async fn scoped_get_memory_document(
@@ -23056,6 +23064,14 @@ async fn create_workspace_worker_inner(
         workdir_attachments,
         control_operation_id: _,
     } = request;
+    if let Some(singleton_key) = singleton_key.as_deref()
+        && crate::hosts::is_reserved_internal_worker_singleton_key(singleton_key)
+    {
+        return Err(Error::InvalidInput(format!(
+            "Worker singleton key {singleton_key:?} is reserved for a Backend-managed Worker"
+        ))
+        .into());
+    }
     let config_state = api
         .config_store
         .load_workspace_config(&api.config.workspace_id)?
@@ -33372,7 +33388,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn arbitrary_singleton_create_conflicts_while_idle_or_stopped_and_restore_keeps_key() {
+    async fn arbitrary_singleton_exact_retry_replays_while_competing_create_conflicts() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
@@ -33395,12 +33411,22 @@ mod tests {
             created.worker.singleton_key.as_deref(),
             Some("subjektiv:subject-42")
         );
-        let duplicate =
+        let Json(duplicate) =
             create_workspace_worker(State(api.clone()), HeaderMap::new(), Json(request()))
                 .await
-                .unwrap_err();
+                .unwrap();
+        assert_eq!(duplicate.worker_id, created.worker_id);
+        let mut competing_request = request();
+        competing_request.display_name = "Competing Subject Worker".to_string();
+        let competing = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(competing_request),
+        )
+        .await
+        .unwrap_err();
         assert!(
-            matches!(duplicate.error, Error::RepositoryConflict(message) if message.contains("worker_singleton_owned"))
+            matches!(competing.error, Error::RepositoryConflict(message) if message.contains("worker_singleton_owned"))
         );
 
         let worker = RuntimeWorkerRef::new(&created.runtime_id, &created.worker_id);
@@ -33415,12 +33441,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
-        let stopped_duplicate =
+        let Json(stopped_retry) =
             create_workspace_worker(State(api.clone()), HeaderMap::new(), Json(request()))
                 .await
-                .unwrap_err();
+                .unwrap();
+        assert_eq!(stopped_retry.worker_id, created.worker_id);
+        let mut stopped_competing_request = request();
+        stopped_competing_request.display_name = "Stopped competing Worker".to_string();
+        let stopped_competing = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(stopped_competing_request),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(
-            stopped_duplicate.error,
+            stopped_competing.error,
             Error::RepositoryConflict(_)
         ));
 
@@ -33477,6 +33513,37 @@ mod tests {
             Error::InvalidInput(_)
         ));
         assert!(runtime.spawn_requests().is_empty());
+
+        // Simulate a Backend crash after the durable singleton reservation commits but before
+        // Runtime dispatch. The restarted request receives a fresh manual allocation key, yet its
+        // identical singleton intent replays the reserved Worker and dispatches that generation.
+        let mut restart_request = request("ignored-manual-operation");
+        restart_request.singleton_key = Some("subjektiv:restart-retry".to_string());
+        restart_request.resolved_control_operation = None;
+        let restart_fingerprint = worker_spawn_create_fingerprint(&restart_request).unwrap();
+        let memory = api
+            .config_store
+            .get_workspace_memory_settings(&api.config.workspace_id)
+            .unwrap();
+        let pre_crash_reservation = api
+            .config_store
+            .reserve_worker_create(
+                &api.config.workspace_id,
+                WorkdirlessFixtureRuntime::RUNTIME_ID,
+                "manual:lost-before-dispatch",
+                &restart_fingerprint,
+                restart_request.singleton_key.as_deref(),
+                &memory,
+            )
+            .unwrap();
+        let recovered = api
+            .spawn_workspace_worker(WorkdirlessFixtureRuntime::RUNTIME_ID, restart_request)
+            .unwrap();
+        assert_eq!(recovered.state, InternalWorkerOperationState::Accepted);
+        assert_eq!(
+            recovered.worker.unwrap().worker.worker_id,
+            pre_crash_reservation.worker_id.to_string()
+        );
 
         assert!(matches!(
             api.spawn_workspace_worker("missing-runtime", request("singleton-create-undispatched"))
@@ -33657,6 +33724,90 @@ mod tests {
         .unwrap();
         assert_eq!(generic.worker.singleton_key, None);
         assert!(find_workspace_orchestrator(&api).is_none());
+
+        let forged_public = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(CreateWorkspaceWorkerRequest {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                display_name: "Generic singleton key claimant".to_string(),
+                singleton_key: Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string()),
+                profile: Some("builtin:companion".to_string()),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachments: Vec::new(),
+                control_operation_id: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(forged_public.error, Error::InvalidInput(_)));
+        assert!(
+            api.store
+                .current_worker_singleton_owner(
+                    &workspace_id,
+                    crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY,
+                )
+                .unwrap()
+                .is_none()
+        );
+
+        // Even a trusted internal caller that accidentally assigns the legacy key cannot turn
+        // generic Worker metadata into Orchestrator completion authority.
+        let forged_internal = api
+            .spawn_workspace_worker(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                WorkerSpawnRequest {
+                    requested_worker_name: Some("Forged Orchestrator claimant".to_string()),
+                    singleton_key: Some(
+                        crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string(),
+                    ),
+                    intent: WorkerSpawnIntent::WorkspaceCompanion,
+                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                        expected_segments: 0,
+                    },
+                    profile: ProfileSelector::Builtin("builtin:companion".to_string()),
+                    ticket_assignment: None,
+                    initial_submit: Vec::new(),
+                    workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachments: Vec::new(),
+                    resolved_config_bundle: None,
+                    resolved_worker_observation_enabled: false,
+                    resolved_worker_observation_grants: Vec::new(),
+                    resolved_workspace_api: None,
+                    resolved_memory_settings: None,
+                    resolved_control_operation: None,
+                },
+            )
+            .unwrap()
+            .worker
+            .unwrap();
+        assert!(find_workspace_orchestrator(&api).is_none());
+        assert!(
+            require_online_workspace_orchestrator_source(&api, &forged_internal.worker).is_err()
+        );
+        let stopped = api
+            .runtime
+            .stop_worker(
+                &forged_internal.worker,
+                WorkerLifecycleRequest {
+                    reason: Some("remove forged Orchestrator claimant".to_string()),
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
+        assert!(
+            api.runtime
+                .delete_worker(&forged_internal.worker)
+                .unwrap()
+                .deleted
+        );
+        api.store
+            .delete_worker_registry(&workspace_id, &forged_internal.worker)
+            .unwrap();
+
         let reserved = create_workspace_worker(
             State(api.clone()),
             HeaderMap::new(),

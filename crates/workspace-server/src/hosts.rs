@@ -5361,9 +5361,16 @@ fn embedded_profile_label(profile: &ProfileSelector) -> Option<String> {
 }
 
 const MEMORY_CONSOLIDATION_PROFILE: &str = "memory-consolidation";
-const MEMORY_CONSOLIDATION_SINGLETON_KEY: &str = "workspace-memory-consolidation";
+pub(crate) const MEMORY_CONSOLIDATION_SINGLETON_KEY: &str = "workspace-memory-consolidation";
 const WORKSPACE_ORCHESTRATOR_PROFILE: &str = "orchestrator";
 pub(crate) const WORKSPACE_ORCHESTRATOR_SINGLETON_KEY: &str = "workspace-orchestrator";
+
+pub(crate) fn is_reserved_internal_worker_singleton_key(key: &str) -> bool {
+    matches!(
+        key,
+        MEMORY_CONSOLIDATION_SINGLETON_KEY | WORKSPACE_ORCHESTRATOR_SINGLETON_KEY
+    )
+}
 
 struct WorkerDisplayMetadata {
     display_name: String,

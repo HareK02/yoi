@@ -2231,6 +2231,86 @@ impl SqliteWorkspaceStore {
                 });
             }
 
+            let singleton_owner = singleton_key
+                .map(|key| current_worker_singleton_owner(&tx, workspace_id, key))
+                .transpose()?
+                .flatten();
+            if let Some((owner, state)) = singleton_owner.as_ref()
+                && state.as_deref() != Some("removed")
+            {
+                let stored = tx
+                    .query_row(
+                        "SELECT allocation_key, request_fingerprint, create_fingerprint, \
+                                memory_settings_revision, memory_language, singleton_key, \
+                                singleton_generation \
+                         FROM worker_create_reservations \
+                         WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
+                        params![
+                            workspace_id,
+                            owner.worker.runtime_id,
+                            owner.worker.worker_id
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, Option<i64>>(3)?,
+                                row.get::<_, Option<String>>(4)?,
+                                row.get::<_, Option<String>>(5)?,
+                                row.get::<_, Option<i64>>(6)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                if let Some((stored_allocation_key, stored_request_fingerprint, create_fingerprint, revision, language, stored_singleton_key, stored_generation)) = stored
+                    && allocation_key.starts_with("manual:")
+                    && stored_allocation_key.starts_with("manual:")
+                    && owner.worker.runtime_id == runtime_id
+                    && stored_request_fingerprint.as_deref() == Some(request_fingerprint)
+                    && stored_singleton_key.as_deref() == singleton_key
+                    && stored_generation.and_then(|generation| u64::try_from(generation).ok())
+                        == Some(owner.generation)
+                {
+                    let revision = revision.ok_or_else(|| {
+                        Error::InvalidInput(format!(
+                            "Worker singleton reservation {}:{} has no persisted Memory settings snapshot",
+                            owner.worker.runtime_id, owner.worker.worker_id
+                        ))
+                    })?;
+                    let language = language.ok_or_else(|| {
+                        Error::InvalidInput(format!(
+                            "Worker singleton reservation {}:{} has no persisted Memory language",
+                            owner.worker.runtime_id, owner.worker.worker_id
+                        ))
+                    })?;
+                    let worker_id = owner.worker.worker_id.parse::<WorkerId>().map_err(|_| {
+                        Error::Store(format!(
+                            "Worker singleton reservation {}:{} has a non-UUIDv7 worker id",
+                            owner.worker.runtime_id, owner.worker.worker_id
+                        ))
+                    })?;
+                    let snapshot = manifest::WorkspaceMemorySettingsSnapshot {
+                        workspace_id: workspace_id.to_string(),
+                        settings_revision: revision.try_into().map_err(|_| {
+                            rusqlite::Error::IntegralValueOutOfRange(2, revision)
+                        })?,
+                        language,
+                    };
+                    validate_workspace_memory_settings_snapshot(&snapshot, workspace_id)?;
+                    return Ok(WorkerCreateReservation {
+                        worker_id,
+                        create_fingerprint,
+                        memory_settings: snapshot,
+                        singleton: Some(owner.clone()),
+                    });
+                }
+                return Err(Error::RepositoryConflict(format!(
+                    "worker_singleton_owned: singleton key is already owned by Worker {}:{}",
+                    owner.worker.runtime_id, owner.worker.worker_id
+                )));
+            }
+
             let (authoritative_revision, authoritative_language) = tx
                 .query_row(
                     "SELECT settings_revision, language FROM workspace_memory_settings WHERE workspace_id = ?1",
@@ -2262,10 +2342,6 @@ impl SqliteWorkspaceStore {
             let worker_id = WorkerId::now_v7();
             let worker_id_text = worker_id.to_string();
             let now = chrono::Utc::now().to_rfc3339();
-            let singleton_owner = singleton_key
-                .map(|key| current_worker_singleton_owner(&tx, workspace_id, key))
-                .transpose()?
-                .flatten();
             let singleton_generation = match singleton_owner.as_ref() {
                 None if singleton_key.is_some() => Some(1_u64),
                 None => None,
@@ -18218,6 +18294,75 @@ mod tests {
             })
             .unwrap();
         assert!(store.get_workspace_memory_settings("workspace-a").is_err());
+    }
+
+    #[tokio::test]
+    async fn worker_singleton_reservation_retry_survives_restart_and_new_allocation_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("server.db");
+        let store = SqliteWorkspaceStore::open(&database).unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "workspace-a".to_string(),
+                owner_account_id: "owner-account".to_string(),
+                display_name: "Workspace A".to_string(),
+                state: "active".to_string(),
+                created_at: "2026-10-01T00:00:00Z".to_string(),
+                updated_at: "2026-10-01T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+        let memory = store.get_workspace_memory_settings("workspace-a").unwrap();
+        let reserved = store
+            .reserve_worker_create(
+                "workspace-a",
+                "runtime-a",
+                "manual:lost-before-dispatch",
+                "sha256:stable-request",
+                Some("subjektiv:restart-retry"),
+                &memory,
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = SqliteWorkspaceStore::open(&database).unwrap();
+        let retried = reopened
+            .reserve_worker_create(
+                "workspace-a",
+                "runtime-a",
+                "manual:new-after-restart",
+                "sha256:stable-request",
+                Some("subjektiv:restart-retry"),
+                &memory,
+            )
+            .unwrap();
+        assert_eq!(retried, reserved);
+        let reservation_count: i64 = reopened
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM worker_create_reservations \
+                     WHERE workspace_id = 'workspace-a' AND singleton_key = 'subjektiv:restart-retry'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(Error::from)
+            })
+            .unwrap();
+        assert_eq!(reservation_count, 1);
+        let conflict = reopened
+            .reserve_worker_create(
+                "workspace-a",
+                "runtime-a",
+                "manual:different-request",
+                "sha256:different-request",
+                Some("subjektiv:restart-retry"),
+                &memory,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            conflict,
+            Error::RepositoryConflict(message) if message.contains("worker_singleton_owned")
+        ));
     }
 
     #[tokio::test]
