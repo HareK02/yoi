@@ -88,6 +88,8 @@ async function checkSidebarSlide(page: Page, mobile: boolean, opening: boolean):
       panelWidth: frame.querySelector(".sidebar-frame__bevel")!.getBoundingClientRect().width,
       mainWidth: main.getBoundingClientRect().width,
       mainHeight: main.getBoundingClientRect().height,
+      pinLeft: frame.querySelector(".sidebar-fold-button")!.getBoundingClientRect().left - frame.getBoundingClientRect().left,
+      pinBottom: frame.getBoundingClientRect().bottom - frame.querySelector(".sidebar-fold-button")!.getBoundingClientRect().bottom,
     });
     const before = sample();
     if (mobile) {
@@ -113,6 +115,10 @@ async function checkSidebarSlide(page: Page, mobile: boolean, opening: boolean):
   assert(result.durations.length >= (mobile ? 1 : 2), `missing sidebar motion: ${JSON.stringify({ mobile, opening, result })}`);
   assert(result.durations.every((duration) => duration === 220));
   const { before, middle, after } = result;
+  for (const sample of [before, middle, after]) {
+    assert(Math.abs(sample.pinLeft - 8) <= 1, "Pin must stay at the sidebar's left edge");
+    assert(Math.abs(sample.pinBottom - 16) <= 1, "Pin must stay at the sidebar's bottom edge");
+  }
   assert(opening ? before.x < middle.x && middle.x < after.x : before.x > middle.x && middle.x > after.x,
     `sidebar must slide horizontally through an intermediate position: ${JSON.stringify(result)}`);
   assertEquals(before.width, after.width, "sidebar contents must slide without reflowing");
