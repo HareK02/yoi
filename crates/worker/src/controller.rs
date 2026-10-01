@@ -1242,6 +1242,18 @@ where
             ),
         );
     }
+    let memory_profile = &worker.manifest().feature.memory.profile;
+    let subjektiv_profile = &worker.manifest().feature.subjektiv.profile;
+    if memory_profile.enabled
+        && memory_profile.extraction.enabled
+        && subjektiv_profile.enabled
+        && subjektiv_profile.extraction.enabled
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Workspace Memory and subjektiv automatic extraction cannot both be enabled for one Worker",
+        ));
+    }
     let memory_install_plan = crate::feature::builtin::memory::MemoryFeatureInstallPlan::prepare(
         worker.manifest(),
         worker.workspace_client_handle(),
@@ -1275,6 +1287,22 @@ where
             )?
     {
         feature_registry.add_module(memory_lifecycle);
+    }
+    if let Some(subjektiv_lifecycle) =
+        crate::feature::builtin::memory_lifecycle::SubjektivLifecycleFeature::from_resolved_config(
+            worker.manifest_lifecycle_features_enabled(),
+            worker.manifest().feature.subjektiv.clone(),
+            worker.committed_session_capture_handle(),
+            worker.session_extension_handle(),
+            worker.workspace_client_handle(),
+            spawner_manifest.clone(),
+            worker.llm_client_handle(),
+            prompts.clone(),
+            spawner_workspace_context.clone(),
+            worker.working_event_sender(),
+        )?
+    {
+        feature_registry.add_module(subjektiv_lifecycle);
     }
     if sub_worker_enabled && !worker_enabled {
         feature_registry.add_module(

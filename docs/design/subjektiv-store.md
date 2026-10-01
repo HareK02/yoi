@@ -19,14 +19,17 @@ cutover of the existing Workspace Memory authority.
   Async callers must run these synchronous repository calls on a blocking
   executor.
 - The store contains no `current_worker_id` or equivalent current link. Yoi's
-  keyed singleton remains the sole authority for the current Worker. Historical
-  Worker/Session attribution is provenance and will be connected separately.
+  keyed singleton remains the sole authority for the current Worker. T-668
+  connects Workers using the opaque `subjektiv:<subject-id>` key and records
+  immutable historical Worker/Session attribution as provenance; that history is
+  never consulted as a current Worker link.
 
 Registration is deliberately separate from open. Trusted Server construction
 registers `REGISTRATION` once per `FeatureStorage` manager, then reuses its
 `RegisteredFeature` for each Workspace. Merely adding this module does not open
-or create a subjektiv database; product enablement and old-Memory cutover are
-later work.
+or create a subjektiv database. T-668 opens it lazily for explicit subject
+operations or an authenticated subject extraction write; leaving the Feature
+disabled has no subject-store side effect.
 
 ## Versioned records
 
@@ -120,3 +123,39 @@ online backup/restore includes the entire subjektiv database, including immutabl
 history and provenance. Workspace deletion and shutdown use the common lifecycle
 fences and close retained repository handles. Disabling subjektiv does not erase
 its database.
+
+## Extraction connection (T-668)
+
+`feature.subjektiv` is an explicit Worker profile boundary. It reuses the
+committed-run threshold, restricted Internal extraction Worker,
+`SessionEntryRef` evidence resolution, explicit finish, generation fence, and
+success-only pointer progression from the established Memory lifecycle. Its
+pointer domain is separate from legacy Workspace Memory, and a Worker is rejected
+at installation when both automatic extraction destinations are enabled. Ordinary
+SubWorkers and Reviewer SubWorkers have lifecycle Features disabled by their host;
+only evidence actually committed into the parent Session can enter the parent's
+capture.
+
+The staging request contains the existing model contract (`kind`, `claim`,
+`why_useful`, optional `staleness`, and entry references after host resolution)
+plus the committed parent `session_id`. It contains no subject id. The Server
+derives subject scope from authenticated Runtime/Worker source proof and the
+current keyed-singleton lease, then attaches the session id to every source
+reference and records immutable historical `{subject, runtime, worker, session}`
+provenance atomically with staging. A Session already attributed to another
+subject is rejected. Preference candidates still require exclusively HumanInput
+evidence.
+
+Subject retirement does not stop a Worker, and stopping/replacing a Worker does
+not retire the subject. A replacement uses the same `subjektiv:<subject-id>` key;
+retries therefore recover through Yoi's singleton authority without a second
+current-worker mapping in this database.
+
+Candidates are immutable writes that occur before `FinishMemoryExtraction`. If a
+run stages one or more candidates and then fails, is cancelled, or loses its
+generation fence, those candidates remain recorded and the extraction pointer
+does not advance. A retry may therefore produce semantically duplicate candidates;
+subsequent consolidation must compare them using the existing candidate
+identity/content boundary. The system must not claim that the partial writes were
+rolled back or silently delete them. Subject recall, consolidation, and legacy
+Memory migration remain separate work.

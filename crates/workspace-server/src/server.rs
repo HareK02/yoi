@@ -1388,6 +1388,7 @@ pub struct WorkspaceApi {
     config_schema_registry: crate::config_source::WorkspaceConfigSchemaRegistry,
     prompt_projection_cache: crate::prompt_settings::WorkspacePromptProjectionCache,
     feature_storage: crate::WorkspaceFeatureStorage,
+    subjektiv_registration: crate::RegisteredFeature,
     authority: SqliteWorkspaceAuthority,
     _worker_projection_shutdown: Arc<WorkerProjectionShutdownGuard>,
     runtime: Arc<RuntimeRegistry>,
@@ -3215,6 +3216,10 @@ impl WorkspaceApi {
             .map_err(|error| {
                 Error::Store(format!("failed to initialize Feature storage: {error}"))
             })?;
+        let subjektiv_registration = crate::subjektiv::SubjektivStore::register(&feature_storage)
+            .map_err(|error| {
+            Error::Store(format!("failed to register subjektiv storage: {error}"))
+        })?;
         let api = Self {
             config_store,
             repository_secrets,
@@ -3223,6 +3228,7 @@ impl WorkspaceApi {
             prompt_projection_cache:
                 crate::prompt_settings::WorkspacePromptProjectionCache::default(),
             feature_storage,
+            subjektiv_registration,
             authority: SqliteWorkspaceAuthority::new(
                 config.database_path.clone(),
                 config.workspace_id.clone(),
@@ -5432,6 +5438,24 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::memory_consolidation(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::subjektiv_subject_create(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::subjektiv_subject_get(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::subjektiv_subject_retire(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::subjektiv_subject_worker_start(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::subjektiv_stage_candidate(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::subjektiv_record_session(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::skill_list(service.clone()))
         .merge(server_api::server_api_axum::skill_lint(service.clone()))
         .merge(server_api::server_api_axum::skill_get(service.clone()))
@@ -7003,6 +7027,119 @@ impl server_api::ServerApi for ServerApiContractService {
             candidate_count: response.candidate_count,
             total_bytes: response.total_bytes,
         })
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn subjektiv_subject_create(
+        &self,
+        workspace_id: String,
+        request: server_api::SubjektivSubjectCreateRequest,
+    ) -> std::result::Result<server_api::SubjektivSubjectResponse, server_api::RepositoryApiError>
+    {
+        scoped_create_subjektiv_subject(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Json(request),
+        )
+        .await
+        .map(|(_, Json(response))| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn subjektiv_subject_get(
+        &self,
+        workspace_id: String,
+        subject_id: String,
+    ) -> std::result::Result<server_api::SubjektivSubjectResponse, server_api::RepositoryApiError>
+    {
+        scoped_get_subjektiv_subject(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedSubjektivSubjectPath {
+                workspace_id,
+                subject_id,
+            }),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn subjektiv_subject_retire(
+        &self,
+        workspace_id: String,
+        subject_id: String,
+    ) -> std::result::Result<server_api::SubjektivSubjectResponse, server_api::RepositoryApiError>
+    {
+        scoped_retire_subjektiv_subject(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedSubjektivSubjectPath {
+                workspace_id,
+                subject_id,
+            }),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn subjektiv_subject_worker_start(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        subject_id: String,
+        request: server_api::SubjektivSubjectWorkerStartRequest,
+    ) -> std::result::Result<BrowserCreateWorkerResponse, server_api::RepositoryApiError> {
+        scoped_start_subjektiv_subject_worker(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedSubjektivSubjectPath {
+                workspace_id,
+                subject_id,
+            }),
+            contract_request_headers(&context)?,
+            Json(request),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn subjektiv_stage_candidate(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::SubjektivStageCandidateRequest,
+    ) -> std::result::Result<
+        server_api::SubjektivStageCandidateResponse,
+        server_api::RepositoryApiError,
+    > {
+        scoped_stage_subjektiv_candidate(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            context,
+            Json(request),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn subjektiv_record_session(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::SubjektivRecordSessionRequest,
+    ) -> std::result::Result<
+        server_api::SubjektivRecordSessionResponse,
+        server_api::RepositoryApiError,
+    > {
+        scoped_record_subjektiv_session(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            context,
+            Json(request),
+        )
+        .await
+        .map(|Json(response)| response)
         .map_err(ApiError::into_repository_api_error)
     }
 
@@ -10215,6 +10352,12 @@ struct TranscriptQuery {
 #[derive(Debug, Clone, Deserialize)]
 struct ScopedWorkspacePath {
     workspace_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ScopedSubjektivSubjectPath {
+    workspace_id: String,
+    subject_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -16350,6 +16493,255 @@ async fn scoped_memory_backend_operation(
         },
     };
     Ok(Json(response))
+}
+
+const SUBJEKTIV_SINGLETON_PREFIX: &str = "subjektiv:";
+
+fn open_subjektiv_store(api: &WorkspaceApi) -> ApiResult<crate::subjektiv::SubjektivStore> {
+    crate::subjektiv::SubjektivStore::open(&api.feature_storage, &api.subjektiv_registration)
+        .map_err(|error| ApiError::from(Error::Store(error.to_string())))
+}
+
+fn subjektiv_subject_id_from_singleton_key(key: &str) -> ApiResult<&str> {
+    key.strip_prefix(SUBJEKTIV_SINGLETON_PREFIX)
+        .filter(|subject_id| {
+            !subject_id.is_empty()
+                && !subject_id.chars().any(char::is_control)
+                && subject_id.trim() == *subject_id
+        })
+        .ok_or_else(|| {
+            Error::WorkspacePermissionDenied(
+                "current Worker is not connected to a subjektiv subject".to_string(),
+            )
+            .into()
+        })
+}
+
+fn subjektiv_singleton_key(subject_id: &str) -> ApiResult<String> {
+    if subject_id.trim().is_empty() || subject_id.chars().any(char::is_control) {
+        return Err(Error::InvalidInput("subjektiv subject id is invalid".to_string()).into());
+    }
+    let key = format!("{SUBJEKTIV_SINGLETON_PREFIX}{subject_id}");
+    crate::store::validate_worker_singleton_key(&key)?;
+    Ok(key)
+}
+
+fn subjektiv_session_attribution(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    context: &server_api::ServerRequestContext,
+    session_id: &str,
+) -> ApiResult<crate::subjektiv::SubjectSessionAttribution> {
+    let source = context.runtime_source.as_ref().ok_or_else(|| {
+        Error::WorkspacePermissionDenied(
+            "subjektiv extraction requires authenticated Runtime-owned source authority"
+                .to_string(),
+        )
+    })?;
+    let worker_id = source.worker_id.as_deref().ok_or_else(|| {
+        Error::WorkspacePermissionDenied(
+            "subjektiv extraction requires Runtime-bound Worker identity".to_string(),
+        )
+    })?;
+    let worker = RuntimeWorkerRef::new(&source.runtime_id, worker_id);
+    let lease = api
+        .store
+        .require_current_worker_singleton_owner(workspace_id, &worker)?
+        .ok_or_else(|| {
+            Error::WorkspacePermissionDenied(
+                "current Worker has no keyed singleton ownership".to_string(),
+            )
+        })?;
+    let subject_id = subjektiv_subject_id_from_singleton_key(&lease.key)?;
+    let session_id = session_id.trim();
+    if session_id.is_empty() || session_id.chars().any(char::is_control) {
+        return Err(Error::InvalidInput("committed session_id is invalid".to_string()).into());
+    }
+    crate::subjektiv::SubjectSessionAttribution::new(
+        subject_id,
+        worker.runtime_id,
+        worker.worker_id,
+        session_id,
+    )
+    .map_err(|error| Error::InvalidInput(error.to_string()).into())
+}
+
+fn subjektiv_subject_response(
+    api: &WorkspaceApi,
+    subject: crate::subjektiv::SubjectRecord,
+) -> server_api::SubjektivSubjectResponse {
+    let current_worker = subjektiv_singleton_key(&subject.id)
+        .ok()
+        .and_then(|key| {
+            api.store
+                .current_worker_singleton_owner(&api.config.workspace_id, &key)
+                .ok()
+                .flatten()
+        })
+        .and_then(|lease| api.runtime.worker(&lease.worker).ok())
+        .map(worker_launch_worker_summary);
+    server_api::SubjektivSubjectResponse {
+        id: subject.id,
+        role: subject.role.as_str().to_string(),
+        state: match subject.state {
+            crate::subjektiv::SubjectState::Active => server_api::SubjektivSubjectState::Active,
+            crate::subjektiv::SubjectState::Retired => server_api::SubjektivSubjectState::Retired,
+        },
+        store_revision: subject.store_revision,
+        created_at: subject.created_at,
+        updated_at: subject.updated_at,
+        current_worker,
+    }
+}
+
+async fn scoped_create_subjektiv_subject(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Json(request): Json<server_api::SubjektivSubjectCreateRequest>,
+) -> ApiResult<(StatusCode, Json<server_api::SubjektivSubjectResponse>)> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let role = crate::subjektiv::SubjectRole::new(request.role)
+        .map_err(|error| Error::InvalidInput(error.to_string()))?;
+    let subject = open_subjektiv_store(&api)?
+        .create_subject(role)
+        .map_err(|error| Error::Store(error.to_string()))?;
+    Ok((
+        StatusCode::CREATED,
+        Json(subjektiv_subject_response(&api, subject)),
+    ))
+}
+
+async fn scoped_get_subjektiv_subject(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedSubjektivSubjectPath>,
+) -> ApiResult<Json<server_api::SubjektivSubjectResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let subject = open_subjektiv_store(&api)?
+        .subject(&path.subject_id)
+        .map_err(|error| Error::Store(error.to_string()))?
+        .ok_or_else(|| {
+            Error::InvalidInput(format!("unknown subjektiv subject `{}`", path.subject_id))
+        })?;
+    Ok(Json(subjektiv_subject_response(&api, subject)))
+}
+
+async fn scoped_retire_subjektiv_subject(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedSubjektivSubjectPath>,
+) -> ApiResult<Json<server_api::SubjektivSubjectResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let subject = open_subjektiv_store(&api)?
+        .retire_subject(&path.subject_id)
+        .map_err(|error| Error::InvalidInput(error.to_string()))?;
+    // Retirement deliberately does not stop or remove the current Worker. The
+    // Worker lease and subject lifecycle are independent authorities.
+    Ok(Json(subjektiv_subject_response(&api, subject)))
+}
+
+async fn scoped_start_subjektiv_subject_worker(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedSubjektivSubjectPath>,
+    headers: HeaderMap,
+    Json(request): Json<server_api::SubjektivSubjectWorkerStartRequest>,
+) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let subject = open_subjektiv_store(&api)?
+        .subject(&path.subject_id)
+        .map_err(|error| Error::Store(error.to_string()))?
+        .ok_or_else(|| {
+            Error::InvalidInput(format!("unknown subjektiv subject `{}`", path.subject_id))
+        })?;
+    if subject.state != crate::subjektiv::SubjectState::Active {
+        return Err(Error::InvalidInput(format!(
+            "subjektiv subject `{}` is retired",
+            path.subject_id
+        ))
+        .into());
+    }
+    let mut worker = request.worker;
+    if worker.singleton_key.is_some() {
+        return Err(Error::InvalidInput(
+            "subjektiv subject Worker start owns singleton selection; singleton_key must be omitted"
+                .to_string(),
+        )
+        .into());
+    }
+    worker.singleton_key = Some(subjektiv_singleton_key(&path.subject_id)?);
+    create_workspace_worker(State(api), headers, Json(worker)).await
+}
+
+async fn scoped_stage_subjektiv_candidate(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    context: server_api::ServerRequestContext,
+    Json(mut request): Json<server_api::SubjektivStageCandidateRequest>,
+) -> ApiResult<Json<server_api::SubjektivStageCandidateResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let attribution =
+        subjektiv_session_attribution(&api, &path.workspace_id, &context, &request.session_id)?;
+    let subject_id = attribution.subject_id.clone();
+    let session_id = attribution.session_id.as_str();
+    for source_ref in &mut request.operation.source_refs {
+        if source_ref
+            .session_id
+            .as_deref()
+            .is_some_and(|value| value != session_id)
+        {
+            return Err(Error::InvalidInput(
+                "candidate source_ref belongs to a different Session".to_string(),
+            )
+            .into());
+        }
+        source_ref.session_id = Some(session_id.to_string());
+    }
+    if matches!(
+        request.operation.candidate.kind,
+        memory::extract::CandidateKind::Preference
+    ) && request.operation.evidence.iter().any(|evidence| {
+        !matches!(
+            evidence.origin.as_ref().map(|origin| &origin.kind),
+            Some(memory::schema::EvidenceOriginKind::HumanInput)
+        )
+    }) {
+        return Err(Error::InvalidInput(
+            "preference candidates require exclusively HumanInput evidence".to_string(),
+        )
+        .into());
+    }
+    let candidate_id = Uuid::now_v7().to_string();
+    let record = memory::extract::StagingRecord::from_candidate(
+        candidate_id,
+        request.operation.extract_run_id,
+        request.operation.source,
+        request.operation.candidate,
+        request.operation.evidence,
+        request.operation.source_refs,
+    );
+    let record = crate::subjektiv::SubjectStagingRecord::attach(&subject_id, record);
+    let (staged, _) = open_subjektiv_store(&api)?
+        .stage_candidate_with_attribution(record, attribution)
+        .map_err(|error| Error::InvalidInput(error.to_string()))?;
+    Ok(Json(server_api::SubjektivStageCandidateResponse {
+        staging_id: staged.id,
+    }))
+}
+
+async fn scoped_record_subjektiv_session(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    context: server_api::ServerRequestContext,
+    Json(request): Json<server_api::SubjektivRecordSessionRequest>,
+) -> ApiResult<Json<server_api::SubjektivRecordSessionResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let attribution =
+        subjektiv_session_attribution(&api, &path.workspace_id, &context, &request.session_id)?;
+    let attribution = open_subjektiv_store(&api)?
+        .record_session_attribution(attribution)
+        .map_err(|error| Error::InvalidInput(error.to_string()))?;
+    Ok(Json(server_api::SubjektivRecordSessionResponse {
+        subject_id: attribution.subject_id,
+        session_id: attribution.session_id,
+    }))
 }
 
 const MEMORY_CONSOLIDATION_PROFILE: &str = "memory-consolidation";
@@ -33524,6 +33916,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subjektiv_subject_worker_and_staging_derive_scope_from_singleton_authority() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let subject = open_subjektiv_store(&api)
+            .unwrap()
+            .create_subject(crate::subjektiv::SubjectRole::new("companion").unwrap())
+            .unwrap();
+        let request = server_api::SubjektivSubjectWorkerStartRequest {
+            worker: CreateWorkspaceWorkerRequest {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                display_name: "Subject Worker".to_string(),
+                singleton_key: None,
+                profile: Some("builtin:companion".to_string()),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachments: Vec::new(),
+                control_operation_id: None,
+            },
+        };
+        let Json(created) = scoped_start_subjektiv_subject_worker(
+            State(api.clone()),
+            AxumPath(ScopedSubjektivSubjectPath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                subject_id: subject.id.clone(),
+            }),
+            HeaderMap::new(),
+            Json(request),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            created.worker.singleton_key.as_deref(),
+            Some(format!("subjektiv:{}", subject.id).as_str())
+        );
+        let context = server_api::ServerRequestContext {
+            actor: None,
+            worker_source: None,
+            runtime_source: Some(server_api::ServerRuntimeSource {
+                runtime_id: created.runtime_id.clone(),
+                worker_id: Some(created.worker_id.clone()),
+            }),
+            origin: None,
+            transport_headers: Vec::new(),
+        };
+        let operation = memory::backend::MemoryStageCandidateOperation {
+            source: memory::schema::SourceRef {
+                segment_id: "segment-1".to_string(),
+                range: [0, 0],
+            },
+            extract_run_id: "extract-1".to_string(),
+            candidate: memory::extract::ExtractedCandidate {
+                kind: memory::extract::CandidateKind::Decision,
+                claim: "Keep subject scope host-derived".to_string(),
+                why_useful: "Prevents cross-subject writes".to_string(),
+                staleness: None,
+                evidence_ids: vec!["E00000000".to_string()],
+            },
+            evidence: vec![memory::extract::StagingEvidence {
+                id: "E00000000".to_string(),
+                kind: memory::schema::EvidenceKind::new(memory::schema::EvidenceKind::MESSAGE),
+                entry_range: Some([0, 0]),
+                origin: Some(memory::schema::EvidenceOrigin {
+                    kind: memory::schema::EvidenceOriginKind::HumanInput,
+                    account_id: None,
+                    workspace_id: None,
+                    runtime_id: None,
+                    worker_id: None,
+                    flow_selector: None,
+                    flow_definition_id: None,
+                    flow_definition_revision: None,
+                }),
+                excerpt: Some("Keep subject scope host-derived".to_string()),
+                summary: Some("Scope decision".to_string()),
+            }],
+            source_refs: vec![memory::schema::SourceEvidenceRef {
+                segment_id: Some("segment-1".to_string()),
+                entry_range: Some([0, 0]),
+                evidence_id: Some("E00000000".to_string()),
+                evidence_kind: Some(memory::schema::EvidenceKind::new(
+                    memory::schema::EvidenceKind::MESSAGE,
+                )),
+                ..Default::default()
+            }],
+        };
+        let Json(staged) = scoped_stage_subjektiv_candidate(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            context,
+            Json(server_api::SubjektivStageCandidateRequest {
+                session_id: "session-1".to_string(),
+                operation,
+            }),
+        )
+        .await
+        .unwrap();
+        let store = open_subjektiv_store(&api).unwrap();
+        let candidate = store
+            .staging_candidate(&subject.id, &staged.staging_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.subject_id, subject.id);
+        assert_eq!(
+            candidate.source_refs[0].session_id.as_deref(),
+            Some("session-1")
+        );
+        let attribution = store.session_attribution("session-1").unwrap().unwrap();
+        assert_eq!(attribution.subject_id, subject.id);
+        assert_eq!(attribution.worker_id, created.worker_id);
+    }
+
+    #[tokio::test]
     async fn singleton_retry_disconnect_replacement_and_restore_are_generation_fenced() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
@@ -48087,6 +48593,21 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
             String::from_utf8_lossy(&bytes)
         );
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn subjektiv_singleton_scope_is_explicit_and_opaque() {
+        assert_eq!(
+            subjektiv_subject_id_from_singleton_key("subjektiv:subject-42").unwrap(),
+            "subject-42"
+        );
+        assert!(subjektiv_subject_id_from_singleton_key("workspace-orchestrator").is_err());
+        assert!(subjektiv_subject_id_from_singleton_key("subjektiv:").is_err());
+        assert!(subjektiv_subject_id_from_singleton_key("subjektiv: subject-42").is_err());
+        assert_eq!(
+            subjektiv_singleton_key("subject-42").unwrap(),
+            "subjektiv:subject-42"
+        );
     }
 
     fn write_ticket(

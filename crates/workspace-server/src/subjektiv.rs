@@ -41,6 +41,16 @@ pub enum SubjektivError {
     CandidateConflict(String),
     #[error("staging candidate `{0}` is already resolved")]
     CandidateResolved(String),
+    #[error(
+        "session `{session_id}` is already attributed to subject `{existing_subject_id}` and cannot be attributed to `{requested_subject_id}`"
+    )]
+    SessionSubjectConflict {
+        session_id: String,
+        existing_subject_id: String,
+        requested_subject_id: String,
+    },
+    #[error("session `{0}` already has different historical attribution")]
+    SessionAttributionConflict(String),
     #[error("memory `{0}` was not found for this subject")]
     MemoryNotFound(String),
     #[error("memory `{memory_id}` revision conflict: expected {expected}, current {actual}")]
@@ -115,6 +125,40 @@ pub struct SubjectRecord {
     pub store_revision: u64,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Immutable host-recorded history that attributes one durable Session to the
+/// subject and Worker that produced it. This is archival provenance only: it is
+/// deliberately not a current-Worker link or execution ownership record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubjectSessionAttribution {
+    pub schema_version: u32,
+    pub subject_id: String,
+    pub runtime_id: String,
+    pub worker_id: String,
+    pub session_id: String,
+    pub attributed_at: String,
+}
+
+impl SubjectSessionAttribution {
+    pub fn new(
+        subject_id: impl Into<String>,
+        runtime_id: impl Into<String>,
+        worker_id: impl Into<String>,
+        session_id: impl Into<String>,
+    ) -> Result<Self> {
+        let record = Self {
+            schema_version: SUBJEKTIV_SCHEMA_VERSION,
+            subject_id: subject_id.into(),
+            runtime_id: runtime_id.into(),
+            worker_id: worker_id.into(),
+            session_id: session_id.into(),
+            attributed_at: now(),
+        };
+        validate_session_attribution(&record)?;
+        Ok(record)
+    }
 }
 
 /// The existing extraction schema with only host-owned subject scope and
@@ -602,11 +646,45 @@ END;
     Ok(())
 }
 
-static MIGRATIONS: &[FeatureMigration] = &[FeatureMigration::new(
-    1,
-    "create subjektiv subject memory store",
-    create_schema,
-)];
+fn add_subject_session_attribution(
+    transaction: &Transaction<'_>,
+) -> crate::feature_storage::Result<()> {
+    transaction.execute_batch(
+        r#"
+CREATE TABLE subject_session_attributions (
+    session_id TEXT PRIMARY KEY,
+    subject_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    record_json TEXT NOT NULL,
+    attributed_at TEXT NOT NULL,
+    FOREIGN KEY (subject_id) REFERENCES subjects(subject_id) ON DELETE RESTRICT
+);
+
+CREATE INDEX subject_session_attributions_by_subject
+ON subject_session_attributions(subject_id, attributed_at, session_id);
+
+CREATE TRIGGER subject_session_attributions_no_update
+BEFORE UPDATE ON subject_session_attributions BEGIN
+    SELECT RAISE(ABORT, 'subjektiv session attribution is immutable');
+END;
+CREATE TRIGGER subject_session_attributions_no_delete
+BEFORE DELETE ON subject_session_attributions BEGIN
+    SELECT RAISE(ABORT, 'subjektiv session attribution is retained');
+END;
+"#,
+    )?;
+    Ok(())
+}
+
+static MIGRATIONS: &[FeatureMigration] = &[
+    FeatureMigration::new(1, "create subjektiv subject memory store", create_schema),
+    FeatureMigration::new(
+        2,
+        "add immutable subject session attribution",
+        add_subject_session_attribution,
+    ),
+];
 
 pub const REGISTRATION: FeatureRegistration =
     FeatureRegistration::new(SUBJEKTIV_FEATURE_ID, MIGRATIONS);
@@ -740,33 +818,89 @@ impl SubjektivStore {
         let raw = serde_json::to_string(&record)?;
         self.database.try_transaction(|transaction| {
             require_active_subject(transaction, &record.subject_id)?;
-            let existing = transaction
+            write_staging_candidate(transaction, self.workspace_id(), record, raw)
+        })
+    }
+
+    /// Atomically records immutable host attribution for the committed Session
+    /// and stages its extracted candidate. Exact retries return the first stored
+    /// records, including their original host timestamps.
+    pub fn stage_candidate_with_attribution(
+        &self,
+        mut record: SubjectStagingRecord,
+        attribution: SubjectSessionAttribution,
+    ) -> Result<(SubjectStagingRecord, SubjectSessionAttribution)> {
+        validate_session_attribution(&attribution)?;
+        if record.subject_id != attribution.subject_id {
+            return Err(SubjektivError::SubjectScopeMismatch {
+                subject_id: record.subject_id,
+                reference: format!(
+                    "session {} is attributed to subject {}",
+                    attribution.session_id, attribution.subject_id
+                ),
+            });
+        }
+        attach_session_to_candidate(&mut record, &attribution.session_id)?;
+        validate_staging_record(self.workspace_id(), &record)?;
+        let candidate_raw = serde_json::to_string(&record)?;
+        let attribution_raw = serde_json::to_string(&attribution)?;
+
+        self.database.try_transaction(|transaction| {
+            require_active_subject(transaction, &record.subject_id)?;
+            let attribution = write_session_attribution(transaction, attribution, attribution_raw)?;
+            let candidate =
+                write_staging_candidate(transaction, self.workspace_id(), record, candidate_raw)?;
+            Ok((candidate, attribution))
+        })
+    }
+
+    pub fn record_session_attribution(
+        &self,
+        attribution: SubjectSessionAttribution,
+    ) -> Result<SubjectSessionAttribution> {
+        validate_session_attribution(&attribution)?;
+        let raw = serde_json::to_string(&attribution)?;
+        self.database.try_transaction(|transaction| {
+            require_active_subject(transaction, &attribution.subject_id)?;
+            write_session_attribution(transaction, attribution, raw)
+        })
+    }
+
+    pub fn session_attribution(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SubjectSessionAttribution>> {
+        validate_label("session id", session_id)?;
+        self.database.try_with_connection(|connection| {
+            let raw = connection
                 .query_row(
-                    "SELECT record_json FROM staging_records
-                     WHERE subject_id = ?1 AND candidate_id = ?2",
-                    params![record.subject_id, record.id],
+                    "SELECT record_json FROM subject_session_attributions
+                     WHERE session_id = ?1",
+                    [session_id],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?;
-            if let Some(existing) = existing {
-                if equivalent_staging_payload(&existing, &raw)? {
-                    return parse_staging(self.workspace_id(), &existing);
-                }
-                return Err(SubjektivError::CandidateConflict(record.id.clone()));
-            }
-            transaction.execute(
-                "INSERT INTO staging_records (
-                    subject_id, candidate_id, kind, record_json, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    record.subject_id,
-                    record.id,
-                    candidate_kind_name(&record.kind),
-                    raw,
-                    record.created_at
-                ],
+            raw.map(|raw| parse_session_attribution(&raw)).transpose()
+        })
+    }
+
+    pub fn subject_session_attributions(
+        &self,
+        subject_id: &str,
+    ) -> Result<Vec<SubjectSessionAttribution>> {
+        validate_label("subject id", subject_id)?;
+        self.database.try_with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT record_json FROM subject_session_attributions
+                 WHERE subject_id = ?1
+                 ORDER BY attributed_at ASC, session_id ASC",
             )?;
-            Ok(record)
+            let rows = statement.query_map([subject_id], |row| row.get::<_, String>(0))?;
+            let mut records = Vec::new();
+            for row in rows {
+                records.push(parse_session_attribution(&row?)?);
+            }
+            Ok(records)
         })
     }
 
@@ -1228,6 +1362,85 @@ fn write_memory_revision(
     Ok(record)
 }
 
+fn write_staging_candidate(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    record: SubjectStagingRecord,
+    raw: String,
+) -> Result<SubjectStagingRecord> {
+    let existing = transaction
+        .query_row(
+            "SELECT record_json FROM staging_records
+             WHERE subject_id = ?1 AND candidate_id = ?2",
+            params![record.subject_id, record.id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        if equivalent_staging_payload(&existing, &raw)? {
+            return parse_staging(workspace_id, &existing);
+        }
+        return Err(SubjektivError::CandidateConflict(record.id.clone()));
+    }
+    transaction.execute(
+        "INSERT INTO staging_records (
+            subject_id, candidate_id, kind, record_json, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            record.subject_id,
+            record.id,
+            candidate_kind_name(&record.kind),
+            raw,
+            record.created_at
+        ],
+    )?;
+    Ok(record)
+}
+
+fn write_session_attribution(
+    transaction: &Transaction<'_>,
+    record: SubjectSessionAttribution,
+    raw: String,
+) -> Result<SubjectSessionAttribution> {
+    let existing = transaction
+        .query_row(
+            "SELECT record_json FROM subject_session_attributions WHERE session_id = ?1",
+            [&record.session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        let existing = parse_session_attribution(&existing)?;
+        if existing.subject_id != record.subject_id {
+            return Err(SubjektivError::SessionSubjectConflict {
+                session_id: record.session_id,
+                existing_subject_id: existing.subject_id,
+                requested_subject_id: record.subject_id,
+            });
+        }
+        if equivalent_session_attribution(&existing, &record) {
+            return Ok(existing);
+        }
+        return Err(SubjektivError::SessionAttributionConflict(
+            record.session_id,
+        ));
+    }
+    transaction.execute(
+        "INSERT INTO subject_session_attributions (
+            session_id, subject_id, runtime_id, worker_id, record_json, attributed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            record.session_id,
+            record.subject_id,
+            record.runtime_id,
+            record.worker_id,
+            raw,
+            record.attributed_at
+        ],
+    )?;
+    Ok(record)
+}
+
 fn insert_resolution(
     transaction: &Transaction<'_>,
     subject_id: &str,
@@ -1436,6 +1649,48 @@ fn validate_memory_refs(
     Ok(())
 }
 
+fn validate_session_attribution(record: &SubjectSessionAttribution) -> Result<()> {
+    validate_schema_version(record.schema_version, "subject Session attribution")?;
+    validate_label("subject id", &record.subject_id)?;
+    validate_label("runtime id", &record.runtime_id)?;
+    validate_label("worker id", &record.worker_id)?;
+    validate_label("session id", &record.session_id)?;
+    validate_label("Session attribution timestamp", &record.attributed_at)?;
+    chrono::DateTime::parse_from_rfc3339(&record.attributed_at).map_err(|error| {
+        SubjektivError::InvalidRecord(format!(
+            "Session attribution timestamp is not RFC 3339: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn attach_session_to_candidate(record: &mut SubjectStagingRecord, session_id: &str) -> Result<()> {
+    if record.source_refs.is_empty() {
+        record.source_refs.push(SourceEvidenceRef {
+            session_id: Some(session_id.to_string()),
+            segment_id: Some(record.source.segment_id.clone()),
+            entry_range: Some(record.source.range),
+            ..SourceEvidenceRef::default()
+        });
+        return Ok(());
+    }
+    for source in &mut record.source_refs {
+        match source.session_id.as_deref() {
+            Some(existing) if existing != session_id => {
+                return Err(SubjektivError::SubjectScopeMismatch {
+                    subject_id: record.subject_id.clone(),
+                    reference: format!(
+                        "candidate source Session `{existing}` does not match attributed Session `{session_id}`"
+                    ),
+                });
+            }
+            Some(_) => {}
+            None => source.session_id = Some(session_id.to_string()),
+        }
+    }
+    Ok(())
+}
+
 fn validate_staging_record(workspace_id: &str, record: &SubjectStagingRecord) -> Result<()> {
     if record.schema_version != STAGING_SCHEMA_VERSION {
         return Err(SubjektivError::InvalidRecord(format!(
@@ -1450,6 +1705,18 @@ fn validate_staging_record(workspace_id: &str, record: &SubjectStagingRecord) ->
     validate_nonempty("candidate claim", &record.claim)?;
     validate_nonempty("candidate why_useful", &record.why_useful)?;
     validate_range("candidate source", record.source.range)?;
+    if matches!(record.kind, CandidateKind::Preference)
+        && record.evidence.iter().any(|evidence| {
+            !matches!(
+                evidence.origin.as_ref().map(|origin| &origin.kind),
+                Some(memory::schema::EvidenceOriginKind::HumanInput)
+            )
+        })
+    {
+        return Err(SubjektivError::InvalidRecord(
+            "preference candidates require exclusively HumanInput evidence".to_string(),
+        ));
+    }
 
     let mut evidence_ids = HashSet::new();
     for evidence in &record.evidence {
@@ -1552,6 +1819,17 @@ fn parse_subject(raw: &str) -> Result<SubjectRecord> {
     Ok(record)
 }
 
+fn equivalent_session_attribution(
+    left: &SubjectSessionAttribution,
+    right: &SubjectSessionAttribution,
+) -> bool {
+    left.schema_version == right.schema_version
+        && left.subject_id == right.subject_id
+        && left.runtime_id == right.runtime_id
+        && left.worker_id == right.worker_id
+        && left.session_id == right.session_id
+}
+
 fn equivalent_staging_payload(left: &str, right: &str) -> Result<bool> {
     let mut left = serde_json::from_str::<serde_json::Value>(left)?;
     let mut right = serde_json::from_str::<serde_json::Value>(right)?;
@@ -1567,6 +1845,12 @@ fn equivalent_staging_payload(left: &str, right: &str) -> Result<bool> {
     left_object.remove("created_at");
     right_object.remove("created_at");
     Ok(left == right)
+}
+
+fn parse_session_attribution(raw: &str) -> Result<SubjectSessionAttribution> {
+    let record: SubjectSessionAttribution = serde_json::from_str(raw)?;
+    validate_session_attribution(&record)?;
+    Ok(record)
 }
 
 fn parse_staging(workspace_id: &str, raw: &str) -> Result<SubjectStagingRecord> {
@@ -1736,6 +2020,12 @@ mod tests {
     use super::*;
     use crate::FeatureStorage;
 
+    static V1_MIGRATIONS: &[FeatureMigration] = &[FeatureMigration::new(
+        1,
+        "create subjektiv subject memory store",
+        create_schema,
+    )];
+
     fn role() -> SubjectRole {
         SubjectRole::new("workspace_companion").unwrap()
     }
@@ -1785,6 +2075,19 @@ mod tests {
             }],
         );
         SubjectStagingRecord::attach_at(subject_id, record, "2026-09-28T10:00:00.000Z".into())
+    }
+
+    fn attribution(
+        subject_id: &str,
+        runtime_id: &str,
+        worker_id: &str,
+        session_id: &str,
+        attributed_at: &str,
+    ) -> SubjectSessionAttribution {
+        let mut record =
+            SubjectSessionAttribution::new(subject_id, runtime_id, worker_id, session_id).unwrap();
+        record.attributed_at = attributed_at.to_string();
+        record
     }
 
     fn draft(claim: &str, reason: &str) -> MemoryDraft {
@@ -1852,10 +2155,215 @@ mod tests {
     }
 
     #[test]
+    fn v1_store_migrates_before_attributed_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("storage");
+        let subject_id = {
+            let manager = FeatureStorage::new(&root);
+            let workspace = manager.workspace("workspace-a").unwrap();
+            let registration = workspace
+                .register(FeatureRegistration::new(
+                    SUBJEKTIV_FEATURE_ID,
+                    V1_MIGRATIONS,
+                ))
+                .unwrap();
+            let store = SubjektivStore::open(&workspace, &registration).unwrap();
+            store.create_subject(role()).unwrap().id
+        };
+
+        let (_manager, _workspace, store) = open_store(&root, "workspace-a");
+        let (staged, stored_attribution) = store
+            .stage_candidate_with_attribution(
+                candidate(&subject_id, "candidate-after-migration", "workspace-a"),
+                attribution(
+                    &subject_id,
+                    "runtime-1",
+                    "worker-1",
+                    "session-1",
+                    "2026-09-28T10:00:00.000Z",
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(staged.subject_id, subject_id);
+        assert_eq!(stored_attribution.session_id, "session-1");
+        assert_eq!(
+            store.session_attribution("session-1").unwrap().unwrap(),
+            stored_attribution
+        );
+    }
+
+    #[test]
+    fn attributed_staging_is_atomic_and_retry_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_manager, _workspace, store) = open_store(&temp.path().join("storage"), "workspace-a");
+        let subject = store.create_subject(role()).unwrap();
+        let first_attribution = attribution(
+            &subject.id,
+            "runtime-1",
+            "worker-1",
+            "session-1",
+            "2026-09-28T10:00:00.000Z",
+        );
+        let (first_candidate, first_attribution) = store
+            .stage_candidate_with_attribution(
+                candidate(&subject.id, "candidate-1", "workspace-a"),
+                first_attribution,
+            )
+            .unwrap();
+
+        let mut retried_candidate = first_candidate.clone();
+        retried_candidate.created_at = "2026-09-28T11:00:00.000Z".into();
+        let retried_attribution = attribution(
+            &subject.id,
+            "runtime-1",
+            "worker-1",
+            "session-1",
+            "2026-09-28T11:00:00.000Z",
+        );
+        let (retried_candidate, retried_attribution) = store
+            .stage_candidate_with_attribution(retried_candidate, retried_attribution)
+            .unwrap();
+        assert_eq!(retried_candidate.created_at, first_candidate.created_at);
+        assert_eq!(retried_attribution, first_attribution);
+
+        let mut conflicting_candidate = candidate(&subject.id, "candidate-1", "workspace-a");
+        conflicting_candidate.claim = "different content".into();
+        conflicting_candidate.source_refs[0].session_id = Some("session-2".into());
+        let result = store.stage_candidate_with_attribution(
+            conflicting_candidate,
+            attribution(
+                &subject.id,
+                "runtime-1",
+                "worker-1",
+                "session-2",
+                "2026-09-28T12:00:00.000Z",
+            ),
+        );
+        assert!(matches!(
+            result,
+            Err(SubjektivError::CandidateConflict(candidate_id))
+                if candidate_id == "candidate-1"
+        ));
+        assert!(store.session_attribution("session-2").unwrap().is_none());
+    }
+
+    #[test]
+    fn worker_replacement_preserves_subject_history_and_rejects_cross_subject_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_manager, _workspace, store) = open_store(&temp.path().join("storage"), "workspace-a");
+        let subject = store.create_subject(role()).unwrap();
+        let other_subject = store.create_subject(role()).unwrap();
+
+        store
+            .stage_candidate_with_attribution(
+                candidate(&subject.id, "candidate-1", "workspace-a"),
+                attribution(
+                    &subject.id,
+                    "runtime-1",
+                    "worker-1",
+                    "session-1",
+                    "2026-09-28T10:00:00.000Z",
+                ),
+            )
+            .unwrap();
+        let mut replacement_candidate = candidate(&subject.id, "candidate-2", "workspace-a");
+        replacement_candidate.source_refs[0].session_id = None;
+        let (replacement_candidate, _) = store
+            .stage_candidate_with_attribution(
+                replacement_candidate,
+                attribution(
+                    &subject.id,
+                    "runtime-2",
+                    "worker-2",
+                    "session-2",
+                    "2026-09-28T11:00:00.000Z",
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            replacement_candidate.source_refs[0].session_id.as_deref(),
+            Some("session-2")
+        );
+
+        let history = store.subject_session_attributions(&subject.id).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].worker_id, "worker-1");
+        assert_eq!(history[1].worker_id, "worker-2");
+        assert!(history.iter().all(|entry| entry.subject_id == subject.id));
+
+        let update = store
+            .database
+            .try_with_connection::<_, SubjektivError>(|connection| {
+                connection.execute(
+                    "UPDATE subject_session_attributions SET worker_id = 'worker-other'
+                     WHERE session_id = 'session-1'",
+                    [],
+                )?;
+                Ok(())
+            });
+        assert!(update.is_err());
+        let delete = store
+            .database
+            .try_with_connection::<_, SubjektivError>(|connection| {
+                connection.execute(
+                    "DELETE FROM subject_session_attributions WHERE session_id = 'session-1'",
+                    [],
+                )?;
+                Ok(())
+            });
+        assert!(delete.is_err());
+
+        let mut foreign_candidate =
+            candidate(&other_subject.id, "candidate-foreign", "workspace-a");
+        foreign_candidate.source_refs[0].session_id = Some("session-1".into());
+        let result = store.stage_candidate_with_attribution(
+            foreign_candidate,
+            attribution(
+                &other_subject.id,
+                "runtime-1",
+                "worker-1",
+                "session-1",
+                "2026-09-28T12:00:00.000Z",
+            ),
+        );
+        assert!(matches!(
+            result,
+            Err(SubjektivError::SessionSubjectConflict {
+                session_id,
+                existing_subject_id,
+                requested_subject_id,
+            }) if session_id == "session-1"
+                && existing_subject_id == subject.id
+                && requested_subject_id == other_subject.id
+        ));
+        assert!(
+            store
+                .staging_candidate(&other_subject.id, "candidate-foreign")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn malformed_nested_provenance_is_rejected_without_staging() {
         let temp = tempfile::tempdir().unwrap();
         let (_manager, _workspace, store) = open_store(&temp.path().join("storage"), "workspace-a");
         let subject = store.create_subject(role()).unwrap();
+
+        let mut non_human_preference =
+            candidate(&subject.id, "candidate-preference", "workspace-a");
+        non_human_preference.kind = CandidateKind::Preference;
+        non_human_preference.evidence[0]
+            .origin
+            .as_mut()
+            .unwrap()
+            .kind = EvidenceOriginKind::ModelOutput;
+        assert!(matches!(
+            store.stage_candidate(non_human_preference),
+            Err(SubjektivError::InvalidRecord(message))
+                if message.contains("HumanInput")
+        ));
 
         let mut reversed = candidate(&subject.id, "candidate-reversed", "workspace-a");
         reversed.evidence[0].entry_range = Some([12, 10]);

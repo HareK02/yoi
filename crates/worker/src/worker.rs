@@ -624,6 +624,8 @@ pub enum WorkspaceServerOperation {
     },
     WorkerObservationSessions,
     WorkerObservationCapture(server_api::WorkerObservationSubjectRef),
+    SubjektivStageCandidate(server_api::SubjektivStageCandidateRequest),
+    SubjektivRecordSession(server_api::SubjektivRecordSessionRequest),
 }
 
 fn workspace_server_json_request<T: serde::Serialize>(
@@ -701,6 +703,12 @@ fn workspace_server_operation_request(
         ))),
         WorkspaceServerOperation::WorkerObservationCapture(request) => {
             workspace_server_json_request(format!("{base}/worker-observation/session"), &request)
+        }
+        WorkspaceServerOperation::SubjektivStageCandidate(request) => {
+            workspace_server_json_request(format!("{base}/subjektiv/staging"), &request)
+        }
+        WorkspaceServerOperation::SubjektivRecordSession(request) => {
+            workspace_server_json_request(format!("{base}/subjektiv/sessions"), &request)
         }
     }
 }

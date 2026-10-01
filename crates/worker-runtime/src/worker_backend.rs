@@ -960,14 +960,28 @@ fn bind_workspace_memory_settings(
             snapshot.workspace_id, workspace_api.workspace_id
         ));
     }
+    if manifest.feature.memory.profile.enabled {
+        manifest
+            .feature
+            .memory
+            .bind_workspace_settings(snapshot.clone())
+            .map_err(str::to_string)?;
+    }
+    if manifest.feature.subjektiv.profile.enabled {
+        manifest
+            .feature
+            .subjektiv
+            .bind_workspace_settings(snapshot.clone())
+            .map_err(str::to_string)?;
+    }
     manifest
         .feature
         .memory
-        .bind_workspace_settings(snapshot.clone())
+        .validate_execution()
         .map_err(str::to_string)?;
     manifest
         .feature
-        .memory
+        .subjektiv
         .validate_execution()
         .map_err(str::to_string)?;
     Ok(())
@@ -985,24 +999,35 @@ fn validate_worker_memory_settings(
         .memory
         .validate_execution()
         .map_err(str::to_string)?;
-    if !manifest.feature.memory.profile.enabled {
-        return Ok(());
-    }
-    let actual = manifest
+    manifest
         .feature
-        .memory
-        .workspace_settings()
-        .ok_or_else(|| {
-            "Workspace Worker restored without its bound Memory settings snapshot".to_string()
-        })?;
-    if &actual != expected {
-        return Err(format!(
-            "Workspace Worker Memory settings snapshot mismatch: expected {} revision {}, restored {} revision {}",
-            expected.workspace_id,
-            expected.settings_revision,
-            actual.workspace_id,
-            actual.settings_revision
-        ));
+        .subjektiv
+        .validate_execution()
+        .map_err(str::to_string)?;
+    for (feature, enabled, actual) in [
+        (
+            "Memory",
+            manifest.feature.memory.profile.enabled,
+            manifest.feature.memory.workspace_settings(),
+        ),
+        (
+            "subjektiv",
+            manifest.feature.subjektiv.profile.enabled,
+            manifest.feature.subjektiv.workspace_settings(),
+        ),
+    ] {
+        if enabled && actual.as_ref() != Some(expected) {
+            let actual = actual.ok_or_else(|| {
+                format!("Workspace Worker restored without its bound {feature} settings snapshot")
+            })?;
+            return Err(format!(
+                "Workspace Worker {feature} settings snapshot mismatch: expected {} revision {}, restored {} revision {}",
+                expected.workspace_id,
+                expected.settings_revision,
+                actual.workspace_id,
+                actual.settings_revision
+            ));
+        }
     }
     Ok(())
 }

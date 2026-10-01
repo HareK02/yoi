@@ -144,6 +144,7 @@ pub enum WorkspaceAuthorityRequirement {
     Flow,
     ManageWorkdir,
     Memory,
+    Subjektiv,
     MergeRequest,
     Objective,
     Orchestration,
@@ -157,6 +158,7 @@ impl fmt::Display for WorkspaceAuthorityRequirement {
             Self::Flow => formatter.write_str("feature.flow"),
             Self::ManageWorkdir => formatter.write_str("feature.manage_workdir"),
             Self::Memory => formatter.write_str("feature.memory"),
+            Self::Subjektiv => formatter.write_str("feature.subjektiv"),
             Self::MergeRequest => formatter.write_str("feature.merge_request"),
             Self::Objective => formatter.write_str("feature.objective"),
             Self::Orchestration => formatter.write_str("feature.orchestration"),
@@ -184,6 +186,9 @@ pub fn validate_profile_execution_target(
     }
     if feature.memory.profile.enabled || feature.memory.profile.staging_tools {
         requirements.insert(WorkspaceAuthorityRequirement::Memory);
+    }
+    if feature.subjektiv.profile.enabled {
+        requirements.insert(WorkspaceAuthorityRequirement::Subjektiv);
     }
     if feature.merge_request.show
         || feature.merge_request.open

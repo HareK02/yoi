@@ -234,6 +234,13 @@ impl_openapi_schema!(
     MemoryBackendResponse,
     MemoryConsolidateStagingRequest,
     MemoryConsolidationResponse,
+    SubjektivSubjectCreateRequest,
+    SubjektivSubjectResponse,
+    SubjektivSubjectWorkerStartRequest,
+    SubjektivStageCandidateRequest,
+    SubjektivStageCandidateResponse,
+    SubjektivRecordSessionRequest,
+    SubjektivRecordSessionResponse,
     SkillCatalogResponse,
     SkillDetailResponse,
     SkillActivationResponse,
@@ -1088,6 +1095,87 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[body] request: MemoryConsolidateStagingRequest,
     ) -> Result<MemoryConsolidationResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/subjektiv/subjects",
+        status = 201,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        bearer_auth = true,
+        browser_auth = true,
+    )]
+    async fn subjektiv_subject_create(
+        &self,
+        #[path] workspace_id: String,
+        #[body] request: SubjektivSubjectCreateRequest,
+    ) -> Result<SubjektivSubjectResponse, RepositoryApiError>;
+    #[get(
+        "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}",
+        status = 200,
+        error_status = 404,
+        additional_error_statuses = [400, 401, 403, 500],
+        bearer_auth = true,
+        browser_auth = true,
+    )]
+    async fn subjektiv_subject_get(
+        &self,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+    ) -> Result<SubjektivSubjectResponse, RepositoryApiError>;
+    #[post(
+        "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/retire",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        bearer_auth = true,
+        browser_auth = true,
+    )]
+    async fn subjektiv_subject_retire(
+        &self,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+    ) -> Result<SubjektivSubjectResponse, RepositoryApiError>;
+    #[post(
+        "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/worker",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        bearer_auth = true,
+        browser_auth = true,
+    )]
+    async fn subjektiv_subject_worker_start(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+        #[body] request: SubjektivSubjectWorkerStartRequest,
+    ) -> Result<BrowserCreateWorkerResponse, RepositoryApiError>;
+    #[post(
+        "/api/w/{workspace_id}/subjektiv/staging",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        openapi = false,
+    )]
+    async fn subjektiv_stage_candidate(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: SubjektivStageCandidateRequest,
+    ) -> Result<SubjektivStageCandidateResponse, RepositoryApiError>;
+    #[post(
+        "/api/w/{workspace_id}/subjektiv/sessions",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        openapi = false,
+    )]
+    async fn subjektiv_record_session(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: SubjektivRecordSessionRequest,
+    ) -> Result<SubjektivRecordSessionResponse, RepositoryApiError>;
 
     #[get(
         "/api/w/{workspace_id}/skills",
@@ -4354,6 +4442,68 @@ pub struct MemoryConsolidationResponse {
     pub candidate_count: usize,
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjektivSubjectState {
+    Active,
+    Retired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSubjectCreateRequest {
+    pub role: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSubjectResponse {
+    pub id: String,
+    pub role: String,
+    pub state: SubjektivSubjectState,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub store_revision: u64,
+    pub created_at: String,
+    pub updated_at: String,
+    /// Current keyed-singleton owner, when one exists. This is a live Yoi
+    /// projection, not state duplicated in the subjektiv store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_worker: Option<WorkerLaunchWorkerSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSubjectWorkerStartRequest {
+    pub worker: CreateWorkspaceWorkerRequest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivStageCandidateRequest {
+    /// Committed parent Session identity captured by the Worker host.
+    pub session_id: String,
+    pub operation: memory::backend::MemoryStageCandidateOperation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivStageCandidateResponse {
+    pub staging_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivRecordSessionRequest {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivRecordSessionResponse {
+    pub subject_id: String,
+    pub session_id: String,
 }
 
 pub const WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES: usize = 128;
@@ -11521,6 +11671,8 @@ mod openapi_artifact_tests {
             "worker_control_stop",
             "worker_observation_capture",
             "worker_observation_sessions",
+            "subjektiv_stage_candidate",
+            "subjektiv_record_session",
             "workspace_worker_discovery",
             "workspace_worker_remove",
         ];

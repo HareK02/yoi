@@ -39,7 +39,15 @@ use manifest::WorkerManifest;
 use protocol::Event;
 
 const TASK_NAME: &str = "memory-lifecycle";
+const SUBJEKTIV_TASK_NAME: &str = "subjektiv-memory-lifecycle";
+const SUBJEKTIV_EXTRACT_DOMAIN: &str = "subjektiv.extract.v1";
 const TASK_TIMEOUT: Duration = Duration::from_secs(300);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtractionTarget {
+    WorkspaceMemory,
+    Subjektiv,
+}
 
 /// Parent-Worker lifecycle Feature that observes committed runs and schedules
 /// bounded extraction work. It owns the Memory pointer, audit, restricted
@@ -50,9 +58,17 @@ pub(crate) struct MemoryLifecycleFeature {
     task: MemoryLifecycleTask,
 }
 
+/// Subject-scoped extraction is a distinct Feature module even though it reuses
+/// the mature committed-capture/extract/pointer lifecycle implementation.
+#[derive(Clone)]
+pub(crate) struct SubjektivLifecycleFeature {
+    task: MemoryLifecycleTask,
+}
+
 #[derive(Clone)]
 struct MemoryLifecycleTask {
     config: manifest::ResolvedMemoryFeatureConfig,
+    target: ExtractionTarget,
     capture: CommittedSessionCaptureHandle,
     extensions: SessionExtensionHandle,
     workspace_client: Arc<dyn WorkspaceClient>,
@@ -120,6 +136,7 @@ impl MemoryLifecycleFeature {
         Self {
             task: MemoryLifecycleTask {
                 config,
+                target: ExtractionTarget::WorkspaceMemory,
                 capture,
                 extensions,
                 workspace_client,
@@ -130,6 +147,63 @@ impl MemoryLifecycleFeature {
                 event_tx,
             },
         }
+    }
+}
+
+impl SubjektivLifecycleFeature {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_resolved_config(
+        lifecycle_enabled: bool,
+        config: manifest::ResolvedSubjektivFeatureConfig,
+        capture: CommittedSessionCaptureHandle,
+        extensions: SessionExtensionHandle,
+        workspace_client: Arc<dyn WorkspaceClient>,
+        manifest: WorkerManifest,
+        client: Box<dyn LlmClient>,
+        prompts: Arc<ArcSwap<PromptCatalog>>,
+        workspace_context: WorkerWorkspaceContext,
+        event_tx: Option<broadcast::Sender<Event>>,
+    ) -> std::io::Result<Option<Self>> {
+        if !lifecycle_enabled || !config.profile.enabled || !config.profile.extraction.enabled {
+            return Ok(None);
+        }
+        config
+            .validate_execution()
+            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+        if !workspace_client.is_available() || workspace_client.workspace_id().is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "subjektiv extraction requires Backend Workspace API authority",
+            ));
+        }
+        let memory_config = manifest::ResolvedMemoryFeatureConfig {
+            profile: manifest::MemoryFeatureProfileConfig {
+                enabled: true,
+                staging_tools: false,
+                resident: manifest::MemoryResidentProfileConfig {
+                    inject_summary: false,
+                },
+                extraction: config.profile.extraction,
+                consolidation: manifest::MemoryConsolidationProfileConfig {
+                    request_enabled: false,
+                },
+            },
+            workspace_settings: config.workspace_settings,
+        };
+        Ok(Some(Self {
+            task: MemoryLifecycleTask {
+                config: memory_config,
+                target: ExtractionTarget::Subjektiv,
+                capture,
+                extensions,
+                workspace_client,
+                manifest,
+                client,
+                prompts,
+                workspace_context,
+                event_tx,
+            },
+        }))
     }
 }
 
@@ -152,17 +226,54 @@ impl FeatureModule for MemoryLifecycleFeature {
     }
 }
 
+impl FeatureModule for SubjektivLifecycleFeature {
+    fn descriptor(&self) -> FeatureDescriptor {
+        FeatureDescriptor::builtin("subjektiv-memory-lifecycle", "subjektiv Memory Lifecycle")
+            .with_description(
+                "Observes terminal committed parent runs and stages bounded Memory candidates for the host-connected subject.",
+            )
+            .with_background_task(BackgroundTaskDeclaration::worker_managed(
+                SUBJEKTIV_TASK_NAME,
+                "Extract provenance-preserving candidates into subject-scoped staging after committed runs.",
+            ))
+    }
+
+    fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
+        context
+            .background_tasks()
+            .register(subjektiv_lifecycle_task_spec(), self.task.clone())
+    }
+}
+
 fn memory_lifecycle_task_spec() -> BackgroundTaskSpec {
-    let declaration = BackgroundTaskDeclaration::worker_managed(
+    lifecycle_task_spec(
         TASK_NAME,
         "Extract provenance-preserving Memory candidates and request Backend consolidation after committed runs.",
-    );
+    )
+}
+
+fn subjektiv_lifecycle_task_spec() -> BackgroundTaskSpec {
+    lifecycle_task_spec(
+        SUBJEKTIV_TASK_NAME,
+        "Extract provenance-preserving candidates into subject-scoped staging after committed runs.",
+    )
+}
+
+fn lifecycle_task_spec(name: &'static str, description: &'static str) -> BackgroundTaskSpec {
+    let declaration = BackgroundTaskDeclaration::worker_managed(name, description);
     let mut spec = BackgroundTaskSpec::single_flight(declaration, TASK_TIMEOUT);
     spec.trigger = BackgroundTaskTrigger::RunCommitted;
     spec
 }
 
 impl MemoryLifecycleTask {
+    fn pointer_domain(&self) -> &'static str {
+        match self.target {
+            ExtractionTarget::WorkspaceMemory => extract::EXTRACT_DOMAIN,
+            ExtractionTarget::Subjektiv => SUBJEKTIV_EXTRACT_DOMAIN,
+        }
+    }
+
     fn extraction_manifest(&self) -> WorkerManifest {
         let mut manifest = self.manifest.clone();
         if let Some(model) = self.config.profile.extraction.model.clone() {
@@ -192,6 +303,11 @@ impl MemoryLifecycleTask {
                 .map(model_audit_from_manifest),
         )
         .with_memory_settings(&self.config);
+        let audit = if self.target == ExtractionTarget::Subjektiv {
+            audit.without_legacy_backend()
+        } else {
+            audit
+        };
         let capture = match self.capture.capture() {
             Ok(capture) => capture,
             Err(error) => {
@@ -223,7 +339,7 @@ impl MemoryLifecycleTask {
                 .await;
             return Ok(());
         }
-        let pointer = match extract_pointer(&capture) {
+        let pointer = match extract_pointer(&capture, self.pointer_domain()) {
             Ok(pointer) => pointer,
             Err(error) => {
                 audit
@@ -333,12 +449,21 @@ impl MemoryLifecycleTask {
                 None,
             )
             .await;
-        let output_state = MemoryStagingOutputState::new(
-            view.clone(),
-            Arc::clone(&self.workspace_client),
-            source,
-            audit.run_id.to_string(),
-        );
+        let output_state = match self.target {
+            ExtractionTarget::WorkspaceMemory => MemoryStagingOutputState::new(
+                view.clone(),
+                Arc::clone(&self.workspace_client),
+                source,
+                audit.run_id.to_string(),
+            ),
+            ExtractionTarget::Subjektiv => MemoryStagingOutputState::new_subjektiv(
+                view.clone(),
+                Arc::clone(&self.workspace_client),
+                source,
+                audit.run_id.to_string(),
+                capture.session_id.clone(),
+            ),
+        };
         let client = if let Some(model) = self.config.profile.extraction.model.as_ref() {
             match crate::model_client::build_client(model) {
                 Ok(client) => client,
@@ -485,6 +610,23 @@ impl MemoryLifecycleTask {
             ExtractionDisposition::Completed => {}
         }
 
+        if self.target == ExtractionTarget::Subjektiv
+            && let Err(reason) = self.record_subjektiv_session(&capture.session_id)
+        {
+            audit
+                .emit(
+                    self.workspace_client.as_ref(),
+                    self.event_tx.as_ref(),
+                    memory::audit::WorkerLifecycleStatus::Failed,
+                    reason,
+                    usage_audit,
+                    extract_audit,
+                    None,
+                )
+                .await;
+            return Ok(());
+        }
+
         context.generation_fence.ensure_current()?;
         let next_pointer = memory::ExtractPointerPayload {
             processed_through_entry: capture.entry_count - 1,
@@ -494,7 +636,7 @@ impl MemoryLifecycleTask {
         let payload = serde_json::to_value(&next_pointer).map_err(hook_internal)?;
         if !self
             .extensions
-            .append_if_current(&capture.location(), extract::EXTRACT_DOMAIN, payload)
+            .append_if_current(&capture.location(), self.pointer_domain(), payload)
             .map_err(hook_internal)?
         {
             audit
@@ -549,6 +691,35 @@ impl FeatureBackgroundTask for MemoryLifecycleTask {
 }
 
 impl MemoryLifecycleTask {
+    fn record_subjektiv_session(&self, session_id: &str) -> Result<(), String> {
+        let response = self
+            .workspace_client
+            .execute_server_operation(
+                crate::worker::WorkspaceServerOperation::SubjektivRecordSession(
+                    server_api::SubjektivRecordSessionRequest {
+                        session_id: session_id.to_string(),
+                    },
+                ),
+            )
+            .map_err(|error| format!("record subjektiv Session attribution failed: {error}"))?;
+        if !response.is_success() {
+            return Err(format!(
+                "record subjektiv Session attribution returned HTTP {}: {}",
+                response.status, response.body
+            ));
+        }
+        let output: server_api::SubjektivRecordSessionResponse =
+            serde_json::from_str(&response.body).map_err(|error| {
+                format!("decode subjektiv Session attribution response: {error}")
+            })?;
+        if output.session_id != session_id {
+            return Err(
+                "subjektiv Session attribution response changed session identity".to_string(),
+            );
+        }
+        Ok(())
+    }
+
     async fn request_consolidation(&self) {
         let audit = WorkerAuditBase::new(
             memory::audit::AuditWorker::MemoryConsolidation,
@@ -668,13 +839,19 @@ fn hook_internal(error: impl std::fmt::Display) -> HookError {
 
 fn extract_pointer(
     capture: &CommittedSessionCapture,
+    domain: &str,
 ) -> Result<Option<memory::ExtractPointerPayload>, HookError> {
-    let pointer = memory::extract::fold_pointer(&capture.extensions);
+    let pointer = capture
+        .extensions
+        .iter()
+        .rev()
+        .find(|(candidate, _)| candidate == domain)
+        .and_then(|(_, payload)| serde_json::from_value(payload.clone()).ok());
     if pointer.is_none()
         && capture
             .extensions
             .iter()
-            .any(|(domain, _)| domain == extract::EXTRACT_DOMAIN)
+            .any(|(candidate, _)| candidate == domain)
     {
         return Err(hook_internal(
             "latest committed Memory extraction pointer is malformed",
@@ -732,6 +909,7 @@ struct WorkerAuditBase {
     trigger: memory::audit::AuditTrigger,
     memory_settings: Option<memory::audit::MemorySettingsAudit>,
     model: Option<memory::audit::ModelAudit>,
+    persist_legacy_backend: bool,
 }
 
 impl WorkerAuditBase {
@@ -746,7 +924,13 @@ impl WorkerAuditBase {
             trigger,
             memory_settings: None,
             model,
+            persist_legacy_backend: true,
         }
+    }
+
+    fn without_legacy_backend(mut self) -> Self {
+        self.persist_legacy_backend = false;
+        self
     }
 
     fn with_memory_settings(mut self, config: &manifest::ResolvedMemoryFeatureConfig) -> Self {
@@ -784,15 +968,19 @@ impl WorkerAuditBase {
             extract,
             consolidation,
         };
-        let _ = workspace_client
-            .execute_memory_backend_operation(memory::backend::MemoryBackendOperation::AppendAudit(
-                memory::backend::MemoryAppendAuditOperation {
-                    event: memory::audit::AuditEvent::new(
-                        memory::audit::AuditPayload::WorkerLifecycle(payload),
+        if self.persist_legacy_backend {
+            let _ = workspace_client
+                .execute_memory_backend_operation(
+                    memory::backend::MemoryBackendOperation::AppendAudit(
+                        memory::backend::MemoryAppendAuditOperation {
+                            event: memory::audit::AuditEvent::new(
+                                memory::audit::AuditPayload::WorkerLifecycle(payload),
+                            ),
+                        },
                     ),
-                },
-            ))
-            .await;
+                )
+                .await;
+        }
         if let Some(tx) = event_tx {
             let _ = tx.send(Event::MemoryWorker(protocol::MemoryWorkerEvent {
                 worker: self.worker.label().to_string(),
@@ -859,6 +1047,8 @@ mod tests {
             &self,
             request: crate::worker::WorkspaceRequest,
         ) -> Result<crate::worker::WorkspaceResponse, crate::worker::WorkspaceClientError> {
+            let is_subjektiv_stage = request.path.ends_with("/subjektiv/staging");
+            let is_subjektiv_session = request.path.ends_with("/subjektiv/sessions");
             let is_stage_candidate = request
                 .body
                 .as_deref()
@@ -868,6 +1058,25 @@ mod tests {
                 .as_deref()
                 .is_some_and(|body| body.contains("append_audit"));
             self.requests.lock().unwrap().push(request);
+            if is_subjektiv_session {
+                return Ok(crate::worker::WorkspaceResponse {
+                    status: 200,
+                    body: serde_json::to_string(&server_api::SubjektivRecordSessionResponse {
+                        subject_id: "subject-1".to_string(),
+                        session_id: "session-1".to_string(),
+                    })
+                    .unwrap(),
+                });
+            }
+            if is_subjektiv_stage {
+                return Ok(crate::worker::WorkspaceResponse {
+                    status: 200,
+                    body: serde_json::to_string(&server_api::SubjektivStageCandidateResponse {
+                        staging_id: "subject-candidate-1".to_string(),
+                    })
+                    .unwrap(),
+                });
+            }
             if is_stage_candidate {
                 return Ok(crate::worker::WorkspaceResponse {
                     status: 200,
@@ -1072,6 +1281,7 @@ permission = "write"
         });
         MemoryLifecycleTask {
             config: test_config(),
+            target: ExtractionTarget::WorkspaceMemory,
             capture: capture_handle,
             extensions,
             workspace_client,
@@ -1120,6 +1330,30 @@ permission = "write"
         .await
         .expect("memory lifecycle background task should finish");
         registry.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn disabled_subjektiv_feature_installs_nothing_without_workspace_side_effects() {
+        let capture = CommittedSessionCaptureHandle::new(|| {
+            panic!("disabled subjektiv must not capture a Session")
+        });
+        let extensions = SessionExtensionHandle::new(|_, _, _| {
+            panic!("disabled subjektiv must not write a pointer")
+        });
+        let feature = SubjektivLifecycleFeature::from_resolved_config(
+            true,
+            manifest::ResolvedSubjektivFeatureConfig::default(),
+            capture,
+            extensions,
+            crate::worker::marker_workspace_client(None, "disabled"),
+            test_manifest(),
+            Box::new(ScriptClient::new(Vec::new())),
+            Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap())),
+            WorkerWorkspaceContext::no_workspace(),
+            None,
+        )
+        .unwrap();
+        assert!(feature.is_none());
     }
 
     #[test]
@@ -1234,6 +1468,136 @@ permission = "write"
                         .is_some_and(|body| body.contains("stage_candidate"))
                 })
         );
+    }
+
+    #[tokio::test]
+    async fn subjektiv_extraction_stages_once_and_commits_its_independent_pointer() {
+        let source = capture(2, 250);
+        let entry_ref =
+            SessionCapture::from_history_entries(source.segment_id.clone(), source.history.clone())
+                .overview()[0]
+                .id
+                .to_string();
+        let client = ScriptClient::new(vec![
+            stage_candidate_events("stage-1", &entry_ref),
+            finish_events("finish-1", 1),
+            completed_events(),
+        ]);
+        let extension_writes = Arc::new(Mutex::new(Vec::new()));
+        let (event_tx, _) = broadcast::channel(64);
+        let workspace_client = Arc::new(RecordingWorkspaceClient::default());
+        let mut task = test_task(
+            source,
+            Box::new(client),
+            Arc::clone(&extension_writes),
+            event_tx,
+            workspace_client.clone(),
+        );
+        task.target = ExtractionTarget::Subjektiv;
+        task.config.profile.consolidation.request_enabled = false;
+        run_background_task(task).await;
+
+        let writes = extension_writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].1, SUBJEKTIV_EXTRACT_DOMAIN);
+        let pointer: memory::ExtractPointerPayload =
+            serde_json::from_value(writes[0].2.clone()).unwrap();
+        assert_eq!(pointer.staging_id, "subject-candidate-1");
+        let requests = workspace_client.requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.path.ends_with("/subjektiv/staging"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.path.ends_with("/subjektiv/sessions"))
+                .count(),
+            1
+        );
+        assert!(requests.iter().all(|request| {
+            request
+                .body
+                .as_deref()
+                .is_none_or(|body| !body.contains("append_audit") && body != "{\"force\":false}")
+        }));
+    }
+
+    #[tokio::test]
+    async fn empty_subjektiv_extraction_records_session_and_commits_pointer_without_candidate() {
+        let client = ScriptClient::new(vec![finish_empty_events("finish-1"), completed_events()]);
+        let extension_writes = Arc::new(Mutex::new(Vec::new()));
+        let (event_tx, _) = broadcast::channel(32);
+        let workspace_client = Arc::new(RecordingWorkspaceClient::default());
+        let mut task = test_task(
+            capture(2, 250),
+            Box::new(client),
+            Arc::clone(&extension_writes),
+            event_tx,
+            workspace_client.clone(),
+        );
+        task.target = ExtractionTarget::Subjektiv;
+        task.config.profile.consolidation.request_enabled = false;
+        run_background_task(task).await;
+
+        let writes = extension_writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].1, SUBJEKTIV_EXTRACT_DOMAIN);
+        let pointer: memory::ExtractPointerPayload =
+            serde_json::from_value(writes[0].2.clone()).unwrap();
+        assert!(pointer.staging_id.is_empty());
+        let requests = workspace_client.requests.lock().unwrap();
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.path.ends_with("/subjektiv/staging"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.path.ends_with("/subjektiv/sessions"))
+        );
+    }
+
+    #[tokio::test]
+    async fn subjektiv_candidate_remains_staged_when_later_extraction_fails_without_pointer() {
+        let source = capture(2, 250);
+        let entry_ref =
+            SessionCapture::from_history_entries(source.segment_id.clone(), source.history.clone())
+                .overview()[0]
+                .id
+                .to_string();
+        let client = ScriptClient::new(vec![stage_candidate_events("stage-1", &entry_ref)]);
+        let extension_writes = Arc::new(Mutex::new(Vec::new()));
+        let (event_tx, _) = broadcast::channel(32);
+        let workspace_client = Arc::new(RecordingWorkspaceClient::default());
+        let mut task = test_task(
+            source,
+            Box::new(client),
+            Arc::clone(&extension_writes),
+            event_tx,
+            workspace_client.clone(),
+        );
+        task.target = ExtractionTarget::Subjektiv;
+        task.config.profile.consolidation.request_enabled = false;
+        run_background_task(task).await;
+
+        assert!(extension_writes.lock().unwrap().is_empty());
+        let requests = workspace_client.requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.path.ends_with("/subjektiv/staging"))
+                .count(),
+            1,
+            "the immutable partial candidate remains staged for retry/deduplication"
+        );
+        assert!(!requests
+            .iter()
+            .any(|request| request.path.ends_with("/subjektiv/sessions")));
     }
 
     #[tokio::test]
@@ -1562,7 +1926,10 @@ permission = "write"
                 serde_json::to_value(&latest).unwrap(),
             ),
         ];
-        assert_eq!(extract_pointer(&capture).unwrap(), Some(latest));
+        assert_eq!(
+            extract_pointer(&capture, extract::EXTRACT_DOMAIN).unwrap(),
+            Some(latest)
+        );
     }
 
     #[test]
@@ -1583,7 +1950,7 @@ permission = "write"
                 serde_json::json!({"invalid": true}),
             ),
         ];
-        assert!(extract_pointer(&capture).is_err());
+        assert!(extract_pointer(&capture, extract::EXTRACT_DOMAIN).is_err());
     }
 
     #[test]
