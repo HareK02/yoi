@@ -93,18 +93,18 @@ Deno.test("Shell regions use selected Bevel edges while open separators use Beve
   assert(
     rootLayout.includes('class="app-shell__topbar-bevel"') &&
       rootLayout.includes("top={false} right={false} left={false}") &&
-      rootLayout.includes("bind:folded={sidebarFolded}") &&
+      rootLayout.includes("open={sidebarOpen}") &&
       rootLayout.includes("app-shell__mobile-sidebar-toggle") &&
-      rootLayout.includes("class:sidebar-open={!sidebarFolded}") &&
+      rootLayout.includes("class:sidebar-open={sidebarOpen}") &&
       !rootLayout.includes("depth=") &&
       !rootLayout.includes("BevelLine") &&
       sidebarFrame.includes('class="sidebar-frame__bevel"') &&
       sidebarFrame.includes("top={false} bottom={false} left={false}") &&
-      sidebarFrame.includes("$bindable(false)") &&
+      sidebarFrame.includes("class:folded={!open}") &&
       !sidebarFrame.includes("depth=") &&
       !sidebarFrame.includes("BevelLine") &&
       sidebarCss.includes(".sidebar-frame.folded") &&
-      sidebarCss.includes("display: none") &&
+      sidebarCss.includes("transform: translateX(-100%)") &&
       sidebarCss.includes("display: grid"),
     "Desktop shell boundaries must use one selected border edge and Mobile must share Header fold state",
   );

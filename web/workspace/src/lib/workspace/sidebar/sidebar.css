@@ -5,6 +5,7 @@
     --sidebar-item-hover: oklch(96% 0 0);
     --sidebar-item-active: oklch(92.5% 0 0);
     --sidebar-width: clamp(220px, 20vw, 280px);
+    --sidebar-rail-width: calc(32px + var(--space-2) + var(--space-2) + 1px);
     --sidebar-motion-duration: 220ms;
     --sidebar-motion-easing: cubic-bezier(0.2, 0, 0, 1);
 
@@ -38,7 +39,7 @@
     }
   }
   .sidebar-frame.folded {
-    width: calc(32px + var(--space-2) + var(--space-2) + 1px);
+    width: var(--sidebar-rail-width);
     overflow: hidden;
   }
   .sidebar-frame-content {
@@ -57,6 +58,25 @@
     transform: translateX(-100%);
     visibility: hidden;
     transition-delay: 0s, var(--sidebar-motion-duration);
+  }
+  .sidebar-frame.hover-mode {
+    position: relative;
+    z-index: 40;
+    width: var(--sidebar-rail-width);
+    overflow: visible;
+  }
+  .sidebar-frame.hover-mode .bevel.sidebar-frame__bevel {
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 100%;
+    width: var(--sidebar-width);
+    overflow: hidden;
+    background: var(--bg);
+    transition: width var(--sidebar-motion-duration) var(--sidebar-motion-easing);
+  }
+  .sidebar-frame.hover-mode.folded .bevel.sidebar-frame__bevel {
+    width: var(--sidebar-rail-width);
   }
   .sidebar-frame-content,
   .global-sidebar,
@@ -647,7 +667,8 @@
   }
 
   @media (max-width: 760px) {
-    .sidebar-frame {
+    .sidebar-frame,
+    .sidebar-frame.hover-mode {
       --sidebar-width: 100%;
       z-index: 20;
       grid-column: 1;
@@ -660,7 +681,8 @@
       transition: transform var(--sidebar-motion-duration) var(--sidebar-motion-easing),
         visibility 0s;
     }
-    .sidebar-frame.folded {
+    .sidebar-frame.folded,
+    .sidebar-frame.hover-mode.folded {
       width: 100%;
       transform: translateX(-100%);
       visibility: hidden;
@@ -673,8 +695,11 @@
       visibility: inherit;
       transition: none;
     }
-    .sidebar-control-row {
-      display: none;
+    .sidebar-frame.hover-mode .bevel.sidebar-frame__bevel,
+    .sidebar-frame.hover-mode.folded .bevel.sidebar-frame__bevel {
+      position: static;
+      width: 100%;
+      transition: none;
     }
   }
 

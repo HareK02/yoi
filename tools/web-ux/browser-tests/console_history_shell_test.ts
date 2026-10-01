@@ -42,8 +42,8 @@ async function historyRequestCount(baseUrl: string): Promise<number> {
 }
 
 async function checkSidebarSlide(page: Page, mobile: boolean, opening: boolean): Promise<void> {
-  const toggle = page.locator(mobile ? ".app-shell__mobile-sidebar-toggle" : ".sidebar-fold-button");
-  const result = await toggle.evaluate(async (button, mobile) => {
+  const toggle = page.locator(mobile ? ".app-shell__mobile-sidebar-toggle" : ".sidebar-frame");
+  const result = await toggle.evaluate(async (button, { mobile, opening }) => {
     const frame = document.querySelector<HTMLElement>(".sidebar-frame")!;
     const content = frame.querySelector<HTMLElement>(".sidebar-frame-content")!;
     const main = document.querySelector<HTMLElement>(".app-shell__main")!;
@@ -52,11 +52,17 @@ async function checkSidebarSlide(page: Page, mobile: boolean, opening: boolean):
       x: moving.getBoundingClientRect().x,
       width: moving.getBoundingClientRect().width,
       frameWidth: frame.getBoundingClientRect().width,
+      panelWidth: frame.querySelector(".sidebar-frame__bevel")!.getBoundingClientRect().width,
       mainWidth: main.getBoundingClientRect().width,
       mainHeight: main.getBoundingClientRect().height,
     });
     const before = sample();
-    (button as HTMLButtonElement).click();
+    if (mobile) {
+      (button as HTMLButtonElement).click();
+    } else {
+      button.dispatchEvent(new PointerEvent(opening ? "pointerenter" : "pointerleave", { pointerType: "mouse" }));
+      if (!opening) await new Promise((resolve) => setTimeout(resolve, 190));
+    }
     await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
     const animations = frame.getAnimations({ subtree: true });
     const slides = animations.filter((animation) => animation instanceof CSSTransition &&
@@ -70,8 +76,8 @@ async function checkSidebarSlide(page: Page, mobile: boolean, opening: boolean):
     for (const animation of animations) animation.finish();
     await Promise.all(animations.map((animation) => animation.finished));
     return { before, middle, after: sample(), durations, contentInert: content.inert, mainInert: main.inert };
-  }, mobile);
-  assert(result.durations.length >= (mobile ? 1 : 2));
+  }, { mobile, opening });
+  assert(result.durations.length >= (mobile ? 1 : 2), `missing sidebar motion: ${JSON.stringify({ mobile, opening, result })}`);
   assert(result.durations.every((duration) => duration === 220));
   const { before, middle, after } = result;
   assert(opening ? before.x < middle.x && middle.x < after.x : before.x > middle.x && middle.x > after.x,
@@ -79,13 +85,13 @@ async function checkSidebarSlide(page: Page, mobile: boolean, opening: boolean):
   assertEquals(before.width, after.width, "sidebar contents must slide without reflowing");
   assertEquals(result.contentInert, !opening);
   assertEquals(result.mainInert, mobile && opening);
-  if (mobile) {
-    assertEquals(before.mainWidth, after.mainWidth);
-    assertEquals(before.mainHeight, after.mainHeight);
-    assertEquals(after.frameWidth, before.frameWidth);
-  } else {
-    assert(opening ? before.frameWidth < middle.frameWidth && middle.frameWidth < after.frameWidth
-      : before.frameWidth > middle.frameWidth && middle.frameWidth > after.frameWidth);
+  assertEquals(before.mainWidth, after.mainWidth, "hover/touch previews must not resize the main content");
+  assertEquals(before.mainHeight, after.mainHeight);
+  assertEquals(after.frameWidth, before.frameWidth, "hover mode keeps a fixed rail width");
+  if (!mobile) {
+    assert(opening ? before.panelWidth < middle.panelWidth && middle.panelWidth < after.panelWidth
+      : before.panelWidth > middle.panelWidth && middle.panelWidth > after.panelWidth,
+      "the overlay panel must expand past the rail and contract again");
   }
 }
 
@@ -384,24 +390,55 @@ async function checkConsoleHistory(viewportHeight: number): Promise<void> {
       assertEquals(new Set(rowIds).size, rowIds.length);
       await page.getByRole("button", { name: "Overview", exact: true }).click();
       assertEquals(await transcript.getByText("searched 1 time・ran 1 command", { exact: true }).count(), 12);
-      await checkSidebarSlide(page, false, false);
-      await checkSidebarSlide(page, false, true);
-      await checkSidebarSlide(page, false, false);
-      assertEquals(await page.evaluate(() => localStorage.getItem("yoi.sidebar.folded.v1")), "true");
-      await page.reload();
-      await page.getByRole("button", { name: "Unfold sidebar", exact: true }).waitFor();
-      assertEquals(await page.locator(".app-shell.sidebar-open").count(), 0);
-      await page.setViewportSize({ width: 600, height: viewportHeight });
-      await page.locator(".sidebar-frame").evaluate(async (element) => {
+      const sidebar = page.locator(".sidebar-frame");
+      const settleSidebar = () => sidebar.evaluate(async (element) => {
         await Promise.all(element.getAnimations({ subtree: true }).map((animation) => animation.finished));
       });
+      await page.getByRole("button", { name: "Unpin sidebar", exact: true }).click();
+      await page.mouse.move(1000, 30);
+      await page.locator(".sidebar-frame.folded").waitFor();
+      await settleSidebar();
+      const mainBeforeHover = await page.locator(".app-shell__main").boundingBox();
+      await checkSidebarSlide(page, false, true);
+      await checkSidebarSlide(page, false, false);
+      // Use real mouse and keyboard events as well as deterministic motion sampling.
+      await sidebar.hover({ position: { x: 10, y: 40 } });
+      await page.locator(".sidebar-frame:not(.folded)").waitFor();
+      await settleSidebar();
+      assertEquals(await page.locator(".app-shell__main").boundingBox(), mainBeforeHover);
+      const sidebarLink = sidebar.locator(".sidebar-frame-content a").first();
+      await sidebarLink.focus();
+      await page.mouse.move(1000, 30);
+      await page.waitForTimeout(250);
+      assertEquals(await page.locator(".sidebar-frame.folded").count(), 0, "keyboard focus must hold the preview open");
+      await page.getByRole("link", { name: "Open Account", exact: true }).focus();
+      await page.locator(".sidebar-frame.folded").waitFor();
+      await settleSidebar();
+      await sidebar.hover({ position: { x: 10, y: 40 } });
+      await page.getByRole("button", { name: "Pin sidebar", exact: true }).click();
+      await page.mouse.move(1000, 30);
+      await page.waitForTimeout(250);
+      assertEquals(await page.locator(".sidebar-frame.folded").count(), 0);
+      assertEquals(await page.evaluate(() => localStorage.getItem("yoi.sidebar.mode.v1")), "pinned");
+      await page.getByRole("button", { name: "Unpin sidebar", exact: true }).click();
+      // Hold a preview open across reload; only the mode should be restored.
+      await sidebarLink.focus();
+      await page.mouse.move(1000, 30);
+      assertEquals(await page.evaluate(() => localStorage.getItem("yoi.sidebar.mode.v1")), "hover");
+      await page.reload();
+      await page.getByRole("button", { name: "Pin sidebar", exact: true }).waitFor();
+      assertEquals(await page.locator(".app-shell.sidebar-open").count(), 0);
+      await page.setViewportSize({ width: 600, height: viewportHeight });
+      await settleSidebar();
       await checkSidebarSlide(page, true, true);
       await checkSidebarSlide(page, true, false);
       await checkSidebarSlide(page, true, true);
-      assertEquals(await page.evaluate(() => localStorage.getItem("yoi.sidebar.folded.v1")), "false");
+      assertEquals(await page.evaluate(() => localStorage.getItem("yoi.sidebar.mode.v1")), "hover");
       await page.reload();
-      await page.getByRole("button", { name: "Hide sidebar", exact: true }).waitFor();
-      assertEquals(await page.locator(".app-shell.sidebar-open").count(), 1);
+      await page.getByRole("button", { name: "Show sidebar", exact: true }).waitFor();
+      assertEquals(await page.locator(".app-shell.sidebar-open").count(), 0);
+      await page.getByRole("button", { name: "Show sidebar", exact: true }).click();
+      await settleSidebar();
       await page.emulateMedia({ reducedMotion: "reduce" });
       await page.getByRole("button", { name: "Hide sidebar", exact: true }).click();
       const reducedSidebar = await page.locator(".sidebar-frame").evaluate((element) => ({
@@ -411,6 +448,31 @@ async function checkConsoleHistory(viewportHeight: number): Promise<void> {
       }));
       assertEquals(reducedSidebar, { animations: 0, right: 0, visibility: "hidden" });
       assertEquals(await page.locator(".app-shell__main").evaluate((element) => (element as HTMLElement).inert), false);
+      if (viewportHeight === 600) {
+        const touchContext = await browser.newContext({
+          viewport: { width: 600, height: 600 }, hasTouch: true, isMobile: true,
+          storageState: await context.storageState(),
+        });
+        const touchPage = await touchContext.newPage();
+        await touchPage.goto(page.url());
+        await touchPage.getByRole("button", { name: "Show sidebar", exact: true }).tap();
+        await touchPage.getByRole("button", { name: "Pin sidebar", exact: true }).tap();
+        assertEquals(await touchPage.evaluate(() => localStorage.getItem("yoi.sidebar.mode.v1")), "pinned");
+        await touchPage.getByRole("button", { name: "Hide sidebar", exact: true }).tap();
+        await touchPage.reload();
+        await touchPage.getByRole("button", { name: "Show sidebar", exact: true }).waitFor();
+        assertEquals(await touchPage.evaluate(() => localStorage.getItem("yoi.sidebar.mode.v1")), "pinned");
+        // A wide touchscreen still has a temporary-open control in hover mode.
+        await touchPage.setViewportSize({ width: 1024, height: 600 });
+        await touchPage.getByRole("button", { name: "Unpin sidebar", exact: true }).tap();
+        await touchPage.locator(".sidebar-frame.folded").waitFor();
+        await touchPage.getByRole("button", { name: "Show sidebar", exact: true }).tap();
+        await touchPage.locator(".sidebar-frame:not(.folded)").waitFor();
+        await touchPage.getByRole("button", { name: "Hide sidebar", exact: true }).tap();
+        await touchPage.locator(".sidebar-frame.folded").waitFor();
+        assertEquals(await touchPage.evaluate(() => localStorage.getItem("yoi.sidebar.mode.v1")), "hover");
+        await touchContext.close();
+      }
       assertEquals(errors, []);
       await context.close();
     } finally {

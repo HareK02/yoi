@@ -25,31 +25,42 @@
   const headerOverrides = createOverrideStack<HeaderSnippet>((activeHeader) => {
     header = activeHeader;
   });
-  // Browser-wide layout preference; independent of authentication and Workspace.
-  const sidebarFoldStorageKey = 'yoi.sidebar.folded.v1';
-  function loadSidebarFolded(): boolean {
-    if (typeof window === 'undefined') return false;
+  // Only the display mode persists; hover/touch previews never do.
+  const sidebarModeStorageKey = 'yoi.sidebar.mode.v1';
+  const legacySidebarStorageKey = 'yoi.sidebar.folded.v1';
+  function loadSidebarMode(): 'pinned' | 'hover' {
+    if (typeof window === 'undefined') return 'pinned';
     try {
-      return window.localStorage.getItem(sidebarFoldStorageKey) === 'true';
+      const mode = window.localStorage.getItem(sidebarModeStorageKey);
+      if (mode === 'pinned' || mode === 'hover') return mode;
+      return window.localStorage.getItem(legacySidebarStorageKey) === 'true' ? 'hover' : 'pinned';
     } catch {
-      return false;
+      return 'pinned';
     }
   }
 
-  let sidebarFolded = $state(loadSidebarFolded());
+  let sidebarMode = $state(loadSidebarMode());
+  let sidebarTransientOpen = $state(false);
   const mobileLayout = new MediaQuery('(max-width: 760px)');
+  const sidebarOpen = $derived((!mobileLayout.current && sidebarMode === 'pinned') || sidebarTransientOpen);
 
   $effect(() => {
-    const folded = sidebarFolded;
+    const mode = sidebarMode;
     try {
-      window.localStorage.setItem(sidebarFoldStorageKey, String(folded));
+      window.localStorage.setItem(sidebarModeStorageKey, mode);
+      window.localStorage.removeItem(legacySidebarStorageKey);
     } catch {
-      // Storage can be blocked or full; folding must still work for this page.
+      // Blocked/full storage must not prevent mode changes in this page.
     }
   });
 
+  $effect(() => {
+    mobileLayout.current;
+    sidebarTransientOpen = false;
+  });
+
   function toggleSidebar() {
-    sidebarFolded = !sidebarFolded;
+    sidebarTransientOpen = !sidebarOpen;
   }
 
   provideHeaderController({
@@ -62,8 +73,14 @@
 
 <WorkspaceAlerts />
 
-<div class="app-shell" class:sidebar-open={!sidebarFolded}>
-  <SidebarFrame bind:folded={sidebarFolded}>
+<div class="app-shell" class:sidebar-open={sidebarOpen} class:sidebar-hover-mode={sidebarMode === 'hover'}>
+  <SidebarFrame
+    mode={sidebarMode}
+    open={sidebarOpen}
+    mobile={mobileLayout.current}
+    onModeChange={(mode) => { sidebarMode = mode; }}
+    onOpenChange={(open) => { sidebarTransientOpen = open; }}
+  >
     <GlobalSidebar
       currentPath={page.url.pathname}
       content={sidebar}
@@ -80,13 +97,13 @@
         <button
           class="app-shell__icon-button app-shell__mobile-sidebar-toggle"
           type="button"
-          aria-label={sidebarFolded ? 'Show sidebar' : 'Hide sidebar'}
-          aria-expanded={!sidebarFolded}
-          title={sidebarFolded ? 'Show sidebar' : 'Hide sidebar'}
+          aria-label={sidebarOpen ? 'Hide sidebar' : 'Show sidebar'}
+          aria-expanded={sidebarOpen}
+          title={sidebarOpen ? 'Hide sidebar' : 'Show sidebar'}
           onclick={toggleSidebar}
         >
           <svg class="app-shell__icon" aria-hidden="true" viewBox="0 0 24 24">
-            {#if sidebarFolded}
+            {#if !sidebarOpen}
               <path d="m6 17 5-5-5-5" />
               <path d="m13 17 5-5-5-5" />
             {:else}
@@ -104,7 +121,7 @@
       </nav>
     </header>
   </Bevel>
-  <main class="app-shell__main" inert={mobileLayout.current && !sidebarFolded}>
+  <main class="app-shell__main" inert={mobileLayout.current && sidebarOpen}>
     {@render children()}
   </main>
 </div>
@@ -201,6 +218,12 @@
     margin-inline: auto;
     overflow-y: auto;
     padding: var(--space-4);
+  }
+
+  @media (hover: none) {
+    .sidebar-hover-mode .app-shell__mobile-sidebar-toggle {
+      display: inline-flex;
+    }
   }
 
   @media (max-width: 760px) {
