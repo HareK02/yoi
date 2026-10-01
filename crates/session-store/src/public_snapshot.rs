@@ -1075,6 +1075,17 @@ fn project_session_snapshot_for_segment(
                     },
                 ));
             }
+            LogEntry::RunCancelled { ts } => {
+                active_run_turn_count = None;
+                entries.push(legacy_entry(
+                    &session_key,
+                    segment_id.as_ref(),
+                    log_index,
+                    0,
+                    *ts,
+                    SessionSnapshotEntryData::RunCancelled,
+                ));
+            }
             LogEntry::RunErrored {
                 ts,
                 message,
@@ -2846,6 +2857,27 @@ mod tests {
                 failure: Some(protocol::RunFailureKind::Compaction),
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn cancelled_run_projects_as_a_non_failure_terminal() {
+        let snapshot = project_session_snapshot(
+            crate::new_session_id(),
+            &[
+                LogEntry::Invoke {
+                    ts: 10,
+                    trigger: protocol::InvokeKind::UserSend,
+                },
+                LogEntry::RunCancelled { ts: 20 },
+            ],
+        );
+
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].timestamp, 20);
+        assert!(matches!(
+            snapshot.entries[0].data,
+            SessionSnapshotEntryData::RunCancelled
         ));
     }
 

@@ -125,6 +125,7 @@ impl SegmentLogSink {
                 | LogEntry::Invoke { .. }
                 | LogEntry::RunYielded { .. }
                 | LogEntry::RunResumed { .. }
+                | LogEntry::RunCancelled { .. }
                 | LogEntry::RunErrored { .. }
         )
     }

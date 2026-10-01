@@ -28,7 +28,7 @@ use crate::logged_item::LoggedItem;
 ///   `run()`/`resume()` (current callers persist a single TurnEnd at
 ///   run completion); the fork-point seq for `at_turn_index` is the
 ///   preceding `Invoke` entry, not the TurnEnd.
-/// - `RunCompleted` / `RunErrored` — marks end of a `run()` or `resume()` call
+/// - `RunCompleted` / `RunCancelled` / `RunErrored` — terminal run outcomes
 /// - `PausedTurnAbandoned` — explicit abandon/cancel of a paused interrupted turn
 /// - `ConfigChanged` — `RequestConfig` mutation
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -86,9 +86,10 @@ pub enum LogEntry {
     /// serde tag already occupies `"kind"`.
     ///
     /// Replay marks the run interrupted until a terminal `RunCompleted`,
-    /// `RunErrored`, or `PausedTurnAbandoned` entry proves how it ended. This
-    /// makes a process/disk failure between Invoke and its terminal record
-    /// restore conservatively instead of re-running a dangling tool call.
+    /// `RunCancelled`, `RunErrored`, or `PausedTurnAbandoned` entry proves how
+    /// it ended. This makes a process/disk failure between Invoke and its
+    /// terminal record restore conservatively instead of re-running a dangling
+    /// tool call.
     Invoke { ts: u64, trigger: InvokeKind },
 
     /// Canonical user submission with its exact model-visible entries. Typed
@@ -151,6 +152,10 @@ pub enum LogEntry {
         source: RunResumeSource,
         active_run_turn_count: usize,
     },
+
+    /// The logical Run ended because the user intentionally cancelled it.
+    /// This is terminal, but is not an execution failure.
+    RunCancelled { ts: u64 },
 
     /// `run()` / `resume()` が `EngineError` で終了した。
     /// `EngineError` は `Serialize` 不可なので `message` のみ lossy 保持する。
@@ -388,6 +393,10 @@ pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
                 // committed, not that Engine produced later output.
                 state.last_run_interrupted = true;
                 state.active_run_turn_count = Some(*active_run_turn_count);
+            }
+            LogEntry::RunCancelled { .. } => {
+                state.last_run_interrupted = false;
+                state.active_run_turn_count = None;
             }
             LogEntry::RunErrored { interrupted, .. } => {
                 state.last_run_interrupted = *interrupted;
@@ -887,6 +896,25 @@ mod tests {
         assert!(state.last_run_interrupted);
         assert_eq!(state.turn_count, 2);
         assert_eq!(state.active_run_turn_count, Some(2));
+    }
+
+    #[test]
+    fn replay_cancelled_run_is_terminal_without_becoming_a_failure() {
+        let state = collect_state(&[
+            LogEntry::Invoke {
+                ts: 100,
+                trigger: InvokeKind::UserSend,
+            },
+            LogEntry::TurnEnd {
+                ts: 200,
+                turn_count: 1,
+            },
+            LogEntry::RunCancelled { ts: 300 },
+        ]);
+
+        assert!(!state.last_run_interrupted);
+        assert_eq!(state.active_run_turn_count, None);
+        assert_eq!(state.turn_count, 1);
     }
 
     #[test]

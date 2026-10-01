@@ -2190,8 +2190,9 @@ function applySessionEntry(
     }
     case "run_yielded":
     case "run_resumed":
-      // Durable logical-Run transitions are replayable state, not Console
-      // progress rows. Runtime compaction progress remains the spinner authority.
+    case "run_cancelled":
+      // Durable logical-Run transitions and intentional cancellation are
+      // replayable lifecycle state, not errors or Console progress rows.
       break;
     case "run_error":
       appendDurableRunFailure(

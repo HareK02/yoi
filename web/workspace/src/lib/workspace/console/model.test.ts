@@ -134,6 +134,7 @@ function canonicalSession(logEntries: unknown[]): Event extends {
       }
       case "run_yielded":
       case "run_resumed":
+      case "run_cancelled":
         entries.push({
           entry_id: `legacy-test-${sequence++}`,
           provenance: "legacy_unknown",
@@ -393,6 +394,43 @@ Deno.test("snapshot restores compaction terminal without reviving transition pro
   assertEquals(projection.lines.length, 1);
   assertEquals(projection.lines[0].title, "Compaction failed");
   assertEquals(projection.lines[0].kind, "error");
+});
+
+Deno.test("intentional cancellation stays non-error in live and snapshot projections", () => {
+  const live = projectConsole([
+    {
+      eventId: "cancelled-terminal",
+      event: {
+        event: "session_entry_committed",
+        data: {
+          entry: {
+            entry_id: "cancelled-entry",
+            timestamp: 10,
+            provenance: "legacy_unknown",
+            kind: "run_cancelled",
+          },
+        },
+      } as Event,
+    },
+    {
+      eventId: "cancelled-run-end",
+      event: {
+        event: "run_end",
+        data: { result: "cancelled" },
+      } as Event,
+    },
+  ]);
+  assertEquals(live.lines.some((line) => line.kind === "error"), false);
+
+  const restored = projectConsole([{
+    eventId: "snapshot",
+    event: snapshotEvent("/repo", [{
+      kind: "run_cancelled",
+      timestamp: 10,
+    }]),
+  }]);
+  assertEquals(restored.lines.some((line) => line.kind === "error"), false);
+  assertEquals(restored.compaction, null);
 });
 
 Deno.test("snapshot replaces a live error with one durable run_errored row", () => {

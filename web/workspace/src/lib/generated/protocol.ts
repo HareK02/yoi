@@ -40,7 +40,7 @@ export type TurnResult = "finished" | "paused";
 
 export type InvokeKind = "user_send" | "notify" | "worker_event" | "system_reminder" | "wakeup";
 
-export type RunResult = "finished" | "paused" | "limit_reached" | "rolled_back";
+export type RunResult = "finished" | "paused" | "limit_reached" | "cancelled" | "rolled_back";
 
 export type ToolResultDisposition = "success" | "error" | "interrupted" | "cancelled" | "outcome_unknown";
 
@@ -142,7 +142,7 @@ export type RunResumeSource = "compaction" | "pause";
 
 export type RunFailureKind = "engine" | "compaction";
 
-export type SessionSnapshotEntryData = { "kind": "user_input", segments: Array<Segment>, } | { "kind": "message", role: SessionMessageRole, content: Array<SessionContentPart>, } | { "kind": "tool_call", call_id: string, name: string, arguments: string, } | { "kind": "tool_result", call_id: string, summary: string, content?: string | null, is_error: boolean, attachments?: Array<SessionToolAttachment>, } | { "kind": "system_item", item_kind: string, content: string, data?: unknown, } | { "kind": "run_yielded", reason: RunYieldReason, active_run_turn_count: number, } | { "kind": "run_resumed", source: RunResumeSource, active_run_turn_count: number, } | { "kind": "run_error", message: string, failure?: RunFailureKind | null, };
+export type SessionSnapshotEntryData = { "kind": "user_input", segments: Array<Segment>, } | { "kind": "message", role: SessionMessageRole, content: Array<SessionContentPart>, } | { "kind": "tool_call", call_id: string, name: string, arguments: string, } | { "kind": "tool_result", call_id: string, summary: string, content?: string | null, is_error: boolean, attachments?: Array<SessionToolAttachment>, } | { "kind": "system_item", item_kind: string, content: string, data?: unknown, } | { "kind": "run_yielded", reason: RunYieldReason, active_run_turn_count: number, } | { "kind": "run_resumed", source: RunResumeSource, active_run_turn_count: number, } | { "kind": "run_cancelled" } | { "kind": "run_error", message: string, failure?: RunFailureKind | null, };
 
 export type SessionSnapshotEntry = {
 /**
@@ -153,7 +153,7 @@ entry_id: string,
 /**
  * Timestamp copied from the durable log record that commits this entry.
  */
-timestamp: number, provenance: SessionEntryProvenance, derived_from?: Array<string>, } & ({ "kind": "user_input", segments: Array<Segment>, } | { "kind": "message", role: SessionMessageRole, content: Array<SessionContentPart>, } | { "kind": "tool_call", call_id: string, name: string, arguments: string, } | { "kind": "tool_result", call_id: string, summary: string, content?: string | null, is_error: boolean, attachments?: Array<SessionToolAttachment>, } | { "kind": "system_item", item_kind: string, content: string, data?: unknown, } | { "kind": "run_yielded", reason: RunYieldReason, active_run_turn_count: number, } | { "kind": "run_resumed", source: RunResumeSource, active_run_turn_count: number, } | { "kind": "run_error", message: string, failure?: RunFailureKind | null, });
+timestamp: number, provenance: SessionEntryProvenance, derived_from?: Array<string>, } & ({ "kind": "user_input", segments: Array<Segment>, } | { "kind": "message", role: SessionMessageRole, content: Array<SessionContentPart>, } | { "kind": "tool_call", call_id: string, name: string, arguments: string, } | { "kind": "tool_result", call_id: string, summary: string, content?: string | null, is_error: boolean, attachments?: Array<SessionToolAttachment>, } | { "kind": "system_item", item_kind: string, content: string, data?: unknown, } | { "kind": "run_yielded", reason: RunYieldReason, active_run_turn_count: number, } | { "kind": "run_resumed", source: RunResumeSource, active_run_turn_count: number, } | { "kind": "run_cancelled" } | { "kind": "run_error", message: string, failure?: RunFailureKind | null, });
 
 export type SessionConversationTurn = { turn_id: string, entries: Array<SessionSnapshotEntry>, };
 

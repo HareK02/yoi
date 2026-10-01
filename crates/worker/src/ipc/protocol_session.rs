@@ -64,6 +64,7 @@ pub fn live_log_entry_event(entry: LogEntry) -> Option<Event> {
         | LogEntry::AnnotatedToolResult { .. }
         | LogEntry::RunYielded { .. }
         | LogEntry::RunResumed { .. }
+        | LogEntry::RunCancelled { .. }
         | LogEntry::RunErrored { .. }) => {
             let mut projected =
                 session_store::public_snapshot::project_current_session_snapshot(&[entry]);

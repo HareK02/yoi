@@ -2794,6 +2794,12 @@ where
                             WorkerRunResult::Paused => (WorkerStatus::Paused, RunResult::Paused),
                             WorkerRunResult::LimitReached => (WorkerStatus::Idle, RunResult::LimitReached),
                             WorkerRunResult::RolledBack => (WorkerStatus::Idle, RunResult::RolledBack),
+                            WorkerRunResult::Cancelled if pause_requested => {
+                                (WorkerStatus::Paused, RunResult::Paused)
+                            }
+                            WorkerRunResult::Cancelled => {
+                                (WorkerStatus::Idle, RunResult::Cancelled)
+                            }
                             WorkerRunResult::Interrupted { .. } if pause_requested => {
                                 let _ = working_event_tx.send(Event::RunEnd { result: RunResult::Paused });
                                 return (WorkerStatus::Paused, shutdown_requested, false);

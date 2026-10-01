@@ -287,6 +287,7 @@ impl SessionCapture {
                     SessionSnapshotEntryData::SystemItem { .. }
                     | SessionSnapshotEntryData::RunYielded { .. }
                     | SessionSnapshotEntryData::RunResumed { .. }
+                    | SessionSnapshotEntryData::RunCancelled
                     | SessionSnapshotEntryData::RunError { .. } => return None,
                 };
                 Some(CapturedHistoryEntry {

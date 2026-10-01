@@ -4974,6 +4974,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 self.last_run_interrupted = false;
                 Ok(WorkerRunResult::LimitReached)
             }
+            EngineRunExit::Interrupted(RunInterruptionReason::Cancelled) => {
+                self.last_run_interrupted = false;
+                Ok(WorkerRunResult::Cancelled)
+            }
             EngineRunExit::Interrupted(reason) => {
                 self.last_run_interrupted = true;
                 Ok(WorkerRunResult::Interrupted {
@@ -5444,6 +5448,11 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     interrupted: false,
                     result: EngineResult::LimitReached,
                     active_run_turn_count,
+                })?;
+            }
+            EngineRunExit::Interrupted(RunInterruptionReason::Cancelled) => {
+                self.commit_entry(LogEntry::RunCancelled {
+                    ts: segment_log::now_millis(),
                 })?;
             }
             EngineRunExit::Interrupted(reason) => {
@@ -7376,6 +7385,8 @@ pub enum WorkerRunResult {
     Paused,
     /// The worker reached its configured max_turns limit.
     LimitReached,
+    /// The logical Run was intentionally cancelled after observable work.
+    Cancelled,
     /// The run was interrupted by a known or unexpected terminal cause.
     Interrupted { code: ErrorCode, message: String },
     /// The submit-time user turn was rolled back because no AI output was materialized.
@@ -9336,6 +9347,48 @@ mod build_summary_prompt_tests {
     }
 
     #[tokio::test]
+    async fn intentional_cancel_commits_a_non_failure_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let mut worker = Worker::new(
+            minimal_manifest(),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+            store.clone(),
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        worker.ensure_segment_head().await.unwrap();
+        worker.engine_mut().set_active_run_turn_count(Some(1));
+
+        let result = worker
+            .handle_worker_result(
+                EngineRunExit::Interrupted(RunInterruptionReason::Cancelled),
+                0,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result, WorkerRunResult::Cancelled);
+        let entries = store
+            .read_all(worker.session_id(), worker.segment_id())
+            .unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| matches!(entry, LogEntry::RunCancelled { .. }))
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| matches!(entry, LogEntry::RunErrored { .. }))
+        );
+        assert!(!worker.last_run_interrupted);
+    }
+
+    #[tokio::test]
     async fn fresh_run_clears_interrupted_budget_before_pre_run_compaction() {
         let dir = tempfile::tempdir().unwrap();
         let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
@@ -10522,7 +10575,7 @@ mod build_summary_prompt_tests {
     }
 
     #[tokio::test]
-    async fn interrupted_result_terminalizes_orphan_before_run_completed() {
+    async fn cancelled_result_terminalizes_orphan_before_run_terminal() {
         let dir = tempfile::tempdir().unwrap();
         let manifest = minimal_manifest();
         let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
@@ -10631,7 +10684,9 @@ mod build_summary_prompt_tests {
             .position(|entry| {
                 matches!(
                     entry,
-                    LogEntry::RunCompleted { .. } | LogEntry::RunErrored { .. }
+                    LogEntry::RunCompleted { .. }
+                        | LogEntry::RunCancelled { .. }
+                        | LogEntry::RunErrored { .. }
                 )
             })
             .expect("durable final run status");

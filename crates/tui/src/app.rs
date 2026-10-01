@@ -2545,7 +2545,8 @@ impl App {
                     }
                 }
                 SessionSnapshotEntryData::RunYielded { .. }
-                | SessionSnapshotEntryData::RunResumed { .. } => {
+                | SessionSnapshotEntryData::RunResumed { .. }
+                | SessionSnapshotEntryData::RunCancelled => {
                     // Durable logical-Run transitions are intentionally not
                     // presentation rows and never restore runtime progress.
                 }
@@ -3536,7 +3537,7 @@ mod completion_flow_tests {
 
     #[test]
     fn non_rolled_back_run_end_keeps_submitted_blocks_and_does_not_restore_input() {
-        for result in [RunResult::Paused, RunResult::Finished] {
+        for result in [RunResult::Paused, RunResult::Finished, RunResult::Cancelled] {
             let mut app = App::new("test".into());
             let submitted = submit_text(&mut app, "normal run");
             app.handle_worker_event(Event::UserMessage {
