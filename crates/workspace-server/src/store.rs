@@ -1532,7 +1532,11 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         target: &RuntimeWorkerRef,
         now: &str,
     ) -> Result<(BackendJobDeliveryRecord, bool)>;
-    fn recover_backend_job_deliveries(&self, workspace_id: &str, now: &str) -> Result<usize>;
+    fn recover_backend_job_deliveries(
+        &self,
+        workspace_id: &str,
+        now: &str,
+    ) -> Result<Vec<BackendJobDeliveryRecord>>;
     fn finish_backend_job_delivery(
         &self,
         workspace_id: &str,
@@ -5915,9 +5919,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let previous_id = attempt_id(job_id, job.current_attempt);
             let previous = read_backend_job_attempt(&tx, workspace_id, job_id, &previous_id)?
                 .ok_or_else(|| Error::Store("Backend Job current attempt is missing".to_string()))?;
-            if !matches!(previous.state, BackendJobAttemptState::Failed | BackendJobAttemptState::Unknown) {
+            if previous.state != BackendJobAttemptState::Failed {
                 return Err(Error::InvalidInput(
-                    "Backend Job re-evaluation requires a failed or unknown current attempt".to_string(),
+                    "Backend Job re-evaluation requires a definitively failed current attempt; unknown execution outcomes cannot be retried"
+                        .to_string(),
                 ));
             }
             if job.current_attempt >= job.request.limits.max_attempts {
@@ -6285,17 +6290,39 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
-    fn recover_backend_job_deliveries(&self, workspace_id: &str, now: &str) -> Result<usize> {
+    fn recover_backend_job_deliveries(
+        &self,
+        workspace_id: &str,
+        now: &str,
+    ) -> Result<Vec<BackendJobDeliveryRecord>> {
         self.with_conn_mut(|conn| {
-            conn.execute(
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
                 "UPDATE backend_job_deliveries
-                 SET state = 'unknown', failure_category = 'restart_ambiguous',
-                     failure_detail = 'delivery was in progress when the Backend restarted; notification will not be replayed',
+                 SET state = 'pending', failure_category = NULL, failure_detail = NULL,
                      updated_at = ?2
-                 WHERE workspace_id = ?1 AND state = 'sending'",
+                 WHERE workspace_id = ?1 AND state IN ('sending', 'unknown')",
                 params![workspace_id, now],
-            )
-            .map_err(Into::into)
+            )?;
+            let mut statement = tx.prepare(
+                "SELECT delivery_id FROM backend_job_deliveries
+                 WHERE workspace_id = ?1 AND state = 'pending'
+                 ORDER BY created_at, delivery_id",
+            )?;
+            let delivery_ids = statement
+                .query_map(params![workspace_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            let deliveries = delivery_ids
+                .into_iter()
+                .map(|delivery_id| {
+                    read_backend_job_delivery(&tx, workspace_id, &delivery_id)?.ok_or_else(|| {
+                        Error::Store("recoverable Backend Job delivery disappeared".to_string())
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            tx.commit()?;
+            Ok(deliveries)
         })
     }
 
@@ -19669,8 +19696,9 @@ INSERT INTO worker_registry (
             .unwrap();
         assert!(!claimed);
 
-        // A restart cannot know whether an in-flight transport completed, so
-        // it terminalizes the claim as unknown instead of sending twice.
+        // Restart recovery returns ambiguous in-flight claims to pending. The
+        // caller retries the same durable delivery id, which is also the
+        // Runtime notification request id and is deduplicated by the Worker.
         let (_, claimed) = store
             .reserve_backend_job_delivery(
                 workspace_id,
@@ -19681,12 +19709,12 @@ INSERT INTO worker_registry (
             )
             .unwrap();
         assert!(claimed);
-        assert_eq!(
-            store
-                .recover_backend_job_deliveries(workspace_id, "2026-09-01T00:00:09Z")
-                .unwrap(),
-            1
-        );
+        let recoverable = store
+            .recover_backend_job_deliveries(workspace_id, "2026-09-01T00:00:09Z")
+            .unwrap();
+        assert_eq!(recoverable.len(), 1);
+        assert_eq!(recoverable[0].delivery_id, "delivery-2");
+        assert_eq!(recoverable[0].state, BackendJobDeliveryState::Pending);
         let (delivery, claimed) = store
             .reserve_backend_job_delivery(
                 workspace_id,
@@ -19696,24 +19724,18 @@ INSERT INTO worker_registry (
                 "2026-09-01T00:00:10Z",
             )
             .unwrap();
-        assert!(!claimed);
-        assert_eq!(delivery.state, BackendJobDeliveryState::Unknown);
-        assert_eq!(
-            delivery.failure_category.as_deref(),
-            Some("restart_ambiguous")
-        );
-        assert!(
-            store
-                .finish_backend_job_delivery(
-                    workspace_id,
-                    "delivery-2",
-                    BackendJobDeliveryState::Completed,
-                    None,
-                    None,
-                    "2026-09-01T00:00:11Z",
-                )
-                .is_err()
-        );
+        assert!(claimed);
+        assert_eq!(delivery.state, BackendJobDeliveryState::Sending);
+        store
+            .finish_backend_job_delivery(
+                workspace_id,
+                "delivery-2",
+                BackendJobDeliveryState::Completed,
+                None,
+                None,
+                "2026-09-01T00:00:11Z",
+            )
+            .unwrap();
         assert_eq!(
             store
                 .get_backend_job(workspace_id, &request.job_id)
