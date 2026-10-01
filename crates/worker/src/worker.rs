@@ -4941,11 +4941,19 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
 
         if let Some(block) = request_block {
             let error = automatic_compact_block_error(block);
-            if matches!(result, EngineRunExit::Yielded) {
-                self.persist_compaction_run_failure(
+            let error = if matches!(result, EngineRunExit::Yielded) {
+                self.terminalize_compaction_run_failure(
                     request_block_message.expect("blocked request has a terminal reason"),
-                );
-            }
+                    error,
+                )
+            } else {
+                // `persist_turn` above already committed this non-yielded Run's
+                // compaction terminal. Preserve Err semantics while preventing a
+                // second Controller Error for the same durable entry.
+                WorkerError::RunFailureAlreadyDelivered {
+                    source: Box::new(error),
+                }
+            };
             if let Some(state) = &self.compact_state {
                 state.finish_logical_run();
             }
@@ -4999,33 +5007,33 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         }
     }
 
-    fn persist_compaction_run_failure(&mut self, message: String) {
-        // Keep the original compaction/preparation error as controller authority.
-        // A terminal append failure is diagnosed separately and cannot publish a
-        // false persisted result through the session-log sink.
-        match self.commit_entry(LogEntry::RunErrored {
+    fn persist_compaction_run_failure(&mut self, message: String) -> Result<(), WorkerError> {
+        // The Store is the terminal authority. Only a successful append can be
+        // marked as already delivered to clients through the session-log sink.
+        self.commit_entry(LogEntry::RunErrored {
             ts: segment_log::now_millis(),
             interrupted: false,
             message,
             failure: Some(RunFailureKind::Compaction),
-        }) {
-            Ok(()) => {
-                self.last_run_interrupted = false;
-                self.engine_mut().set_active_run_turn_count(None);
-            }
-            Err(persist_error) => {
-                warn!(
-                    error = %persist_error,
-                    "failed to persist mid-run compaction terminal record"
-                );
-                self.alert(
-                    AlertLevel::Error,
-                    AlertSource::Worker,
-                    format!(
-                        "mid-run compaction failed and its Run terminal record could not be saved: {persist_error}"
-                    ),
-                );
-            }
+        })?;
+        self.last_run_interrupted = false;
+        self.engine_mut().set_active_run_turn_count(None);
+        Ok(())
+    }
+
+    fn terminalize_compaction_run_failure(
+        &mut self,
+        message: String,
+        run_failure: WorkerError,
+    ) -> WorkerError {
+        match self.persist_compaction_run_failure(message) {
+            Ok(()) => WorkerError::RunFailureAlreadyDelivered {
+                source: Box::new(run_failure),
+            },
+            Err(persist_error) => WorkerError::RunTerminalPersistence {
+                run_failure: Box::new(run_failure),
+                persist_error: Box::new(persist_error),
+            },
         }
     }
 
@@ -5078,9 +5086,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                         }
                         let message =
                             format!("mid-run resume preparation failed after compaction: {error}");
-                        self.persist_compaction_run_failure(message.clone());
-                        self.alert(AlertLevel::Error, AlertSource::Compactor, message);
-                        return Err(error);
+                        return Err(self.terminalize_compaction_run_failure(message, error));
                     }
                     self.resume_prepared(RunResumeSource::Compaction).await
                 }
@@ -5102,14 +5108,11 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     }
 
                     // The yielded logical Run is no longer resumable. Commit its
-                    // durable failure before any log-derived live event can claim
-                    // the terminal transition. If storage itself is unavailable,
-                    // the helper retains the original compaction error (and its
-                    // fail-closed controller classification) while diagnosing the
-                    // missing terminal record separately.
-                    self.persist_compaction_run_failure(message.clone());
-                    self.alert(AlertLevel::Error, AlertSource::Compactor, message);
-                    Err(e)
+                    // durable failure before returning a typed handled error. The
+                    // Controller suppresses only that exact handled variant; if
+                    // persistence fails it instead reports both failures through
+                    // the non-durable error channel.
+                    Err(self.terminalize_compaction_run_failure(message, e))
                 }
             }
         })
@@ -5951,25 +5954,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             // outer compaction boundary performs the single stop attempt.
             return Err(WorkerError::InvalidState(error.to_string()));
         }
-        match handle.wait_until_idle().await {
-            crate::internal_worker::InternalWorkerSessionStatus::Idle => {}
-            crate::internal_worker::InternalWorkerSessionStatus::Stopped => {
-                return Err(WorkerError::CompactCancelled);
-            }
-            crate::internal_worker::InternalWorkerSessionStatus::Failed => {
-                return Err(WorkerError::InvalidState(
-                    handle
-                        .protocol_snapshot()
-                        .error
-                        .unwrap_or_else(|| "compactor Internal Worker failed".into()),
-                ));
-            }
-            status => {
-                return Err(WorkerError::InvalidState(format!(
-                    "compactor Internal Worker ended in {status:?}"
-                )));
-            }
-        }
+        ensure_compaction_internal_turn_succeeded(handle.wait_for_turn_outcome().await)?;
 
         // Guard: nudge the worker once more if the expected outputs
         // (summary, and any auto-read nominations when default refs
@@ -6003,20 +5988,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 .send(prompt)
                 .await
                 .map_err(|error| WorkerError::InvalidState(error.to_string()))?;
-            match handle.wait_until_idle().await {
-                crate::internal_worker::InternalWorkerSessionStatus::Idle => {}
-                crate::internal_worker::InternalWorkerSessionStatus::Stopped => {
-                    return Err(WorkerError::CompactCancelled);
-                }
-                _ => {
-                    return Err(WorkerError::InvalidState(
-                        handle
-                            .protocol_snapshot()
-                            .error
-                            .unwrap_or_else(|| "compactor Internal Worker failed".into()),
-                    ));
-                }
-            }
+            ensure_compaction_internal_turn_succeeded(handle.wait_for_turn_outcome().await)?;
         }
 
         let mut final_ctx = ctx.lock().expect("compact ctx poisoned").clone();
@@ -6035,20 +6007,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 .send(prompt)
                 .await
                 .map_err(|error| WorkerError::InvalidState(error.to_string()))?;
-            match handle.wait_until_idle().await {
-                crate::internal_worker::InternalWorkerSessionStatus::Idle => {}
-                crate::internal_worker::InternalWorkerSessionStatus::Stopped => {
-                    return Err(WorkerError::CompactCancelled);
-                }
-                _ => {
-                    return Err(WorkerError::InvalidState(
-                        handle
-                            .protocol_snapshot()
-                            .error
-                            .unwrap_or_else(|| "compactor Internal Worker failed".into()),
-                    ));
-                }
-            }
+            ensure_compaction_internal_turn_succeeded(handle.wait_for_turn_outcome().await)?;
             final_ctx = ctx.lock().expect("compact ctx poisoned").clone();
             summary_text = final_ctx
                 .summary
@@ -7904,6 +7863,37 @@ fn restored_flow_runtime_state(
         .transpose()
 }
 
+fn ensure_compaction_internal_turn_succeeded(
+    outcome: Option<crate::internal_worker::InternalWorkerTurnOutcome>,
+) -> Result<(), WorkerError> {
+    use crate::internal_worker::InternalWorkerTurnOutcome;
+
+    match outcome {
+        Some(InternalWorkerTurnOutcome::Completed(WorkerRunResult::Finished)) => Ok(()),
+        Some(InternalWorkerTurnOutcome::Completed(WorkerRunResult::LimitReached)) => {
+            Err(WorkerError::Engine(EngineError::Aborted(
+                "compactor Internal Worker reached its turn limit".to_string(),
+            )))
+        }
+        Some(InternalWorkerTurnOutcome::Completed(WorkerRunResult::Interrupted {
+            message,
+            ..
+        })) => Err(WorkerError::Engine(EngineError::Aborted(message))),
+        Some(InternalWorkerTurnOutcome::Completed(
+            WorkerRunResult::Cancelled | WorkerRunResult::RolledBack,
+        )) => Err(WorkerError::CompactCancelled),
+        Some(InternalWorkerTurnOutcome::Completed(WorkerRunResult::Paused)) => Err(
+            WorkerError::InvalidState("compactor Internal Worker paused unexpectedly".to_string()),
+        ),
+        Some(InternalWorkerTurnOutcome::Failed { message }) => {
+            Err(WorkerError::InvalidState(message))
+        }
+        None => Err(WorkerError::InvalidState(
+            "compactor Internal Worker stopped without a typed turn outcome".to_string(),
+        )),
+    }
+}
+
 fn automatic_compact_block_error(block: AutomaticCompactBlock) -> WorkerError {
     match block {
         AutomaticCompactBlock::Thrash => WorkerError::CompactThrash,
@@ -8018,6 +8008,26 @@ pub enum WorkerError {
 
     #[error("compaction was cancelled")]
     CompactCancelled,
+
+    /// The logical Run failed, and its terminal entry was already committed and
+    /// published through the session-log authority. Controllers must preserve the
+    /// error outcome without emitting a second generic error event.
+    #[error("{source}")]
+    RunFailureAlreadyDelivered {
+        #[source]
+        source: Box<WorkerError>,
+    },
+
+    /// The logical Run failed and its terminal entry could not be committed.
+    /// This remains unhandled so the Controller reports the run and persistence
+    /// failures together through its non-durable error channel.
+    #[error(
+        "run failed ({run_failure}) and its terminal record could not be persisted: {persist_error}"
+    )]
+    RunTerminalPersistence {
+        run_failure: Box<WorkerError>,
+        persist_error: Box<WorkerError>,
+    },
 
     #[error("compact summary too large: {tokens} tokens exceeds max {max}")]
     CompactSummaryTooLarge { tokens: u64, max: u64 },
@@ -9105,6 +9115,83 @@ mod build_summary_prompt_tests {
     }
 
     #[derive(Clone)]
+    struct FailRunTerminalStore {
+        inner: session_store::FsStore,
+        fail_run_terminal: Arc<AtomicBool>,
+    }
+
+    impl Store for FailRunTerminalStore {
+        fn append(
+            &self,
+            session_id: SessionId,
+            segment_id: SegmentId,
+            entry: &LogEntry,
+        ) -> Result<(), StoreError> {
+            if matches!(entry, LogEntry::RunErrored { .. })
+                && self.fail_run_terminal.swap(false, Ordering::SeqCst)
+            {
+                return Err(StoreError::Io(std::io::Error::other(
+                    "synthetic terminal append failure",
+                )));
+            }
+            self.inner.append(session_id, segment_id, entry)
+        }
+
+        fn read_all(
+            &self,
+            session_id: SessionId,
+            segment_id: SegmentId,
+        ) -> Result<Vec<LogEntry>, StoreError> {
+            self.inner.read_all(session_id, segment_id)
+        }
+
+        fn list_sessions(&self) -> Result<Vec<SessionId>, StoreError> {
+            self.inner.list_sessions()
+        }
+
+        fn list_segments(&self, session_id: SessionId) -> Result<Vec<SegmentId>, StoreError> {
+            self.inner.list_segments(session_id)
+        }
+
+        fn lookup_session_of(
+            &self,
+            segment_id: SegmentId,
+        ) -> Result<Option<SessionId>, StoreError> {
+            self.inner.lookup_session_of(segment_id)
+        }
+
+        fn create_segment(
+            &self,
+            session_id: SessionId,
+            segment_id: SegmentId,
+            entries: &[LogEntry],
+        ) -> Result<(), StoreError> {
+            self.inner.create_segment(session_id, segment_id, entries)
+        }
+
+        fn exists(&self, session_id: SessionId, segment_id: SegmentId) -> Result<bool, StoreError> {
+            self.inner.exists(session_id, segment_id)
+        }
+
+        fn read_entry_count(
+            &self,
+            session_id: SessionId,
+            segment_id: SegmentId,
+        ) -> Result<usize, StoreError> {
+            self.inner.read_entry_count(session_id, segment_id)
+        }
+
+        fn append_trace(
+            &self,
+            session_id: SessionId,
+            segment_id: SegmentId,
+            entry: &session_store::TraceEntry,
+        ) -> Result<(), StoreError> {
+            self.inner.append_trace(session_id, segment_id, entry)
+        }
+    }
+
+    #[derive(Clone)]
     struct NoopClient;
 
     #[async_trait]
@@ -9314,9 +9401,9 @@ mod build_summary_prompt_tests {
             .unwrap();
         worker.last_run_interrupted = true;
 
-        worker.persist_compaction_run_failure(
-            "mid-run compaction failed: summary unavailable".into(),
-        );
+        worker
+            .persist_compaction_run_failure("mid-run compaction failed: summary unavailable".into())
+            .unwrap();
 
         let entries = store
             .read_all(worker.session_id(), worker.segment_id())
@@ -9346,6 +9433,92 @@ mod build_summary_prompt_tests {
         );
         assert!(!worker.last_run_interrupted);
         assert_eq!(worker.engine().active_run_turn_count(), None);
+    }
+
+    #[tokio::test]
+    async fn failed_compaction_terminal_append_stays_unhandled_and_unpublished() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FailRunTerminalStore {
+            inner: session_store::FsStore::new(dir.path().join("sessions")).unwrap(),
+            fail_run_terminal: Arc::new(AtomicBool::new(false)),
+        };
+        let mut worker = Worker::new(
+            minimal_manifest(),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+            store.clone(),
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        worker.ensure_segment_head().await.unwrap();
+        store.fail_run_terminal.store(true, Ordering::SeqCst);
+
+        let error = worker.terminalize_compaction_run_failure(
+            "mid-run compaction failed: summary unavailable".into(),
+            WorkerError::CompactSummaryMissing,
+        );
+
+        assert!(matches!(
+            error,
+            WorkerError::RunTerminalPersistence {
+                run_failure,
+                persist_error,
+            } if matches!(*run_failure, WorkerError::CompactSummaryMissing)
+                && persist_error.to_string().contains("synthetic terminal append failure")
+        ));
+        assert!(
+            store
+                .read_all(worker.session_id(), worker.segment_id())
+                .unwrap()
+                .iter()
+                .all(|entry| !matches!(entry, LogEntry::RunErrored { .. }))
+        );
+        assert!(
+            worker
+                .sink()
+                .subscribe_with_snapshot()
+                .0
+                .iter()
+                .all(|entry| !matches!(entry, LogEntry::RunErrored { .. })),
+            "a failed append must not be published as durable"
+        );
+    }
+
+    #[test]
+    fn compaction_internal_turn_preserves_typed_stop_causes() {
+        use crate::internal_worker::InternalWorkerTurnOutcome;
+
+        let limit = ensure_compaction_internal_turn_succeeded(Some(
+            InternalWorkerTurnOutcome::Completed(WorkerRunResult::LimitReached),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(limit, WorkerError::Engine(EngineError::Aborted(message)) if message.contains("turn limit"))
+        );
+
+        let interrupted = ensure_compaction_internal_turn_succeeded(Some(
+            InternalWorkerTurnOutcome::Completed(WorkerRunResult::Interrupted {
+                code: ErrorCode::ProviderError,
+                message: "summary provider failed".to_string(),
+            }),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(interrupted, WorkerError::Engine(EngineError::Aborted(message)) if message == "summary provider failed")
+        );
+
+        let cancelled = ensure_compaction_internal_turn_succeeded(Some(
+            InternalWorkerTurnOutcome::Completed(WorkerRunResult::Cancelled),
+        ))
+        .unwrap_err();
+        assert!(matches!(cancelled, WorkerError::CompactCancelled));
+
+        let unknown = ensure_compaction_internal_turn_succeeded(None).unwrap_err();
+        assert!(
+            matches!(unknown, WorkerError::InvalidState(message) if message.contains("without a typed turn outcome"))
+        );
     }
 
     #[tokio::test]

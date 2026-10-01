@@ -2208,7 +2208,10 @@ function applySessionEntry(
   const entryId = stringField(value, "entry_id");
   if (entryId) {
     for (
-      let index = Math.max(0, lineCountBefore - 1);
+      let index = Math.max(
+        0,
+        Math.min(lineCountBefore, projection.lines.length - 1),
+      );
       index < projection.lines.length;
       index += 1
     ) {
