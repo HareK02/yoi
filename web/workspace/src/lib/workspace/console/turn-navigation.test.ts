@@ -54,11 +54,11 @@ Deno.test("streaming updates change the preview without creating another turn", 
   equal(answer.body, "Hi");
 });
 
-Deno.test("snapshot in-flight assistant text is previewed but in-flight thinking is not", () => {
+Deno.test("snapshot-restored assistant text is previewed but thinking is not", () => {
   equal(consoleTurns([
     line("u", "user", "Question"),
-    { ...line("reasoning", "in_flight", "Private"), title: "in-flight thinking" },
-    { ...line("text", "in_flight", "Answer in progress"), title: "in-flight assistant text" },
+    line("reasoning", "thinking", "Private"),
+    line("text", "assistant", "Answer in progress"),
   ]), [{ id: "u", user: "Question", assistant: "Answer in progress" }]);
 });
 

@@ -40,7 +40,6 @@ export type ConsoleLineKind =
   | "status"
   | "error"
   | "usage"
-  | "in_flight"
   | "system";
 
 type ToolCallState =
@@ -361,8 +360,7 @@ function projectVisibleConsole(
 }
 
 function isOverviewThinkingLine(line: ConsoleLine): boolean {
-  return line.kind === "thinking" ||
-    (line.kind === "in_flight" && line.title === "in-flight thinking");
+  return line.kind === "thinking";
 }
 
 function representedToolCallCount(line: ConsoleLine): number {
@@ -559,12 +557,58 @@ function appendSnapshotInFlightLines(
   eventId: string,
   cwd: string | null,
 ): void {
-  const lineIds = new Set(projection.lines.map((line) => line.id));
   blocks.forEach((block, index) => {
-    const pending = inFlightLine(`${eventId}:${index}`, block, cwd);
-    if (lineIds.has(pending.id)) return;
-    projection.lines.push(pending);
-    lineIds.add(pending.id);
+    const blockEventId = `${eventId}:${index}`;
+    switch (block.kind) {
+      case "text":
+        appendStreaming(
+          projection,
+          blockEventId,
+          "assistant",
+          "assistant streaming",
+          block.text,
+        );
+        if (block.finished) {
+          finalizeStreaming(
+            projection,
+            "assistant",
+            blockEventId,
+            "assistant",
+            block.text,
+          );
+        }
+        break;
+      case "thinking":
+        startStreaming(projection, blockEventId, "thinking", "Thinking...");
+        if (block.text) {
+          appendStreaming(
+            projection,
+            blockEventId,
+            "thinking",
+            "Thinking...",
+            block.text,
+          );
+        }
+        if (block.finished) {
+          finalizeStreaming(
+            projection,
+            "thinking",
+            blockEventId,
+            "Thought",
+            block.text,
+          );
+        }
+        break;
+      case "tool_call":
+        upsertToolCall(projection, blockEventId, block.id, {
+          name: block.name,
+          argsStream: block.args,
+          arguments: block.state === "done" ? block.args : undefined,
+          state: inFlightToolState(block.state),
+          cwd,
+        });
+        break;
+    }
   });
 }
 
@@ -924,10 +968,23 @@ export function applyProtocolEvent(
         entryId: event.data.entry_id ?? undefined,
       });
       break;
-    case "session_entry_committed":
-      reconcileCommittedSessionEntry(next, event.data.entry);
+    case "session_entry_committed": {
+      const replacementIndex = reconcileCommittedSessionEntry(
+        next,
+        event.data.entry,
+      );
       applySessionEntry(next, envelope.eventId, event.data.entry);
+      if (replacementIndex !== undefined) {
+        const committedIndex = next.lines.findIndex((line) =>
+          line.entryId === event.data.entry.entry_id
+        );
+        if (committedIndex >= 0) {
+          const [committed] = next.lines.splice(committedIndex, 1);
+          next.lines.splice(replacementIndex, 0, committed);
+        }
+      }
       break;
+    }
     case "system_item":
       next.lines.push(systemItemLine(envelope.eventId, event.data.item));
       applyTaskSystemItem(next, event.data.item);
@@ -951,9 +1008,7 @@ export function applyProtocolEvent(
       );
       break;
     case "thinking_start":
-      next.lines.push(
-        line(envelope.eventId, "thinking", "Thinking...", "", undefined, true),
-      );
+      startStreaming(next, envelope.eventId, "thinking", "Thinking...");
       break;
     case "thinking_delta":
       appendStreaming(
@@ -1296,7 +1351,8 @@ function appendDurableRunFailure(
   ) return;
   projection.lines = projection.lines.filter((line) => {
     if (isDurableRunFailure(line)) return true;
-    return !(line.kind === "error" && runFailureMessagesMatch(line.body, message));
+    return !(line.kind === "error" &&
+      runFailureMessagesMatch(line.body, message));
   });
   projection.lines.push({
     ...line(
@@ -1342,6 +1398,15 @@ function findLastLineIndex(
     }
   }
   return -1;
+}
+
+function startStreaming(
+  projection: ConsoleProjection,
+  eventId: string,
+  kind: "assistant" | "thinking",
+  title: string,
+): void {
+  projection.lines.push(line(eventId, kind, title, "", undefined, true));
 }
 
 function appendStreaming(
@@ -2131,16 +2196,22 @@ function snapshotProjectionFromSession(
 function reconcileCommittedSessionEntry(
   projection: ConsoleProjection,
   entry: SessionSnapshotEntry,
-): void {
+): number | undefined {
   if (entry.kind !== "message" || entry.role !== "assistant") return;
-  for (let index = projection.lines.length - 1; index >= 0; index -= 1) {
+  const turnStart = findLastLineIndex(
+    projection.lines,
+    (line) => line.kind === "user",
+  );
+  for (let index = turnStart + 1; index < projection.lines.length; index += 1) {
     const line = projection.lines[index];
-    if (line.entryId) continue;
-    if (line.kind === "assistant" || line.kind === "in_flight") {
+    if (
+      line.kind === "assistant" &&
+      !line.entryId &&
+      line.streaming !== true
+    ) {
       projection.lines.splice(index, 1);
-      return;
+      return index;
     }
-    if (line.kind === "user") return;
   }
 }
 
@@ -2356,42 +2427,6 @@ function loggedContentText(parts: unknown[]): string {
     })
     .filter(Boolean)
     .join("\n");
-}
-
-function inFlightLine(
-  eventId: string,
-  block: InFlightBlock,
-  cwd: string | null,
-): ConsoleLine {
-  switch (block.kind) {
-    case "text":
-      return line(
-        eventId,
-        "in_flight",
-        "in-flight assistant text",
-        block.text,
-        undefined,
-        !block.finished,
-      );
-    case "thinking":
-      return line(
-        eventId,
-        "in_flight",
-        "in-flight thinking",
-        block.text,
-        undefined,
-        !block.finished,
-      );
-    case "tool_call":
-      return toolLine(eventId, {
-        id: block.id,
-        name: block.name,
-        argsStream: block.args,
-        arguments: block.state === "done" ? block.args : undefined,
-        state: inFlightToolState(block.state),
-        cwd,
-      });
-  }
 }
 
 function inFlightToolState(
