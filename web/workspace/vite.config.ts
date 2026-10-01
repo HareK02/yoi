@@ -19,7 +19,9 @@ export default defineConfig({
       ignored: [
         "**/.tmp*",
         "**/.tmp*/**",
+        // Config bundling creates and immediately deletes these files.
         "**/vite.config.*.timestamp-*.mjs",
+        "**/vitest.config.*.timestamp-*.mjs",
       ],
     },
 
