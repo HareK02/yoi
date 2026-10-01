@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onDestroy, type Snippet } from 'svelte';
   import Bevel from '$lib/workspace/ui/Bevel.svelte';
+  import SidebarToggleIcon from './SidebarToggleIcon.svelte';
   import './sidebar.css';
 
   type Props = {
@@ -81,16 +82,20 @@
   class:hover-mode={mode === 'hover'}
   aria-label="Sidebar"
   bind:this={frame}
-  onpointerenter={enter}
-  onpointerleave={leave}
-  onpointercancel={leave}
   onfocusin={focusIn}
   onfocusout={focusOut}
 >
   <Bevel as="div" class="sidebar-frame__bevel" top={false} bottom={false} left={false}>
     <div class="sidebar-frame__surface">
-      <div class="sidebar-frame-content" inert={!open} aria-hidden={!open}>
-        {@render children()}
+      <div
+        class="sidebar-hover-region"
+        onpointerenter={enter}
+        onpointerleave={leave}
+        onpointercancel={leave}
+      >
+        <div class="sidebar-frame-content" inert={!open} aria-hidden={!open}>
+          {@render children()}
+        </div>
       </div>
 
       <div class="sidebar-control-row">
@@ -102,10 +107,7 @@
           title={mode === 'pinned' ? 'Always visible — switch to show on hover' : 'Show on hover — pin sidebar'}
           onclick={toggleMode}
         >
-          <svg class="sidebar-icon" aria-hidden="true" viewBox="0 0 24 24">
-            <path d="M9 3H15L14 9L18 13V15H6V13L10 9L9 3ZM12 15V21" />
-            {#if mode === 'hover'}<path d="M3 3L21 21" />{/if}
-          </svg>
+          <SidebarToggleIcon open={mode === 'pinned'} />
         </button>
       </div>
     </div>

@@ -44,19 +44,26 @@ async function historyRequestCount(baseUrl: string): Promise<number> {
 async function checkSidebarModeSwitch(page: Page, name: string): Promise<void> {
   const button = page.getByRole("button", { name, exact: true });
   await button.hover();
+  await button.focus();
   const samples = await button.evaluate(async (button) => {
     const frame = button.closest<HTMLElement>(".sidebar-frame")!;
     await Promise.all(frame.getAnimations({ subtree: true }).map((animation) => animation.finished));
     const panel = frame.querySelector<HTMLElement>(".sidebar-frame__bevel")!;
     const content = frame.querySelector<HTMLElement>(".sidebar-frame-content")!;
+    const main = document.querySelector<HTMLElement>(".app-shell__main")!;
     const sample = () => ({
-      panel: panel.getBoundingClientRect().toJSON(),
-      content: content.getBoundingClientRect().toJSON(),
-      button: button.getBoundingClientRect().toJSON(),
-      folded: frame.classList.contains("folded"),
-      motion: frame.getAnimations({ subtree: true }).filter((animation) =>
-        animation instanceof CSSTransition && ["width", "transform"].includes(animation.transitionProperty)
-      ).length,
+      mainLeft: main.getBoundingClientRect().left,
+      mainWidth: main.getBoundingClientRect().width,
+      stationary: {
+        panel: panel.getBoundingClientRect().toJSON(),
+        content: content.getBoundingClientRect().toJSON(),
+        button: button.getBoundingClientRect().toJSON(),
+        folded: frame.classList.contains("folded"),
+        unclipped: panel.contains(document.elementFromPoint(panel.getBoundingClientRect().right - 8, 40)),
+        motion: panel.getAnimations({ subtree: true }).filter((animation) =>
+          animation instanceof CSSTransition && ["width", "transform"].includes(animation.transitionProperty)
+        ).length,
+      },
     });
     const samples = [sample()];
     (button as HTMLButtonElement).click();
@@ -68,14 +75,22 @@ async function checkSidebarModeSwitch(page: Page, name: string): Promise<void> {
     return samples;
   });
   for (const sample of samples) {
-    assertEquals(sample, samples[0], `${name} must keep the open panel stationary without slide animation`);
-    assertEquals(sample.folded, false);
-    assertEquals(sample.motion, 0);
+    assertEquals(sample.stationary, samples[0].stationary, `${name} must keep the open panel stationary without slide animation`);
+    assertEquals(sample.stationary.folded, false);
+    assertEquals(sample.stationary.motion, 0);
+    assertEquals(sample.stationary.unclipped, true);
   }
+  const first = samples[0];
+  const last = samples.at(-1)!;
+  assert(samples.some((sample) => sample.mainLeft > Math.min(first.mainLeft, last.mainLeft) &&
+    sample.mainLeft < Math.max(first.mainLeft, last.mainLeft)), "main position must animate through intermediate coordinates");
+  assert(samples.some((sample) => sample.mainWidth > Math.min(first.mainWidth, last.mainWidth) &&
+    sample.mainWidth < Math.max(first.mainWidth, last.mainWidth)), "main width must animate through intermediate sizes");
+  await page.locator(".sidebar-fold-button").evaluate((button) => (button as HTMLButtonElement).blur());
 }
 
 async function checkSidebarSlide(page: Page, mobile: boolean, opening: boolean): Promise<void> {
-  const toggle = page.locator(mobile ? ".app-shell__mobile-sidebar-toggle" : ".sidebar-frame");
+  const toggle = page.locator(mobile ? ".app-shell__mobile-sidebar-toggle" : ".sidebar-hover-region");
   const result = await toggle.evaluate(async (button, { mobile, opening }) => {
     const frame = document.querySelector<HTMLElement>(".sidebar-frame")!;
     const content = frame.querySelector<HTMLElement>(".sidebar-frame-content")!;
@@ -440,6 +455,20 @@ async function checkConsoleHistory(viewportHeight: number): Promise<void> {
       const mainBeforeHover = await page.locator(".app-shell__main").boundingBox();
       await checkSidebarSlide(page, false, true);
       await checkSidebarSlide(page, false, false);
+      // The entire footer, including its button, is outside hover activation.
+      const footer = sidebar.locator(".sidebar-control-row");
+      await footer.hover({ position: { x: 4, y: 4 } });
+      await page.waitForTimeout(250);
+      assertEquals(await page.locator(".sidebar-frame.folded").count(), 1);
+      await page.getByRole("button", { name: "Pin sidebar", exact: true }).hover();
+      await page.waitForTimeout(250);
+      assertEquals(await page.locator(".sidebar-frame.folded").count(), 1);
+      await sidebar.locator(".sidebar-hover-region").hover({ position: { x: 10, y: 24 } });
+      await page.locator(".sidebar-frame:not(.folded)").waitFor();
+      await settleSidebar();
+      await footer.hover({ position: { x: 4, y: 4 } });
+      await page.locator(".sidebar-frame.folded").waitFor();
+      await settleSidebar();
       // Use real mouse and keyboard events as well as deterministic motion sampling.
       await sidebar.hover({ position: { x: 10, y: 40 } });
       await page.locator(".sidebar-frame:not(.folded)").waitFor();

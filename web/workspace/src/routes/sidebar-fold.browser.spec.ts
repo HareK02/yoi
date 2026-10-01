@@ -16,8 +16,9 @@ const props = {
 };
 const frame = () => screen.getByRole("complementary", { name: "Sidebar" });
 const folded = () => frame().classList.contains("folded");
-const enter = () => fireEvent.pointerEnter(frame(), { pointerType: "mouse" });
-const leave = () => fireEvent.pointerLeave(frame(), { pointerType: "mouse" });
+const hoverRegion = () => frame().querySelector<HTMLElement>(".sidebar-hover-region")!;
+const enter = () => fireEvent.pointerEnter(hoverRegion(), { pointerType: "mouse" });
+const leave = () => fireEvent.pointerLeave(hoverRegion(), { pointerType: "mouse" });
 const delay = () => vi.advanceTimersByTimeAsync(200);
 
 beforeEach(() => { localStorage.clear(); vi.useFakeTimers(); });
@@ -85,6 +86,27 @@ test("hover keeps the same content node, delays closing, and cancels closing on 
   expect(content.inert).toBe(true);
   expect(content.getAttribute("aria-hidden")).toBe("true");
   expect(localStorage.getItem(storageKey)).toBe("hover");
+});
+
+test("footer hover does not open or hold the preview, but its button still changes mode", async () => {
+  localStorage.setItem(storageKey, "hover");
+  render(Layout, { props });
+  const footer = frame().querySelector<HTMLElement>(".sidebar-control-row")!;
+  const button = screen.getByRole("button", { name: "Pin sidebar" });
+  expect(button.querySelector('[data-icon="panel-right-open"] rect')).not.toBeNull();
+  await fireEvent.pointerEnter(footer, { pointerType: "mouse" });
+  await fireEvent.pointerEnter(button, { pointerType: "mouse" });
+  await delay();
+  expect(folded()).toBe(true);
+  await enter();
+  expect(folded()).toBe(false);
+  await leave();
+  await fireEvent.pointerEnter(footer, { pointerType: "mouse" });
+  await delay();
+  expect(folded()).toBe(true);
+  await fireEvent.click(button, { detail: 1 });
+  expect(folded()).toBe(false);
+  expect(button.querySelector('[data-icon="panel-right-close"] rect')).not.toBeNull();
 });
 
 test("keyboard focus opens the preview and holds it until focus leaves", async () => {

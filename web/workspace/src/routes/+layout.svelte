@@ -11,6 +11,7 @@
   } from '$lib/workspace/header/context';
   import GlobalSidebar from '$lib/workspace/sidebar/GlobalSidebar.svelte';
   import SidebarFrame from '$lib/workspace/sidebar/SidebarFrame.svelte';
+  import SidebarToggleIcon from '$lib/workspace/sidebar/SidebarToggleIcon.svelte';
   import { SIDEBAR_CONTEXT, type SidebarController, type SidebarSnippet } from '$lib/workspace/sidebar/context';
   import { createOverrideStack } from '$lib/workspace/sidebar/override-stack';
   import '../app.css';
@@ -102,15 +103,7 @@
           title={sidebarOpen ? 'Hide sidebar' : 'Show sidebar'}
           onclick={toggleSidebar}
         >
-          <svg class="app-shell__icon" aria-hidden="true" viewBox="0 0 24 24">
-            {#if !sidebarOpen}
-              <path d="m6 17 5-5-5-5" />
-              <path d="m13 17 5-5-5-5" />
-            {:else}
-              <path d="m11 17-5-5 5-5" />
-              <path d="m18 17-5-5 5-5" />
-            {/if}
-          </svg>
+          <SidebarToggleIcon open={sidebarOpen} />
         </button>
         <a class="app-shell__icon-button" href="/account" aria-label="Open Account" title="Account">
           <svg class="app-shell__icon" aria-hidden="true" viewBox="0 0 24 24">
