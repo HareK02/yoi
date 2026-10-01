@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum WorkerInputKind {
     User,
+    /// Agent input that must never enter the human Submit queue.
+    UserIfIdle,
     Notify,
     Compact,
     ListRewindTargets,

@@ -240,6 +240,16 @@ pub enum Method {
         #[serde(skip_deserializing, default)]
         source: AuthenticatedInputSource,
     },
+    /// Agent-controlled input: accept only at an Idle controller boundary, never
+    /// enqueue behind a run. Unlike human Submit, non-Idle admission is rejected.
+    #[cfg_attr(feature = "typescript", ts(skip))]
+    #[cfg_attr(feature = "json-schema", schemars(skip))]
+    SubmitIfIdle {
+        submission_request_id: String,
+        input: Vec<Segment>,
+        #[serde(skip_deserializing, default)]
+        source: AuthenticatedInputSource,
+    },
     /// Human-readable text injected into the target Worker's LLM context as a
     /// non-blocking system message. Accepted notifications are delivered at the
     /// next between-turn boundary, or start a coalesced notification run while

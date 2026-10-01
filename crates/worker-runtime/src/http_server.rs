@@ -1556,6 +1556,19 @@ fn authorize_runtime_protocol_method(
             submission_request_id,
             input,
         },
+        protocol::Method::SubmitIfIdle {
+            submission_request_id,
+            input,
+            ..
+        } => protocol::Method::SubmitIfIdle {
+            source: transport_source.cloned().unwrap_or_else(|| {
+                protocol::AuthenticatedInputSource::Backend {
+                    operation_id: submission_request_id.clone(),
+                }
+            }),
+            submission_request_id,
+            input,
+        },
         protocol::Method::NotifyTracked {
             notification_request_id,
             message,

@@ -65,6 +65,14 @@ pub struct WorkerHandle {
 
 impl WorkerHandle {
     pub async fn send(&self, method: Method) -> Result<(), mpsc::error::SendError<Method>> {
+        // Reject known-busy sends before channel dispatch, including maintenance
+        // that cannot receive methods until it finishes. The controller checks
+        // again at admission to cover an Idle -> busy race after this snapshot.
+        if self.shared_state.snapshot().state != WorkerState::Idle
+            && reject_idle_only_submission(&method, &self.working_event_tx)
+        {
+            return Ok(());
+        }
         self.method_tx.send(method).await
     }
 
@@ -1523,6 +1531,21 @@ where
     }
 }
 
+fn reject_idle_only_submission(method: &Method, events: &broadcast::Sender<Event>) -> bool {
+    let Method::SubmitIfIdle {
+        submission_request_id,
+        ..
+    } = method
+    else {
+        return false;
+    };
+    let _ = events.send(Event::SubmissionRejected {
+        submission_request_id: submission_request_id.clone(),
+        message: "WorkerSendInput requires an Idle Worker and never queues input. Use WorkerNotify for information about work already in progress.".to_string(),
+    });
+    true
+}
+
 fn durably_accept_method_while_busy<St>(
     method: Method,
     pending_submissions: &PendingSubmissionHandle<St>,
@@ -1531,6 +1554,9 @@ fn durably_accept_method_while_busy<St>(
 where
     St: session_store::Store + Clone,
 {
+    if reject_idle_only_submission(&method, working_event_tx) {
+        return None;
+    }
     match method {
         Method::Submit {
             submission_request_id,
@@ -1638,6 +1664,10 @@ fn reject_method_while_attention_locked(
             ..
         }
         | Method::SubmitTracked {
+            submission_request_id,
+            ..
+        }
+        | Method::SubmitIfIdle {
             submission_request_id,
             ..
         } => {
@@ -1946,6 +1976,12 @@ async fn controller_loop<C, St>(
             }
         };
 
+        if shared_state.snapshot().state != WorkerState::Idle
+            && reject_idle_only_submission(&method, &working_event_tx)
+        {
+            continue;
+        }
+
         if worker.has_pending_compaction_cleanup() {
             match worker.retry_pending_compaction_cleanup().await {
                 Ok(()) => {
@@ -2029,6 +2065,11 @@ async fn controller_loop<C, St>(
                 }
             }
             Method::SubmitTracked {
+                submission_request_id,
+                input,
+                source,
+            }
+            | Method::SubmitIfIdle {
                 submission_request_id,
                 input,
                 source,
@@ -3017,6 +3058,9 @@ where
                             }
                         }
                     }
+                    Some(method @ Method::SubmitIfIdle { .. }) => {
+                        reject_idle_only_submission(&method, working_event_tx);
+                    }
                     Some(Method::SubmitTracked {
                         submission_request_id,
                         input,
@@ -3556,6 +3600,36 @@ mod tests {
             }
         };
         tokio::time::timeout(timeout, accept).await.ok().flatten()
+    }
+
+    #[tokio::test]
+    async fn idle_only_input_is_rejected_in_busy_maintenance_admission() {
+        let env = make_env().await;
+        let mut events = env.working_event_tx.subscribe();
+        let method = Method::SubmitIfIdle {
+            submission_request_id: "maintenance-input".to_string(),
+            input: vec![protocol::Segment::text("must not queue")],
+            source: protocol::AuthenticatedInputSource::Backend {
+                operation_id: "maintenance-input".to_string(),
+            },
+        };
+        assert!(
+            durably_accept_method_while_busy(
+                method,
+                &env.pending_submissions,
+                &env.working_event_tx
+            )
+            .is_none()
+        );
+        let event = events.try_recv().unwrap();
+        assert!(
+            matches!(event, Event::SubmissionRejected { submission_request_id, message }
+            if submission_request_id == "maintenance-input" && message.contains("WorkerNotify"))
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "must not emit durable acceptance or queue changes"
+        );
     }
 
     #[tokio::test]

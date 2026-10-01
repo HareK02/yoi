@@ -696,6 +696,8 @@ pub struct WorkerLifecycleResult {
 #[serde(rename_all = "snake_case")]
 pub enum WorkerInputKind {
     User,
+    /// Agent input that must never enter the human Submit queue.
+    UserIfIdle,
     Notify,
     Compact,
     ListRewindTargets,
@@ -3037,6 +3039,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         let input = EmbeddedWorkerInput {
             kind: match request.kind {
                 WorkerInputKind::User => EmbeddedWorkerInputKind::User,
+                WorkerInputKind::UserIfIdle => EmbeddedWorkerInputKind::UserIfIdle,
                 WorkerInputKind::Notify => EmbeddedWorkerInputKind::Notify,
                 WorkerInputKind::Compact => EmbeddedWorkerInputKind::Compact,
                 WorkerInputKind::ListRewindTargets => EmbeddedWorkerInputKind::ListRewindTargets,
@@ -5028,6 +5031,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         let input = EmbeddedWorkerInput {
             kind: match request.kind {
                 WorkerInputKind::User => EmbeddedWorkerInputKind::User,
+                WorkerInputKind::UserIfIdle => EmbeddedWorkerInputKind::UserIfIdle,
                 WorkerInputKind::Notify => EmbeddedWorkerInputKind::Notify,
                 WorkerInputKind::Compact => EmbeddedWorkerInputKind::Compact,
                 WorkerInputKind::ListRewindTargets => EmbeddedWorkerInputKind::ListRewindTargets,

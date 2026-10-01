@@ -2982,7 +2982,7 @@ where
         }
 
         let (method, submission_request_id) = match input.kind {
-            WorkerInputKind::User => {
+            WorkerInputKind::User | WorkerInputKind::UserIfIdle => {
                 let Some(submission_id) = input
                     .submission_request_id
                     .filter(|submission_id| !submission_id.trim().is_empty())
@@ -2992,18 +2992,26 @@ where
                         "Runtime user input is missing its internal submission id",
                     );
                 };
-                (
+                let segments = input
+                    .segments
+                    .unwrap_or_else(|| vec![Segment::text(input.content.trim().to_string())]);
+                let source = protocol::AuthenticatedInputSource::Backend {
+                    operation_id: submission_id.clone(),
+                };
+                let method = if input.kind == WorkerInputKind::UserIfIdle {
+                    Method::SubmitIfIdle {
+                        submission_request_id: submission_id.clone(),
+                        input: segments,
+                        source,
+                    }
+                } else {
                     Method::SubmitTracked {
                         submission_request_id: submission_id.clone(),
-                        input: input.segments.unwrap_or_else(|| {
-                            vec![Segment::text(input.content.trim().to_string())]
-                        }),
-                        source: protocol::AuthenticatedInputSource::Backend {
-                            operation_id: submission_id.clone(),
-                        },
-                    },
-                    Some(submission_id),
-                )
+                        input: segments,
+                        source,
+                    }
+                };
+                (method, Some(submission_id))
             }
             WorkerInputKind::Notify => {
                 unreachable!("Notify input is dispatched before ordinary input mapping")
@@ -5579,6 +5587,124 @@ mod tests {
             )
         }));
         assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    #[cfg(feature = "ws-server")]
+    #[serial_test::serial(worker_allocation)]
+    fn idle_only_input_acknowledges_idle_and_rejects_running_paused_and_stopped() {
+        let client = MockClient::sequential(vec![MockResponse::Hang(
+            simple_text_events().into_iter().take(2).collect(),
+        )]);
+        let runtime_base = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let factory = MockFactory {
+            client,
+            runtime_base: runtime_base.path().to_path_buf(),
+            cwd: cwd.path().to_path_buf(),
+            store_dir: store.path().join("sessions"),
+            worker_metadata_dir: store.path().join("workers"),
+            observed_cwds: Arc::new(Mutex::new(Vec::new())),
+            observed_workspace_clients: Arc::new(Mutex::new(Vec::new())),
+        };
+        let backend = Arc::new(WorkerRuntimeExecutionBackend::new(factory).unwrap());
+        let runtime =
+            EmbeddedRuntime::with_execution_backend(RuntimeOptions::default(), backend.clone())
+                .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let detail = runtime.create_worker(create_request("idle-only")).unwrap();
+        let input = |id: &str| {
+            let mut input = WorkerInput::user(id);
+            input.kind = WorkerInputKind::UserIfIdle;
+            input.submission_request_id = Some(id.to_string());
+            input
+        };
+        let ack = runtime
+            .send_input(&detail.worker_ref, input("idle-input"))
+            .unwrap();
+        assert_eq!(ack.submission.unwrap().submission_request_id, "idle-input");
+        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Running);
+        let error = runtime
+            .send_input(&detail.worker_ref, input("running-input"))
+            .unwrap_err();
+        assert!(error.to_string().contains("WorkerNotify"), "{error}");
+        runtime
+            .send_protocol_method(
+                &detail.worker_ref,
+                Method::Pause {
+                    command: adapter_command(&backend, &detail.worker_ref),
+                },
+            )
+            .unwrap();
+        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Paused);
+        let error = runtime
+            .send_input(&detail.worker_ref, input("paused-input"))
+            .unwrap_err();
+        assert!(error.to_string().contains("WorkerNotify"), "{error}");
+        let handle = backend
+            .workers
+            .lock()
+            .unwrap()
+            .get(&detail.worker_ref)
+            .unwrap()
+            .handle
+            .clone();
+        let pending = backend
+            .run_on_adapter_runtime(async move {
+                let mut events = handle.subscribe();
+                handle
+                    .send(Method::ListPendingSubmissions)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if let Ok(Event::PendingSubmissionsChanged { pending }) =
+                            events.recv().await
+                        {
+                            break pending;
+                        }
+                    }
+                })
+                .await
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert!(pending.submissions.is_empty());
+        // Human Submit still queues while paused, and Notify remains advisory.
+        let ack = runtime
+            .send_input(&detail.worker_ref, WorkerInput::user("human-input"))
+            .unwrap();
+        assert_eq!(
+            ack.submission.unwrap().disposition,
+            protocol::SubmissionDisposition::Queued
+        );
+        let mut notify = WorkerInput::user("advisory");
+        notify.kind = WorkerInputKind::Notify;
+        assert!(
+            runtime
+                .send_input(&detail.worker_ref, notify)
+                .unwrap()
+                .notification
+                .is_some()
+        );
+        wait_for_adapter_state(&backend, &detail.worker_ref, WorkerStatus::Paused);
+        let handle = backend
+            .workers
+            .lock()
+            .unwrap()
+            .get(&detail.worker_ref)
+            .unwrap()
+            .handle
+            .clone();
+        let entries = serde_json::to_string(&handle.committed_entries()).unwrap();
+        assert!(!entries.contains("running-input"));
+        assert!(!entries.contains("paused-input"));
+        runtime.stop_worker(&detail.worker_ref, None).unwrap();
+        let error = runtime
+            .send_input(&detail.worker_ref, input("stopped-input"))
+            .unwrap_err();
+        assert!(error.to_string().contains("WorkerNotify"), "{error}");
     }
 
     #[test]
