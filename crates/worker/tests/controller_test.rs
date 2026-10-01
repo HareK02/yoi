@@ -3694,6 +3694,71 @@ async fn empty_turn_rollback_removes_only_the_most_recent_turn() {
 }
 
 #[tokio::test]
+async fn cancel_after_assistant_output_is_a_non_failure_terminal() {
+    let client = MockClient::sequential(vec![MockResponse::Hang(vec![
+        LlmEvent::text_block_start(0),
+        LlmEvent::text_delta(0, "committed before cancel"),
+        LlmEvent::text_block_stop(0, None),
+    ])]);
+    let worker = make_worker(client).await;
+    let handle = spawn_controller(worker).await;
+    let mut rx = handle.subscribe();
+
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "cancel this active turn",
+        ))
+        .await
+        .unwrap();
+    assert!(
+        drain_until(
+            &mut rx,
+            std::time::Duration::from_secs(2),
+            |event| matches!(event, Event::TextDone { .. })
+        )
+        .await,
+        "assistant output should be durable before cancellation"
+    );
+    handle
+        .send(Method::Cancel {
+            command: worker_command(&handle),
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        drain_until(
+            &mut rx,
+            std::time::Duration::from_secs(2),
+            |event| matches!(
+                event,
+                Event::RunEnd {
+                    result: protocol::RunResult::Cancelled
+                }
+            )
+        )
+        .await,
+        "intentional cancellation must emit RunEnd::Cancelled, not Event::Error"
+    );
+    wait_for_status(&handle, WorkerStatus::Idle).await;
+
+    let (entries, _) = handle.sink.subscribe_with_snapshot();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| matches!(entry, LogEntry::RunCancelled { .. })),
+        "cancelled run must keep a durable non-failure terminal: {entries:?}"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| matches!(entry, LogEntry::RunErrored { .. })),
+        "intentional cancellation must not be restored as a run error: {entries:?}"
+    );
+}
+
+#[tokio::test]
 async fn pause_after_assistant_token_does_not_rollback() {
     let client = MockClient::sequential(vec![MockResponse::Hang(vec![
         LlmEvent::text_block_start(0),

@@ -10,7 +10,7 @@ use crate::{LoggedHistoryEntry, LoggedSystemHistoryEntry, SegmentId, SessionId};
 use agen::EngineResult;
 use agen::llm_client::RequestConfig;
 use agen::llm_client::types::Item;
-use protocol::Segment;
+use protocol::{RunFailureKind, RunResumeSource, RunYieldReason, Segment};
 
 /// State snapshot for creating a SegmentStart entry.
 pub struct SegmentStartState<'a> {
@@ -332,6 +332,47 @@ pub fn save_run_completed(
     )
 }
 
+/// Log a non-terminal yield of one logical Run. New writers must use this
+/// instead of encoding `EngineResult::Yielded` in `RunCompleted`.
+pub fn save_run_yielded(
+    store: &impl Store,
+    session_id: SessionId,
+    segment_id: SegmentId,
+    reason: RunYieldReason,
+    active_run_turn_count: usize,
+) -> Result<(), StoreError> {
+    append_entry(
+        store,
+        session_id,
+        segment_id,
+        LogEntry::RunYielded {
+            ts: segment_log::now_millis(),
+            reason,
+            active_run_turn_count,
+        },
+    )
+}
+
+/// Log the boundary immediately before Engine resumes one logical Run.
+pub fn save_run_resumed(
+    store: &impl Store,
+    session_id: SessionId,
+    segment_id: SegmentId,
+    source: RunResumeSource,
+    active_run_turn_count: usize,
+) -> Result<(), StoreError> {
+    append_entry(
+        store,
+        session_id,
+        segment_id,
+        LogEntry::RunResumed {
+            ts: segment_log::now_millis(),
+            source,
+            active_run_turn_count,
+        },
+    )
+}
+
 /// Log a `RunErrored` entry — `run()` / `resume()` returned `Err(EngineError)`.
 ///
 /// `EngineError` is not `Serialize`, so the caller passes a lossy
@@ -351,6 +392,7 @@ pub fn save_run_errored(
             ts: segment_log::now_millis(),
             interrupted,
             message,
+            failure: Some(RunFailureKind::Engine),
         },
     )
 }

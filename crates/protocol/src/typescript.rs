@@ -10,8 +10,9 @@ use crate::{
     InFlightCompaction, InFlightSnapshot, InFlightToolCallState, InternalWorkerKind,
     InternalWorkerRef, InternalWorkerSnapshot, InvokeKind, MemoryWorkerEvent, Method,
     PasteArtifactAvailability, PasteArtifactMediaType, PasteArtifactRef, PendingSubmissionSummary,
-    PendingSubmissionsSnapshot, Permission, RewindSummary, RewindTarget, RewindTargetId, RunResult,
-    ScopeRule, Segment, SessionContentPart, SessionConversationTurn, SessionEntryProvenance,
+    PendingSubmissionsSnapshot, Permission, RewindSummary, RewindTarget, RewindTargetId,
+    RunFailureKind, RunResult, RunResumeSource, RunYieldReason, ScopeRule, Segment,
+    SessionContentPart, SessionConversationTurn, SessionEntryProvenance,
     SessionHistoryLineageBoundary, SessionHistoryPage, SessionMessageRole, SessionSnapshot,
     SessionSnapshotEntry, SessionSnapshotEntryData, SessionToolAttachment, SubmissionDisposition,
     SymlinkPolicy, ToolResultDisposition, TurnResult, UploadedFileAvailability, UploadedFileRef,
@@ -103,6 +104,9 @@ pub fn generated_protocol_types() -> String {
     push_decl::<SessionMessageRole>(&cfg, &mut output);
     push_decl::<SessionContentPart>(&cfg, &mut output);
     push_decl::<SessionToolAttachment>(&cfg, &mut output);
+    push_decl::<RunYieldReason>(&cfg, &mut output);
+    push_decl::<RunResumeSource>(&cfg, &mut output);
+    push_decl::<RunFailureKind>(&cfg, &mut output);
     push_decl::<SessionSnapshotEntryData>(&cfg, &mut output);
     push_decl::<SessionSnapshotEntry>(&cfg, &mut output);
     push_decl::<SessionConversationTurn>(&cfg, &mut output);

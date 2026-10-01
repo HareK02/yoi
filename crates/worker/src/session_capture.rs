@@ -285,6 +285,9 @@ impl SessionCapture {
                     // Observation deliberately excludes system items and
                     // controller errors from model-visible session evidence.
                     SessionSnapshotEntryData::SystemItem { .. }
+                    | SessionSnapshotEntryData::RunYielded { .. }
+                    | SessionSnapshotEntryData::RunResumed { .. }
+                    | SessionSnapshotEntryData::RunCancelled
                     | SessionSnapshotEntryData::RunError { .. } => return None,
                 };
                 Some(CapturedHistoryEntry {

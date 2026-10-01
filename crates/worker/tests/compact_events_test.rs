@@ -1123,7 +1123,55 @@ async fn request_threshold_compact_publishes_runtime_progress() {
 
     // Second run: pre_llm_request yields immediately, Engine returns
     // Yielded, handle_worker_result routes into do_compact_and_resume.
+    let source_segment = worker.segment_id();
+    let store = worker.store().clone();
     worker.run_text("second").await.unwrap();
+    let replacement_segment = worker.segment_id();
+    assert_ne!(replacement_segment, source_segment);
+
+    let source_entries = store.read_all(worker.session_id(), source_segment).unwrap();
+    assert!(source_entries.iter().any(|entry| matches!(
+        entry,
+        LogEntry::RunYielded {
+            reason: protocol::RunYieldReason::Compaction,
+            ..
+        }
+    )));
+    assert!(!source_entries.iter().any(|entry| matches!(
+        entry,
+        LogEntry::RunCompleted {
+            result: agen::EngineResult::Yielded,
+            ..
+        }
+    )));
+    let replacement_entries = store
+        .read_all(worker.session_id(), replacement_segment)
+        .unwrap();
+    let resumed = replacement_entries
+        .iter()
+        .position(|entry| {
+            matches!(
+                entry,
+                LogEntry::RunResumed {
+                    source: protocol::RunResumeSource::Compaction,
+                    ..
+                }
+            )
+        })
+        .expect("compaction resume transition");
+    let completed = replacement_entries
+        .iter()
+        .position(|entry| {
+            matches!(
+                entry,
+                LogEntry::RunCompleted {
+                    result: agen::EngineResult::Finished,
+                    ..
+                }
+            )
+        })
+        .expect("logical run completion");
+    assert!(resumed < completed);
 
     let events = drain(&mut rx);
     assert!(events.iter().any(|event| matches!(
@@ -1461,6 +1509,21 @@ async fn compacted_context_above_request_threshold_fails_before_provider_request
         3,
         "the provider must receive only the seed and compaction requests"
     );
+    let entries = worker
+        .store()
+        .read_all(worker.session_id(), worker.segment_id())
+        .unwrap();
+    assert!(entries.iter().any(|entry| {
+        matches!(
+            entry,
+            LogEntry::RunErrored {
+                interrupted: false,
+                failure: Some(protocol::RunFailureKind::Compaction),
+                message,
+                ..
+            } if message.contains("mid-run compaction could not continue")
+        )
+    }));
 }
 
 #[tokio::test]
