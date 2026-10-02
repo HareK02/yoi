@@ -899,6 +899,7 @@ impl SubjektivStore {
 
     pub fn stage_candidate(&self, record: SubjectStagingRecord) -> Result<SubjectStagingRecord> {
         validate_staging_record(self.workspace_id(), &record)?;
+        validate_staging_admission(&record)?;
         let raw = serde_json::to_string(&record)?;
         self.database.try_transaction(|transaction| {
             require_active_subject(transaction, &record.subject_id)?;
@@ -926,6 +927,7 @@ impl SubjektivStore {
         }
         attach_session_to_candidate(&mut record, &attribution.session_id)?;
         validate_staging_record(self.workspace_id(), &record)?;
+        validate_staging_admission(&record)?;
         let candidate_raw = serde_json::to_string(&record)?;
         let attribution_raw = serde_json::to_string(&attribution)?;
 
@@ -935,6 +937,21 @@ impl SubjektivStore {
             let candidate =
                 write_staging_candidate(transaction, self.workspace_id(), record, candidate_raw)?;
             Ok((candidate, attribution))
+        })
+    }
+
+    /// Inserts a structurally valid record using the pre-admission-limit path so
+    /// upgrade tests can prove that compatible historical rows stay readable.
+    #[cfg(test)]
+    pub(crate) fn stage_legacy_candidate_for_test(
+        &self,
+        record: SubjectStagingRecord,
+    ) -> Result<SubjectStagingRecord> {
+        validate_staging_record(self.workspace_id(), &record)?;
+        let raw = serde_json::to_string(&record)?;
+        self.database.try_transaction(|transaction| {
+            require_active_subject(transaction, &record.subject_id)?;
+            write_staging_candidate(transaction, self.workspace_id(), record, raw)
         })
     }
 
@@ -1899,12 +1916,6 @@ fn validate_staging_record(workspace_id: &str, record: &SubjectStagingRecord) ->
         ));
     }
 
-    if record.evidence.len() > MAX_STAGING_ANCHORS || record.source_refs.len() > MAX_STAGING_ANCHORS
-    {
-        return Err(SubjektivError::InvalidRecord(format!(
-            "staging evidence/source_refs are limited to {MAX_STAGING_ANCHORS} items each"
-        )));
-    }
     let mut evidence_ids = HashSet::new();
     for evidence in &record.evidence {
         validate_label("evidence id", &evidence.id)?;
@@ -1963,6 +1974,19 @@ fn validate_staging_record(workspace_id: &str, record: &SubjectStagingRecord) ->
     }
     if let Some(proposal) = &record.revision_proposal {
         validate_revision_proposal_metadata(proposal)?;
+    }
+    Ok(())
+}
+
+/// Applies the current write-admission contract separately from structural
+/// validation. Persisted rows from older compatible implementations remain
+/// readable even when a later release tightens admission limits.
+fn validate_staging_admission(record: &SubjectStagingRecord) -> Result<()> {
+    if record.evidence.len() > MAX_STAGING_ANCHORS || record.source_refs.len() > MAX_STAGING_ANCHORS
+    {
+        return Err(SubjektivError::InvalidRecord(format!(
+            "staging evidence/source_refs are limited to {MAX_STAGING_ANCHORS} items each"
+        )));
     }
     Ok(())
 }

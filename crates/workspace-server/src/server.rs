@@ -16776,8 +16776,8 @@ const SUBJEKTIV_QUERY_MAX_LIMIT: usize = 100;
 const SUBJEKTIV_BODY_DEFAULT_LINES: usize = 200;
 const SUBJEKTIV_BODY_MAX_LINES: usize = 1_000;
 const SUBJEKTIV_BODY_MAX_BYTES: usize = 16 * 1024;
-const SUBJEKTIV_EVIDENCE_PAGE_SIZE: usize = 1;
 const SUBJEKTIV_CANDIDATE_ANCHOR_LIMIT: usize = crate::subjektiv::MAX_STAGING_ANCHORS;
+const SUBJEKTIV_EVIDENCE_ANCHOR_PAGE_SIZE: usize = 2;
 const SUBJEKTIV_ANCHOR_TEXT_MAX_BYTES: usize = 64;
 const SUBJEKTIV_NESTED_EVIDENCE_MAX_BYTES: usize = 40 * 1024;
 
@@ -16807,7 +16807,14 @@ struct SubjektivEvidenceCursor {
     subject_id: String,
     memory_id: String,
     revision: u64,
+    /// Candidate/derivation reference offset within the immutable revision.
     offset: usize,
+    /// Nested offsets keep compatible historical candidates with more anchors
+    /// resumable without admitting new over-limit records.
+    #[serde(default)]
+    evidence_offset: usize,
+    #[serde(default)]
+    source_ref_offset: usize,
 }
 
 async fn scoped_subjektiv_memory_backend(
@@ -17038,21 +17045,26 @@ fn subjektiv_memory_read(
         .map(|(line, byte)| (Some(line), Some(byte)))
         .unwrap_or((None, None));
 
-    let evidence_offset = if let Some(cursor) = input.evidence_cursor {
-        let cursor: SubjektivEvidenceCursor = decode_subjektiv_cursor("evidence", &cursor)?;
-        if cursor.subject_id != subject_id
-            || cursor.memory_id != record.id
-            || cursor.revision != record.revision
-        {
-            return Err(Error::InvalidInput(
-                "subjektiv evidence cursor does not match subject, Memory, or revision".into(),
+    let (evidence_offset, nested_evidence_offset, nested_source_ref_offset) =
+        if let Some(cursor) = input.evidence_cursor {
+            let cursor: SubjektivEvidenceCursor = decode_subjektiv_cursor("evidence", &cursor)?;
+            if cursor.subject_id != subject_id
+                || cursor.memory_id != record.id
+                || cursor.revision != record.revision
+            {
+                return Err(Error::InvalidInput(
+                    "subjektiv evidence cursor does not match subject, Memory, or revision".into(),
+                )
+                .into());
+            }
+            (
+                cursor.offset,
+                cursor.evidence_offset,
+                cursor.source_ref_offset,
             )
-            .into());
-        }
-        cursor.offset
-    } else {
-        0
-    };
+        } else {
+            (0, 0, 0)
+        };
     let total_evidence = record
         .source_candidate_ids
         .len()
@@ -17062,61 +17074,89 @@ fn subjektiv_memory_read(
             Error::InvalidInput("subjektiv evidence cursor offset is invalid".into()).into(),
         );
     }
-    let evidence_end = evidence_offset
-        .saturating_add(SUBJEKTIV_EVIDENCE_PAGE_SIZE)
-        .min(total_evidence);
+
     let mut source_candidate_ids = Vec::new();
     let mut source_candidates = Vec::new();
     let mut derived_from = Vec::new();
-    let mut evidence_budget = SUBJEKTIV_CANDIDATE_ANCHOR_LIMIT;
-    let mut source_ref_budget = SUBJEKTIV_CANDIDATE_ANCHOR_LIMIT;
-    for index in evidence_offset..evidence_end {
-        if let Some(candidate_id) = record.source_candidate_ids.get(index) {
-            let candidate = store
-                .staging_candidate(subject_id, candidate_id)
-                .map_err(subjektiv_store_error)?
-                .ok_or_else(|| {
-                    Error::Store(format!(
-                        "subjektiv candidate provenance `{candidate_id}` is missing"
-                    ))
-                })?;
-            source_candidate_ids.push(candidate_id.clone());
-            let evidence_total = candidate.evidence.len();
-            let source_refs_total = candidate.source_refs.len();
-            let evidence_take = evidence_total.min(evidence_budget);
-            let source_refs_take = source_refs_total.min(source_ref_budget);
-            evidence_budget -= evidence_take;
-            source_ref_budget -= source_refs_take;
-            source_candidates.push(server_api::SubjektivMemoryEvidenceCandidate {
-                candidate_id: candidate.id,
-                evidence: candidate
-                    .evidence
-                    .into_iter()
-                    .take(evidence_take)
-                    .map(bounded_subjektiv_staging_evidence)
-                    .collect(),
-                evidence_total,
-                evidence_truncated: evidence_total > evidence_take,
-                source_refs: candidate
-                    .source_refs
-                    .into_iter()
-                    .take(source_refs_take)
-                    .map(bounded_subjektiv_source_ref)
-                    .collect(),
-                source_refs_total,
-                source_refs_truncated: source_refs_total > source_refs_take,
-            });
-        } else {
-            let derived_index = index - record.source_candidate_ids.len();
-            let reference = &record.derived_from[derived_index];
-            derived_from.push(server_api::SubjektivMemoryRevisionRef {
-                memory_id: reference.memory_id.clone(),
-                revision: reference.revision,
-            });
+    let mut next_evidence_offset = evidence_offset;
+    let mut next_nested_evidence_offset = 0;
+    let mut next_nested_source_ref_offset = 0;
+    if let Some(candidate_id) = record.source_candidate_ids.get(evidence_offset) {
+        let candidate = store
+            .staging_candidate(subject_id, candidate_id)
+            .map_err(subjektiv_store_error)?
+            .ok_or_else(|| {
+                Error::Store(format!(
+                    "subjektiv candidate provenance `{candidate_id}` is missing"
+                ))
+            })?;
+        let evidence_total = candidate.evidence.len();
+        let source_refs_total = candidate.source_refs.len();
+        if nested_evidence_offset > evidence_total || nested_source_ref_offset > source_refs_total {
+            return Err(Error::InvalidInput(
+                "subjektiv nested evidence cursor offset is invalid".into(),
+            )
+            .into());
         }
+        let evidence_end = nested_evidence_offset
+            .saturating_add(SUBJEKTIV_EVIDENCE_ANCHOR_PAGE_SIZE)
+            .min(evidence_total);
+        let source_ref_end = nested_source_ref_offset
+            .saturating_add(SUBJEKTIV_EVIDENCE_ANCHOR_PAGE_SIZE)
+            .min(source_refs_total);
+        source_candidate_ids.push(candidate_id.clone());
+        source_candidates.push(server_api::SubjektivMemoryEvidenceCandidate {
+            candidate_id: candidate.id,
+            evidence: candidate
+                .evidence
+                .into_iter()
+                .skip(nested_evidence_offset)
+                .take(evidence_end - nested_evidence_offset)
+                .map(bounded_subjektiv_staging_evidence)
+                .collect(),
+            evidence_total,
+            evidence_truncated: nested_evidence_offset > 0 || evidence_end < evidence_total,
+            source_refs: candidate
+                .source_refs
+                .into_iter()
+                .skip(nested_source_ref_offset)
+                .take(source_ref_end - nested_source_ref_offset)
+                .map(bounded_subjektiv_source_ref)
+                .collect(),
+            source_refs_total,
+            source_refs_truncated: nested_source_ref_offset > 0
+                || source_ref_end < source_refs_total,
+        });
+        if evidence_end < evidence_total || source_ref_end < source_refs_total {
+            next_nested_evidence_offset = evidence_end;
+            next_nested_source_ref_offset = source_ref_end;
+        } else {
+            next_evidence_offset += 1;
+        }
+    } else if evidence_offset < total_evidence {
+        if nested_evidence_offset != 0 || nested_source_ref_offset != 0 {
+            return Err(Error::InvalidInput(
+                "subjektiv derivation cursor cannot contain nested offsets".into(),
+            )
+            .into());
+        }
+        let derived_index = evidence_offset - record.source_candidate_ids.len();
+        let reference = &record.derived_from[derived_index];
+        derived_from.push(server_api::SubjektivMemoryRevisionRef {
+            memory_id: reference.memory_id.clone(),
+            revision: reference.revision,
+        });
+        next_evidence_offset += 1;
+    } else if nested_evidence_offset != 0 || nested_source_ref_offset != 0 {
+        return Err(Error::InvalidInput(
+            "subjektiv evidence cursor points beyond the final reference".into(),
+        )
+        .into());
     }
-    bound_subjektiv_nested_evidence(&mut source_candidates)?;
-    let evidence_has_more = evidence_end < total_evidence;
+    bound_subjektiv_nested_evidence(&source_candidates)?;
+    let evidence_has_more = next_evidence_offset < total_evidence
+        || next_nested_evidence_offset != 0
+        || next_nested_source_ref_offset != 0;
     let evidence_next_cursor = evidence_has_more
         .then(|| {
             encode_subjektiv_cursor(
@@ -17125,13 +17165,15 @@ fn subjektiv_memory_read(
                     subject_id: subject_id.to_string(),
                     memory_id: record.id.clone(),
                     revision: record.revision,
-                    offset: evidence_end,
+                    offset: next_evidence_offset,
+                    evidence_offset: next_nested_evidence_offset,
+                    source_ref_offset: next_nested_source_ref_offset,
                 },
             )
         })
         .transpose()?;
 
-    Ok(server_api::SubjektivMemoryReadResponse {
+    let mut response = server_api::SubjektivMemoryReadResponse {
         memory_id: record.id,
         revision: record.revision,
         current_revision: current.revision,
@@ -17154,7 +17196,15 @@ fn subjektiv_memory_read(
         derived_from,
         evidence_next_cursor,
         evidence_has_more,
-    })
+    };
+    fit_subjektiv_read_body_to_output_budget(
+        &mut response,
+        &lines,
+        body_offset,
+        body_byte_offset,
+        body_limit,
+    )?;
+    Ok(response)
 }
 
 fn subjektiv_memory_list_revisions(
@@ -17532,6 +17582,76 @@ fn api_proposal_intent(
     }
 }
 
+fn fit_subjektiv_read_body_to_output_budget(
+    response: &mut server_api::SubjektivMemoryReadResponse,
+    lines: &[&str],
+    line_offset: usize,
+    byte_offset: usize,
+    line_limit: usize,
+) -> ApiResult<()> {
+    let serialized_len = |response: &server_api::SubjektivMemoryReadResponse| {
+        serde_json::to_vec_pretty(response)
+            .map(|value| value.len())
+            .map_err(|error| Error::Store(format!("encode subjektiv Memory read: {error}")))
+    };
+    if serialized_len(response)? <= server_api::SUBJEKTIV_MEMORY_READ_MAX_TOOL_CONTENT_BYTES {
+        return Ok(());
+    }
+
+    let initial_body_len = response.body_md.len();
+    let mut lower = 0usize;
+    let mut upper = initial_body_len;
+    while lower < upper {
+        let candidate_limit = lower + (upper - lower).div_ceil(2);
+        set_subjektiv_read_body_page(
+            response,
+            lines,
+            line_offset,
+            byte_offset,
+            line_limit,
+            candidate_limit,
+        );
+        if serialized_len(response)? <= server_api::SUBJEKTIV_MEMORY_READ_MAX_TOOL_CONTENT_BYTES {
+            lower = candidate_limit;
+        } else {
+            upper = candidate_limit - 1;
+        }
+    }
+    set_subjektiv_read_body_page(response, lines, line_offset, byte_offset, line_limit, lower);
+    let final_len = serialized_len(response)?;
+    if final_len > server_api::SUBJEKTIV_MEMORY_READ_MAX_TOOL_CONTENT_BYTES {
+        return Err(Error::Store(format!(
+            "subjektiv Memory metadata/provenance requires {final_len} bytes and exceeds the {} byte read-output budget",
+            server_api::SUBJEKTIV_MEMORY_READ_MAX_TOOL_CONTENT_BYTES
+        ))
+        .into());
+    }
+    if initial_body_len > 0 && response.body_md.is_empty() {
+        return Err(Error::Store(
+            "subjektiv Memory metadata/provenance leaves no room for resumable body content".into(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn set_subjektiv_read_body_page(
+    response: &mut server_api::SubjektivMemoryReadResponse,
+    lines: &[&str],
+    line_offset: usize,
+    byte_offset: usize,
+    line_limit: usize,
+    byte_limit: usize,
+) {
+    let (body_md, body_next) =
+        bounded_memory_body_page(lines, line_offset, byte_offset, line_limit, byte_limit);
+    response.body_md = body_md;
+    response.body_truncated = body_next.is_some();
+    (response.body_next_offset, response.body_next_byte_offset) = body_next
+        .map(|(line, byte)| (Some(line), Some(byte)))
+        .unwrap_or((None, None));
+}
+
 fn bounded_memory_body_page(
     lines: &[&str],
     line_offset: usize,
@@ -17580,7 +17700,7 @@ fn memory_body_lines(body: &str) -> Vec<&str> {
 }
 
 fn bound_subjektiv_nested_evidence(
-    candidates: &mut [server_api::SubjektivMemoryEvidenceCandidate],
+    candidates: &[server_api::SubjektivMemoryEvidenceCandidate],
 ) -> ApiResult<()> {
     let serialized = serde_json::to_vec(candidates)
         .map_err(|error| Error::Store(format!("encode subjektiv evidence page: {error}")))?;
@@ -35673,6 +35793,7 @@ mod tests {
                 nested_candidate,
             ))
             .unwrap();
+        let escape_heavy_body = "\\\u{0000}\u{0001}".repeat(8_000);
         let (nested_memory, _) = store
             .apply_candidate(
                 &subject.id,
@@ -35681,7 +35802,7 @@ mod tests {
                 crate::subjektiv::MemoryDraft::active(
                     memory::extract::CandidateKind::Lesson,
                     "Keep nested provenance bounded",
-                    "bounded body",
+                    escape_heavy_body.clone(),
                     "Prevents unbounded read responses",
                     "adopt oversized historical candidate",
                 ),
@@ -35692,7 +35813,7 @@ mod tests {
             &store,
             &subject.id,
             server_api::SubjektivMemoryReadRequest {
-                memory_id: nested_memory.id,
+                memory_id: nested_memory.id.clone(),
                 revision: Some(1),
                 offset: None,
                 byte_offset: None,
@@ -35703,12 +35824,15 @@ mod tests {
         .unwrap();
         assert_eq!(nested_read.source_candidates.len(), 1);
         let nested = &nested_read.source_candidates[0];
-        assert_eq!(nested.evidence.len(), SUBJEKTIV_CANDIDATE_ANCHOR_LIMIT);
+        assert_eq!(nested.evidence.len(), SUBJEKTIV_EVIDENCE_ANCHOR_PAGE_SIZE);
         assert_eq!(nested.evidence_total, nested_count);
-        assert!(!nested.evidence_truncated);
-        assert_eq!(nested.source_refs.len(), SUBJEKTIV_CANDIDATE_ANCHOR_LIMIT);
+        assert!(nested.evidence_truncated);
+        assert_eq!(
+            nested.source_refs.len(),
+            SUBJEKTIV_EVIDENCE_ANCHOR_PAGE_SIZE
+        );
         assert_eq!(nested.source_refs_total, nested_count);
-        assert!(!nested.source_refs_truncated);
+        assert!(nested.source_refs_truncated);
         assert!(nested.evidence.iter().all(|item| {
             item.excerpt
                 .as_ref()
@@ -35737,7 +35861,195 @@ mod tests {
                 .len()
                 <= SUBJEKTIV_NESTED_EVIDENCE_MAX_BYTES
         );
-        assert!(serde_json::to_vec(&nested_read).unwrap().len() < 64 * 1024);
+        assert!(
+            serde_json::to_vec_pretty(&nested_read).unwrap().len()
+                <= server_api::SUBJEKTIV_MEMORY_READ_MAX_TOOL_CONTENT_BYTES
+        );
+        assert!(nested_read.body_truncated);
+        assert!(nested_read.body_next_offset.is_some());
+        let mut nested_evidence_ids = nested
+            .evidence
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        let mut nested_source_sessions = nested
+            .source_refs
+            .iter()
+            .filter_map(|item| item.session_id.clone())
+            .collect::<Vec<_>>();
+        let mut nested_cursor = nested_read.evidence_next_cursor.clone();
+        while let Some(cursor) = nested_cursor {
+            let page = subjektiv_memory_read(
+                &store,
+                &subject.id,
+                server_api::SubjektivMemoryReadRequest {
+                    memory_id: nested_memory.id.clone(),
+                    revision: Some(1),
+                    offset: None,
+                    byte_offset: None,
+                    limit: None,
+                    evidence_cursor: Some(cursor),
+                },
+            )
+            .unwrap();
+            let candidate = &page.source_candidates[0];
+            nested_evidence_ids.extend(candidate.evidence.iter().map(|item| item.id.clone()));
+            nested_source_sessions.extend(
+                candidate
+                    .source_refs
+                    .iter()
+                    .filter_map(|item| item.session_id.clone()),
+            );
+            nested_cursor = page.evidence_next_cursor;
+        }
+        assert_eq!(nested_evidence_ids.len(), nested_count);
+        assert_eq!(nested_source_sessions.len(), nested_count);
+
+        let mut reconstructed_body = nested_read.body_md.clone();
+        let mut next_line = nested_read.body_next_offset;
+        let mut next_byte = nested_read.body_next_byte_offset;
+        while let Some(offset) = next_line {
+            let page = subjektiv_memory_read(
+                &store,
+                &subject.id,
+                server_api::SubjektivMemoryReadRequest {
+                    memory_id: nested_memory.id.clone(),
+                    revision: Some(1),
+                    offset: Some(offset),
+                    byte_offset: next_byte,
+                    limit: None,
+                    evidence_cursor: None,
+                },
+            )
+            .unwrap();
+            assert!(
+                serde_json::to_vec_pretty(&page).unwrap().len()
+                    <= server_api::SUBJEKTIV_MEMORY_READ_MAX_TOOL_CONTENT_BYTES
+            );
+            reconstructed_body.push_str(&page.body_md);
+            next_line = page.body_next_offset;
+            next_byte = page.body_next_byte_offset;
+        }
+        assert_eq!(reconstructed_body, escape_heavy_body);
+
+        // Simulate a row accepted before the write-admission anchor cap. The
+        // compatible schema remains readable, and its nested anchors advance
+        // through the ordinary evidence cursor instead of becoming orphaned.
+        let legacy_count = SUBJEKTIV_CANDIDATE_ANCHOR_LIMIT + 7;
+        let legacy_workspace_id = store.workspace_id().to_string();
+        let legacy_evidence = (0..legacy_count)
+            .map(|index| memory::extract::StagingEvidence {
+                id: format!("legacy-evidence-{index}"),
+                kind: memory::schema::EvidenceKind::new("model_output"),
+                entry_range: Some([index as u64, index as u64]),
+                origin: Some(memory::schema::EvidenceOrigin {
+                    kind: memory::schema::EvidenceOriginKind::ModelOutput,
+                    account_id: None,
+                    workspace_id: Some(legacy_workspace_id.clone()),
+                    runtime_id: None,
+                    worker_id: None,
+                    flow_selector: None,
+                    flow_definition_id: None,
+                    flow_definition_revision: None,
+                }),
+                excerpt: Some(format!("legacy excerpt {index}")),
+                summary: None,
+            })
+            .collect::<Vec<_>>();
+        let legacy_refs = (0..legacy_count)
+            .map(|index| memory::schema::SourceEvidenceRef {
+                session_id: Some(format!("legacy-session-{index}")),
+                segment_id: Some("legacy-segment".to_string()),
+                entry_range: Some([index as u64, index as u64]),
+                evidence_id: Some(format!("legacy-evidence-{index}")),
+                evidence_kind: Some(memory::schema::EvidenceKind::new("model_output")),
+                origin: Some(memory::schema::EvidenceOrigin {
+                    kind: memory::schema::EvidenceOriginKind::ModelOutput,
+                    account_id: None,
+                    workspace_id: Some(legacy_workspace_id.clone()),
+                    runtime_id: None,
+                    worker_id: None,
+                    flow_selector: None,
+                    flow_definition_id: None,
+                    flow_definition_revision: None,
+                }),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let legacy_candidate = memory::extract::StagingRecord::from_candidate(
+            "candidate-legacy-over-anchor-limit",
+            "legacy-over-anchor-limit-dedup",
+            memory::schema::SourceRef {
+                segment_id: "legacy-segment".to_string(),
+                range: [0, legacy_count as u64 - 1],
+            },
+            memory::extract::ExtractedCandidate {
+                kind: memory::extract::CandidateKind::Lesson,
+                claim: "Preserve compatible historical provenance".to_string(),
+                why_useful: "Upgrade must not orphan accepted anchors".to_string(),
+                staleness: None,
+                evidence_ids: legacy_evidence.iter().map(|item| item.id.clone()).collect(),
+            },
+            legacy_evidence,
+            legacy_refs,
+        );
+        let legacy_candidate = store
+            .stage_legacy_candidate_for_test(crate::subjektiv::SubjectStagingRecord::attach(
+                &subject.id,
+                legacy_candidate,
+            ))
+            .unwrap();
+        let (legacy_memory, _) = store
+            .apply_candidate(
+                &subject.id,
+                &legacy_candidate.id,
+                crate::subjektiv::MemoryRevisionTarget::Create,
+                crate::subjektiv::MemoryDraft::active(
+                    memory::extract::CandidateKind::Lesson,
+                    "Preserve compatible historical provenance",
+                    "legacy body",
+                    "Upgrade must not orphan accepted anchors",
+                    "upgrade fixture",
+                ),
+                "adopt legacy candidate",
+            )
+            .unwrap();
+        let mut legacy_cursor = None;
+        let mut retrieved_evidence = Vec::new();
+        let mut retrieved_sessions = Vec::new();
+        loop {
+            let page = subjektiv_memory_read(
+                &store,
+                &subject.id,
+                server_api::SubjektivMemoryReadRequest {
+                    memory_id: legacy_memory.id.clone(),
+                    revision: Some(1),
+                    offset: None,
+                    byte_offset: None,
+                    limit: None,
+                    evidence_cursor: legacy_cursor,
+                },
+            )
+            .unwrap();
+            let candidate = &page.source_candidates[0];
+            retrieved_evidence.extend(candidate.evidence.iter().map(|item| item.id.clone()));
+            retrieved_sessions.extend(
+                candidate
+                    .source_refs
+                    .iter()
+                    .filter_map(|item| item.session_id.clone()),
+            );
+            if !page.evidence_has_more {
+                break;
+            }
+            legacy_cursor = page.evidence_next_cursor;
+        }
+        assert_eq!(retrieved_evidence.len(), legacy_count);
+        assert_eq!(retrieved_sessions.len(), legacy_count);
+        for index in 0..legacy_count {
+            assert!(retrieved_evidence.contains(&format!("legacy-evidence-{index}")));
+            assert!(retrieved_sessions.contains(&format!("legacy-session-{index}")));
+        }
 
         let revisions = subjektiv_memory_list_revisions(
             &store,

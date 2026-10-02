@@ -4689,6 +4689,11 @@ pub struct SubjektivMemoryQueryResponse {
     pub has_more: bool,
 }
 
+/// Maximum pretty-serialized model-visible content for one subject Memory read.
+/// This stays below the Worker's generic 64 KiB tool-content ceiling so the
+/// result remains valid JSON with explicit continuation coordinates.
+pub const SUBJEKTIV_MEMORY_READ_MAX_TOOL_CONTENT_BYTES: usize = 56 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SubjektivMemoryEvidenceCandidate {
@@ -4733,8 +4738,10 @@ pub struct SubjektivMemoryReadResponse {
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub body_next_byte_offset: Option<usize>,
     pub body_truncated: bool,
-    /// Candidate ids on this evidence page. The corresponding bounded anchors
-    /// are returned in `source_candidates` with the same order.
+    /// Candidate ids on this evidence page. A compatible historical candidate
+    /// may repeat across pages while its nested anchors advance through the same
+    /// evidence cursor. Corresponding bounded anchors retain the same order in
+    /// `source_candidates`.
     pub source_candidate_ids: Vec<String>,
     pub source_candidates: Vec<SubjektivMemoryEvidenceCandidate>,
     /// Derivation references on this evidence page.

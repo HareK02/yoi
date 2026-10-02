@@ -268,7 +268,17 @@ impl Tool for SubjektivReadTool {
             }
         };
         let value = value.map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
-        Ok(json_output(summary, &value)?)
+        let output = json_output(summary, &value)?;
+        if matches!(self.operation, ReadOperation::Read)
+            && output.content.as_ref().is_some_and(|content| {
+                content.len() > server_api::SUBJEKTIV_MEMORY_READ_MAX_TOOL_CONTENT_BYTES
+            })
+        {
+            return Err(ToolError::ExecutionFailed(
+                "subjektiv Memory read exceeded its model-visible output budget".into(),
+            ));
+        }
+        Ok(output)
     }
 }
 
@@ -976,6 +986,40 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ReadWorkspaceClient(server_api::SubjektivMemoryReadResponse);
+
+    impl WorkspaceClient for ReadWorkspaceClient {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("workspace-test")
+        }
+
+        fn kind(&self) -> &str {
+            "read-test"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn execute(
+            &self,
+            request: WorkspaceRequest,
+        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            let request: SubjektivMemoryBackendRequest =
+                serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+            assert!(matches!(
+                request.operation,
+                SubjektivMemoryBackendOperation::Read(_)
+            ));
+            Ok(WorkspaceResponse {
+                status: 200,
+                body: serde_json::to_string(&SubjektivMemoryBackendResponse::Read(self.0.clone()))
+                    .unwrap(),
+            })
+        }
+    }
+
     #[derive(Debug, Default)]
     struct RecordingWorkspaceClient {
         requests: Mutex<Vec<WorkspaceRequest>>,
@@ -1128,6 +1172,112 @@ mod tests {
         )
         .unwrap();
         assert!(parsed.entry_refs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_tool_preserves_bounded_model_visible_json_with_escape_heavy_content() {
+        let origin = || memory::schema::EvidenceOrigin {
+            kind: memory::schema::EvidenceOriginKind::ModelOutput,
+            account_id: Some("a".repeat(64)),
+            workspace_id: Some("workspace-test".into()),
+            runtime_id: Some("r".repeat(64)),
+            worker_id: Some("w".repeat(64)),
+            flow_selector: Some("f".repeat(64)),
+            flow_definition_id: Some("d".repeat(64)),
+            flow_definition_revision: Some(1),
+        };
+        let evidence = (0..MAX_EVIDENCE_REFS)
+            .map(|index| memory::extract::StagingEvidence {
+                id: format!("evidence-{index}"),
+                kind: memory::schema::EvidenceKind::new("model_output"),
+                entry_range: Some([index as u64, index as u64]),
+                origin: Some(origin()),
+                excerpt: Some("\\\u{0000}".repeat(32)),
+                summary: Some("\\\u{0001}".repeat(32)),
+            })
+            .collect::<Vec<_>>();
+        let source_refs = (0..MAX_EVIDENCE_REFS)
+            .map(|index| memory::schema::SourceEvidenceRef {
+                session_id: Some(format!("session-{index}")),
+                segment_id: Some(format!("segment-{index}")),
+                entry_range: Some([index as u64, index as u64]),
+                evidence_id: Some(format!("evidence-{index}")),
+                origin: Some(origin()),
+                evidence_kind: Some(memory::schema::EvidenceKind::new("model_output")),
+                label: Some("\\\u{0002}".repeat(32)),
+                summary: Some("\\\u{0003}".repeat(32)),
+            })
+            .collect::<Vec<_>>();
+        let response = server_api::SubjektivMemoryReadResponse {
+            memory_id: "memory-1".into(),
+            revision: 1,
+            current_revision: 1,
+            kind: CandidateKind::Lesson,
+            state: server_api::SubjektivMemoryState::Active,
+            claim: "Escape-aware read".into(),
+            body_md: "\\\u{0000}\u{0001}".repeat(2_000),
+            why_useful: "Proves the actual ToolOutput remains parseable".into(),
+            staleness: None,
+            change_reason: "test".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            body_offset: 0,
+            body_byte_offset: 0,
+            body_next_offset: Some(0),
+            body_next_byte_offset: Some(6_000),
+            body_truncated: true,
+            source_candidate_ids: vec!["candidate-1".into()],
+            source_candidates: vec![server_api::SubjektivMemoryEvidenceCandidate {
+                candidate_id: "candidate-1".into(),
+                evidence,
+                evidence_total: MAX_EVIDENCE_REFS,
+                evidence_truncated: false,
+                source_refs,
+                source_refs_total: MAX_EVIDENCE_REFS,
+                source_refs_truncated: false,
+            }],
+            derived_from: Vec::new(),
+            evidence_next_cursor: None,
+            evidence_has_more: false,
+        };
+        let mut oversized_response = response.clone();
+        oversized_response.body_md =
+            "\\\u{0000}".repeat(server_api::SUBJEKTIV_MEMORY_READ_MAX_TOOL_CONTENT_BYTES);
+        let tool = SubjektivReadTool {
+            state: SubjektivMemoryState {
+                client: Arc::new(ReadWorkspaceClient(response)),
+                capture: feature().state.capture,
+            },
+            operation: ReadOperation::Read,
+        };
+        let output = tool
+            .execute(
+                r#"{"memory_id":"memory-1"}"#,
+                ToolExecutionContext::new("call-read", "batch-read", 0),
+            )
+            .await
+            .unwrap();
+        let content = output.content.unwrap();
+        assert!(content.len() <= server_api::SUBJEKTIV_MEMORY_READ_MAX_TOOL_CONTENT_BYTES);
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(value["body_truncated"], true);
+        assert_eq!(value["body_next_byte_offset"], 6_000);
+
+        let oversized_tool = SubjektivReadTool {
+            state: SubjektivMemoryState {
+                client: Arc::new(ReadWorkspaceClient(oversized_response)),
+                capture: feature().state.capture,
+            },
+            operation: ReadOperation::Read,
+        };
+        let error = oversized_tool
+            .execute(
+                r#"{"memory_id":"memory-1"}"#,
+                ToolExecutionContext::new("call-oversized", "batch-read", 1),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("model-visible output budget"));
     }
 
     #[tokio::test]
