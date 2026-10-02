@@ -1426,7 +1426,8 @@ where
     /// Append `entry` to the log: disk write → counter bump → in-memory
     /// mirror push → broadcast. The Store owns physical write ordering and
     /// partial-write recovery; publication happens only after it returns Ok.
-    pub fn append_entry(&self, entry: LogEntry) -> Result<(), StoreError> {
+    pub fn append_entry(&self, mut entry: LogEntry) -> Result<(), StoreError> {
+        entry.ensure_session_entry_id();
         let _append_guard = self
             .state
             .append_lock
@@ -3055,7 +3056,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// Append `entry` to the session log AND publish it through the
     /// broadcast sink. The Store is the commit boundary: a failed write is
     /// never counted or published.
-    pub(crate) fn commit_entry(&self, entry: LogEntry) -> Result<(), StoreError> {
+    pub(crate) fn commit_entry(&self, mut entry: LogEntry) -> Result<(), StoreError> {
+        entry.ensure_session_entry_id();
         let loc = self.segment_state.location();
         self.store.append(loc.session_id, loc.segment_id, &entry)?;
         self.segment_state.increment_entries();
@@ -4707,6 +4709,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .expect("pause/yield resume must retain the logical-run turn budget");
         self.commit_entry(LogEntry::RunResumed {
             ts: segment_log::now_millis(),
+            entry_id: None,
             source,
             active_run_turn_count,
         })?;
@@ -5024,6 +5027,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         // marked as already delivered to clients through the session-log sink.
         self.commit_entry(LogEntry::RunErrored {
             ts: segment_log::now_millis(),
+            entry_id: None,
             interrupted: false,
             message,
             failure: Some(RunFailureKind::Compaction),
@@ -5435,6 +5439,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         {
             self.commit_entry(LogEntry::RunErrored {
                 ts: segment_log::now_millis(),
+                entry_id: None,
                 interrupted: false,
                 message: message.to_string(),
                 failure: Some(RunFailureKind::Compaction),
@@ -5458,6 +5463,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             EngineRunExit::Yielded => {
                 self.commit_entry(LogEntry::RunYielded {
                     ts: segment_log::now_millis(),
+                    entry_id: None,
                     reason: RunYieldReason::Compaction,
                     active_run_turn_count: active_run_turn_count
                         .expect("yielded logical run must retain its turn budget"),
@@ -5474,11 +5480,13 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             EngineRunExit::Interrupted(RunInterruptionReason::Cancelled) => {
                 self.commit_entry(LogEntry::RunCancelled {
                     ts: segment_log::now_millis(),
+                    entry_id: None,
                 })?;
             }
             EngineRunExit::Interrupted(reason) => {
                 self.commit_entry(LogEntry::RunErrored {
                     ts: segment_log::now_millis(),
+                    entry_id: None,
                     interrupted,
                     message: run_interruption_reason_message(reason),
                     failure: Some(RunFailureKind::Engine),
@@ -11442,6 +11450,7 @@ mod build_summary_prompt_tests {
         worker
             .commit_entry(LogEntry::RunErrored {
                 ts: segment_log::now_millis(),
+                entry_id: None,
                 interrupted: true,
                 message: "provider failed".to_string(),
                 failure: Some(RunFailureKind::Engine),
@@ -11472,6 +11481,7 @@ mod build_summary_prompt_tests {
         worker
             .commit_entry(LogEntry::RunCancelled {
                 ts: segment_log::now_millis(),
+                entry_id: None,
             })
             .unwrap();
         assert_eq!(
@@ -11482,6 +11492,7 @@ mod build_summary_prompt_tests {
         worker
             .commit_entry(LogEntry::RunResumed {
                 ts: segment_log::now_millis(),
+                entry_id: None,
                 source: RunResumeSource::Compaction,
                 active_run_turn_count: 1,
             })

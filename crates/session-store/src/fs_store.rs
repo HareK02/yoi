@@ -211,7 +211,11 @@ impl FsStore {
         }
     }
 
-    fn parse_jsonl<T: serde::de::DeserializeOwned>(content: &[u8]) -> Result<Vec<T>, StoreError> {
+    fn parse_jsonl(
+        content: &[u8],
+        session_id: SessionId,
+        segment_id: SegmentId,
+    ) -> Result<Vec<LogEntry>, StoreError> {
         let complete = Self::complete_jsonl_prefix(content);
         let content = std::str::from_utf8(complete).map_err(|error| StoreError::Corrupt {
             line: complete[..error.valid_up_to()]
@@ -222,15 +226,19 @@ impl FsStore {
             message: error.to_string(),
         })?;
         let mut entries = Vec::new();
-        for (i, line) in content.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
+        let mut record_start = 0_u64;
+        for (index, record) in content.split_inclusive('\n').enumerate() {
+            let line = record.strip_suffix('\n').unwrap_or(record);
+            if !line.trim().is_empty() {
+                let mut entry: LogEntry =
+                    serde_json::from_str(line).map_err(|error| StoreError::Corrupt {
+                        line: index + 1,
+                        message: error.to_string(),
+                    })?;
+                entry.ensure_legacy_session_entry_id(session_id, segment_id, record_start);
+                entries.push(entry);
             }
-            let entry: T = serde_json::from_str(line).map_err(|e| StoreError::Corrupt {
-                line: i + 1,
-                message: e.to_string(),
-            })?;
-            entries.push(entry);
+            record_start = record_start.saturating_add(record.len() as u64);
         }
         Ok(entries)
     }
@@ -294,7 +302,7 @@ impl Store for FsStore {
             return Err(StoreError::NotFound(segment_id));
         }
         let content = fs::read(&path)?;
-        Self::parse_jsonl(&content)
+        Self::parse_jsonl(&content, session_id, segment_id)
     }
 
     fn list_sessions(&self) -> Result<Vec<SessionId>, StoreError> {

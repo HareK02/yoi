@@ -1041,15 +1041,16 @@ fn project_session_snapshot_for_segment(
             )),
             LogEntry::RunYielded {
                 ts,
+                entry_id,
                 reason,
                 active_run_turn_count: count,
             } => {
                 active_run_turn_count = Some(*count);
-                entries.push(legacy_entry(
+                entries.push(run_transition_entry(
+                    entry_id.as_ref(),
                     &session_key,
                     segment_id.as_ref(),
                     log_index,
-                    0,
                     *ts,
                     SessionSnapshotEntryData::RunYielded {
                         reason: *reason,
@@ -1059,15 +1060,16 @@ fn project_session_snapshot_for_segment(
             }
             LogEntry::RunResumed {
                 ts,
+                entry_id,
                 source,
                 active_run_turn_count: count,
             } => {
                 active_run_turn_count = Some(*count);
-                entries.push(legacy_entry(
+                entries.push(run_transition_entry(
+                    entry_id.as_ref(),
                     &session_key,
                     segment_id.as_ref(),
                     log_index,
-                    0,
                     *ts,
                     SessionSnapshotEntryData::RunResumed {
                         source: *source,
@@ -1075,29 +1077,30 @@ fn project_session_snapshot_for_segment(
                     },
                 ));
             }
-            LogEntry::RunCancelled { ts } => {
+            LogEntry::RunCancelled { ts, entry_id } => {
                 active_run_turn_count = None;
-                entries.push(legacy_entry(
+                entries.push(run_transition_entry(
+                    entry_id.as_ref(),
                     &session_key,
                     segment_id.as_ref(),
                     log_index,
-                    0,
                     *ts,
                     SessionSnapshotEntryData::RunCancelled,
                 ));
             }
             LogEntry::RunErrored {
                 ts,
+                entry_id,
                 message,
                 failure,
                 ..
             } => {
                 active_run_turn_count = None;
-                entries.push(legacy_entry(
+                entries.push(run_transition_entry(
+                    entry_id.as_ref(),
                     &session_key,
                     segment_id.as_ref(),
                     log_index,
-                    0,
                     *ts,
                     SessionSnapshotEntryData::RunError {
                         message: message.clone(),
@@ -1232,6 +1235,25 @@ fn derivation_ids(entry: &crate::LoggedSystemHistoryEntry) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn run_transition_entry(
+    persisted_entry_id: Option<&crate::LoggedSessionHistoryEntryId>,
+    session_key: &SessionId,
+    segment_id: Option<&SegmentId>,
+    log_index: usize,
+    timestamp: u64,
+    data: SessionSnapshotEntryData,
+) -> SessionSnapshotEntry {
+    SessionSnapshotEntry {
+        entry_id: persisted_entry_id
+            .map(|entry_id| entry_id.0.clone())
+            .unwrap_or_else(|| legacy_entry_id(session_key, segment_id, log_index, 0)),
+        timestamp,
+        provenance: SessionEntryProvenance::LegacyUnknown,
+        derived_from: Vec::new(),
+        data,
+    }
 }
 
 fn legacy_entry(
@@ -2812,22 +2834,344 @@ mod tests {
         ));
     }
 
+    fn run_entry_ids(entries: &[SessionSnapshotEntry]) -> Vec<String> {
+        entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.data,
+                    SessionSnapshotEntryData::RunYielded { .. }
+                        | SessionSnapshotEntryData::RunResumed { .. }
+                        | SessionSnapshotEntryData::RunCancelled
+                        | SessionSnapshotEntryData::RunError { .. }
+                )
+            })
+            .map(|entry| entry.entry_id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn saved_run_transition_ids_match_snapshot_retained_and_paged_history() {
+        let worker_name = "worker-run-identities";
+        let session_id = crate::new_session_id();
+        let segment_id = crate::new_segment_id();
+        let initial = vec![
+            segment_start(session_id, Vec::new(), None, None),
+            LogEntry::AnnotatedUserInput {
+                ts: 2,
+                segments: vec![Segment::text("compact")],
+                history: vec![user_message(1)],
+                extensions: Vec::new(),
+            },
+        ];
+        let (_root, aggregate_root) = persist_history_fixture(
+            worker_name,
+            session_id,
+            segment_id,
+            vec![(segment_id, initial)],
+        );
+        let store = WorkerSessionStore::new(aggregate_root.join("session")).unwrap();
+        let transitions = [
+            LogEntry::RunYielded {
+                ts: 10,
+                entry_id: None,
+                reason: protocol::RunYieldReason::Compaction,
+                active_run_turn_count: 2,
+            },
+            LogEntry::RunResumed {
+                ts: 10,
+                entry_id: None,
+                source: protocol::RunResumeSource::Compaction,
+                active_run_turn_count: 2,
+            },
+            LogEntry::RunErrored {
+                ts: 10,
+                entry_id: None,
+                interrupted: false,
+                message: "mid-run compaction failed: unavailable".into(),
+                failure: Some(protocol::RunFailureKind::Compaction),
+            },
+            LogEntry::RunErrored {
+                ts: 10,
+                entry_id: None,
+                interrupted: false,
+                message: "mid-run compaction failed: unavailable".into(),
+                failure: Some(protocol::RunFailureKind::Compaction),
+            },
+            LogEntry::RunCancelled {
+                ts: 10,
+                entry_id: None,
+            },
+        ];
+        for entry in transitions {
+            crate::segment::append_entry(&store, session_id, segment_id, entry).unwrap();
+        }
+
+        let stored = store.read_all(session_id, segment_id).unwrap();
+        let stored_ids = run_entry_ids(
+            &project_session_snapshot_for_segment(session_id, Some(segment_id), &stored).entries,
+        );
+        assert_eq!(stored_ids.len(), 5);
+        assert_eq!(stored_ids.iter().collect::<HashSet<_>>().len(), 5);
+        assert!(
+            stored_ids
+                .iter()
+                .all(|entry_id| !entry_id.starts_with("l-run-"))
+        );
+
+        let retained = read_retained_session_snapshot(
+            &aggregate_root,
+            worker_name,
+            DEFAULT_RETAINED_SNAPSHOT_MAX_BYTES,
+        )
+        .unwrap();
+        assert_eq!(run_entry_ids(&retained.snapshot.entries), stored_ids);
+
+        let page = read_retained_session_history_page(
+            &aggregate_root,
+            worker_name,
+            None,
+            Some(1),
+            RetainedHistoryReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(page.turns.len(), 1);
+        assert_eq!(run_entry_ids(&page.turns[0].entries), stored_ids);
+
+        let reconnect = read_retained_session_snapshot(
+            &aggregate_root,
+            worker_name,
+            DEFAULT_RETAINED_SNAPSHOT_MAX_BYTES,
+        )
+        .unwrap();
+        assert_eq!(run_entry_ids(&reconnect.snapshot.entries), stored_ids);
+    }
+
+    #[test]
+    fn run_transition_ids_survive_segment_lineage_and_history_page_boundaries() {
+        let worker_name = "worker-run-lineage-identities";
+        let session_id = crate::new_session_id();
+        let source_segment = crate::new_segment_id();
+        let active_segment = crate::new_segment_id();
+        let source = vec![
+            segment_start(session_id, Vec::new(), None, None),
+            LogEntry::AnnotatedUserInput {
+                ts: 2,
+                segments: vec![Segment::text("source turn")],
+                history: vec![user_message(1)],
+                extensions: Vec::new(),
+            },
+        ];
+        let (_root, aggregate_root) = persist_history_fixture(
+            worker_name,
+            session_id,
+            source_segment,
+            vec![(source_segment, source)],
+        );
+        let store = WorkerSessionStore::new(aggregate_root.join("session")).unwrap();
+        crate::segment::append_entry(
+            &store,
+            session_id,
+            source_segment,
+            LogEntry::RunYielded {
+                ts: 3,
+                entry_id: None,
+                reason: protocol::RunYieldReason::Compaction,
+                active_run_turn_count: 1,
+            },
+        )
+        .unwrap();
+        store
+            .append(
+                session_id,
+                source_segment,
+                &LogEntry::TurnEnd {
+                    ts: 4,
+                    turn_count: 1,
+                },
+            )
+            .unwrap();
+        store
+            .create_segment(
+                session_id,
+                active_segment,
+                &[
+                    segment_start(
+                        session_id,
+                        vec![user_message(1)],
+                        None,
+                        Some(SegmentOrigin {
+                            segment_id: source_segment,
+                            at_turn_index: 1,
+                        }),
+                    ),
+                    LogEntry::AnnotatedUserInput {
+                        ts: 5,
+                        segments: vec![Segment::text("active turn")],
+                        history: vec![user_message(2)],
+                        extensions: Vec::new(),
+                    },
+                ],
+            )
+            .unwrap();
+        for entry in [
+            LogEntry::RunResumed {
+                ts: 6,
+                entry_id: None,
+                source: protocol::RunResumeSource::Compaction,
+                active_run_turn_count: 1,
+            },
+            LogEntry::RunErrored {
+                ts: 7,
+                entry_id: None,
+                interrupted: false,
+                message: "mid-run compaction failed".into(),
+                failure: Some(protocol::RunFailureKind::Compaction),
+            },
+        ] {
+            crate::segment::append_entry(&store, session_id, active_segment, entry).unwrap();
+        }
+        WorkerAggregateStore::new(&aggregate_root, worker_name)
+            .unwrap()
+            .write(&crate::WorkerMetadata::new(
+                worker_name,
+                Some(crate::WorkerActiveSegmentRef::active_segment(
+                    session_id,
+                    active_segment,
+                )),
+            ))
+            .unwrap();
+
+        let active_ids = run_entry_ids(
+            &project_session_snapshot_for_segment(
+                session_id,
+                Some(active_segment),
+                &store.read_all(session_id, active_segment).unwrap(),
+            )
+            .entries,
+        );
+        let source_ids = run_entry_ids(
+            &project_session_snapshot_for_segment(
+                session_id,
+                Some(source_segment),
+                &store.read_all(session_id, source_segment).unwrap(),
+            )
+            .entries,
+        );
+        assert_eq!(active_ids.len(), 2);
+        assert_eq!(source_ids.len(), 1);
+
+        let newest = read_retained_session_history_page(
+            &aggregate_root,
+            worker_name,
+            None,
+            Some(1),
+            RetainedHistoryReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(run_entry_ids(&newest.turns[0].entries), active_ids);
+        assert!(newest.has_more);
+        let older = read_retained_session_history_page(
+            &aggregate_root,
+            worker_name,
+            newest.next_cursor.as_deref(),
+            Some(1),
+            RetainedHistoryReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(run_entry_ids(&older.turns[0].entries), source_ids);
+    }
+
+    #[test]
+    fn legacy_run_transition_ids_use_stable_distinct_record_positions() {
+        let worker_name = "worker-legacy-run-identities";
+        let session_id = crate::new_session_id();
+        let segment_id = crate::new_segment_id();
+        let log = vec![
+            segment_start(session_id, Vec::new(), None, None),
+            LogEntry::AnnotatedUserInput {
+                ts: 2,
+                segments: vec![Segment::text("legacy")],
+                history: vec![user_message(1)],
+                extensions: Vec::new(),
+            },
+            LogEntry::RunErrored {
+                ts: 10,
+                entry_id: None,
+                interrupted: false,
+                message: "same legacy failure".into(),
+                failure: None,
+            },
+            LogEntry::RunErrored {
+                ts: 10,
+                entry_id: None,
+                interrupted: false,
+                message: "same legacy failure".into(),
+                failure: None,
+            },
+        ];
+        let (_root, aggregate_root) =
+            persist_history_fixture(worker_name, session_id, segment_id, vec![(segment_id, log)]);
+        let log_path = aggregate_root
+            .join("session")
+            .join("segments")
+            .join(format!("{segment_id}.jsonl"));
+        let persisted_before = std::fs::read(&log_path).unwrap();
+        assert!(!String::from_utf8_lossy(&persisted_before).contains("entry_id\":\"l-run-"));
+
+        let retained = read_retained_session_snapshot(
+            &aggregate_root,
+            worker_name,
+            DEFAULT_RETAINED_SNAPSHOT_MAX_BYTES,
+        )
+        .unwrap();
+        let snapshot_ids = run_entry_ids(&retained.snapshot.entries);
+        assert_eq!(snapshot_ids.len(), 2);
+        assert_ne!(snapshot_ids[0], snapshot_ids[1]);
+        assert!(
+            snapshot_ids
+                .iter()
+                .all(|entry_id| entry_id.starts_with("l-run-"))
+        );
+
+        let page = read_retained_session_history_page(
+            &aggregate_root,
+            worker_name,
+            None,
+            Some(1),
+            RetainedHistoryReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(run_entry_ids(&page.turns[0].entries), snapshot_ids);
+        let reread = read_retained_session_snapshot(
+            &aggregate_root,
+            worker_name,
+            DEFAULT_RETAINED_SNAPSHOT_MAX_BYTES,
+        )
+        .unwrap();
+        assert_eq!(run_entry_ids(&reread.snapshot.entries), snapshot_ids);
+        assert_eq!(std::fs::read(log_path).unwrap(), persisted_before);
+    }
+
     #[test]
     fn run_transitions_project_with_timestamps_and_typed_causes() {
         let session_id = crate::new_session_id();
         let log = vec![
             LogEntry::RunYielded {
                 ts: 10,
+                entry_id: None,
                 reason: protocol::RunYieldReason::Compaction,
                 active_run_turn_count: 2,
             },
             LogEntry::RunResumed {
                 ts: 20,
+                entry_id: None,
                 source: protocol::RunResumeSource::Compaction,
                 active_run_turn_count: 2,
             },
             LogEntry::RunErrored {
                 ts: 30,
+                entry_id: None,
                 interrupted: false,
                 message: "mid-run compaction failed: unavailable".into(),
                 failure: Some(protocol::RunFailureKind::Compaction),
@@ -2869,7 +3213,10 @@ mod tests {
                     ts: 10,
                     trigger: protocol::InvokeKind::UserSend,
                 },
-                LogEntry::RunCancelled { ts: 20 },
+                LogEntry::RunCancelled {
+                    ts: 20,
+                    entry_id: None,
+                },
             ],
         );
 

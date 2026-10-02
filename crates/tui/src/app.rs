@@ -3800,6 +3800,7 @@ mod completion_flow_tests {
 
         let run_errored = session_store::LogEntry::RunErrored {
             ts: 3,
+            entry_id: None,
             interrupted: false,
             message: "provider unavailable".into(),
             failure: None,

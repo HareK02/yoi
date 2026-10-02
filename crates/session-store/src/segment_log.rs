@@ -140,6 +140,12 @@ pub enum LogEntry {
     /// preceding Invoke and a later RunResumed or terminal record.
     RunYielded {
         ts: u64,
+        /// Stable public identity allocated before the record is committed.
+        /// `None` is accepted only when reading logs written before this field
+        /// existed; read paths derive the same legacy identity from the durable
+        /// record position without rewriting the log.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry_id: Option<crate::LoggedSessionHistoryEntryId>,
         reason: RunYieldReason,
         active_run_turn_count: usize,
     },
@@ -149,19 +155,27 @@ pub enum LogEntry {
     /// It deliberately does not assert that a subsequent model call occurred.
     RunResumed {
         ts: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry_id: Option<crate::LoggedSessionHistoryEntryId>,
         source: RunResumeSource,
         active_run_turn_count: usize,
     },
 
     /// The logical Run ended because the user intentionally cancelled it.
     /// This is terminal, but is not an execution failure.
-    RunCancelled { ts: u64 },
+    RunCancelled {
+        ts: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry_id: Option<crate::LoggedSessionHistoryEntryId>,
+    },
 
     /// `run()` / `resume()` が `EngineError` で終了した。
     /// `EngineError` は `Serialize` 不可なので `message` のみ lossy 保持する。
     /// Audit-only metadata: replay は `interrupted` のみ反映する。
     RunErrored {
         ts: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry_id: Option<crate::LoggedSessionHistoryEntryId>,
         interrupted: bool,
         message: String,
         /// Older records omit this field. New records distinguish failures in
@@ -234,6 +248,48 @@ pub enum LogEntry {
 pub struct SegmentOrigin {
     pub segment_id: crate::SegmentId,
     pub at_turn_index: usize,
+}
+
+impl LogEntry {
+    /// Allocate the durable public identity for a newly committed Run
+    /// transition. Calling this repeatedly is idempotent so the exact value
+    /// written to storage is also the value published to live subscribers.
+    pub fn ensure_session_entry_id(&mut self) {
+        let entry_id = match self {
+            Self::RunYielded { entry_id, .. }
+            | Self::RunResumed { entry_id, .. }
+            | Self::RunCancelled { entry_id, .. }
+            | Self::RunErrored { entry_id, .. } => entry_id,
+            _ => return,
+        };
+        if entry_id.is_none() {
+            *entry_id = Some(crate::LoggedSessionHistoryEntryId::new());
+        }
+    }
+
+    /// Supply an in-memory compatibility identity for a legacy Run transition
+    /// that predates persisted entry IDs. The physical record position is
+    /// stable within the append-only Segment and distinguishes equal payloads.
+    /// This helper never writes the synthesized value back to the log.
+    pub(crate) fn ensure_legacy_session_entry_id(
+        &mut self,
+        session_id: crate::SessionId,
+        segment_id: crate::SegmentId,
+        record_start: u64,
+    ) {
+        let entry_id = match self {
+            Self::RunYielded { entry_id, .. }
+            | Self::RunResumed { entry_id, .. }
+            | Self::RunCancelled { entry_id, .. }
+            | Self::RunErrored { entry_id, .. } => entry_id,
+            _ => return,
+        };
+        if entry_id.is_none() {
+            *entry_id = Some(crate::LoggedSessionHistoryEntryId(format!(
+                "l-run-{session_id}-{segment_id}-{record_start}"
+            )));
+        }
+    }
 }
 
 /// State collected from log entries.
@@ -878,6 +934,7 @@ mod tests {
             },
             LogEntry::RunYielded {
                 ts: 300,
+                entry_id: None,
                 reason: RunYieldReason::Compaction,
                 active_run_turn_count: 2,
             },
@@ -888,6 +945,7 @@ mod tests {
             },
             LogEntry::RunResumed {
                 ts: 500,
+                entry_id: None,
                 source: RunResumeSource::Compaction,
                 active_run_turn_count: 2,
             },
@@ -909,7 +967,10 @@ mod tests {
                 ts: 200,
                 turn_count: 1,
             },
-            LogEntry::RunCancelled { ts: 300 },
+            LogEntry::RunCancelled {
+                ts: 300,
+                entry_id: None,
+            },
         ]);
 
         assert!(!state.last_run_interrupted);

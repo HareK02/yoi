@@ -330,6 +330,7 @@ mod tests {
         // Durable logical-Run transitions share the committed-entry lane.
         sink.publish(LogEntry::RunResumed {
             ts: now_millis(),
+            entry_id: None,
             source: protocol::RunResumeSource::Compaction,
             active_run_turn_count: 1,
         });
