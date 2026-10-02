@@ -21,7 +21,7 @@ use flow::{FlowSourceKind, FlowSourceResolveRequest, ResolvedFlowSource};
 use futures::{SinkExt, StreamExt};
 use memory::backend::{
     MemoryBackendHttpResponse, MemoryBackendOperation, MemoryBackendOperationResult,
-    MemoryConsolidateStagingOperation, MemoryConsolidationOutput, MemoryToolOutput,
+    MemoryConsolidateStagingOperation, MemoryConsolidationOutput,
 };
 use protocol::Segment;
 use protocol::stream::{decode_method, encode_event};
@@ -16590,34 +16590,39 @@ fn execute_scoped_resident_summary(
             .map_err(|error| Error::Store(error.to_string()))?
             .resident_surface(subject_id)
             .map_err(|error| Error::Store(error.to_string()))?;
-    let (summary, content) = match resident.availability {
+    Ok(MemoryBackendOperationResult::ResidentSummary(
+        resident_summary_output(resident),
+    ))
+}
+
+fn resident_summary_output(
+    resident: crate::subjektiv::ResidentSurface,
+) -> memory::backend::MemoryResidentSummaryOutput {
+    let (availability, content) = match resident.availability {
         crate::subjektiv::SurfaceAvailability::Ready => {
             let snapshot = resident.snapshot.expect("ready surface has a snapshot");
-            if snapshot.body_md.is_empty() {
-                ("subject resident Memory surface is normally empty", None)
-            } else {
-                (
-                    "subject resident Memory surface collected",
-                    Some(snapshot.body_md),
-                )
-            }
+            (
+                memory::backend::MemoryResidentSummaryAvailability::Ready,
+                (!snapshot.body_md.is_empty()).then_some(snapshot.body_md),
+            )
         }
-        crate::subjektiv::SurfaceAvailability::Ungenerated => {
-            ("subject resident Memory surface is not generated", None)
-        }
+        crate::subjektiv::SurfaceAvailability::Ungenerated => (
+            memory::backend::MemoryResidentSummaryAvailability::Ungenerated,
+            None,
+        ),
         crate::subjektiv::SurfaceAvailability::Stale => (
-            "subject resident Memory surface is stale and was omitted",
+            memory::backend::MemoryResidentSummaryAvailability::Stale,
             None,
         ),
         crate::subjektiv::SurfaceAvailability::Failed => (
-            "subject resident Memory surface generation failed and was omitted",
+            memory::backend::MemoryResidentSummaryAvailability::Failed,
             None,
         ),
     };
-    Ok(MemoryBackendOperationResult::ToolOutput(MemoryToolOutput {
-        summary: summary.into(),
+    memory::backend::MemoryResidentSummaryOutput {
+        availability,
         content,
-    }))
+    }
 }
 
 const SUBJEKTIV_SINGLETON_PREFIX: &str = "subjektiv:";
@@ -30144,6 +30149,50 @@ mod tests {
         bytes.extend_from_slice(&[0, 0x3b]);
         assert_eq!(bytes.len(), target_len);
         bytes
+    }
+
+    #[test]
+    fn resident_summary_transport_preserves_ready_empty_state() {
+        let output = resident_summary_output(crate::subjektiv::ResidentSurface {
+            availability: crate::subjektiv::SurfaceAvailability::Ready,
+            snapshot: Some(crate::subjektiv::SurfaceSnapshot {
+                schema_version: 1,
+                id: "surface-empty".into(),
+                subject_id: "subject-a".into(),
+                body_md: String::new(),
+                memory_refs: Vec::new(),
+                built_from_store_revision: 7,
+                created_at: "2026-10-02T00:00:00Z".into(),
+            }),
+        });
+
+        assert_eq!(
+            output.availability,
+            memory::backend::MemoryResidentSummaryAvailability::Ready
+        );
+        assert_eq!(output.content, None);
+
+        for (surface, expected) in [
+            (
+                crate::subjektiv::SurfaceAvailability::Ungenerated,
+                memory::backend::MemoryResidentSummaryAvailability::Ungenerated,
+            ),
+            (
+                crate::subjektiv::SurfaceAvailability::Stale,
+                memory::backend::MemoryResidentSummaryAvailability::Stale,
+            ),
+            (
+                crate::subjektiv::SurfaceAvailability::Failed,
+                memory::backend::MemoryResidentSummaryAvailability::Failed,
+            ),
+        ] {
+            let output = resident_summary_output(crate::subjektiv::ResidentSurface {
+                availability: surface,
+                snapshot: None,
+            });
+            assert_eq!(output.availability, expected);
+            assert_eq!(output.content, None);
+        }
     }
 
     #[test]

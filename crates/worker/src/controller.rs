@@ -767,6 +767,17 @@ impl WorkerController {
         // the actual registered set instead of a hand-maintained mirror.
         worker.engine().tool_server_handle().flush_pending();
 
+        // Runtime-owned fresh Workers persist their initial model-visible head
+        // before controller exposure. Feature installation above must happen first
+        // so the resident contribution is loaded into that durable prompt. Restored
+        // Workers retain their established first-turn refresh lifecycle.
+        if runtime_managed && worker.needs_initial_session_head_materialization() {
+            worker
+                .materialize_durable_session_head()
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+        }
+
         // === 4. Initial runtime files + WorkerSharedState + WorkerHandle +
         //         SocketServer ===
         let manifest_toml = toml::to_string_pretty(worker.manifest()).unwrap_or_default();
@@ -3464,6 +3475,30 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio::net::UnixListener;
+
+    #[test]
+    fn runtime_session_head_is_materialized_after_feature_installation_before_exposure() {
+        let production = include_str!("controller.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .map(|(production, _)| production)
+            .expect("controller test module marker");
+        let startup = production
+            .split_once("async fn spawn_initialized")
+            .map(|(_, startup)| startup)
+            .expect("controller startup implementation");
+        let feature_install = startup
+            .find("let fs_for_view = register_worker_tools(")
+            .expect("feature installation call");
+        let materialize = startup
+            .find(".materialize_durable_session_head()")
+            .expect("runtime session-head materialization");
+        let exposure = startup
+            .find("let handle = WorkerHandle")
+            .expect("controller handle exposure");
+
+        assert!(feature_install < materialize);
+        assert!(materialize < exposure);
+    }
 
     #[test]
     fn automatic_memory_extraction_destinations_are_mutually_exclusive() {

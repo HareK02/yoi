@@ -507,11 +507,15 @@ impl PromptCatalog {
     }
     pub fn resident_memory_restore_section(
         &self,
+        surface_ready: bool,
         summary: Option<&str>,
     ) -> Result<String, CatalogError> {
         self.render(
             WorkerPrompt::ResidentMemoryRestoreSection,
-            single("summary", summary.unwrap_or_default()),
+            minijinja::context! {
+                surface_ready => surface_ready,
+                summary => summary.unwrap_or_default(),
+            },
         )
     }
     pub fn worker_orchestration_guidance_section(&self) -> Result<String, CatalogError> {

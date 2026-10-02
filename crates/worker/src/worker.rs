@@ -2336,9 +2336,15 @@ impl WorkerSession {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SystemPromptContribution {
+    Ready(String),
+    Unavailable,
+}
+
 #[async_trait::async_trait]
 pub(crate) trait SystemPromptContributionSource: Send + Sync {
-    async fn load(&self) -> Option<String>;
+    async fn load(&self) -> SystemPromptContribution;
 }
 
 #[derive(Debug, Clone)]
@@ -3835,13 +3841,17 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             self.restore_resident_summary_refresh_pending = false;
             return Ok(());
         };
-        let summary = if self.inject_resident_summary {
+        let contribution = if self.inject_resident_summary {
             source.load().await
         } else {
-            None
+            SystemPromptContribution::Unavailable
+        };
+        let (surface_ready, summary) = match &contribution {
+            SystemPromptContribution::Ready(summary) => (true, Some(summary.as_str())),
+            SystemPromptContribution::Unavailable => (false, None),
         };
         let prompt_catalog = self.prompts.load_full();
-        let body = prompt_catalog.resident_memory_restore_section(summary.as_deref())?;
+        let body = prompt_catalog.resident_memory_restore_section(surface_ready, summary)?;
         let prompt_provenance =
             Some(self.prompt_render_provenance(WorkerPrompt::ResidentMemoryRestoreSection.key()));
         let item = SystemItem::ResidentSummaryRefresh {
@@ -3925,7 +3935,14 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         }
         let resident_summary = if self.inject_resident_summary {
             match &self.feature_resident_summary_source {
-                Some(source) => source.load().await,
+                Some(source) => match source.load().await {
+                    SystemPromptContribution::Ready(summary) if !summary.is_empty() => {
+                        Some(summary)
+                    }
+                    SystemPromptContribution::Ready(_) | SystemPromptContribution::Unavailable => {
+                        None
+                    }
+                },
                 None => None,
             }
         } else {
@@ -3979,6 +3996,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.compact_state
             .as_ref()
             .is_some_and(|state| state.pre_run_eligible(self.total_tokens().tokens))
+    }
+
+    pub(crate) fn needs_initial_session_head_materialization(&self) -> bool {
+        self.system_prompt_template.is_some()
     }
 
     /// Materialize the initial durable session head without running the model.
@@ -8770,13 +8791,13 @@ mod build_summary_prompt_tests {
     use super::*;
 
     struct TestSystemPromptContributionSource {
-        value: Option<String>,
+        value: SystemPromptContribution,
         load_count: Arc<AtomicUsize>,
     }
 
     #[async_trait::async_trait]
     impl SystemPromptContributionSource for TestSystemPromptContributionSource {
-        async fn load(&self) -> Option<String> {
+        async fn load(&self) -> SystemPromptContribution {
             self.load_count.fetch_add(1, Ordering::SeqCst);
             self.value.clone()
         }
@@ -8788,7 +8809,10 @@ mod build_summary_prompt_tests {
         let load_count = Arc::new(AtomicUsize::new(0));
         (
             Arc::new(TestSystemPromptContributionSource {
-                value,
+                value: value.map_or(
+                    SystemPromptContribution::Unavailable,
+                    SystemPromptContribution::Ready,
+                ),
                 load_count: Arc::clone(&load_count),
             }),
             load_count,
@@ -11245,6 +11269,40 @@ permission = "write"
         restored.materialize_durable_session_head().await.unwrap();
         assert_eq!(restored.history().len(), refreshed_len);
         drop(restored);
+
+        let mut empty_restore =
+            Worker::<Box<dyn LlmClient>, _>::restore_from_manifest_with_context_and_model_client(
+                session_id,
+                segment_id,
+                manifest.clone(),
+                store.clone(),
+                crate::prompt::source::PromptCatalogSource::builtins_only(),
+                WorkerWorkspaceContext::no_workspace(),
+                authority.clone(),
+                Some(Box::new(NoopClient)),
+            )
+            .await
+            .unwrap();
+        let (empty_source, empty_loads) =
+            test_system_prompt_contribution_source(Some(String::new()));
+        empty_restore.install_system_prompt_contribution(Some(empty_source), None);
+        empty_restore
+            .materialize_durable_session_head()
+            .await
+            .unwrap();
+        assert_eq!(empty_loads.load(Ordering::SeqCst), 1);
+        let empty_boundary = empty_restore
+            .history()
+            .last()
+            .unwrap()
+            .as_text()
+            .unwrap()
+            .to_string();
+        assert!(
+            empty_boundary.contains("current ready resident memory surface is intentionally empty")
+        );
+        assert!(!empty_boundary.contains("No current ready resident memory surface"));
+        drop(empty_restore);
 
         let mut stale_restore =
             Worker::<Box<dyn LlmClient>, _>::restore_from_manifest_with_context_and_model_client(

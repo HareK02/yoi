@@ -23,8 +23,8 @@ use crate::feature::{
     ToolDeclaration,
 };
 use crate::worker::{
-    SystemPromptContributionSource, WorkspaceClient, WorkspaceClientError, WorkspaceRequest,
-    WorkspaceRequestMethod,
+    SystemPromptContribution, SystemPromptContributionSource, WorkspaceClient,
+    WorkspaceClientError, WorkspaceRequest, WorkspaceRequestMethod,
 };
 
 #[derive(Clone, Debug)]
@@ -652,7 +652,7 @@ struct WorkspaceResidentSummarySource {
 
 #[async_trait]
 impl SystemPromptContributionSource for WorkspaceResidentSummarySource {
-    async fn load(&self) -> Option<String> {
+    async fn load(&self) -> SystemPromptContribution {
         match self
             .client
             .execute_memory_backend_operation(
@@ -662,14 +662,22 @@ impl SystemPromptContributionSource for WorkspaceResidentSummarySource {
             )
             .await
         {
-            Ok(memory::backend::MemoryBackendOperationResult::ToolOutput(output)) => output.content,
+            Ok(memory::backend::MemoryBackendOperationResult::ResidentSummary(output))
+                if output.availability
+                    == memory::backend::MemoryResidentSummaryAvailability::Ready =>
+            {
+                SystemPromptContribution::Ready(output.content.unwrap_or_default())
+            }
+            Ok(memory::backend::MemoryBackendOperationResult::ResidentSummary(_)) => {
+                SystemPromptContribution::Unavailable
+            }
             Ok(other) => {
                 tracing::debug!(?other, "unexpected resident Memory Backend result");
-                None
+                SystemPromptContribution::Unavailable
             }
             Err(error) => {
                 tracing::debug!(%error, "resident Memory summary unavailable");
-                None
+                SystemPromptContribution::Unavailable
             }
         }
     }
@@ -843,8 +851,8 @@ mod tests {
             let body = serde_json::json!({
                 "status": "ok",
                 "result": {
-                    "kind": "tool_output",
-                    "summary": "resident Memory summary collected",
+                    "kind": "resident_summary",
+                    "availability": "ready",
                     "content": content,
                 }
             })
@@ -976,12 +984,8 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(
-            plan.resident_summary_source
-                .unwrap()
-                .load()
-                .await
-                .as_deref(),
-            Some("# Durable Memory")
+            plan.resident_summary_source.unwrap().load().await,
+            SystemPromptContribution::Ready("# Durable Memory".into())
         );
     }
 
@@ -1016,22 +1020,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            first
-                .resident_summary_source
-                .unwrap()
-                .load()
-                .await
-                .as_deref(),
-            Some("first resident summary")
+            first.resident_summary_source.unwrap().load().await,
+            SystemPromptContribution::Ready("first resident summary".into())
         );
         assert_eq!(
-            restored
-                .resident_summary_source
-                .unwrap()
-                .load()
-                .await
-                .as_deref(),
-            Some("updated resident summary")
+            restored.resident_summary_source.unwrap().load().await,
+            SystemPromptContribution::Ready("updated resident summary".into())
         );
     }
 
