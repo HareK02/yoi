@@ -917,19 +917,9 @@ INSERT INTO surface_generation_state (
 )
 SELECT subjects.subject_id,
        subjects.store_revision,
-       CASE WHEN EXISTS (
-           SELECT 1 FROM surface_snapshots current
-           WHERE current.subject_id = subjects.subject_id
-             AND current.built_from_store_revision = subjects.store_revision
-       ) THEN 'ready' ELSE 'dirty' END,
-       (
-           SELECT current.snapshot_id FROM surface_snapshots current
-           WHERE current.subject_id = subjects.subject_id
-             AND current.built_from_store_revision = subjects.store_revision
-           ORDER BY current.created_at ASC, current.snapshot_id ASC
-           LIMIT 1
-       ),
+       'dirty',
        NULL,
+       'legacy_snapshot_requires_regeneration',
        subjects.updated_at
 FROM subjects
 WHERE EXISTS (
@@ -1729,7 +1719,7 @@ impl SubjektivStore {
             }
             let (body_md, memory_refs) = validate_surface_points(&materials, &points)?;
             if let Some(existing) =
-                surface_snapshot_for_revision(transaction, subject_id, store_revision)?
+                ready_surface_snapshot_for_revision(transaction, subject_id, store_revision)?
             {
                 if existing.body_md == body_md && existing.memory_refs == memory_refs {
                     return Ok(existing);
@@ -1959,27 +1949,83 @@ fn select_surface_materials(
         }
     }
 
-    let mut selected = Vec::new();
-    let mut payload_bytes = 2usize; // JSON array delimiters.
+    let populated_kind_count = buckets.iter().filter(|bucket| !bucket.is_empty()).count();
+    let per_kind_token_budget = SURFACE_MATERIAL_TOKEN_BUDGET / populated_kind_count.max(1);
+    let mut ordered = Vec::new();
     for offset in 0..SURFACE_PER_KIND_LIMIT {
-        for bucket in &buckets {
-            let Some(material) = bucket.get(offset) else {
-                continue;
-            };
-            if selected.len() == SURFACE_TOTAL_MATERIAL_LIMIT {
-                return Ok((active_memory_count, selected));
+        for (bucket_index, bucket) in buckets.iter().enumerate() {
+            if let Some(material) = bucket.get(offset) {
+                ordered.push((bucket_index, material.clone()));
             }
-            let material_bytes = serde_json::to_vec(material)?.len().saturating_add(1);
-            if estimated_tokens_for_bytes(payload_bytes.saturating_add(material_bytes))
-                > SURFACE_MATERIAL_TOKEN_BUDGET
-            {
-                continue;
-            }
-            payload_bytes = payload_bytes.saturating_add(material_bytes);
-            selected.push(material.clone());
         }
     }
+
+    let mut accepted = vec![false; ordered.len()];
+    let mut selected_count = 0usize;
+    let mut deferred = Vec::new();
+    for (index, (bucket_index, material)) in ordered.iter().enumerate() {
+        if selected_count == SURFACE_TOTAL_MATERIAL_LIMIT {
+            break;
+        }
+        let kind_materials = ordered
+            .iter()
+            .zip(&accepted)
+            .filter(|((selected_bucket, _), accepted)| {
+                **accepted && selected_bucket == bucket_index
+            })
+            .map(|((_, material), _)| material)
+            .chain(std::iter::once(material));
+        let all_materials = ordered
+            .iter()
+            .zip(&accepted)
+            .filter(|(_, accepted)| **accepted)
+            .map(|((_, material), _)| material)
+            .chain(std::iter::once(material));
+        if serialized_material_tokens(kind_materials)? <= per_kind_token_budget
+            && serialized_material_tokens(all_materials)? <= SURFACE_MATERIAL_TOKEN_BUDGET
+        {
+            accepted[index] = true;
+            selected_count += 1;
+        } else {
+            deferred.push(index);
+        }
+    }
+
+    // Category shares are fairness reservations, not hard ceilings. Reclaim
+    // unused shares in the same canonical order after every populated category
+    // had its first opportunity.
+    for index in deferred {
+        if selected_count == SURFACE_TOTAL_MATERIAL_LIMIT {
+            break;
+        }
+        let material = &ordered[index].1;
+        let all_materials = ordered
+            .iter()
+            .zip(&accepted)
+            .filter(|(_, accepted)| **accepted)
+            .map(|((_, material), _)| material)
+            .chain(std::iter::once(material));
+        if serialized_material_tokens(all_materials)? <= SURFACE_MATERIAL_TOKEN_BUDGET {
+            accepted[index] = true;
+            selected_count += 1;
+        }
+    }
+
+    let selected = ordered
+        .into_iter()
+        .zip(accepted)
+        .filter_map(|((_, material), accepted)| accepted.then_some(material))
+        .collect();
     Ok((active_memory_count, selected))
+}
+
+fn serialized_material_tokens<'a>(
+    materials: impl IntoIterator<Item = &'a SurfaceMaterial>,
+) -> Result<usize> {
+    let materials = materials.into_iter().collect::<Vec<_>>();
+    Ok(estimated_tokens_for_bytes(
+        serde_json::to_vec(&materials)?.len(),
+    ))
 }
 
 fn surface_kind_index(kind: &CandidateKind) -> usize {
@@ -2051,6 +2097,28 @@ fn validate_surface_points(
         )));
     }
     Ok((body_md, refs))
+}
+
+fn ready_surface_snapshot_for_revision(
+    transaction: &Transaction<'_>,
+    subject_id: &str,
+    store_revision: u64,
+) -> Result<Option<SurfaceSnapshot>> {
+    let raw = transaction
+        .query_row(
+            "SELECT snapshots.snapshot_json
+             FROM surface_generation_state state
+             JOIN surface_snapshots snapshots
+               ON snapshots.subject_id = state.subject_id
+              AND snapshots.snapshot_id = state.snapshot_id
+             WHERE state.subject_id = ?1
+               AND state.store_revision = ?2
+               AND state.status = 'ready'",
+            params![subject_id, to_i64(store_revision)?],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    raw.map(|raw| parse_surface_snapshot(&raw)).transpose()
 }
 
 fn surface_snapshot_for_revision(
@@ -3237,6 +3305,19 @@ mod tests {
         "create subjektiv subject memory store",
         create_schema,
     )];
+    static V3_MIGRATIONS: &[FeatureMigration] = &[
+        FeatureMigration::new(1, "create subjektiv subject memory store", create_schema),
+        FeatureMigration::new(
+            2,
+            "add immutable subject session attribution",
+            add_subject_session_attribution,
+        ),
+        FeatureMigration::new(
+            3,
+            "add idempotent atomic candidate decision receipts",
+            add_candidate_decision_receipts,
+        ),
+    ];
 
     fn role() -> SubjectRole {
         SubjectRole::new("workspace_companion").unwrap()
@@ -3456,6 +3537,90 @@ mod tests {
             store.session_attribution("session-1").unwrap().unwrap(),
             stored_attribution
         );
+    }
+
+    #[test]
+    fn legacy_surface_snapshot_migrates_as_stale_until_regenerated() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("storage");
+        let (subject_id, snapshot_id) = {
+            let manager = FeatureStorage::new(&root);
+            let workspace = manager.workspace("workspace-a").unwrap();
+            let registration = workspace
+                .register(FeatureRegistration::new(
+                    SUBJEKTIV_FEATURE_ID,
+                    V3_MIGRATIONS,
+                ))
+                .unwrap();
+            let store = SubjektivStore::open(&workspace, &registration).unwrap();
+            let subject = store.create_subject(role()).unwrap();
+            let snapshot = SurfaceSnapshot {
+                schema_version: SUBJEKTIV_SCHEMA_VERSION,
+                id: "legacy-surface".into(),
+                subject_id: subject.id.clone(),
+                body_md: "Legacy summary without generation-policy evidence.".into(),
+                memory_refs: Vec::new(),
+                built_from_store_revision: subject.store_revision,
+                created_at: now(),
+            };
+            store
+                .database
+                .try_transaction(|transaction| -> Result<()> {
+                    transaction.execute(
+                        "INSERT INTO surface_snapshots (
+                            subject_id, snapshot_id, built_from_store_revision,
+                            snapshot_json, created_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            subject.id,
+                            snapshot.id,
+                            to_i64(snapshot.built_from_store_revision)?,
+                            serde_json::to_string(&snapshot)?,
+                            snapshot.created_at
+                        ],
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO surface_snapshot_seals (subject_id, snapshot_id)
+                         VALUES (?1, ?2)",
+                        params![subject.id, snapshot.id],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            (subject.id, snapshot.id)
+        };
+
+        let (_manager, _workspace, store) = open_store(&root, "workspace-a");
+        let resident = store.resident_surface(&subject_id).unwrap();
+        assert_eq!(resident.availability, SurfaceAvailability::Stale);
+        assert!(resident.snapshot.is_none());
+        assert!(
+            store
+                .surface_snapshot(&subject_id, &snapshot_id)
+                .unwrap()
+                .is_some(),
+            "migration retains the legacy snapshot as history without injecting it"
+        );
+
+        let generation = store.prepare_surface_generation(&subject_id).unwrap();
+        let regenerated = store
+            .publish_surface_generation(&subject_id, &generation.id, Vec::new())
+            .unwrap();
+        assert_ne!(regenerated.id, snapshot_id);
+        let ready = store.resident_surface(&subject_id).unwrap();
+        assert_eq!(ready.availability, SurfaceAvailability::Ready);
+        assert_eq!(ready.snapshot.unwrap().id, regenerated.id);
+        assert!(
+            store
+                .surface_snapshot(&subject_id, &snapshot_id)
+                .unwrap()
+                .is_some(),
+            "regeneration appends instead of mutating legacy history"
+        );
+        let retried = store
+            .publish_surface_generation(&subject_id, &generation.id, Vec::new())
+            .unwrap();
+        assert_eq!(retried.id, regenerated.id);
     }
 
     #[test]
@@ -4810,6 +4975,72 @@ mod tests {
         }
         let serialized = serde_json::to_vec(&first.materials).unwrap();
         assert!(estimated_tokens_for_bytes(serialized.len()) <= SURFACE_MATERIAL_TOKEN_BUDGET);
+    }
+
+    #[test]
+    fn oversized_kind_cannot_starve_other_surface_categories() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_manager, _workspace, store) = open_store(temp.path(), "workspace-a");
+        let subject = store.create_subject(role()).unwrap();
+
+        let mut oversized = draft("oversized preference", "category fairness fixture");
+        oversized.kind = CandidateKind::Preference;
+        oversized.body_md = "x".repeat((SURFACE_MATERIAL_TOKEN_BUDGET - 100) * 4);
+        store.create_memory(&subject.id, oversized).unwrap();
+
+        for kind in [
+            CandidateKind::Constraint,
+            CandidateKind::Decision,
+            CandidateKind::WorkingAssumption,
+            CandidateKind::OpenQuestion,
+            CandidateKind::Lesson,
+        ] {
+            let mut value = draft(&format!("{kind:?}"), "category fairness fixture");
+            value.kind = kind;
+            store.create_memory(&subject.id, value).unwrap();
+        }
+
+        let generation = store.prepare_surface_generation(&subject.id).unwrap();
+        for kind in [
+            CandidateKind::Constraint,
+            CandidateKind::Decision,
+            CandidateKind::WorkingAssumption,
+            CandidateKind::OpenQuestion,
+            CandidateKind::Lesson,
+        ] {
+            assert!(
+                generation.materials.iter().any(|item| item.kind == kind),
+                "one large category must not exclude {kind:?}"
+            );
+        }
+        assert!(
+            estimated_tokens_for_bytes(serde_json::to_vec(&generation.materials).unwrap().len())
+                <= SURFACE_MATERIAL_TOKEN_BUDGET
+        );
+    }
+
+    #[test]
+    fn surface_material_selection_reclaims_unused_category_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_manager, _workspace, store) = open_store(temp.path(), "workspace-a");
+        let subject = store.create_subject(role()).unwrap();
+
+        let mut small = draft("small preference", "soft category budget fixture");
+        small.kind = CandidateKind::Preference;
+        store.create_memory(&subject.id, small).unwrap();
+        let mut large = draft("large constraint", "soft category budget fixture");
+        large.kind = CandidateKind::Constraint;
+        large.body_md = "x".repeat(22_000);
+        store.create_memory(&subject.id, large).unwrap();
+
+        let generation = store.prepare_surface_generation(&subject.id).unwrap();
+        assert_eq!(generation.materials.len(), 2);
+        assert_eq!(generation.materials[0].kind, CandidateKind::Preference);
+        assert_eq!(generation.materials[1].kind, CandidateKind::Constraint);
+        assert!(
+            estimated_tokens_for_bytes(serde_json::to_vec(&generation.materials).unwrap().len())
+                <= SURFACE_MATERIAL_TOKEN_BUDGET
+        );
     }
 
     #[test]

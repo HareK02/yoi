@@ -140,13 +140,27 @@ impl FeatureModule for MemorySurfaceOutputFeature {
     }
 }
 
+fn submit_input_schema() -> serde_json::Value {
+    serde_json::to_value(schemars::schema_for!(SubmitMemorySurfaceParams))
+        .unwrap_or_else(|_| serde_json::json!({}))
+}
+
+pub(crate) fn submit_llm_tool_definition() -> agen::llm_client::ToolDefinition {
+    agen::llm_client::ToolDefinition::new(SUBMIT_TOOL)
+        .description(SUBMIT_DESCRIPTION)
+        .input_schema(submit_input_schema())
+}
+
 fn submit_definition(state: MemorySurfaceOutputState) -> ToolDefinition {
     Arc::new(move || {
-        let schema = serde_json::to_value(schemars::schema_for!(SubmitMemorySurfaceParams))
-            .unwrap_or_else(|_| serde_json::json!({}));
-        let meta = ToolMeta::new(SUBMIT_TOOL)
-            .description(SUBMIT_DESCRIPTION)
-            .input_schema(schema);
+        let definition = submit_llm_tool_definition();
+        let meta = ToolMeta::new(definition.name)
+            .description(
+                definition
+                    .description
+                    .expect("SubmitMemorySurface description is fixed"),
+            )
+            .input_schema(definition.input_schema);
         let tool: Arc<dyn Tool> = Arc::new(SubmitMemorySurfaceTool {
             state: state.clone(),
         });
