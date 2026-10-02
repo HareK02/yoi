@@ -1233,6 +1233,22 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(resolved.manifest.worker.name, "role-worker");
+            let compaction = resolved.manifest.compaction.as_ref().unwrap();
+            assert_eq!(compaction.worker_max_turns, Some(100), "{}", entry.name);
+            assert_eq!(
+                compaction.worker_context_max_tokens, 100_000,
+                "{}",
+                entry.name
+            );
+            assert_eq!(
+                compaction
+                    .model
+                    .as_ref()
+                    .and_then(|model| model.ref_.as_deref()),
+                Some("codex-oauth/gpt-6-luna"),
+                "{}",
+                entry.name
+            );
         }
     }
 

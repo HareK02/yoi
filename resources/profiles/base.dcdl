@@ -20,6 +20,8 @@ compaction = {
     threshold = 240000;
     request_threshold = 270000;
     worker_context_max_tokens = 100000;
+    worker_max_turns = 100;
+    model = { ref = "codex-oauth/gpt-6-luna"; };
 };
 
 feature = {
