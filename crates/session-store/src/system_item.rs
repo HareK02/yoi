@@ -157,6 +157,16 @@ pub enum SystemItem {
         prompt_provenance: Option<PromptRenderProvenance>,
     },
 
+    /// Restore-boundary refresh of the current resident Memory projection.
+    /// The exact rendered body is retained so replay is byte-identical; a
+    /// refresh with no ready summary explicitly supersedes older resident
+    /// context without deleting or rewriting history.
+    ResidentSummaryRefresh {
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_provenance: Option<PromptRenderProvenance>,
+    },
+
     /// Synthetic note inserted after an interrupted turn before the next
     /// user input. `body` is the exact LLM-context text explaining that the
     /// previous turn was cut short.
@@ -181,6 +191,7 @@ impl SystemItem {
                 format!("Ignored legacy procedure item: /{slug}")
             }
             SystemItem::TaskReminder { body, .. } => body.clone(),
+            SystemItem::ResidentSummaryRefresh { body, .. } => body.clone(),
             SystemItem::Interrupt { body, .. } => body.clone(),
         }
     }
@@ -202,6 +213,7 @@ impl SystemItem {
             SystemItem::LegacyKnowledgeIgnored { .. } => "legacy_knowledge_ignored",
             SystemItem::LegacyIgnored { .. } => "legacy_ignored",
             SystemItem::TaskReminder { .. } => "task_reminder",
+            SystemItem::ResidentSummaryRefresh { .. } => "resident_summary_refresh",
             SystemItem::Interrupt { .. } => "interrupt",
         }
     }

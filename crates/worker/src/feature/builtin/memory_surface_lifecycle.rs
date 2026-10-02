@@ -358,42 +358,120 @@ fn bounded_editor_input(
     system_prompt: &str,
     generation: &server_api::SubjektivSurfacePrepareResponse,
 ) -> Result<(String, Vec<server_api::SubjektivSurfaceMaterial>), HookError> {
-    let mut materials = generation.materials.clone();
-    loop {
-        let input = serde_json::to_string(&serde_json::json!({
-            "question": EDITOR_QUESTION,
-            "body_token_budget": generation.body_token_budget,
-            "input_token_budget": generation.input_token_budget,
-            "materials": &materials,
-        }))
-        .map_err(|error| HookError::new(HookErrorCategory::Internal, error.to_string()))?;
-        let request = Request::new()
-            .system(system_prompt)
-            .user(input.clone())
-            .tool(submit_llm_tool_definition());
-        let estimated_tokens = estimated_editor_request_tokens(&request)?;
-        if estimated_tokens <= generation.input_token_budget {
-            if materials.is_empty() && !generation.materials.is_empty() {
-                return Err(HookError::new(
-                    HookErrorCategory::Internal,
-                    format!(
-                        "surface editor fixed prompt and material overhead left no grounded material within the {} token input budget",
-                        generation.input_token_budget
-                    ),
-                ));
-            }
-            return Ok((input, materials));
-        }
-        if materials.pop().is_none() {
-            return Err(HookError::new(
-                HookErrorCategory::Internal,
-                format!(
-                    "surface editor fixed prompt, JSON framing, and tool schema exceed the {} token input budget (estimated {estimated_tokens})",
-                    generation.input_token_budget
-                ),
-            ));
+    let empty_tokens = editor_request_tokens_for_materials(system_prompt, generation, &[])?;
+    if empty_tokens > generation.input_token_budget {
+        return Err(HookError::new(
+            HookErrorCategory::Internal,
+            format!(
+                "surface editor fixed prompt, JSON framing, and tool schema exceed the {} token input budget (estimated {empty_tokens})",
+                generation.input_token_budget
+            ),
+        ));
+    }
+
+    let mut populated_kinds = Vec::new();
+    for material in &generation.materials {
+        if !populated_kinds.contains(&material.kind) {
+            populated_kinds.push(material.kind.clone());
         }
     }
+    let material_token_budget = generation.input_token_budget - empty_tokens;
+    let per_kind_token_budget = material_token_budget / populated_kinds.len().max(1);
+    let mut accepted = vec![false; generation.materials.len()];
+    let mut deferred = Vec::new();
+
+    for (index, material) in generation.materials.iter().enumerate() {
+        let kind_materials = generation
+            .materials
+            .iter()
+            .zip(&accepted)
+            .filter(|(selected, accepted)| **accepted && selected.kind == material.kind)
+            .map(|(selected, _)| selected)
+            .chain(std::iter::once(material))
+            .collect::<Vec<_>>();
+        let all_materials = generation
+            .materials
+            .iter()
+            .zip(&accepted)
+            .filter(|(_, accepted)| **accepted)
+            .map(|(selected, _)| selected)
+            .chain(std::iter::once(material))
+            .collect::<Vec<_>>();
+        let kind_cost =
+            editor_request_tokens_for_materials(system_prompt, generation, &kind_materials)?
+                .saturating_sub(empty_tokens);
+        let all_tokens =
+            editor_request_tokens_for_materials(system_prompt, generation, &all_materials)?;
+        if kind_cost <= per_kind_token_budget && all_tokens <= generation.input_token_budget {
+            accepted[index] = true;
+        } else {
+            deferred.push(index);
+        }
+    }
+
+    // Equal per-kind shares reserve room in the final normalized request. Any
+    // unused share is reclaimed in the original canonical round-robin order.
+    for index in deferred {
+        let material = &generation.materials[index];
+        let all_materials = generation
+            .materials
+            .iter()
+            .zip(&accepted)
+            .filter(|(_, accepted)| **accepted)
+            .map(|(selected, _)| selected)
+            .chain(std::iter::once(material))
+            .collect::<Vec<_>>();
+        if editor_request_tokens_for_materials(system_prompt, generation, &all_materials)?
+            <= generation.input_token_budget
+        {
+            accepted[index] = true;
+        }
+    }
+
+    let materials = generation
+        .materials
+        .iter()
+        .zip(accepted)
+        .filter_map(|(material, accepted)| accepted.then_some(material.clone()))
+        .collect::<Vec<_>>();
+    if materials.is_empty() && !generation.materials.is_empty() {
+        return Err(HookError::new(
+            HookErrorCategory::Internal,
+            format!(
+                "surface editor fixed prompt and material overhead left no grounded material within the {} token input budget",
+                generation.input_token_budget
+            ),
+        ));
+    }
+    let material_refs = materials.iter().collect::<Vec<_>>();
+    let input = serialize_editor_input(generation, &material_refs)?;
+    Ok((input, materials))
+}
+
+fn editor_request_tokens_for_materials(
+    system_prompt: &str,
+    generation: &server_api::SubjektivSurfacePrepareResponse,
+    materials: &[&server_api::SubjektivSurfaceMaterial],
+) -> Result<usize, HookError> {
+    let input = serialize_editor_input(generation, materials)?;
+    let request = Request::new()
+        .system(system_prompt)
+        .user(input)
+        .tool(submit_llm_tool_definition());
+    estimated_editor_request_tokens(&request)
+}
+
+fn serialize_editor_input(
+    generation: &server_api::SubjektivSurfacePrepareResponse,
+    materials: &[&server_api::SubjektivSurfaceMaterial],
+) -> Result<String, HookError> {
+    serde_json::to_string(&serde_json::json!({
+        "question": EDITOR_QUESTION,
+        "body_token_budget": generation.body_token_budget,
+        "input_token_budget": generation.input_token_budget,
+        "materials": materials,
+    }))
+    .map_err(|error| HookError::new(HookErrorCategory::Internal, error.to_string()))
 }
 
 fn estimated_editor_request_tokens(request: &Request) -> Result<usize, HookError> {
@@ -431,11 +509,19 @@ mod tests {
     use crate::worker::{WorkspaceClientError, WorkspaceRequest, WorkspaceResponse};
 
     fn material(id: &str, body_bytes: usize) -> server_api::SubjektivSurfaceMaterial {
+        material_with_body(id, CandidateKind::Constraint, "x".repeat(body_bytes))
+    }
+
+    fn material_with_body(
+        id: &str,
+        kind: CandidateKind,
+        body_md: String,
+    ) -> server_api::SubjektivSurfaceMaterial {
         server_api::SubjektivSurfaceMaterial {
             memory_id: id.into(),
             revision: 1,
-            kind: CandidateKind::Constraint,
-            body_md: "x".repeat(body_bytes),
+            kind,
+            body_md,
             why_useful: "budget fixture".into(),
             staleness: None,
         }
@@ -703,7 +789,7 @@ permission = "write"
         );
         let (input, selected) = bounded_editor_input("system policy", &generation).unwrap();
 
-        assert_eq!(selected.len(), 1, "deterministically trims the tail");
+        assert_eq!(selected.len(), 1, "deterministically bounds one category");
         assert_eq!(selected[0].memory_id, "memory-1");
         assert!(input.contains(EDITOR_QUESTION));
         assert!(
@@ -719,6 +805,77 @@ permission = "write"
             estimated_editor_request_tokens(&editor_request("system policy", &input)).unwrap()
                 > materials_only_tokens,
             "full accounting must include framing and the SubmitMemorySurface schema"
+        );
+    }
+
+    #[test]
+    fn final_editor_budget_preserves_feasible_nonempty_categories() {
+        let materials = vec![
+            material_with_body(
+                "preference-large",
+                CandidateKind::Preference,
+                "\\\"".repeat(8_000),
+            ),
+            material_with_body(
+                "constraint-small",
+                CandidateKind::Constraint,
+                "constraint".into(),
+            ),
+            material_with_body("decision-small", CandidateKind::Decision, "decision".into()),
+            material_with_body(
+                "assumption-small",
+                CandidateKind::WorkingAssumption,
+                "assumption".into(),
+            ),
+            material_with_body(
+                "question-small",
+                CandidateKind::OpenQuestion,
+                "question".into(),
+            ),
+            material_with_body("lesson-small", CandidateKind::Lesson, "lesson".into()),
+        ];
+        let mut generation = generation(9_999, materials);
+        for _ in 0..3 {
+            let large = editor_request_tokens_for_materials(
+                "system policy",
+                &generation,
+                &[&generation.materials[0]],
+            )
+            .unwrap();
+            let small = editor_request_tokens_for_materials(
+                "system policy",
+                &generation,
+                &generation.materials[1..].iter().collect::<Vec<_>>(),
+            )
+            .unwrap();
+            generation.input_token_budget = large.max(small);
+        }
+        let all = editor_request_tokens_for_materials(
+            "system policy",
+            &generation,
+            &generation.materials.iter().collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(all > generation.input_token_budget);
+
+        let (input, selected) = bounded_editor_input("system policy", &generation).unwrap();
+        assert!(
+            !selected
+                .iter()
+                .any(|item| item.kind == CandidateKind::Preference)
+        );
+        for kind in [
+            CandidateKind::Constraint,
+            CandidateKind::Decision,
+            CandidateKind::WorkingAssumption,
+            CandidateKind::OpenQuestion,
+            CandidateKind::Lesson,
+        ] {
+            assert!(selected.iter().any(|item| item.kind == kind));
+        }
+        assert!(
+            estimated_editor_request_tokens(&editor_request("system policy", &input)).unwrap()
+                <= generation.input_token_budget
         );
     }
 

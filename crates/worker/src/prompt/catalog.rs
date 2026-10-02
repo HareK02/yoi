@@ -104,6 +104,7 @@ pub enum WorkerPrompt {
     WorkingBoundariesSection,
     AgentsMdSection,
     ResidentMemorySummarySection,
+    ResidentMemoryRestoreSection,
     WorkerOrchestrationGuidanceSection,
     SubWorkerSpawnToolDescription,
 }
@@ -126,6 +127,7 @@ impl WorkerPrompt {
             Self::WorkingBoundariesSection => "internal.working_boundaries_section",
             Self::AgentsMdSection => "internal.agents_md_section",
             Self::ResidentMemorySummarySection => "internal.resident_memory_summary_section",
+            Self::ResidentMemoryRestoreSection => "internal.resident_memory_restore_section",
             Self::WorkerOrchestrationGuidanceSection => {
                 "internal.worker_orchestration_guidance_section"
             }
@@ -147,6 +149,7 @@ impl WorkerPrompt {
         WorkerPrompt::WorkingBoundariesSection,
         WorkerPrompt::AgentsMdSection,
         WorkerPrompt::ResidentMemorySummarySection,
+        WorkerPrompt::ResidentMemoryRestoreSection,
         WorkerPrompt::WorkerOrchestrationGuidanceSection,
         WorkerPrompt::SubWorkerSpawnToolDescription,
     ];
@@ -500,6 +503,15 @@ impl PromptCatalog {
         self.render(
             WorkerPrompt::ResidentMemorySummarySection,
             single("summary", summary),
+        )
+    }
+    pub fn resident_memory_restore_section(
+        &self,
+        summary: Option<&str>,
+    ) -> Result<String, CatalogError> {
+        self.render(
+            WorkerPrompt::ResidentMemoryRestoreSection,
+            single("summary", summary.unwrap_or_default()),
         )
     }
     pub fn worker_orchestration_guidance_section(&self) -> Result<String, CatalogError> {
