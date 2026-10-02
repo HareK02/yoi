@@ -1,6 +1,11 @@
 declare const Deno: {
   test(name: string, fn: () => void | Promise<void>): void;
+  readTextFile(path: URL): Promise<string>;
 };
+
+function assert(condition: unknown, message: string): asserts condition {
+  if (!condition) throw new Error(message);
+}
 
 function assertEquals(actual: unknown, expected: unknown): void {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -88,7 +93,7 @@ Deno.test("workspace creation preserves caller-owned operation key across retry"
     operation_key: "web-create-1",
     display_name: "Alpha",
     repository: {
-      repository_key: "main",
+      repository_key: "platform",
       uri: "/srv/alpha",
       default_ref: "develop",
     },
@@ -112,4 +117,28 @@ Deno.test("workspace creation preserves caller-owned operation key across retry"
     WorkspaceCatalogError,
   );
   assertEquals(bodies, [request, request]);
+});
+
+Deno.test("workspace creation form starts with an explicit required Repository key", async () => {
+  const source = await Deno.readTextFile(
+    new URL("../src/routes/+page.svelte", import.meta.url),
+  );
+
+  assert(
+    source.includes('let repositoryKey = $state("");'),
+    "the form must start without an implicit Repository key",
+  );
+  assert(
+    source.includes("<input bind:value={repositoryKey} required"),
+    "the Browser must require creator input for the Repository key",
+  );
+  assert(
+    source.includes("repository_key: normalized.repositoryKey"),
+    "the Browser must submit the creator-provided Repository key",
+  );
+  assert(
+    !source.includes('repositoryKey || "main"') &&
+      !source.includes("repositoryKey || 'main'"),
+    "the Browser must not fall back to main",
+  );
 });

@@ -11186,6 +11186,17 @@ mod tests {
             }))
             .is_err()
         );
+        assert!(
+            serde_json::from_value::<WorkspaceCreateRequest>(serde_json::json!({
+                "operation_key": "workspace-create-1",
+                "display_name": "Workspace",
+                "repository": {
+                    "uri": "/srv/repositories/platform"
+                }
+            }))
+            .is_err(),
+            "the API wire shape must not supply a default Repository key"
+        );
     }
 
     #[test]
