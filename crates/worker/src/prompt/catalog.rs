@@ -95,6 +95,7 @@ pub enum WorkerPrompt {
     MemoryExtractSystem,
     MemoryConsolidationSystem,
     SubjektivMemoryConsolidationSystem,
+    SubjektivMemorySurfaceSystem,
     FlowVerifierSystem,
     BackendJobSystem,
     NotifyWrapper,
@@ -116,6 +117,7 @@ impl WorkerPrompt {
             Self::SubjektivMemoryConsolidationSystem => {
                 "internal.subjektiv_memory_consolidation_system"
             }
+            Self::SubjektivMemorySurfaceSystem => "internal.subjektiv_memory_surface_system",
             Self::FlowVerifierSystem => "internal.flow_verifier_system",
             Self::BackendJobSystem => "internal.backend_job_system",
             Self::NotifyWrapper => "internal.notify_wrapper",
@@ -136,6 +138,7 @@ impl WorkerPrompt {
         WorkerPrompt::MemoryExtractSystem,
         WorkerPrompt::MemoryConsolidationSystem,
         WorkerPrompt::SubjektivMemoryConsolidationSystem,
+        WorkerPrompt::SubjektivMemorySurfaceSystem,
         WorkerPrompt::FlowVerifierSystem,
         WorkerPrompt::BackendJobSystem,
         WorkerPrompt::NotifyWrapper,
@@ -460,6 +463,12 @@ impl PromptCatalog {
     ) -> Result<String, CatalogError> {
         self.render(
             WorkerPrompt::SubjektivMemoryConsolidationSystem,
+            single("language", language),
+        )
+    }
+    pub fn subjektiv_memory_surface_system(&self, language: &str) -> Result<String, CatalogError> {
+        self.render(
+            WorkerPrompt::SubjektivMemorySurfaceSystem,
             single("language", language),
         )
     }
@@ -927,6 +936,23 @@ mod tests {
                 .unwrap()
                 .contains("LANGUAGE_MARKER")
         );
+        let surface = catalog
+            .subjektiv_memory_surface_system("SURFACE_LANGUAGE")
+            .unwrap();
+        assert!(surface.contains("SURFACE_LANGUAGE"));
+        for required in [
+            "conditions",
+            "negation",
+            "contradictions",
+            "staleness",
+            "SubmitMemorySurface",
+            "not semantic verification",
+        ] {
+            assert!(
+                surface.contains(required),
+                "missing surface rule {required}"
+            );
+        }
         assert!(
             catalog
                 .notify_wrapper("NOTIFICATION_MARKER")

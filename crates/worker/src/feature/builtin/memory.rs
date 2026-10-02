@@ -93,6 +93,87 @@ impl dyn WorkspaceClient + '_ {
     ) -> Result<MemoryConsolidationOutput, WorkspaceMemoryBackendError> {
         execute_memory_consolidation(self, operation, true).await
     }
+
+    pub async fn prepare_subjektiv_memory_surface(
+        &self,
+    ) -> Result<server_api::SubjektivSurfacePrepareResponse, WorkspaceMemoryBackendError> {
+        match execute_subjektiv_memory_operation(
+            self,
+            server_api::SubjektivMemoryBackendOperation::PrepareSurface(
+                server_api::SubjektivSurfacePrepareRequest {},
+            ),
+        )
+        .await?
+        {
+            server_api::SubjektivMemoryBackendResponse::SurfacePrepared(output) => Ok(output),
+            other => Err(WorkspaceMemoryBackendError::Backend(format!(
+                "unexpected surface preparation response: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn publish_subjektiv_memory_surface(
+        &self,
+        input: server_api::SubjektivSurfacePublishRequest,
+    ) -> Result<server_api::SubjektivSurfacePublishResponse, WorkspaceMemoryBackendError> {
+        match execute_subjektiv_memory_operation(
+            self,
+            server_api::SubjektivMemoryBackendOperation::PublishSurface(input),
+        )
+        .await?
+        {
+            server_api::SubjektivMemoryBackendResponse::SurfacePublished(output) => Ok(output),
+            other => Err(WorkspaceMemoryBackendError::Backend(format!(
+                "unexpected surface publication response: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn fail_subjektiv_memory_surface(
+        &self,
+        input: server_api::SubjektivSurfaceFailureRequest,
+    ) -> Result<server_api::SubjektivSurfaceFailureResponse, WorkspaceMemoryBackendError> {
+        match execute_subjektiv_memory_operation(
+            self,
+            server_api::SubjektivMemoryBackendOperation::FailSurface(input),
+        )
+        .await?
+        {
+            server_api::SubjektivMemoryBackendResponse::SurfaceFailed(output) => Ok(output),
+            other => Err(WorkspaceMemoryBackendError::Backend(format!(
+                "unexpected surface failure response: {other:?}"
+            ))),
+        }
+    }
+}
+
+async fn execute_subjektiv_memory_operation(
+    client: &dyn WorkspaceClient,
+    operation: server_api::SubjektivMemoryBackendOperation,
+) -> Result<server_api::SubjektivMemoryBackendResponse, WorkspaceMemoryBackendError> {
+    let workspace_id =
+        client
+            .workspace_id()
+            .ok_or_else(|| WorkspaceMemoryBackendError::Unavailable {
+                reason: format!(
+                    "workspace client kind `{}` has no workspace id",
+                    client.kind()
+                ),
+            })?;
+    let response = client.execute(WorkspaceRequest::json(
+        WorkspaceRequestMethod::Post,
+        format!("/api/w/{workspace_id}/subjektiv/memory"),
+        serde_json::to_string(&server_api::SubjektivMemoryBackendRequest { operation })?,
+    ))?;
+    let status = reqwest::StatusCode::from_u16(response.status)
+        .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    if !response.is_success() {
+        return Err(WorkspaceMemoryBackendError::Http {
+            status,
+            body: response.body,
+        });
+    }
+    Ok(serde_json::from_str(&response.body)?)
 }
 
 async fn execute_memory_backend(

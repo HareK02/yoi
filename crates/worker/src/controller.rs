@@ -1313,6 +1313,16 @@ where
     {
         feature_registry.add_module(memory_lifecycle);
     }
+    if let Some(surface_lifecycle) = crate::feature::builtin::memory_surface_lifecycle::SubjektivSurfaceLifecycleFeature::from_manifest(
+        worker.manifest_lifecycle_features_enabled(),
+        worker.workspace_client_handle(),
+        spawner_manifest.clone(),
+        worker.llm_client_handle(),
+        prompts.clone(),
+        spawner_workspace_context.clone(),
+    )? {
+        feature_registry.add_module(surface_lifecycle);
+    }
     if let Some(subjektiv_lifecycle) =
         crate::feature::builtin::memory_lifecycle::SubjektivLifecycleFeature::from_resolved_config(
             worker.manifest_lifecycle_features_enabled(),

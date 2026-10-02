@@ -24,6 +24,7 @@ internalBackendJobSystem = import "./internal/backend_job_system.md";
 internalTicketItemChecker = import "./internal/ticket_item_checker.md";
 internalMemoryConsolidationSystem = import "./internal/memory_consolidation_system.md";
 internalSubjektivMemoryConsolidationSystem = import "./internal/subjektiv_memory_consolidation_system.md";
+internalSubjektivMemorySurfaceSystem = import "./internal/subjektiv_memory_surface_system.md";
 internalMemoryExtractSystem = import "./internal/memory_extract_system.md";
 internalWorkspaceOrchestratorQueueAttention = import "./internal/workspace_orchestrator_queue_attention.md";
 internalNotifyWrapper = import "./internal/notify_wrapper.md";
@@ -62,6 +63,7 @@ in
         ticket_item_checker = internalTicketItemChecker.content;
         memory_consolidation_system = internalMemoryConsolidationSystem.content;
         subjektiv_memory_consolidation_system = internalSubjektivMemoryConsolidationSystem.content;
+        subjektiv_memory_surface_system = internalSubjektivMemorySurfaceSystem.content;
         memory_extract_system = internalMemoryExtractSystem.content;
         workspace_orchestrator_queue_attention = internalWorkspaceOrchestratorQueueAttention.content;
         notify_wrapper = internalNotifyWrapper.content;

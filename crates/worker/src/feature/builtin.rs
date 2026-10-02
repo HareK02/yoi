@@ -11,6 +11,8 @@ pub mod manage_worker;
 pub mod memory;
 pub(crate) mod memory_lifecycle;
 pub mod memory_staging_output;
+pub(crate) mod memory_surface_lifecycle;
+pub(crate) mod memory_surface_output;
 pub mod merge_request;
 pub mod objective;
 pub mod orchestration;

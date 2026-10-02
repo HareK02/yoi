@@ -1079,6 +1079,7 @@ pub trait ServerApi {
     )]
     async fn memory_backend(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: MemoryBackendRequest,
     ) -> Result<MemoryBackendResponse, RepositoryApiError>;
@@ -4825,6 +4826,86 @@ pub struct SubjektivMemoryCandidateDecisionResponse {
     pub surface_dirty: bool,
 }
 
+/// One bounded current Memory supplied to the surface editor. The Backend
+/// selects these records deterministically; callers cannot name arbitrary
+/// Memory revisions or broaden the generation input.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSurfaceMaterial {
+    pub memory_id: String,
+    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
+    pub revision: u64,
+    pub kind: memory::extract::CandidateKind,
+    pub body_md: String,
+    pub why_useful: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staleness: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSurfacePrepareRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSurfacePrepareResponse {
+    pub generation_id: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub store_revision: u64,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub active_memory_count: usize,
+    pub materials: Vec<SubjektivSurfaceMaterial>,
+    #[schemars(range(min = 1, max = 9_007_199_254_740_991_usize))]
+    pub body_token_budget: usize,
+    #[schemars(range(min = 1, max = 9_007_199_254_740_991_usize))]
+    pub input_token_budget: usize,
+    #[schemars(range(min = 1, max = 9_007_199_254_740_991_usize))]
+    pub per_kind_limit: usize,
+    #[schemars(range(min = 1, max = 9_007_199_254_740_991_usize))]
+    pub total_material_limit: usize,
+}
+
+/// One model-edited Markdown point and its exact confirmed-Memory support.
+/// Existence and scope are mechanically validated; semantic correctness is
+/// deliberately not claimed by that validation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSurfacePoint {
+    pub body_md: String,
+    pub memory_refs: Vec<SubjektivMemoryRevisionRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSurfacePublishRequest {
+    pub generation_id: String,
+    pub points: Vec<SubjektivSurfacePoint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSurfaceFailureRequest {
+    pub generation_id: String,
+    pub reason_code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSurfacePublishResponse {
+    pub snapshot_id: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub built_from_store_revision: u64,
+    pub empty: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSurfaceFailureResponse {
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub store_revision: u64,
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "operation", content = "input", rename_all = "snake_case")]
 pub enum SubjektivMemoryBackendOperation {
@@ -4837,6 +4918,9 @@ pub enum SubjektivMemoryBackendOperation {
     ListCandidates(SubjektivMemoryCandidateListRequest),
     ReadCandidate(SubjektivMemoryCandidateReadRequest),
     DecideCandidate(SubjektivMemoryCandidateDecisionRequest),
+    PrepareSurface(SubjektivSurfacePrepareRequest),
+    PublishSurface(SubjektivSurfacePublishRequest),
+    FailSurface(SubjektivSurfaceFailureRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -5005,6 +5089,9 @@ pub enum SubjektivMemoryBackendResponse {
     Candidates(SubjektivMemoryCandidateListResponse),
     Candidate(SubjektivMemoryCandidate),
     CandidateDecided(SubjektivMemoryCandidateDecisionResponse),
+    SurfacePrepared(SubjektivSurfacePrepareResponse),
+    SurfacePublished(SubjektivSurfacePublishResponse),
+    SurfaceFailed(SubjektivSurfaceFailureResponse),
 }
 
 pub const WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES: usize = 128;

@@ -23,6 +23,15 @@ use crate::feature_storage::{
 pub const SUBJEKTIV_SCHEMA_VERSION: u32 = 1;
 pub const SUBJEKTIV_FEATURE_ID: &str = "subjektiv";
 pub const MAX_STAGING_ANCHORS: usize = 10;
+/// Deterministic surface-generation policy. Input estimates use the repository's
+/// provider-independent UTF-8 byte estimate (`ceil(bytes / 4)`). The material
+/// payload is capped below the whole-input budget to reserve room for the fixed
+/// prompt and JSON framing.
+pub const SURFACE_BODY_TOKEN_BUDGET: usize = 1_024;
+pub const SURFACE_INPUT_TOKEN_BUDGET: usize = 12_000;
+pub const SURFACE_MATERIAL_TOKEN_BUDGET: usize = 10_000;
+pub const SURFACE_PER_KIND_LIMIT: usize = 8;
+pub const SURFACE_TOTAL_MATERIAL_LIMIT: usize = 24;
 
 pub type Result<T> = std::result::Result<T, SubjektivError>;
 
@@ -62,6 +71,8 @@ pub enum SubjektivError {
         expected: u64,
         actual: u64,
     },
+    #[error("surface generation conflict: {0}")]
+    SurfaceGenerationConflict(String),
     #[error("memory `{memory_id}` cannot transition from {from:?} to {to:?}")]
     InvalidStateTransition {
         memory_id: String,
@@ -401,7 +412,7 @@ pub struct StagingResolution {
     pub resolved_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SurfaceSnapshot {
     pub schema_version: u32,
@@ -412,6 +423,49 @@ pub struct SurfaceSnapshot {
     pub memory_refs: Vec<MemoryRevisionRef>,
     pub built_from_store_revision: u64,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceMaterial {
+    pub memory_id: String,
+    pub revision: u64,
+    pub kind: CandidateKind,
+    pub body_md: String,
+    pub why_useful: String,
+    pub staleness: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceGeneration {
+    pub id: String,
+    pub subject_id: String,
+    pub store_revision: u64,
+    pub active_memory_count: usize,
+    pub materials: Vec<SurfaceMaterial>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfacePoint {
+    pub body_md: String,
+    pub memory_refs: Vec<MemoryRevisionRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceAvailability {
+    Ungenerated,
+    Stale,
+    Failed,
+    Ready,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidentSurface {
+    pub availability: SurfaceAvailability,
+    pub snapshot: Option<SurfaceSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -841,6 +895,75 @@ END;
     Ok(())
 }
 
+fn add_surface_generation_state(
+    transaction: &Transaction<'_>,
+) -> crate::feature_storage::Result<()> {
+    transaction.execute_batch(
+        r#"
+CREATE TABLE surface_generation_state (
+    subject_id TEXT PRIMARY KEY,
+    store_revision INTEGER NOT NULL CHECK (store_revision >= 0),
+    status TEXT NOT NULL CHECK (status IN ('dirty', 'failed', 'ready')),
+    snapshot_id TEXT,
+    reason_code TEXT,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (subject_id) REFERENCES subjects(subject_id) ON DELETE RESTRICT,
+    FOREIGN KEY (subject_id, snapshot_id)
+        REFERENCES surface_snapshots(subject_id, snapshot_id) ON DELETE RESTRICT
+);
+
+INSERT INTO surface_generation_state (
+    subject_id, store_revision, status, snapshot_id, reason_code, updated_at
+)
+SELECT subjects.subject_id,
+       subjects.store_revision,
+       CASE WHEN EXISTS (
+           SELECT 1 FROM surface_snapshots current
+           WHERE current.subject_id = subjects.subject_id
+             AND current.built_from_store_revision = subjects.store_revision
+       ) THEN 'ready' ELSE 'dirty' END,
+       (
+           SELECT current.snapshot_id FROM surface_snapshots current
+           WHERE current.subject_id = subjects.subject_id
+             AND current.built_from_store_revision = subjects.store_revision
+           ORDER BY current.created_at ASC, current.snapshot_id ASC
+           LIMIT 1
+       ),
+       NULL,
+       subjects.updated_at
+FROM subjects
+WHERE EXISTS (
+    SELECT 1 FROM surface_snapshots any_snapshot
+    WHERE any_snapshot.subject_id = subjects.subject_id
+);
+
+CREATE TABLE surface_generation_runs (
+    subject_id TEXT NOT NULL,
+    generation_id TEXT NOT NULL,
+    store_revision INTEGER NOT NULL CHECK (store_revision >= 0),
+    active_memory_count INTEGER NOT NULL CHECK (active_memory_count >= 0),
+    materials_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (subject_id, generation_id),
+    FOREIGN KEY (subject_id) REFERENCES subjects(subject_id) ON DELETE RESTRICT
+);
+
+CREATE INDEX surface_generation_runs_by_revision
+ON surface_generation_runs(subject_id, store_revision, created_at, generation_id);
+
+CREATE TRIGGER surface_generation_runs_no_update
+BEFORE UPDATE ON surface_generation_runs BEGIN
+    SELECT RAISE(ABORT, 'subjektiv surface generation inputs are immutable');
+END;
+CREATE TRIGGER surface_generation_runs_no_delete
+BEFORE DELETE ON surface_generation_runs BEGIN
+    SELECT RAISE(ABORT, 'subjektiv surface generation inputs are retained');
+END;
+"#,
+    )?;
+    Ok(())
+}
+
 static MIGRATIONS: &[FeatureMigration] = &[
     FeatureMigration::new(1, "create subjektiv subject memory store", create_schema),
     FeatureMigration::new(
@@ -852,6 +975,11 @@ static MIGRATIONS: &[FeatureMigration] = &[
         3,
         "add idempotent atomic candidate decision receipts",
         add_candidate_decision_receipts,
+    ),
+    FeatureMigration::new(
+        4,
+        "add bounded surface generation state and runs",
+        add_surface_generation_state,
     ),
 ];
 
@@ -1519,6 +1647,225 @@ impl SubjektivStore {
         })
     }
 
+    /// Captures one deterministic, bounded generation input from only current
+    /// active Memory revisions. Kind order is fixed and selection is round-robin
+    /// across kinds; within each kind, updated_at desc then memory id asc.
+    pub fn prepare_surface_generation(&self, subject_id: &str) -> Result<SurfaceGeneration> {
+        self.database.try_transaction(|transaction| {
+            let subject = require_active_subject(transaction, subject_id)?;
+            let (active_memory_count, materials) =
+                select_surface_materials(transaction, subject_id)?;
+            let generation = SurfaceGeneration {
+                id: issued_id("surface-generation"),
+                subject_id: subject_id.to_string(),
+                store_revision: subject.store_revision,
+                active_memory_count,
+                materials,
+                created_at: now(),
+            };
+            transaction.execute(
+                "INSERT INTO surface_generation_runs (
+                    subject_id, generation_id, store_revision, active_memory_count,
+                    materials_json, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    subject_id,
+                    generation.id,
+                    to_i64(generation.store_revision)?,
+                    to_i64(generation.active_memory_count as u64)?,
+                    serde_json::to_string(&generation.materials)?,
+                    generation.created_at
+                ],
+            )?;
+            Ok(generation)
+        })
+    }
+
+    /// Validates structured editor output against the exact material snapshot and
+    /// atomically publishes it only while the subject store generation is current.
+    pub fn publish_surface_generation(
+        &self,
+        subject_id: &str,
+        generation_id: &str,
+        points: Vec<SurfacePoint>,
+    ) -> Result<SurfaceSnapshot> {
+        validate_label("surface generation id", generation_id)?;
+        self.database.try_transaction(|transaction| {
+            let subject = require_active_subject(transaction, subject_id)?;
+            let (store_revision, active_memory_count, materials_json) = transaction
+                .query_row(
+                    "SELECT store_revision, active_memory_count, materials_json
+                     FROM surface_generation_runs
+                     WHERE subject_id = ?1 AND generation_id = ?2",
+                    params![subject_id, generation_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    SubjektivError::SurfaceGenerationConflict(format!(
+                        "unknown generation `{generation_id}` for subject `{subject_id}`"
+                    ))
+                })?;
+            let store_revision = u64::try_from(store_revision).map_err(|_| {
+                SubjektivError::InvalidRecord("surface generation revision is negative".into())
+            })?;
+            if subject.store_revision != store_revision {
+                return Err(SubjektivError::SurfaceGenerationConflict(format!(
+                    "generation {store_revision} is stale; current store revision is {}",
+                    subject.store_revision
+                )));
+            }
+            let materials: Vec<SurfaceMaterial> = serde_json::from_str(&materials_json)?;
+            if active_memory_count > 0 && materials.is_empty() {
+                return Err(SubjektivError::InvalidRecord(
+                    "active Memory exists but no record fits the surface input budget".into(),
+                ));
+            }
+            let (body_md, memory_refs) = validate_surface_points(&materials, &points)?;
+            if let Some(existing) =
+                surface_snapshot_for_revision(transaction, subject_id, store_revision)?
+            {
+                if existing.body_md == body_md && existing.memory_refs == memory_refs {
+                    return Ok(existing);
+                }
+                return Err(SubjektivError::SurfaceGenerationConflict(format!(
+                    "store revision {store_revision} already has a different published surface"
+                )));
+            }
+            insert_surface_snapshot(
+                transaction,
+                subject_id,
+                body_md,
+                memory_refs,
+                store_revision,
+            )
+        })
+    }
+
+    /// Records a bounded generator failure without changing confirmed Memory. A
+    /// late failure cannot replace a ready surface or dirty a newer generation.
+    pub fn fail_surface_generation(
+        &self,
+        subject_id: &str,
+        generation_id: &str,
+        reason_code: &str,
+    ) -> Result<u64> {
+        validate_label("surface generation id", generation_id)?;
+        validate_label("surface failure reason", reason_code)?;
+        self.database.try_transaction(|transaction| {
+            let subject = require_active_subject(transaction, subject_id)?;
+            let generation_revision = transaction
+                .query_row(
+                    "SELECT store_revision FROM surface_generation_runs
+                     WHERE subject_id = ?1 AND generation_id = ?2",
+                    params![subject_id, generation_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    SubjektivError::SurfaceGenerationConflict(format!(
+                        "unknown generation `{generation_id}` for subject `{subject_id}`"
+                    ))
+                })?;
+            let generation_revision = u64::try_from(generation_revision).map_err(|_| {
+                SubjektivError::InvalidRecord("surface generation revision is negative".into())
+            })?;
+            if generation_revision == subject.store_revision {
+                let ready = transaction
+                    .query_row(
+                        "SELECT status FROM surface_generation_state WHERE subject_id = ?1",
+                        [subject_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .is_some_and(|status| status == "ready");
+                if !ready {
+                    transaction.execute(
+                        "INSERT INTO surface_generation_state (
+                            subject_id, store_revision, status, snapshot_id, reason_code, updated_at
+                         ) VALUES (?1, ?2, 'failed', NULL, ?3, ?4)
+                         ON CONFLICT(subject_id) DO UPDATE SET
+                            store_revision = excluded.store_revision,
+                            status = 'failed', snapshot_id = NULL,
+                            reason_code = excluded.reason_code,
+                            updated_at = excluded.updated_at",
+                        params![subject_id, to_i64(generation_revision)?, reason_code, now()],
+                    )?;
+                }
+            }
+            Ok(subject.store_revision)
+        })
+    }
+
+    /// Returns only a current ready snapshot for injection. Other states are
+    /// explicit so callers never report missing/stale/failed generation as empty
+    /// confirmed Memory.
+    pub fn resident_surface(&self, subject_id: &str) -> Result<ResidentSurface> {
+        self.database.try_with_connection(|connection| {
+            let subject = require_subject_in_connection(connection, subject_id)?;
+            let state = connection
+                .query_row(
+                    "SELECT store_revision, status, snapshot_id
+                     FROM surface_generation_state WHERE subject_id = ?1",
+                    [subject_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((revision, status, snapshot_id)) = state else {
+                return Ok(ResidentSurface {
+                    availability: SurfaceAvailability::Ungenerated,
+                    snapshot: None,
+                });
+            };
+            let revision = u64::try_from(revision).map_err(|_| {
+                SubjektivError::InvalidRecord("surface state revision is negative".into())
+            })?;
+            if revision != subject.store_revision || status == "dirty" {
+                return Ok(ResidentSurface {
+                    availability: SurfaceAvailability::Stale,
+                    snapshot: None,
+                });
+            }
+            if status == "failed" {
+                return Ok(ResidentSurface {
+                    availability: SurfaceAvailability::Failed,
+                    snapshot: None,
+                });
+            }
+            let snapshot_id = snapshot_id.ok_or_else(|| {
+                SubjektivError::InvalidRecord("ready surface state has no snapshot id".into())
+            })?;
+            let raw = connection.query_row(
+                "SELECT snapshot_json FROM surface_snapshots
+                 WHERE subject_id = ?1 AND snapshot_id = ?2",
+                params![subject_id, snapshot_id],
+                |row| row.get::<_, String>(0),
+            )?;
+            let snapshot = parse_surface_snapshot(&raw)?;
+            if snapshot.built_from_store_revision != subject.store_revision {
+                return Err(SubjektivError::InvalidRecord(
+                    "ready surface snapshot generation does not match subject".into(),
+                ));
+            }
+            Ok(ResidentSurface {
+                availability: SurfaceAvailability::Ready,
+                snapshot: Some(snapshot),
+            })
+        })
+    }
+
     pub fn create_surface_snapshot(
         &self,
         subject_id: &str,
@@ -1528,16 +1875,7 @@ impl SubjektivStore {
     ) -> Result<SurfaceSnapshot> {
         reject_duplicate_refs("surface snapshot", &memory_refs)?;
         reject_duplicate_memory_ids("surface snapshot", &memory_refs)?;
-        let snapshot = SurfaceSnapshot {
-            schema_version: SUBJEKTIV_SCHEMA_VERSION,
-            id: issued_id("surface"),
-            subject_id: subject_id.to_string(),
-            body_md: body_md.into(),
-            memory_refs,
-            built_from_store_revision,
-            created_at: now(),
-        };
-        let raw = serde_json::to_string(&snapshot)?;
+        let body_md = body_md.into();
         self.database.try_transaction(|transaction| {
             let subject = require_active_subject(transaction, subject_id)?;
             if subject.store_revision != built_from_store_revision {
@@ -1546,38 +1884,31 @@ impl SubjektivStore {
                     subject.store_revision
                 )));
             }
-            validate_memory_refs(transaction, subject_id, &snapshot.memory_refs)?;
-            transaction.execute(
-                "INSERT INTO surface_snapshots (
-                    subject_id, snapshot_id, built_from_store_revision, snapshot_json, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    subject_id,
-                    snapshot.id,
-                    to_i64(snapshot.built_from_store_revision)?,
-                    raw,
-                    snapshot.created_at
-                ],
-            )?;
-            for reference in &snapshot.memory_refs {
-                transaction.execute(
-                    "INSERT INTO surface_snapshot_refs (
-                        subject_id, snapshot_id, memory_id, revision
-                     ) VALUES (?1, ?2, ?3, ?4)",
-                    params![
-                        subject_id,
-                        snapshot.id,
-                        reference.memory_id,
-                        to_i64(reference.revision)?
-                    ],
-                )?;
+            validate_memory_refs(transaction, subject_id, &memory_refs)?;
+            if estimated_tokens(&body_md) > SURFACE_BODY_TOKEN_BUDGET {
+                return Err(SubjektivError::InvalidRecord(format!(
+                    "surface snapshot body exceeds {SURFACE_BODY_TOKEN_BUDGET} token estimate"
+                )));
             }
-            transaction.execute(
-                "INSERT INTO surface_snapshot_seals (subject_id, snapshot_id)
-                 VALUES (?1, ?2)",
-                params![subject_id, snapshot.id],
-            )?;
-            Ok(snapshot)
+            if let Some(existing) = surface_snapshot_for_revision(
+                transaction,
+                subject_id,
+                built_from_store_revision,
+            )? {
+                if existing.body_md == body_md && existing.memory_refs == memory_refs {
+                    return Ok(existing);
+                }
+                return Err(SubjektivError::SurfaceGenerationConflict(format!(
+                    "store revision {built_from_store_revision} already has a different published surface"
+                )));
+            }
+            insert_surface_snapshot(
+                transaction,
+                subject_id,
+                body_md,
+                memory_refs,
+                built_from_store_revision,
+            )
         })
     }
 
@@ -1598,6 +1929,218 @@ impl SubjektivStore {
             raw.map(|raw| parse_surface_snapshot(&raw)).transpose()
         })
     }
+}
+
+fn select_surface_materials(
+    transaction: &Transaction<'_>,
+    subject_id: &str,
+) -> Result<(usize, Vec<SurfaceMaterial>)> {
+    let mut statement = transaction.prepare(
+        "SELECT record_json FROM memory_records
+         WHERE subject_id = ?1 AND state = 'active'
+         ORDER BY updated_at DESC, memory_id ASC",
+    )?;
+    let rows = statement.query_map([subject_id], |row| row.get::<_, String>(0))?;
+    let mut buckets: [Vec<SurfaceMaterial>; 6] = std::array::from_fn(|_| Vec::new());
+    let mut active_memory_count = 0usize;
+    for row in rows {
+        let memory = parse_memory(&row?)?;
+        active_memory_count = active_memory_count.saturating_add(1);
+        let bucket = surface_kind_index(&memory.kind);
+        if buckets[bucket].len() < SURFACE_PER_KIND_LIMIT {
+            buckets[bucket].push(SurfaceMaterial {
+                memory_id: memory.id,
+                revision: memory.revision,
+                kind: memory.kind,
+                body_md: memory.body_md,
+                why_useful: memory.why_useful,
+                staleness: memory.staleness,
+            });
+        }
+    }
+
+    let mut selected = Vec::new();
+    let mut payload_bytes = 2usize; // JSON array delimiters.
+    for offset in 0..SURFACE_PER_KIND_LIMIT {
+        for bucket in &buckets {
+            let Some(material) = bucket.get(offset) else {
+                continue;
+            };
+            if selected.len() == SURFACE_TOTAL_MATERIAL_LIMIT {
+                return Ok((active_memory_count, selected));
+            }
+            let material_bytes = serde_json::to_vec(material)?.len().saturating_add(1);
+            if estimated_tokens_for_bytes(payload_bytes.saturating_add(material_bytes))
+                > SURFACE_MATERIAL_TOKEN_BUDGET
+            {
+                continue;
+            }
+            payload_bytes = payload_bytes.saturating_add(material_bytes);
+            selected.push(material.clone());
+        }
+    }
+    Ok((active_memory_count, selected))
+}
+
+fn surface_kind_index(kind: &CandidateKind) -> usize {
+    match kind {
+        CandidateKind::Preference => 0,
+        CandidateKind::Constraint => 1,
+        CandidateKind::Decision => 2,
+        CandidateKind::WorkingAssumption => 3,
+        CandidateKind::OpenQuestion => 4,
+        CandidateKind::Lesson => 5,
+    }
+}
+
+fn validate_surface_points(
+    materials: &[SurfaceMaterial],
+    points: &[SurfacePoint],
+) -> Result<(String, Vec<MemoryRevisionRef>)> {
+    if materials.is_empty() {
+        if points.is_empty() {
+            return Ok((String::new(), Vec::new()));
+        }
+        return Err(SubjektivError::InvalidRecord(
+            "an empty material set requires an empty surface".into(),
+        ));
+    }
+    if points.is_empty() {
+        return Err(SubjektivError::InvalidRecord(
+            "non-empty surface materials require at least one grounded point".into(),
+        ));
+    }
+    if points.len() > SURFACE_TOTAL_MATERIAL_LIMIT {
+        return Err(SubjektivError::InvalidRecord(format!(
+            "surface output exceeds {SURFACE_TOTAL_MATERIAL_LIMIT} points"
+        )));
+    }
+    let allowed = materials
+        .iter()
+        .map(|material| (material.memory_id.as_str(), material.revision))
+        .collect::<HashSet<_>>();
+    let mut bodies = Vec::with_capacity(points.len());
+    let mut seen = HashSet::new();
+    let mut refs = Vec::new();
+    for point in points {
+        let body = point.body_md.trim();
+        validate_nonempty("surface point body", body)?;
+        if point.memory_refs.is_empty() {
+            return Err(SubjektivError::InvalidRecord(
+                "every surface point requires at least one Memory reference".into(),
+            ));
+        }
+        reject_duplicate_refs("surface point", &point.memory_refs)?;
+        for reference in &point.memory_refs {
+            if !allowed.contains(&(reference.memory_id.as_str(), reference.revision)) {
+                return Err(SubjektivError::SubjectScopeMismatch {
+                    subject_id: "surface generation materials".into(),
+                    reference: format!("{}@{}", reference.memory_id, reference.revision),
+                });
+            }
+            if seen.insert((reference.memory_id.clone(), reference.revision)) {
+                refs.push(reference.clone());
+            }
+        }
+        bodies.push(body.to_string());
+    }
+    let body_md = bodies.join("\n\n");
+    if estimated_tokens(&body_md) > SURFACE_BODY_TOKEN_BUDGET {
+        return Err(SubjektivError::InvalidRecord(format!(
+            "surface body exceeds {SURFACE_BODY_TOKEN_BUDGET} token estimate"
+        )));
+    }
+    Ok((body_md, refs))
+}
+
+fn surface_snapshot_for_revision(
+    transaction: &Transaction<'_>,
+    subject_id: &str,
+    store_revision: u64,
+) -> Result<Option<SurfaceSnapshot>> {
+    let raw = transaction
+        .query_row(
+            "SELECT snapshot_json FROM surface_snapshots
+             WHERE subject_id = ?1 AND built_from_store_revision = ?2
+             ORDER BY created_at ASC, snapshot_id ASC LIMIT 1",
+            params![subject_id, to_i64(store_revision)?],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    raw.map(|raw| parse_surface_snapshot(&raw)).transpose()
+}
+
+fn insert_surface_snapshot(
+    transaction: &Transaction<'_>,
+    subject_id: &str,
+    body_md: String,
+    memory_refs: Vec<MemoryRevisionRef>,
+    built_from_store_revision: u64,
+) -> Result<SurfaceSnapshot> {
+    validate_memory_refs(transaction, subject_id, &memory_refs)?;
+    let snapshot = SurfaceSnapshot {
+        schema_version: SUBJEKTIV_SCHEMA_VERSION,
+        id: issued_id("surface"),
+        subject_id: subject_id.to_string(),
+        body_md,
+        memory_refs,
+        built_from_store_revision,
+        created_at: now(),
+    };
+    let raw = serde_json::to_string(&snapshot)?;
+    transaction.execute(
+        "INSERT INTO surface_snapshots (
+            subject_id, snapshot_id, built_from_store_revision, snapshot_json, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            subject_id,
+            snapshot.id,
+            to_i64(snapshot.built_from_store_revision)?,
+            raw,
+            snapshot.created_at
+        ],
+    )?;
+    for reference in &snapshot.memory_refs {
+        transaction.execute(
+            "INSERT INTO surface_snapshot_refs (
+                subject_id, snapshot_id, memory_id, revision
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                subject_id,
+                snapshot.id,
+                reference.memory_id,
+                to_i64(reference.revision)?
+            ],
+        )?;
+    }
+    transaction.execute(
+        "INSERT INTO surface_snapshot_seals (subject_id, snapshot_id) VALUES (?1, ?2)",
+        params![subject_id, snapshot.id],
+    )?;
+    transaction.execute(
+        "INSERT INTO surface_generation_state (
+            subject_id, store_revision, status, snapshot_id, reason_code, updated_at
+         ) VALUES (?1, ?2, 'ready', ?3, NULL, ?4)
+         ON CONFLICT(subject_id) DO UPDATE SET
+            store_revision = excluded.store_revision,
+            status = 'ready', snapshot_id = excluded.snapshot_id,
+            reason_code = NULL, updated_at = excluded.updated_at",
+        params![
+            subject_id,
+            to_i64(built_from_store_revision)?,
+            snapshot.id,
+            snapshot.created_at
+        ],
+    )?;
+    Ok(snapshot)
+}
+
+fn estimated_tokens(value: &str) -> usize {
+    estimated_tokens_for_bytes(value.len())
+}
+
+fn estimated_tokens_for_bytes(bytes: usize) -> usize {
+    bytes.saturating_add(3) / 4
 }
 
 fn apply_candidates_in_transaction(
@@ -1814,6 +2357,20 @@ fn write_memory_revision(
             subject_id,
             to_i64(subject.store_revision)?,
             subject_raw,
+            subject.updated_at
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO surface_generation_state (
+            subject_id, store_revision, status, snapshot_id, reason_code, updated_at
+         ) VALUES (?1, ?2, 'dirty', NULL, NULL, ?3)
+         ON CONFLICT(subject_id) DO UPDATE SET
+            store_revision = excluded.store_revision,
+            status = 'dirty', snapshot_id = NULL, reason_code = NULL,
+            updated_at = excluded.updated_at",
+        params![
+            subject_id,
+            to_i64(subject.store_revision)?,
             subject.updated_at
         ],
     )?;
@@ -4190,6 +4747,256 @@ mod tests {
                 .staging_candidate(&subject.id, &staged.id)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn surface_material_selection_is_scoped_active_bounded_and_deterministic() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_manager, _workspace, store) = open_store(temp.path(), "workspace-a");
+        let subject = store.create_subject(role()).unwrap();
+        let other = store.create_subject(role()).unwrap();
+        store
+            .create_memory(&other.id, draft("foreign", "foreign subject"))
+            .unwrap();
+
+        let kinds = [
+            CandidateKind::Preference,
+            CandidateKind::Constraint,
+            CandidateKind::Decision,
+            CandidateKind::WorkingAssumption,
+            CandidateKind::OpenQuestion,
+            CandidateKind::Lesson,
+        ];
+        let mut first_id = None;
+        for kind in &kinds {
+            for index in 0..9 {
+                let mut value = draft(&format!("{kind:?}-{index}"), "selection fixture");
+                value.kind = kind.clone();
+                let memory = store.create_memory(&subject.id, value).unwrap();
+                first_id.get_or_insert(memory.id);
+            }
+        }
+        let resolved_id = first_id.unwrap();
+        let current = store.memory(&subject.id, &resolved_id).unwrap().unwrap();
+        let mut resolved = draft("resolved", "no longer active");
+        resolved.kind = current.kind;
+        resolved.state = MemoryState::Resolved;
+        store
+            .revise_memory(&subject.id, &resolved_id, current.revision, resolved)
+            .unwrap();
+
+        let first = store.prepare_surface_generation(&subject.id).unwrap();
+        let second = store.prepare_surface_generation(&subject.id).unwrap();
+        assert_eq!(first.materials, second.materials);
+        assert_eq!(first.active_memory_count, 53);
+        assert_eq!(first.materials.len(), SURFACE_TOTAL_MATERIAL_LIMIT);
+        assert!(
+            first
+                .materials
+                .iter()
+                .all(|item| item.memory_id != resolved_id)
+        );
+        assert!(first.materials.iter().all(|item| item.body_md != "foreign"));
+        for kind in &kinds {
+            assert!(
+                first
+                    .materials
+                    .iter()
+                    .filter(|item| &item.kind == kind)
+                    .count()
+                    <= SURFACE_PER_KIND_LIMIT
+            );
+        }
+        let serialized = serde_json::to_vec(&first.materials).unwrap();
+        assert!(estimated_tokens_for_bytes(serialized.len()) <= SURFACE_MATERIAL_TOKEN_BUDGET);
+    }
+
+    #[test]
+    fn surface_states_validation_races_and_idempotency_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_manager, _workspace, store) = open_store(temp.path(), "workspace-a");
+        let subject = store.create_subject(role()).unwrap();
+        assert_eq!(
+            store.resident_surface(&subject.id).unwrap().availability,
+            SurfaceAvailability::Ungenerated
+        );
+
+        let empty_generation = store.prepare_surface_generation(&subject.id).unwrap();
+        let empty = store
+            .publish_surface_generation(&subject.id, &empty_generation.id, Vec::new())
+            .unwrap();
+        assert!(empty.body_md.is_empty());
+        assert_eq!(
+            store.resident_surface(&subject.id).unwrap().availability,
+            SurfaceAvailability::Ready
+        );
+
+        let memory = store
+            .create_memory(&subject.id, draft("Current constraint", "confirmed"))
+            .unwrap();
+        assert_eq!(
+            store.resident_surface(&subject.id).unwrap().availability,
+            SurfaceAvailability::Stale
+        );
+        let stale_generation = store.prepare_surface_generation(&subject.id).unwrap();
+        let invalid = store.publish_surface_generation(
+            &subject.id,
+            &stale_generation.id,
+            vec![SurfacePoint {
+                body_md: "Invented".into(),
+                memory_refs: vec![MemoryRevisionRef {
+                    memory_id: "foreign-memory".into(),
+                    revision: 1,
+                }],
+            }],
+        );
+        assert!(matches!(
+            invalid,
+            Err(SubjektivError::SubjectScopeMismatch { .. })
+        ));
+        store
+            .fail_surface_generation(&subject.id, &stale_generation.id, "invalid_output")
+            .unwrap();
+        assert_eq!(
+            store.resident_surface(&subject.id).unwrap().availability,
+            SurfaceAvailability::Failed
+        );
+        assert_eq!(
+            store
+                .memory(&subject.id, &memory.id)
+                .unwrap()
+                .unwrap()
+                .revision,
+            1,
+            "surface failure must not roll back confirmed Memory"
+        );
+
+        let raced = store.prepare_surface_generation(&subject.id).unwrap();
+        store
+            .revise_memory(
+                &subject.id,
+                &memory.id,
+                1,
+                draft("Corrected constraint", "correction"),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.publish_surface_generation(
+                &subject.id,
+                &raced.id,
+                vec![SurfacePoint {
+                    body_md: "Old wording".into(),
+                    memory_refs: vec![MemoryRevisionRef {
+                        memory_id: memory.id.clone(),
+                        revision: 1,
+                    }],
+                }],
+            ),
+            Err(SubjektivError::SurfaceGenerationConflict(_))
+        ));
+        assert_eq!(
+            store.resident_surface(&subject.id).unwrap().availability,
+            SurfaceAvailability::Stale
+        );
+
+        let current = store.prepare_surface_generation(&subject.id).unwrap();
+        let current_ref = MemoryRevisionRef {
+            memory_id: memory.id.clone(),
+            revision: 2,
+        };
+        let points = vec![SurfacePoint {
+            body_md: "Keep the corrected constraint, including its condition.".into(),
+            memory_refs: vec![current_ref.clone()],
+        }];
+        let published = store
+            .publish_surface_generation(&subject.id, &current.id, points.clone())
+            .unwrap();
+        let retry = store
+            .publish_surface_generation(&subject.id, &current.id, points)
+            .unwrap();
+        assert_eq!(published.id, retry.id);
+        let resident = store.resident_surface(&subject.id).unwrap();
+        assert_eq!(resident.availability, SurfaceAvailability::Ready);
+        assert_eq!(resident.snapshot.unwrap().memory_refs, vec![current_ref]);
+    }
+
+    #[test]
+    fn active_memory_that_cannot_fit_is_a_failure_not_a_normal_empty_surface() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_manager, _workspace, store) = open_store(temp.path(), "workspace-a");
+        let subject = store.create_subject(role()).unwrap();
+        let mut oversized = draft("oversized", "fixture");
+        oversized.body_md = "x".repeat((SURFACE_MATERIAL_TOKEN_BUDGET + 1) * 4);
+        store.create_memory(&subject.id, oversized).unwrap();
+
+        let generation = store.prepare_surface_generation(&subject.id).unwrap();
+        assert_eq!(generation.active_memory_count, 1);
+        assert!(generation.materials.is_empty());
+        assert!(
+            store
+                .publish_surface_generation(&subject.id, &generation.id, Vec::new())
+                .is_err()
+        );
+        store
+            .fail_surface_generation(&subject.id, &generation.id, "input_budget_exhausted")
+            .unwrap();
+        assert_eq!(
+            store.resident_surface(&subject.id).unwrap().availability,
+            SurfaceAvailability::Failed
+        );
+    }
+
+    #[test]
+    fn concurrent_surface_generations_cannot_overwrite_one_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_manager, _workspace, store) = open_store(temp.path(), "workspace-a");
+        let subject = store.create_subject(role()).unwrap();
+        let memory = store
+            .create_memory(&subject.id, draft("Concurrent constraint", "fixture"))
+            .unwrap();
+        let first = store.prepare_surface_generation(&subject.id).unwrap();
+        let second = store.prepare_surface_generation(&subject.id).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let mut joins = Vec::new();
+        for (generation, body) in [(first, "first"), (second, "second")] {
+            let store = store.clone();
+            let subject_id = subject.id.clone();
+            let memory_id = memory.id.clone();
+            let barrier = Arc::clone(&barrier);
+            joins.push(thread::spawn(move || {
+                barrier.wait();
+                store.publish_surface_generation(
+                    &subject_id,
+                    &generation.id,
+                    vec![SurfacePoint {
+                        body_md: body.into(),
+                        memory_refs: vec![MemoryRevisionRef {
+                            memory_id,
+                            revision: 1,
+                        }],
+                    }],
+                )
+            }));
+        }
+        let results = joins
+            .into_iter()
+            .map(|join| join.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(
+                    result,
+                    Err(SubjektivError::SurfaceGenerationConflict(_))
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            store.resident_surface(&subject.id).unwrap().availability,
+            SurfaceAvailability::Ready
         );
     }
 

@@ -20,8 +20,8 @@ use config_source::ConfigTreeSnapshot;
 use flow::{FlowSourceKind, FlowSourceResolveRequest, ResolvedFlowSource};
 use futures::{SinkExt, StreamExt};
 use memory::backend::{
-    MemoryBackendHttpResponse, MemoryBackendOperation, MemoryConsolidateStagingOperation,
-    MemoryConsolidationOutput,
+    MemoryBackendHttpResponse, MemoryBackendOperation, MemoryBackendOperationResult,
+    MemoryConsolidateStagingOperation, MemoryConsolidationOutput, MemoryToolOutput,
 };
 use protocol::Segment;
 use protocol::stream::{decode_method, encode_event};
@@ -6998,6 +6998,7 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn memory_backend(
         &self,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         request: server_api::MemoryBackendRequest,
     ) -> std::result::Result<server_api::MemoryBackendResponse, server_api::RepositoryApiError>
@@ -7005,6 +7006,7 @@ impl server_api::ServerApi for ServerApiContractService {
         scoped_memory_backend_operation(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedWorkspacePath { workspace_id }),
+            context,
             Json(request.0),
         )
         .await
@@ -16532,17 +16534,90 @@ async fn scoped_list_memory_staging(
 async fn scoped_memory_backend_operation(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    context: server_api::ServerRequestContext,
     Json(operation): Json<MemoryBackendOperation>,
 ) -> ApiResult<Json<MemoryBackendHttpResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let response = match execute_memory_backend_operation_with_authority(&api.authority, operation)
-    {
+    let result = match operation {
+        MemoryBackendOperation::ResidentSummary(_) => {
+            execute_scoped_resident_summary(&api, &context)
+        }
+        operation => execute_memory_backend_operation_with_authority(&api.authority, operation),
+    };
+    let response = match result {
         Ok(result) => MemoryBackendHttpResponse::Ok { result },
         Err(error) => MemoryBackendHttpResponse::Error {
             message: sanitize_backend_error(&error.to_string()),
         },
     };
     Ok(Json(response))
+}
+
+fn execute_scoped_resident_summary(
+    api: &WorkspaceApi,
+    context: &server_api::ServerRequestContext,
+) -> crate::Result<MemoryBackendOperationResult> {
+    let Some(source) = context.runtime_source.as_ref() else {
+        return execute_memory_backend_operation_with_authority(
+            &api.authority,
+            MemoryBackendOperation::ResidentSummary(Default::default()),
+        );
+    };
+    let Some(worker_id) = source.worker_id.as_deref() else {
+        return execute_memory_backend_operation_with_authority(
+            &api.authority,
+            MemoryBackendOperation::ResidentSummary(Default::default()),
+        );
+    };
+    let worker = RuntimeWorkerRef::new(&source.runtime_id, worker_id);
+    let Some(lease) = api
+        .store
+        .require_current_worker_singleton_owner(&api.config.workspace_id, &worker)?
+    else {
+        return execute_memory_backend_operation_with_authority(
+            &api.authority,
+            MemoryBackendOperation::ResidentSummary(Default::default()),
+        );
+    };
+    let Some(subject_id) = lease.key.strip_prefix(SUBJEKTIV_SINGLETON_PREFIX) else {
+        return execute_memory_backend_operation_with_authority(
+            &api.authority,
+            MemoryBackendOperation::ResidentSummary(Default::default()),
+        );
+    };
+    let resident =
+        crate::subjektiv::SubjektivStore::open(&api.feature_storage, &api.subjektiv_registration)
+            .map_err(|error| Error::Store(error.to_string()))?
+            .resident_surface(subject_id)
+            .map_err(|error| Error::Store(error.to_string()))?;
+    let (summary, content) = match resident.availability {
+        crate::subjektiv::SurfaceAvailability::Ready => {
+            let snapshot = resident.snapshot.expect("ready surface has a snapshot");
+            if snapshot.body_md.is_empty() {
+                ("subject resident Memory surface is normally empty", None)
+            } else {
+                (
+                    "subject resident Memory surface collected",
+                    Some(snapshot.body_md),
+                )
+            }
+        }
+        crate::subjektiv::SurfaceAvailability::Ungenerated => {
+            ("subject resident Memory surface is not generated", None)
+        }
+        crate::subjektiv::SurfaceAvailability::Stale => (
+            "subject resident Memory surface is stale and was omitted",
+            None,
+        ),
+        crate::subjektiv::SurfaceAvailability::Failed => (
+            "subject resident Memory surface generation failed and was omitted",
+            None,
+        ),
+    };
+    Ok(MemoryBackendOperationResult::ToolOutput(MemoryToolOutput {
+        summary: summary.into(),
+        content,
+    }))
 }
 
 const SUBJEKTIV_SINGLETON_PREFIX: &str = "subjektiv:";
@@ -17069,8 +17144,95 @@ async fn scoped_subjektiv_memory_backend(
                 subjektiv_candidate_decision_response(receipt),
             )
         }
+        server_api::SubjektivMemoryBackendOperation::PrepareSurface(_) => {
+            require_subjektiv_worker_authority(
+                authority,
+                SubjektivWorkerAuthority::Consolidation,
+                "surface generation preparation",
+            )?;
+            let generation = store
+                .prepare_surface_generation(&subject_id)
+                .map_err(subjektiv_store_error)?;
+            server_api::SubjektivMemoryBackendResponse::SurfacePrepared(
+                subjektiv_surface_prepare_response(generation),
+            )
+        }
+        server_api::SubjektivMemoryBackendOperation::PublishSurface(input) => {
+            require_subjektiv_worker_authority(
+                authority,
+                SubjektivWorkerAuthority::Consolidation,
+                "surface publication",
+            )?;
+            let points = input
+                .points
+                .into_iter()
+                .map(|point| crate::subjektiv::SurfacePoint {
+                    body_md: point.body_md,
+                    memory_refs: point
+                        .memory_refs
+                        .into_iter()
+                        .map(|reference| crate::subjektiv::MemoryRevisionRef {
+                            memory_id: reference.memory_id,
+                            revision: reference.revision,
+                        })
+                        .collect(),
+                })
+                .collect();
+            let snapshot = store
+                .publish_surface_generation(&subject_id, &input.generation_id, points)
+                .map_err(subjektiv_store_error)?;
+            server_api::SubjektivMemoryBackendResponse::SurfacePublished(
+                server_api::SubjektivSurfacePublishResponse {
+                    snapshot_id: snapshot.id,
+                    built_from_store_revision: snapshot.built_from_store_revision,
+                    empty: snapshot.body_md.is_empty(),
+                },
+            )
+        }
+        server_api::SubjektivMemoryBackendOperation::FailSurface(input) => {
+            require_subjektiv_worker_authority(
+                authority,
+                SubjektivWorkerAuthority::Consolidation,
+                "surface generation failure",
+            )?;
+            let revision = store
+                .fail_surface_generation(&subject_id, &input.generation_id, &input.reason_code)
+                .map_err(subjektiv_store_error)?;
+            server_api::SubjektivMemoryBackendResponse::SurfaceFailed(
+                server_api::SubjektivSurfaceFailureResponse {
+                    store_revision: revision,
+                    status: "failed".into(),
+                },
+            )
+        }
     };
     Ok(Json(response))
+}
+
+fn subjektiv_surface_prepare_response(
+    generation: crate::subjektiv::SurfaceGeneration,
+) -> server_api::SubjektivSurfacePrepareResponse {
+    server_api::SubjektivSurfacePrepareResponse {
+        generation_id: generation.id,
+        store_revision: generation.store_revision,
+        active_memory_count: generation.active_memory_count,
+        materials: generation
+            .materials
+            .into_iter()
+            .map(|material| server_api::SubjektivSurfaceMaterial {
+                memory_id: material.memory_id,
+                revision: material.revision,
+                kind: material.kind,
+                body_md: material.body_md,
+                why_useful: material.why_useful,
+                staleness: material.staleness,
+            })
+            .collect(),
+        body_token_budget: crate::subjektiv::SURFACE_BODY_TOKEN_BUDGET,
+        input_token_budget: crate::subjektiv::SURFACE_INPUT_TOKEN_BUDGET,
+        per_kind_limit: crate::subjektiv::SURFACE_PER_KIND_LIMIT,
+        total_material_limit: crate::subjektiv::SURFACE_TOTAL_MATERIAL_LIMIT,
+    }
 }
 
 fn subjektiv_candidate_summary(
@@ -18215,7 +18377,8 @@ fn subjektiv_store_error(error: crate::subjektiv::SubjektivError) -> Error {
         crate::subjektiv::SubjektivError::SubjectScopeMismatch { .. } => {
             Error::WorkspacePermissionDenied(format!("subject_scope_mismatch: {error}"))
         }
-        crate::subjektiv::SubjektivError::RevisionConflict { .. } => {
+        crate::subjektiv::SubjektivError::RevisionConflict { .. }
+        | crate::subjektiv::SubjektivError::SurfaceGenerationConflict(_) => {
             Error::RepositoryConflict(format!("revision_conflict: {error}"))
         }
         crate::subjektiv::SubjektivError::CandidateResolved(_)
@@ -18253,28 +18416,91 @@ async fn scoped_subjektiv_memory_consolidation(
     )?))
 }
 
+const SUBJECT_CONSOLIDATION_THRESHOLD_FILES: usize = 5;
+const SUBJECT_CONSOLIDATION_THRESHOLD_BYTES: u64 = 50_000;
+
+fn subject_consolidation_required(
+    candidate_count: usize,
+    total_bytes: u64,
+    force: bool,
+    surface_availability: crate::subjektiv::SurfaceAvailability,
+) -> bool {
+    let surface_needs_generation =
+        surface_availability != crate::subjektiv::SurfaceAvailability::Ready;
+    if candidate_count == 0 {
+        return surface_needs_generation;
+    }
+    force
+        || surface_needs_generation
+        || candidate_count >= SUBJECT_CONSOLIDATION_THRESHOLD_FILES
+        || total_bytes >= SUBJECT_CONSOLIDATION_THRESHOLD_BYTES
+}
+
+#[cfg(test)]
+mod subject_surface_consolidation_policy_tests {
+    use super::*;
+    use crate::subjektiv::SurfaceAvailability;
+
+    #[test]
+    fn failed_stale_and_ungenerated_surfaces_bypass_candidate_thresholds() {
+        for availability in [
+            SurfaceAvailability::Failed,
+            SurfaceAvailability::Stale,
+            SurfaceAvailability::Ungenerated,
+        ] {
+            assert!(subject_consolidation_required(0, 0, false, availability));
+            assert!(subject_consolidation_required(1, 1, false, availability));
+        }
+        assert!(!subject_consolidation_required(
+            0,
+            0,
+            true,
+            SurfaceAvailability::Ready
+        ));
+        assert!(!subject_consolidation_required(
+            1,
+            1,
+            false,
+            SurfaceAvailability::Ready
+        ));
+        assert!(subject_consolidation_required(
+            SUBJECT_CONSOLIDATION_THRESHOLD_FILES,
+            1,
+            false,
+            SurfaceAvailability::Ready
+        ));
+    }
+}
+
 fn start_subjektiv_staging_consolidation(
     api: WorkspaceApi,
     subject_id: &str,
     operation: MemoryConsolidateStagingOperation,
 ) -> ApiResult<MemoryConsolidationOutput> {
-    let (candidate_count, total_bytes) = open_subjektiv_store(&api)?
+    let store = open_subjektiv_store(&api)?;
+    let (candidate_count, total_bytes) = store
         .pending_staging_backlog(subject_id)
         .map_err(subjektiv_store_error)?;
-    if candidate_count == 0 {
-        return Ok(MemoryConsolidationOutput {
-            status: "skipped_empty".into(),
-            summary: "No subject Memory staging candidates are pending.".into(),
-            candidate_count,
-            total_bytes,
-        });
-    }
-    const CONSOLIDATION_THRESHOLD_FILES: usize = 5;
-    const CONSOLIDATION_THRESHOLD_BYTES: u64 = 50_000;
-    if !operation.force
-        && candidate_count < CONSOLIDATION_THRESHOLD_FILES
-        && total_bytes < CONSOLIDATION_THRESHOLD_BYTES
-    {
+    let surface_availability = store
+        .resident_surface(subject_id)
+        .map_err(subjektiv_store_error)?
+        .availability;
+    if !subject_consolidation_required(
+        candidate_count,
+        total_bytes,
+        operation.force,
+        surface_availability,
+    ) {
+        if candidate_count == 0 {
+            return Ok(MemoryConsolidationOutput {
+                status: "skipped_empty".into(),
+                summary:
+                    "No subject Memory staging candidates are pending and the surface is current."
+                        .into(),
+                candidate_count,
+                total_bytes,
+            });
+        }
         return Ok(MemoryConsolidationOutput {
             status: "skipped_below_threshold".into(),
             summary: format!(
@@ -18288,7 +18514,8 @@ fn start_subjektiv_staging_consolidation(
     let runtime_id = select_memory_consolidation_runtime(&api)?;
     let singleton_key = format!("{SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX}{subject_id}");
     let input_content = format!(
-        "Process the delegated subject's {candidate_count} pending Memory candidate(s) ({total_bytes} bytes) with MemoryStagingList, MemoryStagingRead, subject Memory reads, and MemoryApplyCandidate."
+        "Process the delegated subject's {candidate_count} pending Memory candidate(s) ({total_bytes} bytes) with MemoryStagingList, MemoryStagingRead, subject Memory reads, and MemoryApplyCandidate. After this committed consolidation turn, the Host will rebuild the {:?} resident surface from confirmed Memory in a separate clean context.",
+        surface_availability
     );
     if let Some(output) = try_reuse_subject_consolidation_worker(
         &api,
