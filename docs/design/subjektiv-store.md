@@ -184,15 +184,18 @@ page members.
 
 Read accepts a positive exact revision or resolves the current revision once. A
 missing historical revision never falls back to current. Markdown pagination is
-line-based (default 200, maximum 1000) and reports `body_truncated` plus
-`body_next_offset`; every nonzero continuation offset must also supply the exact
+line-based (default 200, maximum 1000) with an additional 16 KiB UTF-8 response
+budget. It reports `body_truncated`, `body_next_offset`, and
+`body_next_byte_offset`; an oversized single line resumes from the returned byte
+boundary within that same line. Every continuation offset must also supply the exact
 revision returned by the first page, so a current-revision change cannot mix body
-versions. Provenance uses a separate immutable-revision-bound cursor and returns at
-most 20 candidate/derivation references per page. Expanded candidates share one
-page-wide budget of 20 evidence records and 20 source references, plus a hard 32 KiB
+versions. Provenance uses a separate immutable-revision-bound cursor and returns one
+candidate/derivation reference per page. A staged candidate contains at most 10
+evidence records and 10 source references, all returned together under a hard 40 KiB
 serialized budget for the expanded candidate array; displayed anchor text is capped
-at 64 UTF-8 bytes and total/truncation metadata reports omissions.
-Explicit staging rejects larger anchor sets. Candidate evidence is the bounded host-resolved anchor saved in staging; raw Session bodies are not copied
+at 64 UTF-8 bytes. Every staging path rejects larger anchor sets, so accepted
+provenance is never made unreachable. Candidate evidence is the bounded
+host-resolved anchor saved in staging; raw Session bodies are not copied
 into Memory responses. Resolved, retracted, and historical revisions remain
 addressable by ID.
 

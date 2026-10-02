@@ -22,6 +22,7 @@ use crate::feature_storage::{
 
 pub const SUBJEKTIV_SCHEMA_VERSION: u32 = 1;
 pub const SUBJEKTIV_FEATURE_ID: &str = "subjektiv";
+pub const MAX_STAGING_ANCHORS: usize = 10;
 
 pub type Result<T> = std::result::Result<T, SubjektivError>;
 
@@ -1898,6 +1899,12 @@ fn validate_staging_record(workspace_id: &str, record: &SubjectStagingRecord) ->
         ));
     }
 
+    if record.evidence.len() > MAX_STAGING_ANCHORS || record.source_refs.len() > MAX_STAGING_ANCHORS
+    {
+        return Err(SubjektivError::InvalidRecord(format!(
+            "staging evidence/source_refs are limited to {MAX_STAGING_ANCHORS} items each"
+        )));
+    }
     let mut evidence_ids = HashSet::new();
     for evidence in &record.evidence {
         validate_label("evidence id", &evidence.id)?;

@@ -43,10 +43,10 @@ const PROPOSE_REVISION_TOOL: &str = "SubjektivMemoryProposeRevision";
 const COMMIT_HOOK: &str = "stage-explicit-memory-after-commit";
 const RETRY_HOOK: &str = "retry-committed-explicit-memory";
 const REWRITE_HOOK: &str = "flush-explicit-memory-before-rewrite";
-const MAX_EVIDENCE_REFS: usize = 20;
+const MAX_EVIDENCE_REFS: usize = 10;
 
 const QUERY_DESCRIPTION: &str = "Search the connected subject's current Memory revisions. Omitted states means active only; results are bounded and cursors are bound to the subject, filters, order, and store snapshot.";
-const READ_DESCRIPTION: &str = "Read one current or immutable historical Memory revision for the connected subject, with line-bounded Markdown and paged provenance anchors. Continue partial reads using the returned exact revision.";
+const READ_DESCRIPTION: &str = "Read one current or immutable historical Memory revision for the connected subject, with line- and byte-bounded Markdown plus paged provenance anchors. Continue partial reads using the returned exact revision, line offset, and byte offset.";
 const LIST_REVISIONS_DESCRIPTION: &str = "List immutable revisions of one connected-subject Memory in descending revision order using snapshot-bound pagination.";
 const REMEMBER_DESCRIPTION: &str = "Explicitly stage a new Memory candidate for the connected subject. This never writes confirmed Memory. With no entry_refs, the committed tool call itself becomes model-origin evidence after the run commits and status is pending_commit.";
 const PROPOSE_DESCRIPTION: &str = "Stage a typed correction, resolution, retraction, or reopen proposal for an exact current Memory revision. This validates optimistic concurrency now but never creates a confirmed revision.";

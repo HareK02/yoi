@@ -4592,6 +4592,11 @@ pub struct SubjektivMemoryReadRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub offset: Option<usize>,
+    /// UTF-8 byte offset within `offset`'s line. Used only for continuation of
+    /// one line that exceeds the response byte budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub byte_offset: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 1000))]
     pub limit: Option<usize>,
@@ -4719,9 +4724,14 @@ pub struct SubjektivMemoryReadResponse {
     pub updated_at: String,
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub body_offset: usize,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub body_byte_offset: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub body_next_offset: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub body_next_byte_offset: Option<usize>,
     pub body_truncated: bool,
     /// Candidate ids on this evidence page. The corresponding bounded anchors
     /// are returned in `source_candidates` with the same order.

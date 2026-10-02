@@ -16775,10 +16775,11 @@ const SUBJEKTIV_QUERY_DEFAULT_LIMIT: usize = 20;
 const SUBJEKTIV_QUERY_MAX_LIMIT: usize = 100;
 const SUBJEKTIV_BODY_DEFAULT_LINES: usize = 200;
 const SUBJEKTIV_BODY_MAX_LINES: usize = 1_000;
-const SUBJEKTIV_EVIDENCE_PAGE_SIZE: usize = 20;
-const SUBJEKTIV_CANDIDATE_ANCHOR_LIMIT: usize = 20;
+const SUBJEKTIV_BODY_MAX_BYTES: usize = 16 * 1024;
+const SUBJEKTIV_EVIDENCE_PAGE_SIZE: usize = 1;
+const SUBJEKTIV_CANDIDATE_ANCHOR_LIMIT: usize = crate::subjektiv::MAX_STAGING_ANCHORS;
 const SUBJEKTIV_ANCHOR_TEXT_MAX_BYTES: usize = 64;
-const SUBJEKTIV_NESTED_EVIDENCE_MAX_BYTES: usize = 32 * 1024;
+const SUBJEKTIV_NESTED_EVIDENCE_MAX_BYTES: usize = 40 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -17003,7 +17004,8 @@ fn subjektiv_memory_read(
         .into());
     }
     let body_offset = input.offset.unwrap_or(0);
-    if body_offset > 0 && input.revision.is_none() {
+    let body_byte_offset = input.byte_offset.unwrap_or(0);
+    if (body_offset > 0 || body_byte_offset > 0) && input.revision.is_none() {
         return Err(Error::InvalidInput(
             "body continuation requires the exact revision returned by the first read".into(),
         )
@@ -17013,9 +17015,28 @@ fn subjektiv_memory_read(
     if body_offset > lines.len() {
         return Err(Error::InvalidInput("body line offset exceeds document length".into()).into());
     }
-    let body_end = body_offset.saturating_add(body_limit).min(lines.len());
-    let body_truncated = body_end < lines.len();
-    let body_md = lines[body_offset..body_end].concat();
+    if body_offset == lines.len() && body_byte_offset > 0 {
+        return Err(Error::InvalidInput("body byte offset exceeds document length".into()).into());
+    }
+    if let Some(line) = lines.get(body_offset)
+        && (body_byte_offset > line.len() || !line.is_char_boundary(body_byte_offset))
+    {
+        return Err(Error::InvalidInput(
+            "body byte offset must be a UTF-8 boundary within the selected line".into(),
+        )
+        .into());
+    }
+    let (body_md, body_next) = bounded_memory_body_page(
+        &lines,
+        body_offset,
+        body_byte_offset,
+        body_limit,
+        SUBJEKTIV_BODY_MAX_BYTES,
+    );
+    let body_truncated = body_next.is_some();
+    let (body_next_offset, body_next_byte_offset) = body_next
+        .map(|(line, byte)| (Some(line), Some(byte)))
+        .unwrap_or((None, None));
 
     let evidence_offset = if let Some(cursor) = input.evidence_cursor {
         let cursor: SubjektivEvidenceCursor = decode_subjektiv_cursor("evidence", &cursor)?;
@@ -17124,7 +17145,9 @@ fn subjektiv_memory_read(
         created_at: record.created_at,
         updated_at: record.updated_at,
         body_offset,
-        body_next_offset: body_truncated.then_some(body_end),
+        body_byte_offset,
+        body_next_offset,
+        body_next_byte_offset,
         body_truncated,
         source_candidate_ids,
         source_candidates,
@@ -17509,6 +17532,45 @@ fn api_proposal_intent(
     }
 }
 
+fn bounded_memory_body_page(
+    lines: &[&str],
+    line_offset: usize,
+    byte_offset: usize,
+    line_limit: usize,
+    byte_limit: usize,
+) -> (String, Option<(usize, usize)>) {
+    let line_end = line_offset.saturating_add(line_limit).min(lines.len());
+    let mut line_index = line_offset;
+    let mut within_line = byte_offset;
+    let mut body = String::new();
+    while line_index < line_end {
+        let line = lines[line_index];
+        let remainder = &line[within_line..];
+        let available = byte_limit.saturating_sub(body.len());
+        if remainder.len() <= available {
+            body.push_str(remainder);
+            line_index += 1;
+            within_line = 0;
+            continue;
+        }
+        let mut take = available.min(remainder.len());
+        while take > 0 && !remainder.is_char_boundary(take) {
+            take -= 1;
+        }
+        if take == 0 {
+            return (body, Some((line_index, within_line)));
+        }
+        body.push_str(&remainder[..take]);
+        within_line += take;
+        return (body, Some((line_index, within_line)));
+    }
+    if line_index < lines.len() {
+        (body, Some((line_index, 0)))
+    } else {
+        (body, None)
+    }
+}
+
 fn memory_body_lines(body: &str) -> Vec<&str> {
     if body.is_empty() {
         Vec::new()
@@ -17520,31 +17582,15 @@ fn memory_body_lines(body: &str) -> Vec<&str> {
 fn bound_subjektiv_nested_evidence(
     candidates: &mut [server_api::SubjektivMemoryEvidenceCandidate],
 ) -> ApiResult<()> {
-    loop {
-        let serialized = serde_json::to_vec(candidates)
-            .map_err(|error| Error::Store(format!("encode subjektiv evidence page: {error}")))?;
-        if serialized.len() <= SUBJEKTIV_NESTED_EVIDENCE_MAX_BYTES {
-            return Ok(());
-        }
-        let mut removed = false;
-        for candidate in candidates.iter_mut().rev() {
-            if candidate.source_refs.pop().is_some() {
-                candidate.source_refs_truncated = true;
-                removed = true;
-                break;
-            }
-            if candidate.evidence.pop().is_some() {
-                candidate.evidence_truncated = true;
-                removed = true;
-                break;
-            }
-        }
-        if !removed {
-            return Err(Error::Store(
-                "subjektiv evidence metadata exceeds its response byte budget".into(),
-            )
-            .into());
-        }
+    let serialized = serde_json::to_vec(candidates)
+        .map_err(|error| Error::Store(format!("encode subjektiv evidence page: {error}")))?;
+    if serialized.len() <= SUBJEKTIV_NESTED_EVIDENCE_MAX_BYTES {
+        Ok(())
+    } else {
+        Err(Error::Store(
+            "subjektiv evidence page exceeds its enforced response byte budget".into(),
+        )
+        .into())
     }
 }
 
@@ -17603,6 +17649,16 @@ fn bounded_subjektiv_evidence_origin(
 }
 
 fn bounded_utf8_bytes(value: String, max_bytes: usize) -> String {
+    let value = value
+        .chars()
+        .map(|character| {
+            if character.is_control() || matches!(character, '"' | '\\') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
     if value.len() <= max_bytes {
         return value;
     }
@@ -35402,6 +35458,7 @@ mod tests {
                 memory_id: first.id.clone(),
                 revision: None,
                 offset: None,
+                byte_offset: None,
                 limit: Some(1),
                 evidence_cursor: None,
             },
@@ -35430,6 +35487,7 @@ mod tests {
                 memory_id: first.id.clone(),
                 revision: None,
                 offset: initial_read.body_next_offset,
+                byte_offset: initial_read.body_next_byte_offset,
                 limit: Some(1),
                 evidence_cursor: None,
             },
@@ -35444,6 +35502,7 @@ mod tests {
                 memory_id: first.id.clone(),
                 revision: Some(1),
                 offset: Some(1),
+                byte_offset: None,
                 limit: Some(1),
                 evidence_cursor: None,
             },
@@ -35455,7 +35514,55 @@ mod tests {
         assert_eq!(read.revision, 1);
         assert_eq!(read.current_revision, 2);
 
-        let nested_count = SUBJEKTIV_CANDIDATE_ANCHOR_LIMIT + 5;
+        let oversized_body = "界".repeat(7_000);
+        let oversized_memory = store
+            .create_memory(
+                &subject.id,
+                crate::subjektiv::MemoryDraft::active(
+                    memory::extract::CandidateKind::Lesson,
+                    "Page oversized lines by byte",
+                    oversized_body.clone(),
+                    "Keeps tool JSON intact",
+                    "oversized line regression",
+                ),
+            )
+            .unwrap();
+        let oversized_first = subjektiv_memory_read(
+            &store,
+            &subject.id,
+            server_api::SubjektivMemoryReadRequest {
+                memory_id: oversized_memory.id.clone(),
+                revision: None,
+                offset: None,
+                byte_offset: None,
+                limit: Some(1),
+                evidence_cursor: None,
+            },
+        )
+        .unwrap();
+        assert!(oversized_first.body_md.len() <= SUBJEKTIV_BODY_MAX_BYTES);
+        assert!(oversized_first.body_truncated);
+        assert_eq!(oversized_first.body_next_offset, Some(0));
+        let oversized_second = subjektiv_memory_read(
+            &store,
+            &subject.id,
+            server_api::SubjektivMemoryReadRequest {
+                memory_id: oversized_memory.id,
+                revision: Some(oversized_first.revision),
+                offset: oversized_first.body_next_offset,
+                byte_offset: oversized_first.body_next_byte_offset,
+                limit: Some(1),
+                evidence_cursor: None,
+            },
+        )
+        .unwrap();
+        assert!(!oversized_second.body_truncated);
+        assert_eq!(
+            format!("{}{}", oversized_first.body_md, oversized_second.body_md),
+            oversized_body
+        );
+
+        let nested_count = SUBJEKTIV_CANDIDATE_ANCHOR_LIMIT;
         let nested_evidence = (0..nested_count)
             .map(|index| memory::extract::StagingEvidence {
                 id: format!("nested-{index}-{}", "i".repeat(220)),
@@ -35506,6 +35613,43 @@ mod tests {
                 ..Default::default()
             })
             .collect::<Vec<_>>();
+        let mut rejected_evidence = nested_evidence.clone();
+        let mut extra_evidence = rejected_evidence[0].clone();
+        extra_evidence.id = "nested-over-limit".to_string();
+        rejected_evidence.push(extra_evidence);
+        let mut rejected_refs = nested_refs.clone();
+        let mut extra_ref = rejected_refs[0].clone();
+        extra_ref.evidence_id = Some("nested-over-limit".to_string());
+        rejected_refs.push(extra_ref);
+        let rejected_candidate = memory::extract::StagingRecord::from_candidate(
+            "candidate-over-anchor-limit",
+            "over-anchor-limit-dedup",
+            memory::schema::SourceRef {
+                segment_id: "segment-nested".to_string(),
+                range: [0, nested_count as u64],
+            },
+            memory::extract::ExtractedCandidate {
+                kind: memory::extract::CandidateKind::Lesson,
+                claim: "Reject unpageable provenance".to_string(),
+                why_useful: "Every staging path shares the read bound".to_string(),
+                staleness: None,
+                evidence_ids: rejected_evidence
+                    .iter()
+                    .map(|item| item.id.clone())
+                    .collect(),
+            },
+            rejected_evidence,
+            rejected_refs,
+        );
+        let rejected = store.stage_candidate(crate::subjektiv::SubjectStagingRecord::attach(
+            &subject.id,
+            rejected_candidate,
+        ));
+        assert!(matches!(
+            rejected,
+            Err(crate::subjektiv::SubjektivError::InvalidRecord(message))
+                if message.contains("limited to")
+        ));
         let nested_candidate = memory::extract::StagingRecord::from_candidate(
             "candidate-nested",
             "nested-dedup",
@@ -35551,6 +35695,7 @@ mod tests {
                 memory_id: nested_memory.id,
                 revision: Some(1),
                 offset: None,
+                byte_offset: None,
                 limit: None,
                 evidence_cursor: None,
             },
@@ -35560,11 +35705,10 @@ mod tests {
         let nested = &nested_read.source_candidates[0];
         assert_eq!(nested.evidence.len(), SUBJEKTIV_CANDIDATE_ANCHOR_LIMIT);
         assert_eq!(nested.evidence_total, nested_count);
-        assert!(nested.evidence_truncated);
-        assert!(!nested.source_refs.is_empty());
-        assert!(nested.source_refs.len() <= SUBJEKTIV_CANDIDATE_ANCHOR_LIMIT);
+        assert!(!nested.evidence_truncated);
+        assert_eq!(nested.source_refs.len(), SUBJEKTIV_CANDIDATE_ANCHOR_LIMIT);
         assert_eq!(nested.source_refs_total, nested_count);
-        assert!(nested.source_refs_truncated);
+        assert!(!nested.source_refs_truncated);
         assert!(nested.evidence.iter().all(|item| {
             item.excerpt
                 .as_ref()
