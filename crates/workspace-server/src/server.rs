@@ -16544,7 +16544,9 @@ async fn scoped_memory_backend_operation(
 }
 
 const SUBJEKTIV_SINGLETON_PREFIX: &str = "subjektiv:";
-const SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX: &str = "subjektiv-consolidation:";
+const SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX: &str =
+    crate::hosts::SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX;
+const SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE: &str = "subjektiv-memory-consolidation";
 
 fn open_subjektiv_store(api: &WorkspaceApi) -> ApiResult<crate::subjektiv::SubjektivStore> {
     crate::subjektiv::SubjektivStore::open(&api.feature_storage, &api.subjektiv_registration)
@@ -16591,6 +16593,38 @@ fn subjektiv_singleton_key(subject_id: &str) -> ApiResult<String> {
     Ok(key)
 }
 
+fn is_dedicated_subjektiv_consolidation_worker(
+    worker: &InternalWorkerSummary,
+    workspace_id: &str,
+    singleton_key: &str,
+) -> bool {
+    let profile_matches = worker.profile.as_deref().is_some_and(|profile| {
+        profile.strip_prefix("builtin:").unwrap_or(profile)
+            == SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE
+    });
+    let profile_tag = format!("profile:{SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE}");
+    worker.workspace.workspace_id.as_deref() == Some(workspace_id)
+        && worker.singleton_key.as_deref() == Some(singleton_key)
+        && singleton_key.starts_with(SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX)
+        && profile_matches
+        && worker.tags.iter().any(|tag| tag == &profile_tag)
+}
+
+fn require_dedicated_subjektiv_consolidation_worker(
+    worker: &InternalWorkerSummary,
+    workspace_id: &str,
+    singleton_key: &str,
+) -> ApiResult<()> {
+    if is_dedicated_subjektiv_consolidation_worker(worker, workspace_id, singleton_key) {
+        Ok(())
+    } else {
+        Err(Error::WorkspacePermissionDenied(
+            "subject Memory consolidation requires a Backend-managed dedicated Worker".to_string(),
+        )
+        .into())
+    }
+}
+
 fn subjektiv_subject_scope(
     api: &WorkspaceApi,
     workspace_id: &str,
@@ -16616,6 +16650,14 @@ fn subjektiv_subject_scope(
             )
         })?;
     let (subject_id, authority) = subjektiv_scope_from_singleton_key(&lease.key)?;
+    if authority == SubjektivWorkerAuthority::Consolidation {
+        let mut summary = api
+            .runtime
+            .worker(&worker)
+            .map_err(|error| error.into_error())?;
+        summary.singleton_key = Some(lease.key.clone());
+        require_dedicated_subjektiv_consolidation_worker(&summary, workspace_id, &lease.key)?;
+    }
     Ok((subject_id.to_string(), worker, authority))
 }
 
@@ -18187,7 +18229,6 @@ fn subjektiv_store_error(error: crate::subjektiv::SubjektivError) -> Error {
 }
 
 const MEMORY_CONSOLIDATION_PROFILE: &str = "memory-consolidation";
-const SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE: &str = "subjektiv-memory-consolidation";
 const MEMORY_CONSOLIDATION_SINGLETON_KEY: &str = "workspace-memory-consolidation";
 
 async fn scoped_subjektiv_memory_consolidation(
@@ -18324,6 +18365,11 @@ fn try_reuse_subject_consolidation_worker(
         .worker(&owner.worker)
         .map_err(|error| error.into_error())?;
     worker.singleton_key = Some(owner.key);
+    require_dedicated_subjektiv_consolidation_worker(
+        &worker,
+        &api.config.workspace_id,
+        singleton_key,
+    )?;
     if worker.state != "idle" {
         return Ok(Some(MemoryConsolidationOutput {
             status: "skipped_existing_not_idle".into(),
@@ -29621,25 +29667,32 @@ impl From<Error> for ApiError {
                 severity: HostDiagnosticSeverity::Error,
                 message: sanitize_backend_error(&ticket_error.to_string()),
             }],
-            Error::RepositoryConflict(message) => subjektiv_conflict_code(message)
-                .map(|code| {
-                    vec![RuntimeDiagnostic {
-                        code: code.to_string(),
-                        severity: HostDiagnosticSeverity::Error,
-                        message: sanitize_backend_error(message),
-                    }]
-                })
-                .unwrap_or_default(),
+            Error::RepositoryConflict(message) | Error::WorkspacePermissionDenied(message) => {
+                subjektiv_diagnostic_code(message)
+                    .map(|code| {
+                        vec![RuntimeDiagnostic {
+                            code: code.to_string(),
+                            severity: HostDiagnosticSeverity::Error,
+                            message: sanitize_backend_error(message),
+                        }]
+                    })
+                    .unwrap_or_default()
+            }
             _ => Vec::new(),
         };
         Self { error, diagnostics }
     }
 }
 
-fn subjektiv_conflict_code(message: &str) -> Option<&'static str> {
-    ["revision_conflict", "stale_cursor"]
-        .into_iter()
-        .find(|code| message.starts_with(code))
+fn subjektiv_diagnostic_code(message: &str) -> Option<&'static str> {
+    [
+        "revision_conflict",
+        "stale_cursor",
+        "candidate_decision_conflict",
+        "subject_scope_mismatch",
+    ]
+    .into_iter()
+    .find(|code| message.starts_with(code))
 }
 
 impl ApiError {
@@ -43413,31 +43466,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
         let api = test_api(dir.path()).await;
-        let request = |requested_worker_name: &str,
-                       intent: server_api::RuntimeWorkerSpawnIntent,
-                       profile: &str| server_api::RuntimeWorkerSpawnRequest {
-            requested_worker_name: Some(requested_worker_name.to_string()),
-            intent,
-            singleton_key: Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string()),
-            acceptance: server_api::RuntimeWorkerSpawnAcceptanceRequirement::RunAccepted {
-                expected_segments: 0,
-            },
-            profile: server_api::RuntimeProfileSelector::Builtin(profile.to_string()),
-            ticket_assignment: None,
-            initial_submit: Vec::new(),
-            workdir_attachment_requests: Vec::new(),
-        };
+        let request =
+            |requested_worker_name: &str,
+             intent: server_api::RuntimeWorkerSpawnIntent,
+             profile: &str,
+             singleton_key: &str| server_api::RuntimeWorkerSpawnRequest {
+                requested_worker_name: Some(requested_worker_name.to_string()),
+                intent,
+                singleton_key: Some(singleton_key.to_string()),
+                acceptance: server_api::RuntimeWorkerSpawnAcceptanceRequirement::RunAccepted {
+                    expected_segments: 0,
+                },
+                profile: server_api::RuntimeProfileSelector::Builtin(profile.to_string()),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachment_requests: Vec::new(),
+            };
 
+        let subject_consolidation_key = "subjektiv-consolidation:subject-forged";
         for candidate in [
             request(
                 "Generic key squatter",
                 server_api::RuntimeWorkerSpawnIntent::WorkspaceCompanion,
                 "builtin:companion",
+                crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY,
             ),
             request(
                 crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY,
                 server_api::RuntimeWorkerSpawnIntent::WorkspaceOrchestrator,
                 "builtin:orchestrator",
+                crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY,
+            ),
+            request(
+                SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE,
+                server_api::RuntimeWorkerSpawnIntent::WorkspaceOrchestrator,
+                "builtin:subjektiv-memory-consolidation",
+                subject_consolidation_key,
             ),
         ] {
             let error = scoped_create_runtime_worker(
@@ -43458,6 +43522,12 @@ mod tests {
                     TEST_WORKSPACE_ID,
                     crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY,
                 )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            api.store
+                .current_worker_singleton_owner(TEST_WORKSPACE_ID, subject_consolidation_key)
                 .unwrap()
                 .is_none()
         );
@@ -51155,6 +51225,118 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
             String::from_utf8_lossy(&bytes)
         );
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn subjektiv_consolidation_scope_rejects_non_dedicated_singleton_owner() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let spawn = |profile: &str, key: &str| WorkerSpawnRequest {
+            requested_worker_name: Some(profile.to_string()),
+            singleton_key: Some(key.to_string()),
+            intent: WorkerSpawnIntent::WorkspaceOrchestrator,
+            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                expected_segments: 0,
+            },
+            profile: ProfileSelector::Builtin(profile.to_string()),
+            ticket_assignment: None,
+            initial_submit: Vec::new(),
+            workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachments: Vec::new(),
+            resolved_config_bundle: None,
+            resolved_worker_observation_enabled: false,
+            resolved_worker_observation_grants: Vec::new(),
+            resolved_workspace_api: None,
+            resolved_memory_settings: None,
+            resolved_control_operation: None,
+        };
+
+        let dedicated_key = "subjektiv-consolidation:dedicated-subject";
+        let dedicated = api
+            .spawn_workspace_worker(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                spawn(SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE, dedicated_key),
+            )
+            .unwrap()
+            .worker
+            .unwrap();
+        assert!(is_dedicated_subjektiv_consolidation_worker(
+            &dedicated,
+            TEST_WORKSPACE_ID,
+            dedicated_key
+        ));
+        let dedicated_context = server_api::ServerRequestContext {
+            actor: None,
+            worker_source: None,
+            runtime_source: Some(server_api::ServerRuntimeSource {
+                runtime_id: dedicated.worker.runtime_id.clone(),
+                worker_id: Some(dedicated.worker.worker_id.clone()),
+            }),
+            origin: None,
+            transport_headers: Vec::new(),
+        };
+        assert_eq!(
+            subjektiv_subject_scope(&api, TEST_WORKSPACE_ID, &dedicated_context)
+                .unwrap()
+                .2,
+            SubjektivWorkerAuthority::Consolidation
+        );
+
+        let forged_key = "subjektiv-consolidation:forged-subject";
+        let forged = api
+            .spawn_workspace_worker(EMBEDDED_WORKER_RUNTIME_ID, spawn("companion", forged_key))
+            .unwrap()
+            .worker
+            .unwrap();
+        let forged_context = server_api::ServerRequestContext {
+            actor: None,
+            worker_source: None,
+            runtime_source: Some(server_api::ServerRuntimeSource {
+                runtime_id: forged.worker.runtime_id.clone(),
+                worker_id: Some(forged.worker.worker_id.clone()),
+            }),
+            origin: None,
+            transport_headers: Vec::new(),
+        };
+        let error = subjektiv_subject_scope(&api, TEST_WORKSPACE_ID, &forged_context).unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+        assert!(
+            try_reuse_subject_consolidation_worker(
+                &api,
+                forged_key,
+                "process pending subject Memory",
+                1,
+                1,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn subjektiv_http_errors_emit_typed_retry_diagnostics() {
+        for (error, code, status) in [
+            (
+                Error::RepositoryConflict(
+                    "candidate_decision_conflict: candidate already resolved".to_string(),
+                ),
+                "candidate_decision_conflict",
+                StatusCode::CONFLICT,
+            ),
+            (
+                Error::WorkspacePermissionDenied(
+                    "subject_scope_mismatch: candidate belongs to another subject".to_string(),
+                ),
+                "subject_scope_mismatch",
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            assert_eq!(api_error_status(&error), status);
+            let response = ApiError::from(error).into_repository_api_error();
+            assert_eq!(response.diagnostics.len(), 1);
+            assert_eq!(response.diagnostics[0].code, code);
+        }
     }
 
     #[test]

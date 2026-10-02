@@ -781,6 +781,39 @@ mod tests {
         ))
     }
 
+    fn repository_error_client(status: u16, code: &str) -> Arc<dyn WorkspaceClient> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = serde_json::json!({
+            "error": "request rejected",
+            "message": format!("{code}: retry after reread"),
+            "diagnostics": [{
+                "code": code,
+                "severity": "error",
+                "message": format!("{code}: retry after reread"),
+            }],
+        })
+        .to_string();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            let response = format!(
+                "HTTP/1.1 {status} rejected\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        Arc::new(crate::worker::TestWorkspaceHttpClient::new(
+            "workspace",
+            format!("http://{addr}"),
+        ))
+    }
+
     fn tool_names(definitions: Vec<ToolDefinition>) -> Vec<String> {
         let mut names = definitions
             .into_iter()
@@ -989,6 +1022,39 @@ mod tests {
         assert!(names.contains(&"MemoryStagingList".to_string()));
         assert!(names.contains(&"MemoryStagingRead".to_string()));
         assert!(names.contains(&"MemoryStagingClose".to_string()));
+    }
+
+    #[tokio::test]
+    async fn subjektiv_candidate_conflicts_survive_workspace_http_transport() {
+        let input = serde_json::json!({
+            "request_id": "decision-request-1",
+            "candidate_id": "candidate-1",
+            "reason": "candidate is already covered",
+            "decision": {
+                "kind": "close",
+                "action": "already_covered",
+                "affected_memory": [],
+            },
+        })
+        .to_string();
+        for (status, code) in [
+            (409, "candidate_decision_conflict"),
+            (403, "subject_scope_mismatch"),
+        ] {
+            let tool = SubjectConsolidationTool {
+                client: repository_error_client(status, code),
+                operation: SubjectConsolidationOperation::DecideCandidate,
+            };
+            let output = tool
+                .execute(&input, ToolExecutionContext::direct())
+                .await
+                .expect("typed conflicts are model-visible retry output");
+            let content: serde_json::Value =
+                serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+            assert_eq!(content["status"], "error");
+            assert_eq!(content["error"]["code"], code);
+            assert!(output.summary.contains("requires reread"));
+        }
     }
 
     #[test]

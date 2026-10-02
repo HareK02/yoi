@@ -4,14 +4,40 @@ import "./base.dcdl" // {
     scope = "workspace_read";
     model = { ref = "codex-oauth/gpt-5.6-luna"; };
     engine = { reasoning = "medium"; };
+    web = { enabled = false; };
 
     feature = {
         task = { enabled = false; };
-        memory = { enabled = true; staging_tools = true; };
+        memory = {
+            enabled = true;
+            staging_tools = true;
+            resident = { inject_summary = false; };
+            extraction = { enabled = false; };
+            consolidation = { request_enabled = false; };
+        };
+        subjektiv = { enabled = false; extraction = { enabled = false; }; };
         web = { enabled = false; };
+        image = { enabled = false; };
         sub_worker = { enabled = false; };
-        worker = { enabled = false; };
+        flow = { enabled = false; };
+        worker = { enabled = false; direct_spawn = false; };
+        workspace_worker_discovery = { enabled = false; };
         objective = { enabled = false; };
-        ticket = { enabled = false; thread = false; };
+        manage_workdir = { enabled = false; };
+        ticket = {
+            enabled = false;
+            authoring = false;
+            thread = false;
+            intake = false;
+            workflow = false;
+        };
+        merge_request = {
+            show = false;
+            open = false;
+            review = false;
+            readiness_check = false;
+            complete = false;
+        };
+        orchestration = { enabled = false; };
     };
 }

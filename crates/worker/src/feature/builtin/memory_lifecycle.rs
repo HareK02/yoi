@@ -79,6 +79,15 @@ struct MemoryLifecycleTask {
     event_tx: Option<broadcast::Sender<Event>>,
 }
 
+fn memory_lifecycle_requested(
+    lifecycle_enabled: bool,
+    config: &manifest::ResolvedMemoryFeatureConfig,
+) -> bool {
+    lifecycle_enabled
+        && config.profile.enabled
+        && (config.profile.extraction.enabled || config.profile.consolidation.request_enabled)
+}
+
 impl MemoryLifecycleFeature {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_resolved_config(
@@ -93,10 +102,7 @@ impl MemoryLifecycleFeature {
         workspace_context: WorkerWorkspaceContext,
         event_tx: Option<broadcast::Sender<Event>>,
     ) -> std::io::Result<Option<Self>> {
-        if !lifecycle_enabled
-            || !config.profile.enabled
-            || (!config.profile.extraction.enabled && !config.profile.consolidation.request_enabled)
-        {
+        if !memory_lifecycle_requested(lifecycle_enabled, &config) {
             return Ok(None);
         }
         config
@@ -1363,6 +1369,26 @@ permission = "write"
             })
             .unwrap();
         config
+    }
+
+    #[test]
+    fn resolved_subjektiv_consolidation_profile_does_not_install_global_memory_lifecycle() {
+        let workspace = tempfile::tempdir().unwrap();
+        let resolved = manifest::ProfileResolver::new()
+            .with_workspace_base(workspace.path())
+            .resolve(
+                &manifest::ProfileSelector::source_named(
+                    manifest::ProfileRegistrySource::Builtin,
+                    "subjektiv-memory-consolidation",
+                ),
+                manifest::ProfileResolveOptions::with_worker_name("subject-consolidator"),
+            )
+            .unwrap();
+
+        assert!(!memory_lifecycle_requested(
+            true,
+            &resolved.manifest.feature.memory
+        ));
     }
 
     fn test_task(
