@@ -5522,6 +5522,10 @@ fn sanitize_embedded_execution_message(
 ) -> String {
     let summary =
         format!("Embedded Worker execution backend rejected {operation:?} with {outcome:?}");
+    sanitize_embedded_execution_detail(&summary, message)
+}
+
+fn sanitize_embedded_execution_detail(summary: &str, message: &str) -> String {
     let mut redact_next = false;
     let detail = message
         .split_whitespace()
@@ -5558,7 +5562,7 @@ fn sanitize_embedded_execution_message(
         .join(" ");
     let detail = detail.trim();
     if detail.is_empty() {
-        return summary;
+        return summary.to_string();
     }
     let truncated = detail.chars().count() > 512;
     let mut detail = detail.chars().take(512).collect::<String>();
@@ -5580,11 +5584,18 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
             HostDiagnosticSeverity::Warning,
             "Embedded Runtime worker was not found".to_string(),
         ),
-        EmbeddedRuntimeError::WorkerExecutionUnavailable { .. }
-        | EmbeddedRuntimeError::ExecutionBackendUnavailable { .. } => diagnostic(
+        EmbeddedRuntimeError::WorkerExecutionUnavailable { message, .. } => diagnostic(
             "embedded_worker_execution_unavailable",
             HostDiagnosticSeverity::Warning,
-            "Embedded Worker has no execution backend attached".to_string(),
+            sanitize_embedded_execution_detail("Embedded Worker execution is unavailable", message),
+        ),
+        EmbeddedRuntimeError::ExecutionBackendUnavailable { message } => diagnostic(
+            "embedded_worker_execution_unavailable",
+            HostDiagnosticSeverity::Warning,
+            sanitize_embedded_execution_detail(
+                "Embedded Runtime execution backend is unavailable",
+                message,
+            ),
         ),
         EmbeddedRuntimeError::WorkerExecutionRejected {
             operation,
@@ -6053,6 +6064,58 @@ mod tests {
         );
         assert!(result.worker.is_none());
         assert_eq!(result.diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn embedded_execution_unavailable_preserves_the_actual_reason() {
+        for reason in [
+            "worker stop reconciliation is pending",
+            "worker restore reconciliation is pending",
+            "stopped worker requires an explicit restore",
+            "worker has no live execution handle",
+            "runtime has no execution backend",
+        ] {
+            let diagnostic =
+                embedded_runtime_diagnostic(&EmbeddedRuntimeError::WorkerExecutionUnavailable {
+                    worker_id: EmbeddedWorkerId::now_v7(),
+                    message: reason.to_string(),
+                });
+            assert_eq!(diagnostic.code, "embedded_worker_execution_unavailable");
+            assert_eq!(diagnostic.severity, HostDiagnosticSeverity::Warning);
+            assert_eq!(
+                diagnostic.message,
+                format!("Embedded Worker execution is unavailable: {reason}")
+            );
+        }
+        let diagnostic =
+            embedded_runtime_diagnostic(&EmbeddedRuntimeError::ExecutionBackendUnavailable {
+                message: "Runtime has no execution backend".to_string(),
+            });
+        assert_eq!(
+            diagnostic.message,
+            "Embedded Runtime execution backend is unavailable: Runtime has no execution backend"
+        );
+    }
+
+    #[test]
+    fn embedded_execution_unavailable_detail_remains_bounded_and_redacted() {
+        let diagnostic = embedded_runtime_diagnostic(
+            &EmbeddedRuntimeError::WorkerExecutionUnavailable {
+                worker_id: EmbeddedWorkerId::now_v7(),
+                message: format!(
+                    "worker stop reconciliation is pending /private/runtime Bearer sensitive-value {}",
+                    "x".repeat(600)
+                ),
+            },
+        );
+        assert!(
+            diagnostic
+                .message
+                .contains("stop reconciliation is pending")
+        );
+        assert!(!diagnostic.message.contains("/private/runtime"));
+        assert!(!diagnostic.message.contains("sensitive-value"));
+        assert!(diagnostic.message.chars().count() < 600);
     }
 
     #[test]

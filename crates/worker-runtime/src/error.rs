@@ -15,7 +15,7 @@ pub enum RuntimeError {
     #[error("worker {worker_id} was not found")]
     WorkerNotFound { worker_id: WorkerId },
 
-    #[error("worker {worker_id} has no execution backend: {message}")]
+    #[error("worker {worker_id} execution is unavailable: {message}")]
     WorkerExecutionUnavailable {
         worker_id: WorkerId,
         message: String,

@@ -1425,9 +1425,9 @@ impl Runtime {
         let previous_workspace_api = {
             let state = self.lock()?;
             let worker = state.worker(worker_ref)?;
-            if worker.has_pending_lifecycle_operation() {
+            if let Some(operation) = worker.pending_lifecycle_operation_name() {
                 return Err(RuntimeError::InvalidRequest(format!(
-                    "worker {} has pending restore reconciliation",
+                    "worker {} has pending {operation} reconciliation",
                     worker_ref.worker_id
                 )));
             }
@@ -1453,9 +1453,9 @@ impl Runtime {
         {
             let mut state = self.lock()?;
             let worker = state.worker_mut(worker_ref)?;
-            if worker.has_pending_lifecycle_operation() {
+            if let Some(operation) = worker.pending_lifecycle_operation_name() {
                 return Err(RuntimeError::InvalidRequest(format!(
-                    "worker {} has pending restore reconciliation",
+                    "worker {} has pending {operation} reconciliation",
                     worker_ref.worker_id
                 )));
             }
@@ -2052,10 +2052,10 @@ impl Runtime {
     fn ensure_worker_execution(&self, worker_ref: &WorkerRef) -> Result<(), RuntimeError> {
         let state = self.lock()?;
         let worker = state.worker(worker_ref)?;
-        if worker.has_pending_lifecycle_operation() {
+        if let Some(operation) = worker.pending_lifecycle_operation_name() {
             return Err(RuntimeError::WorkerExecutionUnavailable {
                 worker_id: worker_ref.worker_id,
-                message: "worker restore reconciliation is pending".to_string(),
+                message: format!("worker {operation} reconciliation is pending"),
             });
         }
         if worker.execution_handle.is_some() {
@@ -2734,9 +2734,9 @@ impl Runtime {
             let state = self.lock()?;
             state.ensure_running()?;
             let worker = state.worker(worker_ref)?;
-            if worker.has_pending_lifecycle_operation() {
+            if let Some(operation) = worker.pending_lifecycle_operation_name() {
                 return Err(RuntimeError::InvalidRequest(format!(
-                    "worker {} has pending restore reconciliation",
+                    "worker {} has pending {operation} reconciliation",
                     worker_ref.worker_id
                 )));
             }
@@ -2793,9 +2793,9 @@ impl Runtime {
             state.ensure_running()?;
             state.ensure_worker_ref(worker_ref)?;
             let worker = state.worker(worker_ref)?;
-            if worker.has_pending_lifecycle_operation() {
+            if let Some(operation) = worker.pending_lifecycle_operation_name() {
                 return Err(RuntimeError::InvalidRequest(format!(
-                    "worker {} has pending restore reconciliation and cannot be deleted",
+                    "worker {} has pending {operation} reconciliation and cannot be deleted",
                     worker_ref.worker_id
                 )));
             }
@@ -2834,9 +2834,9 @@ impl Runtime {
         state.ensure_running()?;
         state.ensure_worker_ref(worker_ref)?;
         let worker = state.worker(worker_ref)?;
-        if worker.has_pending_lifecycle_operation() {
+        if let Some(operation) = worker.pending_lifecycle_operation_name() {
             return Err(RuntimeError::InvalidRequest(format!(
-                "worker {} still has pending restore reconciliation",
+                "worker {} still has pending {operation} reconciliation",
                 worker_ref.worker_id
             )));
         }
@@ -3619,10 +3619,10 @@ impl Runtime {
                 "Worker retention requires a stopped Worker".to_string(),
             ));
         }
-        if worker.has_pending_lifecycle_operation() {
-            return Err(RuntimeError::InvalidRequest(
-                "Worker retention cannot remove pending restore reconciliation".to_string(),
-            ));
+        if let Some(operation) = worker.pending_lifecycle_operation_name() {
+            return Err(RuntimeError::InvalidRequest(format!(
+                "Worker retention cannot remove pending {operation} reconciliation"
+            )));
         }
         let result = provider.execute(request)?;
         state.workers.remove(&request.worker_id);
@@ -4801,8 +4801,18 @@ impl WorkerRecord {
         self.worker_state = Some(incoming.clone());
     }
 
+    fn pending_lifecycle_operation_name(&self) -> Option<&'static str> {
+        if self.pending_stop.is_some() {
+            Some("stop")
+        } else if self.pending_restore.is_some() {
+            Some("restore")
+        } else {
+            None
+        }
+    }
+
     fn has_pending_lifecycle_operation(&self) -> bool {
-        self.pending_restore.is_some() || self.pending_stop.is_some()
+        self.pending_lifecycle_operation_name().is_some()
     }
 
     fn belongs_to_workspace(&self, workspace_id: &str) -> bool {
@@ -7418,6 +7428,30 @@ mod tests {
         assert!(runtime.worker_operations.lock().unwrap().is_empty());
     }
 
+    fn assert_pending_lifecycle_errors(runtime: &Runtime, worker_ref: &WorkerRef, operation: &str) {
+        let input_error = runtime
+            .send_input(worker_ref, WorkerInput::user("blocked while pending"))
+            .unwrap_err();
+        assert_eq!(
+            input_error.to_string(),
+            format!(
+                "worker {} execution is unavailable: worker {operation} reconciliation is pending",
+                worker_ref.worker_id
+            )
+        );
+        for error in [
+            runtime.cancel_worker(worker_ref, None).unwrap_err(),
+            runtime.delete_worker(worker_ref).unwrap_err(),
+        ] {
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("pending {operation} reconciliation")),
+                "{error}"
+            );
+        }
+    }
+
     #[test]
     fn failed_stop_cleanup_retains_execution_for_retry() {
         let (runtime, backend) = runtime_and_backend();
@@ -7454,6 +7488,7 @@ mod tests {
             backend.stop_operation_ids.lock().unwrap().as_slice(),
             &[operation_id]
         );
+        assert_pending_lifecycle_errors(&runtime, &created.worker_ref, "stop");
 
         let stopped = runtime.stop_worker(&created.worker_ref, None).unwrap();
         assert_eq!(stopped.status, WorkerStatus::Stopped);
@@ -9133,6 +9168,7 @@ mod tests {
             .pending_restore
             .unwrap()
             .operation_id;
+        assert_pending_lifecycle_errors(&runtime, &created.worker_ref, "restore");
         let delete_error = runtime.delete_worker(&created.worker_ref).unwrap_err();
         assert!(
             delete_error
