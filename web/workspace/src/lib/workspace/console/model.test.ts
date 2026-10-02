@@ -3050,6 +3050,54 @@ Deno.test("Internal Worker output stays separate and revision-fenced", () => {
   assertEquals(resolveConsoleWorkerView(projection, "missing").sessionId, null);
 });
 
+Deno.test("live-created Internal Worker receives own metadata without reconnect", () => {
+  const worker = {
+    session_id: "live-child",
+    name: "research",
+    parent_session_id: "parent-session",
+    kind: "sub_worker" as const,
+  };
+  const childSnapshot = snapshotEvent("/child") as SnapshotEvent;
+  childSnapshot.data.greeting.worker_name = "research";
+  childSnapshot.data.greeting.model = "child-model";
+  childSnapshot.data.greeting.reasoning = { kind: "effort", effort: "high" };
+  childSnapshot.data.greeting.context_window = 64_000;
+  childSnapshot.data.greeting.context_usage = { tokens: 12_000, source: "measured" };
+
+  const projection = projectConsole([
+    {
+      eventId: "child-snapshot",
+      event: {
+        event: "internal_worker",
+        data: { worker, revision: 1, event: childSnapshot },
+      },
+    },
+    {
+      eventId: "child-context",
+      event: {
+        event: "internal_worker",
+        data: {
+          worker,
+          revision: 2,
+          event: {
+            event: "context_usage",
+            data: { usage: { tokens: 14_000, source: "estimated" } },
+          },
+        },
+      },
+    },
+  ]);
+
+  assertEquals(projection.workerMetadata, null);
+  assertEquals(projection.internalWorkers[0].console.workerMetadata, {
+    model: "child-model",
+    reasoning: { kind: "effort", effort: "high" },
+    contextWindow: 64_000,
+    contextTokens: 14_000,
+    contextSource: "estimated",
+  });
+});
+
 Deno.test("Internal Worker snapshot output continues without entering the parent view", () => {
   const worker = {
     session_id: "child-reconnect",

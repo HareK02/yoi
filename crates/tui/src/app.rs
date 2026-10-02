@@ -4093,6 +4093,54 @@ mod completion_flow_tests {
     }
 
     #[test]
+    fn live_internal_worker_snapshot_installs_child_metadata_before_context_updates() {
+        let mut app = App::new("parent".into());
+        let worker = test_internal_worker_snapshot("child", "research", 1).worker;
+        let mut greeting = test_greeting();
+        greeting.worker_name = "research".into();
+        greeting.model = "child-model".into();
+        greeting.context_window = 64_000;
+        greeting.context_usage = Some(protocol::ContextUsage {
+            tokens: 12_000,
+            source: protocol::ContextTokenSource::Measured,
+        });
+
+        app.handle_worker_event(Event::InternalWorker {
+            worker: worker.clone(),
+            revision: 1,
+            event: Box::new(Event::Snapshot {
+                session: protocol::SessionSnapshot {
+                    pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                    entries: Vec::new(),
+                },
+                greeting,
+                state: WorkerStatus::Running.into(),
+                in_flight: Default::default(),
+                internal_workers: Vec::new(),
+            }),
+        });
+        app.handle_worker_event(Event::InternalWorker {
+            worker,
+            revision: 2,
+            event: Box::new(Event::ContextUsage {
+                usage: Some(protocol::ContextUsage {
+                    tokens: 14_000,
+                    source: protocol::ContextTokenSource::Estimated,
+                }),
+            }),
+        });
+
+        let child = &app.internal_workers[0].app;
+        assert_eq!(child.greeting.as_ref().unwrap().model, "child-model");
+        assert_eq!(child.context_window, 64_000);
+        assert_eq!(child.session_context_tokens, 14_000);
+        assert_eq!(
+            child.session_context_source,
+            Some(protocol::ContextTokenSource::Estimated)
+        );
+    }
+
+    #[test]
     fn worker_view_cycle_uses_stable_session_identity_and_wraps_to_main() {
         let mut app = App::new("parent".into());
         for (session_id, name) in [("child-a", "alpha"), ("child-b", "beta")] {

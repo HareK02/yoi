@@ -1221,6 +1221,14 @@ impl session_store::WorkerMetadataStore for EphemeralSessionStore {
 pub(crate) fn test_internal_worker_session(
     visibility: InternalWorkerVisibility,
 ) -> (InternalWorkerSessionHandle, broadcast::Sender<Event>) {
+    test_internal_worker_session_with_greeting(visibility, None)
+}
+
+#[cfg(test)]
+pub(crate) fn test_internal_worker_session_with_greeting(
+    visibility: InternalWorkerVisibility,
+    greeting: Option<protocol::Greeting>,
+) -> (InternalWorkerSessionHandle, broadcast::Sender<Event>) {
     let store = EphemeralSessionStore::default();
     let session_id = session_store::new_session_id();
     let segment_id = session_store::new_segment_id();
@@ -1252,7 +1260,7 @@ pub(crate) fn test_internal_worker_session(
         visibility,
         last_error: Arc::new(Mutex::new(None)),
         last_outcome: Arc::new(Mutex::new(None)),
-        greeting: None,
+        greeting: greeting.map(|greeting| Arc::new(RwLock::new(greeting))),
         child_registry: None,
         sink,
         fail_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
