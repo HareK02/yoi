@@ -43,7 +43,7 @@ function snapshot(
   availability: SubscriptionWorker["availability"],
 ): SubscriptionFrame {
   return {
-    protocol_version: 1,
+    protocol_version: 2,
     frame: "response",
     message: {
       result: "subscribed",
@@ -51,7 +51,6 @@ function snapshot(
         request_id: "request-1",
         subscription_id: "subscription-1",
         selector: { topic: "workspace_workers" },
-        snapshot_revision: 1,
         snapshot: {
           topic: "workers",
           data: {
@@ -60,7 +59,6 @@ function snapshot(
               runtime_id: "runtime-a",
               resource_key: "W-1",
               availability,
-              subject_revision: 1,
               state,
               // An absent foreground snapshot must not prevent stopping an active catalog Worker.
               worker_state: null,

@@ -6,55 +6,55 @@ import type {
 
 export type WorkspaceWorkersProjection = {
   workers: Map<string, SubscriptionWorker>;
-  revisions: Map<string, number>;
+  subscriptionId: string | null;
 };
 
 export function createWorkspaceWorkersProjection(): WorkspaceWorkersProjection {
-  return { workers: new Map(), revisions: new Map() };
+  return { workers: new Map(), subscriptionId: null };
 }
 
 export function applyWorkspaceWorkersFrame(
   projection: WorkspaceWorkersProjection,
   frame: SubscriptionFrame,
 ): void {
-  if (frame.protocol_version !== 1) throw new Error('unsupported Worker subscription protocol');
+  if (frame.protocol_version !== 2) throw new Error('unsupported Worker subscription protocol');
   if (frame.frame === 'response' && frame.message.result === 'subscribed') {
     if (frame.message.payload.selector.topic !== 'workspace_workers') return;
     const snapshot = frame.message.payload.snapshot;
     if (snapshot.topic !== 'workers') throw new Error('workspace_workers returned a non-Worker snapshot');
-    projection.workers.clear();
-    projection.revisions.clear();
+
+    // Build the replacement before mutating the live projection so one malformed
+    // Worker cannot partially clear the previous subscription lifetime.
+    const workers = new Map<string, SubscriptionWorker>();
     for (const worker of snapshot.data.workers) {
-      const key = workerKey(worker.runtime_id, worker.worker_id);
-      projection.workers.set(key, worker);
-      projection.revisions.set(key, worker.subject_revision);
+      workers.set(workerKey(worker.runtime_id, worker.worker_id), worker);
     }
+    projection.workers = workers;
+    projection.subscriptionId = frame.message.payload.subscription_id;
     return;
   }
   if (frame.frame !== 'event' || frame.message.event !== 'event') return;
-  applyPayload(projection, frame.message.data.subject_revision, frame.message.data.payload);
+  const subscriptionId = frame.message.data.subscription_id;
+  if (!projection.subscriptionId) {
+    throw new Error('workspace_workers event arrived before its snapshot');
+  }
+  if (subscriptionId !== projection.subscriptionId) return;
+  applyPayload(projection, frame.message.data.payload);
 }
 
 function applyPayload(
   projection: WorkspaceWorkersProjection,
-  subjectRevision: number,
   payload: SubscriptionEventPayload,
 ): void {
   if (payload.event === 'worker_upserted') {
     const worker = payload.data.worker;
-    const key = workerKey(worker.runtime_id, worker.worker_id);
-    if (subjectRevision <= (projection.revisions.get(key) ?? 0)) return;
-    projection.revisions.set(key, subjectRevision);
-    projection.workers.set(key, worker);
+    projection.workers.set(workerKey(worker.runtime_id, worker.worker_id), worker);
   } else if (payload.event === 'worker_removed') {
-    const key = workerKey(payload.data.runtime_id, payload.data.worker_id);
-    if (subjectRevision <= (projection.revisions.get(key) ?? 0)) return;
-    projection.revisions.set(key, subjectRevision);
-    projection.workers.delete(key);
+    projection.workers.delete(workerKey(payload.data.runtime_id, payload.data.worker_id));
   }
 }
 
 function workerKey(runtimeId: string | null | undefined, workerId: string): string {
   if (!runtimeId) throw new Error('Workspace Worker projection is missing runtime_id');
-  return `${runtimeId}:${workerId}`;
+  return JSON.stringify([runtimeId, workerId]);
 }

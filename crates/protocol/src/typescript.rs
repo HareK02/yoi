@@ -230,7 +230,6 @@ fn rust_serialized_subscription_frame_fixtures() -> Vec<SubscriptionFrame> {
         runtime_id: Some("fixture-runtime".to_string()),
         resource_key: Some("fixture-worker-resource".to_string()),
         availability: SubscriptionWorkerAvailability::default(),
-        subject_revision: 1,
         worker_state: None,
         state: SubscriptionWorkerState::Idle,
         has_running_internal_workers: false,
@@ -250,7 +249,6 @@ fn rust_serialized_subscription_frame_fixtures() -> Vec<SubscriptionFrame> {
             request_id,
             subscription_id: subscription_id.clone(),
             selector: EventSubscriptionSelector::WorkspaceWorkers,
-            snapshot_revision: 1,
             snapshot: SubscriptionSnapshot::Workers {
                 workers: vec![worker],
             },
@@ -259,7 +257,6 @@ fn rust_serialized_subscription_frame_fixtures() -> Vec<SubscriptionFrame> {
     let pending =
         SubscriptionFrame::new(SubscriptionFramePayload::Event(SubscriptionEvent::Event {
             subscription_id,
-            subject_revision: 2,
             payload: SubscriptionEventPayload::WorkerProtocol {
                 worker_id,
                 event: Event::PendingSubmissionsChanged {

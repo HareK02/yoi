@@ -271,7 +271,6 @@ async fn run_worker_protocol(
                     worker_id: worker_id.clone(),
                     runtime_id: Some(runtime_id),
                 },
-                snapshot_revision: 0,
                 snapshot: SubscriptionSnapshot::WorkerProtocol {
                     worker_id: worker_id.clone(),
                     events: vec![initial_event],
@@ -284,13 +283,10 @@ async fn run_worker_protocol(
     {
         return;
     }
-    let mut subject_revision = 0_u64;
     while let Some(event) = events.recv().await {
-        subject_revision = subject_revision.saturating_add(1);
         let frame =
             SubscriptionFrame::new(SubscriptionFramePayload::Event(SubscriptionEvent::Event {
                 subscription_id: subscription_id.clone(),
-                subject_revision,
                 payload: SubscriptionEventPayload::WorkerProtocol {
                     worker_id: worker_id.clone(),
                     event,
@@ -333,12 +329,10 @@ async fn run_workspace_workers(
     subscription_id: SubscriptionId,
     outbound: mpsc::Sender<WsMessage>,
 ) {
-    // Subscribe before reading so commits racing with the snapshot are replayed.
-    let mut events = api.worker_projection.subscribe();
-    let Ok((snapshot_revision, records)) = api.store.worker_registry_projection_snapshot(
-        &api.config.workspace_id,
-        api.config.max_records.max(1),
-    ) else {
+    let Ok(mut projection) = api
+        .worker_projection
+        .subscribe_ordered(api.config.max_records.max(1))
+    else {
         let _ = send_rejected(
             &outbound,
             request_id,
@@ -348,7 +342,8 @@ async fn run_workspace_workers(
         .await;
         return;
     };
-    let mut workers = records
+    let mut workers = projection
+        .take_snapshot()
         .into_iter()
         .filter_map(|record| project_registry_worker(&api, record))
         .collect::<Vec<_>>();
@@ -360,7 +355,6 @@ async fn run_workspace_workers(
                 request_id,
                 subscription_id: subscription_id.clone(),
                 selector: EventSubscriptionSelector::WorkspaceWorkers,
-                snapshot_revision,
                 snapshot: SubscriptionSnapshot::Workers { workers },
             },
         )),
@@ -372,16 +366,14 @@ async fn run_workspace_workers(
     }
 
     loop {
-        match events.recv().await {
-            Ok(event) if event.revision <= snapshot_revision => continue,
+        match projection.recv().await {
             Ok(event) => {
                 for change in event.changes {
                     let payload = match change {
                         crate::worker_projection::WorkerProjectionChange::Upsert(record) => {
-                            let Some(mut worker) = project_registry_worker(&api, record) else {
+                            let Some(worker) = project_registry_worker(&api, record) else {
                                 continue;
                             };
-                            worker.subject_revision = event.revision;
                             SubscriptionEventPayload::WorkerUpserted { worker }
                         }
                         crate::worker_projection::WorkerProjectionChange::Removed(worker) => {
@@ -396,7 +388,7 @@ async fn run_workspace_workers(
                             }
                         }
                     };
-                    if send_event(&outbound, &subscription_id, event.revision, payload)
+                    if send_event(&outbound, &subscription_id, payload)
                         .await
                         .is_err()
                     {
@@ -431,7 +423,6 @@ fn project_registry_worker(
     let mut worker = if let Some(observation) = record.observation {
         let mut worker = observation.worker;
         worker.availability = observation.availability;
-        worker.subject_revision = observation.projection_revision;
         worker
     } else {
         SubscriptionWorker {
@@ -442,7 +433,6 @@ fn project_registry_worker(
             runtime_id: Some(runtime_id.clone()),
             resource_key: record.resource_key.clone(),
             availability: protocol::subscription::SubscriptionWorkerAvailability::Unavailable,
-            subject_revision: 0,
             worker_state: None,
             state: protocol::subscription::SubscriptionWorkerState::Stopped,
             has_running_internal_workers: false,
@@ -559,14 +549,12 @@ fn sort_workers(workers: &mut [SubscriptionWorker]) {
 async fn send_event(
     outbound: &mpsc::Sender<WsMessage>,
     subscription_id: &SubscriptionId,
-    subject_revision: u64,
     payload: SubscriptionEventPayload,
 ) -> Result<(), ()> {
     send_frame(
         outbound,
         SubscriptionFrame::new(SubscriptionFramePayload::Event(SubscriptionEvent::Event {
             subscription_id: subscription_id.clone(),
-            subject_revision,
             payload,
         })),
     )
@@ -617,7 +605,6 @@ mod tests {
             runtime_id: Some("runtime-1".to_string()),
             resource_key: Some("W-1".to_string()),
             availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
-            subject_revision: 1,
             worker_state: None,
             state: protocol::subscription::SubscriptionWorkerState::Idle,
             has_running_internal_workers: false,

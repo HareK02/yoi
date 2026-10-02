@@ -138,7 +138,7 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
         const frame = JSON.parse(String(event.data));
         if (frame?.message?.method !== "subscribe_events") return;
         socket.send(JSON.stringify({
-          protocol_version: 1,
+          protocol_version: 2,
           frame: "response",
           message: {
             result: "subscribed",
@@ -146,7 +146,6 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
               request_id: frame.message.params.request_id,
               subscription_id: "fixture-workers",
               selector: { topic: "workspace_workers" },
-              snapshot_revision: 1,
               snapshot: { topic: "workers", data: { workers: [] } },
             },
           },

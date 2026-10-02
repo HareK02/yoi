@@ -304,11 +304,7 @@ resource_key?: string | null,
  */
 availability: SubscriptionWorkerAvailability,
 /**
- * Producer-owned monotonic revision for this Worker subject.
- */
-subject_revision: number,
-/**
- * Latest revisioned foreground state observed from the Worker. This remains
+ * Latest foreground state observed from the Worker. This remains
  * absent until an authoritative Worker snapshot/event has been applied.
  */
 worker_state?: WorkerStateSnapshot | null,
@@ -336,9 +332,9 @@ export type SubscriptionRequest = { "method": "subscribe_events", "params": { re
 
 export type SubscriptionWorkerProtocolMethod = { subscription_id: SubscriptionId, method: Method, };
 
-export type SubscriptionResponse = { "result": "subscribed", "payload": { request_id: SubscriptionRequestId, subscription_id: SubscriptionId, selector: EventSubscriptionSelector, snapshot_revision: number, snapshot: SubscriptionSnapshot, } } | { "result": "unsubscribed", "payload": { request_id: SubscriptionRequestId, subscription_id: SubscriptionId, } } | { "result": "subscription_rejected", "payload": { request_id: SubscriptionRequestId, subscription_id?: SubscriptionId | null, code: SubscriptionRejectionCode, message: string, } };
+export type SubscriptionResponse = { "result": "subscribed", "payload": { request_id: SubscriptionRequestId, subscription_id: SubscriptionId, selector: EventSubscriptionSelector, snapshot: SubscriptionSnapshot, } } | { "result": "unsubscribed", "payload": { request_id: SubscriptionRequestId, subscription_id: SubscriptionId, } } | { "result": "subscription_rejected", "payload": { request_id: SubscriptionRequestId, subscription_id?: SubscriptionId | null, code: SubscriptionRejectionCode, message: string, } };
 
-export type SubscriptionEvent = { "event": "event", "data": { subscription_id: SubscriptionId, subject_revision: number, payload: SubscriptionEventPayload, } } | { "event": "subscription_closed", "data": { subscription_id: SubscriptionId, code: SubscriptionTerminationCode, message: string, } };
+export type SubscriptionEvent = { "event": "event", "data": { subscription_id: SubscriptionId, payload: SubscriptionEventPayload, } } | { "event": "subscription_closed", "data": { subscription_id: SubscriptionId, code: SubscriptionTerminationCode, message: string, } };
 
 export type SubscriptionFramePayload = { "frame": "request", "message": SubscriptionRequest } | { "frame": "response", "message": SubscriptionResponse } | { "frame": "event", "message": SubscriptionEvent } | { "frame": "worker_protocol", "message": SubscriptionWorkerProtocolMethod };
 

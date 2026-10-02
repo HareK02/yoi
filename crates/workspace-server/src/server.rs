@@ -1501,10 +1501,11 @@ impl WorkerRemovalService {
     /// and WorkerRemove use the retention commit below; compensation preserves
     /// its pre-create semantics while sharing the atomic catalog contract.
     fn commit_catalog_removal(&self, target: &RuntimeWorkerRef) -> crate::Result<()> {
-        let commit = self
-            .store
-            .delete_worker_registry(&self.workspace_id, target)?;
-        self.worker_projection.publish_commit(commit)
+        self.worker_projection.publish_ordered(|| {
+            self.store
+                .delete_worker_registry(&self.workspace_id, target)
+                .map(|commit| ((), commit))
+        })
     }
 
     async fn execute_cleanup_removal(&self, candidate: &CleanupWorkerCandidate) -> ApiResult<()> {
@@ -1631,18 +1632,17 @@ impl WorkerRemovalService {
                     ));
                 }
             };
-        match self.store.commit_worker_removal(
-            &self.workspace_id,
-            &prepared.plan.operation_id,
-            &prepared.plan.input_fingerprint,
-            &result,
-        ) {
-            Ok(commit) => {
-                self.worker_projection
-                    .publish_commit(commit.catalog)
-                    .map_err(|error| error.to_string())?;
-                Ok(worker_remove_success_response(target))
-            }
+        match self.worker_projection.publish_ordered(|| {
+            self.store
+                .commit_worker_removal(
+                    &self.workspace_id,
+                    &prepared.plan.operation_id,
+                    &prepared.plan.input_fingerprint,
+                    &result,
+                )
+                .map(|commit| ((), commit.catalog))
+        }) {
+            Ok(()) => Ok(worker_remove_success_response(target)),
             Err(error) => Ok(worker_retention_error_response(error)),
         }
     }
@@ -1764,12 +1764,12 @@ impl WorkerRemovalService {
             .map_err(|_| "Worker removal recovery authority is unavailable".to_string())?;
         if let Some(prepared) = prepared {
             if prepared.plan.state == crate::retention::WorkerRemovalPlanState::Succeeded {
-                let commit = self
-                    .store
-                    .recover_succeeded_worker_removal_catalog(&self.workspace_id, target)
-                    .map_err(|error| error.to_string())?;
                 self.worker_projection
-                    .publish_commit(commit)
+                    .publish_ordered(|| {
+                        self.store
+                            .recover_succeeded_worker_removal_catalog(&self.workspace_id, target)
+                            .map(|commit| ((), commit))
+                    })
                     .map_err(|error| error.to_string())?;
                 return Ok(worker_remove_success_response(target));
             }
@@ -1947,17 +1947,17 @@ impl WorkerRemovalService {
                     ));
                 }
             };
-        match self.store.commit_worker_removal(
-            &self.workspace_id,
-            &plan.operation_id,
-            &plan.input_fingerprint,
-            &retention_result,
-        ) {
-            Ok(commit) => {
-                self.worker_projection
-                    .publish_commit(commit.catalog)
-                    .map_err(|error| error.to_string())?;
-            }
+        match self.worker_projection.publish_ordered(|| {
+            self.store
+                .commit_worker_removal(
+                    &self.workspace_id,
+                    &plan.operation_id,
+                    &plan.input_fingerprint,
+                    &retention_result,
+                )
+                .map(|commit| ((), commit.catalog))
+        }) {
+            Ok(()) => {}
             Err(error) => {
                 let _ = self.store.fail_worker_removal(
                     &self.workspace_id,
@@ -3454,17 +3454,19 @@ impl WorkspaceApi {
         };
         let bound_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
         let runtime_run_id = crate::backend_job::runtime_run_id(&reservation.attempt.attempt_id);
-        let (commit, newly_bound) = self.store.bind_backend_job_attempt_worker(
-            &self.config.workspace_id,
-            &request.job_id,
-            &reservation.attempt.attempt_id,
-            &worker.worker,
-            Some(&runtime_run_id),
-            &bound_at,
-        )?;
-        if newly_bound {
-            self.worker_projection.publish_commit(commit)?;
-        } else {
+        let newly_bound = self.worker_projection.publish_ordered(|| {
+            self.store
+                .bind_backend_job_attempt_worker(
+                    &self.config.workspace_id,
+                    &request.job_id,
+                    &reservation.attempt.attempt_id,
+                    &worker.worker,
+                    Some(&runtime_run_id),
+                    &bound_at,
+                )
+                .map(|(commit, newly_bound)| (newly_bound, commit))
+        })?;
+        if !newly_bound {
             let job = self
                 .store
                 .get_backend_job(&self.config.workspace_id, &request.job_id)?
@@ -19435,10 +19437,11 @@ async fn scoped_start_workspace_orchestrator(
                 deleted.diagnostics,
             ));
         }
-        let removal = api
-            .store
-            .delete_worker_registry(&api.config.workspace_id, &existing.worker)?;
-        api.worker_projection.publish_commit(removal)?;
+        api.worker_projection.publish_ordered(|| {
+            api.store
+                .delete_worker_registry(&api.config.workspace_id, &existing.worker)
+                .map(|commit| ((), commit))
+        })?;
         disposition = "recreated";
     }
 
@@ -21768,22 +21771,23 @@ async fn set_worker_retention(
         }
     }
     let retention_state = if pinned { "pinned" } else { "normal" };
-    let commit = api.store.update_worker_retention(
-        &api.config.workspace_id,
-        &worker_ref,
-        retention_state,
-        now_registry_timestamp().as_str(),
-    )?;
-    if commit.changes.is_empty() {
+    let changed = api.worker_projection.publish_ordered(|| {
+        api.store
+            .update_worker_retention(
+                &api.config.workspace_id,
+                &worker_ref,
+                retention_state,
+                now_registry_timestamp().as_str(),
+            )
+            .map(|commit| (!commit.changes.is_empty(), commit))
+    })?;
+    if !changed {
         return Err(cleanup_api_error(
             runtime_id.as_str(),
             "workspace_worker_retention_unknown_worker",
             "Worker is not known to the Backend registry",
         ));
     }
-    api.worker_projection
-        .publish_commit(commit)
-        .map_err(ApiError::from)?;
     Ok(Json(WorkerRetentionResponse {
         workspace_id: api.config.workspace_id,
         runtime_id: worker_ref.runtime_id,
@@ -26680,7 +26684,7 @@ fn project_observed_workspace_workers(
 
 fn workers_response(api: WorkspaceApi) -> ApiResult<server_api::WorkerListResponse> {
     let limit = api.config.max_records.min(200);
-    let (_, projections) = api
+    let projections = api
         .store
         .worker_registry_projection_snapshot(&api.config.workspace_id, limit)?;
     let workdir_records = api
@@ -27478,9 +27482,12 @@ fn record_worker_summary(
         created_at: timestamp.clone(),
         updated_at: timestamp,
     };
-    let catalog_commit = api.store.upsert_worker_registry(&record)?;
     api.worker_projection
-        .publish_commit(catalog_commit)
+        .publish_ordered(|| {
+            api.store
+                .upsert_worker_registry(&record)
+                .map(|commit| ((), commit))
+        })
         .map_err(ApiError::from)?;
     if let Ok(worker_id) =
         protocol::subscription::SubscriptionWorkerId::new(worker.worker.worker_id.clone())
@@ -27496,7 +27503,6 @@ fn record_worker_summary(
             runtime_id: Some(worker.worker.runtime_id.clone()),
             resource_key: None,
             availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
-            subject_revision: 0,
             worker_state: worker.worker_state.clone(),
             state,
             has_running_internal_workers: false,
@@ -29427,7 +29433,6 @@ mod tests {
                     runtime_id: Some("runtime-a".to_string()),
                     resource_key: Some("W-1".to_string()),
                     availability,
-                    subject_revision: 4,
                     worker_state: Some(protocol::WorkerStateSnapshot::initial()),
                     state: protocol::subscription::SubscriptionWorkerState::Idle,
                     has_running_internal_workers: false,
@@ -29438,10 +29443,6 @@ mod tests {
                     workdir_attachments: Vec::new(),
                 },
                 availability,
-                connection_generation: 2,
-                subject_revision: 4,
-                snapshot_revision: 7,
-                projection_revision: 9,
                 observed_at: "2026-09-24T00:00:01Z".to_string(),
             }),
             job: None,
@@ -33018,7 +33019,6 @@ mod tests {
                     runtime_id: Some(EMBEDDED_WORKER_RUNTIME_ID.to_string()),
                     resource_key: None,
                     availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
-                    subject_revision: 1,
                     worker_state: None,
                     state: protocol::subscription::SubscriptionWorkerState::Paused,
                     has_running_internal_workers: false,
@@ -44053,7 +44053,8 @@ mod tests {
         let summary = api.runtime.worker(&target).unwrap();
         sync_worker_observation(&api, &summary).unwrap();
         seed_worker_control_grant(&api, &source, &target, "embedded-valid-proof");
-        let mut subscriber = api.worker_projection.subscribe();
+        let mut subscriber = api.worker_projection.subscribe_ordered(10).unwrap();
+        let _ = subscriber.take_snapshot();
 
         let response = WorkerRemovalService::new(&api)
             .execute_async(
@@ -44086,7 +44087,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let removal = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 let event = subscriber.recv().await.expect("projection event");
                 if event.changes.iter().any(|change| {
@@ -44098,7 +44099,6 @@ mod tests {
         })
         .await
         .expect("WorkerRemove catalog removal broadcast");
-        assert!(removal.revision > 0);
     }
 
     #[tokio::test]
@@ -44135,7 +44135,8 @@ mod tests {
         let worker = spawned.worker.unwrap().worker;
         let summary = api.runtime.worker(&worker).unwrap();
         sync_worker_observation(&api, &summary).unwrap();
-        let mut subscriber = api.worker_projection.subscribe();
+        let mut subscriber = api.worker_projection.subscribe_ordered(10).unwrap();
+        let _ = subscriber.take_snapshot();
         let diagnostics = compensate_failed_worker_spawn(
             &api,
             &summary,
@@ -44151,7 +44152,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let removal = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 let event = subscriber.recv().await.expect("projection event");
                 if event.changes.iter().any(|change| {
@@ -44163,7 +44164,6 @@ mod tests {
         })
         .await
         .expect("spawn compensation catalog removal broadcast");
-        assert!(removal.revision > 0);
         sync_worker_observation(&api, &summary).unwrap();
         assert!(
             api.store
@@ -46005,7 +46005,8 @@ mod tests {
             .expect("singleton Worker cleanup candidate")
             .clone();
         assert_eq!(candidate.blocking_reason, None);
-        let mut subscriber = api.worker_projection.subscribe();
+        let mut subscriber = api.worker_projection.subscribe_ordered(10).unwrap();
+        let _ = subscriber.take_snapshot();
 
         WorkerRemovalService::new(&api)
             .execute_cleanup_removal(&candidate)
@@ -46129,7 +46130,8 @@ mod tests {
                 .iter()
                 .any(|item| item.worker_id.as_str() == worker_id)
         );
-        let mut subscriber = api.worker_projection.subscribe();
+        let mut subscriber = api.worker_projection.subscribe_ordered(10).unwrap();
+        let _ = subscriber.take_snapshot();
         let plan = build_runtime_cleanup_plan(&api, EMBEDDED_WORKER_RUNTIME_ID)
             .unwrap_or_else(|error| panic!("cleanup plan: {}", error.error));
         let candidate = plan
@@ -46173,20 +46175,18 @@ mod tests {
             event.changes.as_slice(),
             [crate::store::WorkerCatalogChange::Removed(removed)] if removed == &worker
         ));
-        let acting_revision = tokio::time::timeout(
+        tokio::time::timeout(
             std::time::Duration::from_secs(1),
             next_workspace_worker_removal(&mut acting_socket, worker_id.as_str()),
         )
         .await
         .expect("acting Workspace Worker subscription removal");
-        let observing_revision = tokio::time::timeout(
+        tokio::time::timeout(
             std::time::Duration::from_secs(1),
             next_workspace_worker_removal(&mut observing_socket, worker_id.as_str()),
         )
         .await
         .expect("independent Workspace Worker subscription removal");
-        assert_eq!(acting_revision, event.revision);
-        assert_eq!(observing_revision, event.revision);
         assert!(
             api.store
                 .get_worker_registry(&api.config.workspace_id, &worker)
@@ -46202,11 +46202,10 @@ mod tests {
             recovered.plan.state,
             crate::retention::WorkerRemovalPlanState::Succeeded
         );
-        let (snapshot_revision, snapshot) = api
+        let snapshot = api
             .store
             .worker_registry_projection_snapshot(&api.config.workspace_id, 100)
             .unwrap();
-        assert_eq!(snapshot_revision, event.revision);
         assert!(
             snapshot
                 .iter()
@@ -46228,8 +46227,8 @@ mod tests {
                 .all(|item| item.worker_id.as_str() != worker_id)
         );
 
-        // A retry replays the durable fence at the same revision, healing an
-        // in-process broadcast omitted after the first DB commit.
+        // A retry replays the durable fence, healing an in-process broadcast
+        // omitted after the first DB commit.
         WorkerRemovalService::new(&api)
             .commit_catalog_removal(&worker)
             .unwrap();
@@ -46237,7 +46236,6 @@ mod tests {
             .await
             .expect("catalog removal replay")
             .expect("projection replay");
-        assert_eq!(replay.revision, event.revision);
         assert!(matches!(
             replay.changes.as_slice(),
             [crate::store::WorkerCatalogChange::Removed(removed)] if removed == &worker
@@ -49669,10 +49667,7 @@ mod tests {
         }
     }
 
-    async fn next_workspace_worker_removal(
-        socket: &mut TestWebSocket,
-        expected_worker_id: &str,
-    ) -> u64 {
+    async fn next_workspace_worker_removal(socket: &mut TestWebSocket, expected_worker_id: &str) {
         loop {
             let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
                 continue;
@@ -49681,7 +49676,6 @@ mod tests {
                 serde_json::from_str(text.as_str()).unwrap();
             if let protocol::subscription::SubscriptionFramePayload::Event(
                 protocol::subscription::SubscriptionEvent::Event {
-                    subject_revision,
                     payload:
                         protocol::subscription::SubscriptionEventPayload::WorkerRemoved {
                             worker_id,
@@ -49692,7 +49686,7 @@ mod tests {
             ) = frame.payload
                 && worker_id.as_str() == expected_worker_id
             {
-                return subject_revision;
+                return;
             }
         }
     }
@@ -49812,7 +49806,7 @@ mod tests {
             .unwrap();
         assert_eq!(spawned.state, InternalWorkerOperationState::Accepted);
         let worker_id = spawned.worker.unwrap().worker.worker_id;
-        let (_, projections) = api
+        let projections = api
             .store
             .worker_registry_projection_snapshot(TEST_WORKSPACE_ID, 10)
             .unwrap();

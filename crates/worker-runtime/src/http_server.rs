@@ -1334,7 +1334,6 @@ async fn runtime_protocol_ws_session(
                                 request_id,
                                 subscription_id: subscription_id.clone(),
                                 selector: selector.clone(),
-                                snapshot_revision: subscription.snapshot_revision(),
                                 snapshot: subscription.snapshot().clone(),
                             },
                         ));
@@ -1354,7 +1353,6 @@ async fn runtime_protocol_ws_session(
                                         SubscriptionFramePayload::Event(
                                             SubscriptionEvent::Event {
                                                 subscription_id: event_subscription_id.clone(),
-                                                subject_revision: update.subject_revision,
                                                 payload: update.payload,
                                             },
                                         ),

@@ -264,16 +264,9 @@ async fn replacing_runtime_registration_fences_the_old_generation() {
     assert!(second_generation > first_generation);
     assert!(matches!(
         next_event(&mut old).await,
-        BrokerSubscriptionEvent::Closed {
-            connection_generation,
-            ..
-        } if connection_generation == first_generation
+        BrokerSubscriptionEvent::Closed { .. }
     ));
-    let status = wait_for_status(&broker, "runtime-test", |status| {
-        status.connection_generation == second_generation && status.connected
-    })
-    .await;
-    assert_eq!(status.connection_generation, second_generation);
+    wait_for_status(&broker, "runtime-test", |status| status.connected).await;
     server.abort();
 }
 
@@ -427,6 +420,75 @@ async fn embedded_runtime_uses_in_process_subscription_source() {
         SubscriptionSnapshot::Workers { workers }
             if workers.iter().all(|candidate| candidate.worker_id.as_str() != worker.worker_ref.worker_id.to_string())
     ));
+    server.abort();
+}
+
+#[tokio::test]
+async fn embedded_downstream_overflow_recovers_through_a_fresh_snapshot() {
+    let (runtime, _config, server) = fixture().await;
+    let worker = runtime.list_workers().unwrap().remove(0);
+    let broker = RuntimeSubscriptionBroker::new("local");
+    broker.register_embedded_runtime("embedded-worker-runtime", runtime.clone());
+    let mut subscription = broker
+        .subscribe(
+            "embedded-worker-runtime",
+            EventSubscriptionSelector::RuntimeWorkers,
+        )
+        .unwrap();
+    assert!(matches!(
+        next_snapshot(&mut subscription).await,
+        BrokerSubscriptionEvent::Snapshot { .. }
+    ));
+
+    let final_command_id = (DOWNSTREAM_QUEUE_CAPACITY as u64) * 3;
+    for command_id in 1..=final_command_id {
+        let mut snapshot = worker.worker_state.clone().unwrap();
+        snapshot.last_command_id = command_id;
+        runtime
+            .observe_worker_event(
+                &worker.worker_ref,
+                protocol::Event::WorkerState { snapshot },
+            )
+            .unwrap();
+    }
+
+    let mut saw_recovery_snapshot = false;
+    let mut converged = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !converged {
+            match subscription
+                .recv()
+                .await
+                .expect("broker subscription closed")
+            {
+                BrokerSubscriptionEvent::Snapshot {
+                    snapshot: SubscriptionSnapshot::Workers { workers },
+                } => {
+                    saw_recovery_snapshot = true;
+                    converged = workers.iter().any(|candidate| {
+                        candidate.worker_id.as_str() == worker.worker_id.to_string()
+                            && candidate
+                                .worker_state
+                                .as_ref()
+                                .is_some_and(|state| state.last_command_id == final_command_id)
+                    });
+                }
+                BrokerSubscriptionEvent::Event {
+                    payload: SubscriptionEventPayload::WorkerUpserted { worker: candidate },
+                } if saw_recovery_snapshot => {
+                    converged = candidate.worker_id.as_str() == worker.worker_id.to_string()
+                        && candidate
+                            .worker_state
+                            .as_ref()
+                            .is_some_and(|state| state.last_command_id == final_command_id);
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("overflow recovery did not converge");
+    assert!(saw_recovery_snapshot);
     server.abort();
 }
 
