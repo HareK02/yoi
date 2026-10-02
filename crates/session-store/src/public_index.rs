@@ -95,6 +95,16 @@ pub struct SessionPublicIndexPage {
     pub scanned_entries: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPublicIndexEntryRead {
+    pub session_id: String,
+    pub generation: String,
+    pub item: SessionPublicIndexPageEntry,
+    pub scanned_bytes: u64,
+    pub scanned_segments: usize,
+    pub scanned_entries: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPublicIndex {
     pub session_id: String,
@@ -556,6 +566,76 @@ where
         scanned_segments,
         scanned_entries,
     })
+}
+
+/// Read one exact public entry from its selected Segment without charging
+/// unrelated Segments against the caller's aggregate scan budget. The Session
+/// generation still covers every persisted Segment so content-page cursors are
+/// invalidated by any concurrent Session mutation.
+pub fn read_session_public_index_entry(
+    session_root: &Path,
+    limits: SessionPublicIndexLimits,
+    expected_generation: Option<&str>,
+    segment_id: &str,
+    entry_ref: &str,
+) -> Result<Option<SessionPublicIndexEntryRead>, SessionPublicIndexReadError> {
+    if limits.max_bytes == 0 || limits.max_segments == 0 || limits.max_entries == 0 {
+        return Err(SessionPublicIndexReadError::ResourceLimit);
+    }
+    let selected_segment = match uuid::Uuid::parse_str(segment_id) {
+        Ok(segment_id) => segment_id,
+        Err(_) => return Ok(None),
+    };
+    let store = WorkerSessionStore::open_read_only(session_root).map_err(map_store_open_error)?;
+    let session_id = store
+        .session_id()
+        .map_err(map_store_error)?
+        .ok_or(SessionPublicIndexReadError::Missing)?;
+    let segment_ids = store
+        .list_segments_read_only(session_id)
+        .map_err(map_store_error)?;
+    let Some(segment_index) = segment_ids
+        .iter()
+        .position(|candidate| *candidate == selected_segment)
+    else {
+        return Ok(None);
+    };
+    let page = read_session_public_index_page(
+        session_root,
+        SessionPublicIndexLimits {
+            max_segments: 1,
+            ..limits
+        },
+        expected_generation,
+        Some(SessionPublicIndexScanPosition {
+            segment_index,
+            byte_offset: 0,
+            entry_offset: 0,
+            lineage: None,
+        }),
+        2,
+        |entry| entry.entry_ref == entry_ref,
+    )?;
+    let mut matches = page.entries.into_iter();
+    let item = matches.next();
+    if matches.next().is_some() {
+        return Err(SessionPublicIndexReadError::Corrupt);
+    }
+    if page
+        .next_position
+        .as_ref()
+        .is_some_and(|position| position.segment_index == segment_index)
+    {
+        return Err(SessionPublicIndexReadError::ResourceLimit);
+    }
+    Ok(item.map(|item| SessionPublicIndexEntryRead {
+        session_id: page.session_id,
+        generation: page.generation,
+        item,
+        scanned_bytes: page.scanned_bytes,
+        scanned_segments: page.scanned_segments,
+        scanned_entries: page.scanned_entries,
+    }))
 }
 
 #[derive(Debug)]
@@ -1684,6 +1764,49 @@ mod tests {
             .unwrap();
             assert_eq!(second.entries.len(), 1);
             assert!(!second.has_more);
+        }
+    }
+
+    #[test]
+    fn incremental_scan_exact_aggregate_budgets_finish_without_cursor() {
+        let (_temp, root, store) = create_store();
+        let session_id = crate::new_session_id();
+        let first_segment = segment_id(1_600);
+        let second_segment = segment_id(1_601);
+        for (segment_id, id) in [(first_segment, "entry-a"), (second_segment, "entry-b")] {
+            store
+                .create_segment(
+                    session_id,
+                    segment_id,
+                    &[start(
+                        session_id,
+                        vec![message(id, LoggedRole::User, "ordinary")],
+                        None,
+                        None,
+                    )],
+                )
+                .unwrap();
+        }
+        let total_bytes = store.segment_log_len(first_segment).unwrap()
+            + store.segment_log_len(second_segment).unwrap();
+        for limits in [
+            SessionPublicIndexLimits {
+                max_bytes: total_bytes,
+                ..SessionPublicIndexLimits::default()
+            },
+            SessionPublicIndexLimits {
+                max_segments: 2,
+                ..SessionPublicIndexLimits::default()
+            },
+            SessionPublicIndexLimits {
+                max_entries: 4,
+                ..SessionPublicIndexLimits::default()
+            },
+        ] {
+            let page =
+                read_session_public_index_page(&root, limits, None, None, 10, |_| false).unwrap();
+            assert!(!page.has_more, "exact final-range budget must be complete");
+            assert!(page.next_position.is_none());
         }
     }
 

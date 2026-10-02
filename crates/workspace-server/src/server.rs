@@ -17034,6 +17034,7 @@ struct SubjektivSessionSearchPosition {
     archive_id: Option<String>,
     generation: String,
     runtime_scan_cursor: String,
+    attribution_has_more: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17630,92 +17631,98 @@ fn subjektiv_session_search(
 
     while items.len() < limit && scanned_sessions < SUBJEKTIV_SESSION_MAX_SCANNED_SESSIONS {
         if remaining_scan_bytes == 0 || remaining_segments == 0 || remaining_entries == 0 {
-            has_more = true;
-            state.partial = true;
+            if has_more || state.current.is_some() {
+                state.partial = true;
+            }
             break;
         }
-        let (attribution, expected_generation, runtime_scan_cursor, cursor_source) =
-            if let Some(current) = state.current.take() {
-                let page = match store.subject_session_attribution_page(
-                    subject_id,
-                    Some(&current.session_id),
-                    &state.snapshot_at,
-                    None,
-                    1,
-                ) {
-                    Ok(page) => page,
-                    Err(error) => {
-                        return subjektiv_session_error(
-                            server_api::SubjektivSessionDiagnosticCode::SubjectUnavailable,
-                            error.to_string(),
-                        );
-                    }
-                };
-                let Some(attribution) = page.items.into_iter().next() else {
+        let (
+            attribution,
+            expected_generation,
+            runtime_scan_cursor,
+            cursor_source,
+            attribution_has_more,
+        ) = if let Some(current) = state.current.take() {
+            let page = match store.subject_session_attribution_page(
+                subject_id,
+                Some(&current.session_id),
+                &state.snapshot_at,
+                None,
+                1,
+            ) {
+                Ok(page) => page,
+                Err(error) => {
                     return subjektiv_session_error(
-                        server_api::SubjektivSessionDiagnosticCode::StaleCursor,
-                        "Session search attribution is no longer available",
-                    );
-                };
-                if attribution.attributed_at != current.attributed_at
-                    || attribution.runtime_id != current.runtime_id
-                    || attribution.worker_id != current.worker_id
-                {
-                    return subjektiv_session_error(
-                        server_api::SubjektivSessionDiagnosticCode::StaleCursor,
-                        "Session search attribution changed",
+                        server_api::SubjektivSessionDiagnosticCode::SubjectUnavailable,
+                        error.to_string(),
                     );
                 }
-                (
-                    attribution,
-                    Some(current.generation),
-                    Some(current.runtime_scan_cursor),
-                    Some((current.storage, current.archive_id)),
-                )
-            } else {
-                let page = match store.subject_session_attribution_page(
-                    subject_id,
-                    state.session_id.as_deref(),
-                    &state.snapshot_at,
-                    match (
-                        state.after_attributed_at.as_deref(),
-                        state.after_session_id.as_deref(),
-                    ) {
-                        (Some(attributed_at), Some(session_id)) => {
-                            Some((attributed_at, session_id))
-                        }
-                        (None, None) => None,
-                        _ => {
-                            return subjektiv_session_error(
-                                server_api::SubjektivSessionDiagnosticCode::StaleCursor,
-                                "Session search cursor position is incomplete",
-                            );
-                        }
-                    },
-                    1,
-                ) {
-                    Ok(page) => page,
-                    Err(error) => {
-                        return subjektiv_session_error(
-                            server_api::SubjektivSessionDiagnosticCode::SubjectUnavailable,
-                            error.to_string(),
-                        );
-                    }
-                };
-                let Some(attribution) = page.items.into_iter().next() else {
-                    if state.session_id.is_some() {
-                        return subjektiv_session_error(
-                            server_api::SubjektivSessionDiagnosticCode::NotFoundOrNotAuthorized,
-                            "Session was not found or is not authorized",
-                        );
-                    }
-                    break;
-                };
-                has_more = page.has_more;
-                state.after_attributed_at = Some(attribution.attributed_at.clone());
-                state.after_session_id = Some(attribution.session_id.clone());
-                (attribution, None, None, None)
             };
+            let Some(attribution) = page.items.into_iter().next() else {
+                return subjektiv_session_error(
+                    server_api::SubjektivSessionDiagnosticCode::StaleCursor,
+                    "Session search attribution is no longer available",
+                );
+            };
+            if attribution.attributed_at != current.attributed_at
+                || attribution.runtime_id != current.runtime_id
+                || attribution.worker_id != current.worker_id
+            {
+                return subjektiv_session_error(
+                    server_api::SubjektivSessionDiagnosticCode::StaleCursor,
+                    "Session search attribution changed",
+                );
+            }
+            (
+                attribution,
+                Some(current.generation),
+                Some(current.runtime_scan_cursor),
+                Some((current.storage, current.archive_id)),
+                current.attribution_has_more,
+            )
+        } else {
+            let page = match store.subject_session_attribution_page(
+                subject_id,
+                state.session_id.as_deref(),
+                &state.snapshot_at,
+                match (
+                    state.after_attributed_at.as_deref(),
+                    state.after_session_id.as_deref(),
+                ) {
+                    (Some(attributed_at), Some(session_id)) => Some((attributed_at, session_id)),
+                    (None, None) => None,
+                    _ => {
+                        return subjektiv_session_error(
+                            server_api::SubjektivSessionDiagnosticCode::StaleCursor,
+                            "Session search cursor position is incomplete",
+                        );
+                    }
+                },
+                1,
+            ) {
+                Ok(page) => page,
+                Err(error) => {
+                    return subjektiv_session_error(
+                        server_api::SubjektivSessionDiagnosticCode::SubjectUnavailable,
+                        error.to_string(),
+                    );
+                }
+            };
+            let Some(attribution) = page.items.into_iter().next() else {
+                if state.session_id.is_some() {
+                    return subjektiv_session_error(
+                        server_api::SubjektivSessionDiagnosticCode::NotFoundOrNotAuthorized,
+                        "Session was not found or is not authorized",
+                    );
+                }
+                break;
+            };
+            let attribution_has_more = page.has_more;
+            state.after_attributed_at = Some(attribution.attributed_at.clone());
+            state.after_session_id = Some(attribution.session_id.clone());
+            (attribution, None, None, None, attribution_has_more)
+        };
+        has_more = attribution_has_more;
         scanned_sessions += 1;
         let source = match authorized_subjektiv_session(
             api,
@@ -17870,6 +17877,7 @@ fn subjektiv_session_search(
                     archive_id: source.archive_id.clone(),
                     generation: generation.clone(),
                     runtime_scan_cursor: item_scan_cursor,
+                    attribution_has_more,
                 });
                 break;
             }
@@ -17896,6 +17904,7 @@ fn subjektiv_session_search(
                 archive_id: source.archive_id,
                 generation,
                 runtime_scan_cursor: next_scan_cursor,
+                attribution_has_more,
             });
             break;
         }
@@ -37523,6 +37532,426 @@ mod tests {
                     }
                 )
             } if items.len() == 20
+        ));
+    }
+
+    #[tokio::test]
+    async fn subjektiv_session_search_preserves_later_session_after_runtime_resume() {
+        use session_store::{
+            LogEntry, LoggedContentPart, LoggedHistoryEntry, LoggedItem, LoggedRole,
+            LoggedSessionHistoryEntryId, LoggedSessionHistoryMetadata, LoggedSessionHistoryOrigin,
+            Store as _, WorkerSessionStore,
+        };
+
+        fn public_message(id: &str, text: &str) -> LoggedHistoryEntry {
+            LoggedHistoryEntry {
+                item: LoggedItem::Message {
+                    role: LoggedRole::User,
+                    content: vec![LoggedContentPart::Text { text: text.into() }],
+                },
+                metadata: LoggedSessionHistoryMetadata {
+                    entry_id: LoggedSessionHistoryEntryId(id.to_string()),
+                    origin: LoggedSessionHistoryOrigin::HumanInput {
+                        account_id: "account-1".to_string(),
+                    },
+                    derivation: None,
+                },
+            }
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let create = |display_name: &str| CreateWorkspaceWorkerRequest {
+            runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+            display_name: display_name.to_string(),
+            singleton_key: None,
+            profile: None,
+            ticket_assignment: None,
+            initial_submit: Vec::new(),
+            workdir_attachments: Vec::new(),
+            control_operation_id: None,
+        };
+        let Json(controller) = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(create("Session search controller")),
+        )
+        .await
+        .unwrap();
+        let Json(first_worker) = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(create("Large Session source")),
+        )
+        .await
+        .unwrap();
+        let Json(second_worker) = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(create("Later Session source")),
+        )
+        .await
+        .unwrap();
+        let controller = RuntimeWorkerRef::new(&controller.runtime_id, &controller.worker_id);
+        let first_worker = RuntimeWorkerRef::new(&first_worker.runtime_id, &first_worker.worker_id);
+        let second_worker =
+            RuntimeWorkerRef::new(&second_worker.runtime_id, &second_worker.worker_id);
+
+        let first_session = session_store::new_session_id();
+        let first_root = workspace
+            .path()
+            .join(".test-embedded-runtime-store/workers")
+            .join(&first_worker.worker_id)
+            .join("session");
+        let first_store = WorkerSessionStore::new(&first_root).unwrap();
+        for index in 0..65_u128 {
+            first_store
+                .create_segment(
+                    first_session,
+                    uuid::Uuid::from_u128(20_000 + index),
+                    &[LogEntry::AnnotatedSegmentStart {
+                        ts: 1,
+                        session_id: first_session,
+                        system_prompt: None,
+                        config: agen::llm_client::RequestConfig::default(),
+                        history: vec![public_message(
+                            &format!("first-{index}"),
+                            if index == 64 { "needle" } else { "ordinary" },
+                        )],
+                        forked_from: None,
+                        compacted_from: None,
+                    }],
+                )
+                .unwrap();
+        }
+        let second_session = session_store::new_session_id();
+        let second_root = workspace
+            .path()
+            .join(".test-embedded-runtime-store/workers")
+            .join(&second_worker.worker_id)
+            .join("session");
+        WorkerSessionStore::new(&second_root)
+            .unwrap()
+            .create_segment(
+                second_session,
+                uuid::Uuid::from_u128(30_000),
+                &[LogEntry::AnnotatedSegmentStart {
+                    ts: 1,
+                    session_id: second_session,
+                    system_prompt: None,
+                    config: agen::llm_client::RequestConfig::default(),
+                    history: vec![public_message("second", "needle in later Session")],
+                    forked_from: None,
+                    compacted_from: None,
+                }],
+            )
+            .unwrap();
+
+        let store = open_subjektiv_store(&api).unwrap();
+        let subject = store
+            .create_subject(crate::subjektiv::SubjectRole::new("companion").unwrap())
+            .unwrap();
+        for (worker, session_id, attributed_at) in [
+            (&first_worker, first_session, "2026-10-02T00:00:02Z"),
+            (&second_worker, second_session, "2026-10-02T00:00:01Z"),
+        ] {
+            let mut attribution = crate::subjektiv::SubjectSessionAttribution::new(
+                &subject.id,
+                &worker.runtime_id,
+                &worker.worker_id,
+                session_id.to_string(),
+            )
+            .unwrap();
+            attribution.attributed_at = attributed_at.to_string();
+            store.record_session_attribution(attribution).unwrap();
+            api.store
+                .create_worker_control_grant(&WorkerControlGrantRecord {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    grant_id: format!("search-observe-{}", worker.worker_id),
+                    controller: controller.clone(),
+                    subject: worker.clone(),
+                    relation: "subject_session".to_string(),
+                    origin: "test".to_string(),
+                    permissions: vec!["observe".to_string()],
+                    operation_id: format!("search-observe-{}", worker.worker_id),
+                    created_at: Utc::now().to_rfc3339(),
+                    revoked_at: None,
+                })
+                .unwrap();
+        }
+
+        let search = |cursor| {
+            subjektiv_session_search(
+                &api,
+                &store,
+                TEST_WORKSPACE_ID,
+                &subject.id,
+                &controller,
+                server_api::SubjektivSessionSearchRequest {
+                    query: Some("needle".to_string()),
+                    session_id: None,
+                    kind: None,
+                    tool_name: None,
+                    tool_part: server_api::SubjektivSessionToolPart::Both,
+                    limit: Some(1),
+                    cursor,
+                },
+            )
+        };
+        let page = |response| match response {
+            server_api::SubjektivSessionBackendResponse::Ok {
+                result: server_api::SubjektivSessionBackendResult::Search(page),
+            } => page,
+            other => panic!("unexpected Session search response: {other:?}"),
+        };
+
+        let first = page(search(None));
+        assert!(first.items.is_empty());
+        assert!(first.has_more);
+        let second = page(search(first.next_cursor));
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].session_id, first_session.to_string());
+        assert!(
+            second.has_more,
+            "the outer attribution continuation must survive a resumed Runtime page"
+        );
+        let third = page(search(second.next_cursor));
+        assert_eq!(third.items.len(), 1);
+        assert_eq!(third.items[0].session_id, second_session.to_string());
+        assert!(!third.has_more);
+        assert!(third.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn archived_session_search_and_read_reauthorize_after_grant_revocation() {
+        use session_store::{
+            LogEntry, LoggedContentPart, LoggedHistoryEntry, LoggedItem, LoggedRole,
+            LoggedSessionHistoryEntryId, LoggedSessionHistoryMetadata, LoggedSessionHistoryOrigin,
+            Store as _, WorkerSessionStore,
+        };
+
+        fn public_message(id: &str, text: &str) -> LoggedHistoryEntry {
+            LoggedHistoryEntry {
+                item: LoggedItem::Message {
+                    role: LoggedRole::User,
+                    content: vec![LoggedContentPart::Text { text: text.into() }],
+                },
+                metadata: LoggedSessionHistoryMetadata {
+                    entry_id: LoggedSessionHistoryEntryId(id.to_string()),
+                    origin: LoggedSessionHistoryOrigin::HumanInput {
+                        account_id: "account-1".to_string(),
+                    },
+                    derivation: None,
+                },
+            }
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let Json(orchestrator) = scoped_start_workspace_orchestrator(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let controller = orchestrator.worker.unwrap();
+        let controller = RuntimeWorkerRef::new(&controller.runtime_id, &controller.worker_id);
+        let spawned = api
+            .spawn_workspace_worker(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                WorkerSpawnRequest {
+                    intent: WorkerSpawnIntent::WorkspaceCompanion,
+                    requested_worker_name: Some("archived Session source".to_string()),
+                    singleton_key: None,
+                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                        expected_segments: 0,
+                    },
+                    profile: worker_runtime::catalog::ProfileSelector::Builtin(
+                        "builtin:companion".to_string(),
+                    ),
+                    ticket_assignment: None,
+                    initial_submit: Vec::new(),
+                    workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachment_requests: Vec::new(),
+                    resolved_workdir_attachments: Vec::new(),
+                    resolved_config_bundle: Some(runtime_test_bundle()),
+                    resolved_worker_observation_enabled: false,
+                    resolved_worker_observation_grants: Vec::new(),
+                    resolved_workspace_api: None,
+                    resolved_memory_settings: None,
+                    resolved_control_operation: None,
+                },
+            )
+            .unwrap();
+        let target = spawned.worker.unwrap().worker;
+        let stopped = api
+            .runtime
+            .stop_worker(
+                &target,
+                WorkerLifecycleRequest {
+                    reason: Some("prepare archive revocation regression".to_string()),
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
+
+        let session_id = session_store::new_session_id();
+        let segment_id = uuid::Uuid::from_u128(40_000);
+        let session_root = workspace
+            .path()
+            .join(".test-embedded-runtime-store/workers")
+            .join(&target.worker_id)
+            .join("session");
+        WorkerSessionStore::new(&session_root)
+            .unwrap()
+            .create_segment(
+                session_id,
+                segment_id,
+                &[LogEntry::AnnotatedSegmentStart {
+                    ts: 1,
+                    session_id,
+                    system_prompt: None,
+                    config: agen::llm_client::RequestConfig::default(),
+                    history: vec![
+                        public_message("archive-a", "archived first entry"),
+                        public_message("archive-b", "archived second entry"),
+                    ],
+                    forked_from: None,
+                    compacted_from: None,
+                }],
+            )
+            .unwrap();
+        let subjektiv_store = open_subjektiv_store(&api).unwrap();
+        let subject = subjektiv_store
+            .create_subject(crate::subjektiv::SubjectRole::new("companion").unwrap())
+            .unwrap();
+        subjektiv_store
+            .record_session_attribution(
+                crate::subjektiv::SubjectSessionAttribution::new(
+                    &subject.id,
+                    &target.runtime_id,
+                    &target.worker_id,
+                    session_id.to_string(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let grant_id = "archive-revocable-observe";
+        api.store
+            .create_worker_control_grant(&WorkerControlGrantRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                grant_id: grant_id.to_string(),
+                controller: controller.clone(),
+                subject: target.clone(),
+                relation: "subject_session".to_string(),
+                origin: "test".to_string(),
+                permissions: vec!["observe".to_string(), "remove".to_string()],
+                operation_id: "archive-revocation-proof".to_string(),
+                created_at: Utc::now().to_rfc3339(),
+                revoked_at: None,
+            })
+            .unwrap();
+        let summary = api.runtime.worker(&target).unwrap();
+        sync_worker_observation(&api, &summary).unwrap();
+        let removal = WorkerRemovalService::new(&api)
+            .execute_async(
+                crate::worker_source::VerifiedWorkerMutationSource {
+                    runtime_id: controller.runtime_id.clone(),
+                    worker_id: controller.worker_id.clone(),
+                    actor_kind: worker_runtime::auth::WorkerMutationActorKind::Worker,
+                    permission: worker_runtime::auth::WORKER_REMOVE_PERMISSION.to_string(),
+                    jti: "archive-revocation-proof".to_string(),
+                },
+                &target.runtime_id,
+                &target.worker_id,
+                "archive Session for revocation regression",
+            )
+            .await
+            .unwrap();
+        assert_eq!(removal.status, StatusCode::OK.as_u16(), "{}", removal.body);
+        assert!(
+            api.config_store
+                .worker_session_archive(TEST_WORKSPACE_ID, &target, &session_id.to_string())
+                .unwrap()
+                .is_some(),
+            "removal must commit the archive catalog before backend reads"
+        );
+
+        let search_request = |cursor| server_api::SubjektivSessionSearchRequest {
+            query: None,
+            session_id: Some(session_id.to_string()),
+            kind: None,
+            tool_name: None,
+            tool_part: server_api::SubjektivSessionToolPart::Both,
+            limit: Some(1),
+            cursor,
+        };
+        let first = subjektiv_session_search(
+            &api,
+            &subjektiv_store,
+            TEST_WORKSPACE_ID,
+            &subject.id,
+            &controller,
+            search_request(None),
+        );
+        let cursor = match first {
+            server_api::SubjektivSessionBackendResponse::Ok {
+                result: server_api::SubjektivSessionBackendResult::Search(page),
+            } => {
+                assert_eq!(page.items.len(), 1);
+                assert!(page.has_more);
+                page.next_cursor.unwrap()
+            }
+            other => panic!("unexpected archived Session search response: {other:?}"),
+        };
+
+        assert!(
+            api.store
+                .revoke_worker_control_grant(TEST_WORKSPACE_ID, grant_id, &Utc::now().to_rfc3339())
+                .unwrap()
+        );
+        assert!(matches!(
+            subjektiv_session_search(
+                &api,
+                &subjektiv_store,
+                TEST_WORKSPACE_ID,
+                &subject.id,
+                &controller,
+                search_request(Some(cursor)),
+            ),
+            server_api::SubjektivSessionBackendResponse::Error {
+                error: server_api::SubjektivSessionErrorResponse {
+                    code: server_api::SubjektivSessionDiagnosticCode::NotFoundOrNotAuthorized,
+                    ..
+                }
+            }
+        ));
+        assert!(matches!(
+            subjektiv_session_read(
+                &api,
+                &subjektiv_store,
+                TEST_WORKSPACE_ID,
+                &subject.id,
+                &controller,
+                server_api::SubjektivSessionReadRequest {
+                    session_id: session_id.to_string(),
+                    segment_id: segment_id.to_string(),
+                    entry_ref: "Earchive-a".to_string(),
+                    mode: server_api::SubjektivSessionReadMode::Full,
+                    cursor: None,
+                },
+            ),
+            server_api::SubjektivSessionBackendResponse::Error {
+                error: server_api::SubjektivSessionErrorResponse {
+                    code: server_api::SubjektivSessionDiagnosticCode::NotFoundOrNotAuthorized,
+                    ..
+                }
+            }
         ));
     }
 

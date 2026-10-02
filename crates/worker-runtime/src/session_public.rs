@@ -10,10 +10,10 @@ use runtime_api::{
 };
 use serde::{Deserialize, Serialize};
 use session_store::{
-    SessionPublicIndex, SessionPublicIndexEntry, SessionPublicIndexEntryKind,
-    SessionPublicIndexLimits, SessionPublicIndexLineage, SessionPublicIndexOriginKind,
-    SessionPublicIndexReadError, SessionPublicIndexScanPosition, SessionPublicIndexToolPart,
-    read_session_public_index, read_session_public_index_page,
+    SessionPublicIndexEntry, SessionPublicIndexEntryKind, SessionPublicIndexLimits,
+    SessionPublicIndexLineage, SessionPublicIndexOriginKind, SessionPublicIndexReadError,
+    SessionPublicIndexScanPosition, SessionPublicIndexToolPart, read_session_public_index_entry,
+    read_session_public_index_page,
 };
 
 use crate::retention::WorkerSessionArchiveManifest as DomainArchiveManifest;
@@ -171,57 +171,37 @@ pub(crate) fn read(
             "Session public read content limit must be positive",
         );
     }
-    let index = match load_index(
+    let selected = match read_session_public_index_entry(
         session_root,
-        request.max_scan_bytes,
-        request.max_segments,
-        request.max_entries,
+        SessionPublicIndexLimits {
+            max_bytes: request.max_scan_bytes,
+            max_segments: request.max_segments,
+            max_entries: request.max_entries,
+        },
+        request.expected_generation.as_deref(),
+        &request.segment_id,
+        &request.entry_ref,
     ) {
-        Ok(index) => index,
-        Err((reason, message)) => return read_unavailable(reason, message),
+        Ok(Some(selected)) => selected,
+        Ok(None) => {
+            return read_unavailable(
+                SessionPublicUnavailableReason::NotFound,
+                "Session entry was not found in the authorized source",
+            );
+        }
+        Err(error) => {
+            let (reason, message) = map_index_error(error);
+            return read_unavailable(reason, message);
+        }
     };
-    if index.session_id != request.expected_session_id {
+    if selected.session_id != request.expected_session_id {
         return read_unavailable(
             SessionPublicUnavailableReason::NotFound,
             "Session identity does not match the authorized source",
         );
     }
-    if request
-        .expected_generation
-        .as_deref()
-        .is_some_and(|expected| expected != index.generation)
-    {
-        return read_unavailable(
-            SessionPublicUnavailableReason::InvalidCursor,
-            "Session public read generation changed",
-        );
-    }
-    let Some(segment) = index
-        .segments
-        .iter()
-        .find(|segment| segment.segment_id == request.segment_id)
-    else {
-        return read_unavailable(
-            SessionPublicUnavailableReason::NotFound,
-            "Session entry was not found in the authorized source",
-        );
-    };
-    let mut entries = segment
-        .entries
-        .iter()
-        .filter(|entry| entry.entry_ref == request.entry_ref);
-    let Some(entry) = entries.next() else {
-        return read_unavailable(
-            SessionPublicUnavailableReason::NotFound,
-            "Session entry was not found in the authorized source",
-        );
-    };
-    if entries.next().is_some() {
-        return read_unavailable(
-            SessionPublicUnavailableReason::CorruptLog,
-            "Session entry identity is ambiguous in its Segment",
-        );
-    }
+    let item = selected.item;
+    let entry = item.entry;
     let content = match request.mode {
         SessionPublicReadMode::Compact => &entry.compact_text,
         SessionPublicReadMode::Full => &entry.full_text,
@@ -248,40 +228,23 @@ pub(crate) fn read(
     let has_more = end < content.len();
     SessionPublicReadAvailability::Page {
         page: SessionPublicReadPage {
-            session_id: index.session_id,
-            generation: index.generation,
-            segment_id: segment.segment_id.clone(),
+            session_id: selected.session_id,
+            generation: selected.generation,
+            segment_id: item.segment_id,
             entry_ref: entry.entry_ref.clone(),
             kind: entry_kind(entry.kind),
             origin: entry.provenance.clone(),
-            lineage: lineage(&segment.lineage),
+            lineage: lineage(&item.lineage),
             mode: request.mode,
             content: content[request.byte_offset..end].to_string(),
             next_byte_offset: has_more.then_some(end),
             has_more,
-            scanned_bytes: index.scanned_bytes,
-            scanned_segments: index.segments.len(),
-            scanned_entries: index.scanned_entries,
+            scanned_bytes: selected.scanned_bytes,
+            scanned_segments: selected.scanned_segments,
+            scanned_entries: selected.scanned_entries,
             archive_manifest: archive_manifest.map(api_archive_manifest),
         },
     }
-}
-
-fn load_index(
-    session_root: &Path,
-    max_bytes: u64,
-    max_segments: usize,
-    max_entries: usize,
-) -> Result<SessionPublicIndex, (SessionPublicUnavailableReason, &'static str)> {
-    read_session_public_index(
-        session_root,
-        SessionPublicIndexLimits {
-            max_bytes,
-            max_segments,
-            max_entries,
-        },
-    )
-    .map_err(map_index_error)
 }
 
 fn matches_entry(
@@ -521,6 +484,33 @@ mod tests {
         assert_eq!(second.items.len(), 1);
         assert_eq!(second.items[0].compact, "needle");
         assert!(!second.has_more);
+
+        let read_page = match read(
+            &root,
+            &SessionPublicReadRequest {
+                workspace_id: "workspace-1".into(),
+                source: runtime_api::SessionPublicSource::Retained {
+                    worker_id: crate::identity::WorkerId::now_v7(),
+                },
+                expected_session_id: session_id.to_string(),
+                expected_generation: Some(second.generation.clone()),
+                segment_id: last_segment.unwrap().to_string(),
+                entry_ref: "Eentry-64".into(),
+                mode: SessionPublicReadMode::Full,
+                byte_offset: 0,
+                max_content_bytes: 16 * 1024,
+                max_scan_bytes: 64 * 1024 * 1024,
+                max_segments: 64,
+                max_entries: 100_000,
+            },
+            None,
+        ) {
+            SessionPublicReadAvailability::Page { page } => page,
+            other => panic!("unexpected direct read result: {other:?}"),
+        };
+        assert_eq!(read_page.content, "needle");
+        assert_eq!(read_page.segment_id, last_segment.unwrap().to_string());
+        assert!(!read_page.has_more);
 
         store
             .append(
