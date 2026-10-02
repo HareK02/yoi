@@ -1091,9 +1091,21 @@ impl SubjektivStore {
         })
     }
 
-    /// Lists one deterministic bounded page of subjects. Ordering uses immutable
-    /// creation time with the host-issued subject id as a total-order tie breaker.
+    /// Lists the first deterministic bounded page of subjects. Ordering uses
+    /// immutable creation time with the host-issued subject id as a total-order
+    /// tie breaker.
     pub fn list_subjects(&self, limit: usize) -> Result<SubjectPage> {
+        self.list_subjects_after(limit, None)
+    }
+
+    /// Lists a deterministic bounded keyset page after an exact `(created_at,
+    /// subject_id)` cursor. The cursor fields are wrapped by the public API in
+    /// an opaque Workspace-bound token.
+    pub fn list_subjects_after(
+        &self,
+        limit: usize,
+        after: Option<(&str, &str)>,
+    ) -> Result<SubjectPage> {
         if !(1..=100).contains(&limit) {
             return Err(SubjektivError::InvalidRecord(
                 "subject list limit must be between 1 and 100".to_string(),
@@ -1101,16 +1113,32 @@ impl SubjektivStore {
         }
         let query_limit = limit.saturating_add(1);
         self.database.try_with_connection(|connection| {
-            let mut statement = connection.prepare(
+            let sql = if after.is_some() {
+                "SELECT record_json FROM subjects
+                 WHERE created_at > ?1 OR (created_at = ?1 AND subject_id > ?2)
+                 ORDER BY created_at ASC, subject_id ASC
+                 LIMIT ?3"
+            } else {
                 "SELECT record_json FROM subjects
                  ORDER BY created_at ASC, subject_id ASC
-                 LIMIT ?1",
-            )?;
-            let rows = statement
-                .query_map([to_i64(query_limit as u64)?], |row| row.get::<_, String>(0))?;
+                 LIMIT ?1"
+            };
+            let mut statement = connection.prepare(sql)?;
             let mut items = Vec::new();
-            for row in rows {
-                items.push(parse_subject(&row?)?);
+            if let Some((created_at, subject_id)) = after {
+                let rows = statement.query_map(
+                    params![created_at, subject_id, to_i64(query_limit as u64)?],
+                    |row| row.get::<_, String>(0),
+                )?;
+                for row in rows {
+                    items.push(parse_subject(&row?)?);
+                }
+            } else {
+                let rows = statement
+                    .query_map([to_i64(query_limit as u64)?], |row| row.get::<_, String>(0))?;
+                for row in rows {
+                    items.push(parse_subject(&row?)?);
+                }
             }
             let has_more = items.len() > limit;
             if has_more {
@@ -3559,6 +3587,12 @@ mod tests {
         let page = store.list_subjects(2).unwrap();
         assert_eq!(page.items, expected[..2]);
         assert!(page.has_more);
+        let after = page.items.last().unwrap();
+        let next = store
+            .list_subjects_after(2, Some((&after.created_at, &after.id)))
+            .unwrap();
+        assert_eq!(next.items, expected[2..]);
+        assert!(!next.has_more);
         assert!(store.list_subjects(0).is_err());
         assert!(store.list_subjects(101).is_err());
 

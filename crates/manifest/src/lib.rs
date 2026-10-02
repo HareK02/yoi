@@ -391,6 +391,12 @@ impl ResolvedSubjektivFeatureConfig {
         self.profile.enabled
     }
 
+    /// Returns whether the host attached this profile policy to trusted subject
+    /// authority. Profile enablement without a settings snapshot is inert.
+    pub fn execution_enabled(&self) -> bool {
+        self.profile.enabled && self.workspace_settings.is_some()
+    }
+
     pub fn bind_workspace_settings(
         &mut self,
         settings: WorkspaceMemorySettingsSnapshot,
@@ -413,9 +419,9 @@ impl ResolvedSubjektivFeatureConfig {
     }
 
     pub fn validate_execution(&self) -> Result<(), &'static str> {
-        if self.profile.enabled && self.workspace_settings.is_none() {
-            return Err("enabled subjektiv feature requires trusted Workspace settings");
-        }
+        // `profile.enabled` is reusable policy. Only a host-bound settings
+        // snapshot activates subject execution; an ordinary Worker or Internal
+        // SubWorker with the same Profile remains inert.
         if !self.profile.enabled && self.workspace_settings.is_some() {
             return Err("disabled subjektiv feature must not carry Workspace settings");
         }
@@ -1714,6 +1720,27 @@ model_id = "claude-sonnet-4-20250514"
         assert!(enabled.validate_execution().is_ok());
 
         let mut disabled = ResolvedMemoryFeatureConfig::default();
+        disabled.workspace_settings = Some(snapshot.clone());
+        assert!(disabled.validate_execution().is_err());
+        assert!(disabled.bind_workspace_settings(snapshot).is_err());
+    }
+
+    #[test]
+    fn resolved_subjektiv_policy_is_inert_until_trusted_attachment() {
+        let snapshot = WorkspaceMemorySettingsSnapshot {
+            workspace_id: "workspace-1".to_string(),
+            settings_revision: 1,
+            language: "English".to_string(),
+        };
+        let mut enabled = ResolvedSubjektivFeatureConfig::default();
+        enabled.profile.enabled = true;
+        assert!(enabled.validate_execution().is_ok());
+        assert!(!enabled.execution_enabled());
+        enabled.bind_workspace_settings(snapshot.clone()).unwrap();
+        assert!(enabled.validate_execution().is_ok());
+        assert!(enabled.execution_enabled());
+
+        let mut disabled = ResolvedSubjektivFeatureConfig::default();
         disabled.workspace_settings = Some(snapshot.clone());
         assert!(disabled.validate_execution().is_err());
         assert!(disabled.bind_workspace_settings(snapshot).is_err());

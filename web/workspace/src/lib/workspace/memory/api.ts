@@ -228,7 +228,9 @@ function parseStagingEvidence(value: unknown): MemoryStagingEvidence {
     summary: nullableString(record, "summary"),
   };
   if ("origin" in record) {
-    result.origin = record.origin === null ? null : parseEvidenceOrigin(record.origin);
+    result.origin = record.origin === null
+      ? null
+      : parseEvidenceOrigin(record.origin);
   }
   return result;
 }
@@ -259,7 +261,9 @@ function parseSourceEvidenceRef(value: unknown): MemorySourceEvidenceRef {
     summary: nullableString(record, "summary"),
   };
   if ("origin" in record) {
-    result.origin = record.origin === null ? null : parseEvidenceOrigin(record.origin);
+    result.origin = record.origin === null
+      ? null
+      : parseEvidenceOrigin(record.origin);
   }
   return result;
 }
@@ -350,10 +354,12 @@ export function parseSubjektivSubjectResponse(
     updated_at: requiredString(record, "updated_at"),
   };
   if ("current_worker" in record) {
-    result.current_worker = record.current_worker === null ? null : parseWorkerLaunchWorkerSummary(
-      record.current_worker,
-      "Subject current worker",
-    );
+    result.current_worker = record.current_worker === null
+      ? null
+      : parseWorkerLaunchWorkerSummary(
+        record.current_worker,
+        "Subject current worker",
+      );
   }
   return result;
 }
@@ -363,8 +369,9 @@ export function parseSubjektivSubjectListResponse(
 ): SubjektivSubjectListResponse {
   const record = strictRecord(
     value,
-    ["limit", "items", "has_more"],
+    ["limit", "items", "next_cursor", "has_more"],
     "Subject list response",
+    ["next_cursor"],
   );
   const limit = positiveInteger(record.limit, "limit");
   if (limit > MAX_SUBJECTS) invalid("limit exceeds the Subject list bound");
@@ -373,11 +380,16 @@ export function parseSubjektivSubjectListResponse(
   );
   if (items.length > limit) invalid("items exceeds the declared Subject limit");
   assertUnique(items.map((item) => item.id), "Subject ids");
-  return {
+  const hasMore = requiredBoolean(record, "has_more");
+  const nextCursor = optionalNullableString(record, "next_cursor");
+  assertCursorInvariant(hasMore, nextCursor, "Subject list");
+  const result: SubjektivSubjectListResponse = {
     limit,
     items,
-    has_more: requiredBoolean(record, "has_more"),
+    has_more: hasMore,
   };
+  if (nextCursor !== undefined) result.next_cursor = nextCursor;
+  return result;
 }
 
 export function parseSubjektivResidentSurfaceResponse(
@@ -562,7 +574,9 @@ export function parseSubjektivMemoryReadResponse(
   ).map(parseMemoryEvidenceCandidate);
   if (
     sourceCandidateIds.length !== sourceCandidates.length ||
-    sourceCandidateIds.some((id, index) => sourceCandidates[index]?.candidate_id !== id)
+    sourceCandidateIds.some((id, index) =>
+      sourceCandidates[index]?.candidate_id !== id
+    )
   ) {
     invalid("source candidate ids do not match source candidates");
   }
@@ -690,7 +704,9 @@ function parseMemoryEvidence(value: unknown): SubjektivMemoryEvidence {
       : parseEntryRange(record.entry_range, "entry_range");
   }
   if ("origin" in record) {
-    result.origin = record.origin === null ? null : parseEvidenceOrigin(record.origin);
+    result.origin = record.origin === null
+      ? null
+      : parseEvidenceOrigin(record.origin);
   }
   if ("excerpt" in record) result.excerpt = nullableString(record, "excerpt");
   if ("summary" in record) result.summary = nullableString(record, "summary");
@@ -735,7 +751,9 @@ function parseMemorySourceEvidenceRef(
       : parseEntryRange(record.entry_range, "entry_range");
   }
   if ("origin" in record) {
-    result.origin = record.origin === null ? null : parseEvidenceOrigin(record.origin);
+    result.origin = record.origin === null
+      ? null
+      : parseEvidenceOrigin(record.origin);
   }
   return result;
 }

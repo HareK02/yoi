@@ -5,12 +5,25 @@ import {
 } from "$lib/workspace/memory/api";
 import type { PageLoad } from "./$types";
 
-export const load: PageLoad = async ({ fetch, params }) => {
+const MAX_CURSOR_BYTES = 16_384;
+
+function boundedCursor(value: string | null): string | null {
+  if (value === null || value.length === 0) return null;
+  return new TextEncoder().encode(value).byteLength <= MAX_CURSOR_BYTES
+    ? value
+    : null;
+}
+
+export const load: PageLoad = async ({ fetch, params, url }) => {
+  const cursor = boundedCursor(url.searchParams.get("cursor"));
+  const query = new URLSearchParams({ limit: "100" });
+  if (cursor) query.set("cursor", cursor);
   return {
     workspaceId: params.workspaceId,
+    cursor,
     subjects: await loadJson(
       fetch,
-      `${workspaceApiPath(params.workspaceId, "/subjektiv/subjects")}?limit=100`,
+      `${workspaceApiPath(params.workspaceId, "/subjektiv/subjects")}?${query}`,
       undefined,
       parseSubjektivSubjectListResponse,
       MEMORY_API_LOAD_POLICY,

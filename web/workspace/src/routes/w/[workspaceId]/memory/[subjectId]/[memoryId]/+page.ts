@@ -8,6 +8,15 @@ import {
 import type { PageLoad } from "./$types";
 
 const SAFE_INTEGER_TEXT = /^(0|[1-9][0-9]{0,15})$/;
+const MAX_CURSOR_BYTES = 16_384;
+
+function boundedCursor(
+  value: string | null,
+  maxBytes = MAX_CURSOR_BYTES,
+): string | null {
+  if (value === null || value.length === 0) return null;
+  return new TextEncoder().encode(value).byteLength <= maxBytes ? value : null;
+}
 
 function safeIntegerQuery(
   source: URLSearchParams,
@@ -39,13 +48,14 @@ export const load: PageLoad = async ({ fetch, params, url }) => {
     const value = safeIntegerQuery(url.searchParams, key, positive);
     if (value !== null) detailQuery.set(key, value);
   }
-  const evidenceCursor = url.searchParams.get("evidence_cursor");
-  if (
-    evidenceCursor !== null && evidenceCursor.length > 0 &&
-    new TextEncoder().encode(evidenceCursor).byteLength <= 512
-  ) {
-    detailQuery.set("evidence_cursor", evidenceCursor);
-  }
+  const evidenceCursor = boundedCursor(
+    url.searchParams.get("evidence_cursor"),
+    512,
+  );
+  if (evidenceCursor) detailQuery.set("evidence_cursor", evidenceCursor);
+  const revisionCursor = boundedCursor(url.searchParams.get("revision_cursor"));
+  const revisionQuery = new URLSearchParams({ limit: "100" });
+  if (revisionCursor) revisionQuery.set("cursor", revisionCursor);
 
   const [subject, memory, revisions] = await Promise.all([
     loadJson(
@@ -64,7 +74,9 @@ export const load: PageLoad = async ({ fetch, params, url }) => {
     ),
     loadJson(
       fetch,
-      `${workspaceApiPath(params.workspaceId, `${memoryPath}/revisions`)}?limit=100`,
+      `${
+        workspaceApiPath(params.workspaceId, `${memoryPath}/revisions`)
+      }?${revisionQuery}`,
       undefined,
       (value) => parseSubjektivMemoryListRevisionsResponse(value, memoryId),
       MEMORY_API_LOAD_POLICY,
@@ -75,6 +87,7 @@ export const load: PageLoad = async ({ fetch, params, url }) => {
     workspaceId: params.workspaceId,
     subjectId,
     memoryId,
+    revisionCursor,
     subject,
     memory,
     revisions,

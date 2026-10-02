@@ -298,6 +298,10 @@ pub struct CreateWorkerRequest {
     /// Backend-authored immutable Workspace Memory settings snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_settings: Option<manifest::WorkspaceMemorySettingsSnapshot>,
+    /// Backend-attested subject or consolidation attachment. A reusable Profile
+    /// may enable subjektiv policy, but only this host-owned bit activates it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub subjektiv_attached: bool,
 }
 
 /// Last persisted Worker lifecycle status.

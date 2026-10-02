@@ -160,7 +160,8 @@ Deno.test("Subject parsers enforce identity, exact enums, safe revisions, and bo
     () =>
       parseSubjektivSubjectListResponse({
         limit: 100,
-        items: Array.from({ length: 101 }, (_, index) => subject(`subject-${index}`)),
+        items: Array.from({ length: 101 }, (_, index) =>
+          subject(`subject-${index}`)),
         has_more: false,
       }),
     "bounded array",
@@ -170,6 +171,22 @@ Deno.test("Subject parsers enforce identity, exact enums, safe revisions, and bo
 Deno.test("Subject list parser preserves the exact bounded response", () => {
   const response = { limit: 100, items: [subject()], has_more: false };
   assertEquals(parseSubjektivSubjectListResponse(response), response);
+  const nextPage = {
+    limit: 1,
+    items: [subject()],
+    next_cursor: "subjektiv.subjects.next",
+    has_more: true,
+  };
+  assertEquals(parseSubjektivSubjectListResponse(nextPage), nextPage);
+  assertThrows(
+    () =>
+      parseSubjektivSubjectListResponse({
+        limit: 1,
+        items: [subject()],
+        has_more: true,
+      }),
+    "cursor does not match has_more",
+  );
   assertThrows(
     () =>
       parseSubjektivSubjectListResponse({
@@ -278,7 +295,8 @@ Deno.test("Current Memory list parser rejects unknown variants, unsafe integers,
   assertThrows(
     () =>
       parseSubjektivMemoryQueryResponse({
-        items: Array.from({ length: 101 }, (_, index) => queryItem(`memory-${index}`)),
+        items: Array.from({ length: 101 }, (_, index) =>
+          queryItem(`memory-${index}`)),
         has_more: false,
       }),
     "bounded array",

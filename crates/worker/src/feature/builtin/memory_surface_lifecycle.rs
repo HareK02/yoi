@@ -109,6 +109,12 @@ impl SubjektivSurfaceLifecycleFeature {
             .subjektiv
             .validate_execution()
             .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+        if !manifest.feature.subjektiv.execution_enabled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "subjektiv surface generation requires trusted subject attachment",
+            ));
+        }
         if !workspace_client.is_available() || workspace_client.workspace_id().is_none() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,

@@ -21,6 +21,10 @@ const staleSubjectId = "stale-subject";
 const failedSubjectId = "failed-subject";
 const ungeneratedSubjectId = "ungenerated-subject";
 const errorSubjectId = "error-subject";
+const pagedSubjectId = "paged-subject";
+const subjectPageCursor = "fixture-subject-page-2";
+const memoryPageCursor = "fixture-memory-page-2";
+const revisionPageCursor = "fixture-revision-page-2";
 
 const paragraphs = Array.from(
   { length: sectionCount },
@@ -64,6 +68,7 @@ const subjects = [
   subject(ungeneratedSubjectId, "Ungenerated subject", "active", 0),
   subject(errorSubjectId, "Unavailable subject", "retired", 3),
 ];
+const pagedSubject = subject(pagedSubjectId, "Subject on the next page", "active", 1);
 
 function subject(id: string, role: string, state: "active" | "retired", storeRevision: number) {
   return {
@@ -235,37 +240,40 @@ function memoryDetail(memoryId: string, requestedRevision: number | null) {
   };
 }
 
-function revisions(memoryId: string) {
+function revisions(memoryId: string, cursor: string | null) {
+  const all = [
+    {
+      revision: 3,
+      kind: "decision",
+      state: "active",
+      claim: "Keep subject Memory provenance typed and visible",
+      change_reason: "Clarified the durable read contract.",
+      updated_at: "2026-01-03T03:04:05Z",
+    },
+    {
+      revision: 2,
+      kind: "decision",
+      state: "resolved",
+      claim: "Historical provenance decision, revision 2",
+      change_reason: "Resolved after endpoint integration.",
+      updated_at: "2026-01-02T03:04:05Z",
+    },
+    {
+      revision: 1,
+      kind: "decision",
+      state: "retracted",
+      claim: "Historical provenance decision, revision 1",
+      change_reason: "Retracted the legacy shape.",
+      updated_at: "2026-01-01T03:04:05Z",
+    },
+  ];
+  const continued = cursor === revisionPageCursor;
   return {
     memory_id: memoryId,
     current_revision: 3,
-    items: [
-      {
-        revision: 3,
-        kind: "decision",
-        state: "active",
-        claim: "Keep subject Memory provenance typed and visible",
-        change_reason: "Clarified the durable read contract.",
-        updated_at: "2026-01-03T03:04:05Z",
-      },
-      {
-        revision: 2,
-        kind: "decision",
-        state: "resolved",
-        claim: "Historical provenance decision, revision 2",
-        change_reason: "Resolved after endpoint integration.",
-        updated_at: "2026-01-02T03:04:05Z",
-      },
-      {
-        revision: 1,
-        kind: "decision",
-        state: "retracted",
-        claim: "Historical provenance decision, revision 1",
-        change_reason: "Retracted the legacy shape.",
-        updated_at: "2026-01-01T03:04:05Z",
-      },
-    ],
-    has_more: false,
+    items: continued ? all.slice(2) : all.slice(0, 2),
+    ...(continued ? {} : { next_cursor: revisionPageCursor }),
+    has_more: !continued,
   };
 }
 
@@ -353,7 +361,13 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
 
   const subjectsPath = `/api/w/${workspaceId}/subjektiv/subjects`;
   if (url.pathname === subjectsPath) {
-    return json({ limit: 100, items: subjects, has_more: false });
+    const continued = url.searchParams.get("cursor") === subjectPageCursor;
+    return json({
+      limit: 100,
+      items: continued ? [pagedSubject] : subjects,
+      ...(continued ? {} : { next_cursor: subjectPageCursor }),
+      has_more: !continued,
+    });
   }
   if (url.pathname.startsWith(`${subjectsPath}/`)) {
     const suffix = url.pathname.slice(subjectsPath.length + 1);
@@ -366,11 +380,22 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
     if (parts.length === 1) return json(foundSubject);
     if (parts.length === 2 && parts[1] === "surface") return json(surfaceFor(subjectId));
     if (parts.length === 2 && parts[1] === "memories") {
-      return json({ items: memoriesFor(subjectId), has_more: false });
+      const paginated = subjectId === representativeSubjectId;
+      const continued = paginated && url.searchParams.get("cursor") === memoryPageCursor;
+      const items = continued
+        ? [memorySummary("memory-page-two", 1, "lesson", "active", "Memory on the next page")]
+        : memoriesFor(subjectId);
+      return json({
+        items,
+        ...(paginated && !continued ? { next_cursor: memoryPageCursor } : {}),
+        has_more: paginated && !continued,
+      });
     }
     if (parts.length >= 3 && parts[1] === "memories") {
       const memoryId = parts[2];
-      if (parts.length === 4 && parts[3] === "revisions") return json(revisions(memoryId));
+      if (parts.length === 4 && parts[3] === "revisions") {
+        return json(revisions(memoryId, url.searchParams.get("cursor")));
+      }
       if (parts.length === 3) {
         const requested = url.searchParams.get("revision");
         return json(memoryDetail(memoryId, requested === null ? null : Number(requested)));

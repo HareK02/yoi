@@ -28,7 +28,13 @@ test("renders the subject index as the Memory product entry", () => {
   render(SubjectIndexPage, {
     data: {
       workspaceId: "workspace-1",
-      subjects: result({ limit: 100, items: [subject()], has_more: false }),
+      cursor: "subject-current",
+      subjects: result({
+        limit: 100,
+        items: [subject()],
+        next_cursor: "subject-next",
+        has_more: true,
+      }),
     },
   } as never);
 
@@ -37,6 +43,10 @@ test("renders the subject index as the Memory product entry", () => {
   expect(screen.getByRole("link", { name: /Release coordinator/ })).not
     .toBeNull();
   expect(screen.getByText("subject-1")).not.toBeNull();
+  expect(screen.getByRole("link", { name: "First page" }).getAttribute("href"))
+    .toBe("/w/workspace-1/memory");
+  expect(screen.getByRole("link", { name: /Next page/ }).getAttribute("href"))
+    .toContain("cursor=subject-next");
   expect(screen.queryByText("Staging")).toBeNull();
 });
 
@@ -45,6 +55,7 @@ test("renders a ready resident surface and committed Memory lifecycle states", a
     data: {
       workspaceId: "workspace-1",
       subjectId: "subject-1",
+      cursor: "memory-current",
       subject: result(subject()),
       surface: result({
         subject_id: "subject-1",
@@ -87,7 +98,8 @@ test("renders a ready resident surface and committed Memory lifecycle states", a
             updated_at: "2026-01-02T03:04:05Z",
           },
         ],
-        has_more: false,
+        next_cursor: "memory-next",
+        has_more: true,
       }),
     },
   } as never);
@@ -101,8 +113,12 @@ test("renders a ready resident surface and committed Memory lifecycle states", a
   expect(screen.getAllByText("active", { exact: true }).length).toBeGreaterThan(
     0,
   );
-  expect(screen.getByText("resolved", { exact: true })).not.toBeNull();
-  expect(screen.getByText("retracted", { exact: true })).not.toBeNull();
+  expect(screen.getByText("Resolved", { exact: true })).not.toBeNull();
+  expect(screen.getByText("Retracted", { exact: true })).not.toBeNull();
+  expect(screen.getByRole("navigation", { name: "Current Memory pages" }))
+    .not.toBeNull();
+  expect(screen.getByRole("link", { name: /Next page/ }).getAttribute("href"))
+    .toContain("cursor=memory-next");
 });
 
 test("distinguishes ready-empty, stale, failed, unavailable, and request error surfaces", async () => {
@@ -177,6 +193,7 @@ test("renders committed Memory detail, provenance, derivation, and immutable rev
       workspaceId: "workspace-1",
       subjectId: "subject-1",
       memoryId: "memory-1",
+      revisionCursor: "revision-current",
       subject: result(subject()),
       memory: result({
         memory_id: "memory-1",
@@ -233,7 +250,8 @@ test("renders committed Memory detail, provenance, derivation, and immutable rev
           change_reason: "Resolved",
           updated_at: "2026-01-02T00:00:00Z",
         }],
-        has_more: false,
+        next_cursor: "revision-next",
+        has_more: true,
       }),
     },
   } as never);
@@ -248,4 +266,8 @@ test("renders committed Memory detail, provenance, derivation, and immutable rev
   expect(screen.getByRole("heading", { name: "Revision history" })).not
     .toBeNull();
   expect(screen.getByText("Historical revision")).not.toBeNull();
+  expect(screen.getByRole("navigation", { name: "Revision history pages" }))
+    .not.toBeNull();
+  expect(screen.getByRole("link", { name: /Next page/ }).getAttribute("href"))
+    .toContain("revision_cursor=revision-next");
 });

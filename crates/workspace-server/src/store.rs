@@ -18872,6 +18872,7 @@ mod tests {
             resolved_control_operation: None,
             resolved_workspace_api: None,
             resolved_memory_settings: None,
+            resolved_subjektiv_attached: false,
         };
         let stable_fingerprint =
             crate::hosts::worker_spawn_create_fingerprint(&request(Some("src"))).unwrap();

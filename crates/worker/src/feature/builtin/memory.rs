@@ -825,7 +825,7 @@ pub(crate) fn is_builtin_subjektiv_consolidation_profile(
 }
 
 pub(crate) fn ordinary_subjektiv_features_enabled(manifest: &manifest::WorkerManifest) -> bool {
-    manifest.feature.subjektiv.profile.enabled
+    manifest.feature.subjektiv.execution_enabled()
         && !is_builtin_subjektiv_consolidation_profile(manifest)
 }
 
@@ -890,10 +890,10 @@ impl SubjektivConsolidationFeatureInstallPlan {
         config
             .validate_execution()
             .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
-        if !config.profile.enabled || config.profile.extraction.enabled {
+        if !config.execution_enabled() || config.profile.extraction.enabled {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "subjektiv consolidation profile requires subject settings without automatic extraction",
+                "subjektiv consolidation profile requires trusted subject settings without automatic extraction",
             ));
         }
         let workspace_id = client.workspace_id().ok_or_else(|| {

@@ -422,7 +422,10 @@ impl BackendWorkspaceProductClient {
             client
                 .subjektiv_subject_list(
                     workspace_id,
-                    SubjektivSubjectListQuery { limit: Some(limit) },
+                    SubjektivSubjectListQuery {
+                        limit: Some(limit),
+                        cursor: None,
+                    },
                 )
                 .await
         })

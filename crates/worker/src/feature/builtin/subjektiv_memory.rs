@@ -78,7 +78,7 @@ impl SubjektivMemoryFeature {
         capture: CommittedSessionCaptureHandle,
         client: Arc<dyn WorkspaceClient>,
     ) -> std::io::Result<Option<Self>> {
-        if !config.profile.enabled {
+        if !config.execution_enabled() {
             return Ok(None);
         }
         config

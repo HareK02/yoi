@@ -4605,6 +4605,8 @@ pub struct SubjektivSubjectListQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 100))]
     pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
@@ -4613,6 +4615,8 @@ pub struct SubjektivSubjectListResponse {
     #[schemars(range(min = 1, max = 100))]
     pub limit: usize,
     pub items: Vec<SubjektivSubjectResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
     pub has_more: bool,
 }
 
@@ -9849,7 +9853,7 @@ pub fn memory_api_typescript() -> String {
 
 export type SubjektivSubjectResponse = { id: string, role: string, state: SubjektivSubjectState, store_revision: number, created_at: string, updated_at: string, current_worker?: | import("./worker-launch-api").WorkerLaunchWorkerSummary | null, };
 
-export type SubjektivSubjectListResponse = { limit: number, items: Array<SubjektivSubjectResponse>, has_more: boolean, };
+export type SubjektivSubjectListResponse = { limit: number, items: Array<SubjektivSubjectResponse>, next_cursor?: string | null, has_more: boolean, };
 
 export type SubjektivMemoryState = "active" | "resolved" | "retracted";
 

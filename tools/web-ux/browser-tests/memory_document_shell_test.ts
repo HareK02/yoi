@@ -312,7 +312,20 @@ Deno.test("production subject Memory shell renders exact states, safe Markdown, 
       assertEquals(await detailPage.getByRole("heading", { name: "Revision history" }).count(), 1);
       assertEquals(await detailPage.getByText("Revision 3", { exact: true }).count(), 1);
       assertEquals(await detailPage.getByText("Revision 2", { exact: true }).count(), 1);
-      assertEquals(await detailPage.getByText("Revision 1", { exact: true }).count(), 1);
+      assertEquals(await detailPage.getByText("Revision 1", { exact: true }).count(), 0);
+      await detailPage.getByRole("navigation", { name: "Revision history pages" }).getByRole(
+        "link",
+        { name: "Next page →" },
+      ).click();
+      await detailPage.getByText("Revision 1", { exact: true }).waitFor();
+      assert(new URL(detailPage.url()).searchParams.has("revision_cursor"));
+      assertEquals(
+        await detailPage.getByRole("navigation", { name: "Revision history pages" }).getByRole(
+          "link",
+          { name: "First page" },
+        ).count(),
+        1,
+      );
       assertEquals(await detailPage.locator('a[href^="javascript:"]').count(), 0);
       assertEquals(
         await detailPage.getByRole("article", { name: "Committed Memory body" }).locator(
@@ -328,6 +341,38 @@ Deno.test("production subject Memory shell renders exact states, safe Markdown, 
       await assertNoPageWideOverflow(detailPage);
       await assertMainOwnsVerticalScroll(detailPage);
       await detailContext.close();
+
+      const paginationContext = await browser.newContext({ viewport: { width: 768, height: 900 } });
+      const paginationPage = await paginationContext.newPage();
+      await paginationPage.goto(`${baseUrl}/w/${workspaceId}/memory`);
+      await paginationPage.getByRole("heading", { name: "Subjects", level: 1 }).waitFor();
+      assertEquals(await paginationPage.getByText("Subject on the next page").count(), 0);
+      await paginationPage.getByRole("navigation", { name: "Subject pages" }).getByRole(
+        "link",
+        { name: "Next page →" },
+      ).click();
+      await paginationPage.getByText("Subject on the next page").waitFor();
+      assert(new URL(paginationPage.url()).searchParams.has("cursor"));
+      assertEquals(
+        await paginationPage.getByRole("navigation", { name: "Subject pages" }).getByRole(
+          "link",
+          { name: "First page" },
+        ).count(),
+        1,
+      );
+
+      await paginationPage.goto(
+        `${baseUrl}/w/${workspaceId}/memory/${encodeURIComponent(subjectId)}`,
+      );
+      await paginationPage.getByRole("heading", { name: "Current Memories", level: 2 }).waitFor();
+      await paginationPage.getByRole("navigation", { name: "Current Memory pages" }).getByRole(
+        "link",
+        { name: "Next page →" },
+      ).click();
+      await paginationPage.getByText("Memory on the next page").waitFor();
+      assert(new URL(paginationPage.url()).searchParams.has("cursor"));
+      await assertNoPageWideOverflow(paginationPage);
+      await paginationContext.close();
 
       const stateContext = await browser.newContext({ viewport: { width: 390, height: 844 } });
       const stateCases = [

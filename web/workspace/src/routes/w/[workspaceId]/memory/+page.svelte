@@ -9,6 +9,11 @@
   function subjectHref(subjectId: string): string {
     return workspaceRoute(data.workspaceId, `/memory/${encodeURIComponent(subjectId)}`);
   }
+
+  function pageHref(cursor?: string | null): string {
+    const path = workspaceRoute(data.workspaceId, '/memory');
+    return cursor ? `${path}?cursor=${encodeURIComponent(cursor)}` : path;
+  }
 </script>
 
 <svelte:head>
@@ -33,6 +38,7 @@
       <div class="memory-state" role="status" data-memory-state="empty">
         <strong>No Memory subjects.</strong>
         <p>Subjects will appear here after they are created for this Workspace.</p>
+        {#if data.cursor}<p><a href={pageHref()}>Return to the first page</a></p>{/if}
       </div>
     {:else}
       <div class="subject-list" aria-label="Memory subjects">
@@ -51,9 +57,12 @@
           </a>
         {/each}
       </div>
-      {#if data.subjects.data.has_more}
-        <p class="memory-note">Only the first {data.subjects.data.limit} subjects are shown.</p>
-      {/if}
+      <nav class="memory-pagination" aria-label="Subject pages">
+        {#if data.cursor}<a href={pageHref()}>First page</a>{/if}
+        {#if data.subjects.data.has_more && data.subjects.data.next_cursor}
+          <a href={pageHref(data.subjects.data.next_cursor)}>Next page →</a>
+        {/if}
+      </nav>
     {/if}
   {:else if data.subjects.error}
     <div class="memory-state is-error" role="alert" data-memory-state="error">
@@ -203,8 +212,15 @@
     color: var(--text-strong);
   }
 
-  .memory-state p,
-  .memory-note {
+  .memory-pagination {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: var(--space-3);
+    font-size: var(--font-size-compact);
+  }
+
+  .memory-state p {
     margin: var(--space-1) 0 0;
     color: var(--text-muted);
   }

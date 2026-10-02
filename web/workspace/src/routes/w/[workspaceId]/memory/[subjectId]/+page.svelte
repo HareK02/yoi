@@ -21,6 +21,14 @@
     );
   }
 
+  function memoryPageHref(cursor?: string | null): string {
+    const path = workspaceRoute(
+      data.workspaceId,
+      `/memory/${encodeURIComponent(data.subjectId)}`,
+    );
+    return cursor ? `${path}?cursor=${encodeURIComponent(cursor)}` : path;
+  }
+
   function stateLabel(state: SubjektivMemoryState): string {
     return state[0].toUpperCase() + state.slice(1);
   }
@@ -152,6 +160,7 @@
         <div class="memory-state" role="status" data-memories-empty>
           <strong>No committed Memories.</strong>
           <p>This subject has no current Memory revisions.</p>
+          {#if data.cursor}<p><a href={memoryPageHref()}>Return to the first page</a></p>{/if}
         </div>
       {:else}
         <div class="memory-list" aria-label="Current committed Memories">
@@ -173,9 +182,12 @@
             </a>
           {/each}
         </div>
-        {#if data.memories.data.has_more}
-          <p class="memory-note">More current Memories are available after this bounded page.</p>
-        {/if}
+        <nav class="memory-pagination" aria-label="Current Memory pages">
+          {#if data.cursor}<a href={memoryPageHref()}>First page</a>{/if}
+          {#if data.memories.data.has_more && data.memories.data.next_cursor}
+            <a href={memoryPageHref(data.memories.data.next_cursor)}>Next page →</a>
+          {/if}
+        </nav>
       {/if}
     {:else if data.memories.error}
       <div class="memory-state is-error" role="alert">
@@ -388,8 +400,7 @@
     font-size: var(--font-size-body);
   }
 
-  .memory-row p,
-  .memory-note {
+  .memory-row p {
     margin: 0;
     color: var(--text-muted);
   }
@@ -415,6 +426,14 @@
   .memory-state {
     padding: var(--space-4) 0;
     color: var(--text-muted);
+  }
+
+  .memory-pagination {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: var(--space-3);
+    font-size: var(--font-size-compact);
   }
 
   .memory-state strong {

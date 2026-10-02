@@ -3410,6 +3410,7 @@ impl WorkspaceApi {
                 resolved_worker_observation_grants: Vec::new(),
                 resolved_workspace_api: None,
                 resolved_memory_settings: None,
+                resolved_subjektiv_attached: false,
                 resolved_control_operation: Some(control_operation),
             },
         ) {
@@ -5977,6 +5978,7 @@ fn worker_spawn_request_from_api(
         resolved_config_bundle: None,
         resolved_workspace_api: None,
         resolved_memory_settings: None,
+        resolved_subjektiv_attached: false,
         resolved_worker_observation_enabled: false,
         resolved_worker_observation_grants: Vec::new(),
         resolved_control_operation: None,
@@ -16982,6 +16984,14 @@ async fn scoped_create_subjektiv_subject(
     ))
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubjektivSubjectCursor {
+    workspace_id: String,
+    created_at: String,
+    subject_id: String,
+}
+
 async fn scoped_list_subjektiv_subjects(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
@@ -16996,9 +17006,45 @@ async fn scoped_list_subjektiv_subjects(
         ))
         .into());
     }
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(|cursor| decode_subjektiv_cursor::<SubjektivSubjectCursor>("subjects", cursor))
+        .transpose()?;
+    if cursor
+        .as_ref()
+        .is_some_and(|cursor| cursor.workspace_id != path.workspace_id)
+    {
+        return Err(Error::InvalidInput(
+            "subjektiv subject cursor does not match Workspace".to_string(),
+        )
+        .into());
+    }
     let page = open_subjektiv_store(&api)?
-        .list_subjects(limit)
+        .list_subjects_after(
+            limit,
+            cursor
+                .as_ref()
+                .map(|cursor| (cursor.created_at.as_str(), cursor.subject_id.as_str())),
+        )
         .map_err(subjektiv_store_error)?;
+    let next_cursor = if page.has_more {
+        page.items
+            .last()
+            .map(|subject| {
+                encode_subjektiv_cursor(
+                    "subjects",
+                    &SubjektivSubjectCursor {
+                        workspace_id: path.workspace_id.clone(),
+                        created_at: subject.created_at.clone(),
+                        subject_id: subject.id.clone(),
+                    },
+                )
+            })
+            .transpose()?
+    } else {
+        None
+    };
     Ok(Json(server_api::SubjektivSubjectListResponse {
         limit,
         items: page
@@ -17006,6 +17052,7 @@ async fn scoped_list_subjektiv_subjects(
             .into_iter()
             .map(|subject| subjektiv_subject_response(&api, subject))
             .collect(),
+        next_cursor,
         has_more: page.has_more,
     }))
 }
@@ -17179,7 +17226,7 @@ async fn scoped_start_subjektiv_subject_worker(
         .into());
     }
     worker.singleton_key = Some(subjektiv_singleton_key(&path.subject_id)?);
-    create_workspace_worker(State(api), headers, Json(worker)).await
+    create_workspace_worker_inner(api, headers, worker, None, true).await
 }
 
 async fn scoped_stage_subjektiv_candidate(
@@ -20190,6 +20237,7 @@ fn start_subjektiv_staging_consolidation(
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
             resolved_memory_settings: None,
+            resolved_subjektiv_attached: true,
             resolved_control_operation: None,
         },
     )?;
@@ -20359,6 +20407,7 @@ fn start_memory_staging_consolidation(
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
             resolved_memory_settings: None,
+            resolved_subjektiv_attached: false,
             resolved_control_operation: None,
         },
     )?;
@@ -21480,9 +21529,14 @@ async fn spawn_known_worker(
         operation_id: scoped_worker_control_operation_id(&controller, &operation_id),
         input_fingerprint,
     });
-    let response =
-        create_workspace_worker_inner(api.clone(), headers, request, resolved_control_operation)
-            .await?;
+    let response = create_workspace_worker_inner(
+        api.clone(),
+        headers,
+        request,
+        resolved_control_operation,
+        false,
+    )
+    .await?;
     if let Err(error) = api
         .store
         .create_worker_control_grant(&WorkerControlGrantRecord {
@@ -21890,6 +21944,7 @@ async fn scoped_start_workspace_orchestrator(
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
             resolved_memory_settings: None,
+            resolved_subjektiv_attached: false,
             resolved_control_operation: None,
         },
     )?;
@@ -27040,7 +27095,9 @@ fn validate_caller_worker_singleton_key(singleton_key: Option<&str>) -> Result<(
         return Ok(());
     };
     crate::store::validate_worker_singleton_key(singleton_key)?;
-    if crate::hosts::is_reserved_internal_worker_singleton_key(singleton_key) {
+    if crate::hosts::is_reserved_internal_worker_singleton_key(singleton_key)
+        || singleton_key.starts_with(SUBJEKTIV_SINGLETON_PREFIX)
+    {
         return Err(Error::InvalidInput(format!(
             "Worker singleton key {singleton_key:?} is reserved for a Backend-managed Worker"
         )));
@@ -27053,7 +27110,7 @@ async fn create_workspace_worker(
     headers: HeaderMap,
     Json(request): Json<CreateWorkspaceWorkerRequest>,
 ) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
-    create_workspace_worker_inner(api, headers, request, None).await
+    create_workspace_worker_inner(api, headers, request, None, false).await
 }
 
 async fn create_workspace_worker_inner(
@@ -27061,6 +27118,7 @@ async fn create_workspace_worker_inner(
     headers: HeaderMap,
     request: CreateWorkspaceWorkerRequest,
     resolved_control_operation: Option<WorkerControlOperation>,
+    resolved_subjektiv_attached: bool,
 ) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
     let CreateWorkspaceWorkerRequest {
         runtime_id,
@@ -27072,7 +27130,21 @@ async fn create_workspace_worker_inner(
         workdir_attachments,
         control_operation_id: _,
     } = request;
-    validate_caller_worker_singleton_key(singleton_key.as_deref())?;
+    if resolved_subjektiv_attached {
+        let singleton_key = singleton_key.as_deref().ok_or_else(|| {
+            Error::InvalidInput(
+                "subject-attached Worker launch requires a Backend-owned singleton key".to_string(),
+            )
+        })?;
+        if !singleton_key.starts_with(SUBJEKTIV_SINGLETON_PREFIX) {
+            return Err(Error::InvalidInput(
+                "subject-attached Worker launch requires a subject singleton key".to_string(),
+            )
+            .into());
+        }
+    } else {
+        validate_caller_worker_singleton_key(singleton_key.as_deref())?;
+    }
     let config_state = api
         .config_store
         .load_workspace_config(&api.config.workspace_id)?
@@ -27167,6 +27239,7 @@ async fn create_workspace_worker_inner(
         resolved_control_operation,
         resolved_workspace_api: None,
         resolved_memory_settings: None,
+        resolved_subjektiv_attached,
     };
     validate_ticket_assignment_spawn(&api, &runtime_id, &request)?;
     let assignment = request.ticket_assignment.clone();
@@ -35967,6 +36040,7 @@ mod tests {
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
             resolved_memory_settings: None,
+            resolved_subjektiv_attached: false,
             resolved_control_operation: None,
         };
         assert!(
@@ -36223,6 +36297,7 @@ mod tests {
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
             resolved_memory_settings: None,
+            resolved_subjektiv_attached: false,
             resolved_control_operation: None,
         };
 
@@ -37607,7 +37682,7 @@ mod tests {
         let request = || CreateWorkspaceWorkerRequest {
             runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
             display_name: "Subject Worker".to_string(),
-            singleton_key: Some("subjektiv:subject-42".to_string()),
+            singleton_key: Some("custom:subject-42".to_string()),
             profile: Some("builtin:companion".to_string()),
             ticket_assignment: None,
             initial_submit: Vec::new(),
@@ -37621,7 +37696,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             created.worker.singleton_key.as_deref(),
-            Some("subjektiv:subject-42")
+            Some("custom:subject-42")
         );
         let Json(duplicate) =
             create_workspace_worker(State(api.clone()), HeaderMap::new(), Json(request()))
@@ -37676,7 +37751,7 @@ mod tests {
         assert_eq!(restored.state, server_api::WorkerRestoreState::Rejected);
         assert_eq!(
             api.store
-                .current_worker_singleton_owner(&api.config.workspace_id, "subjektiv:subject-42",)
+                .current_worker_singleton_owner(&api.config.workspace_id, "custom:subject-42",)
                 .unwrap()
                 .unwrap()
                 .worker,
@@ -38081,6 +38156,7 @@ mod tests {
                     resolved_worker_observation_grants: Vec::new(),
                     resolved_workspace_api: None,
                     resolved_memory_settings: None,
+                    resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
                 },
             )
@@ -38442,6 +38518,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subjektiv_browser_routes_enforce_router_auth_scope_and_owner_reset() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let owner_token = seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
+        let non_owner_token = seed_test_api_token(api.store.as_ref(), "subjektiv-non-owner");
+        let store = open_subjektiv_store(&api).unwrap();
+        let subject = store
+            .create_subject(crate::subjektiv::SubjectRole::new("companion").unwrap())
+            .unwrap();
+        let memory = store
+            .create_memory(
+                &subject.id,
+                crate::subjektiv::MemoryDraft::active(
+                    memory::extract::CandidateKind::Lesson,
+                    "Router contract",
+                    "Browser routes cross the generated Axum boundary.",
+                    "Proves route wiring",
+                    "fixture",
+                ),
+            )
+            .unwrap();
+        api.store
+            .upsert_memory_document(&crate::store::MemoryDocumentRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                body_md: "# Legacy reset fixture\n".to_string(),
+                created_at: "2026-10-02T00:00:00Z".to_string(),
+                updated_at: "2026-10-02T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        let app = build_router(api.clone());
+        let subject_root = format!(
+            "/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{}",
+            subject.id
+        );
+        let memory_root = format!("{subject_root}/memories/{}", memory.id);
+
+        request_json(
+            app.clone(),
+            "GET",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects?limit=1"),
+            None,
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+        let subjects = request_json_authenticated(
+            app.clone(),
+            "GET",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects?limit=1"),
+            None,
+            &owner_token,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(subjects["items"][0]["id"], subject.id);
+        for uri in [
+            subject_root.clone(),
+            format!("{subject_root}/surface"),
+            format!("{subject_root}/memories?limit=1"),
+            memory_root.clone(),
+            format!("{memory_root}/revisions?limit=1"),
+        ] {
+            request_json_authenticated(
+                app.clone(),
+                "GET",
+                &uri,
+                None,
+                &owner_token,
+                StatusCode::OK,
+            )
+            .await;
+        }
+        request_json_authenticated(
+            app.clone(),
+            "GET",
+            "/api/w/another-workspace/subjektiv/subjects?limit=1",
+            None,
+            &owner_token,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        request_json_authenticated(
+            app.clone(),
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/memory/reset"),
+            Some(serde_json::json!({
+                "confirmation": format!("RESET LEGACY MEMORY {TEST_WORKSPACE_ID}"),
+            })),
+            &non_owner_token,
+            StatusCode::FORBIDDEN,
+        )
+        .await;
+        assert!(
+            api.store
+                .get_memory_document(TEST_WORKSPACE_ID)
+                .unwrap()
+                .is_some()
+        );
+        let reset = request_json_authenticated(
+            app,
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/memory/reset"),
+            Some(serde_json::json!({
+                "confirmation": format!("RESET LEGACY MEMORY {TEST_WORKSPACE_ID}"),
+            })),
+            &owner_token,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(reset["documents_deleted"], 1);
+        assert_eq!(
+            store
+                .scoped_memory(&subject.id, &memory.id)
+                .unwrap()
+                .revision,
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn subjektiv_browser_reads_are_bounded_scoped_and_revision_exact() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
@@ -38459,7 +38655,10 @@ mod tests {
             AxumPath(ScopedWorkspacePath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
             }),
-            Query(server_api::SubjektivSubjectListQuery { limit: Some(0) }),
+            Query(server_api::SubjektivSubjectListQuery {
+                limit: Some(0),
+                cursor: None,
+            }),
         )
         .await
         .unwrap_err();
@@ -38473,12 +38672,31 @@ mod tests {
             AxumPath(ScopedWorkspacePath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
             }),
-            Query(server_api::SubjektivSubjectListQuery { limit: Some(1) }),
+            Query(server_api::SubjektivSubjectListQuery {
+                limit: Some(1),
+                cursor: None,
+            }),
         )
         .await
         .unwrap();
         assert_eq!(subjects.items.len(), 1);
         assert!(subjects.has_more);
+        let Json(next_subjects) = scoped_list_subjektiv_subjects(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            Query(server_api::SubjektivSubjectListQuery {
+                limit: Some(1),
+                cursor: subjects.next_cursor.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(next_subjects.items.len(), 1);
+        assert_ne!(next_subjects.items[0].id, subjects.items[0].id);
+        assert!(!next_subjects.has_more);
+        assert!(next_subjects.next_cursor.is_none());
 
         let missing = scoped_get_subjektiv_subject(
             State(api.clone()),
@@ -38744,6 +38962,32 @@ mod tests {
             created.worker.singleton_key.as_deref(),
             Some(format!("subjektiv:{}", subject.id).as_str())
         );
+        let worker_ref = RuntimeWorkerRef::new(&created.runtime_id, &created.worker_id);
+        let accepted = api
+            .runtime
+            .send_input(
+                &worker_ref,
+                WorkerInputRequest {
+                    kind: WorkerInputKind::User,
+                    content: "Commit one subject-scoped Session".to_string(),
+                    submission_request_id: None,
+                    segments: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(accepted.state, InternalWorkerOperationState::Accepted);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let detail = api.runtime.worker(&worker_ref).unwrap();
+            if detail.state == "idle" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "subject-attached Worker did not complete its committed turn"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         let context = server_api::ServerRequestContext {
             actor: None,
             worker_source: None,
@@ -39795,6 +40039,7 @@ mod tests {
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
             resolved_memory_settings: None,
+            resolved_subjektiv_attached: false,
             resolved_control_operation: Some(WorkerControlOperation {
                 operation_id: operation_id.to_string(),
                 input_fingerprint: format!("sha256:{operation_id}"),
@@ -40074,6 +40319,7 @@ mod tests {
                     resolved_worker_observation_grants: Vec::new(),
                     resolved_workspace_api: None,
                     resolved_memory_settings: None,
+                    resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
                 },
             )
@@ -41294,6 +41540,7 @@ mod tests {
                 resolved_worker_observation_grants: Vec::new(),
                 resolved_workspace_api: None,
                 resolved_memory_settings: None,
+                resolved_subjektiv_attached: false,
                 resolved_control_operation: None,
             },
         )
@@ -42199,6 +42446,7 @@ mod tests {
                     resolved_worker_observation_grants: Vec::new(),
                     resolved_workspace_api: None,
                     resolved_memory_settings: None,
+                    resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
                 },
             )
@@ -44442,6 +44690,7 @@ mod tests {
                         EMBEDDED_WORKER_RUNTIME_ID,
                     )),
                     resolved_memory_settings: Some(test_worker_memory_settings()),
+                    resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
                 },
             )
@@ -44746,6 +44995,7 @@ mod tests {
                         EMBEDDED_WORKER_RUNTIME_ID,
                     )),
                     resolved_memory_settings: Some(test_worker_memory_settings()),
+                    resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
                 },
             )
@@ -45489,6 +45739,7 @@ mod tests {
                         EMBEDDED_WORKER_RUNTIME_ID,
                     )),
                     resolved_memory_settings: Some(test_worker_memory_settings()),
+                    resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
                 },
             )
@@ -45591,6 +45842,7 @@ mod tests {
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: Some(test_worker_workspace_api(EMBEDDED_WORKER_RUNTIME_ID)),
             resolved_memory_settings: Some(test_worker_memory_settings()),
+            resolved_subjektiv_attached: false,
             resolved_control_operation: None,
         };
         let source_worker = api
@@ -46209,6 +46461,7 @@ mod tests {
                         EMBEDDED_WORKER_RUNTIME_ID,
                     )),
                     resolved_memory_settings: Some(test_worker_memory_settings()),
+                    resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
                 },
             )
@@ -46276,6 +46529,7 @@ mod tests {
                         EMBEDDED_WORKER_RUNTIME_ID,
                     )),
                     resolved_memory_settings: Some(test_worker_memory_settings()),
+                    resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
                 },
             )
@@ -47666,6 +47920,7 @@ mod tests {
                     resolved_worker_observation_grants: Vec::new(),
                     resolved_workspace_api: None,
                     resolved_memory_settings: None,
+                    resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
                 },
             )
@@ -47725,6 +47980,7 @@ mod tests {
                     resolved_worker_observation_grants: Vec::new(),
                     resolved_workspace_api: None,
                     resolved_memory_settings: None,
+                    resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
                 },
             )
@@ -47838,6 +48094,7 @@ mod tests {
                     resolved_worker_observation_grants: Vec::new(),
                     resolved_workspace_api: None,
                     resolved_memory_settings: None,
+                    resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
                 },
             )
@@ -49776,6 +50033,7 @@ mod tests {
                     resolved_worker_observation_grants: Vec::new(),
                     resolved_workspace_api: None,
                     resolved_memory_settings: None,
+                    resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
                 },
             )
@@ -50880,6 +51138,7 @@ mod tests {
             worker_observation_grants: Vec::new(),
             workspace_api: None,
             memory_settings: Some(memory_settings),
+            subjektiv_attached: false,
         }
     }
 
@@ -52070,6 +52329,7 @@ mod tests {
                 control_operation_id: None,
             },
             None,
+            false,
         )
         .await
         .unwrap();
@@ -52855,6 +53115,7 @@ mod tests {
                         "embedded-worker-runtime",
                     )),
                     resolved_memory_settings: Some(test_worker_memory_settings()),
+                    resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
                 },
             )
@@ -53508,6 +53769,7 @@ mod tests {
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
             resolved_memory_settings: None,
+            resolved_subjektiv_attached: false,
             resolved_control_operation: None,
         };
         let spawned = api
@@ -54370,6 +54632,7 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
             resolved_memory_settings: None,
+            resolved_subjektiv_attached: false,
             resolved_control_operation: None,
         };
 

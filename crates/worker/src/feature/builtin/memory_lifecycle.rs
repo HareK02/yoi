@@ -199,7 +199,7 @@ impl SubjektivLifecycleFeature {
         workspace_context: WorkerWorkspaceContext,
         event_tx: Option<broadcast::Sender<Event>>,
     ) -> std::io::Result<Option<Self>> {
-        if !lifecycle_enabled || !config.profile.enabled || !config.profile.extraction.enabled {
+        if !lifecycle_enabled || !config.execution_enabled() || !config.profile.extraction.enabled {
             return Ok(None);
         }
         config

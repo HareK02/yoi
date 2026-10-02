@@ -74,6 +74,7 @@ fn create_request(name: &str) -> CreateWorkerRequest {
             settings_revision: 1,
             language: "English".to_string(),
         }),
+        subjektiv_attached: false,
     }
 }
 

@@ -9325,6 +9325,12 @@
       "SubjektivSubjectListQuery": {
         "additionalProperties": false,
         "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "limit": {
             "format": "uint",
             "maximum": 100,
@@ -9354,6 +9360,12 @@
             "maximum": 100,
             "minimum": 1,
             "type": "integer"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -14738,7 +14750,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:c3466d73ec67447e6f8af0343b20dc90fcffc3620d2e58a4405870311aa8dfd3"
+    "x-yoi-source-digest": "sha256:318ce25c5d41452715ccb31e81798bfe2b894796a1f885afb37c83cdb7525098"
   },
   "openapi": "3.1.0",
   "paths": {

@@ -19,7 +19,7 @@ Every subject operation is bounded first by the authenticated Workspace and then
 
 The current Worker remains Yoi's keyed-singleton responsibility. The subjektiv database records immutable historical Worker and Session attribution, but it contains no second `current_worker_id` mapping and historical attribution is never used to choose or authorize the current Worker. Stopping or replacing a Worker does not retire its subject, and retiring a subject does not stop a Worker.
 
-Workspace Memory settings remain Workspace-owned configuration. When `feature.subjektiv` is enabled, the Backend binds the trusted settings snapshot used for extraction language; the snapshot is not subject identity and cannot be authored by a Profile, Browser, or model.
+Workspace Memory settings remain Workspace-owned configuration. `feature.subjektiv` in a Profile is reusable policy, not subject authority: it remains inert for ordinary Ticket/Orchestrator Workers and Internal SubWorkers. Only a Backend-attested subject Worker (`subjektiv:<subject-id>`) or dedicated subject consolidator receives the trusted settings snapshot that activates subjektiv tools, resident load, and extraction. The snapshot is not subject identity and cannot be authored by a Profile, Browser, or model; Reviewer children never inherit the parent's attachment or run independent extraction.
 
 ## Session, Memory, and correction semantics
 

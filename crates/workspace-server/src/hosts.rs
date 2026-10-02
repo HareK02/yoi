@@ -534,6 +534,9 @@ pub struct WorkerSpawnRequest {
     /// Backend-authored immutable Workspace Memory settings snapshot.
     #[serde(skip, default)]
     pub resolved_memory_settings: Option<manifest::WorkspaceMemorySettingsSnapshot>,
+    /// Backend-attested subjektiv singleton attachment. Browser/model input cannot set it.
+    #[serde(skip, default)]
+    pub resolved_subjektiv_attached: bool,
     /// Backend-owned feature enablement; client input cannot set it.
     #[serde(skip, default)]
     pub resolved_worker_observation_enabled: bool,
@@ -5353,6 +5356,7 @@ fn runtime_create_worker_request(
         worker_observation_grants: request.resolved_worker_observation_grants.clone(),
         workspace_api: Some(workspace_api),
         memory_settings: request.resolved_memory_settings.clone(),
+        subjektiv_attached: request.resolved_subjektiv_attached,
     }
 }
 
@@ -7075,6 +7079,7 @@ mod tests {
             resolved_control_operation: None,
             resolved_workspace_api: Some(test_workspace_api()),
             resolved_memory_settings: Some(test_memory_settings()),
+            resolved_subjektiv_attached: false,
         }
     }
 
@@ -7363,6 +7368,7 @@ mod tests {
                     resolved_control_operation: None,
                     resolved_workspace_api: Some(test_workspace_api()),
                     resolved_memory_settings: Some(test_memory_settings()),
+                    resolved_subjektiv_attached: false,
                 },
             )
             .unwrap();
@@ -7465,6 +7471,7 @@ mod tests {
                     resolved_control_operation: None,
                     resolved_workspace_api: Some(test_workspace_api()),
                     resolved_memory_settings: Some(test_memory_settings()),
+                    resolved_subjektiv_attached: false,
                 },
             )
             .unwrap();
@@ -7505,6 +7512,7 @@ mod tests {
                     resolved_control_operation: None,
                     resolved_workspace_api: Some(test_workspace_api()),
                     resolved_memory_settings: Some(test_memory_settings()),
+                    resolved_subjektiv_attached: false,
                 },
             )
             .unwrap();

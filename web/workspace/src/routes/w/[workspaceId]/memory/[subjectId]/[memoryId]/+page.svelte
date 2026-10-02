@@ -28,6 +28,14 @@
     return `${memoryPath()}?revision=${revision}`;
   }
 
+  function revisionPageHref(cursor?: string | null): string {
+    const query = new URLSearchParams();
+    if (memory) query.set('revision', String(memory.revision));
+    if (cursor) query.set('revision_cursor', cursor);
+    const encoded = query.toString();
+    return encoded ? `${memoryPath()}?${encoded}` : memoryPath();
+  }
+
   function derivedHref(reference: SubjektivMemoryRevisionRef): string {
     return `${memoryPath(reference.memory_id)}?revision=${reference.revision}`;
   }
@@ -221,7 +229,10 @@
       <header class="section-heading"><div><p class="memory-eyebrow">Immutable record</p><h2 id="revision-heading">Revision history</h2></div>{#if data.revisions.data}<span>{revisions.length}{data.revisions.data.has_more ? '+' : ''}</span>{/if}</header>
       {#if data.revisions.data}
         {#if revisions.length === 0}
-          <p class="empty-copy">No revision history is available.</p>
+          <div>
+            <p class="empty-copy">No revision history is available.</p>
+            {#if data.revisionCursor}<p><a href={revisionPageHref()}>Return to the first page</a></p>{/if}
+          </div>
         {:else}
           <ol class="revision-list">
             {#each revisions as revision (revision.revision)}
@@ -234,7 +245,12 @@
               </li>
             {/each}
           </ol>
-          {#if data.revisions.data.has_more}<p class="bounded-note">More immutable revisions are available after this bounded page.</p>{/if}
+          <nav class="memory-pagination" aria-label="Revision history pages">
+            {#if data.revisionCursor}<a href={revisionPageHref()}>First page</a>{/if}
+            {#if data.revisions.data.has_more && data.revisions.data.next_cursor}
+              <a href={revisionPageHref(data.revisions.data.next_cursor)}>Next page →</a>
+            {/if}
+          </nav>
         {/if}
       {:else if data.revisions.error}
         <div class="memory-state is-error" role="alert"><strong>Revision history unavailable.</strong><p>{data.revisions.error}</p></div>
@@ -431,6 +447,14 @@
 
   .continuation-note p {
     margin: 0;
+  }
+
+  .memory-pagination {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: var(--space-3);
+    font-size: var(--font-size-compact);
   }
 
   .candidate-list {

@@ -444,6 +444,10 @@ pub struct CreateWorkerRequest {
     pub workspace_api: Option<WorkspaceApiRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_settings: Option<manifest::WorkspaceMemorySettingsSnapshot>,
+    /// Backend-attested subject or consolidation attachment. Profile policy alone
+    /// never activates subjektiv for an ordinary Workspace Worker.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub subjektiv_attached: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
