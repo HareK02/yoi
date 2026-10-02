@@ -210,6 +210,77 @@ function semanticOutput(lines: readonly ConsoleLine[]) {
   }));
 }
 
+Deno.test("snapshot and usage keep current context separate from run traffic", () => {
+  const snapshot = snapshotEvent("/repo") as SnapshotEvent;
+  snapshot.data.greeting.model = "gpt-6-astra";
+  snapshot.data.greeting.reasoning = { kind: "effort", effort: "high" };
+  snapshot.data.greeting.context_window = 272_000;
+  snapshot.data.greeting.context_tokens = 1;
+  snapshot.data.greeting.context_usage = { tokens: 142_000, source: "estimated" };
+  const projection = projectConsole([
+    { eventId: "snapshot", event: snapshot, observedAtMs: 1 },
+    { eventId: "usage", event: { event: "usage", data: {
+      input_tokens: 150_000,
+      cache_read_input_tokens: 140_000,
+      output_tokens: 2_000,
+    } }, observedAtMs: 2 },
+  ]);
+
+  assertEquals(projection.workerMetadata, {
+    model: "gpt-6-astra",
+    reasoning: { kind: "effort", effort: "high" },
+    contextWindow: 272_000,
+    contextTokens: 150_000,
+    contextSource: "measured",
+  });
+  assertEquals(projection.runActivity.uploadTokens, 10_000);
+  assertEquals(projection.runActivity.outputTokens, 2_000);
+});
+
+Deno.test("snapshot metadata supports budget reasoning and legacy context fallback", () => {
+  const snapshot = snapshotEvent("/repo") as SnapshotEvent;
+  snapshot.data.greeting.reasoning = { kind: "budget_tokens", budget_tokens: 16_384 };
+  delete snapshot.data.greeting.context_usage;
+  const projection = projectConsole([{ eventId: "snapshot", event: snapshot }]);
+
+  assertEquals(projection.workerMetadata, {
+    model: "model",
+    reasoning: { kind: "budget_tokens", budget_tokens: 16_384 },
+    contextWindow: 100,
+    contextTokens: 20,
+    contextSource: "estimated",
+  });
+});
+
+Deno.test("unknown and destructive boundaries never fabricate context percentages", () => {
+  const retained = snapshotEvent("") as SnapshotEvent;
+  retained.data.greeting.model = "";
+  retained.data.greeting.context_window = 0;
+  retained.data.greeting.context_tokens = 0;
+  delete retained.data.greeting.context_usage;
+  let projection = projectConsole([{ eventId: "retained", event: retained }]);
+  assertEquals(projection.workerMetadata, {
+    model: null,
+    reasoning: null,
+    contextWindow: null,
+    contextTokens: null,
+    contextSource: null,
+  });
+
+  const live = snapshotEvent("/repo") as SnapshotEvent;
+  live.data.greeting.context_usage = { tokens: 20, source: "measured" };
+  projection = projectConsole([
+    { eventId: "live", event: live },
+    { eventId: "rewind", event: { event: "rewind_applied", data: {
+      session: canonicalSession([]),
+      input: [],
+      summary: { truncated_to_entries: 0, discarded_entries: 1, tool_side_effect_warning: false },
+    } } },
+  ]);
+  assertEquals(projection.workerMetadata?.contextTokens, null);
+  assertEquals(projection.workerMetadata?.contextSource, null);
+});
+
 Deno.test("large paste segments project compact artifact metadata", () => {
   const body = "secret pasted body";
   const text = segmentsToText([{
@@ -2977,6 +3048,18 @@ Deno.test("Internal Worker snapshot output continues without entering the parent
     worker,
     revision: 4,
     session: canonicalSession([]),
+    greeting: {
+      worker_name: "research",
+      cwd: "/child",
+      provider: "anthropic",
+      model: "child-model",
+      reasoning: { kind: "budget_tokens", budget_tokens: 8_192 },
+      scope_summary: "child scope",
+      tools: [],
+      context_window: 64_000,
+      context_tokens: 12_000,
+      context_usage: { tokens: 12_000, source: "measured" },
+    },
     status: "running",
     in_flight: {
       blocks: [{ kind: "text", text: "**chi", finished: false }],
@@ -2991,6 +3074,14 @@ Deno.test("Internal Worker snapshot output continues without entering the parent
     projection.internalWorkers[0].console.lines.map((line) => line.body),
     ["**chi"],
   );
+  assertEquals(projection.workerMetadata?.model, "model");
+  assertEquals(projection.internalWorkers[0].console.workerMetadata, {
+    model: "child-model",
+    reasoning: { kind: "budget_tokens", budget_tokens: 8_192 },
+    contextWindow: 64_000,
+    contextTokens: 12_000,
+    contextSource: "measured",
+  });
 
   projection = projector.append([
     {

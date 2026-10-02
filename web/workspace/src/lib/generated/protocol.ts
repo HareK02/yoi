@@ -200,21 +200,42 @@ export type SubmissionDisposition = "started" | "queued";
 
 export type SessionSnapshot = { pending_submissions: PendingSubmissionsSnapshot, entries: Array<SessionSnapshotEntry>, };
 
+export type ReasoningConfig = { "kind": "effort", effort: string, } | { "kind": "budget_tokens", budget_tokens: number, };
+
+export type ContextTokenSource = "measured" | "estimated";
+
+export type ContextUsage = { tokens: number, source: ContextTokenSource, };
+
+export type Greeting = { worker_name: string, cwd: string, provider: string, model: string,
+/**
+ * Effective reasoning control. Absent means unspecified or unavailable.
+ */
+reasoning?: ReasoningConfig | null, scope_summary: string, tools: Array<string>,
+/**
+ * Resolved effective model context window in tokens. Legacy producers use
+ * zero when this is unavailable; clients must treat that as unknown.
+ */
+context_window: number,
+/**
+ * Legacy numeric mirror retained for mixed-version clients.
+ */
+context_tokens: number,
+/**
+ * Typed current-context value. Older snapshots omit it; clients may fall
+ * back to `context_tokens` only when `context_window` is known.
+ */
+context_usage?: ContextUsage | null, };
+
 export type InternalWorkerKind = "sub_worker" | { "service": { kind: string, } };
 
 export type InternalWorkerRef = { session_id: string, name: string, parent_session_id?: string | null, kind: InternalWorkerKind, };
 
-export type InternalWorkerSnapshot = { worker: InternalWorkerRef, revision: number, session: SessionSnapshot, status: WorkerStatus, error?: string | null, in_flight?: InFlightSnapshot, internal_workers?: Array<InternalWorkerSnapshot>, };
-
-export type Greeting = { worker_name: string, cwd: string, provider: string, model: string, scope_summary: string, tools: Array<string>,
+export type InternalWorkerSnapshot = { worker: InternalWorkerRef, revision: number, session: SessionSnapshot,
 /**
- * Model context window in tokens. Always filled by the Worker greeting.
+ * Public execution metadata for this child. Older snapshots and service
+ * workers may omit it; clients must never substitute the parent's values.
  */
-context_window: number,
-/**
- * Estimated current session context tokens at connect time.
- */
-context_tokens: number, };
+greeting?: Greeting | null, status: WorkerStatus, error?: string | null, in_flight?: InFlightSnapshot, internal_workers?: Array<InternalWorkerSnapshot>, };
 
 export type Alert = { level: AlertLevel, source: AlertSource, message: string,
 /**

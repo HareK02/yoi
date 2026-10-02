@@ -8,6 +8,11 @@ import {
   resolveCompactionStatusPresentation,
   visibleCompactionProgress,
 } from "./run-status.ts";
+import {
+  formatContextSummary,
+  formatModelSummary,
+  formatReasoning,
+} from "./worker-metadata.ts";
 
 function assertEquals(actual: unknown, expected: unknown): void {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -16,6 +21,57 @@ function assertEquals(actual: unknown, expected: unknown): void {
     );
   }
 }
+
+Deno.test("worker metadata formats effort, budget, estimate, and unknown safely", () => {
+  assertEquals(
+    formatModelSummary({
+      model: "gpt-6-astra",
+      reasoning: { kind: "effort", effort: "high" },
+      contextWindow: 272_000,
+      contextTokens: 142_000,
+      contextSource: "measured",
+    }),
+    "gpt-6-astra · high",
+  );
+  assertEquals(
+    formatReasoning({ kind: "budget_tokens", budget_tokens: 16_384 }),
+    "16.4k token budget",
+  );
+  assertEquals(
+    formatContextSummary({
+      model: "model",
+      reasoning: null,
+      contextWindow: 272_000,
+      contextTokens: 142_000,
+      contextSource: "estimated",
+    }),
+    "Context ~142.0k / 272.0k (52%)",
+  );
+  assertEquals(formatModelSummary(null), "Model unavailable");
+  assertEquals(
+    formatReasoning({ kind: "effort", effort: "" }),
+    "reasoning unavailable",
+  );
+  assertEquals(
+    formatReasoning({ kind: "budget_tokens", budget_tokens: Number.NaN }),
+    "reasoning unavailable",
+  );
+  assertEquals(
+    formatReasoning({ kind: "budget_tokens", budget_tokens: -1 }),
+    "reasoning unavailable",
+  );
+  assertEquals(formatContextSummary(null), "Context unavailable");
+  assertEquals(
+    formatContextSummary({
+      model: null,
+      reasoning: null,
+      contextWindow: 0,
+      contextTokens: 0,
+      contextSource: null,
+    }),
+    "Context unavailable",
+  );
+});
 
 Deno.test("run activity follows TUI request and net-token accounting", () => {
   let stats = applyRunActivityEvent(

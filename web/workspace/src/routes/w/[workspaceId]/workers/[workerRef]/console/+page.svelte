@@ -21,6 +21,7 @@
     } from "$lib/workspace/console/composer-command";
     import { FileCompletions } from "$lib/workspace/console/file-completions";
     import WorkerRunStatus from "$lib/workspace/console/WorkerRunStatus.svelte";
+    import WorkerContextStatus from "$lib/workspace/console/WorkerContextStatus.svelte";
     import { resolveWorkerControlShortcut } from "$lib/workspace/console/worker-control-shortcuts";
     import {
         consoleWorkerViews,
@@ -1651,6 +1652,7 @@
 
 <div class="console-shell worker-console-shell">
     <section class="console-header card" aria-label="Worker controls">
+        <WorkerContextStatus metadata={selectedConsoleProjection.workerMetadata} />
         <div class="console-header-actions">
             <div
                 class="console-view-modes"
@@ -2119,8 +2121,9 @@
 
     .console-header {
         display: flex;
-        align-items: flex-start;
-        justify-content: flex-end;
+        min-width: 0;
+        align-items: center;
+        justify-content: space-between;
         gap: var(--space-4);
     }
 
@@ -2133,6 +2136,7 @@
 
     .console-header-actions {
         display: flex;
+        flex: 0 0 auto;
         align-items: center;
         justify-content: flex-end;
         flex-wrap: wrap;
@@ -2670,7 +2674,12 @@
         }
 
         .console-header {
+            align-items: stretch;
             flex-direction: column;
+        }
+
+        .console-header-actions {
+            align-self: flex-end;
         }
     }
 </style>

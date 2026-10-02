@@ -7,7 +7,7 @@
 //! need durable domain audit must keep using their domain authority (for example Memory audit).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use agen::timeline::event::UsageEvent;
 use agen::{Engine, EngineError, llm_client::LlmClient};
@@ -17,7 +17,9 @@ use session_store::{LogEntry, SegmentId, SessionId, Store, StoreError, TraceEntr
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::controller::{wire_event_bridges_on_engine, wire_workdir_command_events};
+use crate::controller::{
+    build_greeting, wire_event_bridges_on_engine, wire_workdir_command_events,
+};
 use crate::feature::FeatureRegistryBuilder;
 use crate::in_flight::{InFlightEvents, snapshot_from_guard};
 use crate::ipc::alerter::Alerter;
@@ -409,6 +411,7 @@ enum InternalWorkerSessionCommand {
 #[derive(Debug, Clone)]
 pub(crate) struct InternalWorkerSessionSnapshot {
     pub session: protocol::SessionSnapshot,
+    pub greeting: Option<protocol::Greeting>,
     pub status: WorkerStatus,
     pub error: Option<String>,
     pub in_flight: InFlightSnapshot,
@@ -428,6 +431,7 @@ pub(crate) struct InternalWorkerSessionHandle {
     visibility: InternalWorkerVisibility,
     last_error: Arc<Mutex<Option<String>>>,
     last_outcome: Arc<Mutex<Option<InternalWorkerTurnOutcome>>>,
+    greeting: Option<Arc<RwLock<protocol::Greeting>>>,
     child_registry: Option<Arc<SpawnedWorkerRegistry>>,
     sink: SegmentLogSink,
     #[cfg(test)]
@@ -481,6 +485,12 @@ impl InternalWorkerSessionHandle {
         };
         InternalWorkerSessionSnapshot {
             session: session_store::public_snapshot::project_current_session_snapshot(&entries),
+            greeting: self.greeting.as_ref().map(|greeting| {
+                greeting
+                    .read()
+                    .expect("internal Worker greeting lock poisoned")
+                    .clone()
+            }),
             status: match self.status() {
                 InternalWorkerSessionStatus::Running => WorkerStatus::Running,
                 InternalWorkerSessionStatus::Paused => WorkerStatus::Paused,
@@ -851,7 +861,19 @@ pub(crate) async fn prepare_internal_worker_session(
     worker.attach_alerter(alerter.clone());
     worker.attach_working_event_tx(event_tx.clone());
     worker.attach_in_flight_events(in_flight.clone());
+    let greeting = Arc::new(RwLock::new(build_greeting(&worker)));
     wire_event_bridges_on_engine(&mut worker, &event_tx, &alerter, &in_flight);
+    let usage_greeting = greeting.clone();
+    worker.engine_mut().on_usage(move |event| {
+        let mut greeting = usage_greeting
+            .write()
+            .expect("internal Worker greeting lock poisoned");
+        greeting.context_tokens = event.input_tokens.unwrap_or_default();
+        greeting.context_usage = event.input_tokens.map(|tokens| protocol::ContextUsage {
+            tokens,
+            source: protocol::ContextTokenSource::Measured,
+        });
+    });
 
     let session_id = worker.session_id();
     let segment_id = worker.segment_id();
@@ -874,6 +896,7 @@ pub(crate) async fn prepare_internal_worker_session(
         visibility,
         last_error: last_error.clone(),
         last_outcome: last_outcome.clone(),
+        greeting: Some(greeting),
         child_registry,
         sink,
         #[cfg(test)]
@@ -1206,6 +1229,7 @@ pub(crate) fn test_internal_worker_session(
         visibility,
         last_error: Arc::new(Mutex::new(None)),
         last_outcome: Arc::new(Mutex::new(None)),
+        greeting: None,
         child_registry: None,
         sink,
         fail_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),

@@ -995,6 +995,7 @@ fn internal_worker_snapshot(
         worker,
         revision,
         session: snapshot.session,
+        greeting: snapshot.greeting,
         status: snapshot.status,
         error: snapshot.error,
         in_flight: snapshot.in_flight,

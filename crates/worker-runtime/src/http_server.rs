@@ -3992,6 +3992,8 @@ mod ws_tests {
                     tools: Vec::new(),
                     context_window: 0,
                     context_tokens: 0,
+                    reasoning: None,
+                    context_usage: None,
                 },
                 state: protocol::WorkerStateSnapshot::initial(),
                 in_flight: protocol::InFlightSnapshot {

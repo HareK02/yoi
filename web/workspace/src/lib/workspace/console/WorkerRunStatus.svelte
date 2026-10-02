@@ -60,7 +60,7 @@
   <span aria-hidden="true">・</span>
   <span>{requests} {requestLabel}</span>
   <span aria-hidden="true">|</span>
-  <span>↑{formatRunTokens(uploadTokens)}/↓{formatRunTokens(outputTokens)}</span>
+  <span>Run ↑{formatRunTokens(uploadTokens)}/↓{formatRunTokens(outputTokens)}</span>
 </div>
 
 <style>

@@ -499,10 +499,12 @@ impl RetainedSnapshotSocket {
                     cwd: String::new(),
                     provider: "retained session".to_string(),
                     model: String::new(),
+                    reasoning: None,
                     scope_summary: "read-only retained session".to_string(),
                     tools: Vec::new(),
                     context_window: 0,
                     context_tokens: 0,
+                    context_usage: None,
                 },
                 state: protocol::WorkerStateSnapshot {
                     last_command_id: 0,
@@ -654,10 +656,12 @@ async fn run_e2e_rewind_fixture(
             cwd: workspace_root.display().to_string(),
             provider: "e2e-fixture".to_string(),
             model: "canned".to_string(),
+            reasoning: None,
             scope_summary: "isolated e2e rewind fixture".to_string(),
             tools: Vec::new(),
             context_window: 0,
             context_tokens: 0,
+            context_usage: None,
         },
     });
 
@@ -2784,10 +2788,12 @@ mod tests {
             cwd: "/tmp".into(),
             provider: "test".into(),
             model: "test".into(),
+            reasoning: None,
             scope_summary: "".into(),
             tools: vec![],
             context_window: 0,
             context_tokens: 0,
+            context_usage: None,
         }
     }
 

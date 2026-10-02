@@ -766,6 +766,10 @@ pub struct InternalWorkerSnapshot {
     pub worker: InternalWorkerRef,
     pub revision: u64,
     pub session: SessionSnapshot,
+    /// Public execution metadata for this child. Older snapshots and service
+    /// workers may omit it; clients must never substitute the parent's values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub greeting: Option<Greeting>,
     #[serde(default)]
     pub status: WorkerStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1667,11 +1671,45 @@ impl InFlightToolCallState {
     }
 }
 
-/// Worker self-description rendered by the TUI when a session starts empty.
+/// Public reasoning configuration resolved for the model client.
 ///
-/// Built once in the Worker controller from the resolved manifest and
-/// transmitted alongside `Event::Snapshot` so clients don't need
-/// their own view of the manifest.
+/// This deliberately exposes only the effective provider control, not the
+/// Worker manifest or provider credentials. The tagged shape prevents token
+/// budgets from being presented as effort labels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReasoningConfig {
+    Effort { effort: String },
+    BudgetTokens { budget_tokens: i32 },
+}
+
+/// Provenance of the current-context token count in a [`Greeting`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ContextTokenSource {
+    /// Provider-reported input occupancy from the most recent LLM request.
+    Measured,
+    /// Current history projected from the Worker's token accounting records.
+    Estimated,
+}
+
+/// Current prompt-context occupancy, distinct from cumulative run traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct ContextUsage {
+    pub tokens: u64,
+    pub source: ContextTokenSource,
+}
+
+/// Worker self-description rendered by clients when a session starts empty.
+///
+/// Snapshot metadata contains only resolved public execution information so
+/// clients do not need their own copy of the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
@@ -1680,14 +1718,22 @@ pub struct Greeting {
     pub cwd: String,
     pub provider: String,
     pub model: String,
+    /// Effective reasoning control. Absent means unspecified or unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningConfig>,
     pub scope_summary: String,
     pub tools: Vec<String>,
-    /// Model context window in tokens. Always filled by the Worker greeting.
+    /// Resolved effective model context window in tokens. Legacy producers use
+    /// zero when this is unavailable; clients must treat that as unknown.
     #[serde(default)]
     pub context_window: u64,
-    /// Estimated current session context tokens at connect time.
+    /// Legacy numeric mirror retained for mixed-version clients.
     #[serde(default)]
     pub context_tokens: u64,
+    /// Typed current-context value. Older snapshots omit it; clients may fall
+    /// back to `context_tokens` only when `context_window` is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<ContextUsage>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2354,6 +2400,11 @@ mod tests {
                 tools: vec!["Read".into()],
                 context_window: 200_000,
                 context_tokens: 42_000,
+                reasoning: Some(ReasoningConfig::BudgetTokens { budget_tokens: -1 }),
+                context_usage: Some(ContextUsage {
+                    tokens: 42_000,
+                    source: ContextTokenSource::Measured,
+                }),
             },
             state: WorkerStatus::Paused.into(),
             in_flight: InFlightSnapshot::default(),
@@ -2372,6 +2423,19 @@ mod tests {
         assert_eq!(parsed["data"]["greeting"]["tools"][0], "Read");
         assert_eq!(parsed["data"]["greeting"]["context_window"], 200_000);
         assert_eq!(parsed["data"]["greeting"]["context_tokens"], 42_000);
+        assert_eq!(
+            parsed["data"]["greeting"]["reasoning"]["kind"],
+            "budget_tokens"
+        );
+        assert_eq!(parsed["data"]["greeting"]["reasoning"]["budget_tokens"], -1);
+        assert_eq!(
+            parsed["data"]["greeting"]["context_usage"]["tokens"],
+            42_000
+        );
+        assert_eq!(
+            parsed["data"]["greeting"]["context_usage"]["source"],
+            "measured"
+        );
         assert_eq!(parsed["data"]["state"]["state"]["kind"], "busy");
         assert_eq!(parsed["data"]["state"]["state"]["state"]["state"], "paused");
     }
@@ -2381,7 +2445,17 @@ mod tests {
         let inbound = r#"{"event":"snapshot","data":{"session":{"entries":[]},"greeting":{"worker_name":"test","cwd":"/tmp","provider":"p","model":"m","scope_summary":"s","tools":[]},"state":{"last_command_id":0,"state":{"kind":"busy","state":{"kind":"run","state":"running"}}}}}"#;
         let decoded: Event = serde_json::from_str(inbound).unwrap();
         match decoded {
-            Event::Snapshot { in_flight, .. } => assert!(in_flight.is_empty()),
+            Event::Snapshot {
+                greeting,
+                in_flight,
+                ..
+            } => {
+                assert!(in_flight.is_empty());
+                assert_eq!(greeting.reasoning, None);
+                assert_eq!(greeting.context_usage, None);
+                assert_eq!(greeting.context_window, 0);
+                assert_eq!(greeting.context_tokens, 0);
+            }
             other => panic!("expected Snapshot, got {other:?}"),
         }
 
@@ -2399,6 +2473,8 @@ mod tests {
                 tools: Vec::new(),
                 context_window: 0,
                 context_tokens: 0,
+                reasoning: None,
+                context_usage: None,
             },
             state: WorkerStatus::Running.into(),
             in_flight: InFlightSnapshot {

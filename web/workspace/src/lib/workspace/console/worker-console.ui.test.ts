@@ -720,7 +720,8 @@ Deno.test("Worker Console renders Edit diffs without preformatted template gaps"
 Deno.test("Console spacing and text metrics use existing design tokens", async () => {
   const files = [
     "ComposerInput.svelte", "ConsoleLineItem.svelte", "RichMarkdown.svelte",
-    "ConsoleTasks.svelte", "WorkerRunStatus.svelte", "ConsoleDisplayState.svelte",
+    "ConsoleTasks.svelte", "WorkerRunStatus.svelte", "WorkerContextStatus.svelte",
+    "ConsoleDisplayState.svelte",
     "ConsoleTurnNavigation.svelte",
     "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
   ];

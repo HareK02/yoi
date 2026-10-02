@@ -4,11 +4,13 @@ import type {
   CommandSnapshot,
   CommandStreamSlice,
   Event as ProtocolEvent,
+  Greeting,
   InFlightBlock,
   InFlightCompaction,
   InFlightToolCallState,
   InternalWorkerRef,
   InternalWorkerSnapshot,
+  ReasoningConfig,
   Segment,
   SessionSnapshotEntry,
   WorkerState,
@@ -164,6 +166,14 @@ export function resolveConsoleWorkerView(
   return views.find((view) => view.sessionId === selectedSessionId) ?? views[0];
 }
 
+export type ConsoleWorkerMetadata = {
+  model: string | null;
+  reasoning: ReasoningConfig | null;
+  contextWindow: number | null;
+  contextTokens: number | null;
+  contextSource: "measured" | "estimated" | null;
+};
+
 export type ConsoleProjection = {
   lines: ConsoleLine[];
   tasks: ConsoleTask[];
@@ -174,6 +184,7 @@ export type ConsoleProjection = {
   usage: string | null;
   runActivity: RunActivityStats;
   cwd: string | null;
+  workerMetadata: ConsoleWorkerMetadata | null;
   lastEventId: string | null;
   internalWorkers: InternalWorkerProjection[];
   /** Terminal child-session fences, reset only by an authoritative snapshot. */
@@ -204,6 +215,57 @@ function workerStatusFromState(snapshot: WorkerStateSnapshot): WorkerStatus {
   return "running";
 }
 
+function safeTokenCount(value: unknown, allowZero = true): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) &&
+      (allowZero ? value >= 0 : value > 0)
+    ? value
+    : null;
+}
+
+function metadataFromGreeting(greeting: Greeting): ConsoleWorkerMetadata {
+  const contextWindow = safeTokenCount(greeting.context_window, false);
+  const typedTokens = safeTokenCount(greeting.context_usage?.tokens);
+  const legacyTokens = contextWindow === null
+    ? null
+    : safeTokenCount(greeting.context_tokens);
+  const model = greeting.model.trim();
+  return {
+    model: model.length > 0 ? model : null,
+    reasoning: greeting.reasoning ?? null,
+    contextWindow,
+    contextTokens: typedTokens ?? legacyTokens,
+    contextSource: typedTokens !== null
+      ? greeting.context_usage?.source ?? null
+      : legacyTokens !== null
+      ? "estimated"
+      : null,
+  };
+}
+
+function metadataWithUsage(
+  metadata: ConsoleWorkerMetadata | null,
+  inputTokens: number | null | undefined,
+): ConsoleWorkerMetadata {
+  const tokens = safeTokenCount(inputTokens);
+  return {
+    model: metadata?.model ?? null,
+    reasoning: metadata?.reasoning ?? null,
+    contextWindow: metadata?.contextWindow ?? null,
+    contextTokens: tokens,
+    contextSource: tokens === null ? null : "measured",
+  };
+}
+
+function metadataWithoutContext(
+  metadata: ConsoleWorkerMetadata | null,
+): ConsoleWorkerMetadata | null {
+  return metadata && {
+    ...metadata,
+    contextTokens: null,
+    contextSource: null,
+  };
+}
+
 export function emptyConsoleProjection(): ConsoleProjection {
   return {
     lines: [],
@@ -215,6 +277,7 @@ export function emptyConsoleProjection(): ConsoleProjection {
     usage: null,
     runActivity: emptyRunActivityStats(),
     cwd: null,
+    workerMetadata: null,
     lastEventId: null,
     internalWorkers: [],
     removedInternalWorkers: {},
@@ -779,6 +842,9 @@ function projectInternalWorkerSnapshot(
     cwd,
   );
   console.status = snapshot.status;
+  console.workerMetadata = snapshot.greeting
+    ? metadataFromGreeting(snapshot.greeting)
+    : null;
   appendSnapshotInFlightLines(
     console,
     snapshot.in_flight?.blocks ?? [],
@@ -951,6 +1017,7 @@ export function applyProtocolEvent(
       envelope.observedAtMs ?? 0,
     ),
     cwd: projection.cwd,
+    workerMetadata: projection.workerMetadata,
     lastEventId: envelope.eventId,
     internalWorkers: [...projection.internalWorkers],
     removedInternalWorkers: { ...projection.removedInternalWorkers },
@@ -1055,6 +1122,10 @@ export function applyProtocolEvent(
       break;
     case "usage":
       next.usage = usageText(event.data);
+      next.workerMetadata = metadataWithUsage(
+        next.workerMetadata,
+        event.data.input_tokens,
+      );
       break;
     case "error":
       if (hasDurableRunFailure(next, event.data.message)) break;
@@ -1072,6 +1143,7 @@ export function applyProtocolEvent(
       break;
     case "snapshot": {
       next.cwd = event.data.greeting.cwd;
+      next.workerMetadata = metadataFromGreeting(event.data.greeting);
       const snapshot = snapshotProjectionFromSession(
         envelope.eventId,
         event.data.session,
@@ -1171,6 +1243,7 @@ export function applyProtocolEvent(
       next.lines = [...segment.lines, ...retainedErrors, ...retainedCompaction];
       next.tasks = segment.tasks;
       next.taskNextId = segment.taskNextId;
+      next.workerMetadata = metadataWithoutContext(next.workerMetadata);
       break;
     }
     case "invoke_start":
@@ -1196,20 +1269,24 @@ export function applyProtocolEvent(
     case "memory_worker":
     case "completions":
     case "rewind_targets":
-    case "rewind_applied":
     case "workers_listed":
     case "worker_restored":
     case "peer_registered":
       // These are protocol/status/control events. TUI Console does not append
       // them to the conversation surface; browser Console should not either.
       break;
+    case "rewind_applied":
+      next.workerMetadata = metadataWithoutContext(next.workerMetadata);
+      break;
     case "compaction_progress":
       return applyInFlightCompaction(next, event.data.compaction ?? null);
     case "compact_start":
-    case "compact_done":
     case "compact_failed":
       // Durable lifecycle events are retained only as historical protocol
       // compatibility. Runtime progress is the sole Console block authority.
+      break;
+    case "compact_done":
+      next.workerMetadata = metadataWithoutContext(next.workerMetadata);
       break;
     case "shutdown":
       next.status = "shutdown";
@@ -2182,6 +2259,7 @@ function snapshotProjectionFromSession(
     usage: null,
     runActivity: emptyRunActivityStats(),
     cwd,
+    workerMetadata: null,
     lastEventId: eventId,
     internalWorkers: [],
     removedInternalWorkers: {},
