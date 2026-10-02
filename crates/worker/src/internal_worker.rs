@@ -7,7 +7,7 @@
 //! need durable domain audit must keep using their domain authority (for example Memory audit).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use agen::timeline::event::UsageEvent;
 use agen::{Engine, EngineError, llm_client::LlmClient};
@@ -17,7 +17,9 @@ use session_store::{LogEntry, SegmentId, SessionId, Store, StoreError, TraceEntr
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::controller::{wire_event_bridges_on_engine, wire_workdir_command_events};
+use crate::controller::{
+    build_greeting, wire_event_bridges_on_engine, wire_workdir_command_events,
+};
 use crate::feature::FeatureRegistryBuilder;
 use crate::in_flight::{InFlightEvents, snapshot_from_guard};
 use crate::ipc::alerter::Alerter;
@@ -409,6 +411,7 @@ enum InternalWorkerSessionCommand {
 #[derive(Debug, Clone)]
 pub(crate) struct InternalWorkerSessionSnapshot {
     pub session: protocol::SessionSnapshot,
+    pub greeting: Option<protocol::Greeting>,
     pub status: WorkerStatus,
     pub error: Option<String>,
     pub in_flight: InFlightSnapshot,
@@ -428,6 +431,7 @@ pub(crate) struct InternalWorkerSessionHandle {
     visibility: InternalWorkerVisibility,
     last_error: Arc<Mutex<Option<String>>>,
     last_outcome: Arc<Mutex<Option<InternalWorkerTurnOutcome>>>,
+    greeting: Option<Arc<RwLock<protocol::Greeting>>>,
     child_registry: Option<Arc<SpawnedWorkerRegistry>>,
     sink: SegmentLogSink,
     #[cfg(test)]
@@ -481,6 +485,12 @@ impl InternalWorkerSessionHandle {
         };
         InternalWorkerSessionSnapshot {
             session: session_store::public_snapshot::project_current_session_snapshot(&entries),
+            greeting: self.greeting.as_ref().map(|greeting| {
+                greeting
+                    .read()
+                    .expect("internal Worker greeting lock poisoned")
+                    .clone()
+            }),
             status: match self.status() {
                 InternalWorkerSessionStatus::Running => WorkerStatus::Running,
                 InternalWorkerSessionStatus::Paused => WorkerStatus::Paused,
@@ -824,6 +834,23 @@ fn spawn_internal_log_event_bridge(sink: SegmentLogSink, event_tx: broadcast::Se
     });
 }
 
+fn publish_internal_context_usage(
+    greeting: &RwLock<protocol::Greeting>,
+    event_tx: &broadcast::Sender<Event>,
+    tokens: Option<u64>,
+    source: protocol::ContextTokenSource,
+) {
+    let usage = tokens.map(|tokens| protocol::ContextUsage { tokens, source });
+    {
+        let mut greeting = greeting
+            .write()
+            .expect("internal Worker greeting lock poisoned");
+        greeting.context_tokens = tokens.unwrap_or_default();
+        greeting.context_usage = usage;
+    }
+    let _ = event_tx.send(Event::ContextUsage { usage });
+}
+
 pub(crate) async fn prepare_internal_worker_session(
     mut worker: Worker<Box<dyn LlmClient>, EphemeralSessionStore>,
     store: EphemeralSessionStore,
@@ -851,8 +878,20 @@ pub(crate) async fn prepare_internal_worker_session(
     worker.attach_alerter(alerter.clone());
     worker.attach_working_event_tx(event_tx.clone());
     worker.attach_in_flight_events(in_flight.clone());
+    let greeting = Arc::new(RwLock::new(build_greeting(&worker)));
     wire_event_bridges_on_engine(&mut worker, &event_tx, &alerter, &in_flight);
+    let usage_greeting = greeting.clone();
+    let usage_events = event_tx.clone();
+    worker.engine_mut().on_usage(move |event| {
+        publish_internal_context_usage(
+            &usage_greeting,
+            &usage_events,
+            event.input_tokens,
+            protocol::ContextTokenSource::Measured,
+        );
+    });
 
+    let actor_greeting = greeting.clone();
     let session_id = worker.session_id();
     let segment_id = worker.segment_id();
     let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(8);
@@ -874,6 +913,7 @@ pub(crate) async fn prepare_internal_worker_session(
         visibility,
         last_error: last_error.clone(),
         last_outcome: last_outcome.clone(),
+        greeting: Some(greeting),
         child_registry,
         sink,
         #[cfg(test)]
@@ -886,50 +926,56 @@ pub(crate) async fn prepare_internal_worker_session(
             match command {
                 InternalWorkerSessionCommand::Run(input) => {
                     actor_in_flight.clear();
-                    let cancel_sender = worker.engine_mut().cancel_sender();
-                    let mut run = std::pin::pin!(worker.run_text(&input));
-                    loop {
-                        tokio::select! {
-                            result = &mut run => {
-                                let (turn_status, error, outcome) =
-                                    classify_internal_turn_result(result);
-                                actor_in_flight.clear();
-                                *last_outcome.lock().unwrap() = Some(outcome);
-                                status.store(turn_status.encode(), std::sync::atomic::Ordering::Release);
-                                if let Some(message) = error {
-                                    *last_error.lock().unwrap() = Some(message.clone());
-                                    let _ = event_tx.send(Event::Error {
-                                        code: protocol::ErrorCode::Internal,
-                                        message,
-                                    });
+                    let (turn_status, error, outcome) = {
+                        let cancel_sender = worker.engine_mut().cancel_sender();
+                        let mut run = std::pin::pin!(worker.run_text(&input));
+                        loop {
+                            tokio::select! {
+                                result = &mut run => {
+                                    break classify_internal_turn_result(result);
                                 }
-                                send_internal_worker_state(&event_tx, turn_status);
-                                if let Some(callback) = &on_turn_end {
-                                    callback(turn_status);
-                                }
-                                state_changed.notify_waiters();
-                                break;
-                            }
-                            command = command_rx.recv() => {
-                                match command {
-                                    Some(InternalWorkerSessionCommand::Stop(done)) => {
-                                        let _ = cancel_sender.send(()).await;
-                                        let _ = (&mut run).await;
-                                        stop_done = Some(done);
-                                        break 'actor;
-                                    }
-                                    Some(InternalWorkerSessionCommand::Run(_)) => {
-                                        // `send` reserves Running atomically, so a second Run cannot be enqueued.
-                                    }
-                                    None => {
-                                        let _ = cancel_sender.send(()).await;
-                                        let _ = (&mut run).await;
-                                        break 'actor;
+                                command = command_rx.recv() => {
+                                    match command {
+                                        Some(InternalWorkerSessionCommand::Stop(done)) => {
+                                            let _ = cancel_sender.send(()).await;
+                                            let _ = (&mut run).await;
+                                            stop_done = Some(done);
+                                            break 'actor;
+                                        }
+                                        Some(InternalWorkerSessionCommand::Run(_)) => {
+                                            // `send` reserves Running atomically, so a second Run cannot be enqueued.
+                                        }
+                                        None => {
+                                            let _ = cancel_sender.send(()).await;
+                                            let _ = (&mut run).await;
+                                            break 'actor;
+                                        }
                                     }
                                 }
                             }
                         }
+                    };
+                    publish_internal_context_usage(
+                        &actor_greeting,
+                        &event_tx,
+                        Some(worker.total_tokens().tokens),
+                        protocol::ContextTokenSource::Estimated,
+                    );
+                    actor_in_flight.clear();
+                    *last_outcome.lock().unwrap() = Some(outcome);
+                    status.store(turn_status.encode(), std::sync::atomic::Ordering::Release);
+                    if let Some(message) = error {
+                        *last_error.lock().unwrap() = Some(message.clone());
+                        let _ = event_tx.send(Event::Error {
+                            code: protocol::ErrorCode::Internal,
+                            message,
+                        });
                     }
+                    send_internal_worker_state(&event_tx, turn_status);
+                    if let Some(callback) = &on_turn_end {
+                        callback(turn_status);
+                    }
+                    state_changed.notify_waiters();
                 }
                 InternalWorkerSessionCommand::Stop(done) => {
                     stop_done = Some(done);
@@ -1175,6 +1221,14 @@ impl session_store::WorkerMetadataStore for EphemeralSessionStore {
 pub(crate) fn test_internal_worker_session(
     visibility: InternalWorkerVisibility,
 ) -> (InternalWorkerSessionHandle, broadcast::Sender<Event>) {
+    test_internal_worker_session_with_greeting(visibility, None)
+}
+
+#[cfg(test)]
+pub(crate) fn test_internal_worker_session_with_greeting(
+    visibility: InternalWorkerVisibility,
+    greeting: Option<protocol::Greeting>,
+) -> (InternalWorkerSessionHandle, broadcast::Sender<Event>) {
     let store = EphemeralSessionStore::default();
     let session_id = session_store::new_session_id();
     let segment_id = session_store::new_segment_id();
@@ -1206,6 +1260,7 @@ pub(crate) fn test_internal_worker_session(
         visibility,
         last_error: Arc::new(Mutex::new(None)),
         last_outcome: Arc::new(Mutex::new(None)),
+        greeting: greeting.map(|greeting| Arc::new(RwLock::new(greeting))),
         child_registry: None,
         sink,
         fail_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1485,11 +1540,37 @@ permission = "write"
         assert_eq!(handle.protocol_snapshot().in_flight.blocks.len(), 1);
         let entries_after_first = handle.entries().len();
         assert!(entries_after_first >= 4);
+        assert!(matches!(
+            handle
+                .protocol_snapshot()
+                .greeting
+                .and_then(|greeting| greeting.context_usage),
+            Some(protocol::ContextUsage {
+                source: protocol::ContextTokenSource::Estimated,
+                ..
+            })
+        ));
+        let mut events = handle.subscribe_events();
         handle.send("follow-up").await.expect("send follow-up turn");
         assert_eq!(
             handle.wait_until_idle().await,
             InternalWorkerSessionStatus::Idle
         );
+        let mut saw_estimated_context = false;
+        while let Ok(event) = events.try_recv() {
+            if matches!(
+                event,
+                Event::ContextUsage {
+                    usage: Some(protocol::ContextUsage {
+                        source: protocol::ContextTokenSource::Estimated,
+                        ..
+                    })
+                }
+            ) {
+                saw_estimated_context = true;
+            }
+        }
+        assert!(saw_estimated_context);
         assert!(handle.protocol_snapshot().in_flight.blocks.is_empty());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(handle.entries().len() > entries_after_first);

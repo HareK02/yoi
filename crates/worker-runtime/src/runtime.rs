@@ -5626,6 +5626,7 @@ mod tests {
             worker,
             revision,
             status,
+            greeting: None,
             session: protocol::SessionSnapshot {
                 pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: Vec::new(),
@@ -5651,6 +5652,8 @@ mod tests {
                 tools: Vec::new(),
                 context_window: 0,
                 context_tokens: 0,
+                reasoning: None,
+                context_usage: None,
             },
             state: protocol::WorkerStatus::Idle.into(),
             in_flight: protocol::InFlightSnapshot::default(),
@@ -8263,6 +8266,8 @@ mod tests {
                     tools: Vec::new(),
                     context_window: 128,
                     context_tokens: 64,
+                    reasoning: None,
+                    context_usage: None,
                 },
                 state: protocol::WorkerStatus::Running.into(),
                 in_flight: protocol::InFlightSnapshot {

@@ -151,7 +151,7 @@ impl WorkerHandle {
             .snapshot();
         let event = Event::Snapshot {
             session,
-            greeting: self.shared_state.greeting.clone(),
+            greeting: self.shared_state.greeting(),
             state: self.shared_state.snapshot(),
             in_flight,
             internal_workers: self.spawned_registry.internal_worker_snapshots(),
@@ -269,6 +269,17 @@ async fn set_controller_state(
     snapshot
 }
 
+fn publish_context_usage(
+    shared_state: &Arc<WorkerSharedState>,
+    working_event_tx: &broadcast::Sender<Event>,
+    tokens: Option<u64>,
+    source: protocol::ContextTokenSource,
+) {
+    shared_state.update_context_usage(tokens, source);
+    let usage = tokens.map(|tokens| protocol::ContextUsage { tokens, source });
+    let _ = working_event_tx.send(Event::ContextUsage { usage });
+}
+
 async fn set_controller_status(
     shared_state: &Arc<WorkerSharedState>,
     runtime_dir: &RuntimeDir,
@@ -303,6 +314,12 @@ async fn finish_controller_run<C, St>(
     // the terminal run boundary so reconnect snapshots cannot append stale
     // partial text/tool arguments after newer entries.
     worker.clear_in_flight_events();
+    publish_context_usage(
+        shared_state,
+        working_event_tx,
+        Some(worker.total_tokens().tokens),
+        protocol::ContextTokenSource::Estimated,
+    );
     set_controller_status(shared_state, runtime_dir, working_event_tx, new_status).await;
 }
 
@@ -792,6 +809,16 @@ impl WorkerController {
             manifest_toml.clone(),
             greeting,
         ));
+        let usage_state = shared_state.clone();
+        let usage_events = working_event_tx.clone();
+        worker.engine_mut().on_usage(move |event| {
+            publish_context_usage(
+                &usage_state,
+                &usage_events,
+                event.input_tokens,
+                protocol::ContextTokenSource::Measured,
+            );
+        });
         if let Some(fs_for_view) = fs_for_view {
             shared_state.set_fs_view(crate::fs_view::WorkerFsView::new(fs_for_view));
         }
@@ -2518,6 +2545,12 @@ async fn controller_loop<C, St>(
                         }
                     }
                 };
+                publish_context_usage(
+                    &shared_state,
+                    &working_event_tx,
+                    Some(worker.total_tokens().tokens),
+                    protocol::ContextTokenSource::Estimated,
+                );
                 if !matches!(
                     result,
                     Err(WorkerError::Store(_))
@@ -2585,6 +2618,12 @@ async fn controller_loop<C, St>(
                     .await
                     {
                         worker.clear_in_flight_events();
+                        publish_context_usage(
+                            &shared_state,
+                            &working_event_tx,
+                            Some(worker.total_tokens().tokens),
+                            protocol::ContextTokenSource::Estimated,
+                        );
                         let snapshot = shared_state.transition(WorkerState::Idle);
                         let _ = working_event_tx.send(Event::WorkerState { snapshot });
                     }
@@ -3392,7 +3431,24 @@ fn model_supports_image_attachments(model: &manifest::ModelManifest) -> bool {
     })
 }
 
-fn build_greeting<C, St>(worker: &Worker<C, St>) -> protocol::Greeting
+fn public_reasoning_config(
+    reasoning: &agen::llm_client::capability::ReasoningControl,
+) -> protocol::ReasoningConfig {
+    match reasoning {
+        agen::llm_client::capability::ReasoningControl::Effort(effort) => {
+            protocol::ReasoningConfig::Effort {
+                effort: effort.as_str().to_owned(),
+            }
+        }
+        agen::llm_client::capability::ReasoningControl::BudgetTokens(budget_tokens) => {
+            protocol::ReasoningConfig::BudgetTokens {
+                budget_tokens: *budget_tokens,
+            }
+        }
+    }
+}
+
+pub(crate) fn build_greeting<C, St>(worker: &Worker<C, St>) -> protocol::Greeting
 where
     C: LlmClient + 'static,
     St: Store,
@@ -3435,6 +3491,7 @@ where
         .into_iter()
         .map(|def| def.name)
         .collect();
+    let context_tokens = worker.total_tokens().tokens;
     protocol::Greeting {
         worker_name: manifest.worker.name.clone(),
         cwd: worker
@@ -3443,10 +3500,19 @@ where
             .unwrap_or_default(),
         provider: provider_name,
         model: model_id,
+        reasoning: manifest
+            .engine
+            .reasoning
+            .as_ref()
+            .map(public_reasoning_config),
         scope_summary: worker.scope_snapshot().summary(),
         tools: tool_names,
         context_window,
-        context_tokens: worker.total_tokens().tokens,
+        context_tokens,
+        context_usage: Some(protocol::ContextUsage {
+            tokens: context_tokens,
+            source: protocol::ContextTokenSource::Estimated,
+        }),
     }
 }
 
@@ -3507,6 +3573,69 @@ mod tests {
 
         assert!(feature_install < materialize);
         assert!(materialize < exposure);
+    }
+
+    #[test]
+    fn public_reasoning_config_preserves_effort_and_signed_budget() {
+        let effort =
+            public_reasoning_config(&agen::llm_client::capability::ReasoningControl::Effort(
+                agen::llm_client::capability::ReasoningEffort::Other("provider-native".into()),
+            ));
+        assert_eq!(
+            effort,
+            protocol::ReasoningConfig::Effort {
+                effort: "provider-native".into(),
+            }
+        );
+
+        let budget = public_reasoning_config(
+            &agen::llm_client::capability::ReasoningControl::BudgetTokens(-1),
+        );
+        assert_eq!(
+            budget,
+            protocol::ReasoningConfig::BudgetTokens { budget_tokens: -1 }
+        );
+    }
+
+    #[test]
+    fn context_usage_publication_updates_reconnect_state_and_live_clients() {
+        let shared_state = Arc::new(WorkerSharedState::new(
+            "worker".into(),
+            session_store::new_segment_id(),
+            String::new(),
+            protocol::Greeting {
+                worker_name: "worker".into(),
+                cwd: "/tmp".into(),
+                provider: "provider".into(),
+                model: "model".into(),
+                reasoning: None,
+                scope_summary: String::new(),
+                tools: Vec::new(),
+                context_window: 100_000,
+                context_tokens: 0,
+                context_usage: None,
+            },
+        ));
+        let (events, mut receiver) = broadcast::channel(4);
+
+        publish_context_usage(
+            &shared_state,
+            &events,
+            Some(25_000),
+            protocol::ContextTokenSource::Estimated,
+        );
+
+        let expected = protocol::ContextUsage {
+            tokens: 25_000,
+            source: protocol::ContextTokenSource::Estimated,
+        };
+        assert_eq!(shared_state.greeting().context_usage, Some(expected));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::ContextUsage {
+                usage: Some(usage)
+            }) if usage == expected
+        ));
     }
 
     #[test]
@@ -3667,6 +3796,8 @@ mod tests {
                 tools: Vec::new(),
                 context_window: 200_000,
                 context_tokens: 0,
+                reasoning: None,
+                context_usage: None,
             },
         ));
         let notify_buffer = NotifyBuffer::new();
@@ -3716,6 +3847,8 @@ mod tests {
                         tools: Vec::new(),
                         context_window: 200_000,
                         context_tokens: 0,
+                        reasoning: None,
+                        context_usage: None,
                     },
                     state: WorkerStatus::Idle.into(),
                     in_flight: Default::default(),
@@ -4424,6 +4557,8 @@ mod tests {
                 tools: Vec::new(),
                 context_window: 1,
                 context_tokens: 0,
+                reasoning: None,
+                context_usage: None,
             },
         );
         assert!(

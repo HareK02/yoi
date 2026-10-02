@@ -6,17 +6,18 @@ use ts_rs::{Config, TS};
 use crate::{
     Alert, AlertLevel, AlertSource, CommandEvent, CommandSnapshot, CommandStatus, CommandStream,
     CommandStreamSlice, CompactionLifecycle, CompactionLifecycleState, CompactionPhase,
-    CompactionTrigger, CompletionEntry, CompletionKind, ErrorCode, Event, Greeting, InFlightBlock,
-    InFlightCompaction, InFlightSnapshot, InFlightToolCallState, InternalWorkerKind,
-    InternalWorkerRef, InternalWorkerSnapshot, InvokeKind, MemoryWorkerEvent, Method,
-    PasteArtifactAvailability, PasteArtifactMediaType, PasteArtifactRef, PendingSubmissionSummary,
-    PendingSubmissionsSnapshot, Permission, RewindSummary, RewindTarget, RewindTargetId,
-    RunFailureKind, RunResult, RunResumeSource, RunYieldReason, ScopeRule, Segment,
-    SessionContentPart, SessionConversationTurn, SessionEntryProvenance,
-    SessionHistoryLineageBoundary, SessionHistoryPage, SessionMessageRole, SessionSnapshot,
-    SessionSnapshotEntry, SessionSnapshotEntryData, SessionToolAttachment, SubmissionDisposition,
-    SymlinkPolicy, ToolResultDisposition, TurnResult, UploadedFileAvailability, UploadedFileRef,
-    WorkerBusyState, WorkerCommandAcknowledgement, WorkerCommandDisposition, WorkerCommandEnvelope,
+    CompactionTrigger, CompletionEntry, CompletionKind, ContextTokenSource, ContextUsage,
+    ErrorCode, Event, Greeting, InFlightBlock, InFlightCompaction, InFlightSnapshot,
+    InFlightToolCallState, InternalWorkerKind, InternalWorkerRef, InternalWorkerSnapshot,
+    InvokeKind, MemoryWorkerEvent, Method, PasteArtifactAvailability, PasteArtifactMediaType,
+    PasteArtifactRef, PendingSubmissionSummary, PendingSubmissionsSnapshot, Permission,
+    ReasoningConfig, RewindSummary, RewindTarget, RewindTargetId, RunFailureKind, RunResult,
+    RunResumeSource, RunYieldReason, ScopeRule, Segment, SessionContentPart,
+    SessionConversationTurn, SessionEntryProvenance, SessionHistoryLineageBoundary,
+    SessionHistoryPage, SessionMessageRole, SessionSnapshot, SessionSnapshotEntry,
+    SessionSnapshotEntryData, SessionToolAttachment, SubmissionDisposition, SymlinkPolicy,
+    ToolResultDisposition, TurnResult, UploadedFileAvailability, UploadedFileRef, WorkerBusyState,
+    WorkerCommandAcknowledgement, WorkerCommandDisposition, WorkerCommandEnvelope,
     WorkerCommandKind, WorkerEvent, WorkerMaintenanceState, WorkerRunState, WorkerState,
     WorkerStateSnapshot, WorkerStatus,
     subscription::{
@@ -116,10 +117,13 @@ pub fn generated_protocol_types() -> String {
     push_decl::<PendingSubmissionsSnapshot>(&cfg, &mut output);
     push_decl::<SubmissionDisposition>(&cfg, &mut output);
     push_decl::<SessionSnapshot>(&cfg, &mut output);
+    push_decl::<ReasoningConfig>(&cfg, &mut output);
+    push_decl::<ContextTokenSource>(&cfg, &mut output);
+    push_decl::<ContextUsage>(&cfg, &mut output);
+    push_decl::<Greeting>(&cfg, &mut output);
     push_decl::<InternalWorkerKind>(&cfg, &mut output);
     push_decl::<InternalWorkerRef>(&cfg, &mut output);
     push_decl::<InternalWorkerSnapshot>(&cfg, &mut output);
-    push_decl::<Greeting>(&cfg, &mut output);
     push_decl::<Alert>(&cfg, &mut output);
     push_decl::<MemoryWorkerEvent>(&cfg, &mut output);
     push_decl::<PasteArtifactMediaType>(&cfg, &mut output);
@@ -256,20 +260,71 @@ fn rust_serialized_subscription_frame_fixtures() -> Vec<SubscriptionFrame> {
     ));
     let pending =
         SubscriptionFrame::new(SubscriptionFramePayload::Event(SubscriptionEvent::Event {
-            subscription_id,
+            subscription_id: subscription_id.clone(),
             payload: SubscriptionEventPayload::WorkerProtocol {
-                worker_id,
+                worker_id: worker_id.clone(),
                 event: Event::PendingSubmissionsChanged {
                     pending: PendingSubmissionsSnapshot::default(),
                 },
             },
         }));
-    for fixture in [&subscribed, &pending] {
+    let greeting = Greeting {
+        worker_name: "fixture-worker".into(),
+        cwd: "/fixture".into(),
+        provider: "openai_responses".into(),
+        model: "gpt-6-astra".into(),
+        reasoning: Some(ReasoningConfig::Effort {
+            effort: "high".into(),
+        }),
+        scope_summary: "fixture scope".into(),
+        tools: vec!["Read".into()],
+        context_window: 272_000,
+        context_tokens: 142_000,
+        context_usage: Some(ContextUsage {
+            tokens: 142_000,
+            source: ContextTokenSource::Measured,
+        }),
+    };
+    let snapshot =
+        SubscriptionFrame::new(SubscriptionFramePayload::Event(SubscriptionEvent::Event {
+            subscription_id,
+            payload: SubscriptionEventPayload::WorkerProtocol {
+                worker_id,
+                event: Event::Snapshot {
+                    session: SessionSnapshot {
+                        pending_submissions: PendingSubmissionsSnapshot::default(),
+                        entries: Vec::new(),
+                    },
+                    greeting: greeting.clone(),
+                    state: WorkerStateSnapshot::initial(),
+                    in_flight: InFlightSnapshot::default(),
+                    internal_workers: vec![InternalWorkerSnapshot {
+                        worker: InternalWorkerRef {
+                            session_id: "fixture-child-session".into(),
+                            name: "fixture-child".into(),
+                            parent_session_id: Some("fixture-parent-session".into()),
+                            kind: InternalWorkerKind::SubWorker,
+                        },
+                        revision: 1,
+                        session: SessionSnapshot {
+                            pending_submissions: PendingSubmissionsSnapshot::default(),
+                            entries: Vec::new(),
+                        },
+                        greeting: Some(greeting),
+                        status: WorkerStatus::Idle,
+                        error: None,
+                        in_flight: InFlightSnapshot::default(),
+                        internal_workers: Vec::new(),
+                    }],
+                },
+            },
+        }));
+    for fixture in [&subscribed, &pending, &snapshot] {
         fixture
             .validate()
             .expect("Rust-serialized Browser compatibility fixture must validate");
     }
-    vec![subscribed, pending]
+    vec![subscribed, pending, snapshot]
 }
 
 fn close_object_shapes(schema: &mut Value) {

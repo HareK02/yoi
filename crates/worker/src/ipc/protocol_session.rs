@@ -16,9 +16,23 @@ pub struct WorkerProtocolSessionStreams {
     pub events: broadcast::Receiver<Event>,
 }
 
+fn subscribe_before_snapshot<Subscription, Snapshot>(
+    subscribe: impl FnOnce() -> Subscription,
+    snapshot: impl FnOnce() -> Snapshot,
+) -> (Snapshot, Subscription) {
+    // Subscription must exist before any snapshot field is read. A concurrent
+    // state update can then appear in both lanes, but it can never be absent
+    // from both the snapshot and the queued live stream.
+    let subscription = subscribe();
+    let snapshot = snapshot();
+    (snapshot, subscription)
+}
+
 pub fn subscribe_worker_protocol_session(handle: &WorkerHandle) -> WorkerProtocolSessionStreams {
-    let (snapshot_event, log_entries) = handle.snapshot_event_with_entry_subscription();
-    let (alert_snapshot, events) = handle.alerter.subscribe_with_snapshot();
+    let ((snapshot_event, log_entries), (alert_snapshot, events)) = subscribe_before_snapshot(
+        || handle.alerter.subscribe_with_snapshot(),
+        || handle.snapshot_event_with_entry_subscription(),
+    );
     WorkerProtocolSessionStreams {
         snapshot_event,
         alert_snapshot,
@@ -127,6 +141,36 @@ mod tests {
             Event::SessionEntryCommitted { entry } => entry,
             other => panic!("expected SessionEntryCommitted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn context_publication_between_subscription_and_snapshot_cannot_be_missed() {
+        let (events, _) = broadcast::channel(4);
+        let context_tokens = std::cell::Cell::new(20_u64);
+
+        let (snapshot_tokens, mut receiver) = subscribe_before_snapshot(
+            || events.subscribe(),
+            || {
+                context_tokens.set(25);
+                events
+                    .send(Event::ContextUsage {
+                        usage: Some(protocol::ContextUsage {
+                            tokens: 25,
+                            source: protocol::ContextTokenSource::Estimated,
+                        }),
+                    })
+                    .unwrap();
+                context_tokens.get()
+            },
+        );
+
+        assert_eq!(snapshot_tokens, 25);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::ContextUsage {
+                usage: Some(protocol::ContextUsage { tokens: 25, .. })
+            })
+        ));
     }
 
     #[test]
