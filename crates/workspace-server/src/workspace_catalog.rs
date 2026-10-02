@@ -296,7 +296,7 @@ mod tests {
             display_name: "Workspace A".to_string(),
             repository: InitialRepositoryIntent {
                 uri: repository.path().display().to_string(),
-                repository_key: "main".to_string(),
+                repository_key: "platform".to_string(),
                 default_ref: None,
             },
         };
@@ -322,19 +322,46 @@ mod tests {
         assert_eq!(signing_identity.algorithm, "ed25519");
         assert!(signing_identity.public_key.is_some());
         assert!(signing_identity.public_key_fingerprint.is_some());
-        assert_eq!(
-            store
-                .list_repositories(&created.workspace.workspace_id)
-                .unwrap()
-                .len(),
-            1
-        );
+        let repositories = store
+            .list_repositories(&created.workspace.workspace_id)
+            .unwrap();
+        assert_eq!(repositories.len(), 1);
+        assert_eq!(repositories[0].repository_key, "platform");
         assert!(
             store
                 .load_workspace_config(&created.workspace.workspace_id)
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn create_rejects_blank_repository_key_without_persisting_a_workspace() {
+        let store = Arc::new(SqliteWorkspaceStore::in_memory().unwrap());
+        let service = WorkspaceCatalogService::new(
+            store.clone(),
+            Arc::new(
+                crate::workspace_signing_identity::InMemoryWorkspaceSigningMaterialStore::default(),
+            ),
+        );
+        let repository = git_repository();
+        let request = WorkspaceCreateRequest {
+            operation_key: "blank-repository-key".to_string(),
+            display_name: "Workspace A".to_string(),
+            repository: InitialRepositoryIntent {
+                uri: repository.path().display().to_string(),
+                repository_key: "   ".to_string(),
+                default_ref: None,
+            },
+        };
+
+        let error = service
+            .create(request, owner_account(store.as_ref()))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("invalid Repository key"), "{error}");
+        assert!(store.list_workspaces().unwrap().is_empty());
     }
 
     #[tokio::test]

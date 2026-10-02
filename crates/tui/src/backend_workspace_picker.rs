@@ -11,7 +11,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use std::error::Error;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type PickerResult<T> = Result<T, Box<dyn Error>>;
@@ -179,18 +179,47 @@ fn prompt_create_request() -> PickerResult<Option<CreateBackendWorkspaceRequest>
 }
 
 fn prompt_create_request_inner() -> PickerResult<Option<CreateBackendWorkspaceRequest>> {
-    println!("Create Workspace (leave display name empty to cancel)");
-    let display_name = prompt_line("Workspace display name: ")?;
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    prompt_create_request_with_io(&mut stdin.lock(), &mut stdout.lock())
+}
+
+fn prompt_create_request_with_io(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> PickerResult<Option<CreateBackendWorkspaceRequest>> {
+    writeln!(
+        output,
+        "Create Workspace (leave display name empty to cancel)"
+    )?;
+    let Some(display_name) = prompt_line(input, output, "Workspace display name: ")? else {
+        return Ok(None);
+    };
     if display_name.is_empty() {
         return Ok(None);
     }
-    let uri = prompt_line("Initial repository absolute path/URI: ")?;
+    let Some(uri) = prompt_line(input, output, "Initial repository absolute path/URI: ")? else {
+        return Ok(None);
+    };
     if uri.is_empty() {
-        println!("Repository path/URI is required.");
+        writeln!(output, "Repository path/URI is required.")?;
         return Ok(None);
     }
-    let repository_key = prompt_line("Repository key [main]: ")?;
-    let default_ref = prompt_line("Default ref [repository default]: ")?;
+    let repository_key = loop {
+        let Some(repository_key) = prompt_line(input, output, "Repository key (required): ")?
+        else {
+            return Ok(None);
+        };
+        if repository_key.is_empty() {
+            writeln!(output, "Repository key is required.")?;
+            continue;
+        }
+        break repository_key;
+    };
+    let Some(default_ref) = prompt_line(input, output, "Default ref [repository default]: ")?
+    else {
+        return Ok(None);
+    };
     let operation_key = format!(
         "tui-workspace-create-{}-{}",
         std::process::id(),
@@ -204,27 +233,37 @@ fn prompt_create_request_inner() -> PickerResult<Option<CreateBackendWorkspaceRe
         display_name,
         repository: CreateBackendWorkspaceRepository {
             uri,
-            repository_key: if repository_key.is_empty() {
-                "main".to_string()
-            } else {
-                repository_key
-            },
+            repository_key,
             default_ref: (!default_ref.is_empty()).then_some(default_ref),
         },
     }))
 }
 
-fn prompt_line(prompt: &str) -> PickerResult<String> {
-    print!("{prompt}");
-    io::stdout().flush()?;
+fn prompt_line(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    prompt: &str,
+) -> PickerResult<Option<String>> {
+    write!(output, "{prompt}")?;
+    output.flush()?;
     let mut value = String::new();
-    io::stdin().read_line(&mut value)?;
-    Ok(value.trim().to_string())
+    if input.read_line(&mut value)? == 0 {
+        return Ok(None);
+    }
+    Ok(Some(value.trim().to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    fn prompt_create(input: &str) -> (Option<CreateBackendWorkspaceRequest>, String) {
+        let mut input = Cursor::new(input.as_bytes());
+        let mut output = Vec::new();
+        let request = prompt_create_request_with_io(&mut input, &mut output).unwrap();
+        (request, String::from_utf8(output).unwrap())
+    }
 
     #[test]
     fn picker_actions_distinguish_switch_refresh_create_and_cancel() {
@@ -236,5 +275,48 @@ mod tests {
             WorkspacePickerAction::Select(0),
             WorkspacePickerAction::Cancel
         );
+    }
+
+    #[test]
+    fn workspace_creation_preserves_an_explicit_non_main_repository_key() {
+        let (request, output) = prompt_create("Platform\n/srv/platform\nplatform\ndevelop\n");
+        let request = request.expect("complete input should create a request");
+
+        assert_eq!(request.display_name, "Platform");
+        assert_eq!(request.repository.uri, "/srv/platform");
+        assert_eq!(request.repository.repository_key, "platform");
+        assert_eq!(request.repository.default_ref.as_deref(), Some("develop"));
+        assert!(output.contains("Repository key (required): "));
+        assert!(!output.contains("Repository key [main]"));
+    }
+
+    #[test]
+    fn workspace_creation_reprompts_for_blank_repository_keys() {
+        let (request, output) = prompt_create("Platform\n/srv/platform\n\n   \nplatform\n\n");
+        let request = request.expect("a later explicit key should create a request");
+
+        assert_eq!(request.repository.repository_key, "platform");
+        assert_eq!(output.matches("Repository key is required.").count(), 2);
+        assert_eq!(output.matches("Repository key (required): ").count(), 3);
+    }
+
+    #[test]
+    fn workspace_creation_accepts_explicit_main_repository_key() {
+        let (request, _) = prompt_create("Workspace\n/srv/repository\nmain\n\n");
+
+        assert_eq!(
+            request.unwrap().repository.repository_key,
+            "main",
+            "main remains valid when the creator enters it explicitly"
+        );
+    }
+
+    #[test]
+    fn workspace_creation_cancels_on_eof_instead_of_retrying_forever() {
+        let (request, output) = prompt_create("Workspace\n/srv/repository\n   \n");
+
+        assert!(request.is_none());
+        assert_eq!(output.matches("Repository key is required.").count(), 1);
+        assert_eq!(output.matches("Repository key (required): ").count(), 2);
     }
 }
