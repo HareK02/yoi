@@ -336,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn create_rejects_blank_repository_key_without_persisting_a_workspace() {
+    fn create_rejects_noncanonical_repository_keys_without_persisting_a_workspace() {
         let store = Arc::new(SqliteWorkspaceStore::in_memory().unwrap());
         let service = WorkspaceCatalogService::new(
             store.clone(),
@@ -345,23 +345,30 @@ mod tests {
             ),
         );
         let repository = git_repository();
-        let request = WorkspaceCreateRequest {
-            operation_key: "blank-repository-key".to_string(),
-            display_name: "Workspace A".to_string(),
-            repository: InitialRepositoryIntent {
-                uri: repository.path().display().to_string(),
-                repository_key: "   ".to_string(),
-                default_ref: None,
-            },
-        };
+        let owner_account_id = owner_account(store.as_ref());
 
-        let error = service
-            .create(request, owner_account(store.as_ref()))
-            .unwrap_err()
-            .to_string();
+        for (operation_key, repository_key) in [
+            ("blank-repository-key", "   "),
+            ("spaced-repository-key", " platform "),
+        ] {
+            let request = WorkspaceCreateRequest {
+                operation_key: operation_key.to_string(),
+                display_name: "Workspace A".to_string(),
+                repository: InitialRepositoryIntent {
+                    uri: repository.path().display().to_string(),
+                    repository_key: repository_key.to_string(),
+                    default_ref: None,
+                },
+            };
 
-        assert!(error.contains("invalid Repository key"), "{error}");
-        assert!(store.list_workspaces().unwrap().is_empty());
+            let error = service
+                .create(request, owner_account_id.clone())
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains("invalid Repository key"), "{error}");
+            assert!(store.list_workspaces().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]

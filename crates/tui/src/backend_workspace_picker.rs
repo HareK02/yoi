@@ -195,12 +195,14 @@ fn prompt_create_request_with_io(
     let Some(display_name) = prompt_line(input, output, "Workspace display name: ")? else {
         return Ok(None);
     };
+    let display_name = display_name.trim().to_string();
     if display_name.is_empty() {
         return Ok(None);
     }
     let Some(uri) = prompt_line(input, output, "Initial repository absolute path/URI: ")? else {
         return Ok(None);
     };
+    let uri = uri.trim().to_string();
     if uri.is_empty() {
         writeln!(output, "Repository path/URI is required.")?;
         return Ok(None);
@@ -210,7 +212,7 @@ fn prompt_create_request_with_io(
         else {
             return Ok(None);
         };
-        if repository_key.is_empty() {
+        if repository_key.trim().is_empty() {
             writeln!(output, "Repository key is required.")?;
             continue;
         }
@@ -220,6 +222,7 @@ fn prompt_create_request_with_io(
     else {
         return Ok(None);
     };
+    let default_ref = default_ref.trim().to_string();
     let operation_key = format!(
         "tui-workspace-create-{}-{}",
         std::process::id(),
@@ -250,7 +253,13 @@ fn prompt_line(
     if input.read_line(&mut value)? == 0 {
         return Ok(None);
     }
-    Ok(Some(value.trim().to_string()))
+    if value.ends_with('\n') {
+        value.pop();
+        if value.ends_with('\r') {
+            value.pop();
+        }
+    }
+    Ok(Some(value))
 }
 
 #[cfg(test)]
@@ -298,6 +307,17 @@ mod tests {
         assert_eq!(request.repository.repository_key, "platform");
         assert_eq!(output.matches("Repository key is required.").count(), 2);
         assert_eq!(output.matches("Repository key (required): ").count(), 3);
+    }
+
+    #[test]
+    fn workspace_creation_does_not_normalize_a_nonblank_repository_key() {
+        let (request, _) = prompt_create("Workspace\n/srv/repository\n platform \n\n");
+
+        assert_eq!(
+            request.unwrap().repository.repository_key,
+            " platform ",
+            "the Backend must validate the creator's exact Repository key"
+        );
     }
 
     #[test]
