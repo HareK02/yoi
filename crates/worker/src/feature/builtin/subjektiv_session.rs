@@ -730,6 +730,44 @@ mod tests {
                 }
             }
         ));
+
+        let escaped_content = "\0".repeat(8 * 1024);
+        let paged_read = SubjektivSessionBackendResponse::Ok {
+            result: SubjektivSessionBackendResult::Read(server_api::SubjektivSessionReadResponse {
+                session_id: "session-1".into(),
+                segment_id: "segment-1".into(),
+                entry_ref: "Eentry-1".into(),
+                kind: server_api::SubjektivSessionEntryKind::User,
+                origin: protocol::SessionEntryProvenance::HumanInput,
+                lineage: server_api::SubjektivSessionLineage {
+                    kind: server_api::SubjektivSessionLineageKind::Root,
+                    parent_segment_id: None,
+                    at_turn_index: None,
+                },
+                mode: server_api::SubjektivSessionReadMode::Full,
+                content: escaped_content.clone(),
+                truncated: true,
+                next_cursor: Some("next-page".into()),
+                has_more: true,
+            }),
+        };
+        let output = model_visible_response(paged_read).unwrap();
+        let content = output.content.unwrap();
+        assert!(content.len() <= SUBJEKTIV_SESSION_MAX_TOOL_CONTENT_BYTES);
+        let visible: SubjektivSessionBackendResponse = serde_json::from_str(&content).unwrap();
+        assert!(matches!(
+            visible,
+            SubjektivSessionBackendResponse::Ok {
+                result: SubjektivSessionBackendResult::Read(
+                    server_api::SubjektivSessionReadResponse {
+                        content,
+                        next_cursor: Some(cursor),
+                        has_more: true,
+                        ..
+                    }
+                )
+            } if content == escaped_content && cursor == "next-page"
+        ));
     }
 
     #[tokio::test]

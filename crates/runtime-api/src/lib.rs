@@ -755,7 +755,8 @@ pub struct SessionPublicSearchRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
     pub tool_part: SessionPublicToolPart,
-    pub offset: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_cursor: Option<String>,
     pub limit: usize,
     pub max_scan_bytes: u64,
     pub max_segments: usize,
@@ -789,7 +790,10 @@ pub struct SessionPublicSearchItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_part: Option<SessionPublicToolPart>,
     pub compact: String,
+    pub compact_truncated: bool,
     pub lineage: SessionPublicLineage,
+    /// Opaque Runtime continuation immediately before this result.
+    pub scan_cursor: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -797,7 +801,8 @@ pub struct SessionPublicSearchPage {
     pub session_id: String,
     pub generation: String,
     pub items: Vec<SessionPublicSearchItem>,
-    pub next_offset: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_scan_cursor: Option<String>,
     pub has_more: bool,
     pub scanned_bytes: u64,
     pub scanned_segments: usize,

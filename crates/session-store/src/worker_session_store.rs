@@ -485,6 +485,22 @@ impl WorkerSessionStore {
         })
     }
 
+    pub(crate) fn segment_log_observation(
+        &self,
+        segment_id: SegmentId,
+    ) -> Result<(u64, u128), StoreError> {
+        let metadata = fs::metadata(self.log_path(segment_id))?;
+        let modified = metadata
+            .modified()?
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|_| StoreError::Corrupt {
+                line: 0,
+                message: "retained Segment modification time predates the Unix epoch".to_string(),
+            })?
+            .as_nanos();
+        Ok((metadata.len(), modified))
+    }
+
     pub fn segment_log_len(&self, segment_id: SegmentId) -> Result<u64, StoreError> {
         Ok(fs::metadata(self.log_path(segment_id))?.len())
     }

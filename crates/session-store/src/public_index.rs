@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::worker_session_store::RetainedLogRecord;
 use crate::{LogEntry, SegmentId, SegmentOrigin, SessionId, StoreError, WorkerSessionStore};
 
 pub const DEFAULT_SESSION_PUBLIC_INDEX_MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -50,6 +51,48 @@ pub enum SessionPublicIndexReadError {
     Storage,
     #[error("Worker Session public index exceeds a resource limit")]
     ResourceLimit,
+    #[error("Worker Session public index cursor is stale")]
+    StaleCursor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPublicIndexScanPosition {
+    pub segment_index: usize,
+    pub byte_offset: u64,
+    pub entry_offset: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<SessionPublicIndexLineage>,
+}
+
+impl Default for SessionPublicIndexScanPosition {
+    fn default() -> Self {
+        Self {
+            segment_index: 0,
+            byte_offset: 0,
+            entry_offset: 0,
+            lineage: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPublicIndexPageEntry {
+    pub segment_id: String,
+    pub lineage: SessionPublicIndexLineage,
+    pub entry: SessionPublicIndexEntry,
+    pub scan_from: SessionPublicIndexScanPosition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPublicIndexPage {
+    pub session_id: String,
+    pub generation: String,
+    pub entries: Vec<SessionPublicIndexPageEntry>,
+    pub next_position: Option<SessionPublicIndexScanPosition>,
+    pub has_more: bool,
+    pub scanned_bytes: u64,
+    pub scanned_segments: usize,
+    pub scanned_entries: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +164,7 @@ pub struct SessionPublicIndexEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
     pub compact_text: String,
+    pub compact_text_truncated: bool,
     pub full_text: String,
 }
 
@@ -244,6 +288,421 @@ pub fn read_session_public_index(
         scanned_entries,
         entry_count,
     })
+}
+
+/// Incrementally scan the canonical public Session index.
+///
+/// Continuations stop only at a retained log-unit boundary. Ordinary records are
+/// independent units; a run from `Invoke`/`RunResumed` through its terminal
+/// record remains one unit so uncommitted output never crosses the public
+/// projection. A single unit that cannot fit the caller's byte or entry budget
+/// is therefore the only scan shape that returns [`SessionPublicIndexReadError::ResourceLimit`].
+pub fn read_session_public_index_page<F>(
+    session_root: &Path,
+    limits: SessionPublicIndexLimits,
+    expected_generation: Option<&str>,
+    position: Option<SessionPublicIndexScanPosition>,
+    max_results: usize,
+    mut matches: F,
+) -> Result<SessionPublicIndexPage, SessionPublicIndexReadError>
+where
+    F: FnMut(&SessionPublicIndexEntry) -> bool,
+{
+    if limits.max_bytes == 0
+        || limits.max_segments == 0
+        || limits.max_entries == 0
+        || max_results == 0
+    {
+        return Err(SessionPublicIndexReadError::ResourceLimit);
+    }
+
+    let store = WorkerSessionStore::open_read_only(session_root).map_err(map_store_open_error)?;
+    let session_id = store
+        .session_id()
+        .map_err(map_store_error)?
+        .ok_or(SessionPublicIndexReadError::Missing)?;
+    let segment_ids = store
+        .list_segments_read_only(session_id)
+        .map_err(map_store_error)?;
+    let generation = scan_generation(&store, session_id, &segment_ids)?;
+    if expected_generation.is_some_and(|expected| expected != generation) {
+        return Err(SessionPublicIndexReadError::StaleCursor);
+    }
+
+    let mut position = position.unwrap_or_default();
+    if position.segment_index > segment_ids.len()
+        || (position.segment_index == segment_ids.len()
+            && (position.byte_offset != 0
+                || position.entry_offset != 0
+                || position.lineage.is_some()))
+    {
+        return Err(SessionPublicIndexReadError::StaleCursor);
+    }
+
+    let mut scanned_bytes = 0_u64;
+    let mut scanned_segments = 0_usize;
+    let mut scanned_entries = 0_usize;
+    let mut output = Vec::new();
+    let mut made_progress = false;
+    let mut stopped = false;
+
+    while position.segment_index < segment_ids.len() && output.len() < max_results {
+        if scanned_segments == limits.max_segments {
+            stopped = true;
+            break;
+        }
+        let segment_id = segment_ids[position.segment_index];
+        scanned_segments += 1;
+
+        let (file_len, lineage, mut first_for_unit) = if position.byte_offset == 0 {
+            let remaining = limits.max_bytes.saturating_sub(scanned_bytes);
+            let (first, first_bytes, file_len) = match store
+                .read_first_log_record_read_only_bounded(session_id, segment_id, remaining)
+            {
+                Ok(value) => value,
+                Err(StoreError::ReadLimitExceeded) if made_progress => {
+                    stopped = true;
+                    break;
+                }
+                Err(error) => return Err(map_store_error(error)),
+            };
+            let Some(first) = first else {
+                return Err(SessionPublicIndexReadError::Corrupt);
+            };
+            scanned_bytes = scanned_bytes
+                .checked_add(first_bytes)
+                .ok_or(SessionPublicIndexReadError::ResourceLimit)?;
+            let (lineage, origin) =
+                validate_segment_start(session_id, segment_id, std::slice::from_ref(&first.entry))?;
+            if position
+                .lineage
+                .as_ref()
+                .is_some_and(|expected| expected != &lineage)
+            {
+                return Err(SessionPublicIndexReadError::StaleCursor);
+            }
+            validate_incremental_origin(segment_id, origin.as_ref(), &segment_ids)?;
+            (file_len, lineage, Some(first))
+        } else {
+            let lineage = position
+                .lineage
+                .clone()
+                .ok_or(SessionPublicIndexReadError::StaleCursor)?;
+            validate_incremental_lineage(segment_id, &lineage, &segment_ids)?;
+            let (file_len, _) = store
+                .segment_log_observation(segment_id)
+                .map_err(map_store_error)?;
+            (file_len, lineage, None)
+        };
+
+        if position.byte_offset > file_len
+            || (position.byte_offset == file_len && position.entry_offset != 0)
+        {
+            return Err(SessionPublicIndexReadError::StaleCursor);
+        }
+        if position.byte_offset == file_len {
+            position = next_segment_position(position.segment_index);
+            made_progress = true;
+            continue;
+        }
+        loop {
+            if position.byte_offset >= file_len || output.len() == max_results {
+                break;
+            }
+            let unit_start = position.byte_offset;
+            let budget_before_unit = (scanned_bytes, scanned_entries);
+            let unit = match read_public_unit(
+                &store,
+                session_id,
+                segment_id,
+                unit_start,
+                limits.max_bytes.saturating_sub(scanned_bytes),
+                first_for_unit.take(),
+            ) {
+                Ok(unit) => unit,
+                Err(SessionPublicIndexReadError::ResourceLimit) if made_progress => {
+                    scanned_bytes = budget_before_unit.0;
+                    scanned_entries = budget_before_unit.1;
+                    stopped = true;
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            if unit_start > 0
+                && unit
+                    .entries
+                    .iter()
+                    .any(|entry| matches!(entry, LogEntry::AnnotatedSegmentStart { .. }))
+            {
+                return Err(SessionPublicIndexReadError::Corrupt);
+            }
+            let unit_entries = persisted_entry_units(&unit.entries);
+            if scanned_entries.saturating_add(unit_entries) > limits.max_entries {
+                if made_progress {
+                    stopped = true;
+                    break;
+                }
+                return Err(SessionPublicIndexReadError::ResourceLimit);
+            }
+            scanned_bytes = scanned_bytes
+                .checked_add(unit.bytes)
+                .ok_or(SessionPublicIndexReadError::ResourceLimit)?;
+            scanned_entries = scanned_entries
+                .checked_add(unit_entries)
+                .ok_or(SessionPublicIndexReadError::ResourceLimit)?;
+
+            let committed = committed_conversation_records(&unit.entries);
+            let snapshot = crate::public_snapshot::project_session_snapshot_for_segment(
+                session_id,
+                Some(segment_id),
+                &committed,
+            );
+            let projected = project_index_entries(segment_id, snapshot.entries)?;
+            if position.entry_offset > projected.len()
+                || (position.entry_offset != 0 && position.entry_offset == projected.len())
+            {
+                return Err(SessionPublicIndexReadError::StaleCursor);
+            }
+            for (entry_index, entry) in projected
+                .into_iter()
+                .enumerate()
+                .skip(position.entry_offset)
+            {
+                let resume_at = if entry_index + 1 < unit.public_entry_count {
+                    SessionPublicIndexScanPosition {
+                        segment_index: position.segment_index,
+                        byte_offset: unit_start,
+                        entry_offset: entry_index + 1,
+                        lineage: Some(lineage.clone()),
+                    }
+                } else if unit.end_offset == file_len {
+                    next_segment_position(position.segment_index)
+                } else {
+                    SessionPublicIndexScanPosition {
+                        segment_index: position.segment_index,
+                        byte_offset: unit.end_offset,
+                        entry_offset: 0,
+                        lineage: Some(lineage.clone()),
+                    }
+                };
+                if matches(&entry) {
+                    output.push(SessionPublicIndexPageEntry {
+                        segment_id: segment_id.to_string(),
+                        lineage: lineage.clone(),
+                        entry,
+                        scan_from: SessionPublicIndexScanPosition {
+                            segment_index: position.segment_index,
+                            byte_offset: unit_start,
+                            entry_offset: entry_index,
+                            lineage: Some(lineage.clone()),
+                        },
+                    });
+                    if output.len() == max_results {
+                        position = resume_at;
+                        break;
+                    }
+                }
+            }
+            made_progress = true;
+            if output.len() == max_results {
+                break;
+            }
+            position = if unit.end_offset == file_len {
+                next_segment_position(position.segment_index)
+            } else {
+                SessionPublicIndexScanPosition {
+                    segment_index: position.segment_index,
+                    byte_offset: unit.end_offset,
+                    entry_offset: 0,
+                    lineage: Some(lineage.clone()),
+                }
+            };
+            if position.segment_index >= segment_ids.len()
+                || position.segment_index
+                    != segment_ids
+                        .iter()
+                        .position(|candidate| *candidate == segment_id)
+                        .unwrap_or(position.segment_index)
+            {
+                break;
+            }
+        }
+        if stopped || output.len() == max_results {
+            break;
+        }
+        if position.segment_index < segment_ids.len()
+            && segment_ids[position.segment_index] == segment_id
+        {
+            position = next_segment_position(position.segment_index);
+        }
+    }
+
+    let final_segment_ids = store
+        .list_segments_read_only(session_id)
+        .map_err(map_store_error)?;
+    let final_generation = scan_generation(&store, session_id, &final_segment_ids)?;
+    if final_generation != generation {
+        return Err(SessionPublicIndexReadError::StaleCursor);
+    }
+
+    let has_more = stopped || position.segment_index < segment_ids.len();
+    Ok(SessionPublicIndexPage {
+        session_id: session_id.to_string(),
+        generation,
+        entries: output,
+        next_position: has_more.then_some(position),
+        has_more,
+        scanned_bytes,
+        scanned_segments,
+        scanned_entries,
+    })
+}
+
+#[derive(Debug)]
+struct PublicLogUnit {
+    entries: Vec<LogEntry>,
+    end_offset: u64,
+    bytes: u64,
+    public_entry_count: usize,
+}
+
+fn read_public_unit(
+    store: &WorkerSessionStore,
+    session_id: SessionId,
+    segment_id: SegmentId,
+    start_offset: u64,
+    max_bytes: u64,
+    first: Option<RetainedLogRecord>,
+) -> Result<PublicLogUnit, SessionPublicIndexReadError> {
+    let (first, first_bytes) = match first {
+        Some(record) => (Some(record), 0),
+        None => store
+            .read_next_log_record_read_only_bounded(session_id, segment_id, start_offset, max_bytes)
+            .map_err(map_store_error)?,
+    };
+    let Some(first) = first else {
+        return Err(SessionPublicIndexReadError::StaleCursor);
+    };
+    if first.start_offset != start_offset {
+        return Err(SessionPublicIndexReadError::StaleCursor);
+    }
+    let mut bytes = first_bytes;
+    let mut end_offset = first.end_offset;
+    let run = matches!(
+        first.entry,
+        LogEntry::Invoke { .. } | LogEntry::RunResumed { .. }
+    );
+    let mut entries = vec![first.entry];
+    if run {
+        loop {
+            let (next, read_bytes) = store
+                .read_next_log_record_read_only_bounded(
+                    session_id,
+                    segment_id,
+                    end_offset,
+                    max_bytes.saturating_sub(bytes),
+                )
+                .map_err(map_store_error)?;
+            let Some(next) = next else {
+                break;
+            };
+            bytes = bytes
+                .checked_add(read_bytes)
+                .ok_or(SessionPublicIndexReadError::ResourceLimit)?;
+            end_offset = next.end_offset;
+            let terminal = matches!(
+                next.entry,
+                LogEntry::RunCompleted { .. }
+                    | LogEntry::RunYielded { .. }
+                    | LogEntry::RunCancelled { .. }
+                    | LogEntry::RunErrored { .. }
+                    | LogEntry::PausedTurnAbandoned { .. }
+            );
+            entries.push(next.entry);
+            if terminal {
+                break;
+            }
+        }
+    }
+    let committed = committed_conversation_records(&entries);
+    let snapshot = crate::public_snapshot::project_session_snapshot_for_segment(
+        session_id,
+        Some(segment_id),
+        &committed,
+    );
+    let public_entry_count = project_index_entries(segment_id, snapshot.entries)?.len();
+    Ok(PublicLogUnit {
+        entries,
+        end_offset,
+        bytes,
+        public_entry_count,
+    })
+}
+
+fn next_segment_position(segment_index: usize) -> SessionPublicIndexScanPosition {
+    SessionPublicIndexScanPosition {
+        segment_index: segment_index.saturating_add(1),
+        byte_offset: 0,
+        entry_offset: 0,
+        lineage: None,
+    }
+}
+
+fn validate_incremental_lineage(
+    segment_id: SegmentId,
+    lineage: &SessionPublicIndexLineage,
+    segment_ids: &[SegmentId],
+) -> Result<(), SessionPublicIndexReadError> {
+    let parent = match lineage.origin_kind {
+        SessionPublicIndexOriginKind::Root => {
+            if lineage.parent_segment_id.is_some() || lineage.parent_turn_index.is_some() {
+                return Err(SessionPublicIndexReadError::StaleCursor);
+            }
+            return Ok(());
+        }
+        SessionPublicIndexOriginKind::Fork | SessionPublicIndexOriginKind::Compact => lineage
+            .parent_segment_id
+            .as_deref()
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            .ok_or(SessionPublicIndexReadError::StaleCursor)?,
+    };
+    if parent == segment_id || !segment_ids.contains(&parent) || lineage.parent_turn_index.is_none()
+    {
+        return Err(SessionPublicIndexReadError::StaleCursor);
+    }
+    Ok(())
+}
+
+fn validate_incremental_origin(
+    segment_id: SegmentId,
+    origin: Option<&SegmentOrigin>,
+    segment_ids: &[SegmentId],
+) -> Result<(), SessionPublicIndexReadError> {
+    if origin.is_some_and(|origin| {
+        origin.segment_id == segment_id || !segment_ids.contains(&origin.segment_id)
+    }) {
+        return Err(SessionPublicIndexReadError::Corrupt);
+    }
+    Ok(())
+}
+
+fn scan_generation(
+    store: &WorkerSessionStore,
+    session_id: SessionId,
+    segment_ids: &[SegmentId],
+) -> Result<String, SessionPublicIndexReadError> {
+    let mut generation = Sha256::new();
+    generation.update(b"yoi-session-public-index-scan-v1\0");
+    generation.update(session_id.as_bytes());
+    for segment_id in segment_ids {
+        let (len, modified_nanos) = store
+            .segment_log_observation(*segment_id)
+            .map_err(map_store_error)?;
+        generation.update(segment_id.as_bytes());
+        generation.update(len.to_be_bytes());
+        generation.update(modified_nanos.to_be_bytes());
+    }
+    Ok(URL_SAFE_NO_PAD.encode(generation.finalize()))
 }
 
 fn validate_segment_start(
@@ -457,6 +916,7 @@ fn project_index_entries(
             _ => continue,
         };
 
+        let (compact_text, compact_text_truncated) = bounded_compact_text(&compact_source);
         projected.push(SessionPublicIndexEntry {
             segment_id: segment_id.to_string(),
             entry_ref,
@@ -465,15 +925,20 @@ fn project_index_entries(
             timestamp: entry.timestamp,
             tool_part,
             tool_name,
-            compact_text: truncate_utf8(
-                &compact_source,
-                SESSION_PUBLIC_INDEX_COMPACT_TEXT_MAX_BYTES,
-            ),
+            compact_text,
+            compact_text_truncated,
             full_text,
         });
     }
 
     Ok(projected)
+}
+
+fn bounded_compact_text(value: &str) -> (String, bool) {
+    (
+        truncate_utf8(value, SESSION_PUBLIC_INDEX_COMPACT_TEXT_MAX_BYTES),
+        value.len() > SESSION_PUBLIC_INDEX_COMPACT_TEXT_MAX_BYTES,
+    )
 }
 
 fn content_parts_text(parts: &[SessionContentPart]) -> String {
@@ -856,6 +1321,19 @@ mod tests {
     }
 
     #[test]
+    fn compact_text_reports_utf8_safe_truncation() {
+        let exact = "x".repeat(SESSION_PUBLIC_INDEX_COMPACT_TEXT_MAX_BYTES);
+        assert_eq!(bounded_compact_text(&exact), (exact, false));
+
+        let oversized = "界".repeat(SESSION_PUBLIC_INDEX_COMPACT_TEXT_MAX_BYTES);
+        let (compact, truncated) = bounded_compact_text(&oversized);
+        assert!(truncated);
+        assert!(compact.len() <= SESSION_PUBLIC_INDEX_COMPACT_TEXT_MAX_BYTES);
+        assert!(compact.ends_with('…'));
+        assert!(compact.is_char_boundary(compact.len()));
+    }
+
+    #[test]
     fn excludes_uncommitted_cancelled_and_failed_outputs_but_keeps_committed_outcomes() {
         let (_temp, root, store) = create_store();
         let session_id = crate::new_session_id();
@@ -1077,6 +1555,169 @@ mod tests {
             .unwrap();
         let added = read_session_public_index(&root, SessionPublicIndexLimits::default()).unwrap();
         assert_ne!(replaced.generation, added.generation);
+    }
+
+    #[test]
+    fn incremental_scan_finds_hit_beyond_segment_budget_and_stales_after_append() {
+        let (_temp, root, store) = create_store();
+        let session_id = crate::new_session_id();
+        for index in 0..65_u128 {
+            let text = if index == 64 {
+                "needle beyond first page"
+            } else {
+                "ordinary entry"
+            };
+            store
+                .create_segment(
+                    session_id,
+                    segment_id(1_000 + index),
+                    &[start(
+                        session_id,
+                        vec![message(&format!("entry-{index}"), LoggedRole::User, text)],
+                        None,
+                        None,
+                    )],
+                )
+                .unwrap();
+        }
+        let limits = SessionPublicIndexLimits {
+            max_segments: 64,
+            ..SessionPublicIndexLimits::default()
+        };
+        let first = read_session_public_index_page(&root, limits, None, None, 10, |entry| {
+            entry.full_text.contains("needle")
+        })
+        .unwrap();
+        assert!(first.entries.is_empty());
+        assert!(first.has_more);
+        assert_eq!(first.scanned_segments, 64);
+        let next_position = first.next_position.clone().unwrap();
+
+        let second = read_session_public_index_page(
+            &root,
+            limits,
+            Some(&first.generation),
+            Some(next_position.clone()),
+            10,
+            |entry| entry.full_text.contains("needle"),
+        )
+        .unwrap();
+        assert_eq!(second.entries.len(), 1);
+        assert_eq!(
+            second.entries[0].entry.full_text,
+            "needle beyond first page"
+        );
+        assert!(!second.has_more);
+        assert!(second.next_position.is_none());
+
+        store
+            .append(
+                session_id,
+                segment_id(1_064),
+                &LogEntry::AnnotatedAssistantItem {
+                    ts: 2,
+                    entry: message("mutated", LoggedRole::Assistant, "changed"),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            read_session_public_index_page(
+                &root,
+                limits,
+                Some(&first.generation),
+                Some(next_position),
+                10,
+                |_| true,
+            ),
+            Err(SessionPublicIndexReadError::StaleCursor)
+        );
+    }
+
+    #[test]
+    fn incremental_scan_resumes_across_byte_and_entry_budgets() {
+        let (_temp, root, store) = create_store();
+        let session_id = crate::new_session_id();
+        let first_segment = segment_id(1_500);
+        let second_segment = segment_id(1_501);
+        for (segment_id, id, text) in [
+            (first_segment, "entry-a", "aaaaaa"),
+            (second_segment, "entry-b", "needle"),
+        ] {
+            store
+                .create_segment(
+                    session_id,
+                    segment_id,
+                    &[start(
+                        session_id,
+                        vec![message(id, LoggedRole::User, text)],
+                        None,
+                        None,
+                    )],
+                )
+                .unwrap();
+        }
+        let first_len = store.segment_log_len(first_segment).unwrap();
+        for limits in [
+            SessionPublicIndexLimits {
+                max_bytes: first_len,
+                ..SessionPublicIndexLimits::default()
+            },
+            SessionPublicIndexLimits {
+                max_entries: 2,
+                ..SessionPublicIndexLimits::default()
+            },
+        ] {
+            let first = read_session_public_index_page(&root, limits, None, None, 10, |entry| {
+                entry.full_text == "needle"
+            })
+            .unwrap();
+            assert!(first.entries.is_empty());
+            assert!(first.has_more);
+            let second = read_session_public_index_page(
+                &root,
+                limits,
+                Some(&first.generation),
+                first.next_position,
+                10,
+                |entry| entry.full_text == "needle",
+            )
+            .unwrap();
+            assert_eq!(second.entries.len(), 1);
+            assert!(!second.has_more);
+        }
+    }
+
+    #[test]
+    fn incremental_scan_rejects_one_indivisible_record_over_the_byte_budget() {
+        let (_temp, root, store) = create_store();
+        let session_id = crate::new_session_id();
+        store
+            .create_segment(
+                session_id,
+                segment_id(2_000),
+                &[start(
+                    session_id,
+                    vec![message("large-entry", LoggedRole::User, &"x".repeat(8_192))],
+                    None,
+                    None,
+                )],
+            )
+            .unwrap();
+
+        assert_eq!(
+            read_session_public_index_page(
+                &root,
+                SessionPublicIndexLimits {
+                    max_bytes: 512,
+                    ..SessionPublicIndexLimits::default()
+                },
+                None,
+                None,
+                10,
+                |_| true,
+            ),
+            Err(SessionPublicIndexReadError::ResourceLimit)
+        );
     }
 
     #[test]

@@ -709,6 +709,7 @@ impl SqliteWorkspaceStore {
                          WHERE workspace_id = ?1 AND archive_id = ?2
                            AND controller_runtime_id = ?3 AND controller_worker_id = ?4
                            AND subject_runtime_id = ?5 AND subject_worker_id = ?6
+                           AND revoked_at IS NULL
                      )",
                     params![
                         workspace_id,
@@ -1301,6 +1302,32 @@ mod tests {
     #[test]
     fn purge_tombstone_commit_is_idempotent() {
         let s = setup();
+        let archived_grant_id = "archive-observe-grant";
+        let archived_controller =
+            RuntimeWorkerRef::new("r", WorkerId::from_legacy_u64(2).to_string());
+        s.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO worker_registry(\
+                    workspace_id,worker_id,runtime_id,display_name,profile,retention_state,created_at,updated_at\
+                 ) VALUES('w',?1,'r','controller','builtin:companion','normal','created','controller-rev1')",
+                [&archived_controller.worker_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        s.create_worker_control_grant(&crate::store::WorkerControlGrantRecord {
+            workspace_id: "w".into(),
+            grant_id: archived_grant_id.into(),
+            controller: archived_controller.clone(),
+            subject: req().worker,
+            relation: "subject_session".into(),
+            origin: "test".into(),
+            permissions: vec!["observe".into()],
+            operation_id: archived_grant_id.into(),
+            created_at: "2026-10-02T00:00:00Z".into(),
+            revoked_at: None,
+        })
+        .unwrap();
         s.with_conn(|conn| {
             conn.execute("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit) VALUES('w','ticket-old','ticket-old','Old Ticket','open','task','normal','','planning',1)", [])?;
             conn.execute("INSERT INTO worker_registry(workspace_id,worker_id,runtime_id,display_name,profile,retention_state,created_at,updated_at) VALUES('w','1','r','old worker','builtin:coder','normal','created','rev1')", [])?;
@@ -1350,6 +1377,31 @@ mod tests {
                 .plan
                 .state,
             WorkerRemovalPlanState::Succeeded
+        );
+        assert!(
+            s.worker_session_archive_observable_by(
+                "w",
+                p.archive_id.as_deref().unwrap(),
+                &archived_controller,
+                &p.worker,
+            )
+            .unwrap(),
+            "the explicit observe grant survives Worker removal for the committed archive"
+        );
+        assert!(
+            s.revoke_worker_control_grant("w", archived_grant_id, "2026-10-02T00:01:00Z")
+                .unwrap(),
+            "the existing grant revocation authority must also revoke its archive projection"
+        );
+        assert!(
+            !s.worker_session_archive_observable_by(
+                "w",
+                p.archive_id.as_deref().unwrap(),
+                &archived_controller,
+                &p.worker,
+            )
+            .unwrap(),
+            "every later cursor page and direct Read must observe archive grant revocation"
         );
         assert!(s.worker_tombstone("w", &p.worker).unwrap().is_some());
         let reservation_state: String = s.with_conn(|conn| {

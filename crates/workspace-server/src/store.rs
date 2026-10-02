@@ -7451,14 +7451,22 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         grant_id: &str,
         revoked_at: &str,
     ) -> Result<bool> {
-        self.with_conn(|conn| {
-            let changed = conn.execute(
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let active_changed = tx.execute(
                 r#"UPDATE worker_control_grants
                    SET revoked_at = ?3
                    WHERE workspace_id = ?1 AND grant_id = ?2 AND revoked_at IS NULL"#,
                 params![workspace_id, grant_id, revoked_at],
             )?;
-            Ok(changed > 0)
+            let archived_changed = tx.execute(
+                r#"UPDATE worker_session_archive_observe_grants
+                   SET revoked_at = ?3
+                   WHERE workspace_id = ?1 AND source_grant_id = ?2 AND revoked_at IS NULL"#,
+                params![workspace_id, grant_id, revoked_at],
+            )?;
+            tx.commit()?;
+            Ok(active_changed > 0 || archived_changed > 0)
         })
     }
 
@@ -14173,6 +14181,7 @@ fn migrate_archive_observe_grants_v75_to_v76(conn: &Connection) -> Result<()> {
             subject_worker_id TEXT NOT NULL,
             source_grant_id TEXT NOT NULL,
             granted_at TEXT NOT NULL,
+            revoked_at TEXT,
             PRIMARY KEY (
                 workspace_id, archive_id,
                 controller_runtime_id, controller_worker_id,

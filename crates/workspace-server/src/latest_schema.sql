@@ -961,7 +961,7 @@ CREATE TABLE worker_session_archive_observe_grants (
         workspace_id TEXT NOT NULL, archive_id TEXT NOT NULL,
         controller_runtime_id TEXT NOT NULL, controller_worker_id TEXT NOT NULL,
         subject_runtime_id TEXT NOT NULL, subject_worker_id TEXT NOT NULL,
-        source_grant_id TEXT NOT NULL, granted_at TEXT NOT NULL,
+        source_grant_id TEXT NOT NULL, granted_at TEXT NOT NULL, revoked_at TEXT,
         PRIMARY KEY(workspace_id,archive_id,controller_runtime_id,controller_worker_id,source_grant_id),
         FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
         FOREIGN KEY(archive_id) REFERENCES worker_session_archives(archive_id) ON DELETE CASCADE);

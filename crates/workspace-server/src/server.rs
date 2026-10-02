@@ -17033,7 +17033,7 @@ struct SubjektivSessionSearchPosition {
     storage: server_api::SubjektivSessionStorage,
     archive_id: Option<String>,
     generation: String,
-    offset: usize,
+    runtime_scan_cursor: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17258,9 +17258,7 @@ fn subjektiv_session_list(
         }
     }
 
-    let has_more = session_id.is_none()
-        && (store_has_more || scanned == SUBJEKTIV_SESSION_MAX_LIMIT)
-        && after.is_some();
+    let has_more = session_id.is_none() && store_has_more && after.is_some();
     let next_cursor = if has_more {
         let (after_attributed_at, after_session_id) = after.expect("checked above");
         match encode_subjektiv_cursor(
@@ -17404,102 +17402,129 @@ fn subjektiv_session_read(
             "Session storage changed while the read cursor was active",
         );
     }
-    let request = runtime_api::SessionPublicReadRequest {
-        workspace_id: workspace_id.to_string(),
-        source: source.source.clone(),
-        expected_session_id: session_id.clone(),
-        expected_generation: cursor.as_ref().map(|cursor| cursor.generation.clone()),
-        segment_id: segment_id.clone(),
-        entry_ref: entry_ref.clone(),
-        mode: subjektiv_session_read_mode(input.mode),
-        byte_offset: cursor.as_ref().map_or(0, |cursor| cursor.byte_offset),
-        max_content_bytes: server_api::SUBJEKTIV_SESSION_MAX_READ_CONTENT_BYTES,
-        max_scan_bytes: SUBJEKTIV_SESSION_MAX_SCAN_BYTES,
-        max_segments: SUBJEKTIV_SESSION_MAX_SCAN_SEGMENTS,
-        max_entries: SUBJEKTIV_SESSION_MAX_SCAN_ENTRIES,
-    };
-    let availability = match api
-        .runtime
-        .session_public_read(&attribution.runtime_id, request)
-    {
-        Ok(availability) => availability,
-        Err(error) => return subjektiv_session_runtime_error(error),
-    };
-    let page = match availability {
-        runtime_api::SessionPublicReadAvailability::Page { page } => page,
-        runtime_api::SessionPublicReadAvailability::Unavailable { reason, message } => {
-            return subjektiv_session_error(subjektiv_session_diagnostic_code(reason), message);
+    let expected_mode = subjektiv_session_read_mode(input.mode);
+    let byte_offset = cursor.as_ref().map_or(0, |cursor| cursor.byte_offset);
+    let mut expected_generation = cursor.as_ref().map(|cursor| cursor.generation.clone());
+    let mut max_content_bytes = server_api::SUBJEKTIV_SESSION_MAX_READ_CONTENT_BYTES;
+    loop {
+        let request = runtime_api::SessionPublicReadRequest {
+            workspace_id: workspace_id.to_string(),
+            source: source.source.clone(),
+            expected_session_id: session_id.clone(),
+            expected_generation: expected_generation.clone(),
+            segment_id: segment_id.clone(),
+            entry_ref: entry_ref.clone(),
+            mode: expected_mode,
+            byte_offset,
+            max_content_bytes,
+            max_scan_bytes: SUBJEKTIV_SESSION_MAX_SCAN_BYTES,
+            max_segments: SUBJEKTIV_SESSION_MAX_SCAN_SEGMENTS,
+            max_entries: SUBJEKTIV_SESSION_MAX_SCAN_ENTRIES,
+        };
+        let availability = match api
+            .runtime
+            .session_public_read(&attribution.runtime_id, request)
+        {
+            Ok(availability) => availability,
+            Err(error) => return subjektiv_session_runtime_error(error),
+        };
+        let page = match availability {
+            runtime_api::SessionPublicReadAvailability::Page { page } => page,
+            runtime_api::SessionPublicReadAvailability::Unavailable { reason, message } => {
+                return subjektiv_session_error(subjektiv_session_diagnostic_code(reason), message);
+            }
+        };
+        if !subjektiv_session_archive_manifest_matches(&source, page.archive_manifest.as_ref()) {
+            return subjektiv_session_error(
+                server_api::SubjektivSessionDiagnosticCode::ArchiveIncomplete,
+                "Runtime Session archive does not match the committed catalog",
+            );
         }
-    };
-    if !subjektiv_session_archive_manifest_matches(&source, page.archive_manifest.as_ref()) {
-        return subjektiv_session_error(
-            server_api::SubjektivSessionDiagnosticCode::ArchiveIncomplete,
-            "Runtime Session archive does not match the committed catalog",
-        );
-    }
-    if page.session_id != session_id
-        || page.segment_id != segment_id
-        || page.entry_ref != entry_ref
-        || page.mode != subjektiv_session_read_mode(input.mode)
-    {
-        return subjektiv_session_error(
-            server_api::SubjektivSessionDiagnosticCode::CorruptLog,
-            "Runtime Session read response did not match the selected entry",
-        );
-    }
-    let next_cursor = if page.has_more {
-        let Some(byte_offset) = page.next_byte_offset else {
+        if page.session_id != session_id
+            || page.segment_id != segment_id
+            || page.entry_ref != entry_ref
+            || page.mode != expected_mode
+        {
             return subjektiv_session_error(
                 server_api::SubjektivSessionDiagnosticCode::CorruptLog,
-                "Runtime Session read response omitted its continuation position",
+                "Runtime Session read response did not match the selected entry",
             );
+        }
+        if expected_generation.is_none() {
+            expected_generation = Some(page.generation.clone());
+        }
+        let next_cursor = if page.has_more {
+            let Some(next_byte_offset) = page.next_byte_offset else {
+                return subjektiv_session_error(
+                    server_api::SubjektivSessionDiagnosticCode::CorruptLog,
+                    "Runtime Session read response omitted its continuation position",
+                );
+            };
+            match encode_subjektiv_cursor(
+                "session-read",
+                &SubjektivSessionReadCursor {
+                    workspace_id: workspace_id.to_string(),
+                    subject_id: subject_id.to_string(),
+                    controller_runtime_id: controller.runtime_id.clone(),
+                    controller_worker_id: controller.worker_id.clone(),
+                    session_id: session_id.clone(),
+                    segment_id: segment_id.clone(),
+                    entry_ref: entry_ref.clone(),
+                    mode: input.mode,
+                    runtime_id: attribution.runtime_id.clone(),
+                    worker_id: attribution.worker_id.clone(),
+                    storage: source.storage,
+                    archive_id: source.archive_id.clone(),
+                    generation: page.generation.clone(),
+                    byte_offset: next_byte_offset,
+                },
+            ) {
+                Ok(cursor) => Some(cursor),
+                Err(error) => {
+                    return subjektiv_session_error(
+                        server_api::SubjektivSessionDiagnosticCode::SubjectUnavailable,
+                        error.error.to_string(),
+                    );
+                }
+            }
+        } else {
+            None
         };
-        match encode_subjektiv_cursor(
-            "session-read",
-            &SubjektivSessionReadCursor {
-                workspace_id: workspace_id.to_string(),
-                subject_id: subject_id.to_string(),
-                controller_runtime_id: controller.runtime_id.clone(),
-                controller_worker_id: controller.worker_id.clone(),
-                session_id: session_id.clone(),
-                segment_id: segment_id.clone(),
-                entry_ref: entry_ref.clone(),
-                mode: input.mode,
-                runtime_id: attribution.runtime_id,
-                worker_id: attribution.worker_id,
-                storage: source.storage,
-                archive_id: source.archive_id,
-                generation: page.generation.clone(),
-                byte_offset,
-            },
-        ) {
-            Ok(cursor) => Some(cursor),
+        let response = server_api::SubjektivSessionBackendResponse::Ok {
+            result: server_api::SubjektivSessionBackendResult::Read(
+                server_api::SubjektivSessionReadResponse {
+                    session_id: session_id.clone(),
+                    segment_id: segment_id.clone(),
+                    entry_ref: entry_ref.clone(),
+                    kind: subjektiv_session_entry_kind(page.kind),
+                    origin: page.origin,
+                    lineage: subjektiv_session_lineage(page.lineage),
+                    mode: input.mode,
+                    content: page.content,
+                    truncated: page.has_more,
+                    next_cursor,
+                    has_more: page.has_more,
+                },
+            ),
+        };
+        match subjektiv_session_response_fits_model_budget(&response) {
+            Ok(true) => return response,
             Err(error) => {
                 return subjektiv_session_error(
                     server_api::SubjektivSessionDiagnosticCode::SubjectUnavailable,
-                    error.error.to_string(),
+                    format!("Session read response could not be serialized: {error}"),
+                );
+            }
+            Ok(_) if max_content_bytes > 4 => {
+                max_content_bytes = (max_content_bytes / 2).max(4);
+            }
+            Ok(_) => {
+                return subjektiv_session_error(
+                    server_api::SubjektivSessionDiagnosticCode::ResourceLimit,
+                    "One Session read response exceeds the model-visible JSON budget",
                 );
             }
         }
-    } else {
-        None
-    };
-    server_api::SubjektivSessionBackendResponse::Ok {
-        result: server_api::SubjektivSessionBackendResult::Read(
-            server_api::SubjektivSessionReadResponse {
-                session_id,
-                segment_id,
-                entry_ref,
-                kind: subjektiv_session_entry_kind(page.kind),
-                origin: page.origin,
-                lineage: subjektiv_session_lineage(page.lineage),
-                mode: input.mode,
-                content: page.content,
-                truncated: page.has_more,
-                next_cursor,
-                has_more: page.has_more,
-            },
-        ),
     }
 }
 
@@ -17609,87 +17634,88 @@ fn subjektiv_session_search(
             state.partial = true;
             break;
         }
-        let (attribution, expected_generation, offset, cursor_source) = if let Some(current) =
-            state.current.take()
-        {
-            let page = match store.subject_session_attribution_page(
-                subject_id,
-                Some(&current.session_id),
-                &state.snapshot_at,
-                None,
-                1,
-            ) {
-                Ok(page) => page,
-                Err(error) => {
-                    return subjektiv_session_error(
-                        server_api::SubjektivSessionDiagnosticCode::SubjectUnavailable,
-                        error.to_string(),
-                    );
-                }
-            };
-            let Some(attribution) = page.items.into_iter().next() else {
-                return subjektiv_session_error(
-                    server_api::SubjektivSessionDiagnosticCode::StaleCursor,
-                    "Session search attribution is no longer available",
-                );
-            };
-            if attribution.attributed_at != current.attributed_at
-                || attribution.runtime_id != current.runtime_id
-                || attribution.worker_id != current.worker_id
-            {
-                return subjektiv_session_error(
-                    server_api::SubjektivSessionDiagnosticCode::StaleCursor,
-                    "Session search attribution changed",
-                );
-            }
-            (
-                attribution,
-                Some(current.generation),
-                current.offset,
-                Some((current.storage, current.archive_id)),
-            )
-        } else {
-            let page = match store.subject_session_attribution_page(
-                subject_id,
-                state.session_id.as_deref(),
-                &state.snapshot_at,
-                match (
-                    state.after_attributed_at.as_deref(),
-                    state.after_session_id.as_deref(),
+        let (attribution, expected_generation, runtime_scan_cursor, cursor_source) =
+            if let Some(current) = state.current.take() {
+                let page = match store.subject_session_attribution_page(
+                    subject_id,
+                    Some(&current.session_id),
+                    &state.snapshot_at,
+                    None,
+                    1,
                 ) {
-                    (Some(attributed_at), Some(session_id)) => Some((attributed_at, session_id)),
-                    (None, None) => None,
-                    _ => {
+                    Ok(page) => page,
+                    Err(error) => {
                         return subjektiv_session_error(
-                            server_api::SubjektivSessionDiagnosticCode::StaleCursor,
-                            "Session search cursor position is incomplete",
+                            server_api::SubjektivSessionDiagnosticCode::SubjectUnavailable,
+                            error.to_string(),
                         );
                     }
-                },
-                1,
-            ) {
-                Ok(page) => page,
-                Err(error) => {
+                };
+                let Some(attribution) = page.items.into_iter().next() else {
                     return subjektiv_session_error(
-                        server_api::SubjektivSessionDiagnosticCode::SubjectUnavailable,
-                        error.to_string(),
+                        server_api::SubjektivSessionDiagnosticCode::StaleCursor,
+                        "Session search attribution is no longer available",
+                    );
+                };
+                if attribution.attributed_at != current.attributed_at
+                    || attribution.runtime_id != current.runtime_id
+                    || attribution.worker_id != current.worker_id
+                {
+                    return subjektiv_session_error(
+                        server_api::SubjektivSessionDiagnosticCode::StaleCursor,
+                        "Session search attribution changed",
                     );
                 }
+                (
+                    attribution,
+                    Some(current.generation),
+                    Some(current.runtime_scan_cursor),
+                    Some((current.storage, current.archive_id)),
+                )
+            } else {
+                let page = match store.subject_session_attribution_page(
+                    subject_id,
+                    state.session_id.as_deref(),
+                    &state.snapshot_at,
+                    match (
+                        state.after_attributed_at.as_deref(),
+                        state.after_session_id.as_deref(),
+                    ) {
+                        (Some(attributed_at), Some(session_id)) => {
+                            Some((attributed_at, session_id))
+                        }
+                        (None, None) => None,
+                        _ => {
+                            return subjektiv_session_error(
+                                server_api::SubjektivSessionDiagnosticCode::StaleCursor,
+                                "Session search cursor position is incomplete",
+                            );
+                        }
+                    },
+                    1,
+                ) {
+                    Ok(page) => page,
+                    Err(error) => {
+                        return subjektiv_session_error(
+                            server_api::SubjektivSessionDiagnosticCode::SubjectUnavailable,
+                            error.to_string(),
+                        );
+                    }
+                };
+                let Some(attribution) = page.items.into_iter().next() else {
+                    if state.session_id.is_some() {
+                        return subjektiv_session_error(
+                            server_api::SubjektivSessionDiagnosticCode::NotFoundOrNotAuthorized,
+                            "Session was not found or is not authorized",
+                        );
+                    }
+                    break;
+                };
+                has_more = page.has_more;
+                state.after_attributed_at = Some(attribution.attributed_at.clone());
+                state.after_session_id = Some(attribution.session_id.clone());
+                (attribution, None, None, None)
             };
-            let Some(attribution) = page.items.into_iter().next() else {
-                if state.session_id.is_some() {
-                    return subjektiv_session_error(
-                        server_api::SubjektivSessionDiagnosticCode::NotFoundOrNotAuthorized,
-                        "Session was not found or is not authorized",
-                    );
-                }
-                break;
-            };
-            has_more = page.has_more;
-            state.after_attributed_at = Some(attribution.attributed_at.clone());
-            state.after_session_id = Some(attribution.session_id.clone());
-            (attribution, None, 0, None)
-        };
         scanned_sessions += 1;
         let source = match authorized_subjektiv_session(
             api,
@@ -17744,7 +17770,7 @@ fn subjektiv_session_search(
             kind: input.kind.map(runtime_session_entry_kind),
             tool_name: tool_name.clone(),
             tool_part: runtime_session_tool_part(input.tool_part),
-            offset,
+            scan_cursor: runtime_scan_cursor,
             limit: limit.saturating_sub(items.len()),
             max_scan_bytes: remaining_scan_bytes,
             max_segments: remaining_segments,
@@ -17806,7 +17832,9 @@ fn subjektiv_session_search(
         let generation = page.generation.clone();
         let mut consumed = 0usize;
         for item in page.items {
-            let (snippet, snippet_truncated) = truncate_subjektiv_session_snippet(&item.compact);
+            let item_scan_cursor = item.scan_cursor;
+            let (snippet, locally_truncated) = truncate_subjektiv_session_snippet(&item.compact);
+            let snippet_truncated = item.compact_truncated || locally_truncated;
             let projected = server_api::SubjektivSessionSearchItem {
                 session_id: attribution.session_id.clone(),
                 segment_id: item.segment_id,
@@ -17841,7 +17869,7 @@ fn subjektiv_session_search(
                     storage: source.storage,
                     archive_id: source.archive_id.clone(),
                     generation: generation.clone(),
-                    offset: offset.saturating_add(consumed),
+                    runtime_scan_cursor: item_scan_cursor,
                 });
                 break;
             }
@@ -17852,9 +17880,12 @@ fn subjektiv_session_search(
             break;
         }
         if page.has_more {
-            let next_offset = page
-                .next_offset
-                .unwrap_or_else(|| offset.saturating_add(consumed));
+            let Some(next_scan_cursor) = page.next_scan_cursor else {
+                return subjektiv_session_error(
+                    server_api::SubjektivSessionDiagnosticCode::CorruptLog,
+                    "Runtime Session search response omitted its continuation position",
+                );
+            };
             has_more = true;
             state.current = Some(SubjektivSessionSearchPosition {
                 attributed_at: attribution.attributed_at,
@@ -17864,7 +17895,7 @@ fn subjektiv_session_search(
                 storage: source.storage,
                 archive_id: source.archive_id,
                 generation,
-                offset: next_offset,
+                runtime_scan_cursor: next_scan_cursor,
             });
             break;
         }
@@ -17873,13 +17904,18 @@ fn subjektiv_session_search(
             break;
         }
         if items.len() >= limit {
-            has_more = true;
             break;
         }
     }
 
-    if scanned_sessions >= SUBJEKTIV_SESSION_MAX_SCANNED_SESSIONS && state.session_id.is_none() {
-        has_more = true;
+    let (has_more, scan_budget_partial) = subjektiv_session_search_completion(
+        has_more,
+        items.len(),
+        limit,
+        scanned_sessions,
+        state.session_id.is_none(),
+    );
+    if scan_budget_partial {
         state.partial = true;
     }
     if !issues.is_empty() && successful_sources == 0 && !has_more {
@@ -17914,6 +17950,20 @@ fn subjektiv_session_search(
             },
         ),
     }
+}
+
+fn subjektiv_session_search_completion(
+    has_unscanned: bool,
+    item_count: usize,
+    limit: usize,
+    scanned_sessions: usize,
+    cross_session: bool,
+) -> (bool, bool) {
+    debug_assert!(item_count <= limit);
+    let scan_budget_partial = cross_session
+        && scanned_sessions >= SUBJEKTIV_SESSION_MAX_SCANNED_SESSIONS
+        && has_unscanned;
+    (has_unscanned, scan_budget_partial)
 }
 
 fn subjektiv_session_limit(
@@ -17981,6 +18031,13 @@ fn subjektiv_session_error(
             message: bounded_subjektiv_session_message(&message.into()),
         },
     }
+}
+
+fn subjektiv_session_response_fits_model_budget(
+    response: &server_api::SubjektivSessionBackendResponse,
+) -> std::result::Result<bool, serde_json::Error> {
+    serde_json::to_vec(response)
+        .map(|serialized| serialized.len() <= server_api::SUBJEKTIV_SESSION_MAX_TOOL_CONTENT_BYTES)
 }
 
 fn bounded_subjektiv_session_message(message: &str) -> String {
@@ -37351,6 +37408,174 @@ mod tests {
                 }
             })
         ));
+    }
+
+    #[test]
+    fn subjektiv_session_search_exact_boundaries_are_complete() {
+        assert_eq!(
+            subjektiv_session_search_completion(
+                false,
+                20,
+                20,
+                SUBJEKTIV_SESSION_MAX_SCANNED_SESSIONS,
+                true,
+            ),
+            (false, false),
+            "exactly limit results at the end must not invent a continuation"
+        );
+        assert_eq!(
+            subjektiv_session_search_completion(
+                false,
+                0,
+                20,
+                SUBJEKTIV_SESSION_MAX_SCANNED_SESSIONS,
+                true,
+            ),
+            (false, false),
+            "exactly 20 exhausted Sessions must remain complete"
+        );
+        assert_eq!(
+            subjektiv_session_search_completion(
+                true,
+                0,
+                20,
+                SUBJEKTIV_SESSION_MAX_SCANNED_SESSIONS,
+                true,
+            ),
+            (true, true),
+            "a real unscanned twenty-first Session must remain partial"
+        );
+    }
+
+    #[tokio::test]
+    async fn subjektiv_session_list_exactly_twenty_sessions_has_no_false_continuation() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let Json(created) = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(CreateWorkspaceWorkerRequest {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                display_name: "Session boundary Worker".to_string(),
+                singleton_key: None,
+                profile: None,
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachments: Vec::new(),
+                control_operation_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let controller = RuntimeWorkerRef::new(&created.runtime_id, &created.worker_id);
+        let store = open_subjektiv_store(&api).unwrap();
+        let subject = store
+            .create_subject(crate::subjektiv::SubjectRole::new("companion").unwrap())
+            .unwrap();
+        for index in 0..20 {
+            let mut attribution = crate::subjektiv::SubjectSessionAttribution::new(
+                &subject.id,
+                &controller.runtime_id,
+                &controller.worker_id,
+                format!("session-{index:02}"),
+            )
+            .unwrap();
+            attribution.attributed_at = format!("2026-10-02T00:00:{index:02}Z");
+            store.record_session_attribution(attribution).unwrap();
+        }
+        api.store
+            .create_worker_control_grant(&WorkerControlGrantRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                grant_id: "session-boundary-observe".to_string(),
+                controller: controller.clone(),
+                subject: controller.clone(),
+                relation: "subject_session".to_string(),
+                origin: "test".to_string(),
+                permissions: vec!["observe".to_string()],
+                operation_id: "session-boundary-observe".to_string(),
+                created_at: Utc::now().to_rfc3339(),
+                revoked_at: None,
+            })
+            .unwrap();
+
+        let response = subjektiv_session_list(
+            &api,
+            &store,
+            TEST_WORKSPACE_ID,
+            &subject.id,
+            &controller,
+            server_api::SubjektivSessionListRequest {
+                session_id: None,
+                storage: server_api::SubjektivSessionStorageFilter::All,
+                limit: Some(20),
+                cursor: None,
+            },
+        );
+        assert!(matches!(
+            response,
+            server_api::SubjektivSessionBackendResponse::Ok {
+                result: server_api::SubjektivSessionBackendResult::List(
+                    server_api::SubjektivSessionListResponse {
+                        ref items,
+                        next_cursor: None,
+                        has_more: false,
+                    }
+                )
+            } if items.len() == 20
+        ));
+    }
+
+    #[test]
+    fn subjektiv_session_read_budget_uses_serialized_json_and_preserves_pages() {
+        fn response(
+            content: String,
+            has_more: bool,
+        ) -> server_api::SubjektivSessionBackendResponse {
+            server_api::SubjektivSessionBackendResponse::Ok {
+                result: server_api::SubjektivSessionBackendResult::Read(
+                    server_api::SubjektivSessionReadResponse {
+                        session_id: "session-a".into(),
+                        segment_id: "segment-a".into(),
+                        entry_ref: "Eentry-a".into(),
+                        kind: server_api::SubjektivSessionEntryKind::User,
+                        origin: protocol::SessionEntryProvenance::HumanInput,
+                        lineage: server_api::SubjektivSessionLineage {
+                            kind: server_api::SubjektivSessionLineageKind::Root,
+                            parent_segment_id: None,
+                            at_turn_index: None,
+                        },
+                        mode: server_api::SubjektivSessionReadMode::Full,
+                        content,
+                        truncated: has_more,
+                        next_cursor: has_more.then(|| "opaque-cursor".into()),
+                        has_more,
+                    },
+                ),
+            }
+        }
+
+        let content = "\0".repeat(server_api::SUBJEKTIV_SESSION_MAX_READ_CONTENT_BYTES);
+        assert!(
+            !subjektiv_session_response_fits_model_budget(&response(content.clone(), true))
+                .unwrap(),
+            "the raw 16 KiB limit is not safe for JSON-escaped content"
+        );
+        let split = content.len() / 2;
+        let first = response(content[..split].to_string(), true);
+        let second = response(content[split..].to_string(), false);
+        assert!(subjektiv_session_response_fits_model_budget(&first).unwrap());
+        assert!(subjektiv_session_response_fits_model_budget(&second).unwrap());
+        let chunks = [first, second]
+            .into_iter()
+            .map(|response| match response {
+                server_api::SubjektivSessionBackendResponse::Ok {
+                    result: server_api::SubjektivSessionBackendResult::Read(read),
+                } => read.content,
+                _ => unreachable!(),
+            })
+            .collect::<String>();
+        assert_eq!(chunks, content);
     }
 
     #[tokio::test]

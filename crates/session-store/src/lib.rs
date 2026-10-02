@@ -101,8 +101,9 @@ pub use public_index::{
     DEFAULT_SESSION_PUBLIC_INDEX_MAX_SEGMENTS, SESSION_PUBLIC_INDEX_COMPACT_TEXT_MAX_BYTES,
     SessionPublicIndex, SessionPublicIndexEntry, SessionPublicIndexEntryKind,
     SessionPublicIndexLimits, SessionPublicIndexLineage, SessionPublicIndexOriginKind,
-    SessionPublicIndexReadError, SessionPublicIndexSegment, SessionPublicIndexToolPart,
-    read_session_public_index,
+    SessionPublicIndexPage, SessionPublicIndexPageEntry, SessionPublicIndexReadError,
+    SessionPublicIndexScanPosition, SessionPublicIndexSegment, SessionPublicIndexToolPart,
+    read_session_public_index, read_session_public_index_page,
 };
 pub use public_snapshot::{
     DEFAULT_RETAINED_HISTORY_MAX_ENTRIES, DEFAULT_RETAINED_HISTORY_MAX_RESPONSE_BYTES,
