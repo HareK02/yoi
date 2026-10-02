@@ -3,6 +3,7 @@ import type {
   CommandEvent,
   CommandSnapshot,
   CommandStreamSlice,
+  ContextUsage,
   Event as ProtocolEvent,
   Greeting,
   InFlightBlock,
@@ -253,6 +254,20 @@ function metadataWithUsage(
     contextWindow: metadata?.contextWindow ?? null,
     contextTokens: tokens,
     contextSource: tokens === null ? null : "measured",
+  };
+}
+
+function metadataWithContextUsage(
+  metadata: ConsoleWorkerMetadata | null,
+  usage: ContextUsage | null | undefined,
+): ConsoleWorkerMetadata {
+  const tokens = safeTokenCount(usage?.tokens);
+  return {
+    model: metadata?.model ?? null,
+    reasoning: metadata?.reasoning ?? null,
+    contextWindow: metadata?.contextWindow ?? null,
+    contextTokens: tokens,
+    contextSource: tokens === null ? null : usage?.source ?? null,
   };
 }
 
@@ -1125,6 +1140,12 @@ export function applyProtocolEvent(
       next.workerMetadata = metadataWithUsage(
         next.workerMetadata,
         event.data.input_tokens,
+      );
+      break;
+    case "context_usage":
+      next.workerMetadata = metadataWithContextUsage(
+        next.workerMetadata,
+        event.data.usage,
       );
       break;
     case "error":

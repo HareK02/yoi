@@ -58,6 +58,10 @@ Deno.test("worker metadata formats effort, budget, estimate, and unknown safely"
   );
   assertEquals(
     formatReasoning({ kind: "budget_tokens", budget_tokens: -1 }),
+    "dynamic token budget",
+  );
+  assertEquals(
+    formatReasoning({ kind: "budget_tokens", budget_tokens: -2 }),
     "reasoning unavailable",
   );
   assertEquals(formatContextSummary(null), "Context unavailable");

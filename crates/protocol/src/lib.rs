@@ -1245,6 +1245,16 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_read_input_tokens: Option<u64>,
     },
+    /// Authoritative current-context occupancy after a non-request boundary.
+    ///
+    /// Unlike [`Event::Usage`], this is not cumulative request traffic. It lets
+    /// connected clients converge with reconnect snapshots after run completion,
+    /// compaction, rewind, and other history rewrites. `None` explicitly means
+    /// the current value is unavailable and stale occupancy must be cleared.
+    ContextUsage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<ContextUsage>,
+    },
     RunEnd {
         result: RunResult,
     },
@@ -2438,6 +2448,30 @@ mod tests {
         );
         assert_eq!(parsed["data"]["state"]["state"]["kind"], "busy");
         assert_eq!(parsed["data"]["state"]["state"]["state"]["state"], "paused");
+    }
+
+    #[test]
+    fn context_usage_event_roundtrips_typed_value_and_unknown() {
+        let event = Event::ContextUsage {
+            usage: Some(ContextUsage {
+                tokens: 25_000,
+                source: ContextTokenSource::Estimated,
+            }),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+            serde_json::json!({
+                "event": "context_usage",
+                "data": {
+                    "usage": { "tokens": 25_000, "source": "estimated" }
+                }
+            })
+        );
+        assert!(matches!(
+            serde_json::from_str::<Event>(r#"{"event":"context_usage","data":{}}"#).unwrap(),
+            Event::ContextUsage { usage: None }
+        ));
     }
 
     #[test]

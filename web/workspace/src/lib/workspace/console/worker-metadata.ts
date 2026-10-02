@@ -8,10 +8,13 @@ export function formatReasoning(reasoning: ReasoningConfig | null): string {
     const effort = reasoning.effort.trim();
     return effort.length > 0 ? effort : "reasoning unavailable";
   }
-  if (
-    !Number.isSafeInteger(reasoning.budget_tokens) ||
-    reasoning.budget_tokens <= 0
-  ) {
+  if (!Number.isSafeInteger(reasoning.budget_tokens)) {
+    return "reasoning unavailable";
+  }
+  if (reasoning.budget_tokens === -1) {
+    return "dynamic token budget";
+  }
+  if (reasoning.budget_tokens <= 0) {
     return "reasoning unavailable";
   }
   return `${formatRunTokens(reasoning.budget_tokens)} token budget`;

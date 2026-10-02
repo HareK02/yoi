@@ -39,4 +39,15 @@ test("renders honest unavailable state instead of a fabricated zero percent", as
   });
   expect(view.container.textContent).toContain("claude · 8.2k token budget");
   expect(view.container.textContent).toContain("Context ~12.0k / 64.0k (19%)");
+
+  await view.rerender({
+    metadata: {
+      model: "claude",
+      reasoning: { kind: "budget_tokens", budget_tokens: -1 },
+      contextWindow: 64_000,
+      contextTokens: 12_000,
+      contextSource: "estimated",
+    },
+  });
+  expect(view.container.textContent).toContain("claude · dynamic token budget");
 });

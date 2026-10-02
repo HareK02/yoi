@@ -269,6 +269,17 @@ async fn set_controller_state(
     snapshot
 }
 
+fn publish_context_usage(
+    shared_state: &Arc<WorkerSharedState>,
+    working_event_tx: &broadcast::Sender<Event>,
+    tokens: Option<u64>,
+    source: protocol::ContextTokenSource,
+) {
+    shared_state.update_context_usage(tokens, source);
+    let usage = tokens.map(|tokens| protocol::ContextUsage { tokens, source });
+    let _ = working_event_tx.send(Event::ContextUsage { usage });
+}
+
 async fn set_controller_status(
     shared_state: &Arc<WorkerSharedState>,
     runtime_dir: &RuntimeDir,
@@ -303,7 +314,9 @@ async fn finish_controller_run<C, St>(
     // the terminal run boundary so reconnect snapshots cannot append stale
     // partial text/tool arguments after newer entries.
     worker.clear_in_flight_events();
-    shared_state.update_context_usage(
+    publish_context_usage(
+        shared_state,
+        working_event_tx,
         Some(worker.total_tokens().tokens),
         protocol::ContextTokenSource::Estimated,
     );
@@ -797,9 +810,14 @@ impl WorkerController {
             greeting,
         ));
         let usage_state = shared_state.clone();
+        let usage_events = working_event_tx.clone();
         worker.engine_mut().on_usage(move |event| {
-            usage_state
-                .update_context_usage(event.input_tokens, protocol::ContextTokenSource::Measured);
+            publish_context_usage(
+                &usage_state,
+                &usage_events,
+                event.input_tokens,
+                protocol::ContextTokenSource::Measured,
+            );
         });
         if let Some(fs_for_view) = fs_for_view {
             shared_state.set_fs_view(crate::fs_view::WorkerFsView::new(fs_for_view));
@@ -2518,7 +2536,9 @@ async fn controller_loop<C, St>(
                         }
                     }
                 };
-                shared_state.update_context_usage(
+                publish_context_usage(
+                    &shared_state,
+                    &working_event_tx,
                     Some(worker.total_tokens().tokens),
                     protocol::ContextTokenSource::Estimated,
                 );
@@ -2589,7 +2609,9 @@ async fn controller_loop<C, St>(
                     .await
                     {
                         worker.clear_in_flight_events();
-                        shared_state.update_context_usage(
+                        publish_context_usage(
+                            &shared_state,
+                            &working_event_tx,
                             Some(worker.total_tokens().tokens),
                             protocol::ContextTokenSource::Estimated,
                         );
@@ -3564,6 +3586,47 @@ mod tests {
             budget,
             protocol::ReasoningConfig::BudgetTokens { budget_tokens: -1 }
         );
+    }
+
+    #[test]
+    fn context_usage_publication_updates_reconnect_state_and_live_clients() {
+        let shared_state = Arc::new(WorkerSharedState::new(
+            "worker".into(),
+            session_store::new_segment_id(),
+            String::new(),
+            protocol::Greeting {
+                worker_name: "worker".into(),
+                cwd: "/tmp".into(),
+                provider: "provider".into(),
+                model: "model".into(),
+                reasoning: None,
+                scope_summary: String::new(),
+                tools: Vec::new(),
+                context_window: 100_000,
+                context_tokens: 0,
+                context_usage: None,
+            },
+        ));
+        let (events, mut receiver) = broadcast::channel(4);
+
+        publish_context_usage(
+            &shared_state,
+            &events,
+            Some(25_000),
+            protocol::ContextTokenSource::Estimated,
+        );
+
+        let expected = protocol::ContextUsage {
+            tokens: 25_000,
+            source: protocol::ContextTokenSource::Estimated,
+        };
+        assert_eq!(shared_state.greeting().context_usage, Some(expected));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::ContextUsage {
+                usage: Some(usage)
+            }) if usage == expected
+        ));
     }
 
     #[test]

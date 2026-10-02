@@ -1830,13 +1830,20 @@ fn draw_separator(frame: &mut Frame, area: Rect) {
 }
 
 fn context_usage_text(app: &App) -> String {
-    let pct = if app.context_window == 0 {
-        0
-    } else {
-        ((app.session_context_tokens as f64 / app.context_window as f64) * 100.0).round() as u64
+    let Some(source) = app.session_context_source else {
+        return "Context unavailable".to_string();
     };
+    if app.context_window == 0 {
+        return "Context unavailable".to_string();
+    }
+    let pct =
+        ((app.session_context_tokens as f64 / app.context_window as f64) * 100.0).round() as u64;
+    let estimate = matches!(source, protocol::ContextTokenSource::Estimated)
+        .then_some("~")
+        .unwrap_or_default();
     format!(
-        "{} / {} ({}%)",
+        "{}{} / {} ({}%)",
+        estimate,
         fmt_tokens(app.session_context_tokens),
         fmt_tokens(app.context_window),
         pct
@@ -2192,6 +2199,23 @@ mod tests {
             line_text(&run_status_line(&app, now)),
             "⣟ 0s ・ 1 req | ↑1.2k/↓45"
         );
+    }
+
+    #[test]
+    fn context_usage_distinguishes_unknown_measured_and_estimated_values() {
+        let mut app = App::new("worker".into());
+        app.context_window = 100_000;
+        app.session_context_tokens = 0;
+        app.session_context_source = None;
+        assert_eq!(context_usage_text(&app), "Context unavailable");
+
+        app.session_context_tokens = 25_000;
+        app.session_context_source = Some(protocol::ContextTokenSource::Measured);
+        assert_eq!(context_usage_text(&app), "25.0k / 100.0k (25%)");
+
+        app.session_context_tokens = 20_000;
+        app.session_context_source = Some(protocol::ContextTokenSource::Estimated);
+        assert_eq!(context_usage_text(&app), "~20.0k / 100.0k (20%)");
     }
 
     #[test]

@@ -381,7 +381,7 @@ summary: string,
  * Full tool output. Absent when the tool chose to return
  * summary-only, or when the result was pruned.
  */
-output?: string | null, disposition?: ToolResultDisposition | null, is_error: boolean, } } | { "event": "usage", "data": { input_tokens: number | null, output_tokens: number | null, cache_read_input_tokens?: number | null, } } | { "event": "run_end", "data": { result: RunResult, } } | { "event": "error", "data": { code: ErrorCode, message: string, } } | { "event": "snapshot", "data": { session: SessionSnapshot, greeting: Greeting,
+output?: string | null, disposition?: ToolResultDisposition | null, is_error: boolean, } } | { "event": "usage", "data": { input_tokens: number | null, output_tokens: number | null, cache_read_input_tokens?: number | null, } } | { "event": "context_usage", "data": { usage?: ContextUsage | null, } } | { "event": "run_end", "data": { result: RunResult, } } | { "event": "error", "data": { code: ErrorCode, message: string, } } | { "event": "snapshot", "data": { session: SessionSnapshot, greeting: Greeting,
 /**
  * Full revisioned live execution state. `Stopped` remains Runtime
  * catalog authority and is deliberately not represented here.

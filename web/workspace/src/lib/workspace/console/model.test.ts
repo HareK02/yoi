@@ -224,14 +224,17 @@ Deno.test("snapshot and usage keep current context separate from run traffic", (
       cache_read_input_tokens: 140_000,
       output_tokens: 2_000,
     } }, observedAtMs: 2 },
+    { eventId: "context", event: { event: "context_usage", data: {
+      usage: { tokens: 158_000, source: "estimated" },
+    } }, observedAtMs: 3 },
   ]);
 
   assertEquals(projection.workerMetadata, {
     model: "gpt-6-astra",
     reasoning: { kind: "effort", effort: "high" },
     contextWindow: 272_000,
-    contextTokens: 150_000,
-    contextSource: "measured",
+    contextTokens: 158_000,
+    contextSource: "estimated",
   });
   assertEquals(projection.runActivity.uploadTokens, 10_000);
   assertEquals(projection.runActivity.outputTokens, 2_000);
@@ -279,6 +282,20 @@ Deno.test("unknown and destructive boundaries never fabricate context percentage
   ]);
   assertEquals(projection.workerMetadata?.contextTokens, null);
   assertEquals(projection.workerMetadata?.contextSource, null);
+
+  projection = projectConsole([
+    { eventId: "live", event: live },
+    { eventId: "rewind", event: { event: "rewind_applied", data: {
+      session: canonicalSession([]),
+      input: [],
+      summary: { truncated_to_entries: 0, discarded_entries: 1, tool_side_effect_warning: false },
+    } } },
+    { eventId: "post-rewind-context", event: { event: "context_usage", data: {
+      usage: { tokens: 12, source: "estimated" },
+    } } },
+  ]);
+  assertEquals(projection.workerMetadata?.contextTokens, 12);
+  assertEquals(projection.workerMetadata?.contextSource, "estimated");
 });
 
 Deno.test("large paste segments project compact artifact metadata", () => {
