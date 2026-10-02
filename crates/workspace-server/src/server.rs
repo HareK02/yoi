@@ -38229,10 +38229,12 @@ mod tests {
                     cwd: String::new(),
                     provider: "deterministic-workspace-server-test".to_string(),
                     model: "deterministic-workspace-server-test".to_string(),
+                    reasoning: None,
                     scope_summary: "test execution snapshot".to_string(),
                     tools: Vec::new(),
                     context_window: 0,
                     context_tokens: 0,
+                    context_usage: None,
                 },
                 state: protocol::WorkerStateSnapshot::initial(),
                 in_flight: protocol::InFlightSnapshot {
