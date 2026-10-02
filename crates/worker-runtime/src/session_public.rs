@@ -534,4 +534,89 @@ mod tests {
             }
         ));
     }
+
+    #[test]
+    fn search_then_read_crosses_entry_budget_within_one_segment() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("session");
+        let store = WorkerSessionStore::new(&root).unwrap();
+        let session_id = session_store::new_session_id();
+        let segment_id = uuid::Uuid::from_u128(20_000);
+        store
+            .create_segment(
+                session_id,
+                segment_id,
+                &[LogEntry::AnnotatedSegmentStart {
+                    ts: 1,
+                    session_id,
+                    system_prompt: None,
+                    config: RequestConfig::default(),
+                    history: vec![message("seed", "ordinary")],
+                    forked_from: None,
+                    compacted_from: None,
+                }],
+            )
+            .unwrap();
+        for index in 0..4 {
+            let id = if index == 3 {
+                "target".to_string()
+            } else {
+                format!("ordinary-{index}")
+            };
+            store
+                .append(
+                    session_id,
+                    segment_id,
+                    &LogEntry::AnnotatedAssistantItem {
+                        ts: 2 + index,
+                        entry: message(&id, if index == 3 { "needle" } else { "ordinary" }),
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut generation = None;
+        let mut scan_cursor = None;
+        let found = loop {
+            let mut search_request = request(session_id, generation.clone(), scan_cursor.clone());
+            search_request.max_entries = 2;
+            let page = match search(&root, &search_request, None) {
+                SessionPublicSearchAvailability::Page { page } => page,
+                other => panic!("unexpected search result: {other:?}"),
+            };
+            if let Some(item) = page.items.into_iter().next() {
+                break (page.generation, item);
+            }
+            assert!(page.has_more);
+            generation = Some(page.generation);
+            scan_cursor = page.next_scan_cursor;
+        };
+        assert_eq!(found.1.entry_ref, "Etarget");
+
+        let read_page = match read(
+            &root,
+            &SessionPublicReadRequest {
+                workspace_id: "workspace-1".into(),
+                source: runtime_api::SessionPublicSource::Retained {
+                    worker_id: crate::identity::WorkerId::now_v7(),
+                },
+                expected_session_id: session_id.to_string(),
+                expected_generation: Some(found.0),
+                segment_id: segment_id.to_string(),
+                entry_ref: found.1.entry_ref,
+                mode: SessionPublicReadMode::Full,
+                byte_offset: 0,
+                max_content_bytes: 16 * 1024,
+                max_scan_bytes: 64 * 1024 * 1024,
+                max_segments: 64,
+                max_entries: 2,
+            },
+            None,
+        ) {
+            SessionPublicReadAvailability::Page { page } => page,
+            other => panic!("unexpected direct read result: {other:?}"),
+        };
+        assert_eq!(read_page.content, "needle");
+        assert!(read_page.scanned_entries > 2);
+    }
 }

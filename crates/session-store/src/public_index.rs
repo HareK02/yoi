@@ -600,41 +600,56 @@ pub fn read_session_public_index_entry(
     else {
         return Ok(None);
     };
-    let page = read_session_public_index_page(
-        session_root,
-        SessionPublicIndexLimits {
-            max_segments: 1,
-            ..limits
-        },
-        expected_generation,
-        Some(SessionPublicIndexScanPosition {
-            segment_index,
-            byte_offset: 0,
-            entry_offset: 0,
-            lineage: None,
-        }),
-        2,
-        |entry| entry.entry_ref == entry_ref,
-    )?;
-    let mut matches = page.entries.into_iter();
-    let item = matches.next();
-    if matches.next().is_some() {
-        return Err(SessionPublicIndexReadError::Corrupt);
+    let mut position = SessionPublicIndexScanPosition {
+        segment_index,
+        byte_offset: 0,
+        entry_offset: 0,
+        lineage: None,
+    };
+    let mut generation = expected_generation.map(str::to_string);
+    let mut selected = None;
+    let mut scanned_bytes = 0_u64;
+    let mut scanned_segments = 0_usize;
+    let mut scanned_entries = 0_usize;
+    loop {
+        let page = read_session_public_index_page(
+            session_root,
+            SessionPublicIndexLimits {
+                max_segments: 1,
+                ..limits
+            },
+            generation.as_deref(),
+            Some(position.clone()),
+            2,
+            |entry| entry.entry_ref == entry_ref,
+        )?;
+        generation.get_or_insert_with(|| page.generation.clone());
+        scanned_bytes = scanned_bytes.saturating_add(page.scanned_bytes);
+        scanned_segments = scanned_segments.saturating_add(page.scanned_segments);
+        scanned_entries = scanned_entries.saturating_add(page.scanned_entries);
+        for item in page.entries {
+            if selected.replace(item).is_some() {
+                return Err(SessionPublicIndexReadError::Corrupt);
+            }
+        }
+        let Some(next_position) = page.next_position else {
+            break;
+        };
+        if next_position.segment_index != segment_index {
+            break;
+        }
+        if next_position == position {
+            return Err(SessionPublicIndexReadError::ResourceLimit);
+        }
+        position = next_position;
     }
-    if page
-        .next_position
-        .as_ref()
-        .is_some_and(|position| position.segment_index == segment_index)
-    {
-        return Err(SessionPublicIndexReadError::ResourceLimit);
-    }
-    Ok(item.map(|item| SessionPublicIndexEntryRead {
-        session_id: page.session_id,
-        generation: page.generation,
+    Ok(selected.map(|item| SessionPublicIndexEntryRead {
+        session_id: session_id.to_string(),
+        generation: generation.expect("a successful index page always has a generation"),
         item,
-        scanned_bytes: page.scanned_bytes,
-        scanned_segments: page.scanned_segments,
-        scanned_entries: page.scanned_entries,
+        scanned_bytes,
+        scanned_segments,
+        scanned_entries,
     }))
 }
 
@@ -1808,6 +1823,79 @@ mod tests {
             assert!(!page.has_more, "exact final-range budget must be complete");
             assert!(page.next_position.is_none());
         }
+    }
+
+    #[test]
+    fn exact_entry_read_resumes_within_selected_segment_across_byte_and_entry_budgets() {
+        let (_temp, root, store) = create_store();
+        let session_id = crate::new_session_id();
+        let segment_id = segment_id(1_700);
+        store
+            .create_segment(
+                session_id,
+                segment_id,
+                &[start(
+                    session_id,
+                    vec![message("seed", LoggedRole::User, "ordinary seed")],
+                    None,
+                    None,
+                )],
+            )
+            .unwrap();
+        for index in 0..8 {
+            let id = if index == 7 {
+                "target".to_string()
+            } else {
+                format!("ordinary-{index}")
+            };
+            store
+                .append(
+                    session_id,
+                    segment_id,
+                    &LogEntry::AnnotatedAssistantItem {
+                        ts: 2 + index,
+                        entry: message(
+                            &id,
+                            LoggedRole::Assistant,
+                            if index == 7 { "needle" } else { "ordinary" },
+                        ),
+                    },
+                )
+                .unwrap();
+        }
+        let (_, first_record_bytes, _) = store
+            .read_first_log_record_read_only_bounded(session_id, segment_id, u64::MAX)
+            .unwrap();
+
+        let by_bytes = read_session_public_index_entry(
+            &root,
+            SessionPublicIndexLimits {
+                max_bytes: first_record_bytes,
+                ..SessionPublicIndexLimits::default()
+            },
+            None,
+            &segment_id.to_string(),
+            "Etarget",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(by_bytes.item.entry.full_text, "needle");
+        assert!(by_bytes.scanned_bytes > first_record_bytes);
+
+        let by_entries = read_session_public_index_entry(
+            &root,
+            SessionPublicIndexLimits {
+                max_entries: 2,
+                ..SessionPublicIndexLimits::default()
+            },
+            None,
+            &segment_id.to_string(),
+            "Etarget",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(by_entries.item.entry.full_text, "needle");
+        assert!(by_entries.scanned_entries > 2);
     }
 
     #[test]
