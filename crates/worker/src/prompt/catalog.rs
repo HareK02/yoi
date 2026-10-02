@@ -94,6 +94,7 @@ pub enum WorkerPrompt {
     CompactSystem,
     MemoryExtractSystem,
     MemoryConsolidationSystem,
+    SubjektivMemoryConsolidationSystem,
     FlowVerifierSystem,
     BackendJobSystem,
     NotifyWrapper,
@@ -112,6 +113,9 @@ impl WorkerPrompt {
             Self::CompactSystem => "internal.compact_system",
             Self::MemoryExtractSystem => "internal.memory_extract_system",
             Self::MemoryConsolidationSystem => "internal.memory_consolidation_system",
+            Self::SubjektivMemoryConsolidationSystem => {
+                "internal.subjektiv_memory_consolidation_system"
+            }
             Self::FlowVerifierSystem => "internal.flow_verifier_system",
             Self::BackendJobSystem => "internal.backend_job_system",
             Self::NotifyWrapper => "internal.notify_wrapper",
@@ -131,6 +135,7 @@ impl WorkerPrompt {
         WorkerPrompt::CompactSystem,
         WorkerPrompt::MemoryExtractSystem,
         WorkerPrompt::MemoryConsolidationSystem,
+        WorkerPrompt::SubjektivMemoryConsolidationSystem,
         WorkerPrompt::FlowVerifierSystem,
         WorkerPrompt::BackendJobSystem,
         WorkerPrompt::NotifyWrapper,
@@ -446,6 +451,15 @@ impl PromptCatalog {
     pub fn memory_consolidation_system(&self, language: &str) -> Result<String, CatalogError> {
         self.render(
             WorkerPrompt::MemoryConsolidationSystem,
+            single("language", language),
+        )
+    }
+    pub fn subjektiv_memory_consolidation_system(
+        &self,
+        language: &str,
+    ) -> Result<String, CatalogError> {
+        self.render(
+            WorkerPrompt::SubjektivMemoryConsolidationSystem,
             single("language", language),
         )
     }

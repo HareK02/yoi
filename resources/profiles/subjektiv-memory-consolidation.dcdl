@@ -1,0 +1,17 @@
+import "./base.dcdl" // {
+    slug = "subjektiv-memory-consolidation";
+    description = "Delegated subject Memory staging consolidation profile.";
+    scope = "workspace_read";
+    model = { ref = "codex-oauth/gpt-5.6-luna"; };
+    engine = { reasoning = "medium"; };
+
+    feature = {
+        task = { enabled = false; };
+        memory = { enabled = true; staging_tools = true; };
+        web = { enabled = false; };
+        sub_worker = { enabled = false; };
+        worker = { enabled = false; };
+        objective = { enabled = false; };
+        ticket = { enabled = false; thread = false; };
+    };
+}

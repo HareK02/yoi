@@ -1265,6 +1265,7 @@ mod tests {
             "coder",
             "reviewer",
             "memory-consolidation",
+            "subjektiv-memory-consolidation",
         ] {
             let role = resolve(name);
             assert_eq!(
@@ -1311,15 +1312,17 @@ mod tests {
             );
         }
 
-        let consolidation = resolve("memory-consolidation");
-        assert_eq!(
-            consolidation.manifest.model.ref_.as_deref(),
-            Some("codex-oauth/gpt-5.6-luna")
-        );
-        assert_eq!(
-            consolidation.manifest.engine.reasoning,
-            Some(ReasoningControl::Effort(ReasoningEffort::Medium))
-        );
+        for name in ["memory-consolidation", "subjektiv-memory-consolidation"] {
+            let consolidation = resolve(name);
+            assert_eq!(
+                consolidation.manifest.model.ref_.as_deref(),
+                Some("codex-oauth/gpt-5.6-luna")
+            );
+            assert_eq!(
+                consolidation.manifest.engine.reasoning,
+                Some(ReasoningControl::Effort(ReasoningEffort::Medium))
+            );
+        }
     }
 
     #[test]
