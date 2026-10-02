@@ -27,7 +27,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 74;
+const LATEST_SCHEMA_VERSION: i64 = 75;
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
@@ -70,6 +70,8 @@ const WORKER_SINGLETON_OWNERSHIP_MIGRATION_NAME: &str =
     "durable Workspace Worker singleton ownership";
 const ORDERED_WORKER_PROJECTION_MIGRATION_NAME: &str =
     "ordered Worker projection subscriptions without revision reconciliation";
+const RUNTIME_SCOPED_WORKER_IDENTITY_MIGRATION_NAME: &str =
+    "Runtime-scoped durable Worker catalog identity";
 const TICKET_SCHEMA_VERSION_WITH_TARGETS: i64 = 7;
 const TICKET_SCHEMA_BASELINE_NAME: &str = "ticket schema baseline";
 const WORKER_REGISTRY_PROJECTION_SCHEMA: &str = r#"
@@ -236,6 +238,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 74,
         name: ORDERED_WORKER_PROJECTION_MIGRATION_NAME,
         apply: migrate_ordered_worker_projection_v73_to_v74,
+    },
+    Migration {
+        version: 75,
+        name: RUNTIME_SCOPED_WORKER_IDENTITY_MIGRATION_NAME,
+        apply: migrate_runtime_scoped_worker_identity_v74_to_v75,
     },
 ];
 
@@ -6772,8 +6779,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     retention_state, transcript_ref, session_ref, summary_ref,
                     diagnostics_ref, created_at, updated_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                ON CONFLICT(workspace_id, worker_id) DO UPDATE SET
-                    runtime_id = excluded.runtime_id,
+                ON CONFLICT(workspace_id, runtime_id, worker_id) DO UPDATE SET
                     display_name = excluded.display_name,
                     profile = excluded.profile,
                     retention_state = CASE
@@ -7201,6 +7207,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                 ON CONFLICT (
                     workspace_id,
+                    controller_runtime_id,
                     controller_worker_id,
                     operation_id
                 ) DO NOTHING"#,
@@ -9035,7 +9042,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 r#"INSERT INTO worker_workdir_links (
                     workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
-                ON CONFLICT(workspace_id, worker_id, workdir_id, alias) DO UPDATE SET
+                ON CONFLICT(workspace_id, runtime_id, worker_id, workdir_id, alias) DO UPDATE SET
                     capabilities = excluded.capabilities,
                     linked_at = excluded.linked_at,
                     unlinked_at = NULL"#,
@@ -9179,7 +9186,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 r#"INSERT INTO worker_workdir_links (
                     workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
-                ON CONFLICT(workspace_id, worker_id, workdir_id, alias) DO UPDATE SET
+                ON CONFLICT(workspace_id, runtime_id, worker_id, workdir_id, alias) DO UPDATE SET
                     capabilities = excluded.capabilities,
                     linked_at = excluded.linked_at,
                     unlinked_at = NULL"#,
@@ -13783,6 +13790,239 @@ fn migrate_ordered_worker_projection_v73_to_v74(conn: &Connection) -> Result<()>
     Ok(())
 }
 
+fn migrate_runtime_scoped_worker_identity_v74_to_v75(conn: &Connection) -> Result<()> {
+    let current = current_schema_version(conn)?;
+    if current != 74 {
+        return Err(Error::Store(format!(
+            "expected schema version 74 before {RUNTIME_SCOPED_WORKER_IDENTITY_MIGRATION_NAME} migration, found {current}"
+        )));
+    }
+    let foreign_keys_enabled =
+        conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))? != 0;
+    let legacy_alter_table_enabled =
+        conn.query_row("PRAGMA legacy_alter_table", [], |row| row.get::<_, i64>(0))? != 0;
+    if foreign_keys_enabled {
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    }
+    if !legacy_alter_table_enabled {
+        conn.execute_batch("PRAGMA legacy_alter_table = ON;")?;
+    }
+    let result = (|| {
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+        tx.execute_batch(
+            r#"
+            DROP INDEX worker_control_grants_controller;
+            DROP INDEX worker_control_grants_subject;
+            DROP INDEX worker_workdir_links_active_workdir_unique;
+            DROP INDEX worker_workdir_links_active_alias_unique;
+            DROP INDEX worker_workdir_links_workdir;
+            DROP INDEX idx_worker_registry_workspace_runtime_worker;
+            DROP INDEX worker_registry_runtime;
+
+            ALTER TABLE worker_registry_observations RENAME TO worker_registry_observations_v74;
+            ALTER TABLE worker_control_grants RENAME TO worker_control_grants_v74;
+            ALTER TABLE worker_workdir_links RENAME TO worker_workdir_links_v74;
+            ALTER TABLE worker_registry RENAME TO worker_registry_v74;
+
+            CREATE TABLE worker_registry (
+                workspace_id TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                runtime_id TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                profile TEXT,
+                retention_state TEXT NOT NULL CHECK (retention_state IN ('normal', 'pinned')),
+                transcript_ref TEXT,
+                session_ref TEXT,
+                summary_ref TEXT,
+                diagnostics_ref TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (workspace_id, runtime_id, worker_id),
+                FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+            );
+            INSERT INTO worker_registry
+            SELECT * FROM worker_registry_v74;
+
+            CREATE TABLE worker_registry_observations (
+                workspace_id TEXT NOT NULL,
+                runtime_id TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                availability TEXT NOT NULL CHECK (availability IN ('observed', 'unavailable')),
+                worker_json TEXT,
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (workspace_id, runtime_id, worker_id),
+                FOREIGN KEY (workspace_id, runtime_id, worker_id)
+                    REFERENCES worker_registry(workspace_id, runtime_id, worker_id) ON DELETE CASCADE
+            );
+            INSERT INTO worker_registry_observations
+            SELECT * FROM worker_registry_observations_v74;
+
+            CREATE TABLE worker_control_grants (
+                grant_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                controller_runtime_id TEXT NOT NULL,
+                controller_worker_id TEXT NOT NULL,
+                subject_runtime_id TEXT NOT NULL,
+                subject_worker_id TEXT NOT NULL,
+                relation TEXT NOT NULL,
+                origin TEXT NOT NULL,
+                permissions_json TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                revoked_at TEXT,
+                PRIMARY KEY (workspace_id, grant_id),
+                UNIQUE (workspace_id, controller_runtime_id, controller_worker_id, operation_id),
+                FOREIGN KEY (workspace_id, controller_runtime_id, controller_worker_id)
+                    REFERENCES worker_registry(workspace_id, runtime_id, worker_id) ON DELETE CASCADE,
+                FOREIGN KEY (workspace_id, subject_runtime_id, subject_worker_id)
+                    REFERENCES worker_registry(workspace_id, runtime_id, worker_id) ON DELETE CASCADE
+            );
+            INSERT INTO worker_control_grants
+            SELECT * FROM worker_control_grants_v74;
+
+            CREATE TABLE worker_workdir_links (
+                workspace_id TEXT NOT NULL,
+                runtime_id TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                workdir_id TEXT NOT NULL,
+                alias TEXT NOT NULL,
+                linked_at TEXT NOT NULL,
+                unlinked_at TEXT,
+                capabilities TEXT NOT NULL CHECK (capabilities IN (
+                    'all', 'read_only', 'read_write', 'command_only', 'read_command'
+                )),
+                PRIMARY KEY (workspace_id, runtime_id, worker_id, workdir_id, alias),
+                FOREIGN KEY (workspace_id, runtime_id, worker_id)
+                    REFERENCES worker_registry(workspace_id, runtime_id, worker_id) ON DELETE CASCADE,
+                FOREIGN KEY (workspace_id, workdir_id)
+                    REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE
+            );
+            INSERT INTO worker_workdir_links
+            SELECT * FROM worker_workdir_links_v74;
+
+            DROP TABLE worker_registry_observations_v74;
+            DROP TABLE worker_control_grants_v74;
+            DROP TABLE worker_workdir_links_v74;
+            DROP TABLE worker_registry_v74;
+
+            CREATE INDEX worker_control_grants_controller ON worker_control_grants(
+                workspace_id, controller_runtime_id, controller_worker_id, revoked_at
+            );
+            CREATE INDEX worker_control_grants_subject ON worker_control_grants(
+                workspace_id, subject_runtime_id, subject_worker_id, revoked_at
+            );
+            CREATE UNIQUE INDEX worker_workdir_links_active_workdir_unique
+                ON worker_workdir_links(workspace_id, workdir_id) WHERE unlinked_at IS NULL;
+            CREATE UNIQUE INDEX worker_workdir_links_active_alias_unique
+                ON worker_workdir_links(workspace_id, runtime_id, worker_id, alias)
+                WHERE unlinked_at IS NULL;
+            CREATE INDEX worker_workdir_links_workdir
+                ON worker_workdir_links(workspace_id, workdir_id);
+            CREATE INDEX worker_registry_runtime
+                ON worker_registry(workspace_id, runtime_id, worker_id);
+
+            CREATE TRIGGER worker_registry_insert_blocked_by_runtime_removal
+            BEFORE INSERT ON worker_registry FOR EACH ROW
+            WHEN EXISTS (
+                SELECT 1 FROM runtime_removal_operations operation
+                WHERE operation.runtime_id = NEW.runtime_id
+                  AND operation.state IN ('pending', 'cleanup_pending')
+            )
+            BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+
+            CREATE TRIGGER worker_registry_update_blocked_by_runtime_removal
+            BEFORE UPDATE ON worker_registry FOR EACH ROW
+            WHEN EXISTS (
+                SELECT 1 FROM runtime_removal_operations operation
+                WHERE operation.runtime_id = NEW.runtime_id
+                  AND operation.state IN ('pending', 'cleanup_pending')
+            )
+            BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+
+            CREATE TRIGGER workdir_attachment_insert_blocked_by_runtime_removal
+            BEFORE INSERT ON worker_workdir_links FOR EACH ROW
+            WHEN EXISTS (
+                SELECT 1 FROM runtime_removal_operations operation
+                WHERE operation.runtime_id = NEW.runtime_id
+                  AND operation.state IN ('pending', 'cleanup_pending')
+            )
+            BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+
+            CREATE TRIGGER workdir_attachment_update_blocked_by_runtime_removal
+            BEFORE UPDATE ON worker_workdir_links FOR EACH ROW
+            WHEN EXISTS (
+                SELECT 1 FROM runtime_removal_operations operation
+                WHERE operation.runtime_id = NEW.runtime_id
+                  AND operation.state IN ('pending', 'cleanup_pending')
+            )
+            BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+
+            CREATE TRIGGER ticket_assignment_worker_parent_tombstone_delete
+            BEFORE DELETE ON worker_registry
+            WHEN EXISTS (
+                SELECT 1 FROM ticket_worker_assignments AS assignment
+                WHERE assignment.workspace_id = OLD.workspace_id
+                  AND assignment.principal_kind = 'worker'
+                  AND assignment.runtime_id = OLD.runtime_id
+                  AND assignment.worker_id = OLD.worker_id
+            )
+            BEGIN
+                INSERT OR IGNORE INTO ticket_assignment_worker_tombstones (
+                    workspace_id, runtime_id, worker_id, deleted_at
+                ) VALUES (OLD.workspace_id, OLD.runtime_id, OLD.worker_id, CURRENT_TIMESTAMP);
+            END;
+
+            CREATE TRIGGER ticket_assignment_worker_parent_tombstone_move
+            BEFORE UPDATE OF runtime_id ON worker_registry
+            WHEN OLD.runtime_id != NEW.runtime_id
+             AND EXISTS (
+                SELECT 1 FROM ticket_worker_assignments AS assignment
+                WHERE assignment.workspace_id = OLD.workspace_id
+                  AND assignment.principal_kind = 'worker'
+                  AND assignment.runtime_id = OLD.runtime_id
+                  AND assignment.worker_id = OLD.worker_id
+            )
+            BEGIN
+                INSERT OR IGNORE INTO ticket_assignment_worker_tombstones (
+                    workspace_id, runtime_id, worker_id, deleted_at
+                ) VALUES (OLD.workspace_id, OLD.runtime_id, OLD.worker_id, CURRENT_TIMESTAMP);
+            END;
+            "#,
+        )?;
+        tx.execute(
+            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+            params![75_i64, RUNTIME_SCOPED_WORKER_IDENTITY_MIGRATION_NAME],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+    let restore_result = match (legacy_alter_table_enabled, foreign_keys_enabled) {
+        (false, true) => {
+            conn.execute_batch("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;")
+        }
+        (false, false) => conn.execute_batch("PRAGMA legacy_alter_table = OFF;"),
+        (true, true) => conn.execute_batch("PRAGMA foreign_keys = ON;"),
+        (true, false) => Ok(()),
+    }
+    .map_err(Error::from);
+    match (result, restore_result) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => {
+            let violations = conn
+                .prepare("PRAGMA foreign_key_check")?
+                .query_map([], |_| Ok(()))?
+                .count();
+            if violations != 0 {
+                return Err(Error::Store(format!(
+                    "Runtime-scoped Worker identity migration left {violations} foreign key violation(s)"
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("DROP TABLE IF EXISTS typed_ticket_targets;")?;
     conn.execute_batch(include_str!("latest_schema.sql"))?;
@@ -14634,6 +14874,8 @@ mod tests {
                 retention_state, created_at, updated_at
             ) VALUES ('workspace-a', 'worker-a', 'runtime-a', 'Worker A', NULL,
                       'normal', '1', '1');
+            CREATE UNIQUE INDEX worker_registry_v74_workspace_worker
+                ON worker_registry(workspace_id, worker_id);
 
             ALTER TABLE worker_registry_observations
                 RENAME TO worker_registry_observations_v74;
@@ -14746,6 +14988,8 @@ mod tests {
              DROP TABLE typed_ticket_targets;
              ALTER TABLE typed_tickets ADD COLUMN repository_id TEXT;
              ALTER TABLE typed_tickets ADD COLUMN ref_selector TEXT;
+             CREATE UNIQUE INDEX worker_registry_v74_workspace_worker
+                 ON worker_registry(workspace_id, worker_id);
              ALTER TABLE worker_workdir_links DROP COLUMN capabilities;
              DELETE FROM ticket_schema_migrations;
              INSERT INTO ticket_schema_migrations(version, name, applied_at)
@@ -15661,6 +15905,8 @@ mod tests {
             DROP TABLE typed_ticket_targets;
             ALTER TABLE typed_tickets ADD COLUMN repository_id TEXT;
             ALTER TABLE typed_tickets ADD COLUMN ref_selector TEXT;
+            CREATE UNIQUE INDEX worker_registry_v74_workspace_worker
+                ON worker_registry(workspace_id, worker_id);
             DROP INDEX worker_workdir_links_active_workdir_unique;
             DROP INDEX worker_workdir_links_active_alias_unique;
             DROP INDEX worker_workdir_links_workdir;
@@ -16182,6 +16428,10 @@ mod tests {
                     version: 74,
                     name: ORDERED_WORKER_PROJECTION_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 75,
+                    name: RUNTIME_SCOPED_WORKER_IDENTITY_MIGRATION_NAME.to_string(),
+                },
             ]
         );
 
@@ -16260,6 +16510,10 @@ mod tests {
                         (72, BACKEND_JOB_DISPATCH_QUEUE_MIGRATION_NAME.to_string()),
                         (73, WORKER_SINGLETON_OWNERSHIP_MIGRATION_NAME.to_string()),
                         (74, ORDERED_WORKER_PROJECTION_MIGRATION_NAME.to_string()),
+                        (
+                            75,
+                            RUNTIME_SCOPED_WORKER_IDENTITY_MIGRATION_NAME.to_string(),
+                        ),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -16546,7 +16800,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72,
-                73, 74
+                73, 74, 75
             ]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
@@ -16555,7 +16809,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 25);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 26);
         assert!(column_exists(&conn, "worker_workdir_links", "alias").unwrap());
         assert!(column_exists(&conn, "worker_workdir_links", "capabilities").unwrap());
         assert!(!column_exists(&conn, "worker_workdir_links", "role").unwrap());
@@ -19923,6 +20177,98 @@ INSERT INTO worker_registry (
                 .list_worker_workdir_links("local-dev", &second_worker.worker)
                 .unwrap(),
             vec![workdir_conflict]
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_projection_preserves_equal_local_ids_from_distinct_runtimes() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteWorkspaceStore::open(temp.path().join("workspace.db")).unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "local-dev".to_string(),
+                owner_account_id: "owner-account".to_string(),
+                display_name: "Local Dev".to_string(),
+                state: "active".to_string(),
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+            })
+            .await
+            .unwrap();
+        let record = |runtime_id: &str, display_name: &str| WorkerRegistryRecord {
+            workspace_id: "local-dev".to_string(),
+            worker: RuntimeWorkerRef::new(runtime_id, "shared-local-id"),
+            display_name: display_name.to_string(),
+            profile: None,
+            retention_state: "normal".to_string(),
+            transcript_ref: None,
+            session_ref: None,
+            summary_ref: None,
+            diagnostics_ref: None,
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+        let runtime_a = record("runtime-a", "Runtime A Worker");
+        let runtime_b = record("runtime-b", "Runtime B Worker");
+        store.upsert_worker_registry(&runtime_a).unwrap();
+        store.upsert_worker_registry(&runtime_b).unwrap();
+
+        for record in [&runtime_a, &runtime_b] {
+            let observed = SubscriptionWorker {
+                worker_id: SubscriptionWorkerId::new("shared-local-id").unwrap(),
+                runtime_id: Some(record.worker.runtime_id.clone()),
+                resource_key: None,
+                availability: SubscriptionWorkerAvailability::Observed,
+                worker_state: None,
+                state: protocol::subscription::SubscriptionWorkerState::Running,
+                has_running_internal_workers: false,
+                workspace_id: Some("local-dev".to_string()),
+                display_name: Some(record.display_name.clone()),
+                profile: None,
+                job: None,
+                workdir_attachments: Vec::new(),
+            };
+            store
+                .apply_worker_registry_observation(
+                    "local-dev",
+                    record.worker.runtime_id.as_str(),
+                    &observed,
+                    "2",
+                )
+                .unwrap();
+        }
+
+        let snapshot = store
+            .worker_registry_projection_snapshot("local-dev", 10)
+            .unwrap();
+        assert_eq!(snapshot.len(), 2);
+        assert!(
+            snapshot
+                .iter()
+                .any(|row| row.registry.worker == runtime_a.worker)
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|row| row.registry.worker == runtime_b.worker)
+        );
+
+        store
+            .delete_worker_registry("local-dev", &runtime_a.worker)
+            .unwrap();
+        assert!(
+            store
+                .get_worker_registry("local-dev", &runtime_a.worker)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_worker_registry("local-dev", &runtime_b.worker)
+                .unwrap()
+                .unwrap()
+                .display_name,
+            "Runtime B Worker"
         );
     }
 

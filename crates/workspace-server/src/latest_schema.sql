@@ -753,11 +753,11 @@ CREATE TABLE "worker_control_grants" (
             created_at TEXT NOT NULL,
             revoked_at TEXT,
             PRIMARY KEY (workspace_id, grant_id),
-            UNIQUE (workspace_id, controller_worker_id, operation_id),
-            FOREIGN KEY (workspace_id, controller_worker_id)
-                REFERENCES "worker_registry"(workspace_id, worker_id) ON DELETE CASCADE,
-            FOREIGN KEY (workspace_id, subject_worker_id)
-                REFERENCES "worker_registry"(workspace_id, worker_id) ON DELETE CASCADE
+            UNIQUE (workspace_id, controller_runtime_id, controller_worker_id, operation_id),
+            FOREIGN KEY (workspace_id, controller_runtime_id, controller_worker_id)
+                REFERENCES "worker_registry"(workspace_id, runtime_id, worker_id) ON DELETE CASCADE,
+            FOREIGN KEY (workspace_id, subject_runtime_id, subject_worker_id)
+                REFERENCES "worker_registry"(workspace_id, runtime_id, worker_id) ON DELETE CASCADE
         );
 CREATE TABLE worker_create_reservations (
             workspace_id TEXT NOT NULL,
@@ -832,7 +832,7 @@ CREATE TABLE "worker_registry" (
             diagnostics_ref TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            PRIMARY KEY (workspace_id, worker_id),
+            PRIMARY KEY (workspace_id, runtime_id, worker_id),
             FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
         );
 CREATE TABLE backend_jobs (
@@ -916,8 +916,8 @@ CREATE TABLE worker_registry_observations (
     worker_json TEXT,
     observed_at TEXT NOT NULL,
     PRIMARY KEY (workspace_id, runtime_id, worker_id),
-    FOREIGN KEY (workspace_id, worker_id)
-        REFERENCES worker_registry(workspace_id, worker_id) ON DELETE CASCADE
+    FOREIGN KEY (workspace_id, runtime_id, worker_id)
+        REFERENCES worker_registry(workspace_id, runtime_id, worker_id) ON DELETE CASCADE
 );
 CREATE TABLE worker_registry_projection_removals (
     workspace_id TEXT NOT NULL,
@@ -982,9 +982,9 @@ CREATE TABLE "worker_workdir_links" (
             alias TEXT NOT NULL,
             linked_at TEXT NOT NULL,
             unlinked_at TEXT,
-            PRIMARY KEY (workspace_id, worker_id, workdir_id, alias),
-            FOREIGN KEY (workspace_id, worker_id)
-                REFERENCES "worker_registry"(workspace_id, worker_id) ON DELETE CASCADE,
+            PRIMARY KEY (workspace_id, runtime_id, worker_id, workdir_id, alias),
+            FOREIGN KEY (workspace_id, runtime_id, worker_id)
+                REFERENCES "worker_registry"(workspace_id, runtime_id, worker_id) ON DELETE CASCADE,
             FOREIGN KEY (workspace_id, workdir_id)
                 REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE
         );
@@ -1201,11 +1201,11 @@ CREATE UNIQUE INDEX ux_worker_workdir_attachment_reservation_id
     ON worker_workdir_attachment_reservations(workspace_id, reservation_id);
 CREATE INDEX worker_control_grants_controller
             ON worker_control_grants(
-                workspace_id, controller_worker_id, revoked_at
+                workspace_id, controller_runtime_id, controller_worker_id, revoked_at
             );
 CREATE INDEX worker_control_grants_subject
             ON worker_control_grants(
-                workspace_id, subject_worker_id, revoked_at
+                workspace_id, subject_runtime_id, subject_worker_id, revoked_at
             );
 CREATE INDEX worker_create_reservations_worker
             ON worker_create_reservations(workspace_id, worker_id);
@@ -1216,7 +1216,7 @@ CREATE UNIQUE INDEX worker_workdir_links_active_workdir_unique
             ON worker_workdir_links(workspace_id, workdir_id)
             WHERE unlinked_at IS NULL;
 CREATE UNIQUE INDEX worker_workdir_links_active_alias_unique
-            ON worker_workdir_links(workspace_id, worker_id, alias)
+            ON worker_workdir_links(workspace_id, runtime_id, worker_id, alias)
             WHERE unlinked_at IS NULL;
 CREATE INDEX worker_workdir_links_workdir
             ON worker_workdir_links(workspace_id, workdir_id);
