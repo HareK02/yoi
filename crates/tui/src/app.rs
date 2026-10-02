@@ -2584,6 +2584,7 @@ impl App {
             }
             session_store::SystemItem::FileAttachment { body, .. }
             | session_store::SystemItem::SkillActivation { body, .. }
+            | session_store::SystemItem::ResidentSummaryRefresh { body, .. }
             | session_store::SystemItem::Interrupt { body, .. } => {
                 self.task_store.apply_system_message_text(&body);
                 self.blocks.push(Block::SystemMessage { text: body });

@@ -26,7 +26,7 @@ Rules:
 - `source_candidate_ids` are host-derived from the applied candidate. Do not attempt to author them.
 - `derived_from` must contain only exact existing Memory revision refs returned by reads.
 - Applied responses return affected refs with `{memory_id, revision, operation}`. `duplicate` and `already_covered` may reference exact existing revisions; `discarded` and `invalid` require a concrete reason.
-- Surface/snapshot generation is deferred. `surface_dirty: true` reports that a later process should rebuild it; never treat surface generation failure as failure of an already returned committed decision.
+- Surface generation is a separate clean-context Host lifecycle that runs once after this consolidation turn commits. `surface_dirty: true` means confirmed Memory changed; never treat later surface generation failure as failure of an already returned committed decision.
 - An empty model response or transport failure is not a candidate disposition. Only a successful `MemoryApplyCandidate` response closes a candidate.
 
 Valid non-applied close actions are `discarded`, `invalid`, `duplicate`, and `already_covered`. Always provide a specific reason.

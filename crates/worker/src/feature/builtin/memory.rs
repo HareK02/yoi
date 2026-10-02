@@ -23,8 +23,8 @@ use crate::feature::{
     ToolDeclaration,
 };
 use crate::worker::{
-    SystemPromptContributionSource, WorkspaceClient, WorkspaceClientError, WorkspaceRequest,
-    WorkspaceRequestMethod,
+    SystemPromptContribution, SystemPromptContributionSource, WorkspaceClient,
+    WorkspaceClientError, WorkspaceRequest, WorkspaceRequestMethod,
 };
 
 #[derive(Clone, Debug)]
@@ -93,6 +93,87 @@ impl dyn WorkspaceClient + '_ {
     ) -> Result<MemoryConsolidationOutput, WorkspaceMemoryBackendError> {
         execute_memory_consolidation(self, operation, true).await
     }
+
+    pub async fn prepare_subjektiv_memory_surface(
+        &self,
+    ) -> Result<server_api::SubjektivSurfacePrepareResponse, WorkspaceMemoryBackendError> {
+        match execute_subjektiv_memory_operation(
+            self,
+            server_api::SubjektivMemoryBackendOperation::PrepareSurface(
+                server_api::SubjektivSurfacePrepareRequest {},
+            ),
+        )
+        .await?
+        {
+            server_api::SubjektivMemoryBackendResponse::SurfacePrepared(output) => Ok(output),
+            other => Err(WorkspaceMemoryBackendError::Backend(format!(
+                "unexpected surface preparation response: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn publish_subjektiv_memory_surface(
+        &self,
+        input: server_api::SubjektivSurfacePublishRequest,
+    ) -> Result<server_api::SubjektivSurfacePublishResponse, WorkspaceMemoryBackendError> {
+        match execute_subjektiv_memory_operation(
+            self,
+            server_api::SubjektivMemoryBackendOperation::PublishSurface(input),
+        )
+        .await?
+        {
+            server_api::SubjektivMemoryBackendResponse::SurfacePublished(output) => Ok(output),
+            other => Err(WorkspaceMemoryBackendError::Backend(format!(
+                "unexpected surface publication response: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn fail_subjektiv_memory_surface(
+        &self,
+        input: server_api::SubjektivSurfaceFailureRequest,
+    ) -> Result<server_api::SubjektivSurfaceFailureResponse, WorkspaceMemoryBackendError> {
+        match execute_subjektiv_memory_operation(
+            self,
+            server_api::SubjektivMemoryBackendOperation::FailSurface(input),
+        )
+        .await?
+        {
+            server_api::SubjektivMemoryBackendResponse::SurfaceFailed(output) => Ok(output),
+            other => Err(WorkspaceMemoryBackendError::Backend(format!(
+                "unexpected surface failure response: {other:?}"
+            ))),
+        }
+    }
+}
+
+async fn execute_subjektiv_memory_operation(
+    client: &dyn WorkspaceClient,
+    operation: server_api::SubjektivMemoryBackendOperation,
+) -> Result<server_api::SubjektivMemoryBackendResponse, WorkspaceMemoryBackendError> {
+    let workspace_id =
+        client
+            .workspace_id()
+            .ok_or_else(|| WorkspaceMemoryBackendError::Unavailable {
+                reason: format!(
+                    "workspace client kind `{}` has no workspace id",
+                    client.kind()
+                ),
+            })?;
+    let response = client.execute(WorkspaceRequest::json(
+        WorkspaceRequestMethod::Post,
+        format!("/api/w/{workspace_id}/subjektiv/memory"),
+        serde_json::to_string(&server_api::SubjektivMemoryBackendRequest { operation })?,
+    ))?;
+    let status = reqwest::StatusCode::from_u16(response.status)
+        .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    if !response.is_success() {
+        return Err(WorkspaceMemoryBackendError::Http {
+            status,
+            body: response.body,
+        });
+    }
+    Ok(serde_json::from_str(&response.body)?)
 }
 
 async fn execute_memory_backend(
@@ -571,7 +652,7 @@ struct WorkspaceResidentSummarySource {
 
 #[async_trait]
 impl SystemPromptContributionSource for WorkspaceResidentSummarySource {
-    async fn load(&self) -> Option<String> {
+    async fn load(&self) -> SystemPromptContribution {
         match self
             .client
             .execute_memory_backend_operation(
@@ -581,14 +662,22 @@ impl SystemPromptContributionSource for WorkspaceResidentSummarySource {
             )
             .await
         {
-            Ok(memory::backend::MemoryBackendOperationResult::ToolOutput(output)) => output.content,
+            Ok(memory::backend::MemoryBackendOperationResult::ResidentSummary(output))
+                if output.availability
+                    == memory::backend::MemoryResidentSummaryAvailability::Ready =>
+            {
+                SystemPromptContribution::Ready(output.content.unwrap_or_default())
+            }
+            Ok(memory::backend::MemoryBackendOperationResult::ResidentSummary(_)) => {
+                SystemPromptContribution::Unavailable
+            }
             Ok(other) => {
                 tracing::debug!(?other, "unexpected resident Memory Backend result");
-                None
+                SystemPromptContribution::Unavailable
             }
             Err(error) => {
                 tracing::debug!(%error, "resident Memory summary unavailable");
-                None
+                SystemPromptContribution::Unavailable
             }
         }
     }
@@ -762,8 +851,8 @@ mod tests {
             let body = serde_json::json!({
                 "status": "ok",
                 "result": {
-                    "kind": "tool_output",
-                    "summary": "resident Memory summary collected",
+                    "kind": "resident_summary",
+                    "availability": "ready",
                     "content": content,
                 }
             })
@@ -895,12 +984,8 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(
-            plan.resident_summary_source
-                .unwrap()
-                .load()
-                .await
-                .as_deref(),
-            Some("# Durable Memory")
+            plan.resident_summary_source.unwrap().load().await,
+            SystemPromptContribution::Ready("# Durable Memory".into())
         );
     }
 
@@ -935,22 +1020,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            first
-                .resident_summary_source
-                .unwrap()
-                .load()
-                .await
-                .as_deref(),
-            Some("first resident summary")
+            first.resident_summary_source.unwrap().load().await,
+            SystemPromptContribution::Ready("first resident summary".into())
         );
         assert_eq!(
-            restored
-                .resident_summary_source
-                .unwrap()
-                .load()
-                .await
-                .as_deref(),
-            Some("updated resident summary")
+            restored.resident_summary_source.unwrap().load().await,
+            SystemPromptContribution::Ready("updated resident summary".into())
         );
     }
 
