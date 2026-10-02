@@ -42,6 +42,8 @@ pub enum SubjektivError {
     CandidateConflict(String),
     #[error("staging candidate `{0}` is already resolved")]
     CandidateResolved(String),
+    #[error("candidate decision request `{0}` was already used with different input")]
+    DecisionRequestConflict(String),
     #[error(
         "session `{session_id}` is already attributed to subject `{existing_subject_id}` and cannot be attributed to `{requested_subject_id}`"
     )]
@@ -336,7 +338,8 @@ pub struct MemoryRecord {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryDraft {
     pub kind: CandidateKind,
     pub state: MemoryState,
@@ -411,13 +414,59 @@ pub struct SurfaceSnapshot {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MemoryRevisionTarget {
     Create,
     Revise {
         memory_id: String,
         expected_revision: u64,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryDecisionOperation {
+    Create,
+    Revise,
+    Reference,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CandidateDecision {
+    Apply {
+        target: MemoryRevisionTarget,
+        draft: MemoryDraft,
+    },
+    Close {
+        action: StagingResolutionAction,
+        #[serde(default)]
+        affected_memory: Vec<MemoryRevisionRef>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateDecisionRequest {
+    pub request_id: String,
+    pub candidate_id: String,
+    pub reason: String,
+    pub decision: CandidateDecision,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateDecisionReceipt {
+    pub request_id: String,
+    pub candidate_id: String,
+    pub resolution: StagingResolution,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<MemoryDecisionOperation>,
+    pub store_revision: u64,
+    pub surface_dirty: bool,
 }
 
 fn create_schema(transaction: &Transaction<'_>) -> crate::feature_storage::Result<()> {
@@ -761,12 +810,48 @@ END;
     Ok(())
 }
 
+fn add_candidate_decision_receipts(
+    transaction: &Transaction<'_>,
+) -> crate::feature_storage::Result<()> {
+    transaction.execute_batch(
+        r#"
+CREATE TABLE candidate_decision_receipts (
+    subject_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (subject_id, request_id),
+    UNIQUE (subject_id, candidate_id),
+    FOREIGN KEY (subject_id, candidate_id)
+        REFERENCES staging_resolutions(subject_id, candidate_id) ON DELETE RESTRICT
+);
+
+CREATE TRIGGER candidate_decision_receipts_no_update
+BEFORE UPDATE ON candidate_decision_receipts BEGIN
+    SELECT RAISE(ABORT, 'subjektiv candidate decision receipts are immutable');
+END;
+CREATE TRIGGER candidate_decision_receipts_no_delete
+BEFORE DELETE ON candidate_decision_receipts BEGIN
+    SELECT RAISE(ABORT, 'subjektiv candidate decision receipts are retained');
+END;
+"#,
+    )?;
+    Ok(())
+}
+
 static MIGRATIONS: &[FeatureMigration] = &[
     FeatureMigration::new(1, "create subjektiv subject memory store", create_schema),
     FeatureMigration::new(
         2,
         "add immutable subject session attribution",
         add_subject_session_attribution,
+    ),
+    FeatureMigration::new(
+        3,
+        "add idempotent atomic candidate decision receipts",
+        add_candidate_decision_receipts,
     ),
 ];
 
@@ -1024,6 +1109,56 @@ impl SubjektivStore {
         })
     }
 
+    pub fn pending_staging_candidates(
+        &self,
+        subject_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SubjectStagingRecord>> {
+        self.database.try_with_connection(|connection| {
+            require_subject_in_connection(connection, subject_id)?;
+            let mut statement = connection.prepare(
+                "SELECT s.record_json
+                 FROM staging_records s
+                 LEFT JOIN staging_resolutions r
+                   ON r.subject_id = s.subject_id AND r.candidate_id = s.candidate_id
+                 WHERE s.subject_id = ?1 AND r.candidate_id IS NULL
+                 ORDER BY s.created_at ASC, s.candidate_id ASC
+                 LIMIT ?2",
+            )?;
+            let rows = statement.query_map(params![subject_id, to_i64(limit as u64)?], |row| {
+                row.get::<_, String>(0)
+            })?;
+            let mut records = Vec::new();
+            for row in rows {
+                records.push(parse_staging(self.workspace_id(), &row?)?);
+            }
+            Ok(records)
+        })
+    }
+
+    pub fn pending_staging_backlog(&self, subject_id: &str) -> Result<(usize, u64)> {
+        self.database.try_with_connection(|connection| {
+            require_subject_in_connection(connection, subject_id)?;
+            let (count, bytes) = connection.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(s.record_json)), 0)
+                 FROM staging_records s
+                 LEFT JOIN staging_resolutions r
+                   ON r.subject_id = s.subject_id AND r.candidate_id = s.candidate_id
+                 WHERE s.subject_id = ?1 AND r.candidate_id IS NULL",
+                [subject_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )?;
+            Ok((
+                usize::try_from(count).map_err(|_| {
+                    SubjektivError::InvalidRecord("pending candidate count exceeds usize".into())
+                })?,
+                u64::try_from(bytes).map_err(|_| {
+                    SubjektivError::InvalidRecord("pending candidate bytes are negative".into())
+                })?,
+            ))
+        })
+    }
+
     pub fn create_memory(&self, subject_id: &str, draft: MemoryDraft) -> Result<MemoryRecord> {
         validate_direct_memory_draft(&draft)?;
         if draft.state != MemoryState::Active {
@@ -1080,7 +1215,7 @@ impl SubjektivStore {
         subject_id: &str,
         candidate_ids: &[String],
         target: MemoryRevisionTarget,
-        mut draft: MemoryDraft,
+        draft: MemoryDraft,
         reason: impl Into<String>,
     ) -> Result<(MemoryRecord, Vec<StagingResolution>)> {
         if candidate_ids.is_empty() {
@@ -1092,52 +1227,127 @@ impl SubjektivStore {
         for candidate_id in candidate_ids {
             validate_label("candidate id", candidate_id)?;
         }
-        draft.source_candidate_ids = candidate_ids.to_vec();
         let reason = reason.into();
         validate_nonempty("resolution reason", &reason)?;
-        let new_memory_id = issued_id("memory");
         self.database.try_transaction(|transaction| {
-            for candidate_id in candidate_ids {
-                require_unresolved_candidate(transaction, subject_id, candidate_id)?;
-            }
-            let memory = match &target {
-                MemoryRevisionTarget::Create => {
-                    if draft.state != MemoryState::Active {
-                        return Err(SubjektivError::InvalidRecord(
-                            "a new Memory must start in active state".to_string(),
-                        ));
-                    }
-                    write_memory_revision(transaction, subject_id, &new_memory_id, None, draft)?
+            apply_candidates_in_transaction(
+                transaction,
+                subject_id,
+                candidate_ids,
+                &target,
+                draft,
+                &reason,
+            )
+        })
+    }
+
+    pub fn decide_candidate(
+        &self,
+        subject_id: &str,
+        request: CandidateDecisionRequest,
+    ) -> Result<CandidateDecisionReceipt> {
+        validate_label("candidate decision request id", &request.request_id)?;
+        validate_label("candidate id", &request.candidate_id)?;
+        validate_nonempty("resolution reason", &request.reason)?;
+        let request_raw = serde_json::to_string(&request)?;
+        self.database.try_transaction(|transaction| {
+            if let Some((stored_request, stored_receipt)) = transaction
+                .query_row(
+                    "SELECT request_json, receipt_json
+                     FROM candidate_decision_receipts
+                     WHERE subject_id = ?1 AND request_id = ?2",
+                    params![subject_id, request.request_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+            {
+                if stored_request == request_raw {
+                    return serde_json::from_str(&stored_receipt).map_err(Into::into);
                 }
-                MemoryRevisionTarget::Revise {
-                    memory_id,
-                    expected_revision,
-                } => write_memory_revision(
-                    transaction,
-                    subject_id,
-                    memory_id,
-                    Some(*expected_revision),
-                    draft,
-                )?,
-            };
-            let reference = MemoryRevisionRef {
-                memory_id: memory.id.clone(),
-                revision: memory.revision,
-            };
-            let resolutions = candidate_ids
-                .iter()
-                .map(|candidate_id| {
-                    insert_resolution(
+                return Err(SubjektivError::DecisionRequestConflict(
+                    request.request_id.clone(),
+                ));
+            }
+            if transaction
+                .query_row(
+                    "SELECT 1 FROM candidate_decision_receipts
+                     WHERE subject_id = ?1 AND candidate_id = ?2",
+                    params![subject_id, request.candidate_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some()
+            {
+                return Err(SubjektivError::CandidateResolved(
+                    request.candidate_id.clone(),
+                ));
+            }
+
+            let (memory, operation, resolution) = match request.decision.clone() {
+                CandidateDecision::Apply { target, draft } => {
+                    let operation = match &target {
+                        MemoryRevisionTarget::Create => MemoryDecisionOperation::Create,
+                        MemoryRevisionTarget::Revise { .. } => MemoryDecisionOperation::Revise,
+                    };
+                    let candidate_ids = [request.candidate_id.clone()];
+                    let (memory, mut resolutions) = apply_candidates_in_transaction(
                         transaction,
                         subject_id,
-                        candidate_id,
-                        StagingResolutionAction::Applied,
-                        &reason,
-                        std::slice::from_ref(&reference),
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok((memory, resolutions))
+                        &candidate_ids,
+                        &target,
+                        draft,
+                        &request.reason,
+                    )?;
+                    (Some(memory), Some(operation), resolutions.remove(0))
+                }
+                CandidateDecision::Close {
+                    action,
+                    affected_memory,
+                } => {
+                    if action == StagingResolutionAction::Applied {
+                        return Err(SubjektivError::InvalidRecord(
+                            "applied candidates require an apply decision".into(),
+                        ));
+                    }
+                    let resolution = insert_resolution(
+                        transaction,
+                        subject_id,
+                        &request.candidate_id,
+                        action,
+                        &request.reason,
+                        &affected_memory,
+                    )?;
+                    let operation =
+                        (!affected_memory.is_empty()).then_some(MemoryDecisionOperation::Reference);
+                    (None, operation, resolution)
+                }
+            };
+            let store_revision = require_subject(transaction, subject_id)?.store_revision;
+            let receipt = CandidateDecisionReceipt {
+                request_id: request.request_id.clone(),
+                candidate_id: request.candidate_id.clone(),
+                surface_dirty: memory.is_some(),
+                memory,
+                operation,
+                resolution,
+                store_revision,
+            };
+            let receipt_raw = serde_json::to_string(&receipt)?;
+            transaction.execute(
+                "INSERT INTO candidate_decision_receipts (
+                    subject_id, request_id, candidate_id, request_json,
+                    receipt_json, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    subject_id,
+                    request.request_id,
+                    request.candidate_id,
+                    request_raw,
+                    receipt_raw,
+                    now()
+                ],
+            )?;
+            Ok(receipt)
         })
     }
 
@@ -1388,6 +1598,64 @@ impl SubjektivStore {
             raw.map(|raw| parse_surface_snapshot(&raw)).transpose()
         })
     }
+}
+
+fn apply_candidates_in_transaction(
+    transaction: &Transaction<'_>,
+    subject_id: &str,
+    candidate_ids: &[String],
+    target: &MemoryRevisionTarget,
+    mut draft: MemoryDraft,
+    reason: &str,
+) -> Result<(MemoryRecord, Vec<StagingResolution>)> {
+    let mut candidates = Vec::with_capacity(candidate_ids.len());
+    for candidate_id in candidate_ids {
+        let raw = require_unresolved_candidate(transaction, subject_id, candidate_id)?;
+        candidates.push(parse_staging_without_workspace(&raw)?);
+    }
+    for candidate in &candidates {
+        validate_candidate_application(transaction, subject_id, candidate, target, &draft)?;
+    }
+    draft.source_candidate_ids = candidate_ids.to_vec();
+    let new_memory_id = issued_id("memory");
+    let memory = match target {
+        MemoryRevisionTarget::Create => {
+            if draft.state != MemoryState::Active {
+                return Err(SubjektivError::InvalidRecord(
+                    "a new Memory must start in active state".into(),
+                ));
+            }
+            write_memory_revision(transaction, subject_id, &new_memory_id, None, draft)?
+        }
+        MemoryRevisionTarget::Revise {
+            memory_id,
+            expected_revision,
+        } => write_memory_revision(
+            transaction,
+            subject_id,
+            memory_id,
+            Some(*expected_revision),
+            draft,
+        )?,
+    };
+    let reference = MemoryRevisionRef {
+        memory_id: memory.id.clone(),
+        revision: memory.revision,
+    };
+    let resolutions = candidate_ids
+        .iter()
+        .map(|candidate_id| {
+            insert_resolution(
+                transaction,
+                subject_id,
+                candidate_id,
+                StagingResolutionAction::Applied,
+                reason,
+                std::slice::from_ref(&reference),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((memory, resolutions))
 }
 
 fn write_memory_revision(
@@ -1744,8 +2012,26 @@ fn require_unresolved_candidate(
             params![subject_id, candidate_id],
             |row| row.get::<_, String>(0),
         )
-        .optional()?
-        .ok_or_else(|| SubjektivError::CandidateNotFound(candidate_id.to_string()))?;
+        .optional()?;
+    let raw = match raw {
+        Some(raw) => raw,
+        None => {
+            let foreign = transaction
+                .query_row(
+                    "SELECT subject_id FROM staging_records WHERE candidate_id = ?1 LIMIT 1",
+                    [candidate_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if foreign.is_some() {
+                return Err(SubjektivError::SubjectScopeMismatch {
+                    subject_id: subject_id.to_string(),
+                    reference: candidate_id.to_string(),
+                });
+            }
+            return Err(SubjektivError::CandidateNotFound(candidate_id.to_string()));
+        }
+    };
     let resolved = transaction
         .query_row(
             "SELECT 1 FROM staging_resolutions
@@ -1999,6 +2285,74 @@ fn validate_revision_proposal_metadata(proposal: &RevisionProposal) -> Result<()
         ));
     }
     validate_nonempty("revision proposal change_reason", &proposal.change_reason)
+}
+
+fn validate_candidate_application(
+    transaction: &Transaction<'_>,
+    subject_id: &str,
+    candidate: &SubjectStagingRecord,
+    target: &MemoryRevisionTarget,
+    draft: &MemoryDraft,
+) -> Result<()> {
+    let Some(proposal) = &candidate.revision_proposal else {
+        return Ok(());
+    };
+    let MemoryRevisionTarget::Revise {
+        memory_id,
+        expected_revision,
+    } = target
+    else {
+        return Err(SubjektivError::InvalidRecord(
+            "a revision proposal cannot create a different Memory".into(),
+        ));
+    };
+    if memory_id != &proposal.memory_id || expected_revision != &proposal.expected_revision {
+        return Err(SubjektivError::InvalidRecord(
+            "candidate application target must exactly match revision proposal metadata".into(),
+        ));
+    }
+    let current = scoped_memory_in_connection(transaction, subject_id, memory_id)?;
+    if current.revision != *expected_revision {
+        return Err(SubjektivError::RevisionConflict {
+            memory_id: memory_id.clone(),
+            expected: *expected_revision,
+            actual: current.revision,
+        });
+    }
+    let expected_state = match proposal.intent {
+        RevisionProposalIntent::Revise => current.state,
+        RevisionProposalIntent::Resolve => MemoryState::Resolved,
+        RevisionProposalIntent::Retract => MemoryState::Retracted,
+        RevisionProposalIntent::Reopen => MemoryState::Active,
+    };
+    let intent_allowed = match proposal.intent {
+        RevisionProposalIntent::Revise => {
+            matches!(current.state, MemoryState::Active | MemoryState::Resolved)
+        }
+        RevisionProposalIntent::Resolve => current.state == MemoryState::Active,
+        RevisionProposalIntent::Retract => {
+            matches!(current.state, MemoryState::Active | MemoryState::Resolved)
+        }
+        RevisionProposalIntent::Reopen => current.state == MemoryState::Resolved,
+    };
+    if !intent_allowed || draft.state != expected_state {
+        return Err(SubjektivError::InvalidStateTransition {
+            memory_id: memory_id.clone(),
+            from: current.state,
+            to: draft.state,
+        });
+    }
+    if draft.kind != current.kind || draft.kind != candidate.kind {
+        return Err(SubjektivError::InvalidRecord(
+            "revision proposal application must preserve the target Memory kind".into(),
+        ));
+    }
+    if draft.change_reason != proposal.change_reason {
+        return Err(SubjektivError::InvalidRecord(
+            "revision proposal application must preserve change_reason".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_staged_revision_proposal(
@@ -2800,6 +3154,321 @@ mod tests {
                 .revision_proposal,
             Some(proposal)
         );
+    }
+
+    #[test]
+    fn atomic_candidate_decision_is_idempotent_and_preserves_proposal_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_manager, _workspace, store) = open_store(&temp.path().join("storage"), "workspace-a");
+        let subject = store.create_subject(role()).unwrap();
+        let memory = store
+            .create_memory(&subject.id, draft("Original", "initial observation"))
+            .unwrap();
+        let change_reason = "The remembered condition has ended";
+        let staged = store
+            .stage_candidate(
+                candidate(&subject.id, "candidate-resolve-atomic", "workspace-a")
+                    .with_revision_proposal(proposal(
+                        RevisionProposalIntent::Resolve,
+                        &memory.id,
+                        memory.revision,
+                        change_reason,
+                    ))
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut revised = draft("Resolved", change_reason);
+        revised.state = MemoryState::Resolved;
+        let request = CandidateDecisionRequest {
+            request_id: "decision-resolve-1".into(),
+            candidate_id: staged.id.clone(),
+            reason: "Accepted exact resolution proposal".into(),
+            decision: CandidateDecision::Apply {
+                target: MemoryRevisionTarget::Revise {
+                    memory_id: memory.id.clone(),
+                    expected_revision: memory.revision,
+                },
+                draft: revised,
+            },
+        };
+
+        let first = store
+            .decide_candidate(&subject.id, request.clone())
+            .unwrap();
+        let retried = store.decide_candidate(&subject.id, request).unwrap();
+
+        assert_eq!(first.memory.as_ref().unwrap().revision, 2);
+        assert_eq!(retried.memory.as_ref().unwrap().revision, 2);
+        assert_eq!(first.resolution.id, retried.resolution.id);
+        assert_eq!(first.store_revision, 2);
+        assert!(first.surface_dirty);
+        assert_eq!(
+            first
+                .resolution
+                .candidate
+                .revision_proposal
+                .unwrap()
+                .change_reason,
+            change_reason
+        );
+        assert_eq!(
+            store
+                .list_memory_revisions(&subject.id, &memory.id)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn candidate_decision_revalidates_stale_proposals_and_intent_transitions() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_manager, _workspace, store) = open_store(&temp.path().join("storage"), "workspace-a");
+        let subject = store.create_subject(role()).unwrap();
+        let memory = store
+            .create_memory(&subject.id, draft("Lifecycle", "initial"))
+            .unwrap();
+        let stale = store
+            .stage_candidate(
+                candidate(&subject.id, "candidate-stale-apply", "workspace-a")
+                    .with_revision_proposal(proposal(
+                        RevisionProposalIntent::Revise,
+                        &memory.id,
+                        1,
+                        "stale correction",
+                    ))
+                    .unwrap(),
+            )
+            .unwrap();
+        store
+            .revise_memory(&subject.id, &memory.id, 1, draft("Advanced", "advance"))
+            .unwrap();
+        let stale_result = store.decide_candidate(
+            &subject.id,
+            CandidateDecisionRequest {
+                request_id: "decision-stale".into(),
+                candidate_id: stale.id.clone(),
+                reason: "must not auto-rebase".into(),
+                decision: CandidateDecision::Apply {
+                    target: MemoryRevisionTarget::Revise {
+                        memory_id: memory.id.clone(),
+                        expected_revision: 1,
+                    },
+                    draft: draft("Stale", "stale correction"),
+                },
+            },
+        );
+        assert!(matches!(
+            stale_result,
+            Err(SubjektivError::RevisionConflict {
+                expected: 1,
+                actual: 2,
+                ..
+            })
+        ));
+        assert!(
+            store
+                .staging_resolution(&subject.id, &stale.id)
+                .unwrap()
+                .is_none()
+        );
+
+        let apply_intent = |store: &SubjektivStore,
+                            candidate_id: &str,
+                            intent: RevisionProposalIntent,
+                            expected_revision: u64,
+                            state: MemoryState,
+                            reason: &str| {
+            let staged = store
+                .stage_candidate(
+                    candidate(&subject.id, candidate_id, "workspace-a")
+                        .with_revision_proposal(proposal(
+                            intent,
+                            &memory.id,
+                            expected_revision,
+                            reason,
+                        ))
+                        .unwrap(),
+                )
+                .unwrap();
+            let mut next = draft(candidate_id, reason);
+            next.state = state;
+            store
+                .decide_candidate(
+                    &subject.id,
+                    CandidateDecisionRequest {
+                        request_id: format!("decision-{candidate_id}"),
+                        candidate_id: staged.id,
+                        reason: format!("apply {candidate_id}"),
+                        decision: CandidateDecision::Apply {
+                            target: MemoryRevisionTarget::Revise {
+                                memory_id: memory.id.clone(),
+                                expected_revision,
+                            },
+                            draft: next,
+                        },
+                    },
+                )
+                .unwrap()
+                .memory
+                .unwrap()
+        };
+        let resolved = apply_intent(
+            &store,
+            "resolve",
+            RevisionProposalIntent::Resolve,
+            2,
+            MemoryState::Resolved,
+            "resolve reason",
+        );
+        let reopened = apply_intent(
+            &store,
+            "reopen",
+            RevisionProposalIntent::Reopen,
+            resolved.revision,
+            MemoryState::Active,
+            "reopen reason",
+        );
+        let retracted = apply_intent(
+            &store,
+            "retract",
+            RevisionProposalIntent::Retract,
+            reopened.revision,
+            MemoryState::Retracted,
+            "retract reason",
+        );
+        assert_eq!(retracted.state, MemoryState::Retracted);
+        assert!(matches!(
+            store.stage_candidate(
+                candidate(&subject.id, "post-retract", "workspace-a")
+                    .with_revision_proposal(proposal(
+                        RevisionProposalIntent::Reopen,
+                        &memory.id,
+                        retracted.revision,
+                        "cannot revive",
+                    ))
+                    .unwrap()
+            ),
+            Err(SubjektivError::InvalidStateTransition { .. })
+        ));
+    }
+
+    #[test]
+    fn candidate_decisions_reject_conflicts_and_roll_back_partial_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_manager, _workspace, store) = open_store(&temp.path().join("storage"), "workspace-a");
+        let subject = store.create_subject(role()).unwrap();
+        let other = store.create_subject(role()).unwrap();
+        let staged = store
+            .stage_candidate(candidate(&subject.id, "candidate-rollback", "workspace-a"))
+            .unwrap();
+        let foreign = store
+            .stage_candidate(candidate(&other.id, "candidate-foreign", "workspace-a"))
+            .unwrap();
+        let mut invalid = draft("Would be written", "must roll back");
+        invalid.derived_from.push(MemoryRevisionRef {
+            memory_id: "missing-memory".into(),
+            revision: 1,
+        });
+        let failed = store.decide_candidate(
+            &subject.id,
+            CandidateDecisionRequest {
+                request_id: "decision-rollback".into(),
+                candidate_id: staged.id.clone(),
+                reason: "invalid derivation".into(),
+                decision: CandidateDecision::Apply {
+                    target: MemoryRevisionTarget::Create,
+                    draft: invalid,
+                },
+            },
+        );
+        assert!(matches!(
+            failed,
+            Err(SubjektivError::SubjectScopeMismatch { .. })
+        ));
+        assert!(
+            store
+                .staging_resolution(&subject.id, &staged.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.list_memories(&subject.id).unwrap().is_empty());
+
+        let cross_subject = store.decide_candidate(
+            &subject.id,
+            CandidateDecisionRequest {
+                request_id: "decision-foreign".into(),
+                candidate_id: foreign.id,
+                reason: "must remain scoped".into(),
+                decision: CandidateDecision::Close {
+                    action: StagingResolutionAction::Invalid,
+                    affected_memory: vec![],
+                },
+            },
+        );
+        assert!(matches!(
+            cross_subject,
+            Err(SubjektivError::SubjectScopeMismatch { .. })
+        ));
+
+        let closed = store
+            .decide_candidate(
+                &subject.id,
+                CandidateDecisionRequest {
+                    request_id: "decision-close".into(),
+                    candidate_id: staged.id.clone(),
+                    reason: "already represented elsewhere".into(),
+                    decision: CandidateDecision::Close {
+                        action: StagingResolutionAction::AlreadyCovered,
+                        affected_memory: vec![],
+                    },
+                },
+            )
+            .unwrap();
+        assert!(!closed.surface_dirty);
+        assert!(closed.memory.is_none());
+        for (suffix, action) in [
+            ("discarded", StagingResolutionAction::Discarded),
+            ("invalid", StagingResolutionAction::Invalid),
+            ("duplicate", StagingResolutionAction::Duplicate),
+        ] {
+            let candidate_id = format!("candidate-{suffix}");
+            store
+                .stage_candidate(candidate(&subject.id, &candidate_id, "workspace-a"))
+                .unwrap();
+            let receipt = store
+                .decide_candidate(
+                    &subject.id,
+                    CandidateDecisionRequest {
+                        request_id: format!("decision-{suffix}"),
+                        candidate_id,
+                        reason: format!("specific {suffix} reason"),
+                        decision: CandidateDecision::Close {
+                            action,
+                            affected_memory: vec![],
+                        },
+                    },
+                )
+                .unwrap();
+            assert_eq!(receipt.resolution.action, action);
+            assert!(!receipt.surface_dirty);
+        }
+        let conflicting_retry = store.decide_candidate(
+            &subject.id,
+            CandidateDecisionRequest {
+                request_id: "decision-close".into(),
+                candidate_id: staged.id,
+                reason: "different disposition".into(),
+                decision: CandidateDecision::Close {
+                    action: StagingResolutionAction::Discarded,
+                    affected_memory: vec![],
+                },
+            },
+        );
+        assert!(matches!(
+            conflicting_retry,
+            Err(SubjektivError::DecisionRequestConflict(_))
+        ));
     }
 
     #[test]

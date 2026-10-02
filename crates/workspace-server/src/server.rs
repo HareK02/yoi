@@ -7168,6 +7168,31 @@ impl server_api::ServerApi for ServerApiContractService {
         .map_err(ApiError::into_repository_api_error)
     }
 
+    async fn subjektiv_memory_consolidation(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::MemoryConsolidateStagingRequest,
+    ) -> std::result::Result<server_api::MemoryConsolidationResponse, server_api::RepositoryApiError>
+    {
+        scoped_subjektiv_memory_consolidation(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            context,
+            Json(MemoryConsolidateStagingOperation {
+                force: request.force,
+            }),
+        )
+        .await
+        .map(|Json(response)| server_api::MemoryConsolidationResponse {
+            status: response.status,
+            summary: response.summary,
+            candidate_count: response.candidate_count,
+            total_bytes: response.total_bytes,
+        })
+        .map_err(ApiError::into_repository_api_error)
+    }
+
     async fn skill_list(
         &self,
         workspace_id: String,
@@ -16521,25 +16546,44 @@ async fn scoped_memory_backend_operation(
 }
 
 const SUBJEKTIV_SINGLETON_PREFIX: &str = "subjektiv:";
+const SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX: &str =
+    crate::hosts::SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX;
+const SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE: &str = "subjektiv-memory-consolidation";
 
 fn open_subjektiv_store(api: &WorkspaceApi) -> ApiResult<crate::subjektiv::SubjektivStore> {
     crate::subjektiv::SubjektivStore::open(&api.feature_storage, &api.subjektiv_registration)
         .map_err(|error| ApiError::from(Error::Store(error.to_string())))
 }
 
-fn subjektiv_subject_id_from_singleton_key(key: &str) -> ApiResult<&str> {
-    key.strip_prefix(SUBJEKTIV_SINGLETON_PREFIX)
-        .filter(|subject_id| {
-            !subject_id.is_empty()
-                && !subject_id.chars().any(char::is_control)
-                && subject_id.trim() == *subject_id
-        })
-        .ok_or_else(|| {
-            Error::WorkspacePermissionDenied(
-                "current Worker is not connected to a subjektiv subject".to_string(),
-            )
-            .into()
-        })
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubjektivWorkerAuthority {
+    Subject,
+    Consolidation,
+}
+
+fn subjektiv_scope_from_singleton_key(key: &str) -> ApiResult<(&str, SubjektivWorkerAuthority)> {
+    let (subject_id, authority) = if let Some(subject_id) =
+        key.strip_prefix(SUBJEKTIV_SINGLETON_PREFIX)
+    {
+        (subject_id, SubjektivWorkerAuthority::Subject)
+    } else if let Some(subject_id) = key.strip_prefix(SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX) {
+        (subject_id, SubjektivWorkerAuthority::Consolidation)
+    } else {
+        return Err(Error::WorkspacePermissionDenied(
+            "current Worker is not connected to a subjektiv subject".to_string(),
+        )
+        .into());
+    };
+    if subject_id.is_empty()
+        || subject_id.chars().any(char::is_control)
+        || subject_id.trim() != subject_id
+    {
+        return Err(Error::WorkspacePermissionDenied(
+            "current Worker is not connected to a subjektiv subject".to_string(),
+        )
+        .into());
+    }
+    Ok((subject_id, authority))
 }
 
 fn subjektiv_singleton_key(subject_id: &str) -> ApiResult<String> {
@@ -16551,11 +16595,43 @@ fn subjektiv_singleton_key(subject_id: &str) -> ApiResult<String> {
     Ok(key)
 }
 
+fn is_dedicated_subjektiv_consolidation_worker(
+    worker: &InternalWorkerSummary,
+    workspace_id: &str,
+    singleton_key: &str,
+) -> bool {
+    let profile_matches = worker.profile.as_deref().is_some_and(|profile| {
+        profile.strip_prefix("builtin:").unwrap_or(profile)
+            == SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE
+    });
+    let profile_tag = format!("profile:{SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE}");
+    worker.workspace.workspace_id.as_deref() == Some(workspace_id)
+        && worker.singleton_key.as_deref() == Some(singleton_key)
+        && singleton_key.starts_with(SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX)
+        && profile_matches
+        && worker.tags.iter().any(|tag| tag == &profile_tag)
+}
+
+fn require_dedicated_subjektiv_consolidation_worker(
+    worker: &InternalWorkerSummary,
+    workspace_id: &str,
+    singleton_key: &str,
+) -> ApiResult<()> {
+    if is_dedicated_subjektiv_consolidation_worker(worker, workspace_id, singleton_key) {
+        Ok(())
+    } else {
+        Err(Error::WorkspacePermissionDenied(
+            "subject Memory consolidation requires a Backend-managed dedicated Worker".to_string(),
+        )
+        .into())
+    }
+}
+
 fn subjektiv_subject_scope(
     api: &WorkspaceApi,
     workspace_id: &str,
     context: &server_api::ServerRequestContext,
-) -> ApiResult<(String, RuntimeWorkerRef)> {
+) -> ApiResult<(String, RuntimeWorkerRef, SubjektivWorkerAuthority)> {
     let source = context.runtime_source.as_ref().ok_or_else(|| {
         Error::WorkspacePermissionDenied(
             "subjektiv operations require authenticated Runtime-owned source authority".to_string(),
@@ -16575,8 +16651,31 @@ fn subjektiv_subject_scope(
                 "current Worker has no keyed singleton ownership".to_string(),
             )
         })?;
-    let subject_id = subjektiv_subject_id_from_singleton_key(&lease.key)?.to_string();
-    Ok((subject_id, worker))
+    let (subject_id, authority) = subjektiv_scope_from_singleton_key(&lease.key)?;
+    if authority == SubjektivWorkerAuthority::Consolidation {
+        let mut summary = api
+            .runtime
+            .worker(&worker)
+            .map_err(|error| error.into_error())?;
+        summary.singleton_key = Some(lease.key.clone());
+        require_dedicated_subjektiv_consolidation_worker(&summary, workspace_id, &lease.key)?;
+    }
+    Ok((subject_id.to_string(), worker, authority))
+}
+
+fn require_subjektiv_worker_authority(
+    actual: SubjektivWorkerAuthority,
+    expected: SubjektivWorkerAuthority,
+    operation: &str,
+) -> ApiResult<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(Error::WorkspacePermissionDenied(format!(
+            "subjektiv {operation} is not authorized for this Worker role"
+        ))
+        .into())
+    }
 }
 
 fn subjektiv_session_attribution(
@@ -16585,7 +16684,13 @@ fn subjektiv_session_attribution(
     context: &server_api::ServerRequestContext,
     session_id: &str,
 ) -> ApiResult<crate::subjektiv::SubjectSessionAttribution> {
-    let (subject_id, worker) = subjektiv_subject_scope(api, workspace_id, context)?;
+    let (subject_id, worker, authority) = subjektiv_subject_scope(api, workspace_id, context)?;
+    if authority != SubjektivWorkerAuthority::Subject {
+        return Err(Error::WorkspacePermissionDenied(
+            "subject Session attribution requires the current subject Worker".into(),
+        )
+        .into());
+    }
     let session_id = session_id.trim();
     if session_id.is_empty() || session_id.chars().any(char::is_control) {
         return Err(Error::InvalidInput("committed session_id is invalid".to_string()).into());
@@ -16826,7 +16931,7 @@ async fn scoped_subjektiv_memory_backend(
     Json(request): Json<server_api::SubjektivMemoryBackendRequest>,
 ) -> ApiResult<Json<server_api::SubjektivMemoryBackendResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let (subject_id, _) = subjektiv_subject_scope(&api, &path.workspace_id, &context)?;
+    let (subject_id, _, authority) = subjektiv_subject_scope(&api, &path.workspace_id, &context)?;
     let store = open_subjektiv_store(&api)?;
     let response = match request.operation {
         server_api::SubjektivMemoryBackendOperation::Query(input) => {
@@ -16849,11 +16954,21 @@ async fn scoped_subjektiv_memory_backend(
             )
         }
         server_api::SubjektivMemoryBackendOperation::ValidateProposal(input) => {
+            require_subjektiv_worker_authority(
+                authority,
+                SubjektivWorkerAuthority::Subject,
+                "revision proposal validation",
+            )?;
             server_api::SubjektivMemoryBackendResponse::ProposalValidated(
                 subjektiv_memory_validate_proposal(&store, &subject_id, input)?,
             )
         }
         server_api::SubjektivMemoryBackendOperation::ReceiptStatus(input) => {
+            require_subjektiv_worker_authority(
+                authority,
+                SubjektivWorkerAuthority::Subject,
+                "explicit candidate receipt lookup",
+            )?;
             validate_subjektiv_receipt_id(&input.receipt_id)?;
             let candidate = store
                 .staging_candidate(&subject_id, &input.receipt_id)
@@ -16871,6 +16986,11 @@ async fn scoped_subjektiv_memory_backend(
             )
         }
         server_api::SubjektivMemoryBackendOperation::StageExplicit(input) => {
+            require_subjektiv_worker_authority(
+                authority,
+                SubjektivWorkerAuthority::Subject,
+                "explicit candidate staging",
+            )?;
             // Re-derive the same subject and immutable Session attribution for the
             // write. The request never carries subject, Worker, Runtime, origin,
             // or arbitrary source JSON from the model.
@@ -16886,8 +17006,262 @@ async fn scoped_subjektiv_memory_backend(
                 attribution,
             )?)
         }
+        server_api::SubjektivMemoryBackendOperation::ListCandidates(input) => {
+            require_subjektiv_worker_authority(
+                authority,
+                SubjektivWorkerAuthority::Consolidation,
+                "candidate listing",
+            )?;
+            let limit = bounded_subjektiv_limit(input.limit, SUBJEKTIV_QUERY_DEFAULT_LIMIT)?;
+            let mut candidates = store
+                .pending_staging_candidates(&subject_id, limit.saturating_add(1))
+                .map_err(subjektiv_store_error)?;
+            let has_more = candidates.len() > limit;
+            candidates.truncate(limit);
+            server_api::SubjektivMemoryBackendResponse::Candidates(
+                server_api::SubjektivMemoryCandidateListResponse {
+                    items: candidates
+                        .into_iter()
+                        .map(subjektiv_candidate_summary)
+                        .collect(),
+                    has_more,
+                },
+            )
+        }
+        server_api::SubjektivMemoryBackendOperation::ReadCandidate(input) => {
+            require_subjektiv_worker_authority(
+                authority,
+                SubjektivWorkerAuthority::Consolidation,
+                "candidate read",
+            )?;
+            let candidate = store
+                .staging_candidate(&subject_id, &input.candidate_id)
+                .map_err(subjektiv_store_error)?
+                .ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "candidate_not_found: pending candidate `{}` was not found",
+                        input.candidate_id
+                    ))
+                })?;
+            if store
+                .staging_resolution(&subject_id, &input.candidate_id)
+                .map_err(subjektiv_store_error)?
+                .is_some()
+            {
+                return Err(Error::RepositoryConflict(format!(
+                    "candidate_resolved: candidate `{}` is already resolved",
+                    input.candidate_id
+                ))
+                .into());
+            }
+            server_api::SubjektivMemoryBackendResponse::Candidate(subjektiv_candidate(candidate))
+        }
+        server_api::SubjektivMemoryBackendOperation::DecideCandidate(input) => {
+            require_subjektiv_worker_authority(
+                authority,
+                SubjektivWorkerAuthority::Consolidation,
+                "candidate decision",
+            )?;
+            let receipt = store
+                .decide_candidate(&subject_id, subjektiv_candidate_decision(input)?)
+                .map_err(subjektiv_store_error)?;
+            server_api::SubjektivMemoryBackendResponse::CandidateDecided(
+                subjektiv_candidate_decision_response(receipt),
+            )
+        }
     };
     Ok(Json(response))
+}
+
+fn subjektiv_candidate_summary(
+    candidate: crate::subjektiv::SubjectStagingRecord,
+) -> server_api::SubjektivMemoryCandidateSummary {
+    server_api::SubjektivMemoryCandidateSummary {
+        candidate_id: candidate.id,
+        kind: candidate.kind,
+        claim: candidate.claim,
+        revision_proposal: candidate.revision_proposal.map(subjektiv_proposal_metadata),
+        created_at: candidate.created_at,
+    }
+}
+
+fn subjektiv_candidate(
+    candidate: crate::subjektiv::SubjectStagingRecord,
+) -> server_api::SubjektivMemoryCandidate {
+    server_api::SubjektivMemoryCandidate {
+        candidate_id: candidate.id,
+        kind: candidate.kind,
+        claim: candidate.claim,
+        why_useful: candidate.why_useful,
+        staleness: candidate.staleness,
+        source: candidate.source,
+        evidence: candidate.evidence,
+        source_refs: candidate.source_refs,
+        revision_proposal: candidate.revision_proposal.map(subjektiv_proposal_metadata),
+        created_at: candidate.created_at,
+    }
+}
+
+fn subjektiv_proposal_metadata(
+    proposal: crate::subjektiv::RevisionProposal,
+) -> server_api::SubjektivMemoryRevisionProposalMetadata {
+    server_api::SubjektivMemoryRevisionProposalMetadata {
+        memory_id: proposal.memory_id,
+        expected_revision: proposal.expected_revision,
+        intent: match proposal.intent {
+            crate::subjektiv::RevisionProposalIntent::Revise => {
+                server_api::SubjektivMemoryRevisionIntent::Revise
+            }
+            crate::subjektiv::RevisionProposalIntent::Resolve => {
+                server_api::SubjektivMemoryRevisionIntent::Resolve
+            }
+            crate::subjektiv::RevisionProposalIntent::Retract => {
+                server_api::SubjektivMemoryRevisionIntent::Retract
+            }
+            crate::subjektiv::RevisionProposalIntent::Reopen => {
+                server_api::SubjektivMemoryRevisionIntent::Reopen
+            }
+        },
+        change_reason: proposal.change_reason,
+    }
+}
+
+fn subjektiv_candidate_decision(
+    input: server_api::SubjektivMemoryCandidateDecisionRequest,
+) -> ApiResult<crate::subjektiv::CandidateDecisionRequest> {
+    let decision = match input.decision {
+        server_api::SubjektivMemoryCandidateDecision::Apply { target, memory } => {
+            let target = match target {
+                server_api::SubjektivMemoryApplyTarget::Create => {
+                    crate::subjektiv::MemoryRevisionTarget::Create
+                }
+                server_api::SubjektivMemoryApplyTarget::Revise {
+                    memory_id,
+                    expected_revision,
+                } => crate::subjektiv::MemoryRevisionTarget::Revise {
+                    memory_id,
+                    expected_revision,
+                },
+            };
+            crate::subjektiv::CandidateDecision::Apply {
+                target,
+                draft: crate::subjektiv::MemoryDraft {
+                    kind: memory.kind,
+                    state: domain_memory_state(memory.state),
+                    claim: memory.claim,
+                    body_md: memory.body_md,
+                    why_useful: memory.why_useful,
+                    staleness: memory.staleness,
+                    source_candidate_ids: Vec::new(),
+                    derived_from: memory
+                        .derived_from
+                        .into_iter()
+                        .map(|reference| crate::subjektiv::MemoryRevisionRef {
+                            memory_id: reference.memory_id,
+                            revision: reference.revision,
+                        })
+                        .collect(),
+                    change_reason: memory.change_reason,
+                },
+            }
+        }
+        server_api::SubjektivMemoryCandidateDecision::Close {
+            action,
+            affected_memory,
+        } => crate::subjektiv::CandidateDecision::Close {
+            action: match action {
+                server_api::SubjektivMemoryCandidateCloseAction::Discarded => {
+                    crate::subjektiv::StagingResolutionAction::Discarded
+                }
+                server_api::SubjektivMemoryCandidateCloseAction::Invalid => {
+                    crate::subjektiv::StagingResolutionAction::Invalid
+                }
+                server_api::SubjektivMemoryCandidateCloseAction::Duplicate => {
+                    crate::subjektiv::StagingResolutionAction::Duplicate
+                }
+                server_api::SubjektivMemoryCandidateCloseAction::AlreadyCovered => {
+                    crate::subjektiv::StagingResolutionAction::AlreadyCovered
+                }
+            },
+            affected_memory: affected_memory
+                .into_iter()
+                .map(|reference| crate::subjektiv::MemoryRevisionRef {
+                    memory_id: reference.memory_id,
+                    revision: reference.revision,
+                })
+                .collect(),
+        },
+    };
+    Ok(crate::subjektiv::CandidateDecisionRequest {
+        request_id: input.request_id,
+        candidate_id: input.candidate_id,
+        reason: input.reason,
+        decision,
+    })
+}
+
+fn subjektiv_candidate_decision_response(
+    receipt: crate::subjektiv::CandidateDecisionReceipt,
+) -> server_api::SubjektivMemoryCandidateDecisionResponse {
+    let operation = match receipt.operation {
+        Some(crate::subjektiv::MemoryDecisionOperation::Create) => {
+            server_api::SubjektivMemoryAffectedOperation::Create
+        }
+        Some(crate::subjektiv::MemoryDecisionOperation::Revise) => {
+            server_api::SubjektivMemoryAffectedOperation::Revise
+        }
+        Some(crate::subjektiv::MemoryDecisionOperation::Reference) | None => {
+            server_api::SubjektivMemoryAffectedOperation::Reference
+        }
+    };
+    server_api::SubjektivMemoryCandidateDecisionResponse {
+        request_id: receipt.request_id,
+        candidate_id: receipt.candidate_id,
+        action: match receipt.resolution.action {
+            crate::subjektiv::StagingResolutionAction::Applied => {
+                server_api::SubjektivMemoryCandidateResolutionAction::Applied
+            }
+            crate::subjektiv::StagingResolutionAction::Discarded => {
+                server_api::SubjektivMemoryCandidateResolutionAction::Discarded
+            }
+            crate::subjektiv::StagingResolutionAction::Invalid => {
+                server_api::SubjektivMemoryCandidateResolutionAction::Invalid
+            }
+            crate::subjektiv::StagingResolutionAction::Duplicate => {
+                server_api::SubjektivMemoryCandidateResolutionAction::Duplicate
+            }
+            crate::subjektiv::StagingResolutionAction::AlreadyCovered => {
+                server_api::SubjektivMemoryCandidateResolutionAction::AlreadyCovered
+            }
+        },
+        reason: receipt.resolution.reason,
+        affected_memory: receipt
+            .resolution
+            .affected_memory
+            .into_iter()
+            .map(|reference| server_api::SubjektivMemoryAffectedRef {
+                memory_id: reference.memory_id,
+                revision: reference.revision,
+                operation,
+            })
+            .collect(),
+        memory: receipt
+            .memory
+            .map(|memory| server_api::SubjektivMemoryRevisionRef {
+                memory_id: memory.id,
+                revision: memory.revision,
+            }),
+        store_revision: receipt.store_revision,
+        surface_dirty: receipt.surface_dirty,
+    }
+}
+
+fn domain_memory_state(state: server_api::SubjektivMemoryState) -> crate::subjektiv::MemoryState {
+    match state {
+        server_api::SubjektivMemoryState::Active => crate::subjektiv::MemoryState::Active,
+        server_api::SubjektivMemoryState::Resolved => crate::subjektiv::MemoryState::Resolved,
+        server_api::SubjektivMemoryState::Retracted => crate::subjektiv::MemoryState::Retracted,
+    }
 }
 
 fn subjektiv_memory_query(
@@ -17844,6 +18218,10 @@ fn subjektiv_store_error(error: crate::subjektiv::SubjektivError) -> Error {
         crate::subjektiv::SubjektivError::RevisionConflict { .. } => {
             Error::RepositoryConflict(format!("revision_conflict: {error}"))
         }
+        crate::subjektiv::SubjektivError::CandidateResolved(_)
+        | crate::subjektiv::SubjektivError::DecisionRequestConflict(_) => {
+            Error::RepositoryConflict(format!("candidate_decision_conflict: {error}"))
+        }
         crate::subjektiv::SubjektivError::MemoryNotFound(_) => {
             Error::InvalidInput(format!("memory_not_found: {error}"))
         }
@@ -17854,6 +18232,187 @@ fn subjektiv_store_error(error: crate::subjektiv::SubjektivError) -> Error {
 
 const MEMORY_CONSOLIDATION_PROFILE: &str = "memory-consolidation";
 const MEMORY_CONSOLIDATION_SINGLETON_KEY: &str = "workspace-memory-consolidation";
+
+async fn scoped_subjektiv_memory_consolidation(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    context: server_api::ServerRequestContext,
+    Json(operation): Json<MemoryConsolidateStagingOperation>,
+) -> ApiResult<Json<MemoryConsolidationOutput>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let (subject_id, _, authority) = subjektiv_subject_scope(&api, &path.workspace_id, &context)?;
+    require_subjektiv_worker_authority(
+        authority,
+        SubjektivWorkerAuthority::Subject,
+        "consolidation request",
+    )?;
+    Ok(Json(start_subjektiv_staging_consolidation(
+        api,
+        &subject_id,
+        operation,
+    )?))
+}
+
+fn start_subjektiv_staging_consolidation(
+    api: WorkspaceApi,
+    subject_id: &str,
+    operation: MemoryConsolidateStagingOperation,
+) -> ApiResult<MemoryConsolidationOutput> {
+    let (candidate_count, total_bytes) = open_subjektiv_store(&api)?
+        .pending_staging_backlog(subject_id)
+        .map_err(subjektiv_store_error)?;
+    if candidate_count == 0 {
+        return Ok(MemoryConsolidationOutput {
+            status: "skipped_empty".into(),
+            summary: "No subject Memory staging candidates are pending.".into(),
+            candidate_count,
+            total_bytes,
+        });
+    }
+    const CONSOLIDATION_THRESHOLD_FILES: usize = 5;
+    const CONSOLIDATION_THRESHOLD_BYTES: u64 = 50_000;
+    if !operation.force
+        && candidate_count < CONSOLIDATION_THRESHOLD_FILES
+        && total_bytes < CONSOLIDATION_THRESHOLD_BYTES
+    {
+        return Ok(MemoryConsolidationOutput {
+            status: "skipped_below_threshold".into(),
+            summary: format!(
+                "Subject Memory staging backlog has {candidate_count} candidate(s), {total_bytes} byte(s), below Backend policy threshold."
+            ),
+            candidate_count,
+            total_bytes,
+        });
+    }
+
+    let runtime_id = select_memory_consolidation_runtime(&api)?;
+    let singleton_key = format!("{SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX}{subject_id}");
+    let input_content = format!(
+        "Process the delegated subject's {candidate_count} pending Memory candidate(s) ({total_bytes} bytes) with MemoryStagingList, MemoryStagingRead, subject Memory reads, and MemoryApplyCandidate."
+    );
+    if let Some(output) = try_reuse_subject_consolidation_worker(
+        &api,
+        &singleton_key,
+        &input_content,
+        candidate_count,
+        total_bytes,
+    )? {
+        return Ok(output);
+    }
+    let result = api.spawn_workspace_worker(
+        &runtime_id,
+        WorkerSpawnRequest {
+            requested_worker_name: Some(SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE.to_string()),
+            singleton_key: Some(singleton_key),
+            intent: WorkerSpawnIntent::WorkspaceOrchestrator,
+            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                expected_segments: 1,
+            },
+            profile: ProfileSelector::Builtin(SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE.to_string()),
+            ticket_assignment: None,
+            initial_submit: vec![Segment::text(input_content)],
+            workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachments: Vec::new(),
+            resolved_config_bundle: None,
+            resolved_worker_observation_enabled: false,
+            resolved_worker_observation_grants: Vec::new(),
+            resolved_workspace_api: None,
+            resolved_memory_settings: None,
+            resolved_control_operation: None,
+        },
+    )?;
+    if result.state != InternalWorkerOperationState::Accepted {
+        return Ok(MemoryConsolidationOutput {
+            status: "skipped_spawn_rejected".into(),
+            summary: "Runtime rejected subject Memory consolidater spawn.".into(),
+            candidate_count,
+            total_bytes,
+        });
+    }
+    let Some(worker) = result.worker else {
+        return Ok(MemoryConsolidationOutput {
+            status: "skipped_spawn_missing_worker".into(),
+            summary: "Runtime accepted subject Memory consolidater spawn without returning a Worker summary.".into(),
+            candidate_count,
+            total_bytes,
+        });
+    };
+    Ok(MemoryConsolidationOutput {
+        status: "started".into(),
+        summary: format!(
+            "Started subject Memory consolidater '{}' for {candidate_count} staging candidate(s).",
+            worker.worker.worker_id
+        ),
+        candidate_count,
+        total_bytes,
+    })
+}
+
+fn try_reuse_subject_consolidation_worker(
+    api: &WorkspaceApi,
+    singleton_key: &str,
+    input_content: &str,
+    candidate_count: usize,
+    total_bytes: u64,
+) -> ApiResult<Option<MemoryConsolidationOutput>> {
+    let Some(owner) = api
+        .store
+        .current_worker_singleton_owner(&api.config.workspace_id, singleton_key)?
+    else {
+        return Ok(None);
+    };
+    let mut worker = api
+        .runtime
+        .worker(&owner.worker)
+        .map_err(|error| error.into_error())?;
+    worker.singleton_key = Some(owner.key);
+    require_dedicated_subjektiv_consolidation_worker(
+        &worker,
+        &api.config.workspace_id,
+        singleton_key,
+    )?;
+    if worker.state != "idle" {
+        return Ok(Some(MemoryConsolidationOutput {
+            status: "skipped_existing_not_idle".into(),
+            summary: format!(
+                "Existing subject Memory consolidater '{}' is '{}', not confirmed idle.",
+                worker.worker.worker_id, worker.state
+            ),
+            candidate_count,
+            total_bytes,
+        }));
+    }
+    let input = api
+        .runtime
+        .send_input(
+            &worker.worker,
+            WorkerInputRequest {
+                kind: WorkerInputKind::User,
+                content: input_content.to_string(),
+                submission_request_id: None,
+                segments: None,
+            },
+        )
+        .map_err(|error| error.into_error())?;
+    if input.state != InternalWorkerOperationState::Accepted {
+        return Ok(Some(MemoryConsolidationOutput {
+            status: "skipped_existing_input_rejected".into(),
+            summary: "Existing subject Memory consolidater rejected new input.".into(),
+            candidate_count,
+            total_bytes,
+        }));
+    }
+    Ok(Some(MemoryConsolidationOutput {
+        status: "reused".into(),
+        summary: format!(
+            "Reused subject Memory consolidater '{}' for {candidate_count} staging candidate(s).",
+            worker.worker.worker_id
+        ),
+        candidate_count,
+        total_bytes,
+    }))
+}
 
 async fn scoped_memory_consolidation(
     State(api): State<WorkspaceApi>,
@@ -29106,25 +29665,32 @@ impl From<Error> for ApiError {
                 severity: HostDiagnosticSeverity::Error,
                 message: sanitize_backend_error(&ticket_error.to_string()),
             }],
-            Error::RepositoryConflict(message) => subjektiv_conflict_code(message)
-                .map(|code| {
-                    vec![RuntimeDiagnostic {
-                        code: code.to_string(),
-                        severity: HostDiagnosticSeverity::Error,
-                        message: sanitize_backend_error(message),
-                    }]
-                })
-                .unwrap_or_default(),
+            Error::RepositoryConflict(message) | Error::WorkspacePermissionDenied(message) => {
+                subjektiv_diagnostic_code(message)
+                    .map(|code| {
+                        vec![RuntimeDiagnostic {
+                            code: code.to_string(),
+                            severity: HostDiagnosticSeverity::Error,
+                            message: sanitize_backend_error(message),
+                        }]
+                    })
+                    .unwrap_or_default()
+            }
             _ => Vec::new(),
         };
         Self { error, diagnostics }
     }
 }
 
-fn subjektiv_conflict_code(message: &str) -> Option<&'static str> {
-    ["revision_conflict", "stale_cursor"]
-        .into_iter()
-        .find(|code| message.starts_with(code))
+fn subjektiv_diagnostic_code(message: &str) -> Option<&'static str> {
+    [
+        "revision_conflict",
+        "stale_cursor",
+        "candidate_decision_conflict",
+        "subject_scope_mismatch",
+    ]
+    .into_iter()
+    .find(|code| message.starts_with(code))
 }
 
 impl ApiError {
@@ -42930,31 +43496,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
         let api = test_api(dir.path()).await;
-        let request = |requested_worker_name: &str,
-                       intent: server_api::RuntimeWorkerSpawnIntent,
-                       profile: &str| server_api::RuntimeWorkerSpawnRequest {
-            requested_worker_name: Some(requested_worker_name.to_string()),
-            intent,
-            singleton_key: Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string()),
-            acceptance: server_api::RuntimeWorkerSpawnAcceptanceRequirement::RunAccepted {
-                expected_segments: 0,
-            },
-            profile: server_api::RuntimeProfileSelector::Builtin(profile.to_string()),
-            ticket_assignment: None,
-            initial_submit: Vec::new(),
-            workdir_attachment_requests: Vec::new(),
-        };
+        let request =
+            |requested_worker_name: &str,
+             intent: server_api::RuntimeWorkerSpawnIntent,
+             profile: &str,
+             singleton_key: &str| server_api::RuntimeWorkerSpawnRequest {
+                requested_worker_name: Some(requested_worker_name.to_string()),
+                intent,
+                singleton_key: Some(singleton_key.to_string()),
+                acceptance: server_api::RuntimeWorkerSpawnAcceptanceRequirement::RunAccepted {
+                    expected_segments: 0,
+                },
+                profile: server_api::RuntimeProfileSelector::Builtin(profile.to_string()),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachment_requests: Vec::new(),
+            };
 
+        let subject_consolidation_key = "subjektiv-consolidation:subject-forged";
         for candidate in [
             request(
                 "Generic key squatter",
                 server_api::RuntimeWorkerSpawnIntent::WorkspaceCompanion,
                 "builtin:companion",
+                crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY,
             ),
             request(
                 crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY,
                 server_api::RuntimeWorkerSpawnIntent::WorkspaceOrchestrator,
                 "builtin:orchestrator",
+                crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY,
+            ),
+            request(
+                SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE,
+                server_api::RuntimeWorkerSpawnIntent::WorkspaceOrchestrator,
+                "builtin:subjektiv-memory-consolidation",
+                subject_consolidation_key,
             ),
         ] {
             let error = scoped_create_runtime_worker(
@@ -42975,6 +43552,12 @@ mod tests {
                     TEST_WORKSPACE_ID,
                     crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY,
                 )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            api.store
+                .current_worker_singleton_owner(TEST_WORKSPACE_ID, subject_consolidation_key)
                 .unwrap()
                 .is_none()
         );
@@ -50667,15 +51250,141 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    #[tokio::test]
+    async fn subjektiv_consolidation_scope_rejects_non_dedicated_singleton_owner() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let spawn = |profile: &str, key: &str| WorkerSpawnRequest {
+            requested_worker_name: Some(profile.to_string()),
+            singleton_key: Some(key.to_string()),
+            intent: WorkerSpawnIntent::WorkspaceOrchestrator,
+            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                expected_segments: 0,
+            },
+            profile: ProfileSelector::Builtin(profile.to_string()),
+            ticket_assignment: None,
+            initial_submit: Vec::new(),
+            workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachments: Vec::new(),
+            resolved_config_bundle: None,
+            resolved_worker_observation_enabled: false,
+            resolved_worker_observation_grants: Vec::new(),
+            resolved_workspace_api: None,
+            resolved_memory_settings: None,
+            resolved_control_operation: None,
+        };
+
+        let dedicated_key = "subjektiv-consolidation:dedicated-subject";
+        let dedicated = api
+            .spawn_workspace_worker(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                spawn(SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE, dedicated_key),
+            )
+            .unwrap()
+            .worker
+            .unwrap();
+        assert!(is_dedicated_subjektiv_consolidation_worker(
+            &dedicated,
+            TEST_WORKSPACE_ID,
+            dedicated_key
+        ));
+        let dedicated_context = server_api::ServerRequestContext {
+            actor: None,
+            worker_source: None,
+            runtime_source: Some(server_api::ServerRuntimeSource {
+                runtime_id: dedicated.worker.runtime_id.clone(),
+                worker_id: Some(dedicated.worker.worker_id.clone()),
+            }),
+            origin: None,
+            transport_headers: Vec::new(),
+        };
+        assert_eq!(
+            subjektiv_subject_scope(&api, TEST_WORKSPACE_ID, &dedicated_context)
+                .unwrap()
+                .2,
+            SubjektivWorkerAuthority::Consolidation
+        );
+
+        let forged_key = "subjektiv-consolidation:forged-subject";
+        let forged = api
+            .spawn_workspace_worker(EMBEDDED_WORKER_RUNTIME_ID, spawn("companion", forged_key))
+            .unwrap()
+            .worker
+            .unwrap();
+        let forged_context = server_api::ServerRequestContext {
+            actor: None,
+            worker_source: None,
+            runtime_source: Some(server_api::ServerRuntimeSource {
+                runtime_id: forged.worker.runtime_id.clone(),
+                worker_id: Some(forged.worker.worker_id.clone()),
+            }),
+            origin: None,
+            transport_headers: Vec::new(),
+        };
+        let error = subjektiv_subject_scope(&api, TEST_WORKSPACE_ID, &forged_context).unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+        assert!(
+            try_reuse_subject_consolidation_worker(
+                &api,
+                forged_key,
+                "process pending subject Memory",
+                1,
+                1,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn subjektiv_http_errors_emit_typed_retry_diagnostics() {
+        for (error, code, status) in [
+            (
+                Error::RepositoryConflict(
+                    "candidate_decision_conflict: candidate already resolved".to_string(),
+                ),
+                "candidate_decision_conflict",
+                StatusCode::CONFLICT,
+            ),
+            (
+                Error::WorkspacePermissionDenied(
+                    "subject_scope_mismatch: candidate belongs to another subject".to_string(),
+                ),
+                "subject_scope_mismatch",
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            assert_eq!(api_error_status(&error), status);
+            let response = ApiError::from(error).into_repository_api_error();
+            assert_eq!(response.diagnostics.len(), 1);
+            assert_eq!(response.diagnostics[0].code, code);
+        }
+    }
+
     #[test]
     fn subjektiv_singleton_scope_is_explicit_and_opaque() {
         assert_eq!(
-            subjektiv_subject_id_from_singleton_key("subjektiv:subject-42").unwrap(),
+            subjektiv_scope_from_singleton_key("subjektiv:subject-42")
+                .unwrap()
+                .0,
             "subject-42"
         );
-        assert!(subjektiv_subject_id_from_singleton_key("workspace-orchestrator").is_err());
-        assert!(subjektiv_subject_id_from_singleton_key("subjektiv:").is_err());
-        assert!(subjektiv_subject_id_from_singleton_key("subjektiv: subject-42").is_err());
+        assert_eq!(
+            subjektiv_scope_from_singleton_key("subjektiv-consolidation:subject-42")
+                .unwrap()
+                .1,
+            SubjektivWorkerAuthority::Consolidation
+        );
+        assert_eq!(
+            subjektiv_scope_from_singleton_key("subjektiv:subject-42")
+                .unwrap()
+                .1,
+            SubjektivWorkerAuthority::Subject
+        );
+        assert!(subjektiv_scope_from_singleton_key("workspace-orchestrator").is_err());
+        assert!(subjektiv_scope_from_singleton_key("subjektiv:").is_err());
+        assert!(subjektiv_scope_from_singleton_key("subjektiv: subject-42").is_err());
         assert_eq!(
             subjektiv_singleton_key("subject-42").unwrap(),
             "subjektiv:subject-42"

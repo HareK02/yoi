@@ -1265,6 +1265,7 @@ mod tests {
             "coder",
             "reviewer",
             "memory-consolidation",
+            "subjektiv-memory-consolidation",
         ] {
             let role = resolve(name);
             assert_eq!(
@@ -1311,14 +1312,65 @@ mod tests {
             );
         }
 
-        let consolidation = resolve("memory-consolidation");
+        for name in ["memory-consolidation", "subjektiv-memory-consolidation"] {
+            let consolidation = resolve(name);
+            assert_eq!(
+                consolidation.manifest.model.ref_.as_deref(),
+                Some("codex-oauth/gpt-5.6-luna")
+            );
+            assert_eq!(
+                consolidation.manifest.engine.reasoning,
+                Some(ReasoningControl::Effort(ReasoningEffort::Medium))
+            );
+        }
+    }
+
+    #[test]
+    fn subjektiv_memory_consolidation_profile_is_lifecycle_and_capability_isolated() {
+        let tmp = TempDir::new().unwrap();
+        let resolved = ProfileResolver::new()
+            .with_workspace_base(tmp.path())
+            .resolve(
+                &ProfileSelector::source_named(
+                    ProfileRegistrySource::Builtin,
+                    "subjektiv-memory-consolidation",
+                ),
+                ProfileResolveOptions::with_worker_name("subject-consolidator"),
+            )
+            .unwrap();
+        let manifest = resolved.manifest;
+        let feature = &manifest.feature;
+
+        assert!(feature.memory.profile.enabled);
+        assert!(feature.memory.profile.staging_tools);
+        assert!(!feature.memory.profile.resident.inject_summary);
+        assert!(!feature.memory.profile.extraction.enabled);
+        assert!(!feature.memory.profile.consolidation.request_enabled);
+        assert!(!feature.subjektiv.profile.enabled);
+        assert!(!feature.task.enabled);
+        assert!(!feature.web.enabled);
+        assert!(!feature.image.enabled);
+        assert!(!feature.sub_worker.enabled);
+        assert!(!feature.flow.enabled);
+        assert!(!feature.worker.enabled);
+        assert!(!feature.worker.direct_spawn);
+        assert!(!feature.workspace_worker_discovery.enabled);
+        assert!(!feature.objective.enabled);
+        assert!(!feature.manage_workdir.enabled);
+        assert!(!feature.ticket.enabled);
+        assert!(!feature.ticket.authoring);
+        assert!(!feature.ticket.thread);
+        assert!(!feature.ticket.intake);
+        assert!(!feature.ticket.workflow);
+        assert!(!feature.merge_request.show);
+        assert!(!feature.merge_request.open);
+        assert!(!feature.merge_request.review);
+        assert!(!feature.merge_request.readiness_check);
+        assert!(!feature.merge_request.complete);
+        assert!(!feature.orchestration.enabled);
         assert_eq!(
-            consolidation.manifest.model.ref_.as_deref(),
-            Some("codex-oauth/gpt-5.6-luna")
-        );
-        assert_eq!(
-            consolidation.manifest.engine.reasoning,
-            Some(ReasoningControl::Effort(ReasoningEffort::Medium))
+            manifest.web.as_ref().and_then(|web| web.enabled),
+            Some(false)
         );
     }
 

@@ -79,6 +79,15 @@ struct MemoryLifecycleTask {
     event_tx: Option<broadcast::Sender<Event>>,
 }
 
+fn memory_lifecycle_requested(
+    lifecycle_enabled: bool,
+    config: &manifest::ResolvedMemoryFeatureConfig,
+) -> bool {
+    lifecycle_enabled
+        && config.profile.enabled
+        && (config.profile.extraction.enabled || config.profile.consolidation.request_enabled)
+}
+
 impl MemoryLifecycleFeature {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_resolved_config(
@@ -93,10 +102,7 @@ impl MemoryLifecycleFeature {
         workspace_context: WorkerWorkspaceContext,
         event_tx: Option<broadcast::Sender<Event>>,
     ) -> std::io::Result<Option<Self>> {
-        if !lifecycle_enabled
-            || !config.profile.enabled
-            || (!config.profile.extraction.enabled && !config.profile.consolidation.request_enabled)
-        {
+        if !memory_lifecycle_requested(lifecycle_enabled, &config) {
             return Ok(None);
         }
         config
@@ -164,7 +170,7 @@ impl SubjektivLifecycleFeature {
         workspace_context: WorkerWorkspaceContext,
         event_tx: Option<broadcast::Sender<Event>>,
     ) -> std::io::Result<Option<Self>> {
-        if !lifecycle_enabled || !config.profile.enabled || !config.profile.extraction.enabled {
+        if !lifecycle_enabled || !config.profile.enabled {
             return Ok(None);
         }
         config
@@ -712,8 +718,16 @@ impl FeatureBackgroundTask for MemoryLifecycleTask {
         };
         if !cancellation.is_cancelled() {
             context.generation_fence.ensure_current()?;
-            if self.config.profile.consolidation.request_enabled {
-                self.request_consolidation().await;
+            match self.target {
+                ExtractionTarget::WorkspaceMemory
+                    if self.config.profile.consolidation.request_enabled =>
+                {
+                    self.request_consolidation(false).await;
+                }
+                ExtractionTarget::Subjektiv => {
+                    self.request_consolidation(true).await;
+                }
+                ExtractionTarget::WorkspaceMemory => {}
             }
         }
         extraction
@@ -750,20 +764,24 @@ impl MemoryLifecycleTask {
         Ok(())
     }
 
-    async fn request_consolidation(&self) {
+    async fn request_consolidation(&self, subjektiv: bool) {
         let audit = WorkerAuditBase::new(
             memory::audit::AuditWorker::MemoryConsolidation,
             memory::audit::AuditTrigger::StagingBacklog,
             Some(model_audit_from_manifest(&self.manifest.model)),
         )
         .with_memory_settings(&self.config);
-        match self
-            .workspace_client
-            .request_memory_staging_consolidation(
-                memory::backend::MemoryConsolidateStagingOperation { force: false },
-            )
-            .await
-        {
+        let operation = memory::backend::MemoryConsolidateStagingOperation { force: false };
+        let request = if subjektiv {
+            self.workspace_client
+                .request_subjektiv_memory_staging_consolidation(operation)
+                .await
+        } else {
+            self.workspace_client
+                .request_memory_staging_consolidation(operation)
+                .await
+        };
+        match request {
             Ok(output) => {
                 tracing::debug!(
                     status = output.status.as_str(),
@@ -1079,6 +1097,7 @@ mod tests {
         ) -> Result<crate::worker::WorkspaceResponse, crate::worker::WorkspaceClientError> {
             let is_subjektiv_stage = request.path.ends_with("/subjektiv/staging");
             let is_subjektiv_session = request.path.ends_with("/subjektiv/sessions");
+            let is_subjektiv_consolidation = request.path.ends_with("/subjektiv/consolidation");
             let is_stage_candidate = request
                 .body
                 .as_deref()
@@ -1088,6 +1107,18 @@ mod tests {
                 .as_deref()
                 .is_some_and(|body| body.contains("append_audit"));
             self.requests.lock().unwrap().push(request);
+            if is_subjektiv_consolidation {
+                return Ok(crate::worker::WorkspaceResponse {
+                    status: 200,
+                    body: serde_json::to_string(&server_api::MemoryConsolidationResponse {
+                        status: "started".into(),
+                        summary: "subject consolidation requested".into(),
+                        candidate_count: 1,
+                        total_bytes: 1,
+                    })
+                    .unwrap(),
+                });
+            }
             if is_subjektiv_session {
                 return Ok(crate::worker::WorkspaceResponse {
                     status: 200,
@@ -1338,6 +1369,26 @@ permission = "write"
             })
             .unwrap();
         config
+    }
+
+    #[test]
+    fn resolved_subjektiv_consolidation_profile_does_not_install_global_memory_lifecycle() {
+        let workspace = tempfile::tempdir().unwrap();
+        let resolved = manifest::ProfileResolver::new()
+            .with_workspace_base(workspace.path())
+            .resolve(
+                &manifest::ProfileSelector::source_named(
+                    manifest::ProfileRegistrySource::Builtin,
+                    "subjektiv-memory-consolidation",
+                ),
+                manifest::ProfileResolveOptions::with_worker_name("subject-consolidator"),
+            )
+            .unwrap();
+
+        assert!(!memory_lifecycle_requested(
+            true,
+            &resolved.manifest.feature.memory
+        ));
     }
 
     fn test_task(
@@ -1635,8 +1686,15 @@ permission = "write"
             request
                 .body
                 .as_deref()
-                .is_none_or(|body| !body.contains("append_audit") && body != "{\"force\":false}")
+                .is_none_or(|body| !body.contains("append_audit"))
         }));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.path.ends_with("/subjektiv/consolidation"))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

@@ -84,7 +84,14 @@ impl dyn WorkspaceClient + '_ {
         &self,
         operation: MemoryConsolidateStagingOperation,
     ) -> Result<MemoryConsolidationOutput, WorkspaceMemoryBackendError> {
-        execute_memory_consolidation(self, operation).await
+        execute_memory_consolidation(self, operation, false).await
+    }
+
+    pub async fn request_subjektiv_memory_staging_consolidation(
+        &self,
+        operation: MemoryConsolidateStagingOperation,
+    ) -> Result<MemoryConsolidationOutput, WorkspaceMemoryBackendError> {
+        execute_memory_consolidation(self, operation, true).await
     }
 }
 
@@ -125,6 +132,7 @@ async fn execute_memory_backend(
 async fn execute_memory_consolidation(
     client: &dyn WorkspaceClient,
     operation: MemoryConsolidateStagingOperation,
+    subjektiv: bool,
 ) -> Result<MemoryConsolidationOutput, WorkspaceMemoryBackendError> {
     let workspace_id =
         client
@@ -137,7 +145,14 @@ async fn execute_memory_consolidation(
             })?;
     let response = client.execute(WorkspaceRequest::json(
         WorkspaceRequestMethod::Post,
-        format!("/api/w/{workspace_id}/memory/consolidation"),
+        format!(
+            "/api/w/{workspace_id}/{}",
+            if subjektiv {
+                "subjektiv/consolidation"
+            } else {
+                "memory/consolidation"
+            }
+        ),
         serde_json::to_string(&server_api::MemoryConsolidateStagingRequest {
             force: operation.force,
         })?,
@@ -200,6 +215,205 @@ pub fn workspace_http_memory_tools(client: Arc<dyn WorkspaceClient>) -> Vec<Tool
             },
         ),
     ]
+}
+
+pub fn workspace_http_subjektiv_consolidation_tools(
+    client: Arc<dyn WorkspaceClient>,
+) -> Vec<ToolDefinition> {
+    use SubjectConsolidationOperation as Operation;
+    [
+        (
+            "SubjektivMemoryQuery",
+            "Search current Memory revisions for the delegated subject.",
+            schema_for::<server_api::SubjektivMemoryQueryRequest>(),
+            Operation::Query,
+        ),
+        (
+            "SubjektivMemoryRead",
+            "Read one current or historical Memory revision for the delegated subject.",
+            schema_for::<server_api::SubjektivMemoryReadRequest>(),
+            Operation::Read,
+        ),
+        (
+            "SubjektivMemoryListRevisions",
+            "List immutable revisions of one Memory for the delegated subject.",
+            schema_for::<server_api::SubjektivMemoryListRevisionsRequest>(),
+            Operation::ListRevisions,
+        ),
+        (
+            "MemoryStagingList",
+            "List pending staging candidates for the delegated subject.",
+            schema_for::<server_api::SubjektivMemoryCandidateListRequest>(),
+            Operation::ListCandidates,
+        ),
+        (
+            "MemoryStagingRead",
+            "Read one pending candidate, including typed revision proposal metadata and provenance.",
+            schema_for::<server_api::SubjektivMemoryCandidateReadRequest>(),
+            Operation::ReadCandidate,
+        ),
+        (
+            "MemoryApplyCandidate",
+            "Atomically apply or reject one subject candidate. A request_id is idempotent; application revalidates exact revision proposal metadata and returns concrete affected revision refs.",
+            schema_for::<server_api::SubjektivMemoryCandidateDecisionRequest>(),
+            Operation::DecideCandidate,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, description, schema, operation)| {
+        let client = Arc::clone(&client);
+        Arc::new(move || {
+            (
+                ToolMeta::new(name)
+                    .description(description)
+                    .input_schema(schema.clone()),
+                Arc::new(SubjectConsolidationTool {
+                    client: Arc::clone(&client),
+                    operation,
+                }) as Arc<dyn Tool>,
+            )
+        }) as ToolDefinition
+    })
+    .collect()
+}
+
+#[derive(Clone, Copy)]
+enum SubjectConsolidationOperation {
+    Query,
+    Read,
+    ListRevisions,
+    ListCandidates,
+    ReadCandidate,
+    DecideCandidate,
+}
+
+struct SubjectConsolidationTool {
+    client: Arc<dyn WorkspaceClient>,
+    operation: SubjectConsolidationOperation,
+}
+
+#[async_trait]
+impl Tool for SubjectConsolidationTool {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        use SubjectConsolidationOperation as Operation;
+        let operation = match self.operation {
+            Operation::Query => {
+                server_api::SubjektivMemoryBackendOperation::Query(parse_input(input_json)?)
+            }
+            Operation::Read => {
+                server_api::SubjektivMemoryBackendOperation::Read(parse_input(input_json)?)
+            }
+            Operation::ListRevisions => {
+                server_api::SubjektivMemoryBackendOperation::ListRevisions(parse_input(input_json)?)
+            }
+            Operation::ListCandidates => {
+                server_api::SubjektivMemoryBackendOperation::ListCandidates(parse_input(
+                    input_json,
+                )?)
+            }
+            Operation::ReadCandidate => {
+                server_api::SubjektivMemoryBackendOperation::ReadCandidate(parse_input(input_json)?)
+            }
+            Operation::DecideCandidate => {
+                server_api::SubjektivMemoryBackendOperation::DecideCandidate(parse_input(
+                    input_json,
+                )?)
+            }
+        };
+        let workspace_id = self.client.workspace_id().ok_or_else(|| {
+            ToolError::ExecutionFailed(
+                "subjektiv consolidation requires Workspace authority".into(),
+            )
+        })?;
+        let response = self
+            .client
+            .execute(WorkspaceRequest::json(
+                WorkspaceRequestMethod::Post,
+                format!("/api/w/{workspace_id}/subjektiv/memory"),
+                serde_json::to_string(&server_api::SubjektivMemoryBackendRequest { operation })
+                    .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?,
+            ))
+            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+        if !response.is_success() {
+            let parsed =
+                serde_json::from_str::<server_api::RepositoryApiError>(&response.body).ok();
+            if let Some((code, message)) = parsed.as_ref().and_then(|error| {
+                error
+                    .diagnostics
+                    .iter()
+                    .find(|diagnostic| {
+                        matches!(
+                            diagnostic.code.as_str(),
+                            "revision_conflict"
+                                | "candidate_decision_conflict"
+                                | "subject_scope_mismatch"
+                        )
+                    })
+                    .map(|diagnostic| (diagnostic.code.clone(), error.message.clone()))
+            }) {
+                return Ok(ToolOutput {
+                    summary: format!("Candidate decision requires reread: {code}."),
+                    content: Some(
+                        serde_json::json!({
+                            "status": "error",
+                            "error": { "code": code, "message": message }
+                        })
+                        .to_string(),
+                    ),
+                    attachments: Vec::new(),
+                });
+            }
+            let detail = parsed.map(|error| error.message).unwrap_or(response.body);
+            return Err(if matches!(response.status, 400 | 404 | 409 | 422) {
+                ToolError::InvalidArgument(detail)
+            } else {
+                ToolError::ExecutionFailed(detail)
+            });
+        }
+        let response: server_api::SubjektivMemoryBackendResponse =
+            serde_json::from_str(&response.body)
+                .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+        let summary = match &response {
+            server_api::SubjektivMemoryBackendResponse::Query(value) => {
+                format!("Found {} subject Memory item(s).", value.items.len())
+            }
+            server_api::SubjektivMemoryBackendResponse::Read(value) => {
+                format!(
+                    "Read Memory {} revision {}.",
+                    value.memory_id, value.revision
+                )
+            }
+            server_api::SubjektivMemoryBackendResponse::ListRevisions(value) => {
+                format!("Listed {} revision(s).", value.items.len())
+            }
+            server_api::SubjektivMemoryBackendResponse::Candidates(value) => {
+                format!("Listed {} pending candidate(s).", value.items.len())
+            }
+            server_api::SubjektivMemoryBackendResponse::Candidate(value) => {
+                format!("Read pending candidate {}.", value.candidate_id)
+            }
+            server_api::SubjektivMemoryBackendResponse::CandidateDecided(value) => {
+                format!("Candidate {} decision committed.", value.candidate_id)
+            }
+            _ => {
+                return Err(ToolError::ExecutionFailed(
+                    "unexpected subjektiv consolidation response".into(),
+                ));
+            }
+        };
+        Ok(ToolOutput {
+            summary,
+            content: Some(
+                serde_json::to_string_pretty(&response)
+                    .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?,
+            ),
+            attachments: Vec::new(),
+        })
+    }
 }
 
 pub fn workspace_http_memory_consolidation_tools(
@@ -407,16 +621,21 @@ impl MemoryFeatureInstallPlan {
         prompts: Arc<crate::prompt::catalog::PromptCatalog>,
         profile: Option<manifest::ProfileManifestSnapshot>,
     ) -> std::io::Result<Option<Self>> {
-        let memory_consolidation_worker = profile.as_ref().is_some_and(|snapshot| {
-            matches!(
-                &snapshot.source,
+        let profile_name = profile
+            .as_ref()
+            .and_then(|snapshot| match &snapshot.source {
                 manifest::ProfileSource::Registry {
                     source: manifest::ProfileRegistrySource::Builtin,
                     name,
                     ..
-                } if name == "memory-consolidation"
-            )
-        });
+                } => Some(name.as_str()),
+                _ => None,
+            });
+        let memory_consolidation_worker = matches!(
+            profile_name,
+            Some("memory-consolidation" | "subjektiv-memory-consolidation")
+        );
+        let subjektiv_consolidation_worker = profile_name == Some("subjektiv-memory-consolidation");
         config
             .validate_execution()
             .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
@@ -450,16 +669,24 @@ impl MemoryFeatureInstallPlan {
         let system_prompt_override = if memory_consolidation_worker {
             let language = settings.language;
             Some(
-                prompts
-                    .memory_consolidation_system(&language)
-                    .map_err(|error| std::io::Error::other(error.to_string()))?,
+                if subjektiv_consolidation_worker {
+                    prompts.subjektiv_memory_consolidation_system(&language)
+                } else {
+                    prompts.memory_consolidation_system(&language)
+                }
+                .map_err(|error| std::io::Error::other(error.to_string()))?,
             )
         } else {
             None
         };
 
+        let module = if subjektiv_consolidation_worker {
+            MemoryToolsFeature::from_tools(workspace_http_subjektiv_consolidation_tools(client))
+        } else {
+            MemoryToolsFeature::new(client, config.profile.staging_tools)
+        };
         Ok(Some(Self {
-            module: MemoryToolsFeature::new(client, config.profile.staging_tools),
+            module,
             resident_summary_source,
             system_prompt_override,
             resolved_config: config,
@@ -479,6 +706,10 @@ impl MemoryToolsFeature {
         } else {
             workspace_http_memory_tools(client)
         };
+        Self { tools }
+    }
+
+    fn from_tools(tools: Vec<ToolDefinition>) -> Self {
         Self { tools }
     }
 }
@@ -539,6 +770,39 @@ mod tests {
             .to_string();
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        Arc::new(crate::worker::TestWorkspaceHttpClient::new(
+            "workspace",
+            format!("http://{addr}"),
+        ))
+    }
+
+    fn repository_error_client(status: u16, code: &str) -> Arc<dyn WorkspaceClient> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = serde_json::json!({
+            "error": "request rejected",
+            "message": format!("{code}: retry after reread"),
+            "diagnostics": [{
+                "code": code,
+                "severity": "error",
+                "message": format!("{code}: retry after reread"),
+            }],
+        })
+        .to_string();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            let response = format!(
+                "HTTP/1.1 {status} rejected\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
@@ -758,5 +1022,64 @@ mod tests {
         assert!(names.contains(&"MemoryStagingList".to_string()));
         assert!(names.contains(&"MemoryStagingRead".to_string()));
         assert!(names.contains(&"MemoryStagingClose".to_string()));
+    }
+
+    #[tokio::test]
+    async fn subjektiv_candidate_conflicts_survive_workspace_http_transport() {
+        let input = serde_json::json!({
+            "request_id": "decision-request-1",
+            "candidate_id": "candidate-1",
+            "reason": "candidate is already covered",
+            "decision": {
+                "kind": "close",
+                "action": "already_covered",
+                "affected_memory": [],
+            },
+        })
+        .to_string();
+        for (status, code) in [
+            (409, "candidate_decision_conflict"),
+            (403, "subject_scope_mismatch"),
+        ] {
+            let tool = SubjectConsolidationTool {
+                client: repository_error_client(status, code),
+                operation: SubjectConsolidationOperation::DecideCandidate,
+            };
+            let output = tool
+                .execute(&input, ToolExecutionContext::direct())
+                .await
+                .expect("typed conflicts are model-visible retry output");
+            let content: serde_json::Value =
+                serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+            assert_eq!(content["status"], "error");
+            assert_eq!(content["error"]["code"], code);
+            assert!(output.summary.contains("requires reread"));
+        }
+    }
+
+    #[test]
+    fn subjektiv_consolidation_has_atomic_decision_without_host_scope_fields() {
+        let tools = workspace_http_subjektiv_consolidation_tools(test_client());
+        let names = tool_names(tools.clone());
+        assert_eq!(
+            names,
+            vec![
+                "MemoryApplyCandidate",
+                "MemoryStagingList",
+                "MemoryStagingRead",
+                "SubjektivMemoryListRevisions",
+                "SubjektivMemoryQuery",
+                "SubjektivMemoryRead",
+            ]
+        );
+        let decision = tool_meta(tools, "MemoryApplyCandidate").to_string();
+        assert!(decision.contains("request_id"));
+        assert!(decision.contains("expected_revision"));
+        assert!(decision.contains("already_covered"));
+        assert!(!decision.contains("subject_id"));
+        assert!(!decision.contains("workspace_id"));
+        assert!(!decision.contains("runtime_id"));
+        assert!(!decision.contains("worker_id"));
+        assert!(!decision.contains("source_candidate_ids"));
     }
 }

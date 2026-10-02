@@ -1190,6 +1190,19 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[body] request: SubjektivMemoryBackendRequest,
     ) -> Result<SubjektivMemoryBackendResponse, RepositoryApiError>;
+    #[post(
+        "/api/w/{workspace_id}/subjektiv/consolidation",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        openapi = false,
+    )]
+    async fn subjektiv_memory_consolidation(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: MemoryConsolidateStagingRequest,
+    ) -> Result<MemoryConsolidationResponse, RepositoryApiError>;
 
     #[get(
         "/api/w/{workspace_id}/skills",
@@ -4650,6 +4663,168 @@ pub struct SubjektivMemoryStageExplicitRequest {
     pub proposal: Option<SubjektivMemoryRevisionProposal>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryCandidateListRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryCandidateReadRequest {
+    pub candidate_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryRevisionProposalMetadata {
+    pub memory_id: String,
+    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
+    pub expected_revision: u64,
+    pub intent: SubjektivMemoryRevisionIntent,
+    pub change_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryCandidate {
+    pub candidate_id: String,
+    pub kind: memory::extract::CandidateKind,
+    pub claim: String,
+    pub why_useful: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staleness: Option<String>,
+    pub source: memory::schema::SourceRef,
+    #[serde(default)]
+    pub evidence: Vec<memory::extract::StagingEvidence>,
+    #[serde(default)]
+    pub source_refs: Vec<memory::schema::SourceEvidenceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_proposal: Option<SubjektivMemoryRevisionProposalMetadata>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryCandidateSummary {
+    pub candidate_id: String,
+    pub kind: memory::extract::CandidateKind,
+    pub claim: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_proposal: Option<SubjektivMemoryRevisionProposalMetadata>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryCandidateListResponse {
+    pub items: Vec<SubjektivMemoryCandidateSummary>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SubjektivMemoryApplyTarget {
+    Create,
+    Revise {
+        memory_id: String,
+        #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
+        expected_revision: u64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryDraft {
+    pub kind: memory::extract::CandidateKind,
+    pub state: SubjektivMemoryState,
+    pub claim: String,
+    pub body_md: String,
+    pub why_useful: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staleness: Option<String>,
+    #[serde(default)]
+    pub derived_from: Vec<SubjektivMemoryRevisionRef>,
+    pub change_reason: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjektivMemoryCandidateCloseAction {
+    Discarded,
+    Invalid,
+    Duplicate,
+    AlreadyCovered,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SubjektivMemoryCandidateDecision {
+    Apply {
+        target: SubjektivMemoryApplyTarget,
+        memory: SubjektivMemoryDraft,
+    },
+    Close {
+        action: SubjektivMemoryCandidateCloseAction,
+        #[serde(default)]
+        affected_memory: Vec<SubjektivMemoryRevisionRef>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryCandidateDecisionRequest {
+    pub request_id: String,
+    pub candidate_id: String,
+    pub reason: String,
+    pub decision: SubjektivMemoryCandidateDecision,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjektivMemoryAffectedOperation {
+    Create,
+    Revise,
+    Reference,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryAffectedRef {
+    pub memory_id: String,
+    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
+    pub revision: u64,
+    pub operation: SubjektivMemoryAffectedOperation,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjektivMemoryCandidateResolutionAction {
+    Applied,
+    Discarded,
+    Invalid,
+    Duplicate,
+    AlreadyCovered,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryCandidateDecisionResponse {
+    pub request_id: String,
+    pub candidate_id: String,
+    pub action: SubjektivMemoryCandidateResolutionAction,
+    pub reason: String,
+    #[serde(default)]
+    pub affected_memory: Vec<SubjektivMemoryAffectedRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<SubjektivMemoryRevisionRef>,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub store_revision: u64,
+    pub surface_dirty: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "operation", content = "input", rename_all = "snake_case")]
 pub enum SubjektivMemoryBackendOperation {
@@ -4659,6 +4834,9 @@ pub enum SubjektivMemoryBackendOperation {
     ValidateProposal(SubjektivMemoryValidateProposalRequest),
     ReceiptStatus(SubjektivMemoryReceiptStatusRequest),
     StageExplicit(SubjektivMemoryStageExplicitRequest),
+    ListCandidates(SubjektivMemoryCandidateListRequest),
+    ReadCandidate(SubjektivMemoryCandidateReadRequest),
+    DecideCandidate(SubjektivMemoryCandidateDecisionRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -4824,6 +5002,9 @@ pub enum SubjektivMemoryBackendResponse {
     ProposalValidated(SubjektivMemoryProposalValidationResponse),
     ReceiptStatus(SubjektivMemoryReceiptStatusResponse),
     Staged(SubjektivMemoryStageExplicitResponse),
+    Candidates(SubjektivMemoryCandidateListResponse),
+    Candidate(SubjektivMemoryCandidate),
+    CandidateDecided(SubjektivMemoryCandidateDecisionResponse),
 }
 
 pub const WORKSPACE_DELETION_MAX_OPERATION_ID_BYTES: usize = 128;
@@ -11994,6 +12175,7 @@ mod openapi_artifact_tests {
             "subjektiv_stage_candidate",
             "subjektiv_record_session",
             "subjektiv_memory_backend",
+            "subjektiv_memory_consolidation",
             "workspace_worker_discovery",
             "workspace_worker_remove",
         ];
