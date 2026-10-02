@@ -820,11 +820,9 @@ impl SqliteWorkspaceAuthority {
                     .map(|worker| (assignment, worker))
             })
             .map(|(assignment, worker)| {
-                let worker_resource_key = self.store.resource_key(
-                    &self.workspace_id,
-                    WorkspaceResourceKind::Worker,
-                    &worker.worker_id,
-                )?;
+                let worker_resource_key = self
+                    .store
+                    .worker_resource_key(&self.workspace_id, &worker)?;
                 Ok::<_, Error>(TicketAssignmentSummary {
                     assignment_id: assignment.assignment_id.clone(),
                     runtime_id: worker.runtime_id,

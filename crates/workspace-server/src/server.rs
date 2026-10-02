@@ -18823,13 +18823,9 @@ async fn scoped_get_workspace_worker(
     AxumPath(path): AxumPath<ScopedWorkspaceWorkerReferencePath>,
 ) -> ApiResult<Json<server_api::WorkerSummary>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let worker_id = api
+    let worker_ref = api
         .store
-        .resolve_resource_reference(
-            &api.config.workspace_id,
-            WorkspaceResourceKind::Worker,
-            &path.worker_ref,
-        )?
+        .resolve_worker_resource_reference(&api.config.workspace_id, &path.worker_ref)?
         .ok_or_else(|| Error::UnknownWorker {
             worker: RuntimeWorkerRef::new("unknown", &path.worker_ref),
         })?;
@@ -18837,14 +18833,11 @@ async fn scoped_get_workspace_worker(
     workers
         .items
         .into_iter()
-        .find(|worker| worker.worker_id == worker_id)
-        .map(Json)
-        .ok_or_else(|| {
-            Error::UnknownWorker {
-                worker: RuntimeWorkerRef::new("unknown", worker_id),
-            }
-            .into()
+        .find(|worker| {
+            worker.runtime_id == worker_ref.runtime_id && worker.worker_id == worker_ref.worker_id
         })
+        .map(Json)
+        .ok_or_else(|| Error::UnknownWorker { worker: worker_ref }.into())
 }
 
 async fn discover_workspace_workers(
@@ -24887,7 +24880,7 @@ fn browser_worker_response_from_summary(
     let workspace_id = api.workspace_id().to_string();
     let resource_key = api
         .store
-        .resource_key(&workspace_id, WorkspaceResourceKind::Worker, &worker_id)?
+        .worker_resource_key(&workspace_id, &worker.worker)?
         .ok_or_else(|| {
             Error::Store(format!(
                 "Workspace Worker `{worker_id}` has no resource key after registration"
@@ -25219,17 +25212,20 @@ fn resolve_workspace_worker_reference(
     runtime_id: &str,
     reference: &str,
 ) -> ApiResult<RuntimeWorkerRef> {
-    let worker_id = api
+    let direct = RuntimeWorkerRef::new(runtime_id, reference);
+    if let Some(record) = api
         .store
-        .resolve_resource_reference(
-            &api.config.workspace_id,
-            WorkspaceResourceKind::Worker,
-            reference,
-        )?
+        .get_worker_registry(&api.config.workspace_id, &direct)?
+    {
+        return Ok(record.worker);
+    }
+    let worker = api
+        .store
+        .resolve_worker_resource_reference(&api.config.workspace_id, reference)?
+        .filter(|worker| worker.runtime_id == runtime_id)
         .ok_or_else(|| Error::UnknownWorker {
             worker: RuntimeWorkerRef::new(runtime_id, reference),
         })?;
-    let worker = RuntimeWorkerRef::new(runtime_id, worker_id);
     let record = api
         .store
         .get_worker_registry(&api.config.workspace_id, &worker)?
@@ -26645,11 +26641,7 @@ fn project_workspace_worker_with_attachments(
     }
     let resource_key = api
         .store
-        .resource_key(
-            &api.config.workspace_id,
-            WorkspaceResourceKind::Worker,
-            &summary.worker.worker_id,
-        )?
+        .worker_resource_key(&api.config.workspace_id, &summary.worker)?
         .ok_or_else(|| {
             Error::Store(format!(
                 "Workspace Worker `{}` has no resource key",
@@ -31799,6 +31791,44 @@ mod tests {
         let href = browser_worker_console_href("workspace/one", "W-7");
         assert_eq!(href, "/w/workspace%2Fone/workers/W-7/console");
         assert!(!href.contains("/runtimes/"));
+    }
+
+    #[tokio::test]
+    async fn workspace_worker_resource_keys_resolve_equal_local_ids_independently() {
+        let workspace = tempfile::tempdir().unwrap();
+        let api = test_api(workspace.path()).await;
+        let runtime_a = RuntimeWorkerRef::new("runtime-a", "shared-local-id");
+        let runtime_b = RuntimeWorkerRef::new("runtime-b", "shared-local-id");
+        seed_worker_source_member(&api, &runtime_a.runtime_id, &runtime_a.worker_id);
+        seed_worker_source_member(&api, &runtime_b.runtime_id, &runtime_b.worker_id);
+        let runtime_a_key = api
+            .store
+            .worker_resource_key(TEST_WORKSPACE_ID, &runtime_a)
+            .unwrap()
+            .unwrap();
+        let runtime_b_key = api
+            .store
+            .worker_resource_key(TEST_WORKSPACE_ID, &runtime_b)
+            .unwrap()
+            .unwrap();
+        assert_ne!(runtime_a_key, runtime_b_key);
+
+        for (resource_key, expected) in [
+            (runtime_a_key, runtime_a.clone()),
+            (runtime_b_key, runtime_b.clone()),
+        ] {
+            let Json(worker) = scoped_get_workspace_worker(
+                State(api.clone()),
+                AxumPath(ScopedWorkspaceWorkerReferencePath {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    worker_ref: resource_key,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(worker.runtime_id, expected.runtime_id);
+            assert_eq!(worker.worker_id, expected.worker_id);
+        }
     }
 
     #[test]
@@ -46879,10 +46909,9 @@ mod tests {
         seed_worker_source_member(&api, "runtime-test", "worker-target");
         let target_key = api
             .store
-            .resource_key(
+            .worker_resource_key(
                 TEST_WORKSPACE_ID,
-                WorkspaceResourceKind::Worker,
-                "worker-target",
+                &RuntimeWorkerRef::new("runtime-test", "worker-target"),
             )
             .unwrap()
             .unwrap();

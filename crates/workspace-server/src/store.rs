@@ -1093,6 +1093,16 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         kind: WorkspaceResourceKind,
         reference: &str,
     ) -> Result<Option<String>>;
+    fn worker_resource_key(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<String>>;
+    fn resolve_worker_resource_reference(
+        &self,
+        workspace_id: &str,
+        reference: &str,
+    ) -> Result<Option<RuntimeWorkerRef>>;
     async fn upsert_workspace(&self, record: &WorkspaceRecord) -> Result<()>;
     async fn get_workspace(&self, workspace_id: &str) -> Result<Option<WorkspaceRecord>>;
     async fn update_workspace_display_name(
@@ -2352,11 +2362,13 @@ impl SqliteWorkspaceStore {
                     )));
                 }
             };
+            let worker_resource_id =
+                worker_resource_id(&RuntimeWorkerRef::new(runtime_id, worker_id_text.clone()));
             allocate_resource_key(
                 &tx,
                 workspace_id,
                 WorkspaceResourceKind::Worker,
-                &worker_id_text,
+                &worker_resource_id,
                 &now,
             )?;
             tx.execute(
@@ -2570,8 +2582,8 @@ impl SqliteWorkspaceStore {
             let registry_exists = tx
                 .query_row(
                     "SELECT 1 FROM worker_registry \
-                     WHERE workspace_id = ?1 AND worker_id = ?2 LIMIT 1",
-                    params![workspace_id, worker_id.to_string()],
+                     WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3 LIMIT 1",
+                    params![workspace_id, runtime_id, worker_id.to_string()],
                     |_| Ok(()),
                 )
                 .optional()?
@@ -2603,13 +2615,17 @@ impl SqliteWorkspaceStore {
                     )));
                 }
             }
+            let resource_id = worker_resource_id(&RuntimeWorkerRef::new(
+                runtime_id,
+                worker_id.to_string(),
+            ));
             tx.execute(
                 "DELETE FROM workspace_resource_keys \
                  WHERE workspace_id = ?1 AND resource_kind = ?2 AND resource_id = ?3",
                 params![
                     workspace_id,
                     WorkspaceResourceKind::Worker.as_str(),
-                    worker_id.to_string()
+                    resource_id
                 ],
             )?;
             tx.commit()?;
@@ -2624,15 +2640,15 @@ impl SqliteWorkspaceStore {
     ) -> Result<bool> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let reservation_state = tx
+            let reservation = tx
                 .query_row(
-                    "SELECT state FROM worker_create_reservations \
+                    "SELECT state, runtime_id FROM worker_create_reservations \
                      WHERE workspace_id = ?1 AND worker_id = ?2",
                     params![workspace_id, worker_id.to_string()],
-                    |row| row.get::<_, String>(0),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
                 .optional()?;
-            let Some(reservation_state) = reservation_state else {
+            let Some((reservation_state, runtime_id)) = reservation else {
                 tx.commit()?;
                 return Ok(false);
             };
@@ -2645,8 +2661,8 @@ impl SqliteWorkspaceStore {
             let registry_exists = tx
                 .query_row(
                     "SELECT 1 FROM worker_registry \
-                     WHERE workspace_id = ?1 AND worker_id = ?2 LIMIT 1",
-                    params![workspace_id, worker_id.to_string()],
+                     WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3 LIMIT 1",
+                    params![workspace_id, runtime_id, worker_id.to_string()],
                     |_| Ok(()),
                 )
                 .optional()?
@@ -2657,13 +2673,17 @@ impl SqliteWorkspaceStore {
                     worker_id
                 )));
             }
+            let resource_id = worker_resource_id(&RuntimeWorkerRef::new(
+                runtime_id,
+                worker_id.to_string(),
+            ));
             let released = tx.execute(
                 "DELETE FROM workspace_resource_keys \
                  WHERE workspace_id = ?1 AND resource_kind = ?2 AND resource_id = ?3",
                 params![
                     workspace_id,
                     WorkspaceResourceKind::Worker.as_str(),
-                    worker_id.to_string()
+                    resource_id
                 ],
             )? > 0;
             tx.commit()?;
@@ -3888,6 +3908,11 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         kind: WorkspaceResourceKind,
         resource_id: &str,
     ) -> Result<Option<String>> {
+        if kind == WorkspaceResourceKind::Worker {
+            return Err(Error::InvalidInput(
+                "Worker resource keys require a RuntimeWorkerRef".to_string(),
+            ));
+        }
         self.with_conn(|conn| {
             conn.query_row(
                 "SELECT resource_key FROM workspace_resource_keys
@@ -3906,6 +3931,11 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         kind: WorkspaceResourceKind,
         reference: &str,
     ) -> Result<Option<String>> {
+        if kind == WorkspaceResourceKind::Worker {
+            return Err(Error::InvalidInput(
+                "Worker references require a Runtime-scoped resolver".to_string(),
+            ));
+        }
         self.with_conn(|conn| {
             if let Some(resource_id) = conn
                 .query_row(
@@ -3936,6 +3966,67 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 )?,
             };
             Ok((exists != 0).then(|| reference.to_string()))
+        })
+    }
+
+    fn worker_resource_key(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<String>> {
+        let resource_id = worker_resource_id(worker);
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT resource_key FROM workspace_resource_keys
+                 WHERE workspace_id = ?1 AND resource_kind = 'worker' AND resource_id = ?2",
+                params![workspace_id, resource_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn resolve_worker_resource_reference(
+        &self,
+        workspace_id: &str,
+        reference: &str,
+    ) -> Result<Option<RuntimeWorkerRef>> {
+        self.with_conn(|conn| {
+            if let Some(resource_id) = conn
+                .query_row(
+                    "SELECT resource_id FROM workspace_resource_keys
+                     WHERE workspace_id = ?1 AND resource_kind = 'worker' AND resource_key = ?2",
+                    params![workspace_id, reference],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                return parse_worker_resource_id(resource_id.as_str())
+                    .map(Some)
+                    .ok_or_else(|| {
+                        Error::Store(format!(
+                            "Worker resource key `{reference}` has an invalid composite resource identity"
+                        ))
+                    });
+            }
+            let mut statement = conn.prepare(
+                "SELECT runtime_id, worker_id FROM worker_registry
+                 WHERE workspace_id = ?1 AND worker_id = ?2
+                 ORDER BY runtime_id LIMIT 2",
+            )?;
+            let identities = statement
+                .query_map(params![workspace_id, reference], |row| {
+                    Ok(RuntimeWorkerRef::new(
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(match identities.as_slice() {
+                [worker] => Some(worker.clone()),
+                _ => None,
+            })
         })
     }
 
@@ -6814,11 +6905,12 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     record.updated_at,
                 ],
             )?;
+            let resource_id = worker_resource_id(&record.worker);
             allocate_resource_key(
                 &tx,
                 &record.workspace_id,
                 WorkspaceResourceKind::Worker,
-                &record.worker.worker_id,
+                &resource_id,
                 &record.created_at,
             )?;
             let changed_workers = if changed == 0 {
@@ -10464,10 +10556,11 @@ fn read_worker_registry_projection(
     let Some(registry) = registry else {
         return Ok(None);
     };
+    let resource_id = worker_resource_id(worker);
     let resource_key = conn
         .query_row(
             "SELECT resource_key FROM workspace_resource_keys WHERE workspace_id = ?1 AND resource_kind = 'worker' AND resource_id = ?2",
-            params![workspace_id, worker.worker_id],
+            params![workspace_id, resource_id],
             |row| row.get(0),
         )
         .optional()?;
@@ -13843,6 +13936,37 @@ fn migrate_runtime_scoped_worker_identity_v74_to_v75(conn: &Connection) -> Resul
             INSERT INTO worker_registry
             SELECT * FROM worker_registry_v74;
 
+            UPDATE workspace_resource_keys AS resource
+            SET resource_id = COALESCE(
+                (
+                    SELECT hex(worker.runtime_id) || ':' || hex(worker.worker_id)
+                    FROM worker_registry AS worker
+                    WHERE worker.workspace_id = resource.workspace_id
+                      AND worker.worker_id = resource.resource_id
+                    LIMIT 1
+                ),
+                (
+                    SELECT hex(reservation.runtime_id) || ':' || hex(reservation.worker_id)
+                    FROM worker_create_reservations AS reservation
+                    WHERE reservation.workspace_id = resource.workspace_id
+                      AND reservation.worker_id = resource.resource_id
+                    LIMIT 1
+                )
+            )
+            WHERE resource.resource_kind = 'worker'
+              AND (
+                    EXISTS (
+                        SELECT 1 FROM worker_registry AS worker
+                        WHERE worker.workspace_id = resource.workspace_id
+                          AND worker.worker_id = resource.resource_id
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM worker_create_reservations AS reservation
+                        WHERE reservation.workspace_id = resource.workspace_id
+                          AND reservation.worker_id = resource.resource_id
+                    )
+                  );
+
             CREATE TABLE worker_registry_observations (
                 workspace_id TEXT NOT NULL,
                 runtime_id TEXT NOT NULL,
@@ -14589,6 +14713,39 @@ fn current_schema_version(conn: &Connection) -> Result<i64> {
     .map_err(Error::from)
 }
 
+fn worker_resource_id(worker: &RuntimeWorkerRef) -> String {
+    fn encode(value: &str) -> String {
+        value
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect()
+    }
+    format!(
+        "{}:{}",
+        encode(&worker.runtime_id),
+        encode(&worker.worker_id)
+    )
+}
+
+fn parse_worker_resource_id(resource_id: &str) -> Option<RuntimeWorkerRef> {
+    fn decode(value: &str) -> Option<String> {
+        if value.len() % 2 != 0 {
+            return None;
+        }
+        let bytes = (0..value.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok())
+            .collect::<Option<Vec<_>>>()?;
+        String::from_utf8(bytes).ok()
+    }
+    let (runtime_id, worker_id) = resource_id.split_once(':')?;
+    Some(RuntimeWorkerRef::new(
+        decode(runtime_id)?,
+        decode(worker_id)?,
+    ))
+}
+
 fn allocate_resource_key(
     conn: &Connection,
     workspace_id: &str,
@@ -14978,6 +15135,34 @@ mod tests {
             })
             .unwrap();
         assert_eq!(foreign_key_failures, 0);
+
+        conn.execute(
+            "INSERT INTO workspace_resource_keys (
+                 workspace_id, resource_kind, resource_id, sequence, resource_key, allocated_at
+             ) VALUES ('workspace-a', 'worker', 'worker-a', 1, 'W-1', '1')",
+            [],
+        )
+        .unwrap();
+        migrate_runtime_scoped_worker_identity_v74_to_v75(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 75);
+        let worker = RuntimeWorkerRef::new("runtime-a", "worker-a");
+        assert_eq!(
+            conn.query_row(
+                "SELECT resource_id FROM workspace_resource_keys
+                 WHERE workspace_id = 'workspace-a' AND resource_key = 'W-1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            worker_resource_id(&worker)
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
     }
 
     fn downgrade_schema_66_ticket_and_workdir_authority(conn: &Connection) -> Result<()> {
@@ -18322,20 +18507,16 @@ mod tests {
         );
         assert_eq!(
             store
-                .resource_key(
-                    "workspace-a",
-                    WorkspaceResourceKind::Worker,
-                    &reserved.worker_id.to_string()
-                )
+                .worker_resource_key("workspace-a", &reserved_worker)
                 .unwrap()
                 .as_deref(),
             Some("W-1")
         );
         assert_eq!(
             store
-                .resolve_resource_reference("workspace-a", WorkspaceResourceKind::Worker, "W-1")
+                .resolve_worker_resource_reference("workspace-a", "W-1")
                 .unwrap(),
-            Some(reserved.worker_id.to_string())
+            Some(reserved_worker.clone())
         );
         let second = store
             .reserve_worker_create(
@@ -18350,10 +18531,9 @@ mod tests {
         assert_eq!(second.memory_settings.settings_revision, 2);
         assert_eq!(
             store
-                .resource_key(
+                .worker_resource_key(
                     "workspace-a",
-                    WorkspaceResourceKind::Worker,
-                    &second.worker_id.to_string()
+                    &RuntimeWorkerRef::new("arcadia", second.worker_id.to_string()),
                 )
                 .unwrap()
                 .as_deref(),
@@ -18385,17 +18565,16 @@ mod tests {
         );
         assert_eq!(
             store
-                .resource_key(
+                .worker_resource_key(
                     "workspace-a",
-                    WorkspaceResourceKind::Worker,
-                    &second.worker_id.to_string()
+                    &RuntimeWorkerRef::new("arcadia", second.worker_id.to_string()),
                 )
                 .unwrap(),
             None
         );
         assert_eq!(
             store
-                .resolve_resource_reference("workspace-a", WorkspaceResourceKind::Worker, "W-2")
+                .resolve_worker_resource_reference("workspace-a", "W-2")
                 .unwrap(),
             None
         );
@@ -18487,11 +18666,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .resource_key(
-                    "workspace-a",
-                    WorkspaceResourceKind::Worker,
-                    &reserved.worker_id.to_string(),
-                )
+                .worker_resource_key("workspace-a", &reserved_worker)
                 .unwrap(),
             None
         );
@@ -19957,11 +20132,7 @@ INSERT INTO worker_registry (
         store.upsert_worker_registry(&runtime_sync_worker).unwrap();
         assert_eq!(
             store
-                .resource_key(
-                    "local-dev",
-                    WorkspaceResourceKind::Worker,
-                    &worker.worker.worker_id,
-                )
+                .worker_resource_key("local-dev", &worker.worker)
                 .unwrap()
                 .as_deref(),
             Some("W-1")
@@ -20252,6 +20423,39 @@ INSERT INTO worker_registry (
                 .iter()
                 .any(|row| row.registry.worker == runtime_b.worker)
         );
+        let runtime_a_key = store
+            .worker_resource_key("local-dev", &runtime_a.worker)
+            .unwrap()
+            .unwrap();
+        let runtime_b_key = store
+            .worker_resource_key("local-dev", &runtime_b.worker)
+            .unwrap()
+            .unwrap();
+        assert_ne!(runtime_a_key, runtime_b_key);
+        assert_eq!(
+            store
+                .resolve_worker_resource_reference("local-dev", runtime_a_key.as_str())
+                .unwrap(),
+            Some(runtime_a.worker.clone())
+        );
+        assert_eq!(
+            store
+                .resolve_worker_resource_reference("local-dev", runtime_b_key.as_str())
+                .unwrap(),
+            Some(runtime_b.worker.clone())
+        );
+        assert!(
+            store
+                .resolve_worker_resource_reference("local-dev", "shared-local-id")
+                .unwrap()
+                .is_none(),
+            "a bare local Worker ID must not resolve across multiple Runtimes"
+        );
+        let projected_keys = snapshot
+            .iter()
+            .map(|row| row.resource_key.as_deref().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(projected_keys.len(), 2);
 
         store
             .delete_worker_registry("local-dev", &runtime_a.worker)
@@ -20303,7 +20507,7 @@ INSERT INTO worker_registry (
         store.upsert_worker_registry(&catalog).unwrap();
         assert_eq!(
             store
-                .resource_key("local-dev", WorkspaceResourceKind::Worker, "known")
+                .worker_resource_key("local-dev", &catalog.worker)
                 .unwrap()
                 .as_deref(),
             Some("W-1")
