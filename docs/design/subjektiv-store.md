@@ -218,6 +218,46 @@ and exact backend retries return the first candidate rather than creating anothe
 one. Neither path changes `memory_records`, `memory_revisions`, `store_revision`,
 or a surface snapshot.
 
+
+## Historical Session discovery (T-673)
+
+An enabled `feature.subjektiv` also installs exactly three read-only tools:
+`SubjektivSessionList`, `SubjektivSessionSearch`, and `SubjektivSessionRead`.
+The Server binds subject, Workspace, Runtime, Worker, retention catalogue, and
+archive authority from the authenticated caller. Model input contains only
+Session/segment/entry selectors, search filters, limits, and opaque cursors;
+knowing any identifier does not grant access. Reads use Yoi's retained or
+committed-archive Session storage and a shared public projection. They do not
+copy Session bodies into the subjektiv database, restore Workers, migrate
+Session storage, create candidates or Memories, revise a surface, or promote a
+re-read tool result to HumanInput.
+
+The public projection covers committed records in every persisted segment,
+including non-active branches and pre-compaction entries, while excluding
+system prompts, hidden reasoning, traces/diagnostics, unfinished run tails, and
+attachment or pasted-artifact bodies. Results preserve exact Session, segment,
+entry, provenance, and lineage identity so inherited entries are not presented
+as a current decision. Full entry reads are UTF-8-boundary paged and remain
+subject to the same projection as snippets and search.
+
+The subject's first committed primary-Worker Session is attributed independently
+of extraction thresholds or candidate creation. Recording is idempotent and is
+retried on later committed-run and pre-request lifecycle points after transient
+failure; no attribution is attempted before a committed capture exists. This is
+not a distributed transaction with Session persistence. In particular, the
+system does **not** backfill older unattributed Sessions from their text, display
+name, current singleton ownership, Memory references, or other inference.
+Historical Sessions without trustworthy Host-recorded attribution remain outside
+subject discovery until a separately authorized provenance mechanism exists.
+
+Pagination cursors bind scope, operation, filters, stable ordering, and the
+public storage generation and are never authorization credentials. Every page
+rechecks current subject and observation authority. Deleted-Worker archives are
+eligible only when both the committed Server catalogue and Runtime manifest
+agree and the archived observation grant remains valid; incomplete, expired,
+corrupt, unavailable, or changed sources are reported explicitly rather than as
+an empty successful search.
+
 Revision proposals add optional `revision_proposal` metadata to the existing v2
 `SubjectStagingRecord` envelope; automatic extraction remains proposal-free and
 its model schema is unchanged. The metadata is serialized atomically with the

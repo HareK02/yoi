@@ -468,6 +468,23 @@ impl WorkerSessionStore {
         Ok(())
     }
 
+    /// Enumerate canonical Segment logs in ascending identity order without
+    /// creating or migrating state. Unlike the general [`Store`] listing, this
+    /// observation boundary rejects malformed names and non-regular files so a
+    /// persisted Segment cannot be silently omitted from a public index.
+    pub(crate) fn list_segments_read_only(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<SegmentId>, StoreError> {
+        self.validate_retained_session(session_id)?;
+        segment_log_paths(&self.root).map(|paths| {
+            paths
+                .into_iter()
+                .map(|(segment_id, _)| segment_id)
+                .collect()
+        })
+    }
+
     pub fn segment_log_len(&self, segment_id: SegmentId) -> Result<u64, StoreError> {
         Ok(fs::metadata(self.log_path(segment_id))?.len())
     }

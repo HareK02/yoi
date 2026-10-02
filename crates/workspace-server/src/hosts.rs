@@ -1217,6 +1217,26 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         })
     }
 
+    fn session_public_search(
+        &self,
+        _request: runtime_api::SessionPublicSearchRequest,
+    ) -> Result<runtime_api::SessionPublicSearchAvailability, String> {
+        Ok(runtime_api::SessionPublicSearchAvailability::Unavailable {
+            reason: runtime_api::SessionPublicUnavailableReason::StorageUnavailable,
+            message: "Session public search is not supported by this Runtime".to_string(),
+        })
+    }
+
+    fn session_public_read(
+        &self,
+        _request: runtime_api::SessionPublicReadRequest,
+    ) -> Result<runtime_api::SessionPublicReadAvailability, String> {
+        Ok(runtime_api::SessionPublicReadAvailability::Unavailable {
+            reason: runtime_api::SessionPublicUnavailableReason::StorageUnavailable,
+            message: "Session public read is not supported by this Runtime".to_string(),
+        })
+    }
+
     fn observation_source(
         &self,
         _worker_id: &str,
@@ -2069,6 +2089,36 @@ impl RuntimeRegistry {
             .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
                 runtime_id: worker.runtime_id.clone(),
                 code: "worker_session_history_failed".to_string(),
+                message,
+            })
+    }
+
+    pub fn session_public_search(
+        &self,
+        runtime_id: &str,
+        request: runtime_api::SessionPublicSearchRequest,
+    ) -> Result<runtime_api::SessionPublicSearchAvailability, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        self.runtime(runtime_id)?
+            .session_public_search(request)
+            .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: runtime_id.to_string(),
+                code: "session_public_search_failed".to_string(),
+                message,
+            })
+    }
+
+    pub fn session_public_read(
+        &self,
+        runtime_id: &str,
+        request: runtime_api::SessionPublicReadRequest,
+    ) -> Result<runtime_api::SessionPublicReadAvailability, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        self.runtime(runtime_id)?
+            .session_public_read(request)
+            .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: runtime_id.to_string(),
+                code: "session_public_read_failed".to_string(),
                 message,
             })
     }
@@ -2964,6 +3014,36 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             .map_err(|error| error.to_string())
     }
 
+    fn session_public_search(
+        &self,
+        request: runtime_api::SessionPublicSearchRequest,
+    ) -> Result<runtime_api::SessionPublicSearchAvailability, String> {
+        if request.workspace_id != self.workspace_id {
+            return Err(
+                "Session public search Workspace does not match embedded Runtime".to_string(),
+            );
+        }
+        let scope = RuntimeWorkspaceScope::new(&request.workspace_id, "embedded-backend");
+        self.runtime
+            .session_public_search_scoped(&scope, &request)
+            .map_err(|error| error.to_string())
+    }
+
+    fn session_public_read(
+        &self,
+        request: runtime_api::SessionPublicReadRequest,
+    ) -> Result<runtime_api::SessionPublicReadAvailability, String> {
+        if request.workspace_id != self.workspace_id {
+            return Err(
+                "Session public read Workspace does not match embedded Runtime".to_string(),
+            );
+        }
+        let scope = RuntimeWorkspaceScope::new(&request.workspace_id, "embedded-backend");
+        self.runtime
+            .session_public_read_scoped(&scope, &request)
+            .map_err(|error| error.to_string())
+    }
+
     fn observation_source(
         &self,
         worker_id: &str,
@@ -3668,6 +3748,9 @@ fn workspace_runtime_operation(method: &str, path_and_query: &str) -> &'static s
     }
     if path.contains("/retention/") || (path.starts_with("/v1/workers/") && method == "DELETE") {
         return "workers:delete";
+    }
+    if path.starts_with("/v1/session-public/") && method == "POST" {
+        return "workers:read";
     }
     if path.starts_with("/v1/workers/") && method == "GET" {
         return "workers:read";
@@ -5003,6 +5086,30 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             self.request_timeout,
             MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
             move |client| async move { client.worker_session_history(worker_id, request).await },
+        )
+        .map_err(|diagnostic| diagnostic.message)
+    }
+
+    fn session_public_search(
+        &self,
+        request: runtime_api::SessionPublicSearchRequest,
+    ) -> Result<runtime_api::SessionPublicSearchAvailability, String> {
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.session_public_search(request).await },
+        )
+        .map_err(|diagnostic| diagnostic.message)
+    }
+
+    fn session_public_read(
+        &self,
+        request: runtime_api::SessionPublicReadRequest,
+    ) -> Result<runtime_api::SessionPublicReadAvailability, String> {
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.session_public_read(request).await },
         )
         .map_err(|diagnostic| diagnostic.message)
     }

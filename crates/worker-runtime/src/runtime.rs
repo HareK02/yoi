@@ -77,6 +77,41 @@ impl RuntimeWorkspaceScope {
 }
 
 const SUBSCRIPTION_QUEUE_CAPACITY: usize = 256;
+
+#[cfg(feature = "fs-store")]
+fn session_public_source_unavailable(
+    source: &runtime_api::SessionPublicSource,
+    error: &RuntimeError,
+) -> Option<(runtime_api::SessionPublicUnavailableReason, &'static str)> {
+    use runtime_api::SessionPublicUnavailableReason as Reason;
+
+    match (source, error) {
+        (
+            runtime_api::SessionPublicSource::Retained { .. },
+            RuntimeError::WorkerNotFound { .. },
+        ) => Some((
+            Reason::RetentionMissing,
+            "retained Session storage is missing",
+        )),
+        (runtime_api::SessionPublicSource::Archived { .. }, RuntimeError::StoreMissing { .. }) => {
+            Some((
+                Reason::ArchiveIncomplete,
+                "committed Session archive is incomplete",
+            ))
+        }
+        (runtime_api::SessionPublicSource::Archived { .. }, RuntimeError::StoreCorrupt { .. }) => {
+            Some((
+                Reason::ArchiveIncomplete,
+                "committed Session archive failed integrity validation",
+            ))
+        }
+        (_, RuntimeError::StoreIo { .. } | RuntimeError::StoreCommitOutcomeUnknown { .. }) => {
+            Some((Reason::StorageUnavailable, "Session storage is unavailable"))
+        }
+        _ => None,
+    }
+}
+
 const WORKER_DELETE_FAILURE_DIAGNOSTIC_CODE: &str = "worker_delete_persistence_failed";
 const WORKER_DELETE_FAILURE_DIAGNOSTIC_MESSAGE: &str =
     "Worker metadata deletion failed; the persisted Worker identity was retained for retry";
@@ -3541,6 +3576,123 @@ impl Runtime {
             runtime_id,
             worker.worker_id,
         )
+    }
+
+    /// Search the committed public projection of one Backend-selected retained
+    /// Session or verified archive without restoring a Worker.
+    #[cfg(feature = "fs-store")]
+    pub fn session_public_search_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        request: &runtime_api::SessionPublicSearchRequest,
+    ) -> Result<runtime_api::SessionPublicSearchAvailability, RuntimeError> {
+        let (session_root, archive) =
+            match self.resolve_session_public_source(scope, &request.source) {
+                Ok(source) => source,
+                Err(error) => {
+                    if let Some((reason, message)) =
+                        session_public_source_unavailable(&request.source, &error)
+                    {
+                        return Ok(runtime_api::SessionPublicSearchAvailability::Unavailable {
+                            reason,
+                            message: message.to_string(),
+                        });
+                    }
+                    return Err(error);
+                }
+            };
+        Ok(crate::session_public::search(
+            &session_root,
+            request,
+            archive.as_ref(),
+        ))
+    }
+
+    /// Read one exact public entry from a Backend-selected retained Session or
+    /// verified archive. No fallback Worker, Segment, or entry is selected.
+    #[cfg(feature = "fs-store")]
+    pub fn session_public_read_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        request: &runtime_api::SessionPublicReadRequest,
+    ) -> Result<runtime_api::SessionPublicReadAvailability, RuntimeError> {
+        let (session_root, archive) =
+            match self.resolve_session_public_source(scope, &request.source) {
+                Ok(source) => source,
+                Err(error) => {
+                    if let Some((reason, message)) =
+                        session_public_source_unavailable(&request.source, &error)
+                    {
+                        return Ok(runtime_api::SessionPublicReadAvailability::Unavailable {
+                            reason,
+                            message: message.to_string(),
+                        });
+                    }
+                    return Err(error);
+                }
+            };
+        Ok(crate::session_public::read(
+            &session_root,
+            request,
+            archive.as_ref(),
+        ))
+    }
+
+    #[cfg(feature = "fs-store")]
+    fn resolve_session_public_source(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        source: &runtime_api::SessionPublicSource,
+    ) -> Result<
+        (
+            std::path::PathBuf,
+            Option<crate::retention::WorkerSessionArchiveManifest>,
+        ),
+        RuntimeError,
+    > {
+        let state = self.lock()?;
+        let store = state.fs_store().ok_or_else(|| {
+            RuntimeError::InvalidRequest(
+                "Session public reads require an fs-backed Runtime".to_string(),
+            )
+        })?;
+        match source {
+            runtime_api::SessionPublicSource::Retained { worker_id } => {
+                let worker_ref = WorkerRef::new(*worker_id);
+                let worker = state.worker(&worker_ref)?;
+                if worker.workspace_id.as_deref() != Some(scope.workspace_id.as_str()) {
+                    return Err(RuntimeError::WorkerNotFound {
+                        worker_id: *worker_id,
+                    });
+                }
+                Ok((
+                    store
+                        .runtime_dir()
+                        .join("workers")
+                        .join(worker_id.to_string())
+                        .join("session"),
+                    None,
+                ))
+            }
+            runtime_api::SessionPublicSource::Archived { archive_id } => {
+                let runtime_id = state.runtime_identity.as_deref().ok_or_else(|| {
+                    RuntimeError::InvalidRequest(
+                        "Runtime identity is not bound for Session archive reads".to_string(),
+                    )
+                })?;
+                let provider = FsWorkerRetentionProvider::new(store.runtime_dir());
+                let (manifest, session_root) = provider.session_archive(archive_id)?;
+                if manifest.workspace_id != scope.workspace_id
+                    || manifest.source_runtime_id != runtime_id
+                {
+                    return Err(RuntimeError::InvalidRequest(
+                        "Session archive scope does not match the authenticated Runtime capability"
+                            .to_string(),
+                    ));
+                }
+                Ok((session_root, Some(manifest)))
+            }
+        }
     }
 
     /// Enumerate host-authoritative Runtime inventory for Backend orphan

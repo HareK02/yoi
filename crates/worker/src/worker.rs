@@ -629,6 +629,7 @@ pub enum WorkspaceServerOperation {
     SubjektivStageCandidate(server_api::SubjektivStageCandidateRequest),
     SubjektivRecordSession(server_api::SubjektivRecordSessionRequest),
     SubjektivMemory(server_api::SubjektivMemoryBackendRequest),
+    SubjektivSession(server_api::SubjektivSessionBackendRequest),
 }
 
 fn workspace_server_json_request<T: serde::Serialize>(
@@ -715,6 +716,9 @@ fn workspace_server_operation_request(
         }
         WorkspaceServerOperation::SubjektivMemory(request) => {
             workspace_server_json_request(format!("{base}/subjektiv/memory"), &request)
+        }
+        WorkspaceServerOperation::SubjektivSession(request) => {
+            workspace_server_json_request(format!("{base}/subjektiv/session-history"), &request)
         }
     }
 }
@@ -3488,6 +3492,12 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             let entries = store
                 .read_all(location.session_id, location.segment_id)
                 .map_err(|error| FeatureSessionError::Capture(error.to_string()))?;
+            let has_committed_run = entries.iter().any(|entry| {
+                matches!(
+                    entry,
+                    LogEntry::RunCompleted { .. } | LogEntry::RunYielded { .. }
+                )
+            });
             let run_exit = entries
                 .iter()
                 .rev()
@@ -3514,6 +3524,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 segment_id: location.segment_id.to_string(),
                 session_revision: entries.len().try_into().unwrap_or(u64::MAX),
                 entry_count: entries.len(),
+                has_committed_run,
                 run_exit,
                 history,
                 usage_history: restored.usage_history,

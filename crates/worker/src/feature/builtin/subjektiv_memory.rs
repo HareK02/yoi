@@ -1101,6 +1101,7 @@ mod tests {
                 segment_id: "segment-1".into(),
                 session_revision: 1,
                 entry_count: 0,
+                has_committed_run: true,
                 run_exit: CommittedRunExit::Finished,
                 history: Vec::new(),
                 usage_history: Vec::new(),
@@ -1351,6 +1352,7 @@ mod tests {
                 segment_id: "segment-1".into(),
                 session_revision: 1,
                 entry_count: 3,
+                has_committed_run: true,
                 run_exit: CommittedRunExit::Interrupted,
                 history: vec![
                     crate::session_history::history_entry(
@@ -1410,6 +1412,7 @@ mod tests {
                 segment_id: "segment-1".into(),
                 session_revision: 2,
                 entry_count: 2,
+                has_committed_run: true,
                 run_exit: CommittedRunExit::Finished,
                 history: vec![
                     crate::session_history::history_entry(
@@ -1487,6 +1490,7 @@ mod tests {
                 segment_id: "segment-1".into(),
                 session_revision: 2,
                 entry_count: 2,
+                has_committed_run: true,
                 run_exit: CommittedRunExit::Finished,
                 history: vec![
                     crate::session_history::history_entry(

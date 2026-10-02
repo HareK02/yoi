@@ -1192,6 +1192,20 @@ pub trait ServerApi {
         #[body] request: SubjektivMemoryBackendRequest,
     ) -> Result<SubjektivMemoryBackendResponse, RepositoryApiError>;
     #[post(
+        "/api/w/{workspace_id}/subjektiv/session-history",
+        operation_id = "subjektiv_session_backend",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        openapi = false,
+    )]
+    async fn subjektiv_session_backend(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: SubjektivSessionBackendRequest,
+    ) -> Result<SubjektivSessionBackendResponse, RepositoryApiError>;
+    #[post(
         "/api/w/{workspace_id}/subjektiv/consolidation",
         status = 200,
         error_status = 400,
@@ -4533,6 +4547,280 @@ pub struct SubjektivRecordSessionResponse {
     pub subject_id: String,
     pub session_id: String,
 }
+
+/// Model-visible storage selector for subject-attributed Sessions. Runtime,
+/// Worker, archive and filesystem identities remain Host-bound.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjektivSessionStorageFilter {
+    All,
+    Retained,
+    Archived,
+}
+
+impl Default for SubjektivSessionStorageFilter {
+    fn default() -> Self {
+        Self::All
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjektivSessionStorage {
+    Retained,
+    Archived,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjektivSessionAvailability {
+    Available,
+    Unchecked,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSessionListRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub storage: SubjektivSessionStorageFilter,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjektivSessionEntryKind {
+    User,
+    Assistant,
+    Tool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjektivSessionToolPart {
+    Input,
+    Output,
+    Both,
+}
+
+impl Default for SubjektivSessionToolPart {
+    fn default() -> Self {
+        Self::Both
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSessionSearchRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<SubjektivSessionEntryKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub tool_part: SubjektivSessionToolPart,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjektivSessionReadMode {
+    Compact,
+    Full,
+}
+
+impl Default for SubjektivSessionReadMode {
+    fn default() -> Self {
+        Self::Compact
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSessionReadRequest {
+    pub session_id: String,
+    pub segment_id: String,
+    pub entry_ref: String,
+    #[serde(default)]
+    pub mode: SubjektivSessionReadMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "operation", content = "input", rename_all = "snake_case")]
+pub enum SubjektivSessionBackendOperation {
+    List(SubjektivSessionListRequest),
+    Search(SubjektivSessionSearchRequest),
+    Read(SubjektivSessionReadRequest),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSessionBackendRequest {
+    pub operation: SubjektivSessionBackendOperation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSessionListItem {
+    pub session_id: String,
+    /// Host attribution time. This is not represented as experience time.
+    pub attributed_at: String,
+    pub storage: SubjektivSessionStorage,
+    pub availability: SubjektivSessionAvailability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSessionListResponse {
+    pub items: Vec<SubjektivSessionListItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjektivSessionLineageKind {
+    Root,
+    Fork,
+    Compact,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSessionLineage {
+    pub kind: SubjektivSessionLineageKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_segment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_turn_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSessionSearchItem {
+    pub session_id: String,
+    pub segment_id: String,
+    pub entry_ref: String,
+    pub kind: SubjektivSessionEntryKind,
+    pub origin: protocol::SessionEntryProvenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_part: Option<SubjektivSessionToolPart>,
+    pub snippet: String,
+    pub snippet_truncated: bool,
+    pub lineage: SubjektivSessionLineage,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjektivSessionCoverage {
+    Complete,
+    Partial,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjektivSessionDiagnosticCode {
+    InvalidInput,
+    SubjectUnavailable,
+    StaleCursor,
+    NotFoundOrNotAuthorized,
+    RetentionMissing,
+    RetentionExpired,
+    ArchiveIncomplete,
+    CorruptLog,
+    RuntimeUnavailable,
+    MigrationRequired,
+    ResourceLimit,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSessionIssue {
+    pub session_id: String,
+    pub code: SubjektivSessionDiagnosticCode,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSessionSearchResponse {
+    pub items: Vec<SubjektivSessionSearchItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+    pub coverage: SubjektivSessionCoverage,
+    pub issues: Vec<SubjektivSessionIssue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSessionReadResponse {
+    pub session_id: String,
+    pub segment_id: String,
+    pub entry_ref: String,
+    pub kind: SubjektivSessionEntryKind,
+    pub origin: protocol::SessionEntryProvenance,
+    pub lineage: SubjektivSessionLineage,
+    pub mode: SubjektivSessionReadMode,
+    pub content: String,
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSessionErrorResponse {
+    pub code: SubjektivSessionDiagnosticCode,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "result", content = "data", rename_all = "snake_case")]
+pub enum SubjektivSessionBackendResult {
+    List(SubjektivSessionListResponse),
+    Search(SubjektivSessionSearchResponse),
+    Read(SubjektivSessionReadResponse),
+}
+
+/// Expected discovery/read failures remain typed model-visible data instead of
+/// being collapsed into an empty success or an unstructured transport error.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SubjektivSessionBackendResponse {
+    Ok {
+        result: SubjektivSessionBackendResult,
+    },
+    Error {
+        error: SubjektivSessionErrorResponse,
+    },
+}
+
+/// Maximum serialized model-facing JSON content for every subject Session tool.
+pub const SUBJEKTIV_SESSION_MAX_TOOL_CONTENT_BYTES: usize = 56 * 1024;
+pub const SUBJEKTIV_SESSION_MAX_READ_CONTENT_BYTES: usize = 16 * 1024;
+pub const SUBJEKTIV_SESSION_MAX_SNIPPET_BYTES: usize = 512;
 
 /// Current lifecycle state of one confirmed subject Memory revision.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -12273,6 +12561,7 @@ mod openapi_artifact_tests {
             "subjektiv_stage_candidate",
             "subjektiv_record_session",
             "subjektiv_memory_backend",
+            "subjektiv_session_backend",
             "subjektiv_memory_consolidation",
             "workspace_worker_discovery",
             "workspace_worker_remove",

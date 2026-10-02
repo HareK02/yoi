@@ -2312,6 +2312,9 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     if path.starts_with("/v1/workers/") && *method == Method::DELETE {
         return Some("workers:delete");
     }
+    if path.starts_with("/v1/session-public/") && *method == Method::POST {
+        return Some("workers:read");
+    }
     if path.starts_with("/v1/workers/") && *method == Method::GET {
         return Some("workers:read");
     }

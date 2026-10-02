@@ -2833,6 +2833,19 @@
             "type": "object"
           },
           {
+            "$ref": "#/components/schemas/MemoryResidentSummaryOutput",
+            "properties": {
+              "kind": {
+                "const": "resident_summary",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
             "$ref": "#/components/schemas/MemoryBackendAckOutput",
             "properties": {
               "kind": {
@@ -3084,7 +3097,34 @@
         },
         "type": "object"
       },
+      "MemoryResidentSummaryAvailability": {
+        "enum": [
+          "ready",
+          "ungenerated",
+          "stale",
+          "failed",
+          "unavailable"
+        ],
+        "type": "string"
+      },
       "MemoryResidentSummaryOperation": {
+        "type": "object"
+      },
+      "MemoryResidentSummaryOutput": {
+        "properties": {
+          "availability": {
+            "$ref": "#/components/schemas/MemoryResidentSummaryAvailability"
+          },
+          "content": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "availability"
+        ],
         "type": "object"
       },
       "MemorySettingsAudit": {
@@ -14081,7 +14121,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:c77c3a923b6eb888bc80137894313f668ed14e11248695ca5fb07cb00281fef9"
+    "x-yoi-source-digest": "sha256:85a55ead75ec0b0ddebc4dd45905db935c59520656b8490df9fb928daac58dd0"
   },
   "openapi": "3.1.0",
   "paths": {

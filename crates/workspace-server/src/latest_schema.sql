@@ -957,6 +957,17 @@ CREATE TABLE worker_session_archives (
         committed_at TEXT NOT NULL, expires_at TEXT,
         FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
         FOREIGN KEY(operation_id) REFERENCES worker_removal_operations(operation_id));
+CREATE TABLE worker_session_archive_observe_grants (
+        workspace_id TEXT NOT NULL, archive_id TEXT NOT NULL,
+        controller_runtime_id TEXT NOT NULL, controller_worker_id TEXT NOT NULL,
+        subject_runtime_id TEXT NOT NULL, subject_worker_id TEXT NOT NULL,
+        source_grant_id TEXT NOT NULL, granted_at TEXT NOT NULL,
+        PRIMARY KEY(workspace_id,archive_id,controller_runtime_id,controller_worker_id,source_grant_id),
+        FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+        FOREIGN KEY(archive_id) REFERENCES worker_session_archives(archive_id) ON DELETE CASCADE);
+CREATE INDEX worker_session_archive_observe_grants_controller
+        ON worker_session_archive_observe_grants(
+            workspace_id,controller_runtime_id,controller_worker_id,archive_id);
 CREATE TABLE worker_tombstones (
         workspace_id TEXT NOT NULL, runtime_id TEXT NOT NULL, worker_id TEXT NOT NULL,
         display_name TEXT NOT NULL, profile TEXT, worker_created_at TEXT NOT NULL, removed_at TEXT NOT NULL,

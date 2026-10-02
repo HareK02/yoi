@@ -1307,6 +1307,15 @@ where
     {
         feature_registry.add_module(subjektiv_memory);
     }
+    if let Some(subjektiv_sessions) =
+        crate::feature::builtin::subjektiv_session::SubjektivSessionFeature::from_resolved_config(
+            &worker.manifest().feature.subjektiv,
+            worker.committed_session_capture_handle(),
+            worker.workspace_client_handle(),
+        )?
+    {
+        feature_registry.add_module(subjektiv_sessions);
+    }
     if let Some(memory_config) = memory_lifecycle_config
         && let Some(memory_lifecycle) =
             crate::feature::builtin::memory_lifecycle::MemoryLifecycleFeature::from_resolved_config(

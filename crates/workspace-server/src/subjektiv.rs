@@ -175,6 +175,12 @@ impl SubjectSessionAttribution {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubjectSessionAttributionPage {
+    pub items: Vec<SubjectSessionAttribution>,
+    pub has_more: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RevisionProposalIntent {
@@ -1205,6 +1211,93 @@ impl SubjektivStore {
                 records.push(parse_session_attribution(&row?)?);
             }
             Ok(records)
+        })
+    }
+
+    /// Reads one bounded immutable attribution page without materializing the
+    /// subject's complete history. `snapshot_at` fixes the initial discovery
+    /// boundary; later Host attributions require a fresh traversal.
+    pub fn subject_session_attribution_page(
+        &self,
+        subject_id: &str,
+        session_id: Option<&str>,
+        snapshot_at: &str,
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<SubjectSessionAttributionPage> {
+        validate_label("subject id", subject_id)?;
+        validate_label("attribution snapshot", snapshot_at)?;
+        if let Some(session_id) = session_id {
+            validate_label("session id", session_id)?;
+        }
+        if let Some((attributed_at, session_id)) = after {
+            validate_label("attribution cursor timestamp", attributed_at)?;
+            validate_label("attribution cursor session id", session_id)?;
+        }
+        if !(1..=100).contains(&limit) {
+            return Err(SubjektivError::InvalidRecord(
+                "subject Session attribution page limit must be between 1 and 100".to_string(),
+            ));
+        }
+        let query_limit = limit.saturating_add(1);
+        self.database.try_with_connection(|connection| {
+            let raw = match (session_id, after) {
+                (Some(session_id), _) => {
+                    let mut statement = connection.prepare(
+                        "SELECT record_json FROM subject_session_attributions
+                         WHERE subject_id = ?1 AND session_id = ?2 AND attributed_at <= ?3
+                         ORDER BY attributed_at DESC, session_id ASC
+                         LIMIT ?4",
+                    )?;
+                    let rows = statement.query_map(
+                        params![subject_id, session_id, snapshot_at, query_limit as i64],
+                        |row| row.get::<_, String>(0),
+                    )?;
+                    rows.collect::<std::result::Result<Vec<_>, _>>()?
+                }
+                (None, Some((after_at, after_session_id))) => {
+                    let mut statement = connection.prepare(
+                        "SELECT record_json FROM subject_session_attributions
+                         WHERE subject_id = ?1 AND attributed_at <= ?2
+                           AND (attributed_at < ?3 OR (attributed_at = ?3 AND session_id > ?4))
+                         ORDER BY attributed_at DESC, session_id ASC
+                         LIMIT ?5",
+                    )?;
+                    let rows = statement.query_map(
+                        params![
+                            subject_id,
+                            snapshot_at,
+                            after_at,
+                            after_session_id,
+                            query_limit as i64
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )?;
+                    rows.collect::<std::result::Result<Vec<_>, _>>()?
+                }
+                (None, None) => {
+                    let mut statement = connection.prepare(
+                        "SELECT record_json FROM subject_session_attributions
+                         WHERE subject_id = ?1 AND attributed_at <= ?2
+                         ORDER BY attributed_at DESC, session_id ASC
+                         LIMIT ?3",
+                    )?;
+                    let rows = statement.query_map(
+                        params![subject_id, snapshot_at, query_limit as i64],
+                        |row| row.get::<_, String>(0),
+                    )?;
+                    rows.collect::<std::result::Result<Vec<_>, _>>()?
+                }
+            };
+            let mut items = raw
+                .into_iter()
+                .map(|raw| parse_session_attribution(&raw))
+                .collect::<Result<Vec<_>>>()?;
+            let has_more = items.len() > limit;
+            if has_more {
+                items.truncate(limit);
+            }
+            Ok(SubjectSessionAttributionPage { items, has_more })
         })
     }
 
@@ -3676,6 +3769,88 @@ mod tests {
                 if candidate_id == "candidate-1"
         ));
         assert!(store.session_attribution("session-2").unwrap().is_none());
+    }
+
+    #[test]
+    fn attribution_pages_are_bounded_descending_and_snapshot_fixed() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_manager, _workspace, store) = open_store(&temp.path().join("storage"), "workspace-a");
+        let subject = store.create_subject(role()).unwrap();
+        for (session, at) in [
+            ("session-1", "2026-09-28T10:00:00.000Z"),
+            ("session-2", "2026-09-28T11:00:00.000Z"),
+            ("session-3", "2026-09-28T11:00:00.000Z"),
+        ] {
+            store
+                .record_session_attribution(attribution(
+                    &subject.id,
+                    "runtime-1",
+                    "worker-1",
+                    session,
+                    at,
+                ))
+                .unwrap();
+        }
+
+        let first = store
+            .subject_session_attribution_page(
+                &subject.id,
+                None,
+                "2026-09-28T11:30:00.000Z",
+                None,
+                2,
+            )
+            .unwrap();
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|item| item.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["session-2", "session-3"]
+        );
+        assert!(first.has_more);
+
+        store
+            .record_session_attribution(attribution(
+                &subject.id,
+                "runtime-2",
+                "worker-2",
+                "session-later",
+                "2026-09-28T12:00:00.000Z",
+            ))
+            .unwrap();
+        let last = first.items.last().unwrap();
+        let second = store
+            .subject_session_attribution_page(
+                &subject.id,
+                None,
+                "2026-09-28T11:30:00.000Z",
+                Some((&last.attributed_at, &last.session_id)),
+                2,
+            )
+            .unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].session_id, "session-1");
+        assert!(!second.has_more);
+        assert!(
+            second
+                .items
+                .iter()
+                .all(|item| item.session_id != "session-later")
+        );
+
+        let exact = store
+            .subject_session_attribution_page(
+                &subject.id,
+                Some("session-1"),
+                "2026-09-28T11:30:00.000Z",
+                None,
+                20,
+            )
+            .unwrap();
+        assert_eq!(exact.items.len(), 1);
+        assert!(!exact.has_more);
     }
 
     #[test]

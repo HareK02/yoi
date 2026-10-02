@@ -2078,6 +2078,7 @@ permission = "write"
             segment_id: "segment-1".to_string(),
             session_revision: history_len.try_into().unwrap(),
             entry_count: history_len,
+            has_committed_run: true,
             run_exit: CommittedRunExit::Finished,
             history: (0..history_len)
                 .map(|index| HistoryEntry {

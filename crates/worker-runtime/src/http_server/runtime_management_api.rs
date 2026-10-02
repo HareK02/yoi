@@ -289,6 +289,80 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
             .map_err(api_error)
     }
 
+    async fn session_public_search(
+        &self,
+        request: runtime_api::SessionPublicSearchRequest,
+    ) -> Result<runtime_api::SessionPublicSearchAvailability, runtime_api::RuntimeApiError> {
+        let scope = auth_workspace_scope(&self.state, auth_extension().as_ref())
+            .map_err(api_error)?
+            .ok_or_else(|| {
+                runtime_api::RuntimeApiError::new(
+                    StatusCode::FORBIDDEN.as_u16(),
+                    "runtime_session_public_scope_required",
+                    "Session public search requires a Workspace-scoped capability",
+                )
+            })?;
+        if scope.workspace_id != request.workspace_id {
+            return Err(runtime_api::RuntimeApiError::new(
+                StatusCode::FORBIDDEN.as_u16(),
+                "runtime_session_public_workspace_scope_mismatch",
+                "Session public search Workspace scope does not match the authenticated capability",
+            ));
+        }
+        #[cfg(feature = "fs-store")]
+        {
+            self.state
+                .runtime
+                .session_public_search_scoped(&scope, &request)
+                .map_err(RuntimeHttpRestError::runtime)
+                .map_err(api_error)
+        }
+        #[cfg(not(feature = "fs-store"))]
+        {
+            Ok(runtime_api::SessionPublicSearchAvailability::Unavailable {
+                reason: runtime_api::SessionPublicUnavailableReason::StorageUnavailable,
+                message: "Session public storage is unavailable".to_string(),
+            })
+        }
+    }
+
+    async fn session_public_read(
+        &self,
+        request: runtime_api::SessionPublicReadRequest,
+    ) -> Result<runtime_api::SessionPublicReadAvailability, runtime_api::RuntimeApiError> {
+        let scope = auth_workspace_scope(&self.state, auth_extension().as_ref())
+            .map_err(api_error)?
+            .ok_or_else(|| {
+                runtime_api::RuntimeApiError::new(
+                    StatusCode::FORBIDDEN.as_u16(),
+                    "runtime_session_public_scope_required",
+                    "Session public read requires a Workspace-scoped capability",
+                )
+            })?;
+        if scope.workspace_id != request.workspace_id {
+            return Err(runtime_api::RuntimeApiError::new(
+                StatusCode::FORBIDDEN.as_u16(),
+                "runtime_session_public_workspace_scope_mismatch",
+                "Session public read Workspace scope does not match the authenticated capability",
+            ));
+        }
+        #[cfg(feature = "fs-store")]
+        {
+            self.state
+                .runtime
+                .session_public_read_scoped(&scope, &request)
+                .map_err(RuntimeHttpRestError::runtime)
+                .map_err(api_error)
+        }
+        #[cfg(not(feature = "fs-store"))]
+        {
+            Ok(runtime_api::SessionPublicReadAvailability::Unavailable {
+                reason: runtime_api::SessionPublicUnavailableReason::StorageUnavailable,
+                message: "Session public storage is unavailable".to_string(),
+            })
+        }
+    }
+
     async fn create_worker(
         &self,
         value: runtime_api::CreateWorkerRequest,

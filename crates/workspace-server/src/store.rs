@@ -27,7 +27,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 75;
+const LATEST_SCHEMA_VERSION: i64 = 76;
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
@@ -72,6 +72,8 @@ const ORDERED_WORKER_PROJECTION_MIGRATION_NAME: &str =
     "ordered Worker projection subscriptions without revision reconciliation";
 const RUNTIME_SCOPED_WORKER_IDENTITY_MIGRATION_NAME: &str =
     "Runtime-scoped durable Worker catalog identity";
+const ARCHIVE_OBSERVE_GRANTS_MIGRATION_NAME: &str =
+    "preserve explicit observe grants for committed Worker Session archives";
 const TICKET_SCHEMA_VERSION_WITH_TARGETS: i64 = 7;
 const TICKET_SCHEMA_BASELINE_NAME: &str = "ticket schema baseline";
 const WORKER_REGISTRY_PROJECTION_SCHEMA: &str = r#"
@@ -243,6 +245,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 75,
         name: RUNTIME_SCOPED_WORKER_IDENTITY_MIGRATION_NAME,
         apply: migrate_runtime_scoped_worker_identity_v74_to_v75,
+    },
+    Migration {
+        version: 76,
+        name: ARCHIVE_OBSERVE_GRANTS_MIGRATION_NAME,
+        apply: migrate_archive_observe_grants_v75_to_v76,
     },
 ];
 
@@ -14147,6 +14154,47 @@ fn migrate_runtime_scoped_worker_identity_v74_to_v75(conn: &Connection) -> Resul
     }
 }
 
+fn migrate_archive_observe_grants_v75_to_v76(conn: &Connection) -> Result<()> {
+    let current = current_schema_version(conn)?;
+    if current != 75 {
+        return Err(Error::Store(format!(
+            "expected schema version 75 before {ARCHIVE_OBSERVE_GRANTS_MIGRATION_NAME} migration, found {current}"
+        )));
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    tx.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS worker_session_archive_observe_grants (
+            workspace_id TEXT NOT NULL,
+            archive_id TEXT NOT NULL,
+            controller_runtime_id TEXT NOT NULL,
+            controller_worker_id TEXT NOT NULL,
+            subject_runtime_id TEXT NOT NULL,
+            subject_worker_id TEXT NOT NULL,
+            source_grant_id TEXT NOT NULL,
+            granted_at TEXT NOT NULL,
+            PRIMARY KEY (
+                workspace_id, archive_id,
+                controller_runtime_id, controller_worker_id,
+                source_grant_id
+            ),
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+            FOREIGN KEY (archive_id) REFERENCES worker_session_archives(archive_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS worker_session_archive_observe_grants_controller
+            ON worker_session_archive_observe_grants(
+                workspace_id, controller_runtime_id, controller_worker_id, archive_id
+            );
+        "#,
+    )?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+        params![76_i64, ARCHIVE_OBSERVE_GRANTS_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("DROP TABLE IF EXISTS typed_ticket_targets;")?;
     conn.execute_batch(include_str!("latest_schema.sql"))?;
@@ -16617,6 +16665,10 @@ mod tests {
                     version: 75,
                     name: RUNTIME_SCOPED_WORKER_IDENTITY_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 76,
+                    name: ARCHIVE_OBSERVE_GRANTS_MIGRATION_NAME.to_string(),
+                },
             ]
         );
 
@@ -16699,6 +16751,7 @@ mod tests {
                             75,
                             RUNTIME_SCOPED_WORKER_IDENTITY_MIGRATION_NAME.to_string(),
                         ),
+                        (76, ARCHIVE_OBSERVE_GRANTS_MIGRATION_NAME.to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -16985,7 +17038,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72,
-                73, 74, 75
+                73, 74, 75, 76
             ]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
@@ -16994,7 +17047,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 26);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 27);
         assert!(column_exists(&conn, "worker_workdir_links", "alias").unwrap());
         assert!(column_exists(&conn, "worker_workdir_links", "capabilities").unwrap());
         assert!(!column_exists(&conn, "worker_workdir_links", "role").unwrap());

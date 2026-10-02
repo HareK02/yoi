@@ -581,6 +581,13 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
                                 client.subjektiv_memory_backend(workspace_id, request).await,
                             )
                         }
+                        WorkspaceServerOperation::SubjektivSession(request) => {
+                            generated_workspace_response(
+                                client
+                                    .subjektiv_session_backend(workspace_id, request)
+                                    .await,
+                            )
+                        }
                     }
                 })
             })

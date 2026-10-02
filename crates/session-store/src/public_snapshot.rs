@@ -978,7 +978,7 @@ pub fn project_session_snapshot(session_id: SessionId, log: &[LogEntry]) -> Sess
     project_session_snapshot_for_segment(session_id, None, log)
 }
 
-fn project_session_snapshot_for_segment(
+pub(crate) fn project_session_snapshot_for_segment(
     session_id: SessionId,
     segment_id: Option<SegmentId>,
     log: &[LogEntry],
