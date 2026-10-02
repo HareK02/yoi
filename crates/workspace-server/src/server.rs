@@ -16776,6 +16776,9 @@ const SUBJEKTIV_QUERY_MAX_LIMIT: usize = 100;
 const SUBJEKTIV_BODY_DEFAULT_LINES: usize = 200;
 const SUBJEKTIV_BODY_MAX_LINES: usize = 1_000;
 const SUBJEKTIV_EVIDENCE_PAGE_SIZE: usize = 20;
+const SUBJEKTIV_CANDIDATE_ANCHOR_LIMIT: usize = 20;
+const SUBJEKTIV_ANCHOR_TEXT_MAX_BYTES: usize = 64;
+const SUBJEKTIV_NESTED_EVIDENCE_MAX_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -16840,6 +16843,23 @@ async fn scoped_subjektiv_memory_backend(
                 subjektiv_memory_validate_proposal(&store, &subject_id, input)?,
             )
         }
+        server_api::SubjektivMemoryBackendOperation::ReceiptStatus(input) => {
+            validate_subjektiv_receipt_id(&input.receipt_id)?;
+            let candidate = store
+                .staging_candidate(&subject_id, &input.receipt_id)
+                .map_err(subjektiv_store_error)?;
+            server_api::SubjektivMemoryBackendResponse::ReceiptStatus(
+                server_api::SubjektivMemoryReceiptStatusResponse {
+                    receipt_id: input.receipt_id,
+                    status: if candidate.is_some() {
+                        server_api::SubjektivMemoryReceiptStatus::Staged
+                    } else {
+                        server_api::SubjektivMemoryReceiptStatus::Missing
+                    },
+                    candidate_id: candidate.map(|record| record.id),
+                },
+            )
+        }
         server_api::SubjektivMemoryBackendOperation::StageExplicit(input) => {
             // Re-derive the same subject and immutable Session attribution for the
             // write. The request never carries subject, Worker, Runtime, origin,
@@ -16891,7 +16911,7 @@ fn subjektiv_memory_query(
         }
         if cursor.store_revision != subject.store_revision {
             return Err(Error::RepositoryConflict(
-                "subjektiv query cursor is stale because Memory changed; restart the query".into(),
+                "stale_cursor: subjektiv query cursor is stale because Memory changed; restart the query".into(),
             )
             .into());
         }
@@ -16983,6 +17003,12 @@ fn subjektiv_memory_read(
         .into());
     }
     let body_offset = input.offset.unwrap_or(0);
+    if body_offset > 0 && input.revision.is_none() {
+        return Err(Error::InvalidInput(
+            "body continuation requires the exact revision returned by the first read".into(),
+        )
+        .into());
+    }
     let lines = memory_body_lines(&record.body_md);
     if body_offset > lines.len() {
         return Err(Error::InvalidInput("body line offset exceeds document length".into()).into());
@@ -17021,6 +17047,8 @@ fn subjektiv_memory_read(
     let mut source_candidate_ids = Vec::new();
     let mut source_candidates = Vec::new();
     let mut derived_from = Vec::new();
+    let mut evidence_budget = SUBJEKTIV_CANDIDATE_ANCHOR_LIMIT;
+    let mut source_ref_budget = SUBJEKTIV_CANDIDATE_ANCHOR_LIMIT;
     for index in evidence_offset..evidence_end {
         if let Some(candidate_id) = record.source_candidate_ids.get(index) {
             let candidate = store
@@ -17032,10 +17060,30 @@ fn subjektiv_memory_read(
                     ))
                 })?;
             source_candidate_ids.push(candidate_id.clone());
+            let evidence_total = candidate.evidence.len();
+            let source_refs_total = candidate.source_refs.len();
+            let evidence_take = evidence_total.min(evidence_budget);
+            let source_refs_take = source_refs_total.min(source_ref_budget);
+            evidence_budget -= evidence_take;
+            source_ref_budget -= source_refs_take;
             source_candidates.push(server_api::SubjektivMemoryEvidenceCandidate {
                 candidate_id: candidate.id,
-                evidence: candidate.evidence,
-                source_refs: candidate.source_refs,
+                evidence: candidate
+                    .evidence
+                    .into_iter()
+                    .take(evidence_take)
+                    .map(bounded_subjektiv_staging_evidence)
+                    .collect(),
+                evidence_total,
+                evidence_truncated: evidence_total > evidence_take,
+                source_refs: candidate
+                    .source_refs
+                    .into_iter()
+                    .take(source_refs_take)
+                    .map(bounded_subjektiv_source_ref)
+                    .collect(),
+                source_refs_total,
+                source_refs_truncated: source_refs_total > source_refs_take,
             });
         } else {
             let derived_index = index - record.source_candidate_ids.len();
@@ -17046,6 +17094,7 @@ fn subjektiv_memory_read(
             });
         }
     }
+    bound_subjektiv_nested_evidence(&mut source_candidates)?;
     let evidence_has_more = evidence_end < total_evidence;
     let evidence_next_cursor = evidence_has_more
         .then(|| {
@@ -17180,19 +17229,33 @@ fn subjektiv_memory_validate_proposal(
     })
 }
 
+fn validate_subjektiv_receipt_id(receipt_id: &str) -> ApiResult<()> {
+    let receipt_id = receipt_id.trim();
+    if receipt_id.is_empty() || receipt_id.len() > 512 || receipt_id.chars().any(char::is_control) {
+        return Err(Error::InvalidInput("explicit Memory receipt_id is invalid".into()).into());
+    }
+    Ok(())
+}
+
 fn subjektiv_memory_stage_explicit(
     store: &crate::subjektiv::SubjektivStore,
     mut input: server_api::SubjektivMemoryStageExplicitRequest,
     attribution: crate::subjektiv::SubjectSessionAttribution,
 ) -> ApiResult<server_api::SubjektivMemoryStageExplicitResponse> {
+    validate_subjektiv_receipt_id(&input.receipt_id)?;
     let receipt_id = input.receipt_id.trim();
-    if receipt_id.is_empty() || receipt_id.len() > 512 || receipt_id.chars().any(char::is_control) {
-        return Err(Error::InvalidInput("explicit Memory receipt_id is invalid".into()).into());
-    }
     if input.evidence.is_empty() || input.source_refs.is_empty() {
         return Err(Error::InvalidInput(
             "explicit Memory staging requires host-resolved committed evidence".into(),
         )
+        .into());
+    }
+    if input.evidence.len() > SUBJEKTIV_CANDIDATE_ANCHOR_LIMIT
+        || input.source_refs.len() > SUBJEKTIV_CANDIDATE_ANCHOR_LIMIT
+    {
+        return Err(Error::InvalidInput(format!(
+            "explicit Memory evidence/source_refs are limited to {SUBJEKTIV_CANDIDATE_ANCHOR_LIMIT} items each"
+        ))
         .into());
     }
     if matches!(input.kind, memory::extract::CandidateKind::Preference)
@@ -17452,6 +17515,103 @@ fn memory_body_lines(body: &str) -> Vec<&str> {
     } else {
         body.split_inclusive('\n').collect()
     }
+}
+
+fn bound_subjektiv_nested_evidence(
+    candidates: &mut [server_api::SubjektivMemoryEvidenceCandidate],
+) -> ApiResult<()> {
+    loop {
+        let serialized = serde_json::to_vec(candidates)
+            .map_err(|error| Error::Store(format!("encode subjektiv evidence page: {error}")))?;
+        if serialized.len() <= SUBJEKTIV_NESTED_EVIDENCE_MAX_BYTES {
+            return Ok(());
+        }
+        let mut removed = false;
+        for candidate in candidates.iter_mut().rev() {
+            if candidate.source_refs.pop().is_some() {
+                candidate.source_refs_truncated = true;
+                removed = true;
+                break;
+            }
+            if candidate.evidence.pop().is_some() {
+                candidate.evidence_truncated = true;
+                removed = true;
+                break;
+            }
+        }
+        if !removed {
+            return Err(Error::Store(
+                "subjektiv evidence metadata exceeds its response byte budget".into(),
+            )
+            .into());
+        }
+    }
+}
+
+fn bounded_subjektiv_staging_evidence(
+    mut evidence: memory::extract::StagingEvidence,
+) -> memory::extract::StagingEvidence {
+    evidence.kind = memory::schema::EvidenceKind::new(bounded_utf8_bytes(
+        evidence.kind.as_str().to_string(),
+        SUBJEKTIV_ANCHOR_TEXT_MAX_BYTES,
+    ));
+    evidence.origin = evidence.origin.map(bounded_subjektiv_evidence_origin);
+    evidence.excerpt = evidence
+        .excerpt
+        .map(|value| bounded_utf8_bytes(value, SUBJEKTIV_ANCHOR_TEXT_MAX_BYTES));
+    evidence.summary = evidence
+        .summary
+        .map(|value| bounded_utf8_bytes(value, SUBJEKTIV_ANCHOR_TEXT_MAX_BYTES));
+    evidence
+}
+
+fn bounded_subjektiv_source_ref(
+    mut source: memory::schema::SourceEvidenceRef,
+) -> memory::schema::SourceEvidenceRef {
+    source.origin = source.origin.map(bounded_subjektiv_evidence_origin);
+    source.evidence_kind = source.evidence_kind.map(|kind| {
+        memory::schema::EvidenceKind::new(bounded_utf8_bytes(
+            kind.as_str().to_string(),
+            SUBJEKTIV_ANCHOR_TEXT_MAX_BYTES,
+        ))
+    });
+    source.label = source
+        .label
+        .map(|value| bounded_utf8_bytes(value, SUBJEKTIV_ANCHOR_TEXT_MAX_BYTES));
+    source.summary = source
+        .summary
+        .map(|value| bounded_utf8_bytes(value, SUBJEKTIV_ANCHOR_TEXT_MAX_BYTES));
+    source
+}
+
+fn bounded_subjektiv_evidence_origin(
+    mut origin: memory::schema::EvidenceOrigin,
+) -> memory::schema::EvidenceOrigin {
+    for field in [
+        &mut origin.account_id,
+        &mut origin.workspace_id,
+        &mut origin.runtime_id,
+        &mut origin.worker_id,
+        &mut origin.flow_selector,
+        &mut origin.flow_definition_id,
+    ] {
+        if let Some(value) = field.take() {
+            *field = Some(bounded_utf8_bytes(value, SUBJEKTIV_ANCHOR_TEXT_MAX_BYTES));
+        }
+    }
+    origin
+}
+
+fn bounded_utf8_bytes(value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let marker = "…";
+    let mut end = max_bytes.saturating_sub(marker.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{marker}", &value[..end])
 }
 
 fn bounded_memory_excerpt(body: &str, max_chars: usize) -> String {
@@ -28772,10 +28932,25 @@ impl From<Error> for ApiError {
                 severity: HostDiagnosticSeverity::Error,
                 message: sanitize_backend_error(&ticket_error.to_string()),
             }],
+            Error::RepositoryConflict(message) => subjektiv_conflict_code(message)
+                .map(|code| {
+                    vec![RuntimeDiagnostic {
+                        code: code.to_string(),
+                        severity: HostDiagnosticSeverity::Error,
+                        message: sanitize_backend_error(message),
+                    }]
+                })
+                .unwrap_or_default(),
             _ => Vec::new(),
         };
         Self { error, diagnostics }
     }
+}
+
+fn subjektiv_conflict_code(message: &str) -> Option<&'static str> {
+    ["revision_conflict", "stale_cursor"]
+        .into_iter()
+        .find(|code| message.starts_with(code))
 }
 
 impl ApiError {
@@ -34968,12 +35143,46 @@ mod tests {
             excerpt: Some("Correct the first rule".to_string()),
             summary: Some("Human correction".to_string()),
         };
+        let oversized = scoped_subjektiv_memory_backend(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            context.clone(),
+            Json(server_api::SubjektivMemoryBackendRequest {
+                operation: server_api::SubjektivMemoryBackendOperation::StageExplicit(
+                    server_api::SubjektivMemoryStageExplicitRequest {
+                        receipt_id: "explicit:session-1:oversized".to_string(),
+                        session_id: "session-1".to_string(),
+                        kind: memory::extract::CandidateKind::Decision,
+                        claim: "Too many anchors".to_string(),
+                        why_useful: "Prove response bounds".to_string(),
+                        staleness: None,
+                        evidence: vec![
+                            explicit_evidence.clone();
+                            SUBJEKTIV_CANDIDATE_ANCHOR_LIMIT + 1
+                        ],
+                        source_refs: vec![memory::schema::SourceEvidenceRef {
+                            segment_id: Some("segment-1".to_string()),
+                            entry_range: Some([0, 0]),
+                            evidence_id: Some("E00000000".to_string()),
+                            ..Default::default()
+                        }],
+                        proposal: None,
+                    },
+                ),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(oversized.error, Error::InvalidInput(_)));
+
         let Json(explicit) = scoped_subjektiv_memory_backend(
             State(api.clone()),
             AxumPath(ScopedWorkspacePath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
             }),
-            context,
+            context.clone(),
             Json(server_api::SubjektivMemoryBackendRequest {
                 operation: server_api::SubjektivMemoryBackendOperation::StageExplicit(
                     server_api::SubjektivMemoryStageExplicitRequest {
@@ -35007,6 +35216,34 @@ mod tests {
             other => panic!("unexpected explicit response: {other:?}"),
         };
         assert_eq!(staged.candidate_id, "explicit:session-1:call-1");
+        let Json(status) = scoped_subjektiv_memory_backend(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            context,
+            Json(server_api::SubjektivMemoryBackendRequest {
+                operation: server_api::SubjektivMemoryBackendOperation::ReceiptStatus(
+                    server_api::SubjektivMemoryReceiptStatusRequest {
+                        receipt_id: staged.receipt_id.clone(),
+                    },
+                ),
+            }),
+        )
+        .await
+        .unwrap();
+        let status = match status {
+            server_api::SubjektivMemoryBackendResponse::ReceiptStatus(status) => status,
+            other => panic!("unexpected receipt response: {other:?}"),
+        };
+        assert_eq!(
+            status.status,
+            server_api::SubjektivMemoryReceiptStatus::Staged
+        );
+        assert_eq!(
+            status.candidate_id.as_deref(),
+            Some(staged.candidate_id.as_str())
+        );
         let candidate = store
             .staging_candidate(&subject.id, &staged.candidate_id)
             .unwrap()
@@ -35067,6 +35304,18 @@ mod tests {
         store
             .revise_memory(&subject.id, &second.id, 1, resolved)
             .unwrap();
+        let revision_conflict = subjektiv_memory_validate_proposal(
+            &store,
+            &subject.id,
+            server_api::SubjektivMemoryValidateProposalRequest {
+                memory_id: second.id.clone(),
+                expected_revision: 1,
+                intent: server_api::SubjektivMemoryRevisionIntent::Revise,
+            },
+        )
+        .unwrap_err();
+        let revision_api = ApiError::from(revision_conflict.error).into_repository_api_error();
+        assert_eq!(revision_api.diagnostics[0].code, "revision_conflict");
 
         let default_page = subjektiv_memory_query(
             &store,
@@ -35142,7 +35391,51 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(matches!(stale.error, Error::RepositoryConflict(_)));
+        assert!(matches!(&stale.error, Error::RepositoryConflict(_)));
+        let stale_api = ApiError::from(stale.error).into_repository_api_error();
+        assert_eq!(stale_api.diagnostics[0].code, "stale_cursor");
+
+        let initial_read = subjektiv_memory_read(
+            &store,
+            &subject.id,
+            server_api::SubjektivMemoryReadRequest {
+                memory_id: first.id.clone(),
+                revision: None,
+                offset: None,
+                limit: Some(1),
+                evidence_cursor: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(initial_read.revision, 1);
+        assert_eq!(initial_read.body_next_offset, Some(1));
+        store
+            .revise_memory(
+                &subject.id,
+                &first.id,
+                1,
+                crate::subjektiv::MemoryDraft::active(
+                    memory::extract::CandidateKind::Decision,
+                    "Choose stable cursors",
+                    "replacement one\nreplacement two\n",
+                    "Prevents mixed snapshots",
+                    "replace current body",
+                ),
+            )
+            .unwrap();
+        let unbound_continuation = subjektiv_memory_read(
+            &store,
+            &subject.id,
+            server_api::SubjektivMemoryReadRequest {
+                memory_id: first.id.clone(),
+                revision: None,
+                offset: initial_read.body_next_offset,
+                limit: Some(1),
+                evidence_cursor: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(unbound_continuation.error, Error::InvalidInput(_)));
 
         let read = subjektiv_memory_read(
             &store,
@@ -35160,7 +35453,147 @@ mod tests {
         assert_eq!(read.body_next_offset, Some(2));
         assert!(read.body_truncated);
         assert_eq!(read.revision, 1);
-        assert_eq!(read.current_revision, 1);
+        assert_eq!(read.current_revision, 2);
+
+        let nested_count = SUBJEKTIV_CANDIDATE_ANCHOR_LIMIT + 5;
+        let nested_evidence = (0..nested_count)
+            .map(|index| memory::extract::StagingEvidence {
+                id: format!("nested-{index}-{}", "i".repeat(220)),
+                kind: memory::schema::EvidenceKind::new(format!(
+                    "custom-{index}-{}",
+                    "k".repeat(4_000)
+                )),
+                entry_range: Some([index as u64, index as u64]),
+                origin: Some(memory::schema::EvidenceOrigin {
+                    kind: memory::schema::EvidenceOriginKind::ModelOutput,
+                    account_id: Some(format!("account-{index}-{}", "a".repeat(4_000))),
+                    workspace_id: None,
+                    runtime_id: Some(format!("runtime-{index}-{}", "r".repeat(4_000))),
+                    worker_id: Some(format!("worker-{index}-{}", "w".repeat(4_000))),
+                    flow_selector: Some(format!("flow-{index}-{}", "f".repeat(4_000))),
+                    flow_definition_id: Some(format!("definition-{index}-{}", "d".repeat(4_000))),
+                    flow_definition_revision: None,
+                }),
+                excerpt: Some(format!("evidence-{index}-{}", "x".repeat(4_000))),
+                summary: Some(format!("evidence-summary-{index}-{}", "q".repeat(4_000))),
+            })
+            .collect::<Vec<_>>();
+        let nested_refs = (0..nested_count)
+            .map(|index| memory::schema::SourceEvidenceRef {
+                session_id: Some(format!("session-{index}-{}", "u".repeat(220))),
+                segment_id: Some(format!("segment-{index}-{}", "g".repeat(220))),
+                entry_range: Some([index as u64, index as u64]),
+                evidence_id: Some(format!("nested-{index}-{}", "i".repeat(220))),
+                evidence_kind: Some(memory::schema::EvidenceKind::new(format!(
+                    "source-custom-{index}-{}",
+                    "s".repeat(4_000)
+                ))),
+                label: Some(format!("source-{index}-{}", "y".repeat(4_000))),
+                summary: Some(format!("summary-{index}-{}", "z".repeat(4_000))),
+                origin: Some(memory::schema::EvidenceOrigin {
+                    kind: memory::schema::EvidenceOriginKind::ModelOutput,
+                    account_id: Some(format!("source-account-{index}-{}", "a".repeat(4_000))),
+                    workspace_id: None,
+                    runtime_id: Some(format!("source-runtime-{index}-{}", "r".repeat(4_000))),
+                    worker_id: Some(format!("source-worker-{index}-{}", "w".repeat(4_000))),
+                    flow_selector: Some(format!("source-flow-{index}-{}", "f".repeat(4_000))),
+                    flow_definition_id: Some(format!(
+                        "source-definition-{index}-{}",
+                        "d".repeat(4_000)
+                    )),
+                    flow_definition_revision: Some(index as u64),
+                }),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let nested_candidate = memory::extract::StagingRecord::from_candidate(
+            "candidate-nested",
+            "nested-dedup",
+            memory::schema::SourceRef {
+                segment_id: "segment-nested".to_string(),
+                range: [0, nested_count as u64 - 1],
+            },
+            memory::extract::ExtractedCandidate {
+                kind: memory::extract::CandidateKind::Lesson,
+                claim: "Keep nested provenance bounded".to_string(),
+                why_useful: "Prevents unbounded read responses".to_string(),
+                staleness: None,
+                evidence_ids: nested_evidence.iter().map(|item| item.id.clone()).collect(),
+            },
+            nested_evidence,
+            nested_refs,
+        );
+        let nested_candidate = store
+            .stage_candidate(crate::subjektiv::SubjectStagingRecord::attach(
+                &subject.id,
+                nested_candidate,
+            ))
+            .unwrap();
+        let (nested_memory, _) = store
+            .apply_candidate(
+                &subject.id,
+                &nested_candidate.id,
+                crate::subjektiv::MemoryRevisionTarget::Create,
+                crate::subjektiv::MemoryDraft::active(
+                    memory::extract::CandidateKind::Lesson,
+                    "Keep nested provenance bounded",
+                    "bounded body",
+                    "Prevents unbounded read responses",
+                    "adopt oversized historical candidate",
+                ),
+                "adopt for response-bound regression",
+            )
+            .unwrap();
+        let nested_read = subjektiv_memory_read(
+            &store,
+            &subject.id,
+            server_api::SubjektivMemoryReadRequest {
+                memory_id: nested_memory.id,
+                revision: Some(1),
+                offset: None,
+                limit: None,
+                evidence_cursor: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(nested_read.source_candidates.len(), 1);
+        let nested = &nested_read.source_candidates[0];
+        assert_eq!(nested.evidence.len(), SUBJEKTIV_CANDIDATE_ANCHOR_LIMIT);
+        assert_eq!(nested.evidence_total, nested_count);
+        assert!(nested.evidence_truncated);
+        assert!(!nested.source_refs.is_empty());
+        assert!(nested.source_refs.len() <= SUBJEKTIV_CANDIDATE_ANCHOR_LIMIT);
+        assert_eq!(nested.source_refs_total, nested_count);
+        assert!(nested.source_refs_truncated);
+        assert!(nested.evidence.iter().all(|item| {
+            item.excerpt
+                .as_ref()
+                .is_none_or(|value| value.len() <= SUBJEKTIV_ANCHOR_TEXT_MAX_BYTES)
+        }));
+        assert!(nested.evidence.iter().all(|item| {
+            item.kind.as_str().len() <= SUBJEKTIV_ANCHOR_TEXT_MAX_BYTES
+                && item
+                    .origin
+                    .as_ref()
+                    .and_then(|origin| origin.worker_id.as_ref())
+                    .is_none_or(|value| value.len() <= SUBJEKTIV_ANCHOR_TEXT_MAX_BYTES)
+        }));
+        assert!(nested.source_refs.iter().all(|item| {
+            item.label
+                .as_ref()
+                .is_none_or(|value| value.len() <= SUBJEKTIV_ANCHOR_TEXT_MAX_BYTES)
+                && item
+                    .evidence_kind
+                    .as_ref()
+                    .is_none_or(|kind| kind.as_str().len() <= SUBJEKTIV_ANCHOR_TEXT_MAX_BYTES)
+        }));
+        assert!(
+            serde_json::to_vec(&nested_read.source_candidates)
+                .unwrap()
+                .len()
+                <= SUBJEKTIV_NESTED_EVIDENCE_MAX_BYTES
+        );
+        assert!(serde_json::to_vec(&nested_read).unwrap().len() < 64 * 1024);
 
         let revisions = subjektiv_memory_list_revisions(
             &store,

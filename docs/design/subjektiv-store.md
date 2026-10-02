@@ -175,28 +175,41 @@ empty `states` or `kinds` is invalid. Output defaults to 20 and is capped at 100
 ordered by `updated_at DESC, memory_id ASC`. Its opaque cursor binds the subject,
 canonical filters, offset, and subject `store_revision`; any confirmed-Memory
 change makes it a typed stale-cursor conflict rather than silently mixing
-snapshots. Revision history is ordered by revision descending. Its first page
+snapshots. Revision conflicts and stale cursors retain their diagnostic code as a
+structured `{status: "error", error: {code, message}}` tool result instead of
+requiring models to parse prose. Revision history is ordered by revision
+descending. Its first page
 fixes the maximum revision, so later revisions neither duplicate nor displace old
 page members.
 
 Read accepts a positive exact revision or resolves the current revision once. A
 missing historical revision never falls back to current. Markdown pagination is
 line-based (default 200, maximum 1000) and reports `body_truncated` plus
-`body_next_offset`. Provenance uses a separate immutable-revision-bound cursor and
-returns at most 20 candidate/derivation references per page. Candidate evidence is
-the bounded host-resolved anchor saved in staging; raw Session bodies are not
-copied into Memory responses. Resolved, retracted, and historical revisions remain
+`body_next_offset`; every nonzero continuation offset must also supply the exact
+revision returned by the first page, so a current-revision change cannot mix body
+versions. Provenance uses a separate immutable-revision-bound cursor and returns at
+most 20 candidate/derivation references per page. Expanded candidates share one
+page-wide budget of 20 evidence records and 20 source references, plus a hard 32 KiB
+serialized budget for the expanded candidate array; displayed anchor text is capped
+at 64 UTF-8 bytes and total/truncation metadata reports omissions.
+Explicit staging rejects larger anchor sets. Candidate evidence is the bounded host-resolved anchor saved in staging; raw Session bodies are not copied
+into Memory responses. Resolved, retracted, and historical revisions remain
 addressable by ID.
 
 Remember and ProposeRevision only stage candidates. Entry references are resolved
 against the host's committed Session capture, and preference candidates continue
 to require exclusively `HumanInput` evidence. When no entry is supplied, a
 non-preference request returns `pending_commit`; after the run commits, the host
-uses the committed tool-call entry itself as model-origin evidence. An operation
-that never commits is not staged. Receipt identity is derived from Session and
-tool-call identity, and exact backend retries return the first candidate rather
-than creating another one. Neither path changes `memory_records`,
-`memory_revisions`, `store_revision`, or a surface snapshot.
+reconstructs pending receipts from the durable tool-call/tool-result history and
+uses the committed tool-call entry itself as model-origin evidence. Receipt lookup
+reports `pending_commit`, `staged`, or `missing`; the post-commit hook retries
+immediately, the pre-request hook replays durable pending receipts after Worker
+restore, and the fail-closed pre-rewrite hook prevents compaction from dropping an
+unstaged receipt. Hook failure and process restart therefore retain an idempotent
+retry path, while an operation that never commits is not staged. Receipt identity is derived from Session and tool-call identity,
+and exact backend retries return the first candidate rather than creating another
+one. Neither path changes `memory_records`, `memory_revisions`, `store_revision`,
+or a surface snapshot.
 
 Revision proposals add optional `revision_proposal` metadata to the existing v2
 `SubjectStagingRecord` envelope; automatic extraction remains proposal-free and

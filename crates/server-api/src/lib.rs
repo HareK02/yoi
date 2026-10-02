@@ -4619,6 +4619,12 @@ pub struct SubjektivMemoryValidateProposalRequest {
     pub intent: SubjektivMemoryRevisionIntent,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryReceiptStatusRequest {
+    pub receipt_id: String,
+}
+
 /// Host-resolved staging input. Subject scope and evidence origin are never
 /// accepted from model-visible tool arguments.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -4646,6 +4652,7 @@ pub enum SubjektivMemoryBackendOperation {
     Read(SubjektivMemoryReadRequest),
     ListRevisions(SubjektivMemoryListRevisionsRequest),
     ValidateProposal(SubjektivMemoryValidateProposalRequest),
+    ReceiptStatus(SubjektivMemoryReceiptStatusRequest),
     StageExplicit(SubjektivMemoryStageExplicitRequest),
 }
 
@@ -4682,7 +4689,13 @@ pub struct SubjektivMemoryQueryResponse {
 pub struct SubjektivMemoryEvidenceCandidate {
     pub candidate_id: String,
     pub evidence: Vec<memory::extract::StagingEvidence>,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub evidence_total: usize,
+    pub evidence_truncated: bool,
     pub source_refs: Vec<memory::schema::SourceEvidenceRef>,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub source_refs_total: usize,
+    pub source_refs_truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -4756,10 +4769,21 @@ pub struct SubjektivMemoryProposalValidationResponse {
     pub intent: SubjektivMemoryRevisionIntent,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SubjektivMemoryReceiptStatus {
+    PendingCommit,
     Staged,
+    Missing,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryReceiptStatusResponse {
+    pub receipt_id: String,
+    pub status: SubjektivMemoryReceiptStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -4781,6 +4805,7 @@ pub enum SubjektivMemoryBackendResponse {
     Read(SubjektivMemoryReadResponse),
     ListRevisions(SubjektivMemoryListRevisionsResponse),
     ProposalValidated(SubjektivMemoryProposalValidationResponse),
+    ReceiptStatus(SubjektivMemoryReceiptStatusResponse),
     Staged(SubjektivMemoryStageExplicitResponse),
 }
 
