@@ -49,6 +49,35 @@ enum ExtractionTarget {
     Subjektiv,
 }
 
+#[derive(Clone)]
+struct LifecycleConfig {
+    extraction: manifest::MemoryExtractionProfileConfig,
+    consolidation_request_enabled: bool,
+    workspace_settings: Option<manifest::WorkspaceMemorySettingsSnapshot>,
+}
+
+impl LifecycleConfig {
+    fn from_memory(config: manifest::ResolvedMemoryFeatureConfig) -> Self {
+        Self {
+            extraction: config.profile.extraction,
+            consolidation_request_enabled: config.profile.consolidation.request_enabled,
+            workspace_settings: config.workspace_settings,
+        }
+    }
+
+    fn from_subjektiv(config: manifest::ResolvedSubjektivFeatureConfig) -> Self {
+        Self {
+            extraction: config.profile.extraction,
+            consolidation_request_enabled: true,
+            workspace_settings: config.workspace_settings,
+        }
+    }
+
+    fn workspace_settings(&self) -> Option<manifest::WorkspaceMemorySettingsSnapshot> {
+        self.workspace_settings.clone()
+    }
+}
+
 /// Parent-Worker lifecycle Feature that observes committed runs and schedules
 /// bounded extraction work. It owns the Memory pointer, audit, restricted
 /// Internal Worker, and staging disposition; Worker core owns only generic
@@ -67,7 +96,7 @@ pub(crate) struct SubjektivLifecycleFeature {
 
 #[derive(Clone)]
 struct MemoryLifecycleTask {
-    config: manifest::ResolvedMemoryFeatureConfig,
+    config: LifecycleConfig,
     target: ExtractionTarget,
     capture: CommittedSessionCaptureHandle,
     extensions: SessionExtensionHandle,
@@ -141,7 +170,7 @@ impl MemoryLifecycleFeature {
     ) -> Self {
         Self {
             task: MemoryLifecycleTask {
-                config,
+                config: LifecycleConfig::from_memory(config),
                 target: ExtractionTarget::WorkspaceMemory,
                 capture,
                 extensions,
@@ -170,7 +199,7 @@ impl SubjektivLifecycleFeature {
         workspace_context: WorkerWorkspaceContext,
         event_tx: Option<broadcast::Sender<Event>>,
     ) -> std::io::Result<Option<Self>> {
-        if !lifecycle_enabled || !config.profile.enabled {
+        if !lifecycle_enabled || !config.profile.enabled || !config.profile.extraction.enabled {
             return Ok(None);
         }
         config
@@ -182,23 +211,9 @@ impl SubjektivLifecycleFeature {
                 "subjektiv extraction requires Backend Workspace API authority",
             ));
         }
-        let memory_config = manifest::ResolvedMemoryFeatureConfig {
-            profile: manifest::MemoryFeatureProfileConfig {
-                enabled: true,
-                staging_tools: false,
-                resident: manifest::MemoryResidentProfileConfig {
-                    inject_summary: false,
-                },
-                extraction: config.profile.extraction,
-                consolidation: manifest::MemoryConsolidationProfileConfig {
-                    request_enabled: false,
-                },
-            },
-            workspace_settings: config.workspace_settings,
-        };
         Ok(Some(Self {
             task: MemoryLifecycleTask {
-                config: memory_config,
+                config: LifecycleConfig::from_subjektiv(config),
                 target: ExtractionTarget::Subjektiv,
                 capture,
                 extensions,
@@ -282,10 +297,10 @@ impl MemoryLifecycleTask {
 
     fn extraction_manifest(&self) -> WorkerManifest {
         let mut manifest = self.manifest.clone();
-        if let Some(model) = self.config.profile.extraction.model.clone() {
+        if let Some(model) = self.config.extraction.model.clone() {
             manifest.model = model;
         }
-        if let Some(reasoning) = self.config.profile.extraction.reasoning.clone() {
+        if let Some(reasoning) = self.config.extraction.reasoning.clone() {
             manifest.engine.reasoning = Some(reasoning);
         }
         manifest
@@ -301,14 +316,13 @@ impl MemoryLifecycleTask {
             memory::audit::AuditWorker::MemoryExtract,
             memory::audit::AuditTrigger::TokenThreshold,
             self.config
-                .profile
                 .extraction
                 .model
                 .as_ref()
                 .or(Some(&self.manifest.model))
                 .map(model_audit_from_manifest),
         )
-        .with_memory_settings(&self.config);
+        .with_workspace_settings(self.config.workspace_settings.as_ref());
         let audit = if self.target == ExtractionTarget::Subjektiv {
             audit.without_legacy_backend()
         } else {
@@ -364,7 +378,6 @@ impl MemoryLifecycleTask {
         };
         let Some(threshold) = self
             .config
-            .profile
             .extraction
             .threshold
             .filter(|threshold| *threshold > 0)
@@ -470,7 +483,7 @@ impl MemoryLifecycleTask {
                 capture.session_id.clone(),
             ),
         };
-        let client = if let Some(model) = self.config.profile.extraction.model.as_ref() {
+        let client = if let Some(model) = self.config.extraction.model.as_ref() {
             match crate::model_client::build_client(model) {
                 Ok(client) => client,
                 Err(error) => {
@@ -534,7 +547,6 @@ impl MemoryLifecycleTask {
                 cache_key: Some(capture.segment_id.clone()),
                 max_turns: self
                     .config
-                    .profile
                     .extraction
                     .worker_max_turns
                     .or(manifest::defaults::MEMORY_EXTRACT_WORKER_MAX_TURNS),
@@ -710,7 +722,7 @@ impl FeatureBackgroundTask for MemoryLifecycleTask {
         context: BackgroundTaskContext,
         cancellation: BackgroundTaskCancellation,
     ) -> Result<(), HookError> {
-        let extraction = if self.config.profile.extraction.enabled {
+        let extraction = if self.config.extraction.enabled {
             self.run_extraction(context.clone(), cancellation.clone())
                 .await
         } else {
@@ -719,9 +731,7 @@ impl FeatureBackgroundTask for MemoryLifecycleTask {
         if !cancellation.is_cancelled() {
             context.generation_fence.ensure_current()?;
             match self.target {
-                ExtractionTarget::WorkspaceMemory
-                    if self.config.profile.consolidation.request_enabled =>
-                {
+                ExtractionTarget::WorkspaceMemory if self.config.consolidation_request_enabled => {
                     self.request_consolidation(false).await;
                 }
                 ExtractionTarget::Subjektiv => {
@@ -770,7 +780,7 @@ impl MemoryLifecycleTask {
             memory::audit::AuditTrigger::StagingBacklog,
             Some(model_audit_from_manifest(&self.manifest.model)),
         )
-        .with_memory_settings(&self.config);
+        .with_workspace_settings(self.config.workspace_settings.as_ref());
         let operation = memory::backend::MemoryConsolidateStagingOperation { force: false };
         let request = if subjektiv {
             self.workspace_client
@@ -981,15 +991,15 @@ impl WorkerAuditBase {
         self
     }
 
-    fn with_memory_settings(mut self, config: &manifest::ResolvedMemoryFeatureConfig) -> Self {
-        self.memory_settings =
-            config
-                .workspace_settings()
-                .map(|snapshot| memory::audit::MemorySettingsAudit {
-                    workspace_id: snapshot.workspace_id,
-                    settings_revision: snapshot.settings_revision,
-                    language: snapshot.language,
-                });
+    fn with_workspace_settings(
+        mut self,
+        settings: Option<&manifest::WorkspaceMemorySettingsSnapshot>,
+    ) -> Self {
+        self.memory_settings = settings.map(|snapshot| memory::audit::MemorySettingsAudit {
+            workspace_id: snapshot.workspace_id.clone(),
+            settings_revision: snapshot.settings_revision,
+            language: snapshot.language.clone(),
+        });
         self
     }
 
@@ -1407,7 +1417,7 @@ permission = "write"
             Ok(true)
         });
         MemoryLifecycleTask {
-            config: test_config(),
+            config: LifecycleConfig::from_memory(test_config()),
             target: ExtractionTarget::WorkspaceMemory,
             capture: capture_handle,
             extensions,
@@ -1484,6 +1494,35 @@ permission = "write"
     }
 
     #[test]
+    fn subjektiv_without_extraction_installs_no_session_lifecycle() {
+        let capture = CommittedSessionCaptureHandle::new(|| {
+            panic!("subjektiv without extraction must not capture a Session")
+        });
+        let extensions = SessionExtensionHandle::new(|_, _, _| {
+            panic!("subjektiv without extraction must not write a pointer")
+        });
+        let mut config = manifest::ResolvedSubjektivFeatureConfig::default();
+        config.profile.enabled = true;
+        config.profile.extraction.enabled = false;
+
+        let feature = SubjektivLifecycleFeature::from_resolved_config(
+            true,
+            config,
+            capture,
+            extensions,
+            crate::worker::marker_workspace_client(None, "extraction-disabled"),
+            test_manifest(),
+            Box::new(ScriptClient::new(Vec::new())),
+            Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap())),
+            WorkerWorkspaceContext::no_workspace(),
+            None,
+        )
+        .unwrap();
+
+        assert!(feature.is_none());
+    }
+
+    #[test]
     fn child_host_suppresses_enabled_subjektiv_lifecycle_without_capture_side_effects() {
         let capture = CommittedSessionCaptureHandle::new(|| {
             panic!("a child Worker must not capture for an inherited subjektiv profile")
@@ -1536,12 +1575,11 @@ permission = "write"
             event_tx,
             workspace_client,
         );
-        task.config.profile.extraction.model = Some(manifest::ModelManifest {
+        task.config.extraction.model = Some(manifest::ModelManifest {
             ref_: Some("codex-oauth/gpt-5.6-luna".to_string()),
             ..Default::default()
         });
-        task.config.profile.extraction.reasoning =
-            Some(ReasoningControl::Effort(ReasoningEffort::Medium));
+        task.config.extraction.reasoning = Some(ReasoningControl::Effort(ReasoningEffort::Medium));
 
         let manifest = task.extraction_manifest();
         assert_eq!(
@@ -1658,7 +1696,7 @@ permission = "write"
             workspace_client.clone(),
         );
         task.target = ExtractionTarget::Subjektiv;
-        task.config.profile.consolidation.request_enabled = false;
+        task.config.consolidation_request_enabled = false;
         run_background_task(task).await;
 
         let writes = extension_writes.lock().unwrap();
@@ -1711,7 +1749,7 @@ permission = "write"
             workspace_client.clone(),
         );
         task.target = ExtractionTarget::Subjektiv;
-        task.config.profile.consolidation.request_enabled = false;
+        task.config.consolidation_request_enabled = false;
         run_background_task(task).await;
 
         let writes = extension_writes.lock().unwrap();
@@ -1747,7 +1785,7 @@ permission = "write"
             workspace_client.clone(),
         );
         task.target = ExtractionTarget::Subjektiv;
-        task.config.profile.consolidation.request_enabled = false;
+        task.config.consolidation_request_enabled = false;
         let registry = start_background_task(task);
         tokio::time::timeout(Duration::from_secs(5), async {
             while !workspace_client.session_started.load(Ordering::Acquire) {
@@ -1797,7 +1835,7 @@ permission = "write"
             workspace_client.clone(),
         );
         task.target = ExtractionTarget::Subjektiv;
-        task.config.profile.consolidation.request_enabled = false;
+        task.config.consolidation_request_enabled = false;
         run_background_task(task).await;
 
         assert!(extension_writes.lock().unwrap().is_empty());
@@ -1914,7 +1952,7 @@ permission = "write"
             workspace_client.clone(),
         );
         task.target = ExtractionTarget::Subjektiv;
-        task.config.profile.consolidation.request_enabled = false;
+        task.config.consolidation_request_enabled = false;
         let registry = start_background_task(task);
         tokio::time::timeout(Duration::from_secs(5), async {
             while calls.load(Ordering::SeqCst) == 0 {
@@ -2011,7 +2049,7 @@ permission = "write"
             event_tx,
             workspace_client.clone(),
         );
-        task.config.profile.consolidation.request_enabled = false;
+        task.config.consolidation_request_enabled = false;
         run_background_task(task).await;
 
         let requests = workspace_client.requests.lock().unwrap();
@@ -2041,8 +2079,8 @@ permission = "write"
             event_tx,
             workspace_client.clone(),
         );
-        task.config.profile.extraction.enabled = false;
-        task.config.profile.consolidation.request_enabled = true;
+        task.config.extraction.enabled = false;
+        task.config.consolidation_request_enabled = true;
         run_background_task(task).await;
 
         assert!(extension_writes.lock().unwrap().is_empty());

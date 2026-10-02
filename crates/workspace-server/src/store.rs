@@ -1035,6 +1035,13 @@ pub struct MemoryStagingResolutionRecord {
     pub resolved_at: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LegacyMemoryResetCounts {
+    pub documents: usize,
+    pub staging_records: usize,
+    pub staging_resolutions: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FlowSourceRecord {
     pub workspace_id: String,
@@ -1450,6 +1457,10 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         workspace_id: &str,
         limit: usize,
     ) -> Result<Vec<MemoryStagingResolutionRecord>>;
+    /// Atomically removes only the legacy Workspace Memory document and legacy
+    /// staging rows. Subjektiv Feature storage and all other Workspace state are
+    /// outside this transaction's deletion set.
+    fn reset_legacy_memory(&self, workspace_id: &str) -> Result<LegacyMemoryResetCounts>;
 
     fn upsert_account(&self, record: &AccountRecord) -> Result<()>;
     fn get_account(&self, account_id: &str) -> Result<Option<AccountRecord>>;
@@ -5887,6 +5898,34 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )?;
             rows.collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(Error::from)
+        })
+    }
+
+    fn reset_legacy_memory(&self, workspace_id: &str) -> Result<LegacyMemoryResetCounts> {
+        validate_identifier("workspace_id", workspace_id)?;
+        self.with_conn_mut(|connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Resolutions retain copies of staging rows, so remove them first;
+            // pending staging follows, then the singleton legacy document.
+            let staging_resolutions = transaction.execute(
+                "DELETE FROM memory_staging_resolutions WHERE workspace_id = ?1",
+                params![workspace_id],
+            )?;
+            let staging_records = transaction.execute(
+                "DELETE FROM memory_staging_records WHERE workspace_id = ?1",
+                params![workspace_id],
+            )?;
+            let documents = transaction.execute(
+                "DELETE FROM workspace_memory_documents WHERE workspace_id = ?1",
+                params![workspace_id],
+            )?;
+            transaction.commit()?;
+            Ok(LegacyMemoryResetCounts {
+                documents,
+                staging_records,
+                staging_resolutions,
+            })
         })
     }
 
@@ -20136,6 +20175,171 @@ INSERT INTO worker_registry (
                 .list_memory_staging_resolutions("local-dev", 10)
                 .unwrap(),
             vec![resolution]
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_memory_reset_is_atomic_scoped_idempotent_and_exact() {
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        for (workspace_id, display_name) in [
+            ("local-dev", "Local Dev"),
+            ("other-workspace", "Other Workspace"),
+        ] {
+            store
+                .upsert_workspace(&WorkspaceRecord {
+                    workspace_id: workspace_id.to_string(),
+                    owner_account_id: "owner-account".to_string(),
+                    display_name: display_name.to_string(),
+                    state: "active".to_string(),
+                    created_at: "1".to_string(),
+                    updated_at: "1".to_string(),
+                })
+                .await
+                .unwrap();
+            store
+                .ensure_memory_document(workspace_id, "# Legacy Memory\n", "2")
+                .unwrap();
+            store
+                .upsert_memory_staging_record(&MemoryStagingRecord {
+                    workspace_id: workspace_id.to_string(),
+                    candidate_id: format!("candidate-{workspace_id}"),
+                    raw_json: r#"{"claim":"legacy"}"#.to_string(),
+                    source_path: None,
+                    imported_at: "3".to_string(),
+                })
+                .unwrap();
+            store
+                .insert_memory_staging_resolution(&MemoryStagingResolutionRecord {
+                    workspace_id: workspace_id.to_string(),
+                    candidate_id: format!("resolved-{workspace_id}"),
+                    action: "discarded".to_string(),
+                    reason: "fixture".to_string(),
+                    affected_refs_json: "[]".to_string(),
+                    staging_raw_json: r#"{"claim":"resolved"}"#.to_string(),
+                    source_path: None,
+                    imported_at: "3".to_string(),
+                    resolved_at: "4".to_string(),
+                })
+                .unwrap();
+        }
+
+        let unrelated_counts = |store: &SqliteWorkspaceStore| {
+            store
+                .with_conn(|connection| {
+                    let mut tables = connection.prepare(
+                        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+                    )?;
+                    let names = tables
+                        .query_map([], |row| row.get::<_, String>(0))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    drop(tables);
+                    let mut counts = std::collections::BTreeMap::new();
+                    for name in names {
+                        if matches!(
+                            name.as_str(),
+                            "workspace_memory_documents"
+                                | "memory_staging_records"
+                                | "memory_staging_resolutions"
+                        ) {
+                            continue;
+                        }
+                        let quoted = name.replace('"', "\"\"");
+                        let count = connection.query_row(
+                            &format!("SELECT COUNT(*) FROM \"{quoted}\""),
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )?;
+                        counts.insert(name, count);
+                    }
+                    Ok(counts)
+                })
+                .unwrap()
+        };
+        let before = unrelated_counts(&store);
+        assert_eq!(
+            store
+                .get_workspace_memory_settings("local-dev")
+                .unwrap()
+                .language,
+            "English"
+        );
+
+        // A failure after resolution deletion must roll the entire operation back.
+        store
+            .with_conn(|connection| {
+                connection.execute_batch(
+                    "CREATE TRIGGER fail_legacy_memory_reset
+                     BEFORE DELETE ON memory_staging_records
+                     WHEN OLD.workspace_id = 'local-dev'
+                     BEGIN SELECT RAISE(ABORT, 'reset failure fixture'); END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.reset_legacy_memory("local-dev").is_err());
+        assert!(store.get_memory_document("local-dev").unwrap().is_some());
+        assert_eq!(store.count_memory_staging_records("local-dev").unwrap(), 1);
+        assert_eq!(
+            store
+                .list_memory_staging_resolutions("local-dev", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        store
+            .with_conn(|connection| {
+                connection.execute_batch("DROP TRIGGER fail_legacy_memory_reset")?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            store.reset_legacy_memory("local-dev").unwrap(),
+            LegacyMemoryResetCounts {
+                documents: 1,
+                staging_records: 1,
+                staging_resolutions: 1,
+            }
+        );
+        assert_eq!(
+            store.reset_legacy_memory("local-dev").unwrap(),
+            LegacyMemoryResetCounts::default()
+        );
+        assert!(store.get_memory_document("local-dev").unwrap().is_none());
+        assert_eq!(store.count_memory_staging_records("local-dev").unwrap(), 0);
+        assert!(
+            store
+                .list_memory_staging_resolutions("local-dev", 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        assert!(
+            store
+                .get_memory_document("other-workspace")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .count_memory_staging_records("other-workspace")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .list_memory_staging_resolutions("other-workspace", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(unrelated_counts(&store), before);
+        assert_eq!(
+            store
+                .get_workspace_memory_settings("local-dev")
+                .unwrap()
+                .language,
+            "English"
         );
     }
 

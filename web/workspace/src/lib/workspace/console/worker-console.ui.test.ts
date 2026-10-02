@@ -448,27 +448,39 @@ Deno.test("workspace Memory surfaces use read-only scoped memory APIs", async ()
   const memoryNav = await Deno.readTextFile(
     new URL("../sidebar/MemoryNavSection.svelte", import.meta.url),
   );
-  const memoryDocumentLoad = await Deno.readTextFile(
+  const subjectIndexLoad = await Deno.readTextFile(
     new URL(
       "./../../../routes/w/[workspaceId]/memory/+page.ts",
       import.meta.url,
     ),
   );
-  const memoryDocumentPage = await Deno.readTextFile(
+  const subjectIndexPage = await Deno.readTextFile(
     new URL(
       "./../../../routes/w/[workspaceId]/memory/+page.svelte",
       import.meta.url,
     ),
   );
-  const memoryStagingLoad = await Deno.readTextFile(
+  const subjectPageLoad = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/memory/staging/+page.ts",
+      "./../../../routes/w/[workspaceId]/memory/[subjectId]/+page.ts",
       import.meta.url,
     ),
   );
-  const memoryStagingPage = await Deno.readTextFile(
+  const subjectPage = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/memory/staging/+page.svelte",
+      "./../../../routes/w/[workspaceId]/memory/[subjectId]/+page.svelte",
+      import.meta.url,
+    ),
+  );
+  const memoryDetailLoad = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/memory/[subjectId]/[memoryId]/+page.ts",
+      import.meta.url,
+    ),
+  );
+  const memoryDetailPage = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/memory/[subjectId]/[memoryId]/+page.svelte",
       import.meta.url,
     ),
   );
@@ -478,35 +490,44 @@ Deno.test("workspace Memory surfaces use read-only scoped memory APIs", async ()
       memoryNav.includes(
         '<h2 class="sidebar-nav-section__header">Memory</h2>',
       ) &&
-      memoryNav.includes("Document</a>") &&
+      memoryNav.includes("Subjects</a>") &&
+      memoryNav.includes("currentPath.startsWith(`${subjectsHref}/`)") &&
       memoryNav.includes("sidebar-nav-section--category") &&
       memoryNav.includes('class="sidebar-link"') &&
-      memoryNav.includes('workspaceRoute(workspaceId, "/memory/staging")') &&
-      memoryNav.includes("Staging</a>") &&
-      !memoryNav.includes("item-meta") &&
-      !memoryNav.includes("durable workspace memory") &&
-      !memoryNav.includes("pending extraction candidates"),
-    "Memory sidebar section should show Document and Staging as compact single-line links",
+      !memoryNav.includes("Staging</a>") &&
+      !memoryNav.includes("Document</a>"),
+    "Memory sidebar section should expose one Subjects link for the full nested route tree",
   );
   assert(
-    memoryDocumentLoad.includes("workspaceApiPath(params.workspaceId") &&
-      memoryDocumentLoad.includes('"/memory"') &&
-      memoryDocumentPage.includes("DocumentMarkdown from") &&
-      memoryDocumentPage.includes("Read-only") &&
-      memoryDocumentPage.includes("data.memory.data.body_md") &&
-      memoryDocumentPage.includes("data.memory.data.updated_at") &&
-      memoryDocumentPage.includes('role="alert"') &&
-      !memoryDocumentPage.includes('<pre class="memory-document-body"'),
-    "Memory Document page should read the scoped API and expose safe Markdown states without mutation controls",
+    subjectIndexLoad.includes('"/subjektiv/subjects"') &&
+      subjectIndexLoad.includes("parseSubjektivSubjectListResponse") &&
+      subjectIndexPage.includes(">Subjects</h1>") &&
+      subjectIndexPage.includes("subject.store_revision") &&
+      subjectIndexPage.includes('data-memory-view="subjects"'),
+    "Memory product entry should list explicit typed subjects",
   );
   assert(
-    memoryStagingLoad.includes("workspaceApiPath(params.workspaceId") &&
-      memoryStagingLoad.includes('"/memory/staging"') &&
-      memoryStagingPage.includes("Memory Staging") &&
-      memoryStagingPage.includes("Workspace Server memory authority") &&
-      memoryStagingPage.includes("data.staging.data.invalid_count") &&
-      memoryStagingPage.includes("entry.record.evidence"),
-    "Memory Staging page should read the scoped API and expose staged records without mutation controls",
+    subjectPageLoad.includes("`${subjectPath}/surface`") &&
+      subjectPageLoad.includes("`${subjectPath}/memories`") &&
+      subjectPage.includes("DocumentMarkdown from") &&
+      subjectPage.includes("Resident surface") &&
+      subjectPage.includes("Current Memories") &&
+      subjectPage.includes("surface?.availability === 'ready'") &&
+      subjectPage.includes("surface?.availability === 'stale'") &&
+      subjectPage.includes("data-surface-ready-empty") &&
+      !subjectPage.includes("overflow-y"),
+    "Subject page should combine strict resident-surface and current-Memory reads without a nested vertical scroller",
+  );
+  assert(
+    memoryDetailLoad.includes("`${memoryPath}/revisions`") &&
+      memoryDetailLoad.includes("parseSubjektivMemoryReadResponse") &&
+      memoryDetailPage.includes("Candidate provenance") &&
+      memoryDetailPage.includes("Source refs") &&
+      memoryDetailPage.includes("Derived from") &&
+      memoryDetailPage.includes("Revision history") &&
+      memoryDetailPage.includes("DocumentMarkdown from") &&
+      !memoryDetailPage.includes("overflow-y"),
+    "Committed Memory detail should preserve bounded provenance and immutable revisions without mutation controls",
   );
 });
 
@@ -719,8 +740,12 @@ Deno.test("Worker Console renders Edit diffs without preformatted template gaps"
 
 Deno.test("Console spacing and text metrics use existing design tokens", async () => {
   const files = [
-    "ComposerInput.svelte", "ConsoleLineItem.svelte", "RichMarkdown.svelte",
-    "ConsoleTasks.svelte", "WorkerRunStatus.svelte", "WorkerContextStatus.svelte",
+    "ComposerInput.svelte",
+    "ConsoleLineItem.svelte",
+    "RichMarkdown.svelte",
+    "ConsoleTasks.svelte",
+    "WorkerRunStatus.svelte",
+    "WorkerContextStatus.svelte",
     "ConsoleDisplayState.svelte",
     "ConsoleTurnNavigation.svelte",
     "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
@@ -729,7 +754,8 @@ Deno.test("Console spacing and text metrics use existing design tokens", async (
     const source = await Deno.readTextFile(new URL(file, import.meta.url));
     const css = source.split("<style>")[1];
     assert(
-      !/(?:gap|padding(?:-[\w]+)?|margin(?:-[\w]+)?)\s*:[^;]*\d(?:\.\d+)?rem/.test(css),
+      !/(?:gap|padding(?:-[\w]+)?|margin(?:-[\w]+)?)\s*:[^;]*\d(?:\.\d+)?rem/
+        .test(css),
       `${file} should use shared spacing tokens, not a local rem spacing scale`,
     );
     assert(
@@ -737,7 +763,9 @@ Deno.test("Console spacing and text metrics use existing design tokens", async (
       `${file} should use the body/compact line-height tokens`,
     );
   }
-  const navigation = await Deno.readTextFile(new URL("./ConsoleTurnNavigation.svelte", import.meta.url));
+  const navigation = await Deno.readTextFile(
+    new URL("./ConsoleTurnNavigation.svelte", import.meta.url),
+  );
   assert(
     navigation.includes("box-shadow: var(--shadow-overlay)") &&
       navigation.includes("font-size: var(--font-size-body)") &&
@@ -764,7 +792,9 @@ Deno.test("Console and app shell keep compact layout spacing", async () => {
       import.meta.url,
     ),
   );
-  const mainRules = [...layout.matchAll(/^\s*\.app-shell__main\s*\{([^}]+)\}/gm)];
+  const mainRules = [
+    ...layout.matchAll(/^\s*\.app-shell__main\s*\{([^}]+)\}/gm),
+  ];
   assert(
     mainRules.length === 2 &&
       mainRules.every((rule) => rule[1].includes("padding: var(--space-4);")),
@@ -785,7 +815,9 @@ Deno.test("Worker Console uses turn bars with hidden scrollbars and preserves sc
       import.meta.url,
     ),
   );
-  const navigation = await Deno.readTextFile(new URL("./ConsoleTurnNavigation.svelte", import.meta.url));
+  const navigation = await Deno.readTextFile(
+    new URL("./ConsoleTurnNavigation.svelte", import.meta.url),
+  );
   assert(
     !/timeline/i.test(consolePage) &&
       consolePage.includes("conversationTurnPreviewsFromLines(lines)") &&
@@ -814,11 +846,17 @@ Deno.test("Worker Console uses turn bars with hidden scrollbars and preserves sc
     consolePage.includes('class="console-scroll"') &&
       consolePage.includes("overflow-y: auto") &&
       consolePage.includes("onscroll={handleConsoleScroll}") &&
-      consolePage.includes("autoFollowConsole = isNearConsoleBottom(consoleBodyElement)") &&
+      consolePage.includes(
+        "autoFollowConsole = isNearConsoleBottom(consoleBodyElement)",
+      ) &&
       consolePage.includes("void scrollConsoleToBottom()") &&
       consolePage.includes("rememberConsoleWorkerViewScroll()") &&
-      consolePage.includes("consoleBodyElement.scrollTop = resolveConsoleViewScrollTop(") &&
-      consolePage.includes('event.key === "PageUp" || event.key === "PageDown"') &&
+      consolePage.includes(
+        "consoleBodyElement.scrollTop = resolveConsoleViewScrollTop(",
+      ) &&
+      consolePage.includes(
+        'event.key === "PageUp" || event.key === "PageDown"',
+      ) &&
       consolePage.includes("consoleBodyElement.scrollBy({"),
     "Native scroll, PageUp/PageDown, conditional bottom-follow and per-Worker scroll restoration must remain",
   );
@@ -896,7 +934,8 @@ Deno.test("Worker Console composer separates the editor from its icon toolbar", 
   const composerInput = await Deno.readTextFile(
     new URL("./ComposerInput.svelte", import.meta.url),
   );
-  const footerStyle = consolePage.match(/\.composer-input-footer\s*\{([^}]+)\}/)?.[1];
+  const footerStyle = consolePage.match(/\.composer-input-footer\s*\{([^}]+)\}/)
+    ?.[1];
   assert(
     footerStyle?.includes("display: grid") &&
       !/position:\s*(absolute|fixed)/.test(footerStyle) &&
@@ -905,7 +944,9 @@ Deno.test("Worker Console composer separates the editor from its icon toolbar", 
   );
   assert(
     composerInput.includes("min-height: 2.65rem") &&
-      composerInput.includes("padding: var(--space-2) var(--space-2) var(--space-1)") &&
+      composerInput.includes(
+        "padding: var(--space-2) var(--space-2) var(--space-1)",
+      ) &&
       !composerInput.includes("padding: 0.55rem 3.4rem 3rem 0.65rem"),
     "Editor must not reserve an overlapping toolbar inside its scrolling content",
   );
@@ -997,19 +1038,32 @@ Deno.test("Worker Console paste chips preserve typed draft and target authority"
 });
 
 Deno.test("Worker Console routes image paste through the existing attachment upload", async () => {
-  const consolePage = await Deno.readTextFile(new URL(
-    "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte", import.meta.url,
-  ));
-  const input = await Deno.readTextFile(new URL("./ComposerInput.svelte", import.meta.url));
-  const paste = input.slice(input.indexOf("function handlePasteEvent"), input.indexOf("function selectedClipboardContent"));
+  const consolePage = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
+      import.meta.url,
+    ),
+  );
+  const input = await Deno.readTextFile(
+    new URL("./ComposerInput.svelte", import.meta.url),
+  );
+  const paste = input.slice(
+    input.indexOf("function handlePasteEvent"),
+    input.indexOf("function selectedClipboardContent"),
+  );
   assert(
-    paste.indexOf("if (disabled || view?.state.readOnly)") < paste.indexOf("handleComposerImagePaste(event, onpasteimages)") &&
-      paste.indexOf("handleComposerImagePaste(event, onpasteimages)") < paste.indexOf('getData("text/plain")') &&
+    paste.indexOf("if (disabled || view?.state.readOnly)") <
+        paste.indexOf("handleComposerImagePaste(event, onpasteimages)") &&
+      paste.indexOf("handleComposerImagePaste(event, onpasteimages)") <
+        paste.indexOf('getData("text/plain")') &&
       consolePage.includes("onpasteimages={addPastedImages}") &&
       consolePage.includes("addAttachmentFiles(files.map(namePastedImage))"),
     "image paste must respect editability and take priority over text before using the attachment callback",
   );
-  const attach = consolePage.slice(consolePage.indexOf("function addAttachmentFiles"), consolePage.indexOf("async function removeAttachment"));
+  const attach = consolePage.slice(
+    consolePage.indexOf("function addAttachmentFiles"),
+    consolePage.indexOf("async function removeAttachment"),
+  );
   assert(
     attach.includes("if (!composerEditable) return") &&
       attach.includes("MAX_FILES_PER_SUBMISSION - attachments.length") &&
@@ -1488,43 +1542,98 @@ Deno.test("Web Console switches main and direct SubWorker views from the Tasks r
 });
 
 Deno.test("Composer owns TUI-style completion and replaces Compact/Rewind header buttons", async () => {
-  const page = await Deno.readTextFile(new URL("./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte", import.meta.url));
-  const input = await Deno.readTextFile(new URL("./ComposerInput.svelte", import.meta.url));
-  const header = page.slice(page.indexOf('<section class="console-header'), page.indexOf('{#if rewindTargets.length'));
-  assert(!header.includes("Compact") && !header.includes("Rewind") && !page.includes("requestRewindTargets"), "Header must defer Compact/Rewind to commands");
-  assert(input.includes('role="listbox"') && input.includes('role="option"') && input.includes("entry.description") && input.includes("completionStart + 6"), "Completion must expose a bounded selectable list with descriptions");
-  assert(input.indexOf("keydown: completionKeydown") < input.indexOf('key: "ArrowUp"'), "Completion navigation must precede input history");
-  assert(page.includes("fileCompletions.receive(event.data.entries)") && page.includes("fileCompletions.close()"), "File completion lifecycle must be scoped to the transport");
+  const page = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
+      import.meta.url,
+    ),
+  );
+  const input = await Deno.readTextFile(
+    new URL("./ComposerInput.svelte", import.meta.url),
+  );
+  const header = page.slice(
+    page.indexOf('<section class="console-header'),
+    page.indexOf("{#if rewindTargets.length"),
+  );
+  assert(
+    !header.includes("Compact") && !header.includes("Rewind") &&
+      !page.includes("requestRewindTargets"),
+    "Header must defer Compact/Rewind to commands",
+  );
+  assert(
+    input.includes('role="listbox"') && input.includes('role="option"') &&
+      input.includes("entry.description") &&
+      input.includes("completionStart + 6"),
+    "Completion must expose a bounded selectable list with descriptions",
+  );
+  assert(
+    input.indexOf("keydown: completionKeydown") <
+      input.indexOf('key: "ArrowUp"'),
+    "Completion navigation must precede input history",
+  );
+  assert(
+    page.includes("fileCompletions.receive(event.data.entries)") &&
+      page.includes("fileCompletions.close()"),
+    "File completion lifecycle must be scoped to the transport",
+  );
 });
 
 Deno.test("mini task summary owns pane toggling instead of the header", async () => {
-  const page = await Deno.readTextFile(new URL(
-    "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte", import.meta.url,
-  ));
-  const component = await Deno.readTextFile(new URL("./ConsoleTasks.svelte", import.meta.url));
-  const header = page.slice(page.indexOf('<section class="console-header'), page.indexOf('{#if rewindTargets.length'));
-  assert(!header.includes("taskPaneOpen = !taskPaneOpen") && page.includes("onTogglePane={() => {"), "Only the mini summary should own Tasks toggling");
-  assert(component.includes("aria-expanded={paneOpen}") && component.includes("aria-controls={paneId}") && component.includes("onclick={onTogglePane}"), "Tasks summary must be an accessible pane toggle");
-  assert(!/\.task-pane\s*\{[^}]*display:\s*none/.test(component), "Narrow layouts must not hide the opened Tasks pane");
-  assert(page.includes("grid-template-rows: minmax(0, 1fr) minmax(0, 1fr)"), "Narrow layouts should bound transcript and task scrolling separately");
+  const page = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
+      import.meta.url,
+    ),
+  );
+  const component = await Deno.readTextFile(
+    new URL("./ConsoleTasks.svelte", import.meta.url),
+  );
+  const header = page.slice(
+    page.indexOf('<section class="console-header'),
+    page.indexOf("{#if rewindTargets.length"),
+  );
+  assert(
+    !header.includes("taskPaneOpen = !taskPaneOpen") &&
+      page.includes("onTogglePane={() => {"),
+    "Only the mini summary should own Tasks toggling",
+  );
+  assert(
+    component.includes("aria-expanded={paneOpen}") &&
+      component.includes("aria-controls={paneId}") &&
+      component.includes("onclick={onTogglePane}"),
+    "Tasks summary must be an accessible pane toggle",
+  );
+  assert(
+    !/\.task-pane\s*\{[^}]*display:\s*none/.test(component),
+    "Narrow layouts must not hide the opened Tasks pane",
+  );
+  assert(
+    page.includes("grid-template-rows: minmax(0, 1fr) minmax(0, 1fr)"),
+    "Narrow layouts should bound transcript and task scrolling separately",
+  );
 });
 
 Deno.test("Pending inputs are single-line previews between Tasks and Composer", async () => {
-  const page = await Deno.readTextFile(new URL(
-    "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
-    import.meta.url,
-  ));
+  const page = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
+      import.meta.url,
+    ),
+  );
   const pending = page.indexOf('<section class="pending-submissions"');
   assert(
-    page.indexOf("<ConsoleTasks") < pending && pending < page.indexOf('<form class="console-composer"'),
+    page.indexOf("<ConsoleTasks") < pending &&
+      pending < page.indexOf('<form class="console-composer"'),
     "Pending inputs should sit between Tasks and Composer",
   );
   const section = page.slice(pending, page.indexOf("</section>", pending));
   assert(
-    !section.includes("<details") && !page.includes('method: "continue_pending"') &&
-      !section.includes("{submission.submission_id}") && !section.includes("segment_count") &&
+    !section.includes("<details") &&
+      !page.includes('method: "continue_pending"') &&
+      !section.includes("{submission.submission_id}") &&
+      !section.includes("segment_count") &&
       section.includes('submission.preview || "Preview unavailable"') &&
-      section.includes('aria-label={`Cancel queued input ${index + 1}`}') &&
+      section.includes("aria-label={`Cancel queued input ${index + 1}`}") &&
       section.includes('aria-label="Notifications"') &&
       section.includes("pendingSubmissions.notification_previews ?? []") &&
       !page.includes('method: "clear_pending_submissions"'),
@@ -1533,18 +1642,23 @@ Deno.test("Pending inputs are single-line previews between Tasks and Composer", 
   const css = page.split("<style>")[1];
   const previewRule = css.match(/\.pending-submission-preview,[^{]+\{([^}]+)\}/)?.[1] ?? "";
   assert(
-    previewRule.includes("white-space: nowrap") && previewRule.includes("min-width: 0") &&
-      previewRule.includes("overflow: hidden") && previewRule.includes("text-overflow: ellipsis"),
+    previewRule.includes("white-space: nowrap") &&
+      previewRule.includes("min-width: 0") &&
+      previewRule.includes("overflow: hidden") &&
+      previewRule.includes("text-overflow: ellipsis"),
     "Preview text must truncate instead of wrapping or expanding the row",
   );
   assert(
-    /\.pending-queue li\s*\{[^}]*grid-template-columns: minmax\(0, 1fr\) auto/.test(css) &&
+    /\.pending-queue li\s*\{[^}]*grid-template-columns: minmax\(0, 1fr\) auto/
+      .test(css) &&
       css.includes("grid-template-columns: repeat(2, minmax(0, 1fr))") &&
       !section.includes("BevelLine") &&
-      /\.pending-submissions\s*\{[^}]*font-size: var\(--font-size-compact\);[^}]*line-height: var\(--line-height-compact\);/.test(css) &&
+      /\.pending-submissions\s*\{[^}]*font-size: var\(--font-size-compact\);[^}]*line-height: var\(--line-height-compact\);/
+        .test(css) &&
       css.includes(".pending-queue li:hover .pending-icon-button") &&
       css.includes(".pending-queue li:focus-within .pending-icon-button") &&
-      css.includes("@media (hover: none)") && section.includes('<path d="M5 12h14"'),
+      css.includes("@media (hover: none)") &&
+      section.includes('<path d="M5 12h14"'),
     "Cancel icons must retain their column when preview text is long",
   );
 });
@@ -1581,18 +1695,24 @@ Deno.test("Web Console uses Notify while running and exposes queued input cancel
   assert(
     consolePage.includes("handleQueueSubmit") &&
       consolePage.includes('delivery: "queue"') &&
-      consolePage.includes('disabled={!canQueueDraft}') &&
+      consolePage.includes("disabled={!canQueueDraft}") &&
       consolePage.includes('aria-label="Queue Submit"') &&
       consolePage.includes('class="composer-queue-icon"') &&
-      consolePage.includes('{#if workerRunning || workerPaused}') &&
+      consolePage.includes("{#if workerRunning || workerPaused}") &&
       consolePage.includes('delivery === "queue" && request.kind !== "user"') &&
-      consolePage.includes('method.method === "submit" && delivery === "submit"'),
+      consolePage.includes(
+        'method.method === "submit" && delivery === "submit"',
+      ),
     "busy Console must offer explicit Queue without changing paused state or queueing commands",
   );
-  const actions = consolePage.slice(consolePage.indexOf('class="composer-submit-actions"'));
+  const actions = consolePage.slice(
+    consolePage.indexOf('class="composer-submit-actions"'),
+  );
   assert(
-    actions.indexOf('class="composer-queue-button"') < actions.indexOf('class="composer-notify-button"') &&
-      actions.indexOf('class="composer-notify-button"') < actions.indexOf('class="composer-send-button"'),
+    actions.indexOf('class="composer-queue-button"') <
+        actions.indexOf('class="composer-notify-button"') &&
+      actions.indexOf('class="composer-notify-button"') <
+        actions.indexOf('class="composer-send-button"'),
     "Queue must sit beside Notify and Submit/Stop",
   );
 

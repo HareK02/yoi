@@ -16,7 +16,7 @@ It is not a dumping ground for external research, old plans, API inventories, or
 8. [`design/tool-permissions-scope.md`](design/tool-permissions-scope.md) — tool policy and filesystem scope.
 9. [`design/plugin-packages.md`](design/plugin-packages.md) — the retained offline package format and the prohibition on ambient Plugin authority.
 10. [`development/plugin-development.md`](development/plugin-development.md) — explicit-path offline Plugin package authoring and inspection.
-11. [`design/memory-knowledge.md`](design/memory-knowledge.md) — generated memory and audit records.
+11. [`design/memory-knowledge.md`](design/memory-knowledge.md) — deprecated single-document Workspace Memory authority and its separation from subject-scoped subjektiv Memory.
 12. [`design/workspace-kanban-orchestrator-runtime.md`](design/workspace-kanban-orchestrator-runtime.md) — how Kanban operations become durable orchestration events and backend-internal routing decisions.
 13. [`design/workspace-runtime-docker.md`](design/workspace-runtime-docker.md) — the WebUI / Backend / Runtime split, Docker image layout, worker launch path, and workdir materialization boundary.
 14. [`development/ui-ux/design-language.md`](development/ui-ux/design-language.md) — Workspace Webの視覚・interaction原則、文法、token、汎用component。
@@ -30,6 +30,9 @@ It is not a dumping ground for external research, old plans, API inventories, or
 22. [`development/workspace-schema-migrations.md`](development/workspace-schema-migrations.md) — how to preflight, apply, verify, and roll back control-plane SQLite schema changes.
 23. [`design/standalone-agent-host.md`](design/standalone-agent-host.md) — in-process standalone Worker host の依存方向、authority、lifecycle、非目標。
 24. [`design/server-feature-storage.md`](design/server-feature-storage.md) — Server管理のWorkspace/Feature専用SQLite、migration、transaction、backup/restore、削除・shutdown境界。
+25. [`design/subjektiv-store.md`](design/subjektiv-store.md) — subject-scoped Memoryのownership、authorization、Session attribution、revision、candidate consolidation境界。
+26. [`design/subjektiv-surface.md`](design/subjektiv-surface.md) — confirmed Memoryから生成するresident surface、availability、append-only restore injection。
+27. [`development/subjektiv-product-cutover.md`](development/subjektiv-product-cutover.md) — legacy Workspace Memoryからsubjektivへのoperator cutover、explicit reset、backup／rollback runbook。
 
 ## What belongs here
 

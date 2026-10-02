@@ -9,6 +9,10 @@ const fixtureServer = join(
   "tools/web-ux/browser-tests/memory_document_fixture_server.ts",
 );
 const workspaceId = "memory-review";
+const subjectId =
+  "release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review";
+const memoryId =
+  "memory-decision-with-a-deliberately-long-stable-identity-for-overflow-review-0000000001";
 
 async function freePort(): Promise<number> {
   const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
@@ -41,8 +45,8 @@ async function markerIsInsideMain(page: Page): Promise<boolean> {
   return await page.evaluate(() => {
     const document = (globalThis as any).document;
     const main = document.querySelector("main");
-    const marker = [...document.querySelectorAll("h2")].find((heading) =>
-      heading.textContent === "T-661 UNIQUE END MARKER"
+    const marker = [...document.querySelectorAll("h3")].find((heading) =>
+      heading.textContent === "T-672 UNIQUE END MARKER"
     );
     if (!main || !marker) return false;
     const mainRect = main.getBoundingClientRect();
@@ -51,31 +55,86 @@ async function markerIsInsideMain(page: Page): Promise<boolean> {
   });
 }
 
-async function openMemoryPage(
+async function assertNoPageWideOverflow(page: Page): Promise<void> {
+  assertEquals(
+    await page.evaluate(() => {
+      const document = (globalThis as any).document;
+      return document.documentElement.scrollWidth === document.documentElement.clientWidth;
+    }),
+    true,
+  );
+}
+
+async function assertMainOwnsVerticalScroll(page: Page): Promise<void> {
+  const nested = await page.locator("main").evaluate((main) =>
+    [...main.querySelectorAll("*")]
+      .filter((element) => {
+        const style = (globalThis as any).getComputedStyle(element);
+        return ["auto", "scroll"].includes(style.overflowY) &&
+          element.scrollHeight > element.clientHeight + 1;
+      })
+      .map((element) => `${element.tagName.toLowerCase()}.${element.className}`)
+  );
+  assertEquals(nested, []);
+}
+
+async function openSubjectPage(
   page: Page,
   baseUrl: string,
   mobile = false,
 ): Promise<void> {
-  await page.goto(`${baseUrl}/w/${workspaceId}/memory`);
-  const heading = page.locator("h1", { hasText: "Workspace Memory" });
+  await page.goto(`${baseUrl}/w/${workspaceId}/memory/${encodeURIComponent(subjectId)}`);
+  const heading = page.locator("h1", { hasText: "Release coordination" });
   await heading.waitFor({ state: "attached" });
-  if (mobile) await page.getByRole("button", { name: "Hide sidebar" }).click();
+  if (mobile) {
+    const showSidebar = page.getByRole("button", { name: "Show sidebar" });
+    await showSidebar.waitFor();
+    assertEquals(await showSidebar.getAttribute("aria-expanded"), "false");
+    assertEquals(
+      await page.locator("main").evaluate((main) => (main as unknown as { inert: boolean }).inert),
+      false,
+    );
+
+    await showSidebar.click();
+    const hideSidebar = page.getByRole("button", { name: "Hide sidebar" });
+    await hideSidebar.waitFor();
+    assertEquals(await hideSidebar.getAttribute("aria-expanded"), "true");
+    assertEquals(
+      await page.locator("main").evaluate((main) => (main as unknown as { inert: boolean }).inert),
+      true,
+    );
+
+    await hideSidebar.click();
+    await showSidebar.waitFor();
+    assertEquals(await showSidebar.getAttribute("aria-expanded"), "false");
+    assertEquals(
+      await page.locator("main").evaluate((main) => (main as unknown as { inert: boolean }).inert),
+      false,
+    );
+  }
   await heading.waitFor();
 }
 
 async function swipeMainToEnd(page: Page): Promise<void> {
   const session = await page.context().newCDPSession(page);
+  const viewport = page.viewportSize();
+  if (!viewport) throw new Error("touch viewport is unavailable");
+  const x = Math.max(20, Math.min(300, viewport.width - 20));
+  const startY = Math.max(120, viewport.height - 100);
+  const moveYs = [0.8, 0.62, 0.44, 0.26, 0.12].map((ratio) =>
+    Math.max(20, Math.round(viewport.height * ratio))
+  );
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const state = await mainScrollState(page);
     if (state.scrollTop + state.clientHeight >= state.scrollHeight - 1) return;
     await session.send("Input.dispatchTouchEvent", {
       type: "touchStart",
-      touchPoints: [{ x: 300, y: 700, id: 1 }],
+      touchPoints: [{ x, y: startY, id: 1 }],
     });
-    for (const y of [580, 460, 340, 220, 100]) {
+    for (const y of moveYs) {
       await session.send("Input.dispatchTouchEvent", {
         type: "touchMove",
-        touchPoints: [{ x: 300, y, id: 1 }],
+        touchPoints: [{ x, y, id: 1 }],
       });
     }
     await session.send("Input.dispatchTouchEvent", {
@@ -84,10 +143,10 @@ async function swipeMainToEnd(page: Page): Promise<void> {
     });
     await page.waitForTimeout(20);
   }
-  throw new Error("touch input did not reach the end of the Memory document");
+  throw new Error("touch input did not reach the end of the resident Memory surface");
 }
 
-Deno.test("production Memory shell renders safe Markdown and scrolls to its end by wheel, keyboard, and touch", async () => {
+Deno.test("production subject Memory shell renders exact states, safe Markdown, provenance, and one scroll owner", async () => {
   const build = await new Deno.Command(Deno.execPath(), {
     args: ["task", "build"],
     cwd: workspaceRoot,
@@ -130,6 +189,13 @@ Deno.test("production Memory shell renders safe Markdown and scrolls to its end 
             colorScheme: "light" as const,
             mobile: true,
           },
+          {
+            label: "compact-mobile",
+            width: 320,
+            height: 700,
+            colorScheme: "dark" as const,
+            mobile: true,
+          },
         ]
       ) {
         const context = await browser.newContext({
@@ -144,21 +210,28 @@ Deno.test("production Memory shell renders safe Markdown and scrolls to its end 
           if (message.type() === "error") errors.push(message.text());
         });
         page.on("pageerror", (error) => errors.push(String(error)));
-        await openMemoryPage(page, baseUrl, scenario.mobile);
+        await openSubjectPage(page, baseUrl, scenario.mobile);
 
         const initial = await mainScrollState(page);
         assert(initial.scrollHeight > initial.clientHeight);
         assertEquals(await markerIsInsideMain(page), false);
+        await assertNoPageWideOverflow(page);
+        await assertMainOwnsVerticalScroll(page);
         assertEquals(
-          await page.evaluate(() => {
-            const document = (globalThis as any).document;
-            return document.documentElement.scrollWidth === document.documentElement.clientWidth;
-          }),
-          true,
+          await page.locator('aside a[href$="/memory"]', { hasText: "Subjects" }).count(),
+          1,
         );
+        assertEquals(await page.locator("aside a", { hasText: "Staging" }).count(), 0);
 
         if (scenario.label === "wheel") {
-          assertEquals(await page.locator("h1").allTextContents(), ["Workspace Memory"]);
+          assertEquals(
+            await page.getByRole("heading", {
+              name: "Release coordination",
+              level: 1,
+              exact: true,
+            }).count(),
+            1,
+          );
           assertEquals(
             await page.locator("strong").filter({ hasText: "important context" }).count() > 0,
             true,
@@ -167,8 +240,8 @@ Deno.test("production Memory shell renders safe Markdown and scrolls to its end 
           assertEquals(await page.locator("ul li").count() > 0, true);
           for (
             const heading of [
-              { selector: "h5", text: "Deep document heading" },
-              { selector: "h6", text: "Deepest document heading" },
+              { selector: "h5", text: "Deep surface heading" },
+              { selector: "h6", text: "Deepest surface heading" },
             ]
           ) {
             const element = page.locator(heading.selector, { hasText: heading.text });
@@ -182,8 +255,17 @@ Deno.test("production Memory shell renders safe Markdown and scrolls to its end 
           }
           assertEquals(await page.locator('a[href="https://example.com"]').count(), 1);
           assertEquals(await page.locator('a[href^="javascript:"]').count(), 0);
-          assertEquals(await page.locator("article img, article script").count(), 0);
-          assertEquals(await page.getByRole("heading", { name: "Memory Document" }).count(), 0);
+          assertEquals(
+            await page.getByRole("article", { name: "Resident surface" }).locator("img, script")
+              .count(),
+            0,
+          );
+          for (const state of ["Active", "Resolved", "Retracted"]) {
+            assertEquals(
+              await page.locator(".memory-pill", { hasText: state }).count(),
+              1,
+            );
+          }
 
           for (const label of ["Markdown table", "rust code block"]) {
             const region = page.getByRole("region", { name: label });
@@ -194,7 +276,7 @@ Deno.test("production Memory shell renders safe Markdown and scrolls to its end 
           await page.locator("main").hover();
           await page.mouse.wheel(0, 100_000);
         } else if (scenario.label === "keyboard") {
-          await page.getByText("Document details", { exact: true }).focus();
+          await page.getByText("Surface provenance", { exact: true }).focus();
           await page.keyboard.press("End");
         } else {
           await swipeMainToEnd(page);
@@ -213,33 +295,72 @@ Deno.test("production Memory shell renders safe Markdown and scrolls to its end 
         await context.close();
       }
 
-      const stateContext = await browser.newContext({ viewport: { width: 1440, height: 900 } });
-      const emptyPage = await stateContext.newPage();
-      await emptyPage.route(`**/api/w/${workspaceId}/memory`, async (route) => {
-        await route.fulfill({
-          contentType: "application/json",
-          body: JSON.stringify({
-            body_md: " \n",
-            created_at: "2026-01-01T00:00:00Z",
-            updated_at: "2026-01-02T03:04:05Z",
-            bytes: 2,
-            record_source: "fixture",
-          }),
-        });
-      });
-      await emptyPage.goto(`${baseUrl}/w/${workspaceId}/memory`);
-      await emptyPage.getByText("Memory document is empty.").waitFor();
-      assertEquals(await emptyPage.getByRole("alert").count(), 0);
+      const detailContext = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+      const detailPage = await detailContext.newPage();
+      await detailPage.goto(
+        `${baseUrl}/w/${workspaceId}/memory/${encodeURIComponent(subjectId)}/${
+          encodeURIComponent(memoryId)
+        }`,
+      );
+      await detailPage.getByRole("heading", {
+        name: "Keep subject Memory provenance typed and visible",
+        level: 1,
+      }).waitFor();
+      assertEquals(await detailPage.getByText("candidate-release-decision-0001").count(), 1);
+      assertEquals(await detailPage.getByText("T-672 product direction").count(), 1);
+      assertEquals(await detailPage.getByText("memory-derived-source-0002").count(), 1);
+      assertEquals(await detailPage.getByRole("heading", { name: "Revision history" }).count(), 1);
+      assertEquals(await detailPage.getByText("Revision 3", { exact: true }).count(), 1);
+      assertEquals(await detailPage.getByText("Revision 2", { exact: true }).count(), 1);
+      assertEquals(await detailPage.getByText("Revision 1", { exact: true }).count(), 1);
+      assertEquals(await detailPage.locator('a[href^="javascript:"]').count(), 0);
+      assertEquals(
+        await detailPage.getByRole("article", { name: "Committed Memory body" }).locator(
+          "script, img",
+        ).count(),
+        0,
+      );
+      for (const label of ["Markdown table", "text code block"]) {
+        const region = detailPage.getByRole("region", { name: label });
+        assertEquals(await region.getAttribute("tabindex"), "0");
+        assert(await region.evaluate((element) => element.scrollWidth > element.clientWidth));
+      }
+      await assertNoPageWideOverflow(detailPage);
+      await assertMainOwnsVerticalScroll(detailPage);
+      await detailContext.close();
 
-      const errorPage = await stateContext.newPage();
-      await errorPage.route(`**/api/w/${workspaceId}/memory`, async (route) => {
-        await route.fulfill({ status: 503, contentType: "application/json", body: "{}" });
-      });
-      await errorPage.goto(`${baseUrl}/w/${workspaceId}/memory`);
-      const alert = errorPage.getByRole("alert");
-      await alert.waitFor();
-      assert((await alert.textContent())?.includes("Memory document unavailable."));
-      assertEquals(await errorPage.getByText("Memory document is empty.").count(), 0);
+      const stateContext = await browser.newContext({ viewport: { width: 390, height: 844 } });
+      const stateCases = [
+        {
+          id: "empty-subject",
+          text: "Resident surface is ready and empty.",
+          role: "status" as const,
+        },
+        { id: "stale-subject", text: "Resident surface is stale.", role: "status" as const },
+        {
+          id: "failed-subject",
+          text: "Resident surface generation failed.",
+          role: "alert" as const,
+        },
+        {
+          id: "ungenerated-subject",
+          text: "Resident surface has not been generated.",
+          role: "status" as const,
+        },
+        { id: "error-subject", text: "Resident surface unavailable.", role: "alert" as const },
+      ];
+      for (const stateCase of stateCases) {
+        const page = await stateContext.newPage();
+        await page.goto(`${baseUrl}/w/${workspaceId}/memory/${stateCase.id}`);
+        const state = page.getByRole(stateCase.role).filter({ hasText: stateCase.text });
+        await state.waitFor();
+        assert((await state.textContent())?.includes(stateCase.text));
+        if (stateCase.id !== "empty-subject") {
+          assertEquals(await page.getByRole("article", { name: "Resident surface" }).count(), 0);
+        }
+        await assertNoPageWideOverflow(page);
+        await page.close();
+      }
       await stateContext.close();
     } finally {
       await browser.close();

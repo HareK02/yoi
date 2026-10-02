@@ -20,8 +20,8 @@ use config_source::ConfigTreeSnapshot;
 use flow::{FlowSourceKind, FlowSourceResolveRequest, ResolvedFlowSource};
 use futures::{SinkExt, StreamExt};
 use memory::backend::{
-    MemoryBackendHttpResponse, MemoryBackendOperation, MemoryBackendOperationResult,
-    MemoryConsolidateStagingOperation, MemoryConsolidationOutput,
+    MemoryBackendHttpResponse, MemoryBackendOperation, MemoryConsolidateStagingOperation,
+    MemoryConsolidationOutput,
 };
 use protocol::Segment;
 use protocol::stream::{decode_method, encode_event};
@@ -5433,6 +5433,9 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::memory_document(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::legacy_memory_reset(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::memory_staging_list(
             service.clone(),
         ))
@@ -5443,7 +5446,22 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::subjektiv_subject_create(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::subjektiv_subject_list(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::subjektiv_subject_get(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::subjektiv_resident_surface(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::subjektiv_memory_list(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::subjektiv_memory_detail(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::subjektiv_memory_revisions(
             service.clone(),
         ))
         .merge(server_api::server_api_axum::subjektiv_subject_retire(
@@ -5462,6 +5480,9 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
             service.clone(),
         ))
         .merge(server_api::server_api_axum::subjektiv_session_backend(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::subjektiv_memory_consolidation(
             service.clone(),
         ))
         .merge(server_api::server_api_axum::skill_list(service.clone()))
@@ -6984,6 +7005,24 @@ impl server_api::ServerApi for ServerApiContractService {
         .map_err(ApiError::into_repository_api_error)
     }
 
+    async fn legacy_memory_reset(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        request: server_api::LegacyMemoryResetRequest,
+    ) -> std::result::Result<server_api::LegacyMemoryResetResponse, server_api::RepositoryApiError>
+    {
+        scoped_reset_legacy_memory(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Extension(actor),
+            Json(request),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
     async fn memory_staging_list(
         &self,
         workspace_id: String,
@@ -7056,6 +7095,22 @@ impl server_api::ServerApi for ServerApiContractService {
         .map_err(ApiError::into_repository_api_error)
     }
 
+    async fn subjektiv_subject_list(
+        &self,
+        workspace_id: String,
+        query: server_api::SubjektivSubjectListQuery,
+    ) -> std::result::Result<server_api::SubjektivSubjectListResponse, server_api::RepositoryApiError>
+    {
+        scoped_list_subjektiv_subjects(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedWorkspacePath { workspace_id }),
+            Query(query),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
     async fn subjektiv_subject_get(
         &self,
         workspace_id: String,
@@ -7068,6 +7123,92 @@ impl server_api::ServerApi for ServerApiContractService {
                 workspace_id,
                 subject_id,
             }),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn subjektiv_resident_surface(
+        &self,
+        workspace_id: String,
+        subject_id: String,
+    ) -> std::result::Result<
+        server_api::SubjektivResidentSurfaceResponse,
+        server_api::RepositoryApiError,
+    > {
+        scoped_get_subjektiv_resident_surface(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedSubjektivSubjectPath {
+                workspace_id,
+                subject_id,
+            }),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn subjektiv_memory_list(
+        &self,
+        workspace_id: String,
+        subject_id: String,
+        query: server_api::SubjektivMemoryListQuery,
+    ) -> std::result::Result<server_api::SubjektivMemoryQueryResponse, server_api::RepositoryApiError>
+    {
+        scoped_list_subjektiv_memories(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedSubjektivSubjectPath {
+                workspace_id,
+                subject_id,
+            }),
+            Query(query.into()),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn subjektiv_memory_detail(
+        &self,
+        workspace_id: String,
+        subject_id: String,
+        memory_id: String,
+        query: server_api::SubjektivMemoryDetailQuery,
+    ) -> std::result::Result<server_api::SubjektivMemoryReadResponse, server_api::RepositoryApiError>
+    {
+        scoped_get_subjektiv_memory(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedSubjektivMemoryPath {
+                workspace_id,
+                subject_id,
+                memory_id,
+            }),
+            Query(query),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn subjektiv_memory_revisions(
+        &self,
+        workspace_id: String,
+        subject_id: String,
+        memory_id: String,
+        query: server_api::SubjektivMemoryRevisionsQuery,
+    ) -> std::result::Result<
+        server_api::SubjektivMemoryListRevisionsResponse,
+        server_api::RepositoryApiError,
+    > {
+        scoped_list_subjektiv_memory_revisions(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedSubjektivMemoryPath {
+                workspace_id,
+                subject_id,
+                memory_id,
+            }),
+            Query(query),
         )
         .await
         .map(|Json(response)| response)
@@ -10433,6 +10574,13 @@ struct ScopedWorkspacePath {
 struct ScopedSubjektivSubjectPath {
     workspace_id: String,
     subject_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ScopedSubjektivMemoryPath {
+    workspace_id: String,
+    subject_id: String,
+    memory_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -16540,6 +16688,35 @@ async fn scoped_get_memory_document(
     }))
 }
 
+async fn scoped_reset_legacy_memory(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Extension(actor): Extension<RequestActor>,
+    Json(request): Json<server_api::LegacyMemoryResetRequest>,
+) -> ApiResult<Json<server_api::LegacyMemoryResetResponse>> {
+    require_workspace_owner(
+        &api,
+        &path.workspace_id,
+        &actor,
+        "Legacy Workspace Memory reset",
+    )
+    .await?;
+    let expected = format!("RESET LEGACY MEMORY {}", path.workspace_id);
+    if request.confirmation != expected {
+        return Err(Error::InvalidInput(format!(
+            "legacy Memory reset confirmation must exactly equal `{expected}`"
+        ))
+        .into());
+    }
+    let counts = api.store.reset_legacy_memory(&path.workspace_id)?;
+    Ok(Json(server_api::LegacyMemoryResetResponse {
+        workspace_id: path.workspace_id,
+        documents_deleted: counts.documents,
+        staging_records_deleted: counts.staging_records,
+        staging_resolutions_deleted: counts.staging_resolutions,
+    }))
+}
+
 async fn scoped_list_memory_staging(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
@@ -16557,16 +16734,11 @@ async fn scoped_list_memory_staging(
 async fn scoped_memory_backend_operation(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
-    context: server_api::ServerRequestContext,
+    _context: server_api::ServerRequestContext,
     Json(operation): Json<MemoryBackendOperation>,
 ) -> ApiResult<Json<MemoryBackendHttpResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let result = match operation {
-        MemoryBackendOperation::ResidentSummary(_) => {
-            execute_scoped_resident_summary(&api, &context)
-        }
-        operation => execute_memory_backend_operation_with_authority(&api.authority, operation),
-    };
+    let result = execute_memory_backend_operation_with_authority(&api.authority, operation);
     let response = match result {
         Ok(result) => MemoryBackendHttpResponse::Ok { result },
         Err(error) => MemoryBackendHttpResponse::Error {
@@ -16574,48 +16746,6 @@ async fn scoped_memory_backend_operation(
         },
     };
     Ok(Json(response))
-}
-
-fn execute_scoped_resident_summary(
-    api: &WorkspaceApi,
-    context: &server_api::ServerRequestContext,
-) -> crate::Result<MemoryBackendOperationResult> {
-    let Some(source) = context.runtime_source.as_ref() else {
-        return execute_memory_backend_operation_with_authority(
-            &api.authority,
-            MemoryBackendOperation::ResidentSummary(Default::default()),
-        );
-    };
-    let Some(worker_id) = source.worker_id.as_deref() else {
-        return execute_memory_backend_operation_with_authority(
-            &api.authority,
-            MemoryBackendOperation::ResidentSummary(Default::default()),
-        );
-    };
-    let worker = RuntimeWorkerRef::new(&source.runtime_id, worker_id);
-    let Some(lease) = api
-        .store
-        .require_current_worker_singleton_owner(&api.config.workspace_id, &worker)?
-    else {
-        return execute_memory_backend_operation_with_authority(
-            &api.authority,
-            MemoryBackendOperation::ResidentSummary(Default::default()),
-        );
-    };
-    let Some(subject_id) = lease.key.strip_prefix(SUBJEKTIV_SINGLETON_PREFIX) else {
-        return execute_memory_backend_operation_with_authority(
-            &api.authority,
-            MemoryBackendOperation::ResidentSummary(Default::default()),
-        );
-    };
-    let resident =
-        crate::subjektiv::SubjektivStore::open(&api.feature_storage, &api.subjektiv_registration)
-            .map_err(|error| Error::Store(error.to_string()))?
-            .resident_surface(subject_id)
-            .map_err(|error| Error::Store(error.to_string()))?;
-    Ok(MemoryBackendOperationResult::ResidentSummary(
-        resident_summary_output(resident),
-    ))
 }
 
 fn resident_summary_output(
@@ -16852,6 +16982,34 @@ async fn scoped_create_subjektiv_subject(
     ))
 }
 
+async fn scoped_list_subjektiv_subjects(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Query(query): Query<server_api::SubjektivSubjectListQuery>,
+) -> ApiResult<Json<server_api::SubjektivSubjectListResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let limit = query.limit.unwrap_or(20);
+    if limit == 0 || limit > server_api::SUBJEKTIV_BROWSER_MAX_LIST_LIMIT {
+        return Err(Error::InvalidInput(format!(
+            "subject list limit must be within 1..={}",
+            server_api::SUBJEKTIV_BROWSER_MAX_LIST_LIMIT
+        ))
+        .into());
+    }
+    let page = open_subjektiv_store(&api)?
+        .list_subjects(limit)
+        .map_err(subjektiv_store_error)?;
+    Ok(Json(server_api::SubjektivSubjectListResponse {
+        limit,
+        items: page
+            .items
+            .into_iter()
+            .map(|subject| subjektiv_subject_response(&api, subject))
+            .collect(),
+        has_more: page.has_more,
+    }))
+}
+
 async fn scoped_get_subjektiv_subject(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedSubjektivSubjectPath>,
@@ -16864,6 +17022,123 @@ async fn scoped_get_subjektiv_subject(
     Ok(Json(subjektiv_subject_response(&api, subject)))
 }
 
+fn require_subjektiv_subject(
+    store: &crate::subjektiv::SubjektivStore,
+    subject_id: &str,
+) -> ApiResult<()> {
+    if store
+        .subject(subject_id)
+        .map_err(subjektiv_store_error)?
+        .is_none()
+    {
+        return Err(Error::SubjektivSubjectNotFound(subject_id.to_string()).into());
+    }
+    Ok(())
+}
+
+async fn scoped_get_subjektiv_resident_surface(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedSubjektivSubjectPath>,
+) -> ApiResult<Json<server_api::SubjektivResidentSurfaceResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let store = open_subjektiv_store(&api)?;
+    require_subjektiv_subject(&store, &path.subject_id)?;
+    let resident = store
+        .resident_surface(&path.subject_id)
+        .map_err(subjektiv_store_error)?;
+    let availability = match resident.availability {
+        crate::subjektiv::SurfaceAvailability::Ungenerated => {
+            server_api::SubjektivResidentSurfaceAvailability::Ungenerated
+        }
+        crate::subjektiv::SurfaceAvailability::Stale => {
+            server_api::SubjektivResidentSurfaceAvailability::Stale
+        }
+        crate::subjektiv::SurfaceAvailability::Failed => {
+            server_api::SubjektivResidentSurfaceAvailability::Failed
+        }
+        crate::subjektiv::SurfaceAvailability::Ready => {
+            server_api::SubjektivResidentSurfaceAvailability::Ready
+        }
+    };
+    let snapshot = resident
+        .snapshot
+        .map(|snapshot| server_api::SubjektivResidentSurfaceSnapshot {
+            snapshot_id: snapshot.id,
+            body_md: snapshot.body_md,
+            memory_refs: snapshot
+                .memory_refs
+                .into_iter()
+                .map(|reference| server_api::SubjektivMemoryRevisionRef {
+                    memory_id: reference.memory_id,
+                    revision: reference.revision,
+                })
+                .collect(),
+            built_from_store_revision: snapshot.built_from_store_revision,
+            created_at: snapshot.created_at,
+        });
+    Ok(Json(server_api::SubjektivResidentSurfaceResponse {
+        subject_id: path.subject_id,
+        availability,
+        snapshot,
+    }))
+}
+
+async fn scoped_list_subjektiv_memories(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedSubjektivSubjectPath>,
+    Query(query): Query<server_api::SubjektivMemoryQueryRequest>,
+) -> ApiResult<Json<server_api::SubjektivMemoryQueryResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let store = open_subjektiv_store(&api)?;
+    require_subjektiv_subject(&store, &path.subject_id)?;
+    Ok(Json(subjektiv_memory_query(
+        &store,
+        &path.subject_id,
+        query,
+    )?))
+}
+
+async fn scoped_get_subjektiv_memory(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedSubjektivMemoryPath>,
+    Query(query): Query<server_api::SubjektivMemoryDetailQuery>,
+) -> ApiResult<Json<server_api::SubjektivMemoryReadResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let store = open_subjektiv_store(&api)?;
+    require_subjektiv_subject(&store, &path.subject_id)?;
+    Ok(Json(subjektiv_memory_read(
+        &store,
+        &path.subject_id,
+        server_api::SubjektivMemoryReadRequest {
+            memory_id: path.memory_id,
+            revision: query.revision,
+            offset: query.offset,
+            byte_offset: query.byte_offset,
+            limit: query.limit,
+            evidence_cursor: query.evidence_cursor,
+        },
+    )?))
+}
+
+async fn scoped_list_subjektiv_memory_revisions(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedSubjektivMemoryPath>,
+    Query(query): Query<server_api::SubjektivMemoryRevisionsQuery>,
+) -> ApiResult<Json<server_api::SubjektivMemoryListRevisionsResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let store = open_subjektiv_store(&api)?;
+    require_subjektiv_subject(&store, &path.subject_id)?;
+    Ok(Json(subjektiv_memory_list_revisions(
+        &store,
+        &path.subject_id,
+        server_api::SubjektivMemoryListRevisionsRequest {
+            memory_id: path.memory_id,
+            limit: query.limit,
+            cursor: query.cursor,
+        },
+    )?))
+}
+
 async fn scoped_retire_subjektiv_subject(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedSubjektivSubjectPath>,
@@ -16871,7 +17146,7 @@ async fn scoped_retire_subjektiv_subject(
     validate_workspace_scope(&api, &path.workspace_id)?;
     let subject = open_subjektiv_store(&api)?
         .retire_subject(&path.subject_id)
-        .map_err(|error| Error::InvalidInput(error.to_string()))?;
+        .map_err(subjektiv_store_error)?;
     // Retirement deliberately does not stop or remove the current Worker. The
     // Worker lease and subject lifecycle are independent authorities.
     Ok(Json(subjektiv_subject_response(&api, subject)))
@@ -18357,6 +18632,19 @@ async fn scoped_subjektiv_memory_backend(
     let (subject_id, _, authority) = subjektiv_subject_scope(&api, &path.workspace_id, &context)?;
     let store = open_subjektiv_store(&api)?;
     let response = match request.operation {
+        server_api::SubjektivMemoryBackendOperation::ResidentSummary(_) => {
+            require_subjektiv_worker_authority(
+                authority,
+                SubjektivWorkerAuthority::Subject,
+                "resident surface read",
+            )?;
+            let resident = store
+                .resident_surface(&subject_id)
+                .map_err(subjektiv_store_error)?;
+            server_api::SubjektivMemoryBackendResponse::ResidentSummary(resident_summary_output(
+                resident,
+            ))
+        }
         server_api::SubjektivMemoryBackendOperation::Query(input) => {
             server_api::SubjektivMemoryBackendResponse::Query(subjektiv_memory_query(
                 &store,
@@ -19738,9 +20026,12 @@ fn subjektiv_store_error(error: crate::subjektiv::SubjektivError) -> Error {
         | crate::subjektiv::SubjektivError::DecisionRequestConflict(_) => {
             Error::RepositoryConflict(format!("candidate_decision_conflict: {error}"))
         }
-        crate::subjektiv::SubjektivError::MemoryNotFound(_) => {
-            Error::InvalidInput(format!("memory_not_found: {error}"))
+        crate::subjektiv::SubjektivError::SubjectNotFound(subject_id) => {
+            Error::SubjektivSubjectNotFound(subject_id)
         }
+        crate::subjektiv::SubjektivError::MemoryNotFound(memory_id) => Error::InvalidInput(
+            format!("memory_not_found: Memory `{memory_id}` was not found"),
+        ),
         crate::subjektiv::SubjektivError::Storage(_) => Error::Store(error.to_string()),
         _ => Error::InvalidInput(error.to_string()),
     }
@@ -31302,7 +31593,14 @@ fn api_error_status(error: &Error) -> StatusCode {
         | Error::RuntimeBindingRevisionConflict { .. }
         | Error::RuntimeBindingFingerprintConflict { .. }
         | Error::RepositoryConflict(_) => StatusCode::CONFLICT,
-        Error::WorkerSourceIdentity(_) | Error::InvalidInput(_) => StatusCode::BAD_REQUEST,
+        Error::WorkerSourceIdentity(_) => StatusCode::BAD_REQUEST,
+        Error::InvalidInput(message)
+            if message.starts_with("memory_not_found:")
+                || message.starts_with("memory_revision_not_found:") =>
+        {
+            StatusCode::NOT_FOUND
+        }
+        Error::InvalidInput(_) => StatusCode::BAD_REQUEST,
         Error::InvalidRuntimeIdentifier { .. } | Error::ReservedWorkerName(_) => {
             StatusCode::BAD_REQUEST
         }
@@ -38008,6 +38306,398 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_memory_reset_requires_owner_confirmation_and_preserves_subjektiv() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        api.store
+            .upsert_memory_document(&crate::store::MemoryDocumentRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                body_md: "# Legacy Memory\n\nRetained until explicit reset.\n".to_string(),
+                created_at: "2026-10-02T00:00:00Z".to_string(),
+                updated_at: "2026-10-02T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        api.store
+            .upsert_memory_staging_record(&crate::store::MemoryStagingRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                candidate_id: "legacy-pending".to_string(),
+                raw_json: r#"{"claim":"pending"}"#.to_string(),
+                source_path: None,
+                imported_at: "2026-10-02T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        api.store
+            .insert_memory_staging_resolution(&crate::store::MemoryStagingResolutionRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                candidate_id: "legacy-resolved".to_string(),
+                action: "discarded".to_string(),
+                reason: "fixture".to_string(),
+                affected_refs_json: "[]".to_string(),
+                staging_raw_json: r#"{"claim":"resolved"}"#.to_string(),
+                source_path: None,
+                imported_at: "2026-10-02T00:00:00Z".to_string(),
+                resolved_at: "2026-10-02T00:01:00Z".to_string(),
+            })
+            .unwrap();
+
+        let subjektiv = open_subjektiv_store(&api).unwrap();
+        let subject = subjektiv
+            .create_subject(crate::subjektiv::SubjectRole::new("companion").unwrap())
+            .unwrap();
+        let memory = subjektiv
+            .create_memory(
+                &subject.id,
+                crate::subjektiv::MemoryDraft::active(
+                    memory::extract::CandidateKind::Decision,
+                    "Preserve feature Memory",
+                    "This record is outside the legacy reset scope.",
+                    "Proves reset isolation",
+                    "fixture",
+                ),
+            )
+            .unwrap();
+
+        let incorrect = scoped_reset_legacy_memory(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            Extension(test_owner_actor()),
+            Json(server_api::LegacyMemoryResetRequest {
+                confirmation: "RESET LEGACY MEMORY wrong-workspace".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(incorrect.into_response().status(), StatusCode::BAD_REQUEST);
+        assert!(
+            api.store
+                .get_memory_document(TEST_WORKSPACE_ID)
+                .unwrap()
+                .is_some()
+        );
+
+        let mut non_owner = test_owner_actor();
+        non_owner.account_id = "another-account".to_string();
+        let forbidden = scoped_reset_legacy_memory(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            Extension(non_owner),
+            Json(server_api::LegacyMemoryResetRequest {
+                confirmation: format!("RESET LEGACY MEMORY {TEST_WORKSPACE_ID}"),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(forbidden.into_response().status(), StatusCode::FORBIDDEN);
+
+        let Json(reset) = scoped_reset_legacy_memory(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            Extension(test_owner_actor()),
+            Json(server_api::LegacyMemoryResetRequest {
+                confirmation: format!("RESET LEGACY MEMORY {TEST_WORKSPACE_ID}"),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reset.documents_deleted, 1);
+        assert_eq!(reset.staging_records_deleted, 1);
+        assert_eq!(reset.staging_resolutions_deleted, 1);
+        assert!(
+            api.store
+                .get_memory_document(TEST_WORKSPACE_ID)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            subjektiv
+                .memory(&subject.id, &memory.id)
+                .unwrap()
+                .unwrap()
+                .revision,
+            1
+        );
+
+        let Json(repeated) = scoped_reset_legacy_memory(
+            State(api),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            Extension(test_owner_actor()),
+            Json(server_api::LegacyMemoryResetRequest {
+                confirmation: format!("RESET LEGACY MEMORY {TEST_WORKSPACE_ID}"),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(repeated.documents_deleted, 0);
+        assert_eq!(repeated.staging_records_deleted, 0);
+        assert_eq!(repeated.staging_resolutions_deleted, 0);
+    }
+
+    #[tokio::test]
+    async fn subjektiv_browser_reads_are_bounded_scoped_and_revision_exact() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let store = open_subjektiv_store(&api).unwrap();
+        let first_subject = store
+            .create_subject(crate::subjektiv::SubjectRole::new("companion").unwrap())
+            .unwrap();
+        let second_subject = store
+            .create_subject(crate::subjektiv::SubjectRole::new("reviewer").unwrap())
+            .unwrap();
+
+        let invalid_limit = scoped_list_subjektiv_subjects(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            Query(server_api::SubjektivSubjectListQuery { limit: Some(0) }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            invalid_limit.into_response().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let Json(subjects) = scoped_list_subjektiv_subjects(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            Query(server_api::SubjektivSubjectListQuery { limit: Some(1) }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(subjects.items.len(), 1);
+        assert!(subjects.has_more);
+
+        let missing = scoped_get_subjektiv_subject(
+            State(api.clone()),
+            AxumPath(ScopedSubjektivSubjectPath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                subject_id: "missing-subject".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.into_response().status(), StatusCode::NOT_FOUND);
+        assert_eq!(store.list_subjects(100).unwrap().items.len(), 2);
+
+        let Json(subject_detail) = scoped_get_subjektiv_subject(
+            State(api.clone()),
+            AxumPath(ScopedSubjektivSubjectPath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                subject_id: first_subject.id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(subject_detail.id, first_subject.id);
+        let Json(ungenerated) = scoped_get_subjektiv_resident_surface(
+            State(api.clone()),
+            AxumPath(ScopedSubjektivSubjectPath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                subject_id: first_subject.id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ungenerated.availability,
+            server_api::SubjektivResidentSurfaceAvailability::Ungenerated
+        );
+        assert!(ungenerated.snapshot.is_none());
+
+        let memory = store
+            .create_memory(
+                &first_subject.id,
+                crate::subjektiv::MemoryDraft::active(
+                    memory::extract::CandidateKind::Lesson,
+                    "Keep exact revisions",
+                    "first body",
+                    "Supports historical reads",
+                    "initial",
+                ),
+            )
+            .unwrap();
+        let revised = store
+            .revise_memory(
+                &first_subject.id,
+                &memory.id,
+                1,
+                crate::subjektiv::MemoryDraft::active(
+                    memory::extract::CandidateKind::Lesson,
+                    "Keep exact revisions",
+                    "second body",
+                    "Supports historical reads",
+                    "correction",
+                ),
+            )
+            .unwrap();
+        let other_memory = store
+            .create_memory(
+                &second_subject.id,
+                crate::subjektiv::MemoryDraft::active(
+                    memory::extract::CandidateKind::Decision,
+                    "Keep subjects isolated",
+                    "other body",
+                    "Prevents cross-subject reads",
+                    "initial",
+                ),
+            )
+            .unwrap();
+
+        let Json(memories) = scoped_list_subjektiv_memories(
+            State(api.clone()),
+            AxumPath(ScopedSubjektivSubjectPath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                subject_id: first_subject.id.clone(),
+            }),
+            Query(server_api::SubjektivMemoryQueryRequest {
+                query: None,
+                kinds: None,
+                states: None,
+                limit: Some(1),
+                cursor: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(memories.items.len(), 1);
+        assert_eq!(memories.items[0].id, memory.id);
+        assert_eq!(memories.items[0].revision, 2);
+
+        let missing_memory = scoped_get_subjektiv_memory(
+            State(api.clone()),
+            AxumPath(ScopedSubjektivMemoryPath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                subject_id: first_subject.id.clone(),
+                memory_id: "missing-memory".to_string(),
+            }),
+            Query(server_api::SubjektivMemoryDetailQuery::default()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            missing_memory.into_response().status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let missing_revision = scoped_get_subjektiv_memory(
+            State(api.clone()),
+            AxumPath(ScopedSubjektivMemoryPath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                subject_id: first_subject.id.clone(),
+                memory_id: memory.id.clone(),
+            }),
+            Query(server_api::SubjektivMemoryDetailQuery {
+                revision: Some(99),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            missing_revision.into_response().status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let cross_subject = scoped_get_subjektiv_memory(
+            State(api.clone()),
+            AxumPath(ScopedSubjektivMemoryPath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                subject_id: first_subject.id.clone(),
+                memory_id: other_memory.id,
+            }),
+            Query(server_api::SubjektivMemoryDetailQuery::default()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            cross_subject.into_response().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let Json(historical) = scoped_get_subjektiv_memory(
+            State(api.clone()),
+            AxumPath(ScopedSubjektivMemoryPath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                subject_id: first_subject.id.clone(),
+                memory_id: memory.id.clone(),
+            }),
+            Query(server_api::SubjektivMemoryDetailQuery {
+                revision: Some(1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(historical.revision, 1);
+        assert_eq!(historical.current_revision, 2);
+        assert_eq!(historical.body_md, "first body");
+
+        let Json(revisions) = scoped_list_subjektiv_memory_revisions(
+            State(api.clone()),
+            AxumPath(ScopedSubjektivMemoryPath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                subject_id: first_subject.id.clone(),
+                memory_id: memory.id.clone(),
+            }),
+            Query(server_api::SubjektivMemoryRevisionsQuery {
+                limit: Some(1),
+                cursor: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(revisions.current_revision, 2);
+        assert_eq!(revisions.items[0].revision, 2);
+        assert!(revisions.has_more);
+
+        let generation = store.prepare_surface_generation(&first_subject.id).unwrap();
+        let expected_ref = crate::subjektiv::MemoryRevisionRef {
+            memory_id: revised.id.clone(),
+            revision: revised.revision,
+        };
+        store
+            .publish_surface_generation(
+                &first_subject.id,
+                &generation.id,
+                vec![crate::subjektiv::SurfacePoint {
+                    body_md: "- Keep exact revisions".to_string(),
+                    memory_refs: vec![expected_ref.clone()],
+                }],
+            )
+            .unwrap();
+        let Json(surface) = scoped_get_subjektiv_resident_surface(
+            State(api),
+            AxumPath(ScopedSubjektivSubjectPath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                subject_id: first_subject.id,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            surface.availability,
+            server_api::SubjektivResidentSurfaceAvailability::Ready
+        );
+        let snapshot = surface.snapshot.unwrap();
+        assert_eq!(snapshot.memory_refs.len(), 1);
+        assert_eq!(snapshot.memory_refs[0].memory_id, expected_ref.memory_id);
+        assert_eq!(snapshot.memory_refs[0].revision, expected_ref.revision);
+    }
+
+    #[tokio::test]
     async fn subjektiv_subject_worker_and_staging_derive_scope_from_singleton_authority() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
@@ -38064,6 +38754,58 @@ mod tests {
             origin: None,
             transport_headers: Vec::new(),
         };
+        api.store
+            .upsert_memory_document(&MemoryDocumentRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                body_md: "# Legacy sentinel\n".to_string(),
+                created_at: "2026-10-02T00:00:00Z".to_string(),
+                updated_at: "2026-10-02T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        let Json(legacy_resident) = scoped_memory_backend_operation(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            context.clone(),
+            Json(MemoryBackendOperation::ResidentSummary(Default::default())),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            legacy_resident,
+            MemoryBackendHttpResponse::Ok {
+                result: memory::backend::MemoryBackendOperationResult::ResidentSummary(
+                    memory::backend::MemoryResidentSummaryOutput {
+                        availability: memory::backend::MemoryResidentSummaryAvailability::Ready,
+                        content: Some(ref body),
+                    }
+                )
+            } if body == "# Legacy sentinel\n"
+        ));
+        let Json(resident) = scoped_subjektiv_memory_backend(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            context.clone(),
+            Json(server_api::SubjektivMemoryBackendRequest {
+                operation: server_api::SubjektivMemoryBackendOperation::ResidentSummary(
+                    Default::default(),
+                ),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            resident,
+            server_api::SubjektivMemoryBackendResponse::ResidentSummary(
+                memory::backend::MemoryResidentSummaryOutput {
+                    availability: memory::backend::MemoryResidentSummaryAvailability::Ungenerated,
+                    content: None,
+                }
+            )
+        ));
         let operation = memory::backend::MemoryStageCandidateOperation {
             source: memory::schema::SourceRef {
                 segment_id: "segment-1".to_string(),

@@ -784,10 +784,12 @@ impl WorkerController {
         // the actual registered set instead of a hand-maintained mirror.
         worker.engine().tool_server_handle().flush_pending();
 
-        // Runtime-owned fresh Workers persist their initial model-visible head
-        // before controller exposure. Feature installation above must happen first
-        // so the resident contribution is loaded into that durable prompt. Restored
-        // Workers retain their established first-turn refresh lifecycle.
+        // Runtime-owned Workers persist their current model-visible head before
+        // controller exposure. Feature installation above must happen first so a
+        // fresh subject Worker captures the current resident surface in its durable
+        // prompt. Restored Workers defer their one-shot append-only resident refresh
+        // until the next model-visible context materialization, after the Runtime has
+        // committed restoration of the existing durable head.
         if runtime_managed && worker.needs_initial_session_head_materialization() {
             worker
                 .materialize_durable_session_head()
@@ -1179,18 +1181,17 @@ pub(crate) fn wire_event_bridges_on_engine<C, St>(
     // per-item commit channel is wired at the top of this function.
 }
 
-fn validate_automatic_memory_extraction_targets(
+fn validate_memory_lifecycle_targets(
     memory: &manifest::MemoryFeatureProfileConfig,
     subjektiv: &manifest::SubjektivFeatureProfileConfig,
 ) -> std::io::Result<()> {
-    if memory.enabled
-        && memory.extraction.enabled
-        && subjektiv.enabled
-        && subjektiv.extraction.enabled
-    {
+    let legacy_lifecycle =
+        memory.enabled && (memory.extraction.enabled || memory.consolidation.request_enabled);
+    let subjektiv_lifecycle = subjektiv.enabled && subjektiv.extraction.enabled;
+    if legacy_lifecycle && subjektiv_lifecycle {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "Workspace Memory and subjektiv automatic extraction cannot both be enabled for one Worker",
+            "Workspace Memory and subjektiv lifecycles cannot both be enabled for one Worker",
         ));
     }
     Ok(())
@@ -1307,56 +1308,75 @@ where
     }
     let memory_profile = &worker.manifest().feature.memory.profile;
     let subjektiv_profile = &worker.manifest().feature.subjektiv.profile;
-    validate_automatic_memory_extraction_targets(memory_profile, subjektiv_profile)?;
+    validate_memory_lifecycle_targets(memory_profile, subjektiv_profile)?;
     let memory_install_plan = crate::feature::builtin::memory::MemoryFeatureInstallPlan::prepare(
         worker.manifest(),
         worker.workspace_client_handle(),
         worker.prompts().load_full(),
     )?;
-    let memory_prompt_contribution = memory_install_plan.as_ref().map(|plan| {
+    let mut feature_prompt_contribution = memory_install_plan.as_ref().map(|plan| {
         (
             plan.resident_summary_source.clone(),
             plan.system_prompt_override.clone(),
         )
     });
-    let memory_lifecycle_config = memory_install_plan
-        .as_ref()
-        .map(|plan| plan.resolved_config.clone());
+    let memory_lifecycle_config = worker.manifest().feature.memory.clone();
     if let Some(plan) = memory_install_plan {
         feature_registry.add_module(plan.module);
     }
-    if let Some(subjektiv_memory) =
-        crate::feature::builtin::subjektiv_memory::SubjektivMemoryFeature::from_resolved_config(
-            &worker.manifest().feature.subjektiv,
-            worker.committed_session_capture_handle(),
+    let subjektiv_consolidation_plan =
+        crate::feature::builtin::memory::SubjektivConsolidationFeatureInstallPlan::prepare(
+            worker.manifest(),
+            worker.workspace_client_handle(),
+            worker.prompts().load_full(),
+        )?;
+    if let Some(plan) = subjektiv_consolidation_plan {
+        feature_prompt_contribution = Some((None, Some(plan.system_prompt_override)));
+        feature_registry.add_module(plan.module);
+    }
+    let ordinary_subjektiv_features_enabled =
+        crate::feature::builtin::memory::ordinary_subjektiv_features_enabled(worker.manifest());
+    if let Some(resident_summary_source) =
+        crate::feature::builtin::memory::ordinary_subjektiv_resident_summary_source(
+            worker.manifest(),
             worker.workspace_client_handle(),
         )?
+    {
+        feature_prompt_contribution = Some((Some(resident_summary_source), None));
+    }
+    if ordinary_subjektiv_features_enabled
+        && let Some(subjektiv_memory) =
+            crate::feature::builtin::subjektiv_memory::SubjektivMemoryFeature::from_resolved_config(
+                &worker.manifest().feature.subjektiv,
+                worker.committed_session_capture_handle(),
+                worker.workspace_client_handle(),
+            )?
     {
         feature_registry.add_module(subjektiv_memory);
     }
-    if let Some(subjektiv_sessions) =
-        crate::feature::builtin::subjektiv_session::SubjektivSessionFeature::from_resolved_config(
-            &worker.manifest().feature.subjektiv,
-            worker.committed_session_capture_handle(),
-            worker.workspace_client_handle(),
-        )?
+    if ordinary_subjektiv_features_enabled
+        && let Some(subjektiv_sessions) =
+            crate::feature::builtin::subjektiv_session::SubjektivSessionFeature::from_resolved_config(
+                &worker.manifest().feature.subjektiv,
+                worker.committed_session_capture_handle(),
+                worker.workspace_client_handle(),
+            )?
     {
         feature_registry.add_module(subjektiv_sessions);
     }
-    if let Some(memory_config) = memory_lifecycle_config
-        && let Some(memory_lifecycle) =
-            crate::feature::builtin::memory_lifecycle::MemoryLifecycleFeature::from_resolved_config(
-                worker.manifest_lifecycle_features_enabled(),
-                memory_config,
-                worker.committed_session_capture_handle(),
-                worker.session_extension_handle(),
-                worker.workspace_client_handle(),
-                spawner_manifest.clone(),
-                worker.llm_client_handle(),
-                prompts.clone(),
-                spawner_workspace_context.clone(),
-                worker.working_event_sender(),
-            )?
+    if let Some(memory_lifecycle) =
+        crate::feature::builtin::memory_lifecycle::MemoryLifecycleFeature::from_resolved_config(
+            worker.manifest_lifecycle_features_enabled(),
+            memory_lifecycle_config,
+            worker.committed_session_capture_handle(),
+            worker.session_extension_handle(),
+            worker.workspace_client_handle(),
+            spawner_manifest.clone(),
+            worker.llm_client_handle(),
+            prompts.clone(),
+            spawner_workspace_context.clone(),
+            worker.working_event_sender(),
+        )?
     {
         feature_registry.add_module(memory_lifecycle);
     }
@@ -1370,19 +1390,20 @@ where
     )? {
         feature_registry.add_module(surface_lifecycle);
     }
-    if let Some(subjektiv_lifecycle) =
-        crate::feature::builtin::memory_lifecycle::SubjektivLifecycleFeature::from_resolved_config(
-            worker.manifest_lifecycle_features_enabled(),
-            worker.manifest().feature.subjektiv.clone(),
-            worker.committed_session_capture_handle(),
-            worker.session_extension_handle(),
-            worker.workspace_client_handle(),
-            spawner_manifest.clone(),
-            worker.llm_client_handle(),
-            prompts.clone(),
-            spawner_workspace_context.clone(),
-            worker.working_event_sender(),
-        )?
+    if ordinary_subjektiv_features_enabled
+        && let Some(subjektiv_lifecycle) =
+            crate::feature::builtin::memory_lifecycle::SubjektivLifecycleFeature::from_resolved_config(
+                worker.manifest_lifecycle_features_enabled(),
+                worker.manifest().feature.subjektiv.clone(),
+                worker.committed_session_capture_handle(),
+                worker.session_extension_handle(),
+                worker.workspace_client_handle(),
+                spawner_manifest.clone(),
+                worker.llm_client_handle(),
+                prompts.clone(),
+                spawner_workspace_context.clone(),
+                worker.working_event_sender(),
+            )?
     {
         feature_registry.add_module(subjektiv_lifecycle);
     }
@@ -1592,7 +1613,7 @@ where
             ),
         ));
     }
-    if let Some((resident_summary, system_prompt_override)) = memory_prompt_contribution {
+    if let Some((resident_summary, system_prompt_override)) = feature_prompt_contribution {
         worker.install_system_prompt_contribution(resident_summary, system_prompt_override);
     }
     worker.attach_tracker(tracker);
@@ -3570,9 +3591,17 @@ mod tests {
         let exposure = startup
             .find("let handle = WorkerHandle")
             .expect("controller handle exposure");
+        let materialize_gate = startup[..materialize]
+            .rfind("if runtime_managed && worker.needs_initial_session_head_materialization() {")
+            .expect("fresh runtime-managed materialization gate");
 
-        assert!(feature_install < materialize);
+        assert!(feature_install < materialize_gate);
+        assert!(materialize_gate < materialize);
         assert!(materialize < exposure);
+        assert!(
+            startup[materialize_gate..materialize]
+                .contains("needs_initial_session_head_materialization")
+        );
     }
 
     #[test]
@@ -3639,7 +3668,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_memory_extraction_destinations_are_mutually_exclusive() {
+    fn legacy_and_subjektiv_lifecycles_are_mutually_exclusive() {
         let mut memory = manifest::MemoryFeatureProfileConfig::default();
         memory.enabled = true;
         memory.extraction.enabled = true;
@@ -3647,12 +3676,17 @@ mod tests {
         subjektiv.enabled = true;
         subjektiv.extraction.enabled = true;
 
-        let error = validate_automatic_memory_extraction_targets(&memory, &subjektiv).unwrap_err();
+        let error = validate_memory_lifecycle_targets(&memory, &subjektiv).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("cannot both be enabled"));
 
-        subjektiv.extraction.enabled = false;
-        validate_automatic_memory_extraction_targets(&memory, &subjektiv).unwrap();
+        memory.extraction.enabled = false;
+        assert!(
+            validate_memory_lifecycle_targets(&memory, &subjektiv).is_err(),
+            "legacy consolidation still installs the legacy lifecycle"
+        );
+        memory.consolidation.request_enabled = false;
+        validate_memory_lifecycle_targets(&memory, &subjektiv).unwrap();
     }
 
     #[test]

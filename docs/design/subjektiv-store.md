@@ -1,8 +1,13 @@
 # subjektiv subject Memory store
 
-T-667 introduces a trusted Server-side `subjektiv` repository in
-`yoi_workspace_server::subjektiv`. It is a domain store, not a Worker tool or a
-cutover of the existing Workspace Memory authority.
+The trusted Server-side `subjektiv` repository in
+`yoi_workspace_server::subjektiv` is the persistence authority for subject-scoped
+Memory. It is a domain store, not a Worker tool. Legacy single-document Workspace
+Memory remains a separate, deprecated control-plane authority until an operator
+performs the explicit reset defined by the
+[subjektiv product cutover runbook](../development/subjektiv-product-cutover.md);
+legacy rows are never imported, dual-written, or silently reinterpreted as subject
+Memory.
 
 ## Ownership and scope
 
@@ -85,8 +90,9 @@ immutable. A resolution stores both the resolution JSON and the exact staged JSO
 bytes that were resolved. Aggregate seal rows prevent evidence, derivations,
 resolution targets, or snapshot references from being appended after their
 parent JSON is finalized. Foreign keys plus retention triggers prevent dangling
-candidate, derivation, resolution-target, and snapshot references. There is no
-record deletion API in this baseline.
+candidate, derivation, resolution-target, and snapshot references. Ordinary
+subject operations expose no record deletion API; the legacy reset contract does
+not touch this Feature database.
 
 Search columns and JSON projections are written together by the typed repository.
 Raw SQL remains private trusted implementation detail. Existing Workspace Memory
@@ -280,3 +286,34 @@ proposal unresolved/conflicted. It must not parse target information from the
 claim, retarget to the latest revision, or revive a retracted Memory. Valid
 transitions at staging are revise while active/resolved, active→resolved,
 active/resolved→retracted, and resolved→active. Retraction remains terminal.
+
+## Candidate consolidation and corrections (T-670)
+
+The Backend starts a restricted `builtin:subjektiv-memory-consolidation` Worker
+for exactly one authenticated subject. The Host binds the subject; model-visible
+inputs cannot select a Workspace, subject, Runtime, Worker, or Session. Its tools
+list/read pending immutable candidates, query/read confirmed revisions, and make
+one candidate decision. Candidate text is evidence rather than authority.
+
+Every decision carries a stable request ID. An exact retry returns the committed
+receipt, while reuse with different input is a conflict. Applying a candidate
+atomically writes one new confirmed revision, its exact candidate and derivation
+edges, the immutable resolution and affected revision references, and advances
+the subject store revision. A non-applied decision explicitly records
+`discarded`, `invalid`, `duplicate`, or `already_covered`; an empty model response,
+transport failure, or aborted consolidation records no disposition and leaves the
+candidate pending. A successful applied response is the only evidence that
+confirmed Memory changed.
+
+A typed revision proposal must be applied to its exact `memory_id` and
+`expected_revision`, preserving its intent and change reason. The transaction
+rechecks the current revision and state transition. It never rebases or retargets
+a stale proposal, revives retracted Memory, or extracts a target from claim prose.
+Correction/refinement of the same experience appends under the same Memory ID;
+a corrected experience after terminal retraction receives a new Memory ID and may
+cite the retracted fixed revision as a derivation. Surface generation is a
+separate post-consolidation lifecycle: its failure cannot roll back a committed
+candidate decision.
+
+For the product activation, legacy reset, and operator recovery boundary, follow
+the [subjektiv product cutover runbook](../development/subjektiv-product-cutover.md).

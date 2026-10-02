@@ -235,32 +235,40 @@ permission = "write"
 # # ref = "anthropic/claude-haiku-4-5"
 
 
-# ===== [feature.memory] ======================================================
-# Memory は `feature.memory` だけを入口にする。resolved Worker Manifest では
-# Profile由来の設定を `profile` に、Backend由来のWorkspace設定snapshotを
-# `workspace_settings` に分離して保存する。`workspace_settings` はBackendだけが
-# bindする信頼済み入力で、Profile・Browser・model入力から指定できない。
-# `profile.enabled = false` の場合、Memory tools、Feature prompt contributionによる
-# resident injection、extract、consolidation requestをすべて無効にし、snapshotも保持しない。
+# ===== [feature.memory] (legacy/deprecated) ================================
+# Legacy single-document Workspace Memory compatibility設定。新規product pathは
+# `[feature.subjektiv]` を使う。旧`MemoryQuery` / `MemoryReadDocument` /
+# `MemoryUpdateDocument` / `MemoryStaging*` toolsと`/memory` APIのinput意味は
+# 変更せず、subject Memoryへ暗黙転送しない。
 #
-# [feature.memory.profile]
+# resolved Worker ManifestではProfile由来の設定を`profile`に、Backend由来の
+# Workspace設定snapshotを`workspace_settings`に分離して保存する。source TOMLの
+# `[feature.memory]` fieldsはresolve後に`profile`へ入り、`workspace_settings`は
+# Backendだけがbindする信頼済み入力で、Profile・Browser・
+# model入力から指定できない。source `enabled = false`（resolvedでは
+# `profile.enabled = false`）の場合、legacy Memory tools、
+# resident injection、extract、consolidation requestをすべて無効にし、snapshotも保持しない。
+# `[feature.subjektiv]`の有効化やWorker restoreはlegacy dataをreset/migrateしない。
+# legacy resetは認証済みoperatorが明示APIで別途実行する。
+#
+# [feature.memory]
 # enabled = true
 # staging_tools = false
 #
-# [feature.memory.profile.resident]
+# [feature.memory.resident]
 # inject_summary = true
 #
-# [feature.memory.profile.extraction]
+# [feature.memory.extraction]
 # enabled = true
 # reasoning = "medium"
 # threshold = 30000
 # worker_max_turns = 8
 #
 # # modelは任意。省略時はmain modelをcloneする。
-# # [feature.memory.profile.extraction.model]
+# # [feature.memory.extraction.model]
 # # ref = "codex-oauth/gpt-5.6-luna"
 #
-# [feature.memory.profile.consolidation]
+# [feature.memory.consolidation]
 # request_enabled = true
 #
 # # Backendがresolved Manifestへbindする。手書き/Profile入力では指定しない。
@@ -271,6 +279,42 @@ permission = "write"
 #
 # Query結果/抜粋の上限とconsolidation eligibility/thresholdはoperation/Backend
 # policyが所有し、通常Worker Manifestには含めない。legacy `[memory]` は拒否する。
+
+
+# ===== [feature.subjektiv] ================================================
+# Current subject-scoped Memory product。ProfileはFeature activationと自動extract
+# policyだけを所有する。subject idはManifest fieldではない。Hostが認証済み
+# Runtime/Worker sourceとcurrent `subjektiv:<subject-id>` keyed-singleton ownershipから
+# operationごとにbindし、明示Workspace/subject authorizationを再評価する。
+#
+# `enabled = true`はsubject tools、Session attribution/recall、confirmed Memory、
+# candidate consolidation、resident surface lifecycleを有効にする。legacy
+# `[feature.memory]` dataのimport/reset/dual-writeは行わない。同じWorkerでlegacyと
+# subjektivの自動extract destinationを同時に有効化する構成は拒否される。
+#
+# [feature.subjektiv]
+# enabled = true
+#
+# [feature.subjektiv.extraction]
+# enabled = true
+# reasoning = "medium"
+# threshold = 50000
+# worker_max_turns = 8
+#
+# # modelは任意。省略時はmain modelをcloneする。
+# # [feature.subjektiv.extraction.model]
+# # ref = "codex-oauth/gpt-5.6-luna"
+#
+# # Backendがresolved Manifestへbindする。Profile・Browser・model入力では指定しない。
+# # language/settings revisionのtrusted snapshotであり、subject identityではない。
+# # [feature.subjektiv.workspace_settings]
+# # workspace_id = "workspace-id"
+# # settings_revision = 1
+# # language = "日本語"
+#
+# Surface selection/generation/injection、candidate consolidation eligibility、recall
+# limitsはHost/Backend policyが所有し、通常Worker Manifestには含めない。current Worker
+# authorityはYoi keyed singletonに残り、historical Session attributionを代用しない。
 
 
 # ===== [skills] =============================================================

@@ -228,6 +228,8 @@ impl_openapi_schema!(
     FlowSourceResolveRequest,
     ResolvedFlowSource,
     MemoryDocumentResponse,
+    LegacyMemoryResetRequest,
+    LegacyMemoryResetResponse,
     MemoryStagingQuery,
     MemoryStagingListResponse,
     MemoryBackendRequest,
@@ -235,7 +237,18 @@ impl_openapi_schema!(
     MemoryConsolidateStagingRequest,
     MemoryConsolidationResponse,
     SubjektivSubjectCreateRequest,
+    SubjektivSubjectListQuery,
+    SubjektivSubjectListResponse,
     SubjektivSubjectResponse,
+    SubjektivResidentSurfaceResponse,
+    SubjektivResidentSurfaceSnapshot,
+    SubjektivMemoryDetailQuery,
+    SubjektivMemoryRevisionsQuery,
+    SubjektivMemoryListQuery,
+    SubjektivMemoryQueryRequest,
+    SubjektivMemoryQueryResponse,
+    SubjektivMemoryReadResponse,
+    SubjektivMemoryListRevisionsResponse,
     SubjektivSubjectWorkerStartRequest,
     SubjektivStageCandidateRequest,
     SubjektivStageCandidateResponse,
@@ -1056,6 +1069,21 @@ pub trait ServerApi {
         #[path] workspace_id: String,
     ) -> Result<MemoryDocumentResponse, RepositoryApiError>;
 
+    #[post(
+        "/api/w/{workspace_id}/memory/reset",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn legacy_memory_reset(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[body] request: LegacyMemoryResetRequest,
+    ) -> Result<LegacyMemoryResetResponse, RepositoryApiError>;
+
     #[get(
         "/api/w/{workspace_id}/memory/staging",
         status = 200,
@@ -1111,6 +1139,19 @@ pub trait ServerApi {
         #[body] request: SubjektivSubjectCreateRequest,
     ) -> Result<SubjektivSubjectResponse, RepositoryApiError>;
     #[get(
+        "/api/w/{workspace_id}/subjektiv/subjects",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true,
+    )]
+    async fn subjektiv_subject_list(
+        &self,
+        #[path] workspace_id: String,
+        #[query] query: SubjektivSubjectListQuery,
+    ) -> Result<SubjektivSubjectListResponse, RepositoryApiError>;
+    #[get(
         "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}",
         status = 200,
         error_status = 404,
@@ -1123,6 +1164,63 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] subject_id: String,
     ) -> Result<SubjektivSubjectResponse, RepositoryApiError>;
+    #[get(
+        "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/surface",
+        status = 200,
+        error_status = 404,
+        additional_error_statuses = [400, 401, 403, 500],
+        bearer_auth = true,
+        browser_auth = true,
+    )]
+    async fn subjektiv_resident_surface(
+        &self,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+    ) -> Result<SubjektivResidentSurfaceResponse, RepositoryApiError>;
+    #[get(
+        "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/memories",
+        status = 200,
+        error_status = 404,
+        additional_error_statuses = [400, 401, 403, 409, 500],
+        bearer_auth = true,
+        browser_auth = true,
+    )]
+    async fn subjektiv_memory_list(
+        &self,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+        #[query] query: SubjektivMemoryListQuery,
+    ) -> Result<SubjektivMemoryQueryResponse, RepositoryApiError>;
+    #[get(
+        "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/memories/{memory_id}",
+        status = 200,
+        error_status = 404,
+        additional_error_statuses = [400, 401, 403, 500],
+        bearer_auth = true,
+        browser_auth = true,
+    )]
+    async fn subjektiv_memory_detail(
+        &self,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+        #[path] memory_id: String,
+        #[query] query: SubjektivMemoryDetailQuery,
+    ) -> Result<SubjektivMemoryReadResponse, RepositoryApiError>;
+    #[get(
+        "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/memories/{memory_id}/revisions",
+        status = 200,
+        error_status = 404,
+        additional_error_statuses = [400, 401, 403, 500],
+        bearer_auth = true,
+        browser_auth = true,
+    )]
+    async fn subjektiv_memory_revisions(
+        &self,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+        #[path] memory_id: String,
+        #[query] query: SubjektivMemoryRevisionsQuery,
+    ) -> Result<SubjektivMemoryListRevisionsResponse, RepositoryApiError>;
     #[post(
         "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/retire",
         status = 200,
@@ -4499,6 +4597,25 @@ pub struct SubjektivSubjectCreateRequest {
     pub role: String,
 }
 
+pub const SUBJEKTIV_BROWSER_MAX_LIST_LIMIT: usize = 100;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSubjectListQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSubjectListResponse {
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: usize,
+    pub items: Vec<SubjektivSubjectResponse>,
+    pub has_more: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SubjektivSubjectResponse {
@@ -4513,6 +4630,150 @@ pub struct SubjektivSubjectResponse {
     /// projection, not state duplicated in the subjektiv store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_worker: Option<WorkerLaunchWorkerSummary>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjektivResidentSurfaceAvailability {
+    Ungenerated,
+    Stale,
+    Failed,
+    Ready,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivResidentSurfaceSnapshot {
+    pub snapshot_id: String,
+    pub body_md: String,
+    #[serde(default)]
+    pub memory_refs: Vec<SubjektivMemoryRevisionRef>,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub built_from_store_revision: u64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivResidentSurfaceResponse {
+    pub subject_id: String,
+    pub availability: SubjektivResidentSurfaceAvailability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SubjektivResidentSurfaceSnapshot>,
+}
+
+fn serialize_optional_query_enum_list<T, S>(
+    value: &Option<Vec<T>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    T: Serialize,
+    S: serde::Serializer,
+{
+    let Some(items) = value else {
+        return serializer.serialize_none();
+    };
+    let mut encoded = Vec::with_capacity(items.len());
+    for item in items {
+        match serde_json::to_value(item).map_err(serde::ser::Error::custom)? {
+            serde_json::Value::String(value) => encoded.push(value),
+            _ => {
+                return Err(serde::ser::Error::custom(
+                    "query-list values must serialize as strings",
+                ));
+            }
+        }
+    }
+    serializer.serialize_some(&encoded.join(","))
+}
+
+fn deserialize_optional_query_enum_list<'de, T, D>(
+    deserializer: D,
+) -> Result<Option<Vec<T>>, D::Error>
+where
+    T: serde::de::DeserializeOwned,
+    D: serde::Deserializer<'de>,
+{
+    let Some(encoded) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    encoded
+        .split(',')
+        .map(|value| {
+            serde_json::from_value(serde_json::Value::String(value.to_string()))
+                .map_err(serde::de::Error::custom)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+/// Browser GET query for committed subject Memory. Enum lists use a bounded,
+/// comma-separated scalar representation so URL-form encoding stays portable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryListQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_query_enum_list",
+        deserialize_with = "deserialize_optional_query_enum_list"
+    )]
+    pub kinds: Option<Vec<memory::extract::CandidateKind>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_query_enum_list",
+        deserialize_with = "deserialize_optional_query_enum_list"
+    )]
+    pub states: Option<Vec<SubjektivMemoryState>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+impl From<SubjektivMemoryListQuery> for SubjektivMemoryQueryRequest {
+    fn from(value: SubjektivMemoryListQuery) -> Self {
+        Self {
+            query: value.query,
+            kinds: value.kinds,
+            states: value.states,
+            limit: value.limit,
+            cursor: value.cursor,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryDetailQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
+    pub revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub offset: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub byte_offset: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 1000))]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivMemoryRevisionsQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -5197,6 +5458,7 @@ pub struct SubjektivSurfaceFailureResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "operation", content = "input", rename_all = "snake_case")]
 pub enum SubjektivMemoryBackendOperation {
+    ResidentSummary(memory::backend::MemoryResidentSummaryOperation),
     Query(SubjektivMemoryQueryRequest),
     Read(SubjektivMemoryReadRequest),
     ListRevisions(SubjektivMemoryListRevisionsRequest),
@@ -5368,6 +5630,7 @@ pub struct SubjektivMemoryStageExplicitResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "result", content = "data", rename_all = "snake_case")]
 pub enum SubjektivMemoryBackendResponse {
+    ResidentSummary(memory::backend::MemoryResidentSummaryOutput),
     Query(SubjektivMemoryQueryResponse),
     Read(SubjektivMemoryReadResponse),
     ListRevisions(SubjektivMemoryListRevisionsResponse),
@@ -9364,6 +9627,43 @@ pub struct MemoryDocumentResponse {
     pub record_source: String,
 }
 
+pub const LEGACY_MEMORY_RESET_MAX_CONFIRMATION_BYTES: usize = 256;
+
+fn deserialize_legacy_memory_reset_confirmation<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() > LEGACY_MEMORY_RESET_MAX_CONFIRMATION_BYTES {
+        return Err(serde::de::Error::custom(
+            "legacy Memory reset confirmation is too long",
+        ));
+    }
+    Ok(value)
+}
+
+/// Explicit destructive reset request. The confirmation must exactly equal
+/// `RESET LEGACY MEMORY <workspace_id>` for the Workspace named in the route.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyMemoryResetRequest {
+    #[serde(deserialize_with = "deserialize_legacy_memory_reset_confirmation")]
+    #[schemars(length(max = 256))]
+    pub confirmation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyMemoryResetResponse {
+    pub workspace_id: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub documents_deleted: usize,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub staging_records_deleted: usize,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub staging_resolutions_deleted: usize,
+}
+
 /// Candidate kinds exposed by the Memory staging resource.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -9541,12 +9841,47 @@ pub fn memory_api_typescript() -> String {
         MemoryStagingEntry::decl(&config),
         MemoryStagingListResponse::decl(&config),
     ];
+    // These browser DTOs include nested types owned by `memory` and the Worker
+    // launch API. Keep their exported names explicit so the generated Web
+    // contract remains stable without requiring those crates to depend on
+    // `ts-rs` solely for this read-only projection.
+    let subjektiv_browser_declarations = r#"export type SubjektivSubjectState = "active" | "retired";
+
+export type SubjektivSubjectResponse = { id: string, role: string, state: SubjektivSubjectState, store_revision: number, created_at: string, updated_at: string, current_worker?: | import("./worker-launch-api").WorkerLaunchWorkerSummary | null, };
+
+export type SubjektivSubjectListResponse = { limit: number, items: Array<SubjektivSubjectResponse>, has_more: boolean, };
+
+export type SubjektivMemoryState = "active" | "resolved" | "retracted";
+
+export type SubjektivMemoryRevisionRef = { memory_id: string, revision: number, };
+
+export type SubjektivResidentSurfaceAvailability = "ungenerated" | "stale" | "failed" | "ready";
+
+export type SubjektivResidentSurfaceSnapshot = { snapshot_id: string, body_md: string, memory_refs: Array<SubjektivMemoryRevisionRef>, built_from_store_revision: number, created_at: string, };
+
+export type SubjektivResidentSurfaceResponse = { subject_id: string, availability: SubjektivResidentSurfaceAvailability, snapshot?: SubjektivResidentSurfaceSnapshot | null, };
+
+export type SubjektivMemoryQueryItem = { id: string, revision: number, kind: MemoryCandidateKind, state: SubjektivMemoryState, claim: string, excerpt: string, updated_at: string, };
+
+export type SubjektivMemoryQueryResponse = { items: Array<SubjektivMemoryQueryItem>, next_cursor?: string | null, has_more: boolean, };
+
+export type SubjektivMemoryEvidence = { id: string, kind: string, entry_range?: [number, number] | null, origin?: MemoryEvidenceOrigin | null, excerpt?: string | null, summary?: string | null, };
+
+export type SubjektivMemorySourceEvidenceRef = { session_id?: string | null, segment_id?: string | null, entry_range?: [number, number] | null, evidence_id?: string | null, origin?: MemoryEvidenceOrigin | null, evidence_kind?: string | null, label?: string | null, summary?: string | null, };
+
+export type SubjektivMemoryEvidenceCandidate = { candidate_id: string, evidence: Array<SubjektivMemoryEvidence>, evidence_total: number, evidence_truncated: boolean, source_refs: Array<SubjektivMemorySourceEvidenceRef>, source_refs_total: number, source_refs_truncated: boolean, };
+
+export type SubjektivMemoryReadResponse = { memory_id: string, revision: number, current_revision: number, kind: MemoryCandidateKind, state: SubjektivMemoryState, claim: string, body_md: string, why_useful: string, staleness?: string | null, change_reason: string, created_at: string, updated_at: string, body_offset: number, body_byte_offset: number, body_next_offset?: number | null, body_next_byte_offset?: number | null, body_truncated: boolean, source_candidate_ids: Array<string>, source_candidates: Array<SubjektivMemoryEvidenceCandidate>, derived_from: Array<SubjektivMemoryRevisionRef>, evidence_next_cursor?: string | null, evidence_has_more: boolean, };
+
+export type SubjektivMemoryRevisionItem = { revision: number, kind: MemoryCandidateKind, state: SubjektivMemoryState, claim: string, change_reason: string, updated_at: string, };
+
+export type SubjektivMemoryListRevisionsResponse = { memory_id: string, current_revision: number, items: Array<SubjektivMemoryRevisionItem>, next_cursor?: string | null, has_more: boolean, };"#;
 
     let limits = format!(
         "export const MEMORY_API_LIMITS = {{\n  maxResponseBytes: {MEMORY_API_MAX_RESPONSE_BYTES},\n  maxDocumentBytes: {MEMORY_API_MAX_DOCUMENT_BYTES},\n  maxCollectionItems: {MEMORY_API_MAX_COLLECTION_ITEMS},\n  maxStringBytes: {MEMORY_API_MAX_STRING_BYTES},\n  maxIdentifierBytes: {MEMORY_API_MAX_IDENTIFIER_BYTES},\n}} as const;"
     );
     format!(
-        "// Generated from server-api. Do not edit by hand.\n// Regenerate: cargo run -q -p server-api --features typescript --example generate_memory_api_types > web/workspace/src/lib/generated/memory-api.ts\n\n{limits}\n\n{}\n",
+        "// Generated from server-api. Do not edit by hand.\n// Regenerate: cargo run -q -p server-api --features typescript --example generate_memory_api_types > web/workspace/src/lib/generated/memory-api.ts\n\n{limits}\n\n{}\n\n{subjektiv_browser_declarations}\n",
         declarations
             .into_iter()
             .map(|declaration| format!("export {declaration}"))

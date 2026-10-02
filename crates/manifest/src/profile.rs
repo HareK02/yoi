@@ -1242,6 +1242,64 @@ mod tests {
     }
 
     #[test]
+    fn builtin_workspace_profiles_cut_over_to_subjektiv_without_legacy_memory() {
+        let tmp = TempDir::new().unwrap();
+        let resolve = |name: &str| {
+            ProfileResolver::new()
+                .with_workspace_base(tmp.path())
+                .resolve(
+                    &ProfileSelector::source_named(ProfileRegistrySource::Builtin, name),
+                    ProfileResolveOptions::with_worker_name(format!("{name}-worker")),
+                )
+                .unwrap()
+                .manifest
+        };
+
+        for name in ["coder", "companion", "intake", "reviewer", "orchestrator"] {
+            let manifest = resolve(name);
+            assert!(
+                manifest.feature.subjektiv.profile.enabled,
+                "{name} must enable subjektiv"
+            );
+            assert!(
+                manifest.feature.subjektiv.profile.extraction.enabled,
+                "{name} must enable subject extraction"
+            );
+            assert!(
+                !manifest.feature.memory.profile.enabled,
+                "{name} must not enable legacy Workspace Memory"
+            );
+        }
+
+        for name in ["default", "standalone", "backend-job"] {
+            let manifest = resolve(name);
+            assert!(!manifest.feature.memory.profile.enabled, "{name}");
+            assert!(!manifest.feature.subjektiv.profile.enabled, "{name}");
+        }
+
+        let legacy_consolidator = resolve("memory-consolidation");
+        assert!(legacy_consolidator.feature.memory.profile.enabled);
+        assert!(legacy_consolidator.feature.memory.profile.staging_tools);
+        assert!(
+            legacy_consolidator
+                .feature
+                .memory
+                .profile
+                .extraction
+                .enabled
+        );
+        assert!(
+            legacy_consolidator
+                .feature
+                .memory
+                .profile
+                .consolidation
+                .request_enabled
+        );
+        assert!(!legacy_consolidator.feature.subjektiv.profile.enabled);
+    }
+
+    #[test]
     fn builtin_profiles_pin_role_models_and_reasoning() {
         use crate::model::{ReasoningControl, ReasoningEffort};
 
@@ -1298,7 +1356,7 @@ mod tests {
                 role.manifest.engine.reasoning,
                 Some(ReasoningControl::Effort(ReasoningEffort::High))
             );
-            let extraction = &role.manifest.feature.memory.profile.extraction;
+            let extraction = &role.manifest.feature.subjektiv.profile.extraction;
             assert_eq!(
                 extraction
                     .model
@@ -1341,12 +1399,10 @@ mod tests {
         let manifest = resolved.manifest;
         let feature = &manifest.feature;
 
-        assert!(feature.memory.profile.enabled);
-        assert!(feature.memory.profile.staging_tools);
-        assert!(!feature.memory.profile.resident.inject_summary);
-        assert!(!feature.memory.profile.extraction.enabled);
-        assert!(!feature.memory.profile.consolidation.request_enabled);
-        assert!(!feature.subjektiv.profile.enabled);
+        assert!(!feature.memory.profile.enabled);
+        assert!(!feature.memory.profile.staging_tools);
+        assert!(feature.subjektiv.profile.enabled);
+        assert!(!feature.subjektiv.profile.extraction.enabled);
         assert!(!feature.task.enabled);
         assert!(!feature.web.enabled);
         assert!(!feature.image.enabled);
@@ -1518,7 +1574,8 @@ mod tests {
             panic!("unexpected error: {error}");
         };
         assert_eq!(target, ProfileExecutionTarget::Standalone);
-        assert!(requirements.contains(&WorkspaceAuthorityRequirement::Memory));
+        assert!(requirements.contains(&WorkspaceAuthorityRequirement::Subjektiv));
+        assert!(!requirements.contains(&WorkspaceAuthorityRequirement::Memory));
         assert!(requirements.contains(&WorkspaceAuthorityRequirement::MergeRequest));
         assert!(requirements.contains(&WorkspaceAuthorityRequirement::Ticket));
         assert!(!diagnostic.contains(tmp.path().to_string_lossy().as_ref()));

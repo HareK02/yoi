@@ -1,0 +1,113 @@
+{
+  "schemaVersion": 1,
+  "id": "memory-subjects-dark",
+  "title": "Memory subjects, surfaces, and committed records — dark",
+  "baseUrl": "http://127.0.0.1:15286",
+  "colorScheme": "dark",
+  "reducedMotion": "reduce",
+  "personas": [{
+    "id": "fixture",
+    "label": "Read-only Memory fixture",
+    "auth": { "kind": "anonymous" }
+  }],
+  "viewports": [
+    { "label": "desktop", "width": 1440, "height": 900 },
+    { "label": "narrow", "width": 768, "height": 900 },
+    { "label": "mobile", "width": 390, "height": 844 },
+    { "label": "compact", "width": 320, "height": 700 }
+  ],
+  "routes": [
+    {
+      "id": "subjects",
+      "label": "Subject index",
+      "path": "/w/memory-review/memory",
+      "goal": "Choose an explicit Memory subject and inspect state, role, store revision, worker availability, and long identities.",
+      "dataState": "Active and retired subjects spanning representative, empty, stale, failed, ungenerated, and unavailable states.",
+      "ready": { "kind": "selector", "selector": "[data-memory-view='subjects'] .subject-list" },
+      "capturePoints": [{ "id": "initial", "label": "Subjects" }]
+    },
+    {
+      "id": "representative",
+      "label": "Ready subject surface",
+      "path": "/w/memory-review/memory/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review",
+      "goal": "Read the ready resident surface and scan active, resolved, and retracted committed Memories without nested vertical scrolling.",
+      "dataState": "Ready generated Markdown surface with long content, unsafe Markdown, wide table/code, provenance refs, and three lifecycle states.",
+      "ready": {
+        "kind": "selector",
+        "selector": "[data-memory-view='subject'][data-memory-state='ready'] article[aria-label='Resident surface']"
+      },
+      "capturePoints": [{ "id": "initial", "label": "Ready subject" }]
+    },
+    {
+      "id": "detail",
+      "label": "Committed Memory detail",
+      "path": "/w/memory-review/memory/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review/memory-decision-with-a-deliberately-long-stable-identity-for-overflow-review-0000000001",
+      "goal": "Audit immutable Memory body, candidate evidence, source refs, derivations, and revision history.",
+      "dataState": "Current active revision with bounded typed provenance and active/resolved/retracted immutable history.",
+      "ready": { "kind": "selector", "selector": "[data-memory-view='detail'] .revision-list" },
+      "capturePoints": [{ "id": "initial", "label": "Memory detail" }]
+    },
+    {
+      "id": "empty",
+      "label": "Ready-empty subject",
+      "path": "/w/memory-review/memory/empty-subject",
+      "goal": "Distinguish a valid ready-empty snapshot and an empty committed Memory list from failure.",
+      "dataState": "Ready snapshot with empty Markdown and no refs; successful current list with no records.",
+      "ready": {
+        "kind": "selector",
+        "selector": "[data-memory-view='subject'][data-memory-state='ready'] [data-surface-ready-empty]"
+      },
+      "capturePoints": [{ "id": "initial", "label": "Ready empty" }]
+    },
+    {
+      "id": "stale",
+      "label": "Stale subject surface",
+      "path": "/w/memory-review/memory/stale-subject",
+      "goal": "Recognize that no snapshot is displayable while committed Memories remain readable.",
+      "dataState": "Stale availability without snapshot and one resolved committed Memory.",
+      "ready": {
+        "kind": "selector",
+        "selector": "[data-memory-view='subject'][data-memory-state='stale']"
+      },
+      "capturePoints": [{ "id": "initial", "label": "Stale" }]
+    },
+    {
+      "id": "failed",
+      "label": "Failed subject surface",
+      "path": "/w/memory-review/memory/failed-subject",
+      "goal": "See generation failure without displaying a failed or partial snapshot.",
+      "dataState": "Failed availability without snapshot and one retracted committed Memory.",
+      "ready": {
+        "kind": "selector",
+        "selector": "[data-memory-view='subject'][data-memory-state='failed']"
+      },
+      "capturePoints": [{ "id": "initial", "label": "Failed" }]
+    },
+    {
+      "id": "error",
+      "label": "Subject endpoint error",
+      "path": "/w/memory-review/memory/error-subject",
+      "goal": "Keep each read-only region explicit when subject, surface, and current Memory requests fail.",
+      "dataState": "Intentional HTTP 503 from all subject-scoped endpoints.",
+      "ready": {
+        "kind": "selector",
+        "selector": "[data-memory-view='subject'][data-memory-state='error']"
+      },
+      "capturePoints": [{ "id": "initial", "label": "Unavailable" }]
+    }
+  ],
+  "processes": [{
+    "id": "memory-fixture",
+    "command": "deno",
+    "cwd": "..",
+    "args": [
+      "run",
+      "--allow-net",
+      "--allow-read",
+      "browser-tests/memory_document_fixture_server.ts",
+      "15286",
+      "../../web/workspace/build"
+    ],
+    "readyUrl": "http://127.0.0.1:15286/health"
+  }]
+}

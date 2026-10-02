@@ -1,20 +1,19 @@
-import { MEMORY_API_LIMITS } from "$lib/generated/memory-api";
 import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
-import { parseMemoryDocumentResponse } from "$lib/workspace/memory/api";
+import {
+  MEMORY_API_LOAD_POLICY,
+  parseSubjektivSubjectListResponse,
+} from "$lib/workspace/memory/api";
 import type { PageLoad } from "./$types";
 
 export const load: PageLoad = async ({ fetch, params }) => {
   return {
     workspaceId: params.workspaceId,
-    memory: await loadJson(
+    subjects: await loadJson(
       fetch,
-      workspaceApiPath(params.workspaceId, "/memory"),
+      `${workspaceApiPath(params.workspaceId, "/subjektiv/subjects")}?limit=100`,
       undefined,
-      parseMemoryDocumentResponse,
-      {
-        diagnosticLabel: "Memory API",
-        maxResponseBytes: MEMORY_API_LIMITS.maxResponseBytes,
-      },
+      parseSubjektivSubjectListResponse,
+      MEMORY_API_LOAD_POLICY,
     ),
   };
 };

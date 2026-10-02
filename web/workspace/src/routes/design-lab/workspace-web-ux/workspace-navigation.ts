@@ -1,4 +1,4 @@
-export const designLabBasePath = '/design-lab/workspace-web-ux';
+export const designLabBasePath = "/design-lab/workspace-web-ux";
 
 export type WorkspaceNavigationItem = {
   label: string;
@@ -7,31 +7,36 @@ export type WorkspaceNavigationItem = {
 };
 
 export const workspaceNavigation: WorkspaceNavigationItem[] = [
-  { label: 'Tickets', href: `${designLabBasePath}?resource=tickets` },
-  { label: 'Objectives', href: `${designLabBasePath}?resource=objectives` },
-  { label: 'Merge Requests', href: `${designLabBasePath}?resource=merge-requests` },
+  { label: "Tickets", href: `${designLabBasePath}?resource=tickets` },
+  { label: "Objectives", href: `${designLabBasePath}?resource=objectives` },
   {
-    label: 'Memory',
+    label: "Merge Requests",
+    href: `${designLabBasePath}?resource=merge-requests`,
+  },
+  {
+    label: "Memory",
     href: `${designLabBasePath}?resource=memory`,
     children: [
-      { label: 'Document', href: `${designLabBasePath}?resource=memory-document` },
-      { label: 'Staging', href: `${designLabBasePath}?resource=memory-staging` },
+      {
+        label: "Subjects",
+        href: `${designLabBasePath}?resource=memory-subjects`,
+      },
     ],
   },
-  { label: 'Workers', href: `${designLabBasePath}?resource=workers` },
+  { label: "Workers", href: `${designLabBasePath}?resource=workers` },
 ];
 
 export const workspaceWorkers = [
   {
-    key: 'wrk-language-review',
-    label: 'Language review',
-    state: 'Running',
-    repository: 'yoi',
+    key: "wrk-language-review",
+    label: "Language review",
+    state: "Running",
+    repository: "yoi",
   },
   {
-    key: 'wrk-accessibility-check',
-    label: 'Accessibility check with a deliberately long display name',
-    state: 'Idle',
-    repository: 'workspace-web',
+    key: "wrk-accessibility-check",
+    label: "Accessibility check with a deliberately long display name",
+    state: "Idle",
+    repository: "workspace-web",
   },
 ] as const;

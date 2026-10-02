@@ -3,8 +3,11 @@ use server_api::{
     CreateWorkspaceWorkerRequest, ListResponse, MemoryDocumentResponse, MemoryStagingListResponse,
     ObjectiveCreateRequest, ObjectiveDetail, ObjectiveEditRequest, ObjectiveLinkTicketRequest,
     ObjectiveStateRequest, ObjectiveSummary, RevokeRuntimeTrustKeyRequest,
-    RuntimeTrustKeyRevealResponse, WorkerLaunchOptionsResponse, WorkspaceRuntimeDetail,
-    WorkspaceRuntimeResource,
+    RuntimeTrustKeyRevealResponse, SubjektivMemoryDetailQuery, SubjektivMemoryListQuery,
+    SubjektivMemoryListRevisionsResponse, SubjektivMemoryQueryResponse,
+    SubjektivMemoryReadResponse, SubjektivMemoryRevisionsQuery, SubjektivResidentSurfaceResponse,
+    SubjektivSubjectListQuery, SubjektivSubjectListResponse, SubjektivSubjectResponse,
+    WorkerLaunchOptionsResponse, WorkspaceRuntimeDetail, WorkspaceRuntimeResource,
 };
 use ticket::{
     MarkdownText, NewOrchestrationPlanRecord, NewTicket, NewTicketEvent, NewTicketRelation,
@@ -408,6 +411,94 @@ impl BackendWorkspaceProductClient {
         limit: usize,
     ) -> Result<MemoryStagingListResponse, BackendWorkspaceClientError> {
         crate::backend_workspace::memory_staging_list_blocking(&self.api, &self.workspace_id, limit)
+    }
+
+    pub fn list_subjektiv_subjects(
+        &self,
+        limit: usize,
+    ) -> Result<SubjektivSubjectListResponse, BackendWorkspaceClientError> {
+        let workspace_id = self.workspace_id.clone();
+        self.generated(move |client| async move {
+            client
+                .subjektiv_subject_list(
+                    workspace_id,
+                    SubjektivSubjectListQuery { limit: Some(limit) },
+                )
+                .await
+        })
+    }
+
+    pub fn subjektiv_subject(
+        &self,
+        subject_id: &str,
+    ) -> Result<SubjektivSubjectResponse, BackendWorkspaceClientError> {
+        let workspace_id = self.workspace_id.clone();
+        let subject_id = subject_id.to_string();
+        self.generated(move |client| async move {
+            client.subjektiv_subject_get(workspace_id, subject_id).await
+        })
+    }
+
+    pub fn subjektiv_resident_surface(
+        &self,
+        subject_id: &str,
+    ) -> Result<SubjektivResidentSurfaceResponse, BackendWorkspaceClientError> {
+        let workspace_id = self.workspace_id.clone();
+        let subject_id = subject_id.to_string();
+        self.generated(move |client| async move {
+            client
+                .subjektiv_resident_surface(workspace_id, subject_id)
+                .await
+        })
+    }
+
+    pub fn list_subjektiv_memories(
+        &self,
+        subject_id: &str,
+        query: &SubjektivMemoryListQuery,
+    ) -> Result<SubjektivMemoryQueryResponse, BackendWorkspaceClientError> {
+        let workspace_id = self.workspace_id.clone();
+        let subject_id = subject_id.to_string();
+        let query = query.clone();
+        self.generated(move |client| async move {
+            client
+                .subjektiv_memory_list(workspace_id, subject_id, query)
+                .await
+        })
+    }
+
+    pub fn subjektiv_memory(
+        &self,
+        subject_id: &str,
+        memory_id: &str,
+        query: &SubjektivMemoryDetailQuery,
+    ) -> Result<SubjektivMemoryReadResponse, BackendWorkspaceClientError> {
+        let workspace_id = self.workspace_id.clone();
+        let subject_id = subject_id.to_string();
+        let memory_id = memory_id.to_string();
+        let query = query.clone();
+        self.generated(move |client| async move {
+            client
+                .subjektiv_memory_detail(workspace_id, subject_id, memory_id, query)
+                .await
+        })
+    }
+
+    pub fn list_subjektiv_memory_revisions(
+        &self,
+        subject_id: &str,
+        memory_id: &str,
+        query: &SubjektivMemoryRevisionsQuery,
+    ) -> Result<SubjektivMemoryListRevisionsResponse, BackendWorkspaceClientError> {
+        let workspace_id = self.workspace_id.clone();
+        let subject_id = subject_id.to_string();
+        let memory_id = memory_id.to_string();
+        let query = query.clone();
+        self.generated(move |client| async move {
+            client
+                .subjektiv_memory_revisions(workspace_id, subject_id, memory_id, query)
+                .await
+        })
     }
 
     pub fn launch_ticket_intake(
@@ -914,6 +1005,45 @@ mod tests {
                 .unwrap()
                 .starts_with("GET /api/w/workspace-a/memory/staging?limit=10 ")
         );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn subjektiv_memory_list_encodes_typed_filters_as_bounded_query_scalars() {
+        let (base_url, request, handle) =
+            one_response_server("200 OK", r#"{"items":[],"has_more":false}"#);
+        let client = BackendWorkspaceProductClient::new_with_access_token(
+            base_url,
+            "workspace-a",
+            "test-backend-token",
+        )
+        .unwrap();
+
+        let response = client
+            .list_subjektiv_memories(
+                "subject/a",
+                &SubjektivMemoryListQuery {
+                    query: Some("stable cursor".to_string()),
+                    kinds: None,
+                    states: Some(vec![
+                        server_api::SubjektivMemoryState::Active,
+                        server_api::SubjektivMemoryState::Resolved,
+                    ]),
+                    limit: Some(25),
+                    cursor: None,
+                },
+            )
+            .unwrap();
+
+        assert!(response.items.is_empty());
+        let request = request.recv().unwrap();
+        assert!(
+            request.starts_with("GET /api/w/workspace-a/subjektiv/subjects/subject%2Fa/memories?")
+        );
+        assert!(request.contains("query=stable+cursor"));
+        assert!(request.contains("states=active%2Cresolved"));
+        assert!(request.contains("limit=25"));
+        assert!(request.contains("authorization: Bearer test-backend-token\r\n"));
         handle.join().unwrap();
     }
 

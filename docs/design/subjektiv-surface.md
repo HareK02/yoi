@@ -22,7 +22,34 @@ Every editor point carries one or more exact `{memory_id, revision}` references.
 
 Publication is idempotent for identical output at one store revision. A different concurrent output cannot replace the first published surface. Confirmed Memory writes atomically mark the prior surface stale. Failed surface work never rolls back confirmed Memory or candidate disposition.
 
-Resident injection loads only a `ready` snapshot built from the subject's exact current store revision. The resident Backend contract transports typed `ready`, `un-generated`, `failed`, and `stale` availability separately from optional Markdown, so a valid ready-empty snapshot cannot be conflated with omission or request failure. `un-generated`, `failed`, and `stale` states are omitted rather than represented as "no Memory". A successful empty generation is represented by a current ready snapshot with empty Markdown. Snapshots created before this generation policy existed are retained as immutable history but migrate as `stale` and must be regenerated before injection. Runtime-owned new Workers install Features before durably materializing the initial session head, ensuring the current contribution is present in their initial prompt. Restored Workers preserve that persisted prompt and all prior history verbatim, then append one durable restore-boundary system item that supersedes earlier resident summaries with the latest ready surface, an explicit ready-empty state, or a no-current-surface tombstone; subsequent turns in the same restored process do not append it again.
+Resident injection uses five distinct product states:
+
+- `ready`: inject the non-empty snapshot only when its `built_from_store_revision`
+  equals the subject's exact current store revision;
+- `ready-empty`: a successful current generation selected no Markdown; inject no
+  prose, but preserve the explicit successful-empty state;
+- `ungenerated`: no successful current generation exists; inject nothing;
+- `stale`: confirmed Memory changed after publication (or the snapshot predates
+  this generation policy); inject nothing until regeneration succeeds;
+- `failed`: the generation attempt failed; inject nothing and preserve the typed
+  failure for diagnostics/retry rather than representing it as empty Memory.
+
+The resident Backend transports availability separately from optional Markdown.
+In storage, `ready-empty` is a current `ready` snapshot with empty Markdown; it is
+never conflated with `ungenerated`, `stale`, `failed`, request failure, or
+omission. Publication is append-only: generation inputs/runs, failures, snapshots,
+and exact references remain immutable history, while current state points at the
+applicable result.
+
+Runtime-owned new Workers install Features before durably materializing the
+initial Session head, so `ready` content or the explicit `ready-empty` result is
+represented at initial prompt construction. Restored Workers preserve their
+persisted prompt and all prior history verbatim. They append one durable
+restore-boundary system item that supersedes earlier resident summaries with the
+latest `ready` surface, an explicit `ready-empty` state, or a
+no-current-surface tombstone for `ungenerated`, `stale`, or `failed`; subsequent
+turns in that restored process do not append the boundary again. No regeneration,
+correction, failure, or cutover rewrites a committed Session entry.
 
 ## Semantic fixture and verification
 
@@ -45,4 +72,4 @@ A valid review fixture must:
 - cite only exact refs supplied with those materials;
 - distinguish mechanical citation validation from a human/model semantic review of the wording.
 
-The repository tests exercise deterministic bounds and fair budget reclamation, subject isolation, active-current-only selection, complete normalized editor-request accounting, output/reference rejection, empty/un-generated/failed/stale states, legacy regeneration, generation races, bounded conflict retry, terminal failure recording, parallel publication, correction/retraction staleness, and publication idempotency. The prompt fixture above is the manual semantic check for condition, negation, reservation, conflict, expiry, and duplicate editing behavior.
+The repository tests exercise deterministic bounds and fair budget reclamation, subject isolation, active-current-only selection, complete normalized editor-request accounting, output/reference rejection, empty/ungenerated/failed/stale states, legacy regeneration, generation races, bounded conflict retry, terminal failure recording, parallel publication, correction/retraction staleness, and publication idempotency. The prompt fixture above is the manual semantic check for condition, negation, reservation, conflict, expiry, and duplicate editing behavior.

@@ -650,6 +650,22 @@ struct WorkspaceResidentSummarySource {
     client: Arc<dyn WorkspaceClient>,
 }
 
+struct WorkspaceSubjektivResidentSummarySource {
+    client: Arc<dyn WorkspaceClient>,
+}
+
+const READY_EMPTY_RESIDENT_SURFACE: &str =
+    "The current ready resident memory surface is intentionally empty.";
+
+fn resident_summary_contribution(
+    output: memory::backend::MemoryResidentSummaryOutput,
+) -> SystemPromptContribution {
+    if output.availability != memory::backend::MemoryResidentSummaryAvailability::Ready {
+        return SystemPromptContribution::Unavailable;
+    }
+    SystemPromptContribution::Ready(output.content.unwrap_or_default())
+}
+
 #[async_trait]
 impl SystemPromptContributionSource for WorkspaceResidentSummarySource {
     async fn load(&self) -> SystemPromptContribution {
@@ -662,14 +678,8 @@ impl SystemPromptContributionSource for WorkspaceResidentSummarySource {
             )
             .await
         {
-            Ok(memory::backend::MemoryBackendOperationResult::ResidentSummary(output))
-                if output.availability
-                    == memory::backend::MemoryResidentSummaryAvailability::Ready =>
-            {
-                SystemPromptContribution::Ready(output.content.unwrap_or_default())
-            }
-            Ok(memory::backend::MemoryBackendOperationResult::ResidentSummary(_)) => {
-                SystemPromptContribution::Unavailable
+            Ok(memory::backend::MemoryBackendOperationResult::ResidentSummary(output)) => {
+                resident_summary_contribution(output)
             }
             Ok(other) => {
                 tracing::debug!(?other, "unexpected resident Memory Backend result");
@@ -683,11 +693,39 @@ impl SystemPromptContributionSource for WorkspaceResidentSummarySource {
     }
 }
 
+#[async_trait]
+impl SystemPromptContributionSource for WorkspaceSubjektivResidentSummarySource {
+    async fn load(&self) -> SystemPromptContribution {
+        match execute_subjektiv_memory_operation(
+            self.client.as_ref(),
+            server_api::SubjektivMemoryBackendOperation::ResidentSummary(Default::default()),
+        )
+        .await
+        {
+            Ok(server_api::SubjektivMemoryBackendResponse::ResidentSummary(output)) => {
+                match resident_summary_contribution(output) {
+                    SystemPromptContribution::Ready(content) if content.trim().is_empty() => {
+                        SystemPromptContribution::Ready(READY_EMPTY_RESIDENT_SURFACE.to_string())
+                    }
+                    contribution => contribution,
+                }
+            }
+            Ok(other) => {
+                tracing::debug!(?other, "unexpected subject resident Memory response");
+                SystemPromptContribution::Unavailable
+            }
+            Err(error) => {
+                tracing::debug!(%error, "subject resident Memory unavailable");
+                SystemPromptContribution::Unavailable
+            }
+        }
+    }
+}
+
 pub(crate) struct MemoryFeatureInstallPlan {
     pub(crate) module: MemoryToolsFeature,
     pub(crate) resident_summary_source: Option<Arc<dyn SystemPromptContributionSource>>,
     pub(crate) system_prompt_override: Option<String>,
-    pub(crate) resolved_config: manifest::ResolvedMemoryFeatureConfig,
 }
 
 impl MemoryFeatureInstallPlan {
@@ -720,11 +758,7 @@ impl MemoryFeatureInstallPlan {
                 } => Some(name.as_str()),
                 _ => None,
             });
-        let memory_consolidation_worker = matches!(
-            profile_name,
-            Some("memory-consolidation" | "subjektiv-memory-consolidation")
-        );
-        let subjektiv_consolidation_worker = profile_name == Some("subjektiv-memory-consolidation");
+        let memory_consolidation_worker = profile_name == Some("memory-consolidation");
         config
             .validate_execution()
             .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
@@ -758,28 +792,167 @@ impl MemoryFeatureInstallPlan {
         let system_prompt_override = if memory_consolidation_worker {
             let language = settings.language;
             Some(
-                if subjektiv_consolidation_worker {
-                    prompts.subjektiv_memory_consolidation_system(&language)
-                } else {
-                    prompts.memory_consolidation_system(&language)
-                }
-                .map_err(|error| std::io::Error::other(error.to_string()))?,
+                prompts
+                    .memory_consolidation_system(&language)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?,
             )
         } else {
             None
         };
 
-        let module = if subjektiv_consolidation_worker {
-            MemoryToolsFeature::from_tools(workspace_http_subjektiv_consolidation_tools(client))
-        } else {
-            MemoryToolsFeature::new(client, config.profile.staging_tools)
-        };
+        let module = MemoryToolsFeature::new(client, config.profile.staging_tools);
         Ok(Some(Self {
             module,
             resident_summary_source,
             system_prompt_override,
-            resolved_config: config,
         }))
+    }
+}
+
+pub(crate) fn is_builtin_subjektiv_consolidation_profile(
+    manifest: &manifest::WorkerManifest,
+) -> bool {
+    manifest.profile.as_ref().is_some_and(|snapshot| {
+        matches!(
+            &snapshot.source,
+            manifest::ProfileSource::Registry {
+                source: manifest::ProfileRegistrySource::Builtin,
+                name,
+                ..
+            } if name == "subjektiv-memory-consolidation"
+        )
+    })
+}
+
+pub(crate) fn ordinary_subjektiv_features_enabled(manifest: &manifest::WorkerManifest) -> bool {
+    manifest.feature.subjektiv.profile.enabled
+        && !is_builtin_subjektiv_consolidation_profile(manifest)
+}
+
+pub(crate) fn ordinary_subjektiv_resident_summary_source(
+    manifest: &manifest::WorkerManifest,
+    client: Arc<dyn WorkspaceClient>,
+) -> std::io::Result<Option<Arc<dyn SystemPromptContributionSource>>> {
+    if !ordinary_subjektiv_features_enabled(manifest) {
+        return Ok(None);
+    }
+    manifest
+        .feature
+        .subjektiv
+        .validate_execution()
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+    if !client.is_available() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "subjektiv resident Memory requires Backend Workspace API authority",
+        ));
+    }
+    let workspace_id = client.workspace_id().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "subjektiv resident Memory requires Backend Workspace API authority",
+        )
+    })?;
+    let settings = manifest
+        .feature
+        .subjektiv
+        .workspace_settings()
+        .expect("validated enabled subjektiv config has Workspace settings");
+    if settings.workspace_id != workspace_id {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "subjektiv Workspace settings belong to {} instead of {}",
+                settings.workspace_id, workspace_id
+            ),
+        ));
+    }
+    Ok(Some(Arc::new(WorkspaceSubjektivResidentSummarySource {
+        client,
+    })))
+}
+
+pub(crate) struct SubjektivConsolidationFeatureInstallPlan {
+    pub(crate) module: SubjektivConsolidationToolsFeature,
+    pub(crate) system_prompt_override: String,
+}
+
+impl SubjektivConsolidationFeatureInstallPlan {
+    pub(crate) fn prepare(
+        manifest: &manifest::WorkerManifest,
+        client: Arc<dyn WorkspaceClient>,
+        prompts: Arc<crate::prompt::catalog::PromptCatalog>,
+    ) -> std::io::Result<Option<Self>> {
+        if !is_builtin_subjektiv_consolidation_profile(manifest) {
+            return Ok(None);
+        }
+        let config = &manifest.feature.subjektiv;
+        config
+            .validate_execution()
+            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+        if !config.profile.enabled || config.profile.extraction.enabled {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "subjektiv consolidation profile requires subject settings without automatic extraction",
+            ));
+        }
+        let workspace_id = client.workspace_id().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "subjektiv consolidation tools require Backend Workspace API authority",
+            )
+        })?;
+        let settings = config
+            .workspace_settings()
+            .expect("validated enabled subjektiv config has Workspace settings");
+        if settings.workspace_id != workspace_id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "subjektiv settings belong to {} instead of {}",
+                    settings.workspace_id, workspace_id
+                ),
+            ));
+        }
+        let system_prompt_override = prompts
+            .subjektiv_memory_consolidation_system(&settings.language)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Ok(Some(Self {
+            module: SubjektivConsolidationToolsFeature {
+                tools: workspace_http_subjektiv_consolidation_tools(client),
+            },
+            system_prompt_override,
+        }))
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct SubjektivConsolidationToolsFeature {
+    tools: Vec<ToolDefinition>,
+}
+
+impl FeatureModule for SubjektivConsolidationToolsFeature {
+    fn descriptor(&self) -> FeatureDescriptor {
+        let mut descriptor = FeatureDescriptor::builtin(
+            "subjektiv-memory-consolidation",
+            "subjektiv Memory Consolidation",
+        )
+        .with_description("Dedicated subject Memory staging consolidation tools.");
+        for tool in &self.tools {
+            let (meta, _) = tool();
+            descriptor = descriptor.with_tool(ToolDeclaration::new(meta.name, meta.description));
+        }
+        descriptor
+    }
+
+    fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
+        for tool in &self.tools {
+            let (meta, _) = tool();
+            context
+                .tools()
+                .register(ToolContribution::new(meta.name, tool.clone()))?;
+        }
+        Ok(())
     }
 }
 
@@ -795,10 +968,6 @@ impl MemoryToolsFeature {
         } else {
             workspace_http_memory_tools(client)
         };
-        Self { tools }
-    }
-
-    fn from_tools(tools: Vec<ToolDefinition>) -> Self {
         Self { tools }
     }
 }
@@ -828,7 +997,9 @@ impl FeatureModule for MemoryToolsFeature {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::WorkspaceResponse;
     use agen::tool::ToolDefinition;
+    use std::sync::Mutex;
 
     fn test_client() -> Arc<dyn WorkspaceClient> {
         Arc::new(crate::worker::TestWorkspaceHttpClient::new(
@@ -837,13 +1008,100 @@ mod tests {
         ))
     }
 
+    #[derive(Debug)]
+    struct SubjectResidentClient {
+        availability: memory::backend::MemoryResidentSummaryAvailability,
+        content: Option<String>,
+        scope_allowed: bool,
+        paths: Mutex<Vec<String>>,
+    }
+
+    impl SubjectResidentClient {
+        fn new(
+            availability: memory::backend::MemoryResidentSummaryAvailability,
+            content: Option<&str>,
+        ) -> Self {
+            Self {
+                availability,
+                content: content.map(str::to_string),
+                scope_allowed: true,
+                paths: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn denied() -> Self {
+            Self {
+                availability: memory::backend::MemoryResidentSummaryAvailability::Ready,
+                content: Some("must not be injected".into()),
+                scope_allowed: false,
+                paths: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl WorkspaceClient for SubjectResidentClient {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("workspace")
+        }
+
+        fn kind(&self) -> &str {
+            "subject-resident-test"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn execute(
+            &self,
+            request: WorkspaceRequest,
+        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            self.paths.lock().unwrap().push(request.path.clone());
+            assert!(request.path.ends_with("/subjektiv/memory"));
+            let request: server_api::SubjektivMemoryBackendRequest =
+                serde_json::from_str(request.body.as_deref().unwrap_or_default()).unwrap();
+            assert!(matches!(
+                request.operation,
+                server_api::SubjektivMemoryBackendOperation::ResidentSummary(_)
+            ));
+            if !self.scope_allowed {
+                return Ok(WorkspaceResponse {
+                    status: 403,
+                    body: "subject scope unavailable".into(),
+                });
+            }
+            Ok(WorkspaceResponse {
+                status: 200,
+                body: serde_json::to_string(
+                    &server_api::SubjektivMemoryBackendResponse::ResidentSummary(
+                        memory::backend::MemoryResidentSummaryOutput {
+                            availability: self.availability,
+                            content: self.content.clone(),
+                        },
+                    ),
+                )
+                .unwrap(),
+            })
+        }
+    }
+
     fn resident_client(content: &str) -> Arc<dyn WorkspaceClient> {
+        resident_client_state(
+            memory::backend::MemoryResidentSummaryAvailability::Ready,
+            Some(content),
+        )
+    }
+
+    fn resident_client_state(
+        availability: memory::backend::MemoryResidentSummaryAvailability,
+        content: Option<&str>,
+    ) -> Arc<dyn WorkspaceClient> {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let content = content.to_string();
+        let content = content.map(str::to_string);
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0_u8; 1024];
@@ -852,7 +1110,7 @@ mod tests {
                 "status": "ok",
                 "result": {
                     "kind": "resident_summary",
-                    "availability": "ready",
+                    "availability": availability,
                     "content": content,
                 }
             })
@@ -989,6 +1247,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dedicated_subjektiv_consolidator_uses_subject_settings_and_only_consolidation_tools() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut manifest = manifest::ProfileResolver::new()
+            .with_workspace_base(workspace.path())
+            .resolve(
+                &manifest::ProfileSelector::source_named(
+                    manifest::ProfileRegistrySource::Builtin,
+                    "subjektiv-memory-consolidation",
+                ),
+                manifest::ProfileResolveOptions::with_worker_name("subject-consolidator"),
+            )
+            .unwrap()
+            .manifest;
+        manifest
+            .feature
+            .subjektiv
+            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+                workspace_id: "workspace".into(),
+                settings_revision: 1,
+                language: "English".into(),
+            })
+            .unwrap();
+
+        assert!(!manifest.feature.memory.profile.enabled);
+        assert!(!ordinary_subjektiv_features_enabled(&manifest));
+        assert!(
+            MemoryFeatureInstallPlan::prepare(
+                &manifest,
+                test_client(),
+                crate::prompt::catalog::PromptCatalog::builtins_only().unwrap(),
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let plan = SubjektivConsolidationFeatureInstallPlan::prepare(
+            &manifest,
+            test_client(),
+            crate::prompt::catalog::PromptCatalog::builtins_only().unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            plan.module.descriptor().id.as_str(),
+            "builtin:subjektiv-memory-consolidation"
+        );
+        let names = tool_names(plan.module.tools);
+        assert!(names.contains(&"SubjektivMemoryQuery".to_string()));
+        assert!(names.contains(&"MemoryApplyCandidate".to_string()));
+        assert!(!names.contains(&"MemoryQuery".to_string()));
+        assert!(!names.contains(&"SubjektivRemember".to_string()));
+    }
+
     #[tokio::test]
     async fn memory_prompt_contribution_defers_resident_summary_until_loaded() {
         let prompts = crate::prompt::catalog::PromptCatalog::builtins_only().unwrap();
@@ -1027,6 +1339,132 @@ mod tests {
             restored.resident_summary_source.unwrap().load().await,
             SystemPromptContribution::Ready("updated resident summary".into())
         );
+    }
+
+    fn subject_manifest(workspace_id: &str) -> manifest::WorkerManifest {
+        let mut manifest = manifest::WorkerManifest::from_toml(
+            r#"
+[worker]
+name = "subject-worker"
+scope = "main"
+
+[model]
+scheme = "anthropic"
+model_id = "test-model"
+
+[engine]
+
+[[scope.allow]]
+target = "/subject-resident-test"
+permission = "write"
+"#,
+        )
+        .unwrap();
+        manifest.feature.subjektiv.profile.enabled = true;
+        manifest
+            .feature
+            .subjektiv
+            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+                workspace_id: workspace_id.to_string(),
+                settings_revision: 1,
+                language: "English".to_string(),
+            })
+            .unwrap();
+        manifest
+    }
+
+    #[tokio::test]
+    async fn subject_resident_source_preserves_only_current_ready_surface() {
+        let manifest = subject_manifest("workspace");
+        let ready_client = Arc::new(SubjectResidentClient::new(
+            memory::backend::MemoryResidentSummaryAvailability::Ready,
+            Some("current subject surface"),
+        ));
+        let ready = ordinary_subjektiv_resident_summary_source(&manifest, ready_client.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ready.load().await,
+            SystemPromptContribution::Ready("current subject surface".into())
+        );
+        assert_eq!(
+            ready_client.paths.lock().unwrap().clone(),
+            vec!["/api/w/workspace/subjektiv/memory".to_string()]
+        );
+
+        let ready_empty_client = Arc::new(SubjectResidentClient::new(
+            memory::backend::MemoryResidentSummaryAvailability::Ready,
+            None,
+        ));
+        let ready_empty = ordinary_subjektiv_resident_summary_source(&manifest, ready_empty_client)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ready_empty.load().await,
+            SystemPromptContribution::Ready(READY_EMPTY_RESIDENT_SURFACE.into())
+        );
+
+        for availability in [
+            memory::backend::MemoryResidentSummaryAvailability::Ungenerated,
+            memory::backend::MemoryResidentSummaryAvailability::Stale,
+            memory::backend::MemoryResidentSummaryAvailability::Failed,
+        ] {
+            let source = ordinary_subjektiv_resident_summary_source(
+                &manifest,
+                Arc::new(SubjectResidentClient::new(
+                    availability,
+                    Some("must not be injected"),
+                )),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(source.load().await, SystemPromptContribution::Unavailable);
+        }
+    }
+
+    #[tokio::test]
+    async fn subject_resident_source_fails_closed_without_trusted_subject_scope() {
+        let manifest = subject_manifest("workspace");
+        let client = Arc::new(SubjectResidentClient::denied());
+        let source = ordinary_subjektiv_resident_summary_source(&manifest, client.clone())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(source.load().await, SystemPromptContribution::Unavailable);
+        assert_eq!(
+            client.paths.lock().unwrap().clone(),
+            vec!["/api/w/workspace/subjektiv/memory".to_string()]
+        );
+    }
+
+    #[test]
+    fn subject_resident_source_requires_trusted_matching_workspace_config() {
+        let disabled = manifest::WorkerManifest::from_toml(
+            r#"
+[worker]
+name = "ordinary-worker"
+scope = "main"
+
+[model]
+scheme = "anthropic"
+model_id = "test-model"
+
+[engine]
+
+[[scope.allow]]
+target = "/subject-resident-test"
+permission = "write"
+"#,
+        )
+        .unwrap();
+        assert!(
+            ordinary_subjektiv_resident_summary_source(&disabled, test_client())
+                .unwrap()
+                .is_none()
+        );
+
+        let foreign = subject_manifest("other-workspace");
+        assert!(ordinary_subjektiv_resident_summary_source(&foreign, test_client()).is_err());
     }
 
     #[test]

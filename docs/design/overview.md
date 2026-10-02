@@ -16,7 +16,7 @@ That rule shapes the crate split. The runtime can restart, attach, compact, or d
 - `client` contains reusable Backend Workspace/Runtime clients plus the shared `Target` boundary. Its normal targets are exactly Standalone and Backend; it is not a subprocess launcher or repository-local product backend.
 - `manifest` resolves Profiles, Manifests, model/provider references, scopes, prompts, and tool permission policy into a runtime contract.
 - `tools` implements built-in tools with bounded output and policy-aware execution.
-- `memory` owns shared Memory domain, extraction, audit-event, and Workspace API transport types. Persistence and lifecycle execution belong to the Workspace Server control plane.
+- `memory` owns shared legacy Memory transport plus extraction/evidence schemas, not persistence. Legacy single-document Memory lives in the Workspace Server control-plane database; subject-scoped Memory lives in the Workspace's Server-managed `subjektiv` Feature database.
 - `workspace-server` is the local Workspace control-plane seam. It can project Tickets, Workers, lifecycle, usage, and orchestration events, but browser/API operations must stay on opaque backend identities instead of raw local paths, sockets, Worker names, or session files.
 - `tui` is a UI over either one in-process Standalone session or Backend Workspace/Runtime Worker authority; it should not invent a local Worker catalog or durable product state.
 

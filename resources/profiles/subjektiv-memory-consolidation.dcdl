@@ -8,14 +8,8 @@ import "./base.dcdl" // {
 
     feature = {
         task = { enabled = false; };
-        memory = {
-            enabled = true;
-            staging_tools = true;
-            resident = { inject_summary = false; };
-            extraction = { enabled = false; };
-            consolidation = { request_enabled = false; };
-        };
-        subjektiv = { enabled = false; extraction = { enabled = false; }; };
+        memory = { enabled = false; staging_tools = false; };
+        subjektiv = { enabled = true; extraction = { enabled = false; }; };
         web = { enabled = false; };
         image = { enabled = false; };
         sub_worker = { enabled = false; };

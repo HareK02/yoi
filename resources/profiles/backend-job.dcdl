@@ -12,6 +12,7 @@ import "./base.dcdl" // {
     feature = {
         task = { enabled = false; };
         memory = { enabled = false; };
+        subjektiv = { enabled = false; extraction = { enabled = false; }; };
         web = { enabled = false; };
         image = { enabled = false; };
         sub_worker = { enabled = false; };

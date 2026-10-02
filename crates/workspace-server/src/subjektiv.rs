@@ -141,6 +141,12 @@ pub struct SubjectRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubjectPage {
+    pub items: Vec<SubjectRecord>,
+    pub has_more: bool,
+}
+
 /// Immutable host-recorded history that attributes one durable Session to the
 /// subject and Worker that produced it. This is archival provenance only: it is
 /// deliberately not a current-Worker link or execution ownership record.
@@ -1082,6 +1088,35 @@ impl SubjektivStore {
                 )
                 .optional()?;
             raw.map(|raw| parse_subject(&raw)).transpose()
+        })
+    }
+
+    /// Lists one deterministic bounded page of subjects. Ordering uses immutable
+    /// creation time with the host-issued subject id as a total-order tie breaker.
+    pub fn list_subjects(&self, limit: usize) -> Result<SubjectPage> {
+        if !(1..=100).contains(&limit) {
+            return Err(SubjektivError::InvalidRecord(
+                "subject list limit must be between 1 and 100".to_string(),
+            ));
+        }
+        let query_limit = limit.saturating_add(1);
+        self.database.try_with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT record_json FROM subjects
+                 ORDER BY created_at ASC, subject_id ASC
+                 LIMIT ?1",
+            )?;
+            let rows = statement
+                .query_map([to_i64(query_limit as u64)?], |row| row.get::<_, String>(0))?;
+            let mut items = Vec::new();
+            for row in rows {
+                items.push(parse_subject(&row?)?);
+            }
+            let has_more = items.len() > limit;
+            if has_more {
+                items.truncate(limit);
+            }
+            Ok(SubjectPage { items, has_more })
         })
     }
 
@@ -3504,6 +3539,155 @@ mod tests {
         let registration = SubjektivStore::register(&workspace).unwrap();
         let store = SubjektivStore::open(&workspace, &registration).unwrap();
         (manager, workspace, store)
+    }
+
+    #[test]
+    fn subject_listing_is_deterministic_bounded_and_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_manager, _workspace, store) = open_store(temp.path(), "workspace-a");
+        let mut expected = vec![
+            store.create_subject(role()).unwrap(),
+            store.create_subject(role()).unwrap(),
+            store.create_subject(role()).unwrap(),
+        ];
+        expected.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        let page = store.list_subjects(2).unwrap();
+        assert_eq!(page.items, expected[..2]);
+        assert!(page.has_more);
+        assert!(store.list_subjects(0).is_err());
+        assert!(store.list_subjects(101).is_err());
+
+        assert!(store.subject("missing-subject").unwrap().is_none());
+        let complete = store.list_subjects(3).unwrap();
+        assert_eq!(complete.items, expected);
+        assert!(!complete.has_more);
+    }
+
+    #[test]
+    fn attributed_candidates_preserve_revision_and_surface_reference_continuity() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_manager, _workspace, store) = open_store(temp.path(), "workspace-a");
+        let subject = store.create_subject(role()).unwrap();
+        let session = attribution(
+            &subject.id,
+            "runtime-1",
+            "worker-1",
+            "session-1",
+            "2026-09-28T09:00:00.000Z",
+        );
+
+        let (first_candidate, stored_session) = store
+            .stage_candidate_with_attribution(
+                candidate(&subject.id, "candidate-1", "workspace-a"),
+                session.clone(),
+            )
+            .unwrap();
+        assert_eq!(stored_session, session);
+        assert_eq!(
+            first_candidate.source_refs[0].session_id.as_deref(),
+            Some("session-1")
+        );
+
+        let create_request = CandidateDecisionRequest {
+            request_id: "decision-create-1".into(),
+            candidate_id: first_candidate.id.clone(),
+            reason: "adopt the attributed candidate".into(),
+            decision: CandidateDecision::Apply {
+                target: MemoryRevisionTarget::Create,
+                draft: draft(
+                    "Keep the first confirmed rule",
+                    "initial attributed decision",
+                ),
+            },
+        };
+        let created = store
+            .decide_candidate(&subject.id, create_request.clone())
+            .unwrap();
+        let first_revision = created.memory.unwrap();
+        assert_eq!(first_revision.revision, 1);
+        assert_eq!(
+            first_revision.source_candidate_ids,
+            [first_candidate.id.clone()]
+        );
+        assert_eq!(created.resolution.affected_memory.len(), 1);
+        assert_eq!(created.resolution.affected_memory[0].revision, 1);
+
+        // Exact decision retries return the original receipt rather than creating
+        // a second revision or resolution.
+        let replayed = store.decide_candidate(&subject.id, create_request).unwrap();
+        assert_eq!(replayed.store_revision, created.store_revision);
+        assert_eq!(replayed.memory.as_ref().unwrap().revision, 1);
+
+        let (second_candidate, _) = store
+            .stage_candidate_with_attribution(
+                candidate(&subject.id, "candidate-2", "workspace-a"),
+                session,
+            )
+            .unwrap();
+        let revised = store
+            .decide_candidate(
+                &subject.id,
+                CandidateDecisionRequest {
+                    request_id: "decision-revise-2".into(),
+                    candidate_id: second_candidate.id.clone(),
+                    reason: "apply the attributed correction".into(),
+                    decision: CandidateDecision::Apply {
+                        target: MemoryRevisionTarget::Revise {
+                            memory_id: first_revision.id.clone(),
+                            expected_revision: 1,
+                        },
+                        draft: draft("Keep the corrected confirmed rule", "attributed correction"),
+                    },
+                },
+            )
+            .unwrap();
+        let second_revision = revised.memory.unwrap();
+        assert_eq!(second_revision.revision, 2);
+        assert_eq!(second_revision.source_candidate_ids, [second_candidate.id]);
+
+        let historical = store
+            .scoped_memory_revision(&subject.id, &first_revision.id, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(historical.source_candidate_ids, [first_candidate.id]);
+        assert_eq!(
+            store
+                .session_attribution("session-1")
+                .unwrap()
+                .unwrap()
+                .subject_id,
+            subject.id
+        );
+
+        let generation = store.prepare_surface_generation(&subject.id).unwrap();
+        assert_eq!(generation.materials.len(), 1);
+        assert_eq!(generation.materials[0].memory_id, second_revision.id);
+        assert_eq!(generation.materials[0].revision, 2);
+        let expected_ref = MemoryRevisionRef {
+            memory_id: second_revision.id.clone(),
+            revision: second_revision.revision,
+        };
+        let published = store
+            .publish_surface_generation(
+                &subject.id,
+                &generation.id,
+                vec![SurfacePoint {
+                    body_md: "- Keep the corrected confirmed rule".into(),
+                    memory_refs: vec![expected_ref.clone()],
+                }],
+            )
+            .unwrap();
+        assert_eq!(published.memory_refs, [expected_ref.clone()]);
+        assert_eq!(published.built_from_store_revision, revised.store_revision);
+
+        let resident = store.resident_surface(&subject.id).unwrap();
+        assert_eq!(resident.availability, SurfaceAvailability::Ready);
+        assert_eq!(resident.snapshot.unwrap().memory_refs, [expected_ref]);
     }
 
     #[test]

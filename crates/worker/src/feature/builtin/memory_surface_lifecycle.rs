@@ -14,7 +14,9 @@ use crate::feature::background::{
     BackgroundTaskCancellation, BackgroundTaskContext, BackgroundTaskSpec, BackgroundTaskTrigger,
     FeatureBackgroundTask,
 };
-use crate::feature::builtin::memory::WorkspaceMemoryBackendError;
+use crate::feature::builtin::memory::{
+    WorkspaceMemoryBackendError, is_builtin_subjektiv_consolidation_profile,
+};
 use crate::feature::builtin::memory_surface_output::{
     MemorySurfaceOutputFeature, MemorySurfaceOutputState, submit_llm_tool_definition,
 };
@@ -98,19 +100,15 @@ impl SubjektivSurfaceLifecycleFeature {
         prompts: Arc<ArcSwap<PromptCatalog>>,
         workspace_context: WorkerWorkspaceContext,
     ) -> std::io::Result<Option<Self>> {
-        let dedicated = manifest.profile.as_ref().is_some_and(|snapshot| {
-            matches!(
-                &snapshot.source,
-                manifest::ProfileSource::Registry {
-                    source: manifest::ProfileRegistrySource::Builtin,
-                    name,
-                    ..
-                } if name == "subjektiv-memory-consolidation"
-            )
-        });
+        let dedicated = is_builtin_subjektiv_consolidation_profile(&manifest);
         if !lifecycle_enabled || !dedicated {
             return Ok(None);
         }
+        manifest
+            .feature
+            .subjektiv
+            .validate_execution()
+            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
         if !workspace_client.is_available() || workspace_client.workspace_id().is_none() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -260,13 +258,13 @@ impl SubjektivSurfaceLifecycleTask {
         let language = self
             .manifest
             .feature
-            .memory
+            .subjektiv
             .workspace_settings()
             .map(|settings| settings.language)
             .ok_or_else(|| {
                 SurfaceEditorFailure::editor(HookError::new(
                     HookErrorCategory::Internal,
-                    "surface editor requires bound Workspace Memory settings",
+                    "surface editor requires bound subjektiv Workspace settings",
                 ))
             })?;
         let system_prompt = self
@@ -721,10 +719,10 @@ permission = "write"
 "#,
         )
         .unwrap();
-        manifest.feature.memory.profile.enabled = true;
+        manifest.feature.subjektiv.profile.enabled = true;
         manifest
             .feature
-            .memory
+            .subjektiv
             .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
                 workspace_id: "workspace-1".into(),
                 settings_revision: 1,

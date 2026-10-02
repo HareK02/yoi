@@ -1,6 +1,6 @@
 # Server-managed Feature storage
 
-`yoi-workspace-server::feature_storage` provides the SQLite lifecycle boundary for trusted Server-side Features. It is not a Worker feature API and it is not a model-visible SQL tool.
+`yoi-workspace-server::feature_storage` provides the SQLite lifecycle boundary for trusted Server-side Features. It is not a Worker feature API and it is not a model-visible SQL tool. Subject-scoped Memory is persisted in the Workspace's `subjektiv` Feature database through this boundary; legacy single-document Workspace Memory remains in the control-plane database and is not owned, imported, or reset by `FeatureStorage`.
 
 ## Ownership boundary
 
@@ -126,7 +126,7 @@ Not registering/opening a disabled Feature creates nothing. Disabling a previous
 
 `WorkspaceFeatureStorage::backup` uses SQLite's online backup API for each discovered Feature database, so a live WAL is not ignored or copied as a bare database file. Each image passes `integrity_check` and `foreign_key_check`, and a manifest binds the snapshot to its Workspace and Feature identifiers. The snapshot directory is published with an atomic rename only after all images succeed.
 
-Each Feature image is internally consistent. There is deliberately no cross-database snapshot instant or distributed transaction between Feature databases or the Server DB. A caller that needs a higher-level coordinated backup must first stop relevant Feature writers.
+Each Feature image is internally consistent. There is deliberately no cross-database snapshot instant or distributed transaction between Feature databases or the Server DB. A caller that needs a higher-level coordinated backup must first stop relevant Feature writers. In particular, the [subjektiv product cutover](../development/subjektiv-product-cutover.md) stops legacy and subjektiv activity before pairing a control-plane backup with the subjektiv Feature backup; the explicit legacy reset never deletes or recreates the Feature database.
 
 `restore` rejects the wrong Workspace manifest, corrupt/foreign-key-invalid images, an existing destination, or any live connection. It builds validated databases in a temporary directory and atomically publishes the Workspace storage directory. Restore is an operator/Server lifecycle operation, not a model API.
 
