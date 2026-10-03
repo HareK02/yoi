@@ -49,6 +49,7 @@ tungstenite = { version = "0.28.0", default-features = false, features = ["hands
 tokio-tungstenite = { version = "0.28.0", default-features = false, features = ["native-tls", "connect"] }
 futures-util = { version = "0.3", features = ["sink"] }
 jsonschema = { version = "0.33.0", default-features = false }
+base64 = { workspace = true }
 wip-client = { workspace = true }
 wip-http = { workspace = true }
 wip-protocol = { workspace = true }

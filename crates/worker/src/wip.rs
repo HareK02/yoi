@@ -16,6 +16,8 @@ use agen::llm_client::client::LlmClient;
 use agen::state::Mutable;
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use http::{Request, Response};
 use manifest::{ToolPermissionAction, ToolPermissionConfig};
 use serde::Deserialize;
@@ -27,9 +29,9 @@ use wip_client::{
     RequestId, SecurityContext, SessionId,
 };
 use wip_http::{
-    Endpoint, Limits, Route, decode_call_operation_metadata, decode_fetch_interface_request,
-    decode_observe_request, encode_call_operation_response, encode_fetch_interface_response,
-    encode_observe_response, encode_protocol_error_response,
+    Endpoint, Limits, Route, decode_call_operation_metadata, decode_call_operation_request,
+    decode_fetch_interface_request, decode_observe_request, encode_call_operation_response,
+    encode_fetch_interface_response, encode_observe_response, encode_protocol_error_response,
 };
 use wip_protocol::{
     CallOperationRequest, CallOperationResponse, Documentation, FetchInterfaceResponse,
@@ -872,32 +874,22 @@ impl WipRuntime {
         arguments: Json,
         execution: ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
-        let arguments = match self
-            .host
-            .projection(&path)
-            .map(|projection| projection.kind)
-        {
-            Some(WipProjectionKind::Compatibility) => BTreeMap::from([(
-                "input".to_string(),
-                json_to_wip(&arguments).map_err(ToolError::InvalidArgument)?,
-            )]),
-            Some(WipProjectionKind::Native) => {
-                let Json::Object(arguments) = &arguments else {
-                    return Err(ToolError::InvalidArgument(
-                        "native WIP operation arguments must be a JSON object keyed by descriptor parameter name"
-                            .into(),
-                    ));
-                };
-                arguments
-                    .iter()
-                    .map(|(name, value)| {
-                        Ok((
-                            name.clone(),
-                            json_to_wip(value).map_err(ToolError::InvalidArgument)?,
-                        ))
-                    })
-                    .collect::<Result<BTreeMap<_, _>, ToolError>>()?
+        let arguments = match self.host.projection(&path) {
+            Some(projection) if projection.kind == WipProjectionKind::Compatibility => {
+                BTreeMap::from([(
+                    "input".to_string(),
+                    json_to_wip(&arguments).map_err(ToolError::InvalidArgument)?,
+                )])
             }
+            Some(projection) => decode_native_arguments(
+                &path,
+                &interface,
+                &operation,
+                &arguments,
+                &projection.descriptor,
+                self.wire_limits,
+            )
+            .map_err(ToolError::InvalidArgument)?,
             None => {
                 return Err(ToolError::InvalidArgument(format!(
                     "WIP target `{path}` is not published"
@@ -1488,6 +1480,11 @@ fn descriptor_json(descriptor: &InterfaceDescriptor) -> Json {
     json!({
         "format": descriptor.format,
         "documentation": descriptor.documentation.as_ref().map(documentation_json),
+        "types": descriptor.types.iter().map(|declaration| json!({
+            "name": declaration.name,
+            "documentation": declaration.documentation.as_ref().map(documentation_json),
+            "definition": type_json(&declaration.definition),
+        })).collect::<Vec<_>>(),
         "operations": descriptor.operations.iter().map(|operation| json!({
             "name": operation.name,
             "documentation": operation.documentation.as_ref().map(documentation_json),
@@ -1523,10 +1520,34 @@ fn type_json(value: &TypeExpr) -> Json {
         TypeExpr::Json => json!("json"),
         TypeExpr::Entry => json!("entry"),
         TypeExpr::Named { name } => json!({"named": name}),
-        TypeExpr::Record { .. } => json!("record"),
-        TypeExpr::List { .. } => json!("list"),
-        TypeExpr::Enum { .. } => json!("enum"),
-        TypeExpr::Union { .. } => json!("union"),
+        TypeExpr::Record { fields } => json!({
+            "record": {
+                "fields": fields.iter().map(|field| json!({
+                    "name": field.name,
+                    "required": field.required,
+                    "documentation": field.documentation.as_ref().map(documentation_json),
+                    "type": type_json(&field.r#type),
+                })).collect::<Vec<_>>()
+            }
+        }),
+        TypeExpr::List { items } => json!({"list": {"items": type_json(items)}}),
+        TypeExpr::Enum { cases } => json!({
+            "enum": {
+                "cases": cases.iter().map(|case| json!({
+                    "name": case.name,
+                    "documentation": case.documentation.as_ref().map(documentation_json),
+                })).collect::<Vec<_>>()
+            }
+        }),
+        TypeExpr::Union { cases } => json!({
+            "union": {
+                "cases": cases.iter().map(|case| json!({
+                    "name": case.name,
+                    "documentation": case.documentation.as_ref().map(documentation_json),
+                    "payload": case.payload.as_ref().map(type_json),
+                })).collect::<Vec<_>>()
+            }
+        }),
     }
 }
 
@@ -1591,6 +1612,26 @@ fn json_output(summary: String, value: Json) -> ToolOutput {
     }
 }
 
+fn decode_native_arguments(
+    path: &str,
+    interface: &str,
+    operation: &str,
+    arguments: &Json,
+    descriptor: &InterfaceDescriptor,
+    limits: Limits,
+) -> Result<BTreeMap<String, Value>, String> {
+    let body = serde_json::to_vec(&json!({
+        "target": {"path": path},
+        "interface": {"reference": interface},
+        "operation": operation,
+        "arguments": arguments,
+    }))
+    .map_err(|error| format!("failed to encode native WIP arguments: {error}"))?;
+    decode_call_operation_request(&body, descriptor, limits)
+        .map(|request| request.arguments)
+        .map_err(|error| format!("native WIP arguments do not match the descriptor: {error}"))
+}
+
 fn json_to_wip(value: &Json) -> Result<Value, String> {
     match value {
         Json::Null => Ok(Value::Unit),
@@ -1637,7 +1678,7 @@ fn wip_to_json(value: &Value) -> Result<Json, String> {
         Value::Number(value) if value.is_finite() => Ok(json!(value)),
         Value::Number(_) => Err("WIP number is not finite".into()),
         Value::String(value) => Ok(Json::String(value.clone())),
-        Value::Bytes(_) => Err("WIP bytes cannot be projected into JSON tool arguments".into()),
+        Value::Bytes(value) => Ok(Json::String(BASE64_STANDARD.encode(value))),
         Value::Record(values) => values
             .iter()
             .map(|(name, value)| Ok((name.clone(), wip_to_json(value)?)))
@@ -1662,6 +1703,7 @@ mod tests {
     use agen::llm_client::{ClientError, Request as LlmRequest, ResponseStream};
     use futures::stream;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use wip_protocol::{EnumCase, FieldDeclaration, TypeDeclaration, UnionCase};
 
     struct EchoTool {
         calls: Arc<AtomicUsize>,
@@ -1812,96 +1854,225 @@ mod tests {
         ));
     }
 
-    struct NativeConcat;
+    struct NativeTyped;
 
     #[async_trait]
-    impl WipOperationHandler for NativeConcat {
+    impl WipOperationHandler for NativeTyped {
         async fn call(
             &self,
             operation: &str,
             arguments: &BTreeMap<String, Value>,
             _context: WipCallContext,
         ) -> Result<WipOperationOutput, WipOperationError> {
-            assert_eq!(operation, "concat");
-            let (Some(Value::String(left)), Some(Value::String(right))) =
-                (arguments.get("left"), arguments.get("right"))
-            else {
-                panic!("descriptor validation must run before native handler")
-            };
-            Ok(WipOperationOutput::native(Value::String(format!(
-                "{left}{right}"
-            ))))
+            assert_eq!(operation, "accept");
+            assert_eq!(arguments.get("number"), Some(&Value::Number(1.0)));
+            assert_eq!(
+                arguments.get("bytes"),
+                Some(&Value::Bytes(vec![0, 1, 2, 255]))
+            );
+            assert_eq!(
+                arguments.get("payload"),
+                Some(&Value::Record(BTreeMap::from([
+                    ("label".into(), Value::String("item".into())),
+                    (
+                        "tags".into(),
+                        Value::List(vec![
+                            Value::String("red".into()),
+                            Value::String("blue".into()),
+                        ]),
+                    ),
+                    (
+                        "choice".into(),
+                        Value::Record(BTreeMap::from([
+                            ("$case".into(), Value::String("found".into())),
+                            ("value".into(), Value::String("/items/1".into())),
+                        ])),
+                    ),
+                ])))
+            );
+            Ok(WipOperationOutput::native(Value::Bytes(vec![255, 0, 1])))
         }
     }
 
-    fn native_concat_projection() -> WipProjection {
+    fn documentation(summary: &str) -> Option<Documentation> {
+        Some(Documentation {
+            summary: summary.into(),
+            details: None,
+        })
+    }
+
+    fn native_typed_projection() -> WipProjection {
         WipProjection {
-            route: "/native/concat".into(),
-            capability: "native:concat".into(),
+            route: "/native/typed".into(),
+            capability: "native:typed".into(),
             kind: WipProjectionKind::Native,
             object: Object {
-                name: "concat".into(),
-                description: Some("native concat sample".into()),
-                interfaces: vec!["yoi.native/concat/v1".into()],
-                r#ref: Some("native:concat".into()),
+                name: "typed".into(),
+                description: Some("native typed sample".into()),
+                interfaces: vec!["yoi.native/typed/v1".into()],
+                r#ref: Some("native:typed".into()),
                 validator: Some(vec![1]),
             },
-            interface: "yoi.native/concat/v1".into(),
+            interface: "yoi.native/typed/v1".into(),
             descriptor: InterfaceDescriptor {
                 format: INTERFACE_FORMAT_V1.into(),
-                documentation: None,
-                types: Vec::new(),
+                documentation: documentation("typed interface"),
+                types: vec![TypeDeclaration {
+                    name: "Payload".into(),
+                    documentation: documentation("named payload"),
+                    definition: TypeExpr::Record {
+                        fields: vec![
+                            FieldDeclaration {
+                                name: "label".into(),
+                                required: true,
+                                documentation: documentation("payload label"),
+                                r#type: TypeExpr::String,
+                            },
+                            FieldDeclaration {
+                                name: "tags".into(),
+                                required: false,
+                                documentation: documentation("payload tags"),
+                                r#type: TypeExpr::List {
+                                    items: Box::new(TypeExpr::Enum {
+                                        cases: vec![
+                                            EnumCase {
+                                                name: "red".into(),
+                                                documentation: documentation("red tag"),
+                                            },
+                                            EnumCase {
+                                                name: "blue".into(),
+                                                documentation: documentation("blue tag"),
+                                            },
+                                        ],
+                                    }),
+                                },
+                            },
+                            FieldDeclaration {
+                                name: "choice".into(),
+                                required: true,
+                                documentation: documentation("payload choice"),
+                                r#type: TypeExpr::Union {
+                                    cases: vec![
+                                        UnionCase {
+                                            name: "empty".into(),
+                                            documentation: documentation("empty choice"),
+                                            payload: None,
+                                        },
+                                        UnionCase {
+                                            name: "found".into(),
+                                            documentation: documentation("found entry"),
+                                            payload: Some(TypeExpr::Entry),
+                                        },
+                                    ],
+                                },
+                            },
+                        ],
+                    },
+                }],
                 operations: vec![OperationDeclaration {
-                    name: "concat".into(),
-                    documentation: None,
+                    name: "accept".into(),
+                    documentation: documentation("accept typed values"),
                     parameters: vec![
                         ParameterDeclaration {
-                            name: "left".into(),
+                            name: "payload".into(),
                             required: true,
-                            documentation: None,
-                            r#type: TypeExpr::String,
+                            documentation: documentation("named payload argument"),
+                            r#type: TypeExpr::Named {
+                                name: "Payload".into(),
+                            },
                         },
                         ParameterDeclaration {
-                            name: "right".into(),
+                            name: "number".into(),
                             required: true,
                             documentation: None,
-                            r#type: TypeExpr::String,
+                            r#type: TypeExpr::Number,
+                        },
+                        ParameterDeclaration {
+                            name: "bytes".into(),
+                            required: true,
+                            documentation: None,
+                            r#type: TypeExpr::Bytes,
                         },
                     ],
                     returns: ReturnDeclaration {
                         documentation: None,
-                        r#type: TypeExpr::String,
+                        r#type: TypeExpr::Bytes,
                     },
                 }],
             },
             interface_validator: Some(vec![1]),
-            handler: Arc::new(NativeConcat),
+            handler: Arc::new(NativeTyped),
         }
     }
 
     #[tokio::test]
-    async fn native_projection_accepts_descriptor_named_arguments_end_to_end() {
+    async fn native_projection_preserves_descriptor_and_decodes_typed_arguments_end_to_end() {
         let mut registry = WipMountRegistry::new();
-        registry.mount(native_concat_projection()).unwrap();
+        registry.mount(native_typed_projection()).unwrap();
         let runtime =
             WipRuntime::new(WipHost::new(registry), SecurityContext::new("worker-a"), 0).unwrap();
         runtime.discover("/".into(), 2, false).await.unwrap();
-        runtime
-            .inspect("yoi.native/concat/v1".into(), false)
+        let inspected = runtime
+            .inspect("yoi.native/typed/v1".into(), false)
             .await
             .unwrap();
+        let inspected: Json = serde_json::from_str(inspected.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            inspected.pointer(
+                "/descriptor/types/0/definition/record/fields/1/type/list/items/enum/cases/0/documentation/summary"
+            ),
+            Some(&json!("red tag"))
+        );
+        assert_eq!(
+            inspected.pointer("/descriptor/types/0/definition/record/fields/1/required"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            inspected.pointer(
+                "/descriptor/types/0/definition/record/fields/2/type/union/cases/1/payload"
+            ),
+            Some(&json!("entry"))
+        );
+
         let output = runtime
             .call(
-                "/native/concat".into(),
-                "yoi.native/concat/v1".into(),
-                "concat".into(),
-                json!({"left": "W", "right": "IP"}),
+                "/native/typed".into(),
+                "yoi.native/typed/v1".into(),
+                "accept".into(),
+                json!({
+                    "payload": {
+                        "label": "item",
+                        "tags": ["red", "blue"],
+                        "choice": {"$case": "found", "value": "/items/1"}
+                    },
+                    "number": 1,
+                    "bytes": "AAEC/w=="
+                }),
                 ToolExecutionContext::direct(),
             )
             .await
             .unwrap();
         assert_eq!(output.summary, "WIP operation completed");
-        assert_eq!(output.content.as_deref(), Some("\"WIP\""));
+        assert_eq!(output.content.as_deref(), Some("\"/wAB\""));
+
+        let invalid = runtime
+            .call(
+                "/native/typed".into(),
+                "yoi.native/typed/v1".into(),
+                "accept".into(),
+                json!({
+                    "payload": {
+                        "label": "item",
+                        "choice": {"$case": "empty"}
+                    },
+                    "number": 1,
+                    "bytes": "AAEC_w=="
+                }),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap_err();
+        assert!(invalid.to_string().contains("canonical base64"));
     }
 
     #[tokio::test]

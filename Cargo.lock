@@ -6409,6 +6409,7 @@ dependencies = [
  "agen",
  "arc-swap",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "client",

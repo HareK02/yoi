@@ -46,7 +46,7 @@ Each object has one opaque interface reference:
 yoi.tool/<exact-tool-registration-name>/v1
 ```
 
-Its single operation is `call`. For this compatibility route, `WipCall.arguments` is the original ordinary tool argument object. Native projections instead receive a JSON object keyed by the descriptor's declared parameter names. Tool argument IDs remain JSON values; the adapter never infers a domain object or Worldspace route from them.
+Its single operation is `call`. For this compatibility route, `WipCall.arguments` is the original ordinary tool argument object. Native projections instead receive a JSON object keyed by the descriptor's declared parameter names. Native input is decoded with the published `wip-http` descriptor-bound codec, so named and composite types are resolved, an integral JSON number remains a WIP `Number` when declared as such, and WIP `Bytes` use the codec's canonical RFC 4648 base64 JSON representation. Tool argument IDs remain JSON values; the adapter never infers a domain object or Worldspace route from them.
 
 The interface descriptor uses WIP `Json` for compatibility input and includes the exact original JSON Schema in descriptor documentation. Before execution, the Host validates the JSON value with that original schema and then delegates to the original async `Tool`. Constraints are therefore neither approximated nor silently dropped. A schema that cannot be compiled prevents WIP startup instead of creating a weaker projection.
 
@@ -61,7 +61,7 @@ The interface descriptor uses WIP `Json` for compatibility input and includes th
 - A native projection replaces a compatibility projection only when both declare the same semantic capability (`tool:<registration-name>` for compatibility tools).
 - When native is already selected, the compatibility tool is hidden rather than exposed through a second entry.
 
-The unit samples `mount_collision_and_native_replacement_are_explicit` and `native_projection_accepts_descriptor_named_arguments_end_to_end` demonstrate independent native registration, deterministic replacement, collision rejection, and a complete native invocation.
+`WipInspect` renders the complete descriptor, including descriptor-local named declarations and recursive record, list, enum, and union shapes with required flags and declaration documentation. The unit samples `mount_collision_and_native_replacement_are_explicit` and `native_projection_preserves_descriptor_and_decodes_typed_arguments_end_to_end` demonstrate independent native registration, deterministic replacement, collision rejection, complete descriptor inspection, and a descriptor-typed native invocation.
 
 ## Authority and execution
 
