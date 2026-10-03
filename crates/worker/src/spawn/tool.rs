@@ -883,6 +883,7 @@ fn build_spawn_config_json(
     let config = WorkerManifestConfig {
         worker: WorkerMetaConfig {
             name: Some(name.to_string()),
+            mode: None,
         },
         model: model.clone(),
         engine: EngineManifestConfig {
@@ -957,6 +958,7 @@ fn manifest_to_reusable_config(manifest: &WorkerManifest) -> WorkerManifestConfi
     WorkerManifestConfig {
         worker: WorkerMetaConfig {
             name: Some(manifest.worker.name.clone()),
+            mode: Some(manifest.worker.mode),
         },
         model: manifest.model.clone(),
         engine: EngineManifestConfig {
@@ -1871,6 +1873,7 @@ enabled = false
         WorkerManifestConfig {
             worker: WorkerMetaConfig {
                 name: Some("parent".into()),
+                mode: None,
             },
             model: ModelManifest {
                 scheme: Some(SchemeKind::Anthropic),
@@ -2188,7 +2191,8 @@ max_tokens = 3333
         let delegated = tmp.path().join("delegated");
         std::fs::create_dir_all(&parent_deny).unwrap();
         std::fs::create_dir_all(&delegated).unwrap();
-        let parent = parent_manifest(&parent_root, Some(&parent_deny));
+        let mut parent = parent_manifest(&parent_root, Some(&parent_deny));
+        parent.worker.mode = manifest::WorkerMode::Wip;
         let scope = vec![abs_rule(&delegated, Permission::Read)];
         let available = AvailableProfiles {
             registry: None,
@@ -2206,6 +2210,7 @@ max_tokens = 3333
         );
 
         assert_eq!(config.worker.name.as_deref(), Some("inherited-child"));
+        assert_eq!(config.worker.mode, Some(manifest::WorkerMode::Wip));
         assert_eq!(config.model.model_id.as_deref(), Some("parent-model"));
         assert_eq!(config.engine.instruction.as_deref(), Some("default"));
         assert_eq!(config.engine.language.as_deref(), Some("Parentish"));

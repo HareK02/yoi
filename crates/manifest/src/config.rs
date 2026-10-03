@@ -590,6 +590,8 @@ impl From<FeatureConfig> for FeatureConfigPartial {
 pub struct WorkerMetaConfig {
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub mode: Option<crate::WorkerMode>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -925,6 +927,7 @@ impl WorkerMetaConfig {
     fn merge(self, upper: Self) -> Self {
         Self {
             name: upper.name.or(self.name),
+            mode: upper.mode.or(self.mode),
         }
     }
 }
@@ -1356,7 +1359,10 @@ impl TryFrom<WorkerManifestConfig> for WorkerManifest {
         validate_mcp_config(&cfg.mcp)?;
 
         Ok(WorkerManifest {
-            worker: WorkerMeta { name },
+            worker: WorkerMeta {
+                name,
+                mode: cfg.worker.mode.unwrap_or_default(),
+            },
             model: cfg.model,
             engine,
             scope: cfg.scope,
@@ -1391,6 +1397,7 @@ mod tests {
         WorkerManifestConfig {
             worker: WorkerMetaConfig {
                 name: Some("test".into()),
+                mode: None,
             },
             model: ModelManifest {
                 scheme: Some(SchemeKind::Anthropic),
@@ -1498,8 +1505,29 @@ mod tests {
     fn resolve_minimal_succeeds() {
         let manifest: WorkerManifest = minimal_valid().try_into().unwrap();
         assert_eq!(manifest.worker.name, "test");
+        assert_eq!(manifest.worker.mode, crate::WorkerMode::Tools);
         assert_eq!(manifest.model.scheme, Some(SchemeKind::Anthropic));
         assert!(manifest.permissions.is_none());
+    }
+
+    #[test]
+    fn worker_mode_is_explicit_opt_in_and_persists_in_snapshots() {
+        let mut configured = minimal_valid();
+        configured.worker.mode = Some(crate::WorkerMode::Wip);
+        let manifest: WorkerManifest = configured.try_into().unwrap();
+        assert_eq!(manifest.worker.mode, crate::WorkerMode::Wip);
+
+        let snapshot = crate::write_persisted_worker_manifest_snapshot(&manifest).unwrap();
+        let restored = crate::read_persisted_worker_manifest_snapshot(snapshot.clone()).unwrap();
+        assert_eq!(restored.worker.mode, crate::WorkerMode::Wip);
+
+        let mut legacy = snapshot;
+        legacy["manifest"]["worker"]
+            .as_object_mut()
+            .unwrap()
+            .remove("mode");
+        let restored = crate::read_persisted_worker_manifest_snapshot(legacy).unwrap();
+        assert_eq!(restored.worker.mode, crate::WorkerMode::Tools);
     }
 
     #[test]
@@ -1784,6 +1812,7 @@ mod tests {
         let lower = WorkerManifestConfig {
             worker: WorkerMetaConfig {
                 name: Some("lower".into()),
+                mode: None,
             },
             model: ModelManifest {
                 model_id: Some("lower-model".into()),
@@ -1794,6 +1823,7 @@ mod tests {
         let upper = WorkerManifestConfig {
             worker: WorkerMetaConfig {
                 name: Some("upper".into()),
+                mode: None,
             },
             ..Default::default()
         };
@@ -2248,6 +2278,7 @@ enabled = false
             .merge(WorkerManifestConfig {
                 worker: WorkerMetaConfig {
                     name: Some("feature-test".into()),
+                    mode: None,
                 },
                 model: ModelManifest {
                     scheme: Some(SchemeKind::Anthropic),
@@ -2351,6 +2382,7 @@ enabled = true
             .merge(WorkerManifestConfig {
                 worker: WorkerMetaConfig {
                     name: Some("feature-merge-test".into()),
+                    mode: None,
                 },
                 model: ModelManifest {
                     scheme: Some(SchemeKind::Anthropic),
@@ -2428,6 +2460,7 @@ permission = "write"
         let overlay = WorkerManifestConfig {
             worker: WorkerMetaConfig {
                 name: Some("x".into()),
+                mode: None,
             },
             model: ModelManifest {
                 scheme: Some(SchemeKind::Anthropic),

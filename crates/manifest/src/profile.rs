@@ -626,6 +626,7 @@ fn resolve_profile_value(
     let config = WorkerManifestConfig {
         worker: WorkerMetaConfig {
             name: Some(worker_name),
+            mode: profile.worker.and_then(|worker| worker.mode),
         },
         model: profile.model.unwrap_or_default(),
         engine: profile.engine.unwrap_or_default(),
@@ -668,6 +669,8 @@ struct ProfileConfig {
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
+    worker: Option<ProfileWorkerConfig>,
+    #[serde(default)]
     model: Option<ModelManifest>,
     #[serde(default)]
     engine: Option<EngineManifestConfig>,
@@ -689,6 +692,13 @@ struct ProfileConfig {
     web: Option<WebConfig>,
     #[serde(default)]
     skills: Option<SkillsConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileWorkerConfig {
+    #[serde(default)]
+    mode: Option<crate::WorkerMode>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -864,8 +874,15 @@ fn reject_manifest_shaped_profile(value: &serde_json::Value) -> Result<(), Profi
             )));
         }
     }
-    if map.contains_key("worker") {
-        return Err(ProfileError::InvalidProfile("field `worker` is runtime-bound and is not allowed in reusable Profiles; pass the Worker name via CLI/TUI runtime inputs".into()));
+    if let Some(worker) = map.get("worker") {
+        let Some(worker) = worker.as_object() else {
+            return Err(ProfileError::InvalidProfile(
+                "field `worker` must be an object containing only reusable `mode` policy".into(),
+            ));
+        };
+        if worker.contains_key("name") {
+            return Err(ProfileError::InvalidProfile("field `worker.name` is runtime-bound and is not allowed in reusable Profiles; pass the Worker name via CLI/TUI runtime inputs".into()));
+        }
     }
     if let Some(scope) = map.get("scope").and_then(|v| v.as_object()) {
         for key in ["allow", "deny"] {
@@ -1691,6 +1708,7 @@ mod tests {
             r#"
 slug = "coder"
 scope = "workspace_read"
+worker = { mode = "wip" }
 
 [model]
 scheme = "anthropic"
@@ -1710,6 +1728,7 @@ reasoning = "high"
             )
             .unwrap();
         assert_eq!(resolved.manifest.worker.name, "runtime-worker");
+        assert_eq!(resolved.manifest.worker.mode, crate::WorkerMode::Wip);
         assert_eq!(resolved.manifest.model.scheme, Some(SchemeKind::Anthropic));
         assert_eq!(
             resolved.manifest.engine.reasoning,

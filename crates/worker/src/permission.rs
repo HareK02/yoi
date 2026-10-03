@@ -21,16 +21,7 @@ impl PermissionHook {
     }
 
     fn action_for(&self, input: &ToolCallSummary) -> ToolPermissionAction {
-        let target = permission_target(&input.arguments);
-        self.config
-            .rules
-            .iter()
-            .find(|rule| {
-                rule.tool.eq_ignore_ascii_case(&input.tool_name)
-                    && wildcard_match(&rule.pattern, &target)
-            })
-            .map(|rule| rule.action)
-            .unwrap_or(self.config.default_action)
+        permission_action_for(&self.config, &input.tool_name, &input.arguments)
     }
 }
 
@@ -39,7 +30,9 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let Some(permissions) = self.manifest().permissions.clone() else {
             return;
         };
-        self.add_pre_tool_call_hook(PermissionHook::new(permissions));
+        if self.manifest().worker.mode == manifest::WorkerMode::Tools {
+            self.add_pre_tool_call_hook(PermissionHook::new(permissions));
+        }
     }
 }
 
@@ -57,6 +50,22 @@ impl Hook<PreToolCall> for PermissionHook {
             }
         })
     }
+}
+
+pub(crate) fn permission_action_for(
+    config: &ToolPermissionConfig,
+    tool_name: &str,
+    arguments: &Value,
+) -> ToolPermissionAction {
+    let target = permission_target(arguments);
+    config
+        .rules
+        .iter()
+        .find(|rule| {
+            rule.tool.eq_ignore_ascii_case(tool_name) && wildcard_match(&rule.pattern, &target)
+        })
+        .map(|rule| rule.action)
+        .unwrap_or(config.default_action)
 }
 
 fn permission_denied_message(input: &ToolCallSummary) -> String {

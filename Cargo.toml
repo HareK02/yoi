@@ -73,6 +73,7 @@ default-members = [
 [workspace.package]
 edition = "2024"
 license = "MIT"
+rust-version = "1.88"
 
 [profile.dev]
 debug = "line-tables-only"
@@ -124,6 +125,7 @@ decodal-language-service = "0.4.0"
 decodal-language-tools = "0.4.0"
 fs4 = "0.13"
 futures = "0.3"
+http = "1"
 libc = "0.2"
 schemars = "1.2"
 serde = "1.0"
@@ -144,5 +146,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2.5"
 uuid = "1.23"
+wip-client = "0.1.0"
+wip-http = "0.1.0"
+wip-protocol = "0.1.0"
 zeroize = "1"
 webauthn-rs = { version = "0.5.2", features = ["danger-allow-state-serialisation", "danger-credential-internals"] }

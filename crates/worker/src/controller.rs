@@ -1631,6 +1631,23 @@ where
     if let Some((resident_summary, system_prompt_override)) = feature_prompt_contribution {
         worker.install_system_prompt_contribution(resident_summary, system_prompt_override);
     }
+    if worker.manifest().worker.mode == manifest::WorkerMode::Wip {
+        let permissions = worker.manifest().permissions.clone();
+        let security_context = format!(
+            "workspace={};worker={};session={}",
+            worker.workspace_id().map_or("standalone", |id| id.as_str()),
+            worker.manifest().worker.name,
+            worker.session_id()
+        );
+        crate::wip::install_wip_mode(worker.engine_mut(), permissions, security_context).map_err(
+            |error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("install WIP Worker surface: {error}"),
+                )
+            },
+        )?;
+    }
     worker.attach_tracker(tracker);
     Ok(workdir_for_view)
 }

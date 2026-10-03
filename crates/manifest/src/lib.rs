@@ -670,6 +670,21 @@ pub struct WorkspaceMemorySettingsSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerMeta {
     pub name: String,
+    /// Model-facing capability surface. Existing manifests default to ordinary tools.
+    #[serde(default)]
+    pub mode: WorkerMode,
+}
+
+/// Model-facing Worker capability surface.
+///
+/// WIP is explicit opt-in: it replaces individual model-visible tools with the
+/// discover/inspect/call Worldspace client while retaining the same host authority.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerMode {
+    #[default]
+    Tools,
+    Wip,
 }
 
 /// When the engine may begin executing provider-confirmed tool calls.

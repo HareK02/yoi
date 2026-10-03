@@ -123,6 +123,12 @@ where
         authority,
     } = spec;
 
+    // Feature-owned private Internal Workers use their explicitly supplied tool
+    // composition. They are not model-facing direct SubWorkers and must not
+    // inherit a parent's WIP surface (which is finalized only by the normal
+    // controller path); keeping Tool mode also preserves manifest permission
+    // hooks for these private jobs.
+    manifest.worker.mode = manifest::WorkerMode::Tools;
     // Internal identities are run-scoped and never enter the public Runtime Worker catalog.
     manifest.worker.name = format!("internal-{}-{}", identity.kind, identity.run_id);
     // Internal jobs only receive the explicitly supplied Feature set below. A

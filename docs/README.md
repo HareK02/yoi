@@ -33,6 +33,7 @@ It is not a dumping ground for external research, old plans, API inventories, or
 25. [`design/subjektiv-store.md`](design/subjektiv-store.md) — subject-scoped Memoryのownership、authorization、Session attribution、revision、candidate consolidation境界。
 26. [`design/subjektiv-surface.md`](design/subjektiv-surface.md) — confirmed Memoryから生成するresident surface、availability、append-only restore injection。
 27. [`development/subjektiv-product-cutover.md`](development/subjektiv-product-cutover.md) — legacy Workspace Memoryからsubjektivへのoperator cutover、explicit reset、backup／rollback runbook。
+28. [`design/worker-wip-mode.md`](design/worker-wip-mode.md) — explicit-opt-in Worker WIP mode, Worldspace projection, authority, cache, and retry contracts.
 
 ## What belongs here
 

@@ -20,6 +20,7 @@ pub mod shared_state;
 mod shutdown_after_idle;
 pub mod skill;
 pub mod spawn;
+pub mod wip;
 
 mod internal_worker;
 mod interrupt_prep;
