@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { setContext } from 'svelte';
+  import { onDestroy, setContext } from 'svelte';
   import { page } from '$app/state';
   import HeaderOverride from '#lib/workspace/header/HeaderOverride.svelte';
   import WorkspaceBreadcrumbs from '#lib/workspace/header/WorkspaceBreadcrumbs.svelte';
@@ -37,13 +37,23 @@
     workspaceId !== '' && ownsRoutePath(workspaceRoute(workspaceId), page.url.pathname),
   );
 
+  let activeWorkspaceId: string | null = null;
+
+  function disposeWorkspaceResources(workspaceId: string): void {
+    disposeWorkspaceWorkersStore(workspaceId);
+    disposeWorkspaceMultiplexer(workspaceId);
+  }
+
   $effect(() => {
-    const workspaceId = data.workspace?.workspace_id;
-    if (!workspaceId) return;
-    return () => {
-      disposeWorkspaceMultiplexer(workspaceId);
-      disposeWorkspaceWorkersStore(workspaceId);
-    };
+    const nextWorkspaceId = data.workspace?.workspace_id ?? null;
+    if (nextWorkspaceId === activeWorkspaceId) return;
+    const previousWorkspaceId = activeWorkspaceId;
+    activeWorkspaceId = nextWorkspaceId;
+    if (previousWorkspaceId) disposeWorkspaceResources(previousWorkspaceId);
+  });
+
+  onDestroy(() => {
+    if (activeWorkspaceId) disposeWorkspaceResources(activeWorkspaceId);
   });
 </script>
 

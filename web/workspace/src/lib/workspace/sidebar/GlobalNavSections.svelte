@@ -44,10 +44,6 @@
     <section class="sidebar-nav-section sidebar-nav-section--category" aria-labelledby="global-workspaces-heading">
       <h2 id="global-workspaces-heading" class="sidebar-nav-section__header">workspaces</h2>
 
-      {#if workspaceError}
-        <p class="workspace-status error">Workspace list unavailable.</p>
-      {/if}
-
       {#if workspaces.length > 0}
         <div class="sidebar-list">
           {#each workspaces as workspace (workspace.workspace_id)}

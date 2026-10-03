@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
+  import { dismissWorkspaceAlert, pushWorkspaceAlert } from "#lib/workspace/alerts/store.ts";
   import {
     listWorkspaces,
     type WorkspaceCatalogRecord,
@@ -17,11 +18,11 @@
 
   let workspaces = $state<WorkspaceCatalogRecord[]>([]);
   let loading = $state(true);
-  let error = $state("");
   let open = $state(false);
   let root = $state.raw<HTMLDivElement>();
   let trigger = $state.raw<HTMLButtonElement>();
   let menu = $state.raw<HTMLDivElement>();
+  let loadGeneration = 0;
   const menuId = $derived(`workspace-menu-popover-${variant}`);
 
   const menuWorkspaces = $derived.by(() => {
@@ -39,14 +40,22 @@
   });
 
   async function loadWorkspaces() {
+    const generation = ++loadGeneration;
     loading = true;
-    error = "";
     try {
-      workspaces = await listWorkspaces(fetch);
+      const nextWorkspaces = await listWorkspaces(fetch);
+      if (generation !== loadGeneration) return;
+      workspaces = nextWorkspaces;
+      dismissWorkspaceAlert("workspace-catalog-load");
     } catch (cause) {
-      error = cause instanceof Error ? cause.message : "Failed to load Workspaces.";
+      if (generation !== loadGeneration) return;
+      pushWorkspaceAlert(
+        "error",
+        cause instanceof Error ? cause.message : "Failed to load Workspaces.",
+        { id: "workspace-catalog-load", title: "Workspace list unavailable" },
+      );
     } finally {
-      loading = false;
+      if (generation === loadGeneration) loading = false;
     }
   }
 
@@ -111,7 +120,10 @@
   onMount(() => {
     document.addEventListener("pointerdown", handleDocumentPointerDown);
     void loadWorkspaces();
-    return () => document.removeEventListener("pointerdown", handleDocumentPointerDown);
+    return () => {
+      loadGeneration += 1;
+      document.removeEventListener("pointerdown", handleDocumentPointerDown);
+    };
   });
 </script>
 
@@ -191,8 +203,6 @@
 
       {#if loading}
         <p class="workspace-menu-status">Loading Workspaces…</p>
-      {:else if error}
-        <p class="workspace-menu-status error">{error}</p>
       {/if}
     </div>
   {/if}

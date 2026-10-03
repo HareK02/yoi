@@ -1,19 +1,27 @@
-import { browser } from '$app/env';
+import { browser } from "$app/env";
 import type {
   EventSubscriptionSelector,
   Method,
   SubscriptionFrame,
   SubscriptionId,
-} from '#lib/generated/protocol.ts';
+} from "#lib/generated/protocol.ts";
 import {
   decodeSubscriptionFrame,
   subscriptionFrameMatchesSelector,
-} from '#lib/generated/protocol-validator.ts';
-import { workspaceApiPath } from '#lib/workspace/api/http.ts';
+} from "#lib/generated/protocol-validator.ts";
+import { workspaceApiPath } from "#lib/workspace/api/http.ts";
+
+export type WorkspaceMultiplexerFailure = {
+  kind: "protocol" | "transport";
+  message: string;
+};
 
 type Listener = {
   onFrame(frame: SubscriptionFrame): void;
-  onStatus?(status: 'connecting' | 'open' | 'closed', message?: string): void;
+  onStatus?(
+    status: "connecting" | "open" | "closed",
+    failure?: WorkspaceMultiplexerFailure,
+  ): void;
 };
 
 type ActiveSubscription = {
@@ -33,12 +41,14 @@ const multiplexers = new Map<string, WorkspaceMultiplexer>();
 const INVALID_PROTOCOL_CLOSE_CODE = 4002;
 let nextMultiplexerSequence = 0;
 
-function nextMultiplexerId(kind: 'client' | 'request'): string {
+function nextMultiplexerId(kind: "client" | "request"): string {
   nextMultiplexerSequence += 1;
   return `${kind}-${nextMultiplexerSequence}`;
 }
 
-export function workspaceMultiplexer(workspaceId: string): WorkspaceMultiplexer {
+export function workspaceMultiplexer(
+  workspaceId: string,
+): WorkspaceMultiplexer {
   let multiplexer = multiplexers.get(workspaceId);
   if (!multiplexer) {
     multiplexer = new WorkspaceMultiplexer(workspaceId);
@@ -61,7 +71,7 @@ export class WorkspaceMultiplexer {
   readonly #runtimeSubscriptions = new Map<string, string>();
   #socket: WebSocket | null = null;
   #reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  #disconnectMessage: string | null = null;
+  #disconnectFailure: WorkspaceMultiplexerFailure | null = null;
   #closed = false;
 
   constructor(workspaceId: string) {
@@ -72,7 +82,7 @@ export class WorkspaceMultiplexer {
     selector: EventSubscriptionSelector,
     listener: Listener,
   ): WorkspaceMultiplexerSubscription {
-    const clientId = nextMultiplexerId('client');
+    const clientId = nextMultiplexerId("client");
     const subscription: ActiveSubscription = {
       clientId,
       selector,
@@ -83,7 +93,7 @@ export class WorkspaceMultiplexer {
     this.#subscriptions.set(clientId, subscription);
     this.#closed = false;
     if (this.#socket?.readyState === WebSocket.OPEN) {
-      subscription.listener.onStatus?.('open');
+      subscription.listener.onStatus?.("open");
       this.#sendSubscribe(subscription);
     } else {
       this.#ensureConnected();
@@ -95,37 +105,48 @@ export class WorkspaceMultiplexer {
   }
 
   #ensureConnected(): void {
-    if (!browser || this.#socket || this.#closed || this.#subscriptions.size === 0) return;
+    if (
+      !browser || this.#socket || this.#closed || this.#subscriptions.size === 0
+    ) return;
     for (const subscription of this.#subscriptions.values()) {
-      subscription.listener.onStatus?.('connecting');
+      subscription.listener.onStatus?.("connecting");
     }
     const url = new URL(
-      workspaceApiPath(this.#workspaceId, '/protocol/ws'),
+      workspaceApiPath(this.#workspaceId, "/protocol/ws"),
       window.location.origin,
     );
-    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     const socket = new WebSocket(url);
     this.#socket = socket;
-    socket.addEventListener('open', () => {
+    socket.addEventListener("open", () => {
+      if (this.#socket !== socket) return;
       for (const subscription of this.#subscriptions.values()) {
-        subscription.listener.onStatus?.('open');
+        subscription.listener.onStatus?.("open");
         this.#sendSubscribe(subscription);
       }
     });
-    socket.addEventListener('message', (event) => this.#receive(event.data));
-    socket.addEventListener('error', () => socket.close());
-    socket.addEventListener('close', () => {
+    socket.addEventListener("message", (event) => {
+      if (this.#socket !== socket) return;
+      this.#receive(event.data);
+    });
+    socket.addEventListener("error", () => {
+      if (this.#socket !== socket) return;
+      socket.close();
+    });
+    socket.addEventListener("close", () => {
       if (this.#socket !== socket) return;
       this.#socket = null;
-      const disconnectMessage =
-        this.#disconnectMessage ?? 'Workspace subscription disconnected';
-      this.#disconnectMessage = null;
+      const failure = this.#disconnectFailure ?? {
+        kind: "transport" as const,
+        message: "Workspace subscription disconnected",
+      };
+      this.#disconnectFailure = null;
       this.#requests.clear();
       this.#runtimeSubscriptions.clear();
       for (const subscription of this.#subscriptions.values()) {
         subscription.requestId = null;
         subscription.subscriptionId = null;
-        subscription.listener.onStatus?.('closed', disconnectMessage);
+        subscription.listener.onStatus?.("closed", failure);
       }
       if (!this.#closed && this.#subscriptions.size > 0) {
         this.#reconnectTimer = setTimeout(() => this.#ensureConnected(), 500);
@@ -134,14 +155,14 @@ export class WorkspaceMultiplexer {
   }
 
   #sendSubscribe(subscription: ActiveSubscription): void {
-    const requestId = nextMultiplexerId('request');
+    const requestId = nextMultiplexerId("request");
     subscription.requestId = requestId;
     this.#requests.set(requestId, subscription.clientId);
     this.#send({
       protocol_version: 2,
-      frame: 'request',
+      frame: "request",
       message: {
-        method: 'subscribe_events',
+        method: "subscribe_events",
         params: { request_id: requestId, selector: subscription.selector },
       },
     });
@@ -154,9 +175,11 @@ export class WorkspaceMultiplexer {
       return;
     }
     const frame = decoded.value;
-    if (frame.frame === 'response' && frame.message.result === 'subscribed') {
+    if (frame.frame === "response" && frame.message.result === "subscribed") {
       const clientId = this.#requests.get(frame.message.payload.request_id);
-      const subscription = clientId ? this.#subscriptions.get(clientId) : undefined;
+      const subscription = clientId
+        ? this.#subscriptions.get(clientId)
+        : undefined;
       if (!clientId || !subscription) return;
       if (!subscriptionFrameMatchesSelector(frame, subscription.selector)) {
         this.#rejectInboundFrame();
@@ -169,9 +192,14 @@ export class WorkspaceMultiplexer {
       subscription.listener.onFrame(frame);
       return;
     }
-    if (frame.frame === 'response' && frame.message.result === 'subscription_rejected') {
+    if (
+      frame.frame === "response" &&
+      frame.message.result === "subscription_rejected"
+    ) {
       const clientId = this.#requests.get(frame.message.payload.request_id);
-      const subscription = clientId ? this.#subscriptions.get(clientId) : undefined;
+      const subscription = clientId
+        ? this.#subscriptions.get(clientId)
+        : undefined;
       subscription?.listener.onFrame(frame);
       if (clientId) {
         this.#requests.delete(frame.message.payload.request_id);
@@ -179,9 +207,13 @@ export class WorkspaceMultiplexer {
       }
       return;
     }
-    if (frame.frame === 'event') {
-      const clientId = this.#runtimeSubscriptions.get(frame.message.data.subscription_id);
-      const subscription = clientId ? this.#subscriptions.get(clientId) : undefined;
+    if (frame.frame === "event") {
+      const clientId = this.#runtimeSubscriptions.get(
+        frame.message.data.subscription_id,
+      );
+      const subscription = clientId
+        ? this.#subscriptions.get(clientId)
+        : undefined;
       if (
         subscription &&
         !subscriptionFrameMatchesSelector(frame, subscription.selector)
@@ -191,30 +223,45 @@ export class WorkspaceMultiplexer {
       }
       subscription?.listener.onFrame(frame);
       if (
-        frame.message.event === 'subscription_closed' &&
+        frame.message.event === "subscription_closed" &&
         clientId &&
-        subscription &&
-        this.#socket?.readyState === WebSocket.OPEN
+        subscription
       ) {
         this.#runtimeSubscriptions.delete(frame.message.data.subscription_id);
         subscription.subscriptionId = null;
-        subscription.listener.onStatus?.('connecting', frame.message.data.message);
-        this.#sendSubscribe(subscription);
+        if (
+          (frame.message.data.code === "lagged" ||
+            frame.message.data.code === "server_shutdown") &&
+          this.#socket?.readyState === WebSocket.OPEN
+        ) {
+          subscription.listener.onStatus?.("connecting");
+          this.#sendSubscribe(subscription);
+        } else {
+          this.#remove(clientId);
+        }
       }
     }
   }
 
   #rejectInboundFrame(): void {
-    this.#disconnectMessage = 'Workspace protocol frame rejected';
-    this.#socket?.close(INVALID_PROTOCOL_CLOSE_CODE, 'Invalid workspace protocol frame');
+    this.#disconnectFailure = {
+      kind: "protocol",
+      message: "Workspace protocol frame rejected",
+    };
+    this.#socket?.close(
+      INVALID_PROTOCOL_CLOSE_CODE,
+      "Invalid workspace protocol frame",
+    );
   }
 
   #sendWorkerMethod(clientId: string, method: Method): void {
     const subscription = this.#subscriptions.get(clientId);
-    if (!subscription?.subscriptionId) throw new Error('Worker protocol subscription is not open');
+    if (!subscription?.subscriptionId) {
+      throw new Error("Worker protocol subscription is not open");
+    }
     this.#send({
       protocol_version: 2,
-      frame: 'worker_protocol',
+      frame: "worker_protocol",
       message: { subscription_id: subscription.subscriptionId, method },
     });
   }
@@ -223,14 +270,16 @@ export class WorkspaceMultiplexer {
     const subscription = this.#subscriptions.get(clientId);
     if (!subscription) return;
     this.#subscriptions.delete(clientId);
-    if (subscription.subscriptionId && this.#socket?.readyState === WebSocket.OPEN) {
+    if (
+      subscription.subscriptionId && this.#socket?.readyState === WebSocket.OPEN
+    ) {
       this.#send({
         protocol_version: 2,
-        frame: 'request',
+        frame: "request",
         message: {
-          method: 'unsubscribe_events',
+          method: "unsubscribe_events",
           params: {
-            request_id: nextMultiplexerId('request'),
+            request_id: nextMultiplexerId("request"),
             subscription_id: subscription.subscriptionId,
           },
         },
@@ -251,12 +300,10 @@ export class WorkspaceMultiplexer {
       clearTimeout(this.#reconnectTimer);
       this.#reconnectTimer = null;
     }
-    for (const subscription of this.#subscriptions.values()) {
-      subscription.listener.onStatus?.('closed', 'Workspace selection changed');
-    }
     this.#subscriptions.clear();
     this.#requests.clear();
     this.#runtimeSubscriptions.clear();
+    this.#disconnectFailure = null;
     this.#socket?.close();
     this.#socket = null;
   }

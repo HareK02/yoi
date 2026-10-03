@@ -1,9 +1,17 @@
 import { type Readable, readable } from "svelte/store";
 import type { WorkingDirectorySummary } from "#lib/generated/workdir-api.ts";
 import type { SubscriptionWorker } from "#lib/generated/protocol.ts";
+import {
+  dismissWorkspaceAlert,
+  pushWorkspaceAlert,
+} from "#lib/workspace/alerts/store.ts";
 import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
 import { parseWorkingDirectoryListResponse } from "#lib/workspace/api/workdirs.ts";
-import { workspaceMultiplexer } from "#lib/workspace/multiplexer.ts";
+import {
+  workspaceMultiplexer,
+  type WorkspaceMultiplexerFailure,
+  type WorkspaceMultiplexerSubscription,
+} from "#lib/workspace/multiplexer.ts";
 import {
   applyWorkspaceWorkersFrame,
   createWorkspaceWorkersProjection,
@@ -22,105 +30,213 @@ export type SidebarWorker = Omit<Worker, "workdir_attachments"> & {
 
 export type WorkspaceWorkersState = {
   loading: boolean;
-  error: string | null;
   workers: SidebarWorker[];
 };
 
-const stores = new Map<string, Readable<WorkspaceWorkersState>>();
+type WorkerAlertKind = "subscription" | "workdirs";
+type WorkspaceWorkersStoreEntry = {
+  store: Readable<WorkspaceWorkersState>;
+  dispose(): void;
+};
+
+const stores = new Map<string, WorkspaceWorkersStoreEntry>();
+
+function workerAlertId(workspaceId: string, kind: WorkerAlertKind): string {
+  return `workspace:${workspaceId}:workers:${kind}`;
+}
+
+function reportWorkerFailure(
+  workspaceId: string,
+  kind: WorkerAlertKind,
+  message: string,
+  level: "warning" | "error" = "error",
+): void {
+  pushWorkspaceAlert(level, message, {
+    id: workerAlertId(workspaceId, kind),
+    title: kind === "workdirs"
+      ? "Worker Workdirs unavailable"
+      : "Worker updates unavailable",
+  });
+}
+
+function clearWorkerFailure(workspaceId: string, kind: WorkerAlertKind): void {
+  dismissWorkspaceAlert(workerAlertId(workspaceId, kind));
+}
+
+function clearWorkerFailures(workspaceId: string): void {
+  clearWorkerFailure(workspaceId, "subscription");
+  clearWorkerFailure(workspaceId, "workdirs");
+}
 
 export function disposeWorkspaceWorkersStore(workspaceId: string): void {
+  const entry = stores.get(workspaceId);
+  if (!entry) {
+    clearWorkerFailures(workspaceId);
+    return;
+  }
   stores.delete(workspaceId);
+  entry.dispose();
 }
 
 export function workspaceWorkersStore(
   workspaceId: string,
 ): Readable<WorkspaceWorkersState> {
   const cached = stores.get(workspaceId);
-  if (cached) return cached;
+  if (cached) return cached.store;
+
+  let stopActive: (() => void) | null = null;
   const store = readable<WorkspaceWorkersState>(
-    { loading: true, error: null, workers: [] },
+    { loading: true, workers: [] },
     (set) => {
       if (!workspaceId) {
-        set({ loading: false, error: null, workers: [] });
+        set({ loading: false, workers: [] });
         return;
       }
       const projection = createWorkspaceWorkersProjection();
+      const workdirRequest = new AbortController();
+      let subscription: WorkspaceMultiplexerSubscription | null = null;
       let workdirs = new Map<string, WorkingDirectorySummary>();
+      let workers: SidebarWorker[] = [];
       let loading = true;
-      let error: string | null = null;
       let disposed = false;
-      const publish = () => {
-        const workers = [...projection.workers.values()]
-          .map((worker) => projectWorker(worker, workdirs))
-          .sort(compareWorkersForSidebar);
-        set({ loading, error, workers });
+      const publish = (): boolean => {
+        if (disposed) return false;
+        try {
+          workers = [...projection.workers.values()]
+            .map((worker) => projectWorker(worker, workdirs))
+            .sort(compareWorkersForSidebar);
+          set({ loading, workers });
+          return true;
+        } catch (cause) {
+          reportWorkerFailure(
+            workspaceId,
+            "subscription",
+            cause instanceof Error
+              ? cause.message
+              : "Invalid Worker subscription frame",
+          );
+          set({ loading: false, workers });
+          return false;
+        }
       };
       const loadWorkdirs = async () => {
         const result = await loadJson(
           fetch,
           workspaceApiPath(workspaceId, "/working-directories"),
-          undefined,
+          { signal: workdirRequest.signal },
           parseWorkingDirectoryListResponse,
         );
-        if (disposed || !result.data) return;
+        if (disposed) return;
+        if (!result.data) {
+          reportWorkerFailure(
+            workspaceId,
+            "workdirs",
+            result.error ?? "Worker Workdirs could not be loaded",
+            "warning",
+          );
+          return;
+        }
         workdirs = new Map(
           result.data.items.map((
             workdir,
           ) => [workdir.working_directory_id, workdir]),
         );
+        clearWorkerFailure(workspaceId, "workdirs");
         publish();
       };
-      const subscription = workspaceMultiplexer(workspaceId).subscribe(
+      subscription = workspaceMultiplexer(workspaceId).subscribe(
         { topic: "workspace_workers" },
         {
           onFrame: (frame) => {
+            if (disposed) return;
+            if (
+              frame.frame === "event" &&
+              frame.message.event === "subscription_closed"
+            ) {
+              loading = projection.workers.size === 0;
+              if (
+                frame.message.data.code === "resource_gone" ||
+                frame.message.data.code === "unauthorized"
+              ) {
+                reportWorkerFailure(
+                  workspaceId,
+                  "subscription",
+                  frame.message.data.message,
+                );
+              }
+              publish();
+              return;
+            }
+            if (
+              frame.frame === "response" &&
+              frame.message.result === "subscription_rejected"
+            ) {
+              loading = false;
+              reportWorkerFailure(
+                workspaceId,
+                "subscription",
+                frame.message.payload.message,
+              );
+              publish();
+              return;
+            }
             try {
-              if (
-                frame.frame === "event" &&
-                frame.message.event === "subscription_closed"
-              ) {
-                throw new Error(frame.message.data.message);
-              }
-              if (
-                frame.frame === "response" &&
-                frame.message.result === "subscription_rejected"
-              ) {
-                throw new Error(frame.message.payload.message);
-              }
               applyWorkspaceWorkersFrame(projection, frame);
               loading = false;
-              error = null;
-              publish();
+              if (publish()) clearWorkerFailure(workspaceId, "subscription");
             } catch (cause) {
               loading = false;
-              error = cause instanceof Error
-                ? cause.message
-                : "invalid Worker subscription frame";
+              reportWorkerFailure(
+                workspaceId,
+                "subscription",
+                cause instanceof Error
+                  ? cause.message
+                  : "Invalid Worker subscription frame",
+              );
               publish();
             }
           },
-          onStatus: (status, message) => {
+          onStatus: (status, failure?: WorkspaceMultiplexerFailure) => {
+            if (disposed) return;
             if (status === "connecting") {
               loading = projection.workers.size === 0;
-              error = null;
               publish();
             }
-            if (status === "closed") {
+            if (status === "closed" && failure) {
               loading = projection.workers.size === 0;
-              error = message ?? null;
+              reportWorkerFailure(
+                workspaceId,
+                "subscription",
+                failure.message,
+                failure.kind === "transport" ? "warning" : "error",
+              );
               publish();
             }
           },
         },
       );
       void loadWorkdirs();
-      return () => {
+
+      const stop = () => {
+        if (disposed) return;
         disposed = true;
-        subscription.close();
+        workdirRequest.abort();
+        subscription?.close();
+        clearWorkerFailures(workspaceId);
+        if (stopActive === stop) stopActive = null;
       };
+      stopActive = stop;
+      return stop;
     },
   );
-  stores.set(workspaceId, store);
+  const entry: WorkspaceWorkersStoreEntry = {
+    store,
+    dispose: () => {
+      stopActive?.();
+      clearWorkerFailures(workspaceId);
+    },
+  };
+  stores.set(workspaceId, entry);
   return store;
 }
 

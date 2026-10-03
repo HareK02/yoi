@@ -3,6 +3,7 @@
   import { setContext } from 'svelte';
   import { MediaQuery } from 'svelte/reactivity';
   import WorkspaceAlerts from '#lib/workspace/alerts/WorkspaceAlerts.svelte';
+  import { dismissWorkspaceAlert, pushWorkspaceAlert } from '#lib/workspace/alerts/store.ts';
   import Bevel from '#lib/workspace/ui/Bevel.svelte';
   import {
     provideHeaderController,
@@ -44,6 +45,18 @@
   let sidebarTransientOpen = $state(false);
   const mobileLayout = new MediaQuery('(max-width: 760px)');
   const sidebarOpen = $derived((!mobileLayout.current && sidebarMode === 'pinned') || sidebarTransientOpen);
+
+  $effect(() => {
+    const error = data.workspaceCatalogError;
+    if (error) {
+      pushWorkspaceAlert('error', error, {
+        id: 'workspace-catalog-load',
+        title: 'Workspace list unavailable',
+      });
+    } else {
+      dismissWorkspaceAlert('workspace-catalog-load');
+    }
+  });
 
   $effect(() => {
     const mode = sidebarMode;

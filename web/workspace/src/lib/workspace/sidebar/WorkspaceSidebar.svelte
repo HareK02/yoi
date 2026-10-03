@@ -66,9 +66,7 @@
     {:else}
       <div class="workspace-label">
         <div class="workspace-name">Yoi workspace</div>
-        {#if workspaceError}
-          <p class="workspace-status error">Workspace summary unavailable.</p>
-        {:else}
+        {#if !workspaceError}
           <p class="workspace-status">Loading workspace…</p>
         {/if}
       </div>
