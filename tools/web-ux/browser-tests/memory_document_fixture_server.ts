@@ -358,6 +358,38 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
   if (url.pathname === `/api/w/${workspaceId}/working-directories`) {
     return json({ workspace_id: workspaceId, items: [], diagnostics: [] });
   }
+  if (url.pathname === `/api/w/${workspaceId}/workers/launch-options`) {
+    return json({
+      workspace_id: workspaceId,
+      runtimes: [{
+        runtime_id: "embedded-worker-runtime",
+        display_name: "Embedded Runtime",
+        built_in: true,
+        worker_creation_available: true,
+        working_directory_required: false,
+        status: "active",
+        diagnostics: [],
+      }],
+      default_profile: "builtin:companion",
+      profiles: [
+        {
+          id: "builtin:companion",
+          label: "Companion",
+          description: "General Workspace assistance with explicit subject Memory support.",
+          feature_connections: { subjektiv: true },
+        },
+        {
+          id: "builtin:standalone",
+          label: "Standalone",
+          description: "Independent Worker without Workspace subject Memory support.",
+          feature_connections: { subjektiv: false },
+        },
+      ],
+      repositories: [],
+      working_directories: [],
+      diagnostics: [],
+    });
+  }
 
   const subjectsPath = `/api/w/${workspaceId}/subjektiv/subjects`;
   if (url.pathname === subjectsPath) {

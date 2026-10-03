@@ -184,6 +184,68 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: var(--space-3);
   }
+  .worker-feature-connection {
+    display: grid;
+    gap: var(--space-3);
+    min-width: 0;
+    border-left: 2px solid var(--accent);
+    padding-left: var(--space-3);
+  }
+  .worker-feature-connection-heading {
+    display: flex;
+    align-items: start;
+    justify-content: space-between;
+    gap: var(--space-3);
+  }
+  .worker-feature-connection-heading > div {
+    display: grid;
+    gap: var(--space-1);
+  }
+  .worker-feature-connection-heading h3,
+  .worker-feature-connection-heading p,
+  .worker-feature-connection-selection,
+  .worker-feature-connection-state,
+  .worker-feature-connection-note {
+    margin: 0;
+  }
+  .worker-feature-connection-heading h3 {
+    color: var(--text-strong);
+    font-size: var(--font-size-body);
+  }
+  .worker-feature-connection-heading p,
+  .worker-feature-connection-note,
+  .worker-feature-connection-state {
+    color: var(--text-muted);
+    font-size: var(--font-size-compact);
+  }
+  .worker-feature-connection-heading > span {
+    flex: 0 0 auto;
+    color: var(--accent);
+    font-size: var(--font-size-compact);
+    font-weight: 700;
+  }
+  .worker-feature-connection-selection {
+    display: grid;
+    gap: var(--space-1);
+    min-width: 0;
+    color: var(--text-muted);
+    font-size: var(--font-size-compact);
+  }
+  .worker-feature-connection-selection code {
+    overflow-wrap: anywhere;
+  }
+  .worker-feature-connection-state {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+  }
+  .worker-feature-connection-state.is-error {
+    color: var(--danger);
+  }
+  .worker-subject-load-more {
+    justify-self: start;
+  }
   .worker-new-actions {
     display: flex;
     align-items: center;
@@ -212,6 +274,14 @@
     .worker-detail-grid,
     .worker-attachment-row {
       grid-template-columns: 1fr;
+    }
+    .worker-feature-connection-heading {
+      align-items: stretch;
+      flex-direction: column;
+      gap: var(--space-2);
+    }
+    .worker-feature-connection-heading > span {
+      align-self: start;
     }
     .worker-attachment-remove {
       justify-self: start;

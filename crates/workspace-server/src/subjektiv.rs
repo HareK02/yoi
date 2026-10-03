@@ -22,6 +22,7 @@ use crate::feature_storage::{
 
 pub const SUBJEKTIV_SCHEMA_VERSION: u32 = 1;
 pub const SUBJEKTIV_FEATURE_ID: &str = "subjektiv";
+pub const SUBJECT_WORKER_SINGLETON_PREFIX: &str = "subjektiv:";
 pub const MAX_STAGING_ANCHORS: usize = 10;
 /// Deterministic surface-generation policy. Input estimates use the repository's
 /// provider-independent UTF-8 byte estimate (`ceil(bytes / 4)`). The material
@@ -45,6 +46,8 @@ pub enum SubjektivError {
     SubjectNotFound(String),
     #[error("subject `{0}` is retired")]
     SubjectRetired(String),
+    #[error("the selected Worker Profile does not enable subjektiv")]
+    ProfileDisabled,
     #[error("staging candidate `{0}` was not found for this subject")]
     CandidateNotFound(String),
     #[error("staging candidate `{0}` already exists with different content")]
@@ -145,6 +148,23 @@ pub struct SubjectRecord {
 pub struct SubjectPage {
     pub items: Vec<SubjectRecord>,
     pub has_more: bool,
+}
+
+/// Backend-authorized launch material for one active subject. The singleton key
+/// is derived by subjektiv and then acquired through Yoi's generic singleton path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedSubjectWorkerAttachment {
+    pub singleton_key: String,
+}
+
+pub fn subject_worker_singleton_key(subject_id: &str) -> Result<String> {
+    validate_label("subject id", subject_id)?;
+    if subject_id.trim() != subject_id {
+        return Err(SubjektivError::InvalidRecord(
+            "subject id must not contain surrounding whitespace".to_string(),
+        ));
+    }
+    Ok(format!("{SUBJECT_WORKER_SINGLETON_PREFIX}{subject_id}"))
 }
 
 /// Immutable host-recorded history that attributes one durable Session to the
@@ -1088,6 +1108,28 @@ impl SubjektivStore {
                 )
                 .optional()?;
             raw.map(|raw| parse_subject(&raw)).transpose()
+        })
+    }
+
+    /// Validates an explicit product launch connection against this Workspace's
+    /// subject store and the already-resolved Profile policy. Subject knowledge
+    /// alone is insufficient: only an active local record produces host launch material.
+    pub fn authorize_worker_attachment(
+        &self,
+        subject_id: &str,
+        profile: &manifest::WorkerManifest,
+    ) -> Result<AuthorizedSubjectWorkerAttachment> {
+        if !profile.feature.subjektiv.profile.enabled {
+            return Err(SubjektivError::ProfileDisabled);
+        }
+        let subject = self
+            .subject(subject_id)?
+            .ok_or_else(|| SubjektivError::SubjectNotFound(subject_id.to_string()))?;
+        if subject.state != SubjectState::Active {
+            return Err(SubjektivError::SubjectRetired(subject_id.to_string()));
+        }
+        Ok(AuthorizedSubjectWorkerAttachment {
+            singleton_key: subject_worker_singleton_key(&subject.id)?,
         })
     }
 

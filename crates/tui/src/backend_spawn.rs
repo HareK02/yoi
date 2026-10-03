@@ -167,6 +167,7 @@ fn request_from_selection(selection: Selection) -> BackendCreateWorkerRequest {
         initial_submit: Vec::new(),
         workdir_attachments: Vec::new(),
         ticket_assignment: None,
+        feature_connections: Default::default(),
         control_operation_id: None,
     }
 }
@@ -431,11 +432,13 @@ mod tests {
                     id: "builtin:default".to_string(),
                     label: "Default".to_string(),
                     description: String::new(),
+                    feature_connections: Default::default(),
                 },
                 BackendWorkerLaunchProfileCandidate {
                     id: "builtin:coder".to_string(),
                     label: "Coder".to_string(),
                     description: "Ticket implementation".to_string(),
+                    feature_connections: Default::default(),
                 },
             ],
             default_profile: Some("builtin:coder".to_string()),

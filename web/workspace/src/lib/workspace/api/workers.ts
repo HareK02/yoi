@@ -21,6 +21,7 @@ import type {
   WorkerWorkdirAttachmentSummary,
   WorkerWorkspaceSummary,
   WorkingDirectoryRepositoryOption,
+  WorkspaceWorkerFeatureConnectionsRequest,
 } from "#lib/generated/worker-launch-api.ts";
 import type { Segment } from "#lib/generated/protocol.ts";
 import {
@@ -148,16 +149,26 @@ function runtimeOption(
   };
 }
 
+function featureConnectionOptions(value: unknown, label: string) {
+  const item = record(value, label);
+  exact(item, ["subjektiv"], label);
+  return { subjektiv: boolean(item.subjektiv, `${label}.subjektiv`) };
+}
+
 function profileCandidate(
   value: unknown,
   label: string,
 ): WorkerLaunchProfileCandidate {
   const item = record(value, label);
-  exact(item, ["id", "label", "description"], label);
+  exact(item, ["id", "label", "description", "feature_connections"], label);
   return {
     id: string(item.id, `${label}.id`),
     label: string(item.label, `${label}.label`),
     description: string(item.description, `${label}.description`),
+    feature_connections: featureConnectionOptions(
+      item.feature_connections,
+      `${label}.feature_connections`,
+    ),
   };
 }
 
@@ -700,6 +711,20 @@ function ticketAssignment(
   };
 }
 
+function featureConnectionsRequest(
+  value: unknown,
+  label: string,
+): WorkspaceWorkerFeatureConnectionsRequest {
+  const item = record(value, label);
+  exact(item, ["subjektiv"], label);
+  const subjektiv = optional(item.subjektiv, `${label}.subjektiv`, (value, itemLabel) => {
+    const connection = record(value, itemLabel);
+    exact(connection, ["subject_id"], itemLabel);
+    return { subject_id: string(connection.subject_id, `${itemLabel}.subject_id`) };
+  });
+  return subjektiv === undefined ? {} : { subjektiv };
+}
+
 function unsignedInteger(value: unknown, label: string): number {
   const parsed = number(value, label);
   if (!Number.isSafeInteger(parsed) || parsed < 0) {
@@ -853,6 +878,7 @@ export function parseCreateWorkspaceWorkerRequest(
       "ticket_assignment",
       "initial_submit",
       "workdir_attachments",
+      "feature_connections",
       "control_operation_id",
     ],
     "Worker create request",
@@ -869,6 +895,10 @@ export function parseCreateWorkspaceWorkerRequest(
       item.workdir_attachments,
       "workdir_attachments",
       workingDirectorySelection,
+    ),
+    feature_connections: featureConnectionsRequest(
+      item.feature_connections,
+      "feature_connections",
     ),
     control_operation_id: nullableString(
       item.control_operation_id,

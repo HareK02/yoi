@@ -64,7 +64,12 @@ Deno.test("defaultWorkerLaunchForm preserves an available Ticket role profile", 
     ...options,
     profiles: [
       ...options.profiles,
-      { id: "builtin:reviewer", label: "Reviewer", description: "review" },
+      {
+        id: "builtin:reviewer",
+        label: "Reviewer",
+        description: "review",
+        feature_connections: { subjektiv: true },
+      },
     ],
   };
   const form = defaultWorkerLaunchForm(
@@ -195,8 +200,25 @@ Deno.test("buildCreateWorkspaceWorkerRequest emits multiple aliased attachments"
         relative_cwd: null,
       },
     ],
+    feature_connections: {},
     control_operation_id: null,
   });
+});
+
+Deno.test("buildCreateWorkspaceWorkerRequest keeps subject attachment explicit and separate from Profile", () => {
+  const unattached = buildCreateWorkspaceWorkerRequest(emptyForm({
+    profile: "builtin:companion",
+  }));
+  assertEquals(unattached.feature_connections, {});
+
+  const attached = buildCreateWorkspaceWorkerRequest(emptyForm({
+    profile: "builtin:companion",
+    subjektiv_subject_id: " subject-42 ",
+  }));
+  assertEquals(attached.feature_connections, {
+    subjektiv: { subject_id: "subject-42" },
+  });
+  assertEquals(attached.profile, "builtin:companion");
 });
 
 Deno.test("buildCreateWorkspaceWorkerRequest validates attachment aliases and selections", () => {
@@ -268,6 +290,7 @@ Deno.test("buildCreateWorkspaceWorkerRequest emits an empty attachment list for 
     ticket_assignment: null,
     initial_submit: [{ kind: "text", content: "chat" }],
     workdir_attachments: [],
+    feature_connections: {},
     control_operation_id: null,
   });
 });
@@ -280,6 +303,7 @@ function emptyForm(
     runtime_id: "",
     display_name: "",
     profile: "",
+    subjektiv_subject_id: "",
     initial_text: "",
     workdir_attachments: [],
     working_directory_repository_key: "",
@@ -340,8 +364,18 @@ const options: WorkerLaunchOptionsResponse = {
   ],
   default_profile: "builtin:coder",
   profiles: [
-    { id: "builtin:companion", label: "Companion", description: "chat" },
-    { id: "builtin:coder", label: "Coder", description: "code" },
+    {
+      id: "builtin:companion",
+      label: "Companion",
+      description: "chat",
+      feature_connections: { subjektiv: true },
+    },
+    {
+      id: "builtin:coder",
+      label: "Coder",
+      description: "code",
+      feature_connections: { subjektiv: true },
+    },
   ],
   repositories: [
     { repository_key: "repo", default_selector: "HEAD" },

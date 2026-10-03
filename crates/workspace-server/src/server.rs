@@ -5468,9 +5468,6 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::subjektiv_subject_retire(
             service.clone(),
         ))
-        .merge(server_api::server_api_axum::subjektiv_subject_worker_start(
-            service.clone(),
-        ))
         .merge(server_api::server_api_axum::subjektiv_stage_candidate(
             service.clone(),
         ))
@@ -7229,27 +7226,6 @@ impl server_api::ServerApi for ServerApiContractService {
                 workspace_id,
                 subject_id,
             }),
-        )
-        .await
-        .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
-    }
-
-    async fn subjektiv_subject_worker_start(
-        &self,
-        context: server_api::ServerRequestContext,
-        workspace_id: String,
-        subject_id: String,
-        request: server_api::SubjektivSubjectWorkerStartRequest,
-    ) -> std::result::Result<BrowserCreateWorkerResponse, server_api::RepositoryApiError> {
-        scoped_start_subjektiv_subject_worker(
-            State(self.workspace_api()?.clone()),
-            AxumPath(ScopedSubjektivSubjectPath {
-                workspace_id,
-                subject_id,
-            }),
-            contract_request_headers(&context)?,
-            Json(request),
         )
         .await
         .map(|Json(response)| response)
@@ -16780,7 +16756,7 @@ fn resident_summary_output(
     }
 }
 
-const SUBJEKTIV_SINGLETON_PREFIX: &str = "subjektiv:";
+const SUBJEKTIV_SINGLETON_PREFIX: &str = crate::subjektiv::SUBJECT_WORKER_SINGLETON_PREFIX;
 const SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX: &str =
     crate::hosts::SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX;
 const SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE: &str = "subjektiv-memory-consolidation";
@@ -16819,15 +16795,6 @@ fn subjektiv_scope_from_singleton_key(key: &str) -> ApiResult<(&str, SubjektivWo
         .into());
     }
     Ok((subject_id, authority))
-}
-
-fn subjektiv_singleton_key(subject_id: &str) -> ApiResult<String> {
-    if subject_id.trim().is_empty() || subject_id.chars().any(char::is_control) {
-        return Err(Error::InvalidInput("subjektiv subject id is invalid".to_string()).into());
-    }
-    let key = format!("{SUBJEKTIV_SINGLETON_PREFIX}{subject_id}");
-    crate::store::validate_worker_singleton_key(&key)?;
-    Ok(key)
 }
 
 fn is_dedicated_subjektiv_consolidation_worker(
@@ -16943,7 +16910,7 @@ fn subjektiv_subject_response(
     api: &WorkspaceApi,
     subject: crate::subjektiv::SubjectRecord,
 ) -> server_api::SubjektivSubjectResponse {
-    let current_worker = subjektiv_singleton_key(&subject.id)
+    let current_worker = crate::subjektiv::subject_worker_singleton_key(&subject.id)
         .ok()
         .and_then(|key| {
             api.store
@@ -17197,36 +17164,6 @@ async fn scoped_retire_subjektiv_subject(
     // Retirement deliberately does not stop or remove the current Worker. The
     // Worker lease and subject lifecycle are independent authorities.
     Ok(Json(subjektiv_subject_response(&api, subject)))
-}
-
-async fn scoped_start_subjektiv_subject_worker(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedSubjektivSubjectPath>,
-    headers: HeaderMap,
-    Json(request): Json<server_api::SubjektivSubjectWorkerStartRequest>,
-) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    let subject = open_subjektiv_store(&api)?
-        .subject(&path.subject_id)
-        .map_err(|error| Error::Store(error.to_string()))?
-        .ok_or_else(|| Error::SubjektivSubjectNotFound(path.subject_id.clone()))?;
-    if subject.state != crate::subjektiv::SubjectState::Active {
-        return Err(Error::InvalidInput(format!(
-            "subjektiv subject `{}` is retired",
-            path.subject_id
-        ))
-        .into());
-    }
-    let mut worker = request.worker;
-    if worker.singleton_key.is_some() {
-        return Err(Error::InvalidInput(
-            "subjektiv subject Worker start owns singleton selection; singleton_key must be omitted"
-                .to_string(),
-        )
-        .into());
-    }
-    worker.singleton_key = Some(subjektiv_singleton_key(&path.subject_id)?);
-    create_workspace_worker_inner(api, headers, worker, None, true).await
 }
 
 async fn scoped_stage_subjektiv_candidate(
@@ -21529,14 +21466,9 @@ async fn spawn_known_worker(
         operation_id: scoped_worker_control_operation_id(&controller, &operation_id),
         input_fingerprint,
     });
-    let response = create_workspace_worker_inner(
-        api.clone(),
-        headers,
-        request,
-        resolved_control_operation,
-        false,
-    )
-    .await?;
+    let response =
+        create_workspace_worker_inner(api.clone(), headers, request, resolved_control_operation)
+            .await?;
     if let Err(error) = api
         .store
         .create_worker_control_grant(&WorkerControlGrantRecord {
@@ -27110,7 +27042,7 @@ async fn create_workspace_worker(
     headers: HeaderMap,
     Json(request): Json<CreateWorkspaceWorkerRequest>,
 ) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
-    create_workspace_worker_inner(api, headers, request, None, false).await
+    create_workspace_worker_inner(api, headers, request, None).await
 }
 
 async fn create_workspace_worker_inner(
@@ -27118,33 +27050,19 @@ async fn create_workspace_worker_inner(
     headers: HeaderMap,
     request: CreateWorkspaceWorkerRequest,
     resolved_control_operation: Option<WorkerControlOperation>,
-    resolved_subjektiv_attached: bool,
 ) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
     let CreateWorkspaceWorkerRequest {
         runtime_id,
         display_name,
-        singleton_key,
+        mut singleton_key,
         profile,
         ticket_assignment,
         initial_submit,
         workdir_attachments,
+        feature_connections,
         control_operation_id: _,
     } = request;
-    if resolved_subjektiv_attached {
-        let singleton_key = singleton_key.as_deref().ok_or_else(|| {
-            Error::InvalidInput(
-                "subject-attached Worker launch requires a Backend-owned singleton key".to_string(),
-            )
-        })?;
-        if !singleton_key.starts_with(SUBJEKTIV_SINGLETON_PREFIX) {
-            return Err(Error::InvalidInput(
-                "subject-attached Worker launch requires a subject singleton key".to_string(),
-            )
-            .into());
-        }
-    } else {
-        validate_caller_worker_singleton_key(singleton_key.as_deref())?;
-    }
+    let source = optional_worker_mutation_source(&api, &api.config.workspace_id, &headers)?;
     let config_state = api
         .config_store
         .load_workspace_config(&api.config.workspace_id)?
@@ -27185,6 +27103,34 @@ async fn create_workspace_worker_inner(
             &profile,
             prompt_catalog.as_ref(),
         )?;
+    let resolved_subjektiv_attached = match feature_connections.subjektiv {
+        None => {
+            validate_caller_worker_singleton_key(singleton_key.as_deref())?;
+            false
+        }
+        Some(connection) => {
+            if singleton_key.is_some() {
+                return Err(Error::InvalidInput(
+                    "singleton_key must be omitted when a subjektiv subject connection is requested"
+                        .to_string(),
+                )
+                .into());
+            }
+            let profile_manifest =
+                crate::profile_settings::resolve_profile_manifest_from_config_bundle(
+                    resolved_config_bundle.as_ref().ok_or_else(|| {
+                        Error::Config("resolved Worker Profile bundle is missing".to_string())
+                    })?,
+                    &profile,
+                )?;
+            let attachment = open_subjektiv_store(&api)?
+                .authorize_worker_attachment(&connection.subject_id, &profile_manifest)
+                .map_err(subjektiv_store_error)?;
+            crate::store::validate_worker_singleton_key(&attachment.singleton_key)?;
+            singleton_key = Some(attachment.singleton_key);
+            true
+        }
+    };
     let display_name = sanitize_worker_display_name(&display_name).ok_or_else(|| {
         settings_bad_request(
             "invalid_worker_display_name",
@@ -27195,7 +27141,6 @@ async fn create_workspace_worker_inner(
         return Err(Error::ReservedWorkerName(display_name).into());
     }
     validate_worker_initial_submit(&initial_submit)?;
-    let source = optional_worker_mutation_source(&api, &api.config.workspace_id, &headers)?;
     reject_orchestrator_generic_flow_spawn(
         &api,
         source.as_ref(),
@@ -29771,32 +29716,55 @@ fn worker_launch_options_response(api: &WorkspaceApi) -> ApiResult<WorkerLaunchO
         .ok_or_else(|| {
             ApiError::from(Error::InvalidRecordId("virtual config source tree".into()))
         })?;
-    let profile_settings = crate::profile_settings::project_profiles_from_workspace_config(
+    let profile_projection = crate::profile_settings::project_profiles_from_workspace_config(
         &api.config.workspace_id,
         &config_state,
-    )?
-    .settings;
-    let profiles = profile_settings
+    )?;
+    let prompt_catalog = api
+        .prompt_projection_cache
+        .resolve(&api.config.workspace_id, &config_state)?;
+    let profiles = profile_projection
+        .settings
         .profiles
-        .into_iter()
+        .iter()
         .filter(|profile| {
             !profile
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.severity == server_api::DiagnosticSeverity::Error)
         })
-        .map(|profile| WorkerLaunchProfileCandidate {
-            id: profile.profile_id,
-            label: profile.label,
-            description: profile
-                .description
-                .unwrap_or_else(|| "Workspace profile.".to_string()),
+        .map(|profile| {
+            let bundle =
+                crate::profile_settings::build_virtual_profile_config_bundle_with_prompt_projection(
+                    &profile_projection,
+                    &config_state,
+                    &api.config.workspace_id,
+                    &api.config.workspace_created_at,
+                    &profile.profile_id,
+                    prompt_catalog.as_ref(),
+                )?
+                .ok_or_else(|| Error::Config("resolved Worker Profile bundle is missing".into()))?;
+            let manifest = crate::profile_settings::resolve_profile_manifest_from_config_bundle(
+                &bundle,
+                &profile.profile_id,
+            )?;
+            Ok(WorkerLaunchProfileCandidate {
+                id: profile.profile_id.clone(),
+                label: profile.label.clone(),
+                description: profile
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| "Workspace profile.".to_string()),
+                feature_connections: server_api::WorkerLaunchFeatureConnectionOptions {
+                    subjektiv: manifest.feature.subjektiv.profile.enabled,
+                },
+            })
         })
-        .collect();
+        .collect::<ApiResult<Vec<_>>>()?;
     Ok(WorkerLaunchOptionsResponse {
         workspace_id: api.config.workspace_id.clone(),
         runtimes,
-        default_profile: profile_settings.default_profile,
+        default_profile: profile_projection.settings.default_profile.clone(),
         profiles,
         repositories: working_directory_repository_options(api),
         working_directories: available_working_directory_summaries(api)
@@ -32729,6 +32697,7 @@ mod tests {
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
+                feature_connections: Default::default(),
                 control_operation_id: None,
             }),
         )
@@ -33258,6 +33227,15 @@ mod tests {
         }
 
         let options = worker_launch_options_response(&api).unwrap();
+        assert!(
+            options
+                .profiles
+                .iter()
+                .find(|profile| profile.id == "builtin:companion")
+                .unwrap()
+                .feature_connections
+                .subjektiv
+        );
         let available = options
             .working_directories
             .iter()
@@ -33306,6 +33284,7 @@ mod tests {
                         relative_cwd: None,
                     },
                 ],
+                feature_connections: Default::default(),
                 control_operation_id: None,
             }),
         )
@@ -33543,6 +33522,7 @@ mod tests {
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
+                feature_connections: Default::default(),
                 control_operation_id: None,
             }),
         )
@@ -36389,6 +36369,7 @@ mod tests {
                     selector: "builtin:coder-review".to_string(),
                 }],
                 workdir_attachments: Vec::new(),
+                feature_connections: Default::default(),
                 control_operation_id: None,
             }),
         )
@@ -36423,6 +36404,7 @@ mod tests {
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
+                feature_connections: Default::default(),
                 control_operation_id: None,
             }),
         )
@@ -36458,6 +36440,7 @@ mod tests {
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
+                feature_connections: Default::default(),
                 control_operation_id: None,
             }),
         )
@@ -36547,6 +36530,7 @@ mod tests {
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
+                feature_connections: Default::default(),
                 control_operation_id: None,
             }),
         )
@@ -36805,6 +36789,7 @@ mod tests {
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
+                feature_connections: Default::default(),
                 control_operation_id: None,
             }),
         )
@@ -36864,6 +36849,7 @@ mod tests {
                     "working_directory_id": fixture.read_only_workdir_id,
                 }
             ],
+            "feature_connections": {},
             "control_operation_id": operation_id,
         })
     }
@@ -37287,6 +37273,7 @@ mod tests {
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
+                feature_connections: Default::default(),
                 control_operation_id: None,
             }),
         )
@@ -37328,6 +37315,7 @@ mod tests {
                     "working_directory_id": read_only_workdir_id,
                 }
             ],
+            "feature_connections": {},
             "control_operation_id": "guarded-strict-remote-success",
         });
         assert!(payload.get("working_directory").is_none());
@@ -37580,6 +37568,7 @@ mod tests {
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
+                feature_connections: Default::default(),
                 control_operation_id: None,
             }),
         )
@@ -37612,6 +37601,7 @@ mod tests {
             ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachments: Vec::new(),
+            feature_connections: Default::default(),
             control_operation_id: Some("control-spawn-retry".to_string()),
         };
 
@@ -37687,6 +37677,7 @@ mod tests {
             ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachments: Vec::new(),
+            feature_connections: Default::default(),
             control_operation_id: None,
         };
 
@@ -37845,6 +37836,7 @@ mod tests {
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
+                feature_connections: Default::default(),
                 control_operation_id: None,
             }),
         )
@@ -37943,6 +37935,7 @@ mod tests {
             ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachments: Vec::new(),
+            feature_connections: Default::default(),
             control_operation_id: None,
         };
         let Json(controller) = create_workspace_worker(
@@ -38555,6 +38548,15 @@ mod tests {
         );
         let memory_root = format!("{subject_root}/memories/{}", memory.id);
 
+        request_json_authenticated(
+            app.clone(),
+            "POST",
+            &format!("{subject_root}/worker"),
+            Some(serde_json::json!({})),
+            &owner_token,
+            StatusCode::METHOD_NOT_ALLOWED,
+        )
+        .await;
         request_json(
             app.clone(),
             "GET",
@@ -38916,6 +38918,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_worker_launch_validates_optional_subjektiv_connection() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let store = open_subjektiv_store(&api).unwrap();
+        let active = store
+            .create_subject(crate::subjektiv::SubjectRole::new("companion").unwrap())
+            .unwrap();
+        let retired = store
+            .create_subject(crate::subjektiv::SubjectRole::new("retired").unwrap())
+            .unwrap();
+        store.retire_subject(&retired.id).unwrap();
+
+        let request = |subject_id: Option<&str>, profile: &str, singleton_key: Option<&str>| {
+            CreateWorkspaceWorkerRequest {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                display_name: "Ordinary launch".to_string(),
+                singleton_key: singleton_key.map(ToOwned::to_owned),
+                profile: Some(profile.to_string()),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachments: Vec::new(),
+                feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
+                    subjektiv: subject_id.map(|subject_id| {
+                        server_api::SubjektivWorkerConnectionRequest {
+                            subject_id: subject_id.to_string(),
+                        }
+                    }),
+                },
+                control_operation_id: None,
+            }
+        };
+
+        let Json(ordinary) = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(request(None, "builtin:companion", None)),
+        )
+        .await
+        .unwrap();
+        assert!(ordinary.worker.singleton_key.is_none());
+
+        for (candidate, profile, singleton_key, expected_status) in [
+            (
+                "missing-subject",
+                "builtin:companion",
+                None,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                retired.id.as_str(),
+                "builtin:companion",
+                None,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                active.id.as_str(),
+                "builtin:standalone",
+                None,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                active.id.as_str(),
+                "builtin:companion",
+                Some("caller-key"),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let response = create_workspace_worker(
+                State(api.clone()),
+                HeaderMap::new(),
+                Json(request(Some(candidate), profile, singleton_key)),
+            )
+            .await
+            .unwrap_err()
+            .into_response();
+            assert_eq!(response.status(), expected_status, "candidate={candidate}");
+        }
+
+        let Json(first) = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(request(Some(&active.id), "builtin:companion", None)),
+        )
+        .await
+        .unwrap();
+        let Json(retried) = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(request(Some(&active.id), "builtin:companion", None)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(retried.worker_id, first.worker_id);
+        assert_eq!(
+            first.worker.singleton_key.as_deref(),
+            Some(format!("subjektiv:{}", active.id).as_str())
+        );
+    }
+
+    #[tokio::test]
     async fn subjektiv_subject_worker_and_staging_derive_scope_from_singleton_authority() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
@@ -38935,23 +39038,25 @@ mod tests {
             .unwrap()
             .create_subject(crate::subjektiv::SubjectRole::new("companion").unwrap())
             .unwrap();
-        let request = server_api::SubjektivSubjectWorkerStartRequest {
-            worker: CreateWorkspaceWorkerRequest {
-                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
-                display_name: "Subject Worker".to_string(),
-                singleton_key: None,
-                profile: Some("builtin:companion".to_string()),
-                ticket_assignment: None,
-                initial_submit: Vec::new(),
-                workdir_attachments: Vec::new(),
-                control_operation_id: None,
+        let request = CreateWorkspaceWorkerRequest {
+            runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+            display_name: "Subject Worker".to_string(),
+            singleton_key: None,
+            profile: Some("builtin:companion".to_string()),
+            ticket_assignment: None,
+            initial_submit: Vec::new(),
+            workdir_attachments: Vec::new(),
+            feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
+                subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
+                    subject_id: subject.id.clone(),
+                }),
             },
+            control_operation_id: None,
         };
-        let Json(created) = scoped_start_subjektiv_subject_worker(
+        let Json(created) = scoped_create_workspace_worker(
             State(api.clone()),
-            AxumPath(ScopedSubjektivSubjectPath {
+            AxumPath(ScopedWorkspacePath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
-                subject_id: subject.id.clone(),
             }),
             HeaderMap::new(),
             Json(request),
@@ -40259,6 +40364,7 @@ mod tests {
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
+                feature_connections: Default::default(),
                 control_operation_id: None,
             }),
         )
@@ -40278,6 +40384,7 @@ mod tests {
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
+                feature_connections: Default::default(),
                 control_operation_id: None,
             }),
         )
@@ -40362,6 +40469,7 @@ mod tests {
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
+                feature_connections: Default::default(),
                 control_operation_id: None,
             }),
         )
@@ -45168,6 +45276,7 @@ mod tests {
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
+                feature_connections: Default::default(),
                 control_operation_id: None,
             }),
         )
@@ -51507,7 +51616,8 @@ mod tests {
                     "alias": "workdir",
                     "working_directory_id": working_directory_id,
                     "relative_cwd": "../escape"
-                }]
+                }],
+                "feature_connections": {}
             })),
             StatusCode::BAD_REQUEST,
         )
@@ -52207,7 +52317,8 @@ mod tests {
             serde_json::json!({
                 "runtime_id": "embedded-worker-runtime",
                 "display_name": "",
-                "initial_submit": []
+                "initial_submit": [],
+                "feature_connections": {}
             }),
         )
         .await;
@@ -52326,10 +52437,10 @@ mod tests {
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
+                feature_connections: Default::default(),
                 control_operation_id: None,
             },
             None,
-            false,
         )
         .await
         .unwrap();
@@ -54746,7 +54857,7 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
         assert!(subjektiv_scope_from_singleton_key("subjektiv:").is_err());
         assert!(subjektiv_scope_from_singleton_key("subjektiv: subject-42").is_err());
         assert_eq!(
-            subjektiv_singleton_key("subject-42").unwrap(),
+            crate::subjektiv::subject_worker_singleton_key("subject-42").unwrap(),
             "subjektiv:subject-42"
         );
     }
