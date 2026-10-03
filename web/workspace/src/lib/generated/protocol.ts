@@ -367,7 +367,11 @@ export type Event = { "event": "submission_accepted", "data": { submission_reque
 /**
  * Stable durable history identity. Older mixed-version producers omit it.
  */
-entry_id?: string | null, segments: Array<Segment>, } } | { "event": "session_entry_committed", "data": { entry: SessionSnapshotEntry, } } | { "event": "system_item", "data": { item: unknown, } } | { "event": "invoke_start", "data": { kind: InvokeKind, } } | { "event": "turn_start", "data": { turn: number, } } | { "event": "turn_end", "data": { turn: number, result: TurnResult, } } | { "event": "llm_call_start", "data": { llm_call: number, } } | { "event": "llm_call_end", "data": { llm_call: number, } } | { "event": "llm_retry", "data": { llm_call: number,
+entry_id?: string | null, segments: Array<Segment>, } } | { "event": "session_entry_committed", "data": { entry: SessionSnapshotEntry, } } | { "event": "system_item", "data": {
+/**
+ * Stable durable history identity. Synthetic compatibility events omit it.
+ */
+entry_id?: string | null, item: unknown, } } | { "event": "invoke_start", "data": { kind: InvokeKind, } } | { "event": "turn_start", "data": { turn: number, } } | { "event": "turn_end", "data": { turn: number, result: TurnResult, } } | { "event": "llm_call_start", "data": { llm_call: number, } } | { "event": "llm_call_end", "data": { llm_call: number, } } | { "event": "llm_retry", "data": { llm_call: number,
 /**
  * The attempt that just failed. 1 origin.
  */

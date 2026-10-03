@@ -3781,6 +3781,37 @@ Deno.test("committed history reconciles overlapping Read groups before counting 
   }
 });
 
+Deno.test("live system items reconcile with committed history by entry identity", () => {
+  const item = {
+    kind: "resident_summary_refresh",
+    body: "Resident memory refresh",
+  };
+  const event: Event = {
+    event: "system_item",
+    data: { entry_id: "resident-refresh-1", item },
+  };
+  const current = projectConsole([
+    { eventId: "live-1", event },
+    { eventId: "live-retry", event },
+  ]).lines;
+  assertEquals(current.length, 1);
+  assertEquals(current[0].entryId, "resident-refresh-1");
+
+  const history = projectSessionHistoryEntries([{
+    kind: "system_item",
+    entry_id: "resident-refresh-1",
+    timestamp: 1,
+    provenance: "backend_instruction",
+    item_kind: "resident_summary_refresh",
+    content: item.body,
+    data: item,
+  }], null);
+  const merged = mergeCommittedHistoryLines(history, current);
+  assertEquals(merged.length, 1);
+  assertEquals(merged[0].entryId, "resident-refresh-1");
+  assertEquals(merged[0].body, item.body);
+});
+
 Deno.test("committed history keeps identical run failures with distinct entry identities", () => {
   const message = "the same failure happened again";
   const runError = (entryId: string): SessionSnapshotEntry => ({

@@ -1067,10 +1067,16 @@ export function applyProtocolEvent(
       }
       break;
     }
-    case "system_item":
-      next.lines.push(systemItemLine(envelope.eventId, event.data.item));
+    case "system_item": {
+      const entryId = event.data.entry_id ?? undefined;
+      if (entryId && next.lines.some((line) => line.entryId === entryId)) break;
+      next.lines.push({
+        ...systemItemLine(envelope.eventId, event.data.item),
+        entryId,
+      });
       applyTaskSystemItem(next, event.data.item);
       break;
+    }
     case "text_delta":
       appendStreaming(
         next,

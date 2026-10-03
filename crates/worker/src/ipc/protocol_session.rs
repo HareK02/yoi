@@ -88,8 +88,12 @@ pub fn live_log_entry_event(entry: LogEntry) -> Option<Event> {
                 .map(|entry| Event::SessionEntryCommitted { entry })
         }
         LogEntry::AnnotatedSystemItem { entry, .. } => {
+            let entry_id = Some(entry.metadata.entry_id.0.clone());
             let value = serde_json::to_value(&entry.item).expect("SystemItem is Serialize");
-            Some(Event::SystemItem { item: value })
+            Some(Event::SystemItem {
+                entry_id,
+                item: value,
+            })
         }
         LogEntry::Invoke { trigger, .. } => Some(Event::InvokeStart { kind: trigger }),
         other => {
@@ -300,6 +304,40 @@ mod tests {
                 ));
             }
             other => panic!("expected SessionEntryCommitted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn system_item_log_entry_keeps_identity_in_live_event() {
+        let entry_id = session_store::LoggedSessionHistoryEntryId::new();
+        let event = live_log_entry_event(LogEntry::AnnotatedSystemItem {
+            ts: session_store::segment_log::now_millis(),
+            entry: session_store::LoggedSystemHistoryEntry {
+                item: session_store::SystemItem::ResidentSummaryRefresh {
+                    body: "refresh".to_string(),
+                    prompt_provenance: None,
+                },
+                metadata: session_store::LoggedSessionHistoryMetadata {
+                    entry_id: entry_id.clone(),
+                    origin: session_store::LoggedSessionHistoryOrigin::BackendInstruction {
+                        operation_id: None,
+                    },
+                    derivation: None,
+                },
+            },
+            extensions: Vec::new(),
+        })
+        .expect("SystemItem must be live-relevant");
+
+        match event {
+            Event::SystemItem {
+                entry_id: live_entry_id,
+                item,
+            } => {
+                assert_eq!(live_entry_id.as_deref(), Some(entry_id.0.as_str()));
+                assert_eq!(item["kind"], "resident_summary_refresh");
+            }
+            other => panic!("expected SystemItem, got {other:?}"),
         }
     }
 

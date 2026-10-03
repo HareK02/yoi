@@ -2717,7 +2717,7 @@ async fn socket_worker_event_turn_ended_while_idle_auto_starts_turn() {
         tokio::select! {
             event = reader.next::<Event>() => {
                 match event {
-                    Ok(Some(Event::SystemItem { ref item }))
+                    Ok(Some(Event::SystemItem { ref item, .. }))
                         if item.get("kind").and_then(|k| k.as_str()) == Some("worker_event")
                             && item
                                 .pointer("/event/worker_name")

@@ -5467,6 +5467,7 @@ fn input_protocol_event(input: &WorkerInput) -> Option<protocol::Event> {
         WorkerInputKind::Compact
         | WorkerInputKind::ListRewindTargets
         | WorkerInputKind::RegisterPeer => Some(protocol::Event::SystemItem {
+            entry_id: None,
             item: serde_json::json!({
                 "kind": "embedded_worker_command_input",
                 "command": input.kind,
@@ -8618,6 +8619,7 @@ mod tests {
             .observe_worker_event(
                 &detail.worker_ref,
                 protocol::Event::SystemItem {
+                    entry_id: Some("entry-1".to_string()),
                     item: serde_json::json!({
                         "kind": "notification",
                         "message": "note",
@@ -8631,14 +8633,15 @@ mod tests {
             .read_worker_observation_events(&detail.worker_ref, WorkerObservationCursor::zero())
             .unwrap();
         assert_eq!(observations.len(), 1);
-        let protocol::Event::SystemItem { item } = &observations[0].payload else {
+        let protocol::Event::SystemItem { entry_id, item } = &observations[0].payload else {
             panic!("committed notification observation must be a system item");
         };
+        assert_eq!(entry_id.as_deref(), Some("entry-1"));
         assert_eq!(item["kind"], "notification");
         assert!(observations.iter().all(|observation| {
             !matches!(
                 &observation.payload,
-                protocol::Event::SystemItem { item }
+                protocol::Event::SystemItem { item, .. }
                     if item["kind"] == "embedded_worker_notification"
             )
         }));

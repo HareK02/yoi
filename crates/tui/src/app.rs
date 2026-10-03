@@ -1213,7 +1213,7 @@ impl App {
                     self.push_durable_run_error(message);
                 }
             }
-            Event::SystemItem { item } => {
+            Event::SystemItem { item, .. } => {
                 self.apply_system_item(&item);
                 self.assistant_streaming = false;
             }
@@ -4006,7 +4006,10 @@ mod completion_flow_tests {
             "slug": "build",
             "body": "[Workflow /build]\nRun the build",
         });
-        app.handle_worker_event(Event::SystemItem { item });
+        app.handle_worker_event(Event::SystemItem {
+            entry_id: None,
+            item,
+        });
 
         assert!(app.blocks.is_empty());
     }
@@ -4443,7 +4446,10 @@ mod completion_flow_tests {
             "message": "hi",
             "body": "[Notification] hi",
         });
-        app.handle_worker_event(Event::SystemItem { item });
+        app.handle_worker_event(Event::SystemItem {
+            entry_id: None,
+            item,
+        });
         assert!(matches!(
             app.blocks.as_slice(),
             [Block::Notify { message }] if message == "hi"
@@ -4458,7 +4464,10 @@ mod completion_flow_tests {
             "event": { "kind": "turn_ended", "worker_name": "child" },
             "body": "[Notification] worker `child` finished a turn",
         });
-        app.handle_worker_event(Event::SystemItem { item });
+        app.handle_worker_event(Event::SystemItem {
+            entry_id: None,
+            item,
+        });
         assert_eq!(app.blocks.len(), 1);
         match &app.blocks[0] {
             Block::WorkerEvent {
@@ -4832,6 +4841,7 @@ mod completion_flow_tests {
         // Snapshot text injected through an active system item kind; legacy
         // workflow items are intentionally ignored and must not carry active state.
         app.handle_worker_event(Event::SystemItem {
+            entry_id: None,
             item: serde_json::json!({
                 "kind": "task_reminder",
                 "body": snapshot,

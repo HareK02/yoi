@@ -1106,6 +1106,9 @@ pub enum Event {
     /// One event per `LogEntry::AnnotatedSystemItem` commit. Disk-side and
     /// wire-side are 1:1.
     SystemItem {
+        /// Stable durable history identity. Synthetic compatibility events omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry_id: Option<String>,
         #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
         item: serde_json::Value,
     },
@@ -2615,17 +2618,29 @@ mod tests {
     #[test]
     fn event_system_item_roundtrip() {
         let event = Event::SystemItem {
+            entry_id: Some("entry-1".to_string()),
             item: serde_json::json!({"kind": "notification", "message": "hello"}),
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["event"], "system_item");
+        assert_eq!(parsed["data"]["entry_id"], "entry-1");
         assert_eq!(parsed["data"]["item"]["kind"], "notification");
         let decoded: Event = serde_json::from_str(&json).unwrap();
         match decoded {
-            Event::SystemItem { item } => assert_eq!(item["kind"], "notification"),
+            Event::SystemItem { entry_id, item } => {
+                assert_eq!(entry_id.as_deref(), Some("entry-1"));
+                assert_eq!(item["kind"], "notification");
+            }
             other => panic!("expected SystemItem, got {other:?}"),
         }
+
+        let legacy: Event = serde_json::from_value(serde_json::json!({
+            "event": "system_item",
+            "data": { "item": { "kind": "notification", "message": "legacy" } }
+        }))
+        .unwrap();
+        assert!(matches!(legacy, Event::SystemItem { entry_id: None, .. }));
     }
 
     #[test]
