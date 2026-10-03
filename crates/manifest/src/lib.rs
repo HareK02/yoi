@@ -965,7 +965,9 @@ pub struct CompactionConfig {
     )]
     pub auto_read_budget_tokens: u64,
 
-    /// Dry-run cap for the compacted session's initial request context.
+    /// Warning threshold for the assembled compacted history estimate, including
+    /// retained items and auto-read files. Exceeding it does not abort compaction;
+    /// request-time context safety checks still apply. `0` disables this warning.
     #[serde(default = "default_result_context_max_tokens")]
     pub result_context_max_tokens: u64,
 
