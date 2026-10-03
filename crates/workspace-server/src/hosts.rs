@@ -534,6 +534,9 @@ pub struct WorkerSpawnRequest {
     /// Backend-authored immutable Workspace Memory settings snapshot.
     #[serde(skip, default)]
     pub resolved_memory_settings: Option<manifest::WorkspaceMemorySettingsSnapshot>,
+    /// Backend-attested subjektiv singleton attachment. Browser/model input cannot set it.
+    #[serde(skip, default)]
+    pub resolved_subjektiv_attached: bool,
     /// Backend-owned feature enablement; client input cannot set it.
     #[serde(skip, default)]
     pub resolved_worker_observation_enabled: bool,
@@ -1214,6 +1217,26 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         Ok(runtime_api::WorkerSessionHistoryAvailability::Unavailable {
             reason: runtime_api::WorkerSessionHistoryUnavailableReason::Unsupported,
             message: "session history paging is not supported by this Runtime".to_string(),
+        })
+    }
+
+    fn session_public_search(
+        &self,
+        _request: runtime_api::SessionPublicSearchRequest,
+    ) -> Result<runtime_api::SessionPublicSearchAvailability, String> {
+        Ok(runtime_api::SessionPublicSearchAvailability::Unavailable {
+            reason: runtime_api::SessionPublicUnavailableReason::StorageUnavailable,
+            message: "Session public search is not supported by this Runtime".to_string(),
+        })
+    }
+
+    fn session_public_read(
+        &self,
+        _request: runtime_api::SessionPublicReadRequest,
+    ) -> Result<runtime_api::SessionPublicReadAvailability, String> {
+        Ok(runtime_api::SessionPublicReadAvailability::Unavailable {
+            reason: runtime_api::SessionPublicUnavailableReason::StorageUnavailable,
+            message: "Session public read is not supported by this Runtime".to_string(),
         })
     }
 
@@ -2069,6 +2092,36 @@ impl RuntimeRegistry {
             .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
                 runtime_id: worker.runtime_id.clone(),
                 code: "worker_session_history_failed".to_string(),
+                message,
+            })
+    }
+
+    pub fn session_public_search(
+        &self,
+        runtime_id: &str,
+        request: runtime_api::SessionPublicSearchRequest,
+    ) -> Result<runtime_api::SessionPublicSearchAvailability, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        self.runtime(runtime_id)?
+            .session_public_search(request)
+            .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: runtime_id.to_string(),
+                code: "session_public_search_failed".to_string(),
+                message,
+            })
+    }
+
+    pub fn session_public_read(
+        &self,
+        runtime_id: &str,
+        request: runtime_api::SessionPublicReadRequest,
+    ) -> Result<runtime_api::SessionPublicReadAvailability, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        self.runtime(runtime_id)?
+            .session_public_read(request)
+            .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: runtime_id.to_string(),
+                code: "session_public_read_failed".to_string(),
                 message,
             })
     }
@@ -2964,6 +3017,36 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             .map_err(|error| error.to_string())
     }
 
+    fn session_public_search(
+        &self,
+        request: runtime_api::SessionPublicSearchRequest,
+    ) -> Result<runtime_api::SessionPublicSearchAvailability, String> {
+        if request.workspace_id != self.workspace_id {
+            return Err(
+                "Session public search Workspace does not match embedded Runtime".to_string(),
+            );
+        }
+        let scope = RuntimeWorkspaceScope::new(&request.workspace_id, "embedded-backend");
+        self.runtime
+            .session_public_search_scoped(&scope, &request)
+            .map_err(|error| error.to_string())
+    }
+
+    fn session_public_read(
+        &self,
+        request: runtime_api::SessionPublicReadRequest,
+    ) -> Result<runtime_api::SessionPublicReadAvailability, String> {
+        if request.workspace_id != self.workspace_id {
+            return Err(
+                "Session public read Workspace does not match embedded Runtime".to_string(),
+            );
+        }
+        let scope = RuntimeWorkspaceScope::new(&request.workspace_id, "embedded-backend");
+        self.runtime
+            .session_public_read_scoped(&scope, &request)
+            .map_err(|error| error.to_string())
+    }
+
     fn observation_source(
         &self,
         worker_id: &str,
@@ -3668,6 +3751,9 @@ fn workspace_runtime_operation(method: &str, path_and_query: &str) -> &'static s
     }
     if path.contains("/retention/") || (path.starts_with("/v1/workers/") && method == "DELETE") {
         return "workers:delete";
+    }
+    if path.starts_with("/v1/session-public/") && method == "POST" {
+        return "workers:read";
     }
     if path.starts_with("/v1/workers/") && method == "GET" {
         return "workers:read";
@@ -5007,6 +5093,30 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         .map_err(|diagnostic| diagnostic.message)
     }
 
+    fn session_public_search(
+        &self,
+        request: runtime_api::SessionPublicSearchRequest,
+    ) -> Result<runtime_api::SessionPublicSearchAvailability, String> {
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.session_public_search(request).await },
+        )
+        .map_err(|diagnostic| diagnostic.message)
+    }
+
+    fn session_public_read(
+        &self,
+        request: runtime_api::SessionPublicReadRequest,
+    ) -> Result<runtime_api::SessionPublicReadAvailability, String> {
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.session_public_read(request).await },
+        )
+        .map_err(|diagnostic| diagnostic.message)
+    }
+
     fn observation_source(
         &self,
         worker_id: &str,
@@ -5246,6 +5356,7 @@ fn runtime_create_worker_request(
         worker_observation_grants: request.resolved_worker_observation_grants.clone(),
         workspace_api: Some(workspace_api),
         memory_settings: request.resolved_memory_settings.clone(),
+        subjektiv_attached: request.resolved_subjektiv_attached,
     }
 }
 
@@ -5370,6 +5481,7 @@ fn embedded_profile_label(profile: &ProfileSelector) -> Option<String> {
 
 const MEMORY_CONSOLIDATION_PROFILE: &str = "memory-consolidation";
 pub(crate) const MEMORY_CONSOLIDATION_SINGLETON_KEY: &str = "workspace-memory-consolidation";
+pub(crate) const SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX: &str = "subjektiv-consolidation:";
 const WORKSPACE_ORCHESTRATOR_PROFILE: &str = "orchestrator";
 pub(crate) const WORKSPACE_ORCHESTRATOR_SINGLETON_KEY: &str = "workspace-orchestrator";
 
@@ -5377,7 +5489,7 @@ pub(crate) fn is_reserved_internal_worker_singleton_key(key: &str) -> bool {
     matches!(
         key,
         MEMORY_CONSOLIDATION_SINGLETON_KEY | WORKSPACE_ORCHESTRATOR_SINGLETON_KEY
-    )
+    ) || key.starts_with(SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX)
 }
 
 struct WorkerDisplayMetadata {
@@ -7030,6 +7142,7 @@ mod tests {
             resolved_control_operation: None,
             resolved_workspace_api: Some(test_workspace_api()),
             resolved_memory_settings: Some(test_memory_settings()),
+            resolved_subjektiv_attached: false,
         }
     }
 
@@ -7318,6 +7431,7 @@ mod tests {
                     resolved_control_operation: None,
                     resolved_workspace_api: Some(test_workspace_api()),
                     resolved_memory_settings: Some(test_memory_settings()),
+                    resolved_subjektiv_attached: false,
                 },
             )
             .unwrap();
@@ -7420,6 +7534,7 @@ mod tests {
                     resolved_control_operation: None,
                     resolved_workspace_api: Some(test_workspace_api()),
                     resolved_memory_settings: Some(test_memory_settings()),
+                    resolved_subjektiv_attached: false,
                 },
             )
             .unwrap();
@@ -7460,6 +7575,7 @@ mod tests {
                     resolved_control_operation: None,
                     resolved_workspace_api: Some(test_workspace_api()),
                     resolved_memory_settings: Some(test_memory_settings()),
+                    resolved_subjektiv_attached: false,
                 },
             )
             .unwrap();

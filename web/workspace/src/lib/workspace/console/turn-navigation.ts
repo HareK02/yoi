@@ -23,11 +23,7 @@ export function consoleTurns(lines: readonly ConsoleLine[]): ConsoleTurn[] {
     if (line.kind === "user") {
       current = { id: line.id, user: previewText(line.body), assistant: "" };
       turns.push(current);
-    } else if (
-      current &&
-      (line.kind === "assistant" ||
-        (line.kind === "in_flight" && line.title === "in-flight assistant text"))
-    ) {
+    } else if (current && line.kind === "assistant") {
       const assistant = previewText(line.body);
       if (assistant) current.assistant = assistant;
     }

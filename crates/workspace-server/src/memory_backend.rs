@@ -1,8 +1,9 @@
 use memory::backend::{
     MemoryBackendAckOutput, MemoryBackendOperation, MemoryBackendOperationResult,
     MemoryDocumentReadOperation, MemoryDocumentUpdateOperation, MemoryQueryOperation,
-    MemoryStagingCloseAction, MemoryStagingCloseOperation, MemoryStagingListOperation,
-    MemoryStagingReadOperation, MemoryStagingWriteOutput, MemoryToolOutput,
+    MemoryResidentSummaryAvailability, MemoryResidentSummaryOutput, MemoryStagingCloseAction,
+    MemoryStagingCloseOperation, MemoryStagingListOperation, MemoryStagingReadOperation,
+    MemoryStagingWriteOutput, MemoryToolOutput,
 };
 use memory::extract::{ExtractedCandidate, StagingEvidence, StagingRecord};
 use memory::schema::{SourceEvidenceRef, SourceRef};
@@ -32,7 +33,7 @@ pub fn execute_memory_backend_operation_with_authority<A: MemoryAuthority>(
                 .map(MemoryBackendOperationResult::ToolOutput)
         }
         MemoryBackendOperation::ResidentSummary(_operation) => Ok(
-            MemoryBackendOperationResult::ToolOutput(execute_resident_summary(authority)?),
+            MemoryBackendOperationResult::ResidentSummary(execute_resident_summary(authority)?),
         ),
         MemoryBackendOperation::AppendAudit(_operation) => Ok(
             MemoryBackendOperationResult::Acknowledged(MemoryBackendAckOutput {
@@ -88,16 +89,18 @@ pub fn execute_memory_backend_operation_with_authority<A: MemoryAuthority>(
     }
 }
 
-fn execute_resident_summary<A: MemoryAuthority>(authority: &A) -> Result<MemoryToolOutput> {
+fn execute_resident_summary<A: MemoryAuthority>(
+    authority: &A,
+) -> Result<MemoryResidentSummaryOutput> {
     let document = authority.ensure_memory_document()?;
     if document.body_md.trim().is_empty() {
-        Ok(MemoryToolOutput {
-            summary: "resident memory summary unavailable".to_string(),
+        Ok(MemoryResidentSummaryOutput {
+            availability: MemoryResidentSummaryAvailability::Unavailable,
             content: None,
         })
     } else {
-        Ok(MemoryToolOutput {
-            summary: "resident memory document collected".to_string(),
+        Ok(MemoryResidentSummaryOutput {
+            availability: MemoryResidentSummaryAvailability::Ready,
             content: Some(document.body_md),
         })
     }

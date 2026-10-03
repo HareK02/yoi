@@ -247,6 +247,9 @@ pub struct App {
     /// Latest session context tokens reported by the Worker. This is the raw
     /// `input_tokens` value and is independent from per-run upload totals.
     pub session_context_tokens: u64,
+    /// Availability and provenance for `session_context_tokens`. `None` means
+    /// the current value is unknown and clients must not render a fabricated 0%.
+    pub session_context_source: Option<protocol::ContextTokenSource>,
     pub context_window: u64,
     pub turn_index: usize,
     pub current_tool: Option<String>,
@@ -352,6 +355,7 @@ impl App {
             run_upload_tokens: 0,
             run_output_tokens: 0,
             session_context_tokens: 0,
+            session_context_source: None,
             context_window: 0,
             turn_index: 0,
             current_tool: None,
@@ -1403,7 +1407,12 @@ impl App {
                 output_tokens,
                 cache_read_input_tokens,
             } => {
-                self.session_context_tokens = input_tokens.unwrap_or(0);
+                if let Some(input_tokens) = input_tokens {
+                    self.session_context_tokens = input_tokens;
+                    self.session_context_source = Some(protocol::ContextTokenSource::Measured);
+                } else {
+                    self.session_context_source = None;
+                }
                 // Subtract the cache-hit portion so a tool loop that
                 // re-sends the same prefix on every request doesn't
                 // re-count it. cache_creation stays in (it is full
@@ -1413,6 +1422,14 @@ impl App {
                     .saturating_sub(cache_read_input_tokens.unwrap_or(0));
                 self.run_upload_tokens += net_input;
                 self.run_output_tokens += output_tokens.unwrap_or(0);
+            }
+            Event::ContextUsage { usage } => {
+                if let Some(usage) = usage {
+                    self.session_context_tokens = usage.tokens;
+                    self.session_context_source = Some(usage.source);
+                } else {
+                    self.session_context_source = None;
+                }
             }
             Event::Error { code, message } => {
                 self.handle_error(code, message);
@@ -1475,7 +1492,6 @@ impl App {
                     return None;
                 }
                 self.active_compaction = None;
-                self.session_context_tokens = 0;
                 let new_segment_id = lifecycle
                     .new_segment_id
                     .as_deref()
@@ -2337,8 +2353,12 @@ impl App {
     ) -> InternalWorkerView {
         let mut app = App::new(snapshot.worker.name.clone());
         app.mode = mode;
-        app.restore_session(&snapshot.session, None);
-        app.apply_in_flight_snapshot(snapshot.in_flight);
+        if let Some(greeting) = snapshot.greeting {
+            app.restore_snapshot(&snapshot.session, greeting, snapshot.in_flight);
+        } else {
+            app.restore_session(&snapshot.session, None);
+            app.apply_in_flight_snapshot(snapshot.in_flight);
+        }
         app.set_worker_status(snapshot.status);
         if let Some(error) = snapshot.error {
             let _ = app.handle_worker_event(Event::Error {
@@ -2424,7 +2444,14 @@ impl App {
     ) {
         self.greeting = Some(greeting.clone());
         self.context_window = greeting.context_window;
-        self.session_context_tokens = greeting.context_tokens;
+        let context_usage = greeting.context_usage.or_else(|| {
+            (greeting.context_window > 0).then_some(protocol::ContextUsage {
+                tokens: greeting.context_tokens,
+                source: protocol::ContextTokenSource::Estimated,
+            })
+        });
+        self.session_context_tokens = context_usage.map(|usage| usage.tokens).unwrap_or_default();
+        self.session_context_source = context_usage.map(|usage| usage.source);
         self.restore_session(session, Some(greeting));
         self.apply_in_flight_snapshot(in_flight);
     }
@@ -2441,10 +2468,16 @@ impl App {
                 _ => None,
             })
         });
+        let greeting = greeting.map(|mut greeting| {
+            greeting.context_tokens = 0;
+            greeting.context_usage = None;
+            greeting
+        });
         if let Some(greeting) = greeting.clone() {
             self.greeting = Some(greeting.clone());
             self.context_window = greeting.context_window;
-            self.session_context_tokens = greeting.context_tokens;
+            self.session_context_tokens = 0;
+            self.session_context_source = None;
         }
         let missing_greeting = greeting.is_none();
         self.restore_session(session, greeting);
@@ -2584,6 +2617,7 @@ impl App {
             }
             session_store::SystemItem::FileAttachment { body, .. }
             | session_store::SystemItem::SkillActivation { body, .. }
+            | session_store::SystemItem::ResidentSummaryRefresh { body, .. }
             | session_store::SystemItem::Interrupt { body, .. } => {
                 self.task_store.apply_system_message_text(&body);
                 self.blocks.push(Block::SystemMessage { text: body });
@@ -2835,6 +2869,9 @@ mod rewind_refresh_tests {
         assert!(!blocks_contain(&app, "old post-target output"));
         assert_eq!(composer_text(&app), "selected rewind input");
         assert!(blocks_contain(&app, "Rewound session"));
+        assert_eq!(app.session_context_tokens, 0);
+        assert_eq!(app.session_context_source, None);
+        assert_eq!(app.greeting.as_ref().and_then(|g| g.context_usage), None);
     }
 
     #[test]
@@ -2945,6 +2982,8 @@ mod rewind_refresh_tests {
             tools: vec![],
             context_window: 100,
             context_tokens: 10,
+            reasoning: None,
+            context_usage: None,
         }
     }
 
@@ -3800,6 +3839,7 @@ mod completion_flow_tests {
 
         let run_errored = session_store::LogEntry::RunErrored {
             ts: 3,
+            entry_id: None,
             interrupted: false,
             message: "provider unavailable".into(),
             failure: None,
@@ -4019,6 +4059,7 @@ mod completion_flow_tests {
             },
             revision,
             status: WorkerStatus::Idle,
+            greeting: None,
             session: protocol::SessionSnapshot {
                 pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: Vec::new(),
@@ -4027,6 +4068,76 @@ mod completion_flow_tests {
             error: None,
             internal_workers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn internal_worker_snapshot_uses_child_greeting_metadata() {
+        let mut app = App::new("parent".into());
+        let mut child = test_internal_worker_snapshot("child", "research", 1);
+        let mut greeting = test_greeting();
+        greeting.worker_name = "research".into();
+        greeting.model = "child-model".into();
+        greeting.context_window = 64_000;
+        greeting.context_usage = Some(protocol::ContextUsage {
+            tokens: 12_000,
+            source: protocol::ContextTokenSource::Measured,
+        });
+        child.greeting = Some(greeting);
+
+        app.replace_internal_worker_snapshots(vec![child]);
+
+        let child_app = &app.internal_workers[0].app;
+        assert_eq!(child_app.greeting.as_ref().unwrap().model, "child-model");
+        assert_eq!(child_app.context_window, 64_000);
+        assert_eq!(child_app.session_context_tokens, 12_000);
+    }
+
+    #[test]
+    fn live_internal_worker_snapshot_installs_child_metadata_before_context_updates() {
+        let mut app = App::new("parent".into());
+        let worker = test_internal_worker_snapshot("child", "research", 1).worker;
+        let mut greeting = test_greeting();
+        greeting.worker_name = "research".into();
+        greeting.model = "child-model".into();
+        greeting.context_window = 64_000;
+        greeting.context_usage = Some(protocol::ContextUsage {
+            tokens: 12_000,
+            source: protocol::ContextTokenSource::Measured,
+        });
+
+        app.handle_worker_event(Event::InternalWorker {
+            worker: worker.clone(),
+            revision: 1,
+            event: Box::new(Event::Snapshot {
+                session: protocol::SessionSnapshot {
+                    pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                    entries: Vec::new(),
+                },
+                greeting,
+                state: WorkerStatus::Running.into(),
+                in_flight: Default::default(),
+                internal_workers: Vec::new(),
+            }),
+        });
+        app.handle_worker_event(Event::InternalWorker {
+            worker,
+            revision: 2,
+            event: Box::new(Event::ContextUsage {
+                usage: Some(protocol::ContextUsage {
+                    tokens: 14_000,
+                    source: protocol::ContextTokenSource::Estimated,
+                }),
+            }),
+        });
+
+        let child = &app.internal_workers[0].app;
+        assert_eq!(child.greeting.as_ref().unwrap().model, "child-model");
+        assert_eq!(child.context_window, 64_000);
+        assert_eq!(child.session_context_tokens, 14_000);
+        assert_eq!(
+            child.session_context_source,
+            Some(protocol::ContextTokenSource::Estimated)
+        );
     }
 
     #[test]
@@ -4307,6 +4418,7 @@ mod completion_flow_tests {
                     pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                     entries: Vec::new(),
                 },
+                greeting: None,
                 status: WorkerStatus::Running,
                 error: None,
                 in_flight: Default::default(),
@@ -4503,15 +4615,21 @@ mod completion_flow_tests {
             tools: Vec::new(),
             context_window: 200_000,
             context_tokens: 0,
+            reasoning: None,
+            context_usage: None,
         }
     }
 
     #[test]
-    fn snapshot_initializes_context_usage() {
+    fn snapshot_prefers_typed_context_usage_over_legacy_mirror() {
         let mut app = App::new("test".into());
         let mut greeting = test_greeting();
         greeting.context_window = 123_000;
-        greeting.context_tokens = 45_000;
+        greeting.context_tokens = 1;
+        greeting.context_usage = Some(protocol::ContextUsage {
+            tokens: 45_000,
+            source: protocol::ContextTokenSource::Measured,
+        });
 
         app.handle_worker_event(Event::Snapshot {
             session: protocol::SessionSnapshot {
@@ -4526,6 +4644,36 @@ mod completion_flow_tests {
 
         assert_eq!(app.context_window, 123_000);
         assert_eq!(app.session_context_tokens, 45_000);
+        assert_eq!(
+            app.session_context_source,
+            Some(protocol::ContextTokenSource::Measured)
+        );
+    }
+
+    #[test]
+    fn snapshot_falls_back_to_legacy_context_tokens() {
+        let mut app = App::new("test".into());
+        let mut greeting = test_greeting();
+        greeting.context_window = 100_000;
+        greeting.context_tokens = 25_000;
+
+        app.handle_worker_event(Event::Snapshot {
+            session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                entries: Vec::new(),
+            },
+            greeting,
+            state: test_worker_state(WorkerStatus::Idle),
+            in_flight: Default::default(),
+            internal_workers: Vec::new(),
+        });
+
+        assert_eq!(app.context_window, 100_000);
+        assert_eq!(app.session_context_tokens, 25_000);
+        assert_eq!(
+            app.session_context_source,
+            Some(protocol::ContextTokenSource::Estimated)
+        );
     }
 
     #[test]
@@ -4539,8 +4687,37 @@ mod completion_flow_tests {
         });
 
         assert_eq!(app.session_context_tokens, 42_000);
+        assert_eq!(
+            app.session_context_source,
+            Some(protocol::ContextTokenSource::Measured)
+        );
         assert_eq!(app.run_upload_tokens, 2_000);
         assert_eq!(app.run_output_tokens, 9);
+    }
+
+    #[test]
+    fn context_usage_event_converges_live_state_without_changing_run_traffic() {
+        let mut app = App::new("test".into());
+        app.run_upload_tokens = 2_000;
+        app.run_output_tokens = 9;
+
+        app.handle_worker_event(Event::ContextUsage {
+            usage: Some(protocol::ContextUsage {
+                tokens: 45_000,
+                source: protocol::ContextTokenSource::Estimated,
+            }),
+        });
+
+        assert_eq!(app.session_context_tokens, 45_000);
+        assert_eq!(
+            app.session_context_source,
+            Some(protocol::ContextTokenSource::Estimated)
+        );
+        assert_eq!(app.run_upload_tokens, 2_000);
+        assert_eq!(app.run_output_tokens, 9);
+
+        app.handle_worker_event(Event::ContextUsage { usage: None });
+        assert_eq!(app.session_context_source, None);
     }
 
     #[test]
@@ -4564,7 +4741,7 @@ mod completion_flow_tests {
     }
 
     #[test]
-    fn compact_done_resets_session_context_tokens() {
+    fn legacy_compact_done_does_not_fabricate_zero_context_usage() {
         let mut app = App::new("test".into());
         app.session_context_tokens = 42_000;
 
@@ -4572,7 +4749,7 @@ mod completion_flow_tests {
         lifecycle.new_segment_id = Some(uuid::Uuid::nil().to_string());
         app.handle_worker_event(Event::CompactDone { lifecycle });
 
-        assert_eq!(app.session_context_tokens, 0);
+        assert_eq!(app.session_context_tokens, 42_000);
     }
 
     #[test]

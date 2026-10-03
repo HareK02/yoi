@@ -25,6 +25,8 @@ pub mod resource;
 #[cfg(feature = "fs-store")]
 pub mod retention;
 mod runtime;
+#[cfg(feature = "fs-store")]
+mod session_public;
 pub mod ssh_host_key_probe;
 pub mod worker_backend;
 pub mod worker_source;
@@ -36,5 +38,8 @@ pub mod workspace_request;
 #[cfg(feature = "fs-store")]
 pub use fs_store::{FsRuntimeStore, FsRuntimeStoreOptions};
 pub use management::RuntimeOptions;
-pub use runtime::{Runtime, RuntimeWorkspaceScope};
+pub use runtime::{
+    Runtime, RuntimeEventSelectorSubscription, RuntimeSubscriptionRecvError,
+    RuntimeSubscriptionUpdate, RuntimeWorkspaceScope,
+};
 pub use session_store::UploadedFileUploadContext;

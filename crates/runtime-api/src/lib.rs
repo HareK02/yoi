@@ -444,6 +444,10 @@ pub struct CreateWorkerRequest {
     pub workspace_api: Option<WorkspaceApiRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_settings: Option<manifest::WorkspaceMemorySettingsSnapshot>,
+    /// Backend-attested subject or consolidation attachment. Profile policy alone
+    /// never activates subjektiv for an ordinary Workspace Worker.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub subjektiv_attached: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -692,6 +696,183 @@ pub enum WorkerSessionHistoryAvailability {
     },
 }
 
+/// Backend-selected storage source. This type is never exposed as model tool
+/// input; Runtime paths remain behind the authenticated Workspace capability.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "storage", rename_all = "snake_case")]
+pub enum SessionPublicSource {
+    Retained { worker_id: WorkerId },
+    Archived { archive_id: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPublicEntryKind {
+    User,
+    Assistant,
+    Tool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPublicToolPart {
+    Input,
+    Output,
+    Both,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPublicReadMode {
+    Compact,
+    Full,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPublicLineageKind {
+    Root,
+    Fork,
+    Compact,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPublicLineage {
+    pub kind: SessionPublicLineageKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_segment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_turn_index: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPublicSearchRequest {
+    pub workspace_id: String,
+    pub source: SessionPublicSource,
+    pub expected_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<SessionPublicEntryKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    pub tool_part: SessionPublicToolPart,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_cursor: Option<String>,
+    pub limit: usize,
+    pub max_scan_bytes: u64,
+    pub max_segments: usize,
+    pub max_entries: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPublicReadRequest {
+    pub workspace_id: String,
+    pub source: SessionPublicSource,
+    pub expected_session_id: String,
+    pub expected_generation: Option<String>,
+    pub segment_id: String,
+    pub entry_ref: String,
+    pub mode: SessionPublicReadMode,
+    pub byte_offset: usize,
+    pub max_content_bytes: usize,
+    pub max_scan_bytes: u64,
+    pub max_segments: usize,
+    pub max_entries: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPublicSearchItem {
+    pub segment_id: String,
+    pub entry_ref: String,
+    pub kind: SessionPublicEntryKind,
+    pub origin: protocol::SessionEntryProvenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_part: Option<SessionPublicToolPart>,
+    pub compact: String,
+    pub compact_truncated: bool,
+    pub lineage: SessionPublicLineage,
+    /// Opaque Runtime continuation immediately before this result.
+    pub scan_cursor: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPublicSearchPage {
+    pub session_id: String,
+    pub generation: String,
+    pub items: Vec<SessionPublicSearchItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_scan_cursor: Option<String>,
+    pub has_more: bool,
+    pub scanned_bytes: u64,
+    pub scanned_segments: usize,
+    pub scanned_entries: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_manifest: Option<WorkerSessionArchiveManifest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPublicReadPage {
+    pub session_id: String,
+    pub generation: String,
+    pub segment_id: String,
+    pub entry_ref: String,
+    pub kind: SessionPublicEntryKind,
+    pub origin: protocol::SessionEntryProvenance,
+    pub lineage: SessionPublicLineage,
+    pub mode: SessionPublicReadMode,
+    pub content: String,
+    pub next_byte_offset: Option<usize>,
+    pub has_more: bool,
+    pub scanned_bytes: u64,
+    pub scanned_segments: usize,
+    pub scanned_entries: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_manifest: Option<WorkerSessionArchiveManifest>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPublicUnavailableReason {
+    NotFound,
+    RetentionMissing,
+    RetentionExpired,
+    ArchiveIncomplete,
+    CorruptLog,
+    MigrationRequired,
+    StorageUnavailable,
+    InvalidCursor,
+    ResourceLimit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "availability", rename_all = "snake_case")]
+pub enum SessionPublicSearchAvailability {
+    Page {
+        page: SessionPublicSearchPage,
+    },
+    Unavailable {
+        reason: SessionPublicUnavailableReason,
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "availability", rename_all = "snake_case")]
+pub enum SessionPublicReadAvailability {
+    Page {
+        page: SessionPublicReadPage,
+    },
+    Unavailable {
+        reason: SessionPublicUnavailableReason,
+        message: String,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetainedSessionIdentity {
     pub session_id: String,
@@ -765,6 +946,18 @@ pub trait RuntimeApi {
         #[path] worker_id: String,
         #[query] request: WorkerSessionHistoryRequest,
     ) -> Result<WorkerSessionHistoryAvailability, RuntimeApiError>;
+
+    #[post("/v1/session-public/search", status = 200, error_status = 400)]
+    async fn session_public_search(
+        &self,
+        #[body] request: SessionPublicSearchRequest,
+    ) -> Result<SessionPublicSearchAvailability, RuntimeApiError>;
+
+    #[post("/v1/session-public/read", status = 200, error_status = 400)]
+    async fn session_public_read(
+        &self,
+        #[body] request: SessionPublicReadRequest,
+    ) -> Result<SessionPublicReadAvailability, RuntimeApiError>;
 
     #[post("/v1/workers", status = 200, error_status = 400)]
     async fn create_worker(
@@ -1112,6 +1305,26 @@ mod tests {
             })
         }
 
+        async fn session_public_search(
+            &self,
+            _request: SessionPublicSearchRequest,
+        ) -> Result<SessionPublicSearchAvailability, RuntimeApiError> {
+            Ok(SessionPublicSearchAvailability::Unavailable {
+                reason: SessionPublicUnavailableReason::StorageUnavailable,
+                message: "unsupported".to_string(),
+            })
+        }
+
+        async fn session_public_read(
+            &self,
+            _request: SessionPublicReadRequest,
+        ) -> Result<SessionPublicReadAvailability, RuntimeApiError> {
+            Ok(SessionPublicReadAvailability::Unavailable {
+                reason: SessionPublicUnavailableReason::StorageUnavailable,
+                message: "unsupported".to_string(),
+            })
+        }
+
         async fn create_worker(
             &self,
             _request: CreateWorkerRequest,
@@ -1248,7 +1461,7 @@ mod tests {
     #[test]
     fn contract_inventory_is_complete_and_unique() {
         let operations = RuntimeApiMetadata::OPERATIONS;
-        assert_eq!(operations.len(), 17);
+        assert_eq!(operations.len(), 19);
         let mut routes = operations
             .iter()
             .map(|operation| (format!("{:?}", operation.method), operation.path))

@@ -753,11 +753,11 @@ CREATE TABLE "worker_control_grants" (
             created_at TEXT NOT NULL,
             revoked_at TEXT,
             PRIMARY KEY (workspace_id, grant_id),
-            UNIQUE (workspace_id, controller_worker_id, operation_id),
-            FOREIGN KEY (workspace_id, controller_worker_id)
-                REFERENCES "worker_registry"(workspace_id, worker_id) ON DELETE CASCADE,
-            FOREIGN KEY (workspace_id, subject_worker_id)
-                REFERENCES "worker_registry"(workspace_id, worker_id) ON DELETE CASCADE
+            UNIQUE (workspace_id, controller_runtime_id, controller_worker_id, operation_id),
+            FOREIGN KEY (workspace_id, controller_runtime_id, controller_worker_id)
+                REFERENCES "worker_registry"(workspace_id, runtime_id, worker_id) ON DELETE CASCADE,
+            FOREIGN KEY (workspace_id, subject_runtime_id, subject_worker_id)
+                REFERENCES "worker_registry"(workspace_id, runtime_id, worker_id) ON DELETE CASCADE
         );
 CREATE TABLE worker_create_reservations (
             workspace_id TEXT NOT NULL,
@@ -832,7 +832,7 @@ CREATE TABLE "worker_registry" (
             diagnostics_ref TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            PRIMARY KEY (workspace_id, worker_id),
+            PRIMARY KEY (workspace_id, runtime_id, worker_id),
             FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
         );
 CREATE TABLE backend_jobs (
@@ -914,31 +914,15 @@ CREATE TABLE worker_registry_observations (
     worker_id TEXT NOT NULL,
     availability TEXT NOT NULL CHECK (availability IN ('observed', 'unavailable')),
     worker_json TEXT,
-    connection_generation INTEGER NOT NULL,
-    subject_revision INTEGER NOT NULL,
-    snapshot_revision INTEGER NOT NULL,
-    projection_revision INTEGER NOT NULL,
     observed_at TEXT NOT NULL,
     PRIMARY KEY (workspace_id, runtime_id, worker_id),
-    FOREIGN KEY (workspace_id, worker_id)
-        REFERENCES worker_registry(workspace_id, worker_id) ON DELETE CASCADE
-);
-CREATE TABLE worker_registry_projection_cursors (
-    workspace_id TEXT NOT NULL,
-    runtime_id TEXT NOT NULL,
-    connection_generation INTEGER NOT NULL,
-    snapshot_revision INTEGER NOT NULL,
-    PRIMARY KEY (workspace_id, runtime_id)
-);
-CREATE TABLE worker_registry_projection_revisions (
-    workspace_id TEXT PRIMARY KEY,
-    revision INTEGER NOT NULL
+    FOREIGN KEY (workspace_id, runtime_id, worker_id)
+        REFERENCES worker_registry(workspace_id, runtime_id, worker_id) ON DELETE CASCADE
 );
 CREATE TABLE worker_registry_projection_removals (
     workspace_id TEXT NOT NULL,
     runtime_id TEXT NOT NULL,
     worker_id TEXT NOT NULL,
-    projection_revision INTEGER NOT NULL,
     PRIMARY KEY (workspace_id, runtime_id, worker_id)
 );
 CREATE TABLE worker_registry_projection_diagnostics (
@@ -973,6 +957,17 @@ CREATE TABLE worker_session_archives (
         committed_at TEXT NOT NULL, expires_at TEXT,
         FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
         FOREIGN KEY(operation_id) REFERENCES worker_removal_operations(operation_id));
+CREATE TABLE worker_session_archive_observe_grants (
+        workspace_id TEXT NOT NULL, archive_id TEXT NOT NULL,
+        controller_runtime_id TEXT NOT NULL, controller_worker_id TEXT NOT NULL,
+        subject_runtime_id TEXT NOT NULL, subject_worker_id TEXT NOT NULL,
+        source_grant_id TEXT NOT NULL, granted_at TEXT NOT NULL, revoked_at TEXT,
+        PRIMARY KEY(workspace_id,archive_id,controller_runtime_id,controller_worker_id,source_grant_id),
+        FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+        FOREIGN KEY(archive_id) REFERENCES worker_session_archives(archive_id) ON DELETE CASCADE);
+CREATE INDEX worker_session_archive_observe_grants_controller
+        ON worker_session_archive_observe_grants(
+            workspace_id,controller_runtime_id,controller_worker_id,archive_id);
 CREATE TABLE worker_tombstones (
         workspace_id TEXT NOT NULL, runtime_id TEXT NOT NULL, worker_id TEXT NOT NULL,
         display_name TEXT NOT NULL, profile TEXT, worker_created_at TEXT NOT NULL, removed_at TEXT NOT NULL,
@@ -998,9 +993,9 @@ CREATE TABLE "worker_workdir_links" (
             alias TEXT NOT NULL,
             linked_at TEXT NOT NULL,
             unlinked_at TEXT,
-            PRIMARY KEY (workspace_id, worker_id, workdir_id, alias),
-            FOREIGN KEY (workspace_id, worker_id)
-                REFERENCES "worker_registry"(workspace_id, worker_id) ON DELETE CASCADE,
+            PRIMARY KEY (workspace_id, runtime_id, worker_id, workdir_id, alias),
+            FOREIGN KEY (workspace_id, runtime_id, worker_id)
+                REFERENCES "worker_registry"(workspace_id, runtime_id, worker_id) ON DELETE CASCADE,
             FOREIGN KEY (workspace_id, workdir_id)
                 REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE
         );
@@ -1217,11 +1212,11 @@ CREATE UNIQUE INDEX ux_worker_workdir_attachment_reservation_id
     ON worker_workdir_attachment_reservations(workspace_id, reservation_id);
 CREATE INDEX worker_control_grants_controller
             ON worker_control_grants(
-                workspace_id, controller_worker_id, revoked_at
+                workspace_id, controller_runtime_id, controller_worker_id, revoked_at
             );
 CREATE INDEX worker_control_grants_subject
             ON worker_control_grants(
-                workspace_id, subject_worker_id, revoked_at
+                workspace_id, subject_runtime_id, subject_worker_id, revoked_at
             );
 CREATE INDEX worker_create_reservations_worker
             ON worker_create_reservations(workspace_id, worker_id);
@@ -1232,7 +1227,7 @@ CREATE UNIQUE INDEX worker_workdir_links_active_workdir_unique
             ON worker_workdir_links(workspace_id, workdir_id)
             WHERE unlinked_at IS NULL;
 CREATE UNIQUE INDEX worker_workdir_links_active_alias_unique
-            ON worker_workdir_links(workspace_id, worker_id, alias)
+            ON worker_workdir_links(workspace_id, runtime_id, worker_id, alias)
             WHERE unlinked_at IS NULL;
 CREATE INDEX worker_workdir_links_workdir
             ON worker_workdir_links(workspace_id, workdir_id);

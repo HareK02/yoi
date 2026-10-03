@@ -347,6 +347,7 @@ pub fn save_run_yielded(
         segment_id,
         LogEntry::RunYielded {
             ts: segment_log::now_millis(),
+            entry_id: None,
             reason,
             active_run_turn_count,
         },
@@ -367,6 +368,7 @@ pub fn save_run_resumed(
         segment_id,
         LogEntry::RunResumed {
             ts: segment_log::now_millis(),
+            entry_id: None,
             source,
             active_run_turn_count,
         },
@@ -390,6 +392,7 @@ pub fn save_run_errored(
         segment_id,
         LogEntry::RunErrored {
             ts: segment_log::now_millis(),
+            entry_id: None,
             interrupted,
             message,
             failure: Some(RunFailureKind::Engine),
@@ -568,7 +571,8 @@ pub fn append_entry(
     store: &impl Store,
     session_id: SessionId,
     segment_id: SegmentId,
-    entry: LogEntry,
+    mut entry: LogEntry,
 ) -> Result<(), StoreError> {
+    entry.ensure_session_entry_id();
     store.append(session_id, segment_id, &entry)
 }

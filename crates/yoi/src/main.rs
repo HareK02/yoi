@@ -2986,7 +2986,7 @@ backend = "shared"
             "--display-name".to_string(),
             "Workspace A".to_string(),
             "--repository-key".to_string(),
-            "main".to_string(),
+            "platform".to_string(),
             "--repository".to_string(),
             repository.path().display().to_string(),
             "--default-ref".to_string(),
@@ -3000,12 +3000,41 @@ backend = "shared"
         };
         assert_eq!(options.backend_url, "http://backend.example");
         assert_eq!(options.display_name, "Workspace A");
-        assert_eq!(options.repository_key, "main");
+        assert_eq!(options.repository_key, "platform");
         assert_eq!(options.default_ref.as_deref(), Some("develop"));
         assert_eq!(
             options.repository_root,
             fs::canonicalize(repository.path()).unwrap()
         );
+        assert!(!repository.path().join(".yoi/workspace.toml").exists());
+    }
+
+    #[test]
+    fn init_parsing_rejects_an_omitted_repository_key() {
+        let repository = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repository.path())
+            .status()
+            .unwrap();
+        let resolver = FixedCliConnectionResolver {
+            backend_url: "http://unused.example",
+        };
+        let args = vec![
+            "--backend".to_string(),
+            "http://backend.example".to_string(),
+            "init".to_string(),
+            "--display-name".to_string(),
+            "Workspace A".to_string(),
+            "--repository".to_string(),
+            repository.path().display().to_string(),
+        ];
+
+        let error = parse_args_slice_with_connection_resolver(&args, &resolver)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(error, "yoi init requires --repository-key KEY");
         assert!(!repository.path().join(".yoi/workspace.toml").exists());
     }
 

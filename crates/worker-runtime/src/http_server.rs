@@ -1334,7 +1334,6 @@ async fn runtime_protocol_ws_session(
                                 request_id,
                                 subscription_id: subscription_id.clone(),
                                 selector: selector.clone(),
-                                snapshot_revision: subscription.snapshot_revision(),
                                 snapshot: subscription.snapshot().clone(),
                             },
                         ));
@@ -1354,7 +1353,6 @@ async fn runtime_protocol_ws_session(
                                         SubscriptionFramePayload::Event(
                                             SubscriptionEvent::Event {
                                                 subscription_id: event_subscription_id.clone(),
-                                                subject_revision: update.subject_revision,
                                                 payload: update.payload,
                                             },
                                         ),
@@ -2314,6 +2312,9 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     if path.starts_with("/v1/workers/") && *method == Method::DELETE {
         return Some("workers:delete");
     }
+    if path.starts_with("/v1/session-public/") && *method == Method::POST {
+        return Some("workers:read");
+    }
     if path.starts_with("/v1/workers/") && *method == Method::GET {
         return Some("workers:read");
     }
@@ -3101,6 +3102,7 @@ mod tests {
                 settings_revision: 1,
                 language: "English".to_string(),
             }),
+            subjektiv_attached: false,
         }
     }
 
@@ -3994,6 +3996,8 @@ mod ws_tests {
                     tools: Vec::new(),
                     context_window: 0,
                     context_tokens: 0,
+                    reasoning: None,
+                    context_usage: None,
                 },
                 state: protocol::WorkerStateSnapshot::initial(),
                 in_flight: protocol::InFlightSnapshot {
@@ -4078,6 +4082,7 @@ mod ws_tests {
                 settings_revision: 1,
                 language: "English".to_string(),
             }),
+            subjektiv_attached: false,
         }
     }
 

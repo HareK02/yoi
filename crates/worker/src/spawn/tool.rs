@@ -925,25 +925,30 @@ fn bind_child_memory_settings(
     parent: &manifest::WorkerManifest,
     child: &mut manifest::WorkerManifest,
 ) -> Result<(), String> {
-    if !child.feature.memory.profile.enabled {
-        return child
+    if child.feature.memory.profile.enabled {
+        let workspace_settings = parent.feature.memory.workspace_settings().ok_or_else(|| {
+            "enabled child Memory feature requires the parent's trusted Workspace settings snapshot"
+                .to_string()
+        })?;
+        child
             .feature
             .memory
-            .validate_execution()
-            .map_err(str::to_string);
+            .bind_workspace_settings(workspace_settings)
+            .map_err(str::to_string)?;
     }
-    let workspace_settings = parent.feature.memory.workspace_settings().ok_or_else(|| {
-        "enabled child Memory feature requires the parent's trusted Workspace settings snapshot"
-            .to_string()
-    })?;
     child
         .feature
         .memory
-        .bind_workspace_settings(workspace_settings)
+        .validate_execution()
         .map_err(str::to_string)?;
+
+    // An Internal SubWorker has no Backend keyed-singleton lease of its own.
+    // Preserve reusable subjektiv profile policy but never copy the parent's
+    // trusted activation snapshot into the child.
+    child.feature.subjektiv.workspace_settings = None;
     child
         .feature
-        .memory
+        .subjektiv
         .validate_execution()
         .map_err(str::to_string)
 }
@@ -1292,7 +1297,7 @@ enabled = false
     }
 
     #[tokio::test]
-    async fn reviewer_profile_write_scope_exposes_command_tools_and_notifies_parent_controller() {
+    async fn builtin_reviewer_spawn_from_subject_parent_is_inert_and_notifies_parent() {
         let runtime = TempDir::new().unwrap();
         let workspace_root = runtime.path().join("project");
         let bash_output_dir = runtime.path().join("bash-output");
@@ -1310,6 +1315,17 @@ enabled = false
             allow: vec![abs_rule(&workspace_root, Permission::Write)],
             deny: Vec::new(),
         };
+        manifest.feature.subjektiv.profile.enabled = true;
+        manifest.feature.subjektiv.profile.extraction.enabled = true;
+        manifest
+            .feature
+            .subjektiv
+            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+                workspace_id: "workspace-test".to_string(),
+                settings_revision: 1,
+                language: "English".to_string(),
+            })
+            .unwrap();
         let spawner_scope = SharedScope::new(Scope::from_config(&manifest.scope).unwrap());
         let registry = SpawnedWorkerRegistry::new_internal("parent".into(), spawner_scope.clone());
         let workspace_context = crate::worker::WorkerWorkspaceContext::with_client(
@@ -1359,7 +1375,7 @@ enabled = false
         }));
         let input = serde_json::json!({
             "name": "reviewer-child",
-            "profile": "project:reviewer",
+            "profile": "builtin:reviewer",
             "instruction": "role.reviewer",
             "task": "review immutable commit",
             "scope": [{
@@ -1409,6 +1425,14 @@ enabled = false
                 record.installed_tools
             );
         }
+        assert!(
+            record
+                .installed_tools
+                .iter()
+                .all(|name| !name.starts_with("Subjektiv")),
+            "Reviewer child must not install independently scoped subjektiv tools: {:?}",
+            record.installed_tools
+        );
         assert!(
             !record
                 .installed_tools
@@ -1881,14 +1905,22 @@ enabled = false
         let temp = tempfile::tempdir().unwrap();
         let mut parent = parent_manifest(temp.path(), None);
         parent.feature.memory.profile.enabled = true;
+        let settings = manifest::WorkspaceMemorySettingsSnapshot {
+            workspace_id: "workspace-1".to_string(),
+            settings_revision: 4,
+            language: "日本語".to_string(),
+        };
         parent
             .feature
             .memory
-            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
-                workspace_id: "workspace-1".to_string(),
-                settings_revision: 4,
-                language: "日本語".to_string(),
-            })
+            .bind_workspace_settings(settings.clone())
+            .unwrap();
+        parent.feature.subjektiv.profile.enabled = true;
+        parent.feature.subjektiv.profile.extraction.enabled = true;
+        parent
+            .feature
+            .subjektiv
+            .bind_workspace_settings(settings)
             .unwrap();
         let mut child = parent.clone();
         child.feature.memory.workspace_settings = None;
@@ -1898,6 +1930,15 @@ enabled = false
             child.feature.memory.workspace_settings(),
             parent.feature.memory.workspace_settings()
         );
+        assert!(child.feature.subjektiv.profile.enabled);
+        assert!(!child.feature.subjektiv.execution_enabled());
+
+        let mut ordinary_parent = parent.clone();
+        ordinary_parent.feature.subjektiv.workspace_settings = None;
+        let mut ordinary_child = child.clone();
+        ordinary_child.feature.memory.workspace_settings = None;
+        bind_child_memory_settings(&ordinary_parent, &mut ordinary_child).unwrap();
+        assert!(!ordinary_child.feature.subjektiv.execution_enabled());
 
         child.feature.memory.profile.enabled = false;
         assert!(bind_child_memory_settings(&parent, &mut child).is_err());

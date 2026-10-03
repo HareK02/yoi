@@ -6403,6 +6403,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "server-api",
+ "session-store",
  "sha2 0.11.0",
  "ssh-key",
  "tempfile",

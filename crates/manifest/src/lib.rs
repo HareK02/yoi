@@ -108,6 +108,11 @@ pub struct FeatureConfig {
     pub task: FeatureFlagConfig,
     #[serde(default)]
     pub memory: ResolvedMemoryFeatureConfig,
+    /// Subject-scoped Memory extraction. Subject identity is resolved by the
+    /// Workspace host from the Worker's keyed singleton lease, never from this
+    /// model-visible manifest.
+    #[serde(default)]
+    pub subjektiv: ResolvedSubjektivFeatureConfig,
     #[serde(default)]
     pub web: FeatureFlagConfig,
     #[serde(default)]
@@ -139,6 +144,7 @@ impl Default for FeatureConfig {
         Self {
             task: FeatureFlagConfig::disabled(),
             memory: ResolvedMemoryFeatureConfig::default(),
+            subjektiv: ResolvedSubjektivFeatureConfig::default(),
             web: FeatureFlagConfig::disabled(),
             image: FeatureFlagConfig::disabled(),
             sub_worker: FeatureFlagConfig::disabled(),
@@ -345,6 +351,85 @@ impl ResolvedMemoryFeatureConfig {
                 || !is_normalized_workspace_memory_language(&settings.language))
         {
             return Err("Memory Workspace settings snapshot metadata is invalid");
+        }
+        Ok(())
+    }
+}
+
+/// Profile-owned subjektiv activation and extraction policy. The subject id is
+/// deliberately absent: the Workspace host binds it from `subjektiv:<id>`
+/// singleton ownership for each operation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SubjektivFeatureProfileConfig {
+    pub enabled: bool,
+    pub extraction: MemoryExtractionProfileConfig,
+}
+
+impl Default for SubjektivFeatureProfileConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            extraction: MemoryExtractionProfileConfig::default(),
+        }
+    }
+}
+
+/// Immutable subjektiv execution configuration persisted in a resolved Worker
+/// Manifest. Workspace settings provide only trusted extraction language and
+/// are not subject identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ResolvedSubjektivFeatureConfig {
+    pub profile: SubjektivFeatureProfileConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_settings: Option<WorkspaceMemorySettingsSnapshot>,
+}
+
+impl ResolvedSubjektivFeatureConfig {
+    pub fn enabled(&self) -> bool {
+        self.profile.enabled
+    }
+
+    /// Returns whether the host attached this profile policy to trusted subject
+    /// authority. Profile enablement without a settings snapshot is inert.
+    pub fn execution_enabled(&self) -> bool {
+        self.profile.enabled && self.workspace_settings.is_some()
+    }
+
+    pub fn bind_workspace_settings(
+        &mut self,
+        settings: WorkspaceMemorySettingsSnapshot,
+    ) -> Result<(), &'static str> {
+        if !self.profile.enabled {
+            if self.workspace_settings.is_some() {
+                return Err("disabled subjektiv feature must not carry Workspace settings");
+            }
+            return Ok(());
+        }
+        if self.workspace_settings.is_some() {
+            return Err("subjektiv Workspace settings are already bound");
+        }
+        self.workspace_settings = Some(settings);
+        Ok(())
+    }
+
+    pub fn workspace_settings(&self) -> Option<WorkspaceMemorySettingsSnapshot> {
+        self.workspace_settings.clone()
+    }
+
+    pub fn validate_execution(&self) -> Result<(), &'static str> {
+        // `profile.enabled` is reusable policy. Only a host-bound settings
+        // snapshot activates subject execution; an ordinary Worker or Internal
+        // SubWorker with the same Profile remains inert.
+        if !self.profile.enabled && self.workspace_settings.is_some() {
+            return Err("disabled subjektiv feature must not carry Workspace settings");
+        }
+        if let Some(settings) = &self.workspace_settings
+            && (settings.settings_revision == 0
+                || !is_normalized_workspace_memory_language(&settings.language))
+        {
+            return Err("subjektiv Workspace settings snapshot metadata is invalid");
         }
         Ok(())
     }
@@ -963,7 +1048,9 @@ impl Default for CompactionConfig {
 
 impl WorkerManifest {
     pub fn requires_persisted_execution_snapshot(&self) -> bool {
-        self.profile.is_some() || self.feature.memory.workspace_settings.is_some()
+        self.profile.is_some()
+            || self.feature.memory.workspace_settings.is_some()
+            || self.feature.subjektiv.workspace_settings.is_some()
     }
 
     /// Parse a manifest from a TOML string.
@@ -1633,6 +1720,27 @@ model_id = "claude-sonnet-4-20250514"
         assert!(enabled.validate_execution().is_ok());
 
         let mut disabled = ResolvedMemoryFeatureConfig::default();
+        disabled.workspace_settings = Some(snapshot.clone());
+        assert!(disabled.validate_execution().is_err());
+        assert!(disabled.bind_workspace_settings(snapshot).is_err());
+    }
+
+    #[test]
+    fn resolved_subjektiv_policy_is_inert_until_trusted_attachment() {
+        let snapshot = WorkspaceMemorySettingsSnapshot {
+            workspace_id: "workspace-1".to_string(),
+            settings_revision: 1,
+            language: "English".to_string(),
+        };
+        let mut enabled = ResolvedSubjektivFeatureConfig::default();
+        enabled.profile.enabled = true;
+        assert!(enabled.validate_execution().is_ok());
+        assert!(!enabled.execution_enabled());
+        enabled.bind_workspace_settings(snapshot.clone()).unwrap();
+        assert!(enabled.validate_execution().is_ok());
+        assert!(enabled.execution_enabled());
+
+        let mut disabled = ResolvedSubjektivFeatureConfig::default();
         disabled.workspace_settings = Some(snapshot.clone());
         assert!(disabled.validate_execution().is_err());
         assert!(disabled.bind_workspace_settings(snapshot).is_err());

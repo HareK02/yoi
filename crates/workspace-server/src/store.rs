@@ -27,7 +27,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 73;
+const LATEST_SCHEMA_VERSION: i64 = 76;
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
@@ -68,6 +68,12 @@ const BACKEND_JOB_DISPATCH_QUEUE_MIGRATION_NAME: &str =
     "durable bounded Backend Job dispatch queue";
 const WORKER_SINGLETON_OWNERSHIP_MIGRATION_NAME: &str =
     "durable Workspace Worker singleton ownership";
+const ORDERED_WORKER_PROJECTION_MIGRATION_NAME: &str =
+    "ordered Worker projection subscriptions without revision reconciliation";
+const RUNTIME_SCOPED_WORKER_IDENTITY_MIGRATION_NAME: &str =
+    "Runtime-scoped durable Worker catalog identity";
+const ARCHIVE_OBSERVE_GRANTS_MIGRATION_NAME: &str =
+    "preserve explicit observe grants for committed Worker Session archives";
 const TICKET_SCHEMA_VERSION_WITH_TARGETS: i64 = 7;
 const TICKET_SCHEMA_BASELINE_NAME: &str = "ticket schema baseline";
 const WORKER_REGISTRY_PROJECTION_SCHEMA: &str = r#"
@@ -229,6 +235,21 @@ const MIGRATIONS: &[Migration] = &[
         version: 73,
         name: WORKER_SINGLETON_OWNERSHIP_MIGRATION_NAME,
         apply: migrate_worker_singleton_ownership_v72_to_v73,
+    },
+    Migration {
+        version: 74,
+        name: ORDERED_WORKER_PROJECTION_MIGRATION_NAME,
+        apply: migrate_ordered_worker_projection_v73_to_v74,
+    },
+    Migration {
+        version: 75,
+        name: RUNTIME_SCOPED_WORKER_IDENTITY_MIGRATION_NAME,
+        apply: migrate_runtime_scoped_worker_identity_v74_to_v75,
+    },
+    Migration {
+        version: 76,
+        name: ARCHIVE_OBSERVE_GRANTS_MIGRATION_NAME,
+        apply: migrate_archive_observe_grants_v75_to_v76,
     },
 ];
 
@@ -638,17 +659,10 @@ pub struct WorkerRegistryRecord {
 }
 
 /// Runtime-backed observation joined to the durable Worker catalog.
-///
-/// The Runtime payload remains intact so protocol projection is lossless. Ordering
-/// metadata is persisted separately to reject stale reconnect snapshots and events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerRegistryObservationRecord {
     pub worker: SubscriptionWorker,
     pub availability: SubscriptionWorkerAvailability,
-    pub connection_generation: u64,
-    pub subject_revision: u64,
-    pub snapshot_revision: u64,
-    pub projection_revision: u64,
     pub observed_at: String,
 }
 
@@ -666,14 +680,9 @@ pub enum WorkerCatalogChange {
     Removed(RuntimeWorkerRef),
 }
 
-/// A catalog mutation and the exact projection payload committed at its revision.
-///
-/// Callers may broadcast this value, but must never re-read catalog rows to infer
-/// what happened: a later catalog mutation could otherwise be paired with an
-/// older revision.
+/// A catalog mutation and the exact projection payload captured in its transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerRegistryProjectionCommit {
-    pub revision: u64,
     pub changes: Vec<WorkerCatalogChange>,
 }
 
@@ -1026,6 +1035,13 @@ pub struct MemoryStagingResolutionRecord {
     pub resolved_at: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LegacyMemoryResetCounts {
+    pub documents: usize,
+    pub staging_records: usize,
+    pub staging_resolutions: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FlowSourceRecord {
     pub workspace_id: String,
@@ -1091,6 +1107,16 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         kind: WorkspaceResourceKind,
         reference: &str,
     ) -> Result<Option<String>>;
+    fn worker_resource_key(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<String>>;
+    fn resolve_worker_resource_reference(
+        &self,
+        workspace_id: &str,
+        reference: &str,
+    ) -> Result<Option<RuntimeWorkerRef>>;
     async fn upsert_workspace(&self, record: &WorkspaceRecord) -> Result<()>;
     async fn get_workspace(&self, workspace_id: &str) -> Result<Option<WorkspaceRecord>>;
     async fn update_workspace_display_name(
@@ -1431,6 +1457,10 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         workspace_id: &str,
         limit: usize,
     ) -> Result<Vec<MemoryStagingResolutionRecord>>;
+    /// Atomically removes only the legacy Workspace Memory document and legacy
+    /// staging rows. Subjektiv Feature storage and all other Workspace state are
+    /// outside this transaction's deletion set.
+    fn reset_legacy_memory(&self, workspace_id: &str) -> Result<LegacyMemoryResetCounts>;
 
     fn upsert_account(&self, record: &AccountRecord) -> Result<()>;
     fn get_account(&self, account_id: &str) -> Result<Option<AccountRecord>>;
@@ -1623,7 +1653,7 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         &self,
         workspace_id: &str,
         limit: usize,
-    ) -> Result<(u64, Vec<WorkerRegistryProjectionRecord>)>;
+    ) -> Result<Vec<WorkerRegistryProjectionRecord>>;
     fn worker_registry_projection(
         &self,
         workspace_id: &str,
@@ -1633,8 +1663,6 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         &self,
         workspace_id: &str,
         runtime_id: &str,
-        connection_generation: u64,
-        snapshot_revision: u64,
         workers: &[SubscriptionWorker],
         observed_at: &str,
     ) -> Result<WorkerRegistryProjectionCommit>;
@@ -1642,7 +1670,6 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         &self,
         workspace_id: &str,
         runtime_id: &str,
-        connection_generation: u64,
         worker: &SubscriptionWorker,
         observed_at: &str,
     ) -> Result<WorkerRegistryProjectionCommit>;
@@ -1650,9 +1677,7 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         &self,
         workspace_id: &str,
         runtime_id: &str,
-        connection_generation: u64,
         worker_id: Option<&str>,
-        subject_revision: Option<u64>,
         observed_at: &str,
     ) -> Result<WorkerRegistryProjectionCommit>;
     fn commit_worker_registry_projection_refresh(
@@ -2355,11 +2380,13 @@ impl SqliteWorkspaceStore {
                     )));
                 }
             };
+            let worker_resource_id =
+                worker_resource_id(&RuntimeWorkerRef::new(runtime_id, worker_id_text.clone()));
             allocate_resource_key(
                 &tx,
                 workspace_id,
                 WorkspaceResourceKind::Worker,
-                &worker_id_text,
+                &worker_resource_id,
                 &now,
             )?;
             tx.execute(
@@ -2573,8 +2600,8 @@ impl SqliteWorkspaceStore {
             let registry_exists = tx
                 .query_row(
                     "SELECT 1 FROM worker_registry \
-                     WHERE workspace_id = ?1 AND worker_id = ?2 LIMIT 1",
-                    params![workspace_id, worker_id.to_string()],
+                     WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3 LIMIT 1",
+                    params![workspace_id, runtime_id, worker_id.to_string()],
                     |_| Ok(()),
                 )
                 .optional()?
@@ -2606,13 +2633,17 @@ impl SqliteWorkspaceStore {
                     )));
                 }
             }
+            let resource_id = worker_resource_id(&RuntimeWorkerRef::new(
+                runtime_id,
+                worker_id.to_string(),
+            ));
             tx.execute(
                 "DELETE FROM workspace_resource_keys \
                  WHERE workspace_id = ?1 AND resource_kind = ?2 AND resource_id = ?3",
                 params![
                     workspace_id,
                     WorkspaceResourceKind::Worker.as_str(),
-                    worker_id.to_string()
+                    resource_id
                 ],
             )?;
             tx.commit()?;
@@ -2627,15 +2658,15 @@ impl SqliteWorkspaceStore {
     ) -> Result<bool> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let reservation_state = tx
+            let reservation = tx
                 .query_row(
-                    "SELECT state FROM worker_create_reservations \
+                    "SELECT state, runtime_id FROM worker_create_reservations \
                      WHERE workspace_id = ?1 AND worker_id = ?2",
                     params![workspace_id, worker_id.to_string()],
-                    |row| row.get::<_, String>(0),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
                 .optional()?;
-            let Some(reservation_state) = reservation_state else {
+            let Some((reservation_state, runtime_id)) = reservation else {
                 tx.commit()?;
                 return Ok(false);
             };
@@ -2648,8 +2679,8 @@ impl SqliteWorkspaceStore {
             let registry_exists = tx
                 .query_row(
                     "SELECT 1 FROM worker_registry \
-                     WHERE workspace_id = ?1 AND worker_id = ?2 LIMIT 1",
-                    params![workspace_id, worker_id.to_string()],
+                     WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3 LIMIT 1",
+                    params![workspace_id, runtime_id, worker_id.to_string()],
                     |_| Ok(()),
                 )
                 .optional()?
@@ -2660,13 +2691,17 @@ impl SqliteWorkspaceStore {
                     worker_id
                 )));
             }
+            let resource_id = worker_resource_id(&RuntimeWorkerRef::new(
+                runtime_id,
+                worker_id.to_string(),
+            ));
             let released = tx.execute(
                 "DELETE FROM workspace_resource_keys \
                  WHERE workspace_id = ?1 AND resource_kind = ?2 AND resource_id = ?3",
                 params![
                     workspace_id,
                     WorkspaceResourceKind::Worker.as_str(),
-                    worker_id.to_string()
+                    resource_id
                 ],
             )? > 0;
             tx.commit()?;
@@ -3891,6 +3926,11 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         kind: WorkspaceResourceKind,
         resource_id: &str,
     ) -> Result<Option<String>> {
+        if kind == WorkspaceResourceKind::Worker {
+            return Err(Error::InvalidInput(
+                "Worker resource keys require a RuntimeWorkerRef".to_string(),
+            ));
+        }
         self.with_conn(|conn| {
             conn.query_row(
                 "SELECT resource_key FROM workspace_resource_keys
@@ -3909,6 +3949,11 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         kind: WorkspaceResourceKind,
         reference: &str,
     ) -> Result<Option<String>> {
+        if kind == WorkspaceResourceKind::Worker {
+            return Err(Error::InvalidInput(
+                "Worker references require a Runtime-scoped resolver".to_string(),
+            ));
+        }
         self.with_conn(|conn| {
             if let Some(resource_id) = conn
                 .query_row(
@@ -3939,6 +3984,67 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 )?,
             };
             Ok((exists != 0).then(|| reference.to_string()))
+        })
+    }
+
+    fn worker_resource_key(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<String>> {
+        let resource_id = worker_resource_id(worker);
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT resource_key FROM workspace_resource_keys
+                 WHERE workspace_id = ?1 AND resource_kind = 'worker' AND resource_id = ?2",
+                params![workspace_id, resource_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn resolve_worker_resource_reference(
+        &self,
+        workspace_id: &str,
+        reference: &str,
+    ) -> Result<Option<RuntimeWorkerRef>> {
+        self.with_conn(|conn| {
+            if let Some(resource_id) = conn
+                .query_row(
+                    "SELECT resource_id FROM workspace_resource_keys
+                     WHERE workspace_id = ?1 AND resource_kind = 'worker' AND resource_key = ?2",
+                    params![workspace_id, reference],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                return parse_worker_resource_id(resource_id.as_str())
+                    .map(Some)
+                    .ok_or_else(|| {
+                        Error::Store(format!(
+                            "Worker resource key `{reference}` has an invalid composite resource identity"
+                        ))
+                    });
+            }
+            let mut statement = conn.prepare(
+                "SELECT runtime_id, worker_id FROM worker_registry
+                 WHERE workspace_id = ?1 AND worker_id = ?2
+                 ORDER BY runtime_id LIMIT 2",
+            )?;
+            let identities = statement
+                .query_map(params![workspace_id, reference], |row| {
+                    Ok(RuntimeWorkerRef::new(
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(match identities.as_slice() {
+                [worker] => Some(worker.clone()),
+                _ => None,
+            })
         })
     }
 
@@ -5795,6 +5901,34 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn reset_legacy_memory(&self, workspace_id: &str) -> Result<LegacyMemoryResetCounts> {
+        validate_identifier("workspace_id", workspace_id)?;
+        self.with_conn_mut(|connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Resolutions retain copies of staging rows, so remove them first;
+            // pending staging follows, then the singleton legacy document.
+            let staging_resolutions = transaction.execute(
+                "DELETE FROM memory_staging_resolutions WHERE workspace_id = ?1",
+                params![workspace_id],
+            )?;
+            let staging_records = transaction.execute(
+                "DELETE FROM memory_staging_records WHERE workspace_id = ?1",
+                params![workspace_id],
+            )?;
+            let documents = transaction.execute(
+                "DELETE FROM workspace_memory_documents WHERE workspace_id = ?1",
+                params![workspace_id],
+            )?;
+            transaction.commit()?;
+            Ok(LegacyMemoryResetCounts {
+                documents,
+                staging_records,
+                staging_resolutions,
+            })
+        })
+    }
+
     fn upsert_account(&self, record: &AccountRecord) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute(
@@ -6383,7 +6517,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     ));
                 }
                 let commit = WorkerRegistryProjectionCommit {
-                    revision: current_worker_projection_revision(&tx, workspace_id)?,
                     changes: Vec::new(),
                 };
                 tx.commit()?;
@@ -6404,10 +6537,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 ));
             }
             let changed_workers = vec![worker.clone()];
-            let revision = commit_worker_projection_changes(&tx, workspace_id, &changed_workers)?;
             let changes = worker_catalog_upsert_changes(&tx, workspace_id, &changed_workers)?;
             tx.commit()?;
-            Ok((WorkerRegistryProjectionCommit { revision, changes }, true))
+            Ok((WorkerRegistryProjectionCommit { changes }, true))
         })
     }
 
@@ -6775,7 +6907,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )?;
             if removal_blocks_upsert {
                 return Ok(WorkerRegistryProjectionCommit {
-                    revision: current_worker_projection_revision(&tx, &record.workspace_id)?,
                     changes: Vec::new(),
                 });
             }
@@ -6785,8 +6916,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     retention_state, transcript_ref, session_ref, summary_ref,
                     diagnostics_ref, created_at, updated_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                ON CONFLICT(workspace_id, worker_id) DO UPDATE SET
-                    runtime_id = excluded.runtime_id,
+                ON CONFLICT(workspace_id, runtime_id, worker_id) DO UPDATE SET
                     display_name = excluded.display_name,
                     profile = excluded.profile,
                     retention_state = CASE
@@ -6821,11 +6951,12 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     record.updated_at,
                 ],
             )?;
+            let resource_id = worker_resource_id(&record.worker);
             allocate_resource_key(
                 &tx,
                 &record.workspace_id,
                 WorkspaceResourceKind::Worker,
-                &record.worker.worker_id,
+                &resource_id,
                 &record.created_at,
             )?;
             let changed_workers = if changed == 0 {
@@ -6833,15 +6964,13 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             } else {
                 vec![record.worker.clone()]
             };
-            let revision =
-                commit_worker_projection_changes(&tx, &record.workspace_id, &changed_workers)?;
             let changes = worker_catalog_upsert_changes(
                 &tx,
                 &record.workspace_id,
                 changed_workers.as_slice(),
             )?;
             tx.commit()?;
-            Ok(WorkerRegistryProjectionCommit { revision, changes })
+            Ok(WorkerRegistryProjectionCommit { changes })
         })
     }
 
@@ -6930,20 +7059,24 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         &self,
         workspace_id: &str,
         limit: usize,
-    ) -> Result<(u64, Vec<WorkerRegistryProjectionRecord>)> {
+    ) -> Result<Vec<WorkerRegistryProjectionRecord>> {
         self.with_conn(|conn| {
-            let revision = current_worker_projection_revision(conn, workspace_id)?;
             let mut statement = conn.prepare(
                 "SELECT runtime_id, worker_id FROM worker_registry WHERE workspace_id = ?1 ORDER BY updated_at DESC LIMIT ?2",
             )?;
-            let identities = statement.query_map(params![workspace_id, limit as i64], |row| {
-                Ok(RuntimeWorkerRef { runtime_id: row.get(0)?, worker_id: row.get(1)? })
-            })?.collect::<std::result::Result<Vec<_>, _>>()?;
-            let records = identities.iter()
+            let identities = statement
+                .query_map(params![workspace_id, limit as i64], |row| {
+                    Ok(RuntimeWorkerRef {
+                        runtime_id: row.get(0)?,
+                        worker_id: row.get(1)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            identities
+                .iter()
                 .map(|worker| read_worker_registry_projection(conn, workspace_id, worker))
-                .collect::<Result<Vec<_>>>()?
-                .into_iter().flatten().collect();
-            Ok((revision, records))
+                .collect::<Result<Vec<_>>>()
+                .map(|records| records.into_iter().flatten().collect())
         })
     }
 
@@ -6959,33 +7092,11 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         &self,
         workspace_id: &str,
         runtime_id: &str,
-        connection_generation: u64,
-        snapshot_revision: u64,
         workers: &[SubscriptionWorker],
         observed_at: &str,
     ) -> Result<WorkerRegistryProjectionCommit> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let (current_generation, current_snapshot) =
-                worker_projection_cursor(&tx, workspace_id, runtime_id)?;
-            if connection_generation < current_generation
-                || (connection_generation == current_generation
-                    && snapshot_revision < current_snapshot)
-            {
-                let revision = current_worker_projection_revision(&tx, workspace_id)?;
-                tx.commit()?;
-                return Ok(WorkerRegistryProjectionCommit {
-                    revision,
-                    changes: Vec::new(),
-                });
-            }
-            upsert_worker_projection_cursor(
-                &tx,
-                workspace_id,
-                runtime_id,
-                connection_generation,
-                snapshot_revision,
-            )?;
             let catalog = worker_registry_identities_for_runtime(&tx, workspace_id, runtime_id)?;
             let runtime_workers = workers
                 .iter()
@@ -7014,32 +7125,20 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                         &tx,
                         workspace_id,
                         runtime_id,
-                        connection_generation,
-                        snapshot_revision,
                         worker,
                         SubscriptionWorkerAvailability::Observed,
                         observed_at,
                     )?
                 } else {
-                    set_worker_observation_unavailable(
-                        &tx,
-                        workspace_id,
-                        &identity,
-                        connection_generation,
-                        None,
-                        snapshot_revision,
-                        observed_at,
-                    )?
+                    set_worker_observation_unavailable(&tx, workspace_id, &identity, observed_at)?
                 };
                 if changed {
                     changed_workers.push(identity);
                 }
             }
-            let revision = commit_worker_projection_changes(&tx, workspace_id, &changed_workers)?;
-            let changes =
-                worker_catalog_upsert_changes(&tx, workspace_id, changed_workers.as_slice())?;
+            let changes = worker_catalog_upsert_changes(&tx, workspace_id, &changed_workers)?;
             tx.commit()?;
-            Ok(WorkerRegistryProjectionCommit { revision, changes })
+            Ok(WorkerRegistryProjectionCommit { changes })
         })
     }
 
@@ -7047,16 +7146,12 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         &self,
         workspace_id: &str,
         runtime_id: &str,
-        connection_generation: u64,
         worker: &SubscriptionWorker,
         observed_at: &str,
     ) -> Result<WorkerRegistryProjectionCommit> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let identity = RuntimeWorkerRef {
-                runtime_id: runtime_id.to_string(),
-                worker_id: worker.worker_id.to_string(),
-            };
+            let identity = RuntimeWorkerRef::new(runtime_id, worker.worker_id.to_string());
             if !worker_registry_identity_exists(&tx, workspace_id, &identity)? {
                 insert_worker_projection_orphan_diagnostic(
                     &tx,
@@ -7066,10 +7161,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     "runtime_worker_without_backend_catalog",
                     observed_at,
                 )?;
-                let revision = current_worker_projection_revision(&tx, workspace_id)?;
                 tx.commit()?;
                 return Ok(WorkerRegistryProjectionCommit {
-                    revision,
                     changes: Vec::new(),
                 });
             }
@@ -7077,18 +7170,14 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 &tx,
                 workspace_id,
                 runtime_id,
-                connection_generation,
-                0,
                 worker,
                 SubscriptionWorkerAvailability::Observed,
                 observed_at,
             )?;
             let changed_workers = if changed { vec![identity] } else { Vec::new() };
-            let revision = commit_worker_projection_changes(&tx, workspace_id, &changed_workers)?;
-            let changes =
-                worker_catalog_upsert_changes(&tx, workspace_id, changed_workers.as_slice())?;
+            let changes = worker_catalog_upsert_changes(&tx, workspace_id, &changed_workers)?;
             tx.commit()?;
-            Ok(WorkerRegistryProjectionCommit { revision, changes })
+            Ok(WorkerRegistryProjectionCommit { changes })
         })
     }
 
@@ -7096,18 +7185,13 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         &self,
         workspace_id: &str,
         runtime_id: &str,
-        connection_generation: u64,
         worker_id: Option<&str>,
-        subject_revision: Option<u64>,
         observed_at: &str,
     ) -> Result<WorkerRegistryProjectionCommit> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let identities = if let Some(worker_id) = worker_id {
-                vec![RuntimeWorkerRef {
-                    runtime_id: runtime_id.to_string(),
-                    worker_id: worker_id.to_string(),
-                }]
+                vec![RuntimeWorkerRef::new(runtime_id, worker_id)]
             } else {
                 worker_registry_identities_for_runtime(&tx, workspace_id, runtime_id)?
             };
@@ -7124,23 +7208,13 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     )?;
                     continue;
                 }
-                if set_worker_observation_unavailable(
-                    &tx,
-                    workspace_id,
-                    &identity,
-                    connection_generation,
-                    subject_revision,
-                    0,
-                    observed_at,
-                )? {
+                if set_worker_observation_unavailable(&tx, workspace_id, &identity, observed_at)? {
                     changed_workers.push(identity);
                 }
             }
-            let revision = commit_worker_projection_changes(&tx, workspace_id, &changed_workers)?;
-            let changes =
-                worker_catalog_upsert_changes(&tx, workspace_id, changed_workers.as_slice())?;
+            let changes = worker_catalog_upsert_changes(&tx, workspace_id, &changed_workers)?;
             tx.commit()?;
-            Ok(WorkerRegistryProjectionCommit { revision, changes })
+            Ok(WorkerRegistryProjectionCommit { changes })
         })
     }
 
@@ -7156,11 +7230,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             } else {
                 Vec::new()
             };
-            let revision = commit_worker_projection_changes(&tx, workspace_id, &changed_workers)?;
             let changes =
                 worker_catalog_upsert_changes(&tx, workspace_id, changed_workers.as_slice())?;
             tx.commit()?;
-            Ok(WorkerRegistryProjectionCommit { revision, changes })
+            Ok(WorkerRegistryProjectionCommit { changes })
         })
     }
 
@@ -7196,11 +7269,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             } else {
                 vec![worker.clone()]
             };
-            let revision = commit_worker_projection_changes(&tx, workspace_id, &changed_workers)?;
             let changes =
                 worker_catalog_upsert_changes(&tx, workspace_id, changed_workers.as_slice())?;
             tx.commit()?;
-            Ok(WorkerRegistryProjectionCommit { revision, changes })
+            Ok(WorkerRegistryProjectionCommit { changes })
         })
     }
 
@@ -7235,21 +7307,20 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     ],
                 )?;
                 commit_worker_catalog_removal(&tx, workspace_id, worker)?
-            } else if let Some(revision) = tx
+            } else if tx
                 .query_row(
-                    "SELECT projection_revision FROM worker_registry_projection_removals WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
+                    "SELECT 1 FROM worker_registry_projection_removals WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
                     params![workspace_id, worker.runtime_id, worker.worker_id],
-                    |row| row.get::<_, i64>(0),
+                    |_| Ok(()),
                 )
                 .optional()?
+                .is_some()
             {
                 WorkerRegistryProjectionCommit {
-                    revision: revision.max(0) as u64,
                     changes: vec![WorkerCatalogChange::Removed(worker.clone())],
                 }
             } else {
                 WorkerRegistryProjectionCommit {
-                    revision: current_worker_projection_revision(&tx, workspace_id)?,
                     changes: Vec::new(),
                 }
             };
@@ -7274,6 +7345,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                 ON CONFLICT (
                     workspace_id,
+                    controller_runtime_id,
                     controller_worker_id,
                     operation_id
                 ) DO NOTHING"#,
@@ -7418,14 +7490,22 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         grant_id: &str,
         revoked_at: &str,
     ) -> Result<bool> {
-        self.with_conn(|conn| {
-            let changed = conn.execute(
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let active_changed = tx.execute(
                 r#"UPDATE worker_control_grants
                    SET revoked_at = ?3
                    WHERE workspace_id = ?1 AND grant_id = ?2 AND revoked_at IS NULL"#,
                 params![workspace_id, grant_id, revoked_at],
             )?;
-            Ok(changed > 0)
+            let archived_changed = tx.execute(
+                r#"UPDATE worker_session_archive_observe_grants
+                   SET revoked_at = ?3
+                   WHERE workspace_id = ?1 AND source_grant_id = ?2 AND revoked_at IS NULL"#,
+                params![workspace_id, grant_id, revoked_at],
+            )?;
+            tx.commit()?;
+            Ok(active_changed > 0 || archived_changed > 0)
         })
     }
 
@@ -9108,7 +9188,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 r#"INSERT INTO worker_workdir_links (
                     workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
-                ON CONFLICT(workspace_id, worker_id, workdir_id, alias) DO UPDATE SET
+                ON CONFLICT(workspace_id, runtime_id, worker_id, workdir_id, alias) DO UPDATE SET
                     capabilities = excluded.capabilities,
                     linked_at = excluded.linked_at,
                     unlinked_at = NULL"#,
@@ -9252,7 +9332,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 r#"INSERT INTO worker_workdir_links (
                     workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
-                ON CONFLICT(workspace_id, worker_id, workdir_id, alias) DO UPDATE SET
+                ON CONFLICT(workspace_id, runtime_id, worker_id, workdir_id, alias) DO UPDATE SET
                     capabilities = excluded.capabilities,
                     linked_at = excluded.linked_at,
                     unlinked_at = NULL"#,
@@ -10530,81 +10610,67 @@ fn read_worker_registry_projection(
     let Some(registry) = registry else {
         return Ok(None);
     };
+    let resource_id = worker_resource_id(worker);
     let resource_key = conn
         .query_row(
             "SELECT resource_key FROM workspace_resource_keys WHERE workspace_id = ?1 AND resource_kind = 'worker' AND resource_id = ?2",
-            params![workspace_id, worker.worker_id],
+            params![workspace_id, resource_id],
             |row| row.get(0),
         )
         .optional()?;
     let observation = conn
         .query_row(
-            "SELECT availability, worker_json, connection_generation, subject_revision, snapshot_revision, projection_revision, observed_at FROM worker_registry_observations WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
+            "SELECT availability, worker_json, observed_at FROM worker_registry_observations WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
             params![workspace_id, worker.runtime_id, worker.worker_id],
             |row| {
-                let availability: String = row.get(0)?;
-                let worker_json: Option<String> = row.get(1)?;
-                Ok((availability, worker_json, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?, row.get::<_, i64>(5)?, row.get::<_, String>(6)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             },
         )
         .optional()?;
     let observation = observation
-        .map(
-            |(
-                availability,
-                worker_json,
-                generation,
-                subject_revision,
-                snapshot_revision,
-                projection_revision,
-                observed_at,
-            )|
-             -> Result<_> {
-                let availability = match availability.as_str() {
-                    "observed" => SubscriptionWorkerAvailability::Observed,
-                    "unavailable" => SubscriptionWorkerAvailability::Unavailable,
-                    other => {
-                        return Err(Error::InvalidInput(format!(
-                            "invalid Worker observation availability `{other}`"
-                        )));
-                    }
-                };
-                let mut observed_worker: SubscriptionWorker = if let Some(worker_json) = worker_json
-                {
-                    serde_json::from_str(&worker_json).map_err(|error| {
-                        Error::InvalidInput(format!("invalid stored Worker observation: {error}"))
-                    })?
-                } else {
-                    SubscriptionWorker {
-                        worker_id: SubscriptionWorkerId::new(worker.worker_id.to_string())
-                            .map_err(|error| Error::InvalidInput(error.to_string()))?,
-                        runtime_id: Some(worker.runtime_id.to_string()),
-                        resource_key: resource_key.clone(),
-                        availability,
-                        subject_revision: subject_revision.max(0) as u64,
-                        state: protocol::subscription::SubscriptionWorkerState::Stopped,
-                        worker_state: None,
-                        has_running_internal_workers: false,
-                        workspace_id: Some(workspace_id.to_string()),
-                        display_name: Some(registry.display_name.clone()),
-                        profile: registry.profile.clone(),
-                        job: None,
-                        workdir_attachments: Vec::new(),
-                    }
-                };
-                observed_worker.availability = availability;
-                observed_worker.resource_key = resource_key.clone();
-                Ok(WorkerRegistryObservationRecord {
-                    worker: observed_worker,
+        .map(|(availability, worker_json, observed_at)| -> Result<_> {
+            let availability = match availability.as_str() {
+                "observed" => SubscriptionWorkerAvailability::Observed,
+                "unavailable" => SubscriptionWorkerAvailability::Unavailable,
+                other => {
+                    return Err(Error::InvalidInput(format!(
+                        "invalid Worker observation availability `{other}`"
+                    )));
+                }
+            };
+            let mut observed_worker: SubscriptionWorker = if let Some(worker_json) = worker_json {
+                serde_json::from_str(&worker_json).map_err(|error| {
+                    Error::InvalidInput(format!("invalid stored Worker observation: {error}"))
+                })?
+            } else {
+                SubscriptionWorker {
+                    worker_id: SubscriptionWorkerId::new(worker.worker_id.to_string())
+                        .map_err(|error| Error::InvalidInput(error.to_string()))?,
+                    runtime_id: Some(worker.runtime_id.to_string()),
+                    resource_key: resource_key.clone(),
                     availability,
-                    connection_generation: generation.max(0) as u64,
-                    subject_revision: subject_revision.max(0) as u64,
-                    snapshot_revision: snapshot_revision.max(0) as u64,
-                    projection_revision: projection_revision.max(0) as u64,
-                    observed_at,
-                })
-            },
-        )
+                    state: protocol::subscription::SubscriptionWorkerState::Stopped,
+                    worker_state: None,
+                    has_running_internal_workers: false,
+                    workspace_id: Some(workspace_id.to_string()),
+                    display_name: Some(registry.display_name.clone()),
+                    profile: registry.profile.clone(),
+                    job: None,
+                    workdir_attachments: Vec::new(),
+                }
+            };
+            observed_worker.availability = availability;
+            observed_worker.resource_key = resource_key.clone();
+            Ok(WorkerRegistryObservationRecord {
+                worker: observed_worker,
+                availability,
+                observed_at,
+            })
+        })
         .transpose()?;
     let job = conn
         .query_row(
@@ -10628,44 +10694,6 @@ fn read_worker_registry_projection(
         observation,
         job,
     }))
-}
-
-fn current_worker_projection_revision(conn: &Connection, workspace_id: &str) -> Result<u64> {
-    Ok(conn
-        .query_row(
-            "SELECT revision FROM worker_registry_projection_revisions WHERE workspace_id = ?1",
-            params![workspace_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?
-        .unwrap_or(0)
-        .max(0) as u64)
-}
-
-fn worker_projection_cursor(
-    conn: &Connection,
-    workspace_id: &str,
-    runtime_id: &str,
-) -> Result<(u64, u64)> {
-    Ok(conn.query_row(
-        "SELECT connection_generation, snapshot_revision FROM worker_registry_projection_cursors WHERE workspace_id = ?1 AND runtime_id = ?2",
-        params![workspace_id, runtime_id],
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-    ).optional()?.map(|(generation, revision)| (generation.max(0) as u64, revision.max(0) as u64)).unwrap_or((0, 0)))
-}
-
-fn upsert_worker_projection_cursor(
-    conn: &Connection,
-    workspace_id: &str,
-    runtime_id: &str,
-    generation: u64,
-    snapshot_revision: u64,
-) -> Result<()> {
-    conn.execute(
-        "INSERT INTO worker_registry_projection_cursors (workspace_id, runtime_id, connection_generation, snapshot_revision) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(workspace_id, runtime_id) DO UPDATE SET connection_generation = excluded.connection_generation, snapshot_revision = excluded.snapshot_revision",
-        params![workspace_id, runtime_id, generation as i64, snapshot_revision as i64],
-    )?;
-    Ok(())
 }
 
 fn worker_registry_identities_for_runtime(
@@ -10715,30 +10743,17 @@ fn upsert_worker_observation(
     conn: &Connection,
     workspace_id: &str,
     runtime_id: &str,
-    connection_generation: u64,
-    snapshot_revision: u64,
     worker: &SubscriptionWorker,
     availability: SubscriptionWorkerAvailability,
     observed_at: &str,
 ) -> Result<bool> {
-    let existing = conn.query_row(
-        "SELECT availability, worker_json, connection_generation, subject_revision FROM worker_registry_observations WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
-        params![workspace_id, runtime_id, worker.worker_id.as_str()],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)),
-    ).optional()?;
-    if let Some((old_availability, _, generation, revision)) = existing.as_ref() {
-        let generation = (*generation).max(0) as u64;
-        let revision = (*revision).max(0) as u64;
-        let restores_unavailable = old_availability == "unavailable"
-            && availability == SubscriptionWorkerAvailability::Observed;
-        if connection_generation < generation
-            || (connection_generation == generation
-                && (worker.subject_revision < revision
-                    || (worker.subject_revision == revision && !restores_unavailable)))
-        {
-            return Ok(false);
-        }
-    }
+    let existing = conn
+        .query_row(
+            "SELECT availability, worker_json FROM worker_registry_observations WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
+            params![workspace_id, runtime_id, worker.worker_id.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
     let mut persisted_worker = worker.clone();
     persisted_worker.runtime_id = Some(runtime_id.to_string());
     persisted_worker.availability = availability;
@@ -10751,13 +10766,13 @@ fn upsert_worker_observation(
     };
     let changed = existing
         .as_ref()
-        .is_none_or(|(old_availability, old_json, _, _)| {
+        .is_none_or(|(old_availability, old_json)| {
             old_availability != availability_text
                 || old_json.as_deref() != Some(worker_json.as_str())
         });
     conn.execute(
-        "INSERT INTO worker_registry_observations (workspace_id, runtime_id, worker_id, availability, worker_json, connection_generation, subject_revision, snapshot_revision, projection_revision, observed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9) ON CONFLICT(workspace_id, runtime_id, worker_id) DO UPDATE SET availability = excluded.availability, worker_json = excluded.worker_json, connection_generation = excluded.connection_generation, subject_revision = excluded.subject_revision, snapshot_revision = MAX(worker_registry_observations.snapshot_revision, excluded.snapshot_revision), observed_at = excluded.observed_at",
-        params![workspace_id, runtime_id, worker.worker_id.as_str(), availability_text, worker_json, connection_generation as i64, worker.subject_revision as i64, snapshot_revision as i64, observed_at],
+        "INSERT INTO worker_registry_observations (workspace_id, runtime_id, worker_id, availability, worker_json, observed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(workspace_id, runtime_id, worker_id) DO UPDATE SET availability = excluded.availability, worker_json = excluded.worker_json, observed_at = excluded.observed_at",
+        params![workspace_id, runtime_id, worker.worker_id.as_str(), availability_text, worker_json, observed_at],
     )?;
     Ok(changed)
 }
@@ -10766,39 +10781,25 @@ fn set_worker_observation_unavailable(
     conn: &Connection,
     workspace_id: &str,
     worker: &RuntimeWorkerRef,
-    connection_generation: u64,
-    subject_revision: Option<u64>,
-    snapshot_revision: u64,
     observed_at: &str,
 ) -> Result<bool> {
-    let existing = conn.query_row(
-        "SELECT availability, connection_generation, subject_revision, worker_json FROM worker_registry_observations WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
-        params![workspace_id, worker.runtime_id, worker.worker_id],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, Option<String>>(3)?)),
-    ).optional()?;
-    if let Some((availability, generation, revision, _)) = existing.as_ref() {
-        let generation = (*generation).max(0) as u64;
-        let revision = (*revision).max(0) as u64;
-        if connection_generation < generation
-            || (connection_generation == generation
-                && subject_revision.is_some_and(|incoming| incoming <= revision))
-        {
-            return Ok(false);
-        }
-        if availability == "unavailable"
-            && subject_revision.is_none()
-            && connection_generation == generation
-        {
-            return Ok(false);
-        }
+    let existing = conn
+        .query_row(
+            "SELECT availability, worker_json FROM worker_registry_observations WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
+            params![workspace_id, worker.runtime_id, worker.worker_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    if existing
+        .as_ref()
+        .is_some_and(|(availability, _)| availability == "unavailable")
+    {
+        return Ok(false);
     }
-    let revision = subject_revision
-        .or_else(|| existing.as_ref().map(|item| item.2.max(0) as u64))
-        .unwrap_or(0);
-    let worker_json = existing.and_then(|item| item.3);
+    let worker_json = existing.and_then(|item| item.1);
     conn.execute(
-        "INSERT INTO worker_registry_observations (workspace_id, runtime_id, worker_id, availability, worker_json, connection_generation, subject_revision, snapshot_revision, projection_revision, observed_at) VALUES (?1, ?2, ?3, 'unavailable', ?4, ?5, ?6, ?7, 0, ?8) ON CONFLICT(workspace_id, runtime_id, worker_id) DO UPDATE SET availability = 'unavailable', connection_generation = excluded.connection_generation, subject_revision = excluded.subject_revision, snapshot_revision = MAX(worker_registry_observations.snapshot_revision, excluded.snapshot_revision), observed_at = excluded.observed_at",
-        params![workspace_id, worker.runtime_id, worker.worker_id, worker_json, connection_generation as i64, revision as i64, snapshot_revision as i64, observed_at],
+        "INSERT INTO worker_registry_observations (workspace_id, runtime_id, worker_id, availability, worker_json, observed_at) VALUES (?1, ?2, ?3, 'unavailable', ?4, ?5) ON CONFLICT(workspace_id, runtime_id, worker_id) DO UPDATE SET availability = 'unavailable', observed_at = excluded.observed_at",
+        params![workspace_id, worker.runtime_id, worker.worker_id, worker_json, observed_at],
     )?;
     Ok(true)
 }
@@ -10832,52 +10833,23 @@ pub(crate) fn commit_worker_catalog_removal(
     workspace_id: &str,
     worker: &RuntimeWorkerRef,
 ) -> Result<WorkerRegistryProjectionCommit> {
-    if let Some(revision) = conn
+    let existing = conn
         .query_row(
-            "SELECT projection_revision FROM worker_registry_projection_removals WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
+            "SELECT 1 FROM worker_registry_projection_removals WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
             params![workspace_id, worker.runtime_id, worker.worker_id],
-            |row| row.get::<_, i64>(0),
+            |_| Ok(()),
         )
         .optional()?
-    {
-        return Ok(WorkerRegistryProjectionCommit {
-            revision: revision.max(0) as u64,
-            changes: vec![WorkerCatalogChange::Removed(worker.clone())],
-        });
-    }
-    let revision =
-        commit_worker_projection_changes(conn, workspace_id, std::slice::from_ref(worker))?;
-    conn.execute(
-        "INSERT INTO worker_registry_projection_removals (workspace_id, runtime_id, worker_id, projection_revision) VALUES (?1, ?2, ?3, ?4)",
-        params![workspace_id, worker.runtime_id, worker.worker_id, revision as i64],
-    )?;
-    Ok(WorkerRegistryProjectionCommit {
-        revision,
-        changes: vec![WorkerCatalogChange::Removed(worker.clone())],
-    })
-}
-
-fn commit_worker_projection_changes(
-    conn: &Connection,
-    workspace_id: &str,
-    changed_workers: &[RuntimeWorkerRef],
-) -> Result<u64> {
-    let current = current_worker_projection_revision(conn, workspace_id)?;
-    if changed_workers.is_empty() {
-        return Ok(current);
-    }
-    let revision = current.saturating_add(1);
-    conn.execute(
-        "INSERT INTO worker_registry_projection_revisions (workspace_id, revision) VALUES (?1, ?2) ON CONFLICT(workspace_id) DO UPDATE SET revision = excluded.revision",
-        params![workspace_id, revision as i64],
-    )?;
-    for worker in changed_workers {
+        .is_some();
+    if !existing {
         conn.execute(
-            "UPDATE worker_registry_observations SET projection_revision = ?1 WHERE workspace_id = ?2 AND runtime_id = ?3 AND worker_id = ?4",
-            params![revision as i64, workspace_id, worker.runtime_id, worker.worker_id],
+            "INSERT INTO worker_registry_projection_removals (workspace_id, runtime_id, worker_id) VALUES (?1, ?2, ?3)",
+            params![workspace_id, worker.runtime_id, worker.worker_id],
         )?;
     }
-    Ok(revision)
+    Ok(WorkerRegistryProjectionCommit {
+        changes: vec![WorkerCatalogChange::Removed(worker.clone())],
+    })
 }
 
 fn read_worker_control_grant_record(
@@ -13911,6 +13883,366 @@ fn migrate_worker_singleton_ownership_v72_to_v73(conn: &Connection) -> Result<()
     Ok(())
 }
 
+fn migrate_ordered_worker_projection_v73_to_v74(conn: &Connection) -> Result<()> {
+    let current = current_schema_version(conn)?;
+    if current != 73 {
+        return Err(Error::Store(format!(
+            "expected schema version 73 before {ORDERED_WORKER_PROJECTION_MIGRATION_NAME} migration, found {current}"
+        )));
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    tx.execute_batch(
+        r#"
+        ALTER TABLE worker_registry_observations RENAME TO worker_registry_observations_v73;
+        CREATE TABLE worker_registry_observations (
+            workspace_id TEXT NOT NULL,
+            runtime_id TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            availability TEXT NOT NULL CHECK (availability IN ('observed', 'unavailable')),
+            worker_json TEXT,
+            observed_at TEXT NOT NULL,
+            PRIMARY KEY (workspace_id, runtime_id, worker_id),
+            FOREIGN KEY (workspace_id, worker_id)
+                REFERENCES worker_registry(workspace_id, worker_id) ON DELETE CASCADE
+        );
+        INSERT INTO worker_registry_observations (
+            workspace_id, runtime_id, worker_id, availability, worker_json, observed_at
+        )
+        SELECT workspace_id, runtime_id, worker_id, availability, worker_json, observed_at
+        FROM worker_registry_observations_v73;
+        DROP TABLE worker_registry_observations_v73;
+
+        DROP TABLE IF EXISTS worker_registry_projection_cursors;
+        DROP TABLE IF EXISTS worker_registry_projection_revisions;
+
+        ALTER TABLE worker_registry_projection_removals
+            RENAME TO worker_registry_projection_removals_v73;
+        CREATE TABLE worker_registry_projection_removals (
+            workspace_id TEXT NOT NULL,
+            runtime_id TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            PRIMARY KEY (workspace_id, runtime_id, worker_id)
+        );
+        INSERT INTO worker_registry_projection_removals (workspace_id, runtime_id, worker_id)
+        SELECT workspace_id, runtime_id, worker_id
+        FROM worker_registry_projection_removals_v73;
+        DROP TABLE worker_registry_projection_removals_v73;
+        "#,
+    )?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+        params![74_i64, ORDERED_WORKER_PROJECTION_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_runtime_scoped_worker_identity_v74_to_v75(conn: &Connection) -> Result<()> {
+    let current = current_schema_version(conn)?;
+    if current != 74 {
+        return Err(Error::Store(format!(
+            "expected schema version 74 before {RUNTIME_SCOPED_WORKER_IDENTITY_MIGRATION_NAME} migration, found {current}"
+        )));
+    }
+    let foreign_keys_enabled =
+        conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))? != 0;
+    let legacy_alter_table_enabled =
+        conn.query_row("PRAGMA legacy_alter_table", [], |row| row.get::<_, i64>(0))? != 0;
+    if foreign_keys_enabled {
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    }
+    if !legacy_alter_table_enabled {
+        conn.execute_batch("PRAGMA legacy_alter_table = ON;")?;
+    }
+    let result = (|| {
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+        tx.execute_batch(
+            r#"
+            DROP INDEX worker_control_grants_controller;
+            DROP INDEX worker_control_grants_subject;
+            DROP INDEX worker_workdir_links_active_workdir_unique;
+            DROP INDEX worker_workdir_links_active_alias_unique;
+            DROP INDEX worker_workdir_links_workdir;
+            DROP INDEX idx_worker_registry_workspace_runtime_worker;
+            DROP INDEX worker_registry_runtime;
+
+            ALTER TABLE worker_registry_observations RENAME TO worker_registry_observations_v74;
+            ALTER TABLE worker_control_grants RENAME TO worker_control_grants_v74;
+            ALTER TABLE worker_workdir_links RENAME TO worker_workdir_links_v74;
+            ALTER TABLE worker_registry RENAME TO worker_registry_v74;
+
+            CREATE TABLE worker_registry (
+                workspace_id TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                runtime_id TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                profile TEXT,
+                retention_state TEXT NOT NULL CHECK (retention_state IN ('normal', 'pinned')),
+                transcript_ref TEXT,
+                session_ref TEXT,
+                summary_ref TEXT,
+                diagnostics_ref TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (workspace_id, runtime_id, worker_id),
+                FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+            );
+            INSERT INTO worker_registry
+            SELECT * FROM worker_registry_v74;
+
+            UPDATE workspace_resource_keys AS resource
+            SET resource_id = COALESCE(
+                (
+                    SELECT hex(worker.runtime_id) || ':' || hex(worker.worker_id)
+                    FROM worker_registry AS worker
+                    WHERE worker.workspace_id = resource.workspace_id
+                      AND worker.worker_id = resource.resource_id
+                    LIMIT 1
+                ),
+                (
+                    SELECT hex(reservation.runtime_id) || ':' || hex(reservation.worker_id)
+                    FROM worker_create_reservations AS reservation
+                    WHERE reservation.workspace_id = resource.workspace_id
+                      AND reservation.worker_id = resource.resource_id
+                    LIMIT 1
+                )
+            )
+            WHERE resource.resource_kind = 'worker'
+              AND (
+                    EXISTS (
+                        SELECT 1 FROM worker_registry AS worker
+                        WHERE worker.workspace_id = resource.workspace_id
+                          AND worker.worker_id = resource.resource_id
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM worker_create_reservations AS reservation
+                        WHERE reservation.workspace_id = resource.workspace_id
+                          AND reservation.worker_id = resource.resource_id
+                    )
+                  );
+
+            CREATE TABLE worker_registry_observations (
+                workspace_id TEXT NOT NULL,
+                runtime_id TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                availability TEXT NOT NULL CHECK (availability IN ('observed', 'unavailable')),
+                worker_json TEXT,
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (workspace_id, runtime_id, worker_id),
+                FOREIGN KEY (workspace_id, runtime_id, worker_id)
+                    REFERENCES worker_registry(workspace_id, runtime_id, worker_id) ON DELETE CASCADE
+            );
+            INSERT INTO worker_registry_observations
+            SELECT * FROM worker_registry_observations_v74;
+
+            CREATE TABLE worker_control_grants (
+                grant_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                controller_runtime_id TEXT NOT NULL,
+                controller_worker_id TEXT NOT NULL,
+                subject_runtime_id TEXT NOT NULL,
+                subject_worker_id TEXT NOT NULL,
+                relation TEXT NOT NULL,
+                origin TEXT NOT NULL,
+                permissions_json TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                revoked_at TEXT,
+                PRIMARY KEY (workspace_id, grant_id),
+                UNIQUE (workspace_id, controller_runtime_id, controller_worker_id, operation_id),
+                FOREIGN KEY (workspace_id, controller_runtime_id, controller_worker_id)
+                    REFERENCES worker_registry(workspace_id, runtime_id, worker_id) ON DELETE CASCADE,
+                FOREIGN KEY (workspace_id, subject_runtime_id, subject_worker_id)
+                    REFERENCES worker_registry(workspace_id, runtime_id, worker_id) ON DELETE CASCADE
+            );
+            INSERT INTO worker_control_grants
+            SELECT * FROM worker_control_grants_v74;
+
+            CREATE TABLE worker_workdir_links (
+                workspace_id TEXT NOT NULL,
+                runtime_id TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                workdir_id TEXT NOT NULL,
+                alias TEXT NOT NULL,
+                linked_at TEXT NOT NULL,
+                unlinked_at TEXT,
+                capabilities TEXT NOT NULL CHECK (capabilities IN (
+                    'all', 'read_only', 'read_write', 'command_only', 'read_command'
+                )),
+                PRIMARY KEY (workspace_id, runtime_id, worker_id, workdir_id, alias),
+                FOREIGN KEY (workspace_id, runtime_id, worker_id)
+                    REFERENCES worker_registry(workspace_id, runtime_id, worker_id) ON DELETE CASCADE,
+                FOREIGN KEY (workspace_id, workdir_id)
+                    REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE
+            );
+            INSERT INTO worker_workdir_links
+            SELECT * FROM worker_workdir_links_v74;
+
+            DROP TABLE worker_registry_observations_v74;
+            DROP TABLE worker_control_grants_v74;
+            DROP TABLE worker_workdir_links_v74;
+            DROP TABLE worker_registry_v74;
+
+            CREATE INDEX worker_control_grants_controller ON worker_control_grants(
+                workspace_id, controller_runtime_id, controller_worker_id, revoked_at
+            );
+            CREATE INDEX worker_control_grants_subject ON worker_control_grants(
+                workspace_id, subject_runtime_id, subject_worker_id, revoked_at
+            );
+            CREATE UNIQUE INDEX worker_workdir_links_active_workdir_unique
+                ON worker_workdir_links(workspace_id, workdir_id) WHERE unlinked_at IS NULL;
+            CREATE UNIQUE INDEX worker_workdir_links_active_alias_unique
+                ON worker_workdir_links(workspace_id, runtime_id, worker_id, alias)
+                WHERE unlinked_at IS NULL;
+            CREATE INDEX worker_workdir_links_workdir
+                ON worker_workdir_links(workspace_id, workdir_id);
+            CREATE INDEX worker_registry_runtime
+                ON worker_registry(workspace_id, runtime_id, worker_id);
+
+            CREATE TRIGGER worker_registry_insert_blocked_by_runtime_removal
+            BEFORE INSERT ON worker_registry FOR EACH ROW
+            WHEN EXISTS (
+                SELECT 1 FROM runtime_removal_operations operation
+                WHERE operation.runtime_id = NEW.runtime_id
+                  AND operation.state IN ('pending', 'cleanup_pending')
+            )
+            BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+
+            CREATE TRIGGER worker_registry_update_blocked_by_runtime_removal
+            BEFORE UPDATE ON worker_registry FOR EACH ROW
+            WHEN EXISTS (
+                SELECT 1 FROM runtime_removal_operations operation
+                WHERE operation.runtime_id = NEW.runtime_id
+                  AND operation.state IN ('pending', 'cleanup_pending')
+            )
+            BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+
+            CREATE TRIGGER workdir_attachment_insert_blocked_by_runtime_removal
+            BEFORE INSERT ON worker_workdir_links FOR EACH ROW
+            WHEN EXISTS (
+                SELECT 1 FROM runtime_removal_operations operation
+                WHERE operation.runtime_id = NEW.runtime_id
+                  AND operation.state IN ('pending', 'cleanup_pending')
+            )
+            BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+
+            CREATE TRIGGER workdir_attachment_update_blocked_by_runtime_removal
+            BEFORE UPDATE ON worker_workdir_links FOR EACH ROW
+            WHEN EXISTS (
+                SELECT 1 FROM runtime_removal_operations operation
+                WHERE operation.runtime_id = NEW.runtime_id
+                  AND operation.state IN ('pending', 'cleanup_pending')
+            )
+            BEGIN SELECT RAISE(ABORT, 'runtime_removal_in_progress'); END;
+
+            CREATE TRIGGER ticket_assignment_worker_parent_tombstone_delete
+            BEFORE DELETE ON worker_registry
+            WHEN EXISTS (
+                SELECT 1 FROM ticket_worker_assignments AS assignment
+                WHERE assignment.workspace_id = OLD.workspace_id
+                  AND assignment.principal_kind = 'worker'
+                  AND assignment.runtime_id = OLD.runtime_id
+                  AND assignment.worker_id = OLD.worker_id
+            )
+            BEGIN
+                INSERT OR IGNORE INTO ticket_assignment_worker_tombstones (
+                    workspace_id, runtime_id, worker_id, deleted_at
+                ) VALUES (OLD.workspace_id, OLD.runtime_id, OLD.worker_id, CURRENT_TIMESTAMP);
+            END;
+
+            CREATE TRIGGER ticket_assignment_worker_parent_tombstone_move
+            BEFORE UPDATE OF runtime_id ON worker_registry
+            WHEN OLD.runtime_id != NEW.runtime_id
+             AND EXISTS (
+                SELECT 1 FROM ticket_worker_assignments AS assignment
+                WHERE assignment.workspace_id = OLD.workspace_id
+                  AND assignment.principal_kind = 'worker'
+                  AND assignment.runtime_id = OLD.runtime_id
+                  AND assignment.worker_id = OLD.worker_id
+            )
+            BEGIN
+                INSERT OR IGNORE INTO ticket_assignment_worker_tombstones (
+                    workspace_id, runtime_id, worker_id, deleted_at
+                ) VALUES (OLD.workspace_id, OLD.runtime_id, OLD.worker_id, CURRENT_TIMESTAMP);
+            END;
+            "#,
+        )?;
+        tx.execute(
+            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+            params![75_i64, RUNTIME_SCOPED_WORKER_IDENTITY_MIGRATION_NAME],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+    let restore_result = match (legacy_alter_table_enabled, foreign_keys_enabled) {
+        (false, true) => {
+            conn.execute_batch("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;")
+        }
+        (false, false) => conn.execute_batch("PRAGMA legacy_alter_table = OFF;"),
+        (true, true) => conn.execute_batch("PRAGMA foreign_keys = ON;"),
+        (true, false) => Ok(()),
+    }
+    .map_err(Error::from);
+    match (result, restore_result) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => {
+            let violations = conn
+                .prepare("PRAGMA foreign_key_check")?
+                .query_map([], |_| Ok(()))?
+                .count();
+            if violations != 0 {
+                return Err(Error::Store(format!(
+                    "Runtime-scoped Worker identity migration left {violations} foreign key violation(s)"
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn migrate_archive_observe_grants_v75_to_v76(conn: &Connection) -> Result<()> {
+    let current = current_schema_version(conn)?;
+    if current != 75 {
+        return Err(Error::Store(format!(
+            "expected schema version 75 before {ARCHIVE_OBSERVE_GRANTS_MIGRATION_NAME} migration, found {current}"
+        )));
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    tx.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS worker_session_archive_observe_grants (
+            workspace_id TEXT NOT NULL,
+            archive_id TEXT NOT NULL,
+            controller_runtime_id TEXT NOT NULL,
+            controller_worker_id TEXT NOT NULL,
+            subject_runtime_id TEXT NOT NULL,
+            subject_worker_id TEXT NOT NULL,
+            source_grant_id TEXT NOT NULL,
+            granted_at TEXT NOT NULL,
+            revoked_at TEXT,
+            PRIMARY KEY (
+                workspace_id, archive_id,
+                controller_runtime_id, controller_worker_id,
+                source_grant_id
+            ),
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+            FOREIGN KEY (archive_id) REFERENCES worker_session_archives(archive_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS worker_session_archive_observe_grants_controller
+            ON worker_session_archive_observe_grants(
+                workspace_id, controller_runtime_id, controller_worker_id, archive_id
+            );
+        "#,
+    )?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+        params![76_i64, ARCHIVE_OBSERVE_GRANTS_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("DROP TABLE IF EXISTS typed_ticket_targets;")?;
     conn.execute_batch(include_str!("latest_schema.sql"))?;
@@ -14477,6 +14809,39 @@ fn current_schema_version(conn: &Connection) -> Result<i64> {
     .map_err(Error::from)
 }
 
+fn worker_resource_id(worker: &RuntimeWorkerRef) -> String {
+    fn encode(value: &str) -> String {
+        value
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect()
+    }
+    format!(
+        "{}:{}",
+        encode(&worker.runtime_id),
+        encode(&worker.worker_id)
+    )
+}
+
+fn parse_worker_resource_id(resource_id: &str) -> Option<RuntimeWorkerRef> {
+    fn decode(value: &str) -> Option<String> {
+        if value.len() % 2 != 0 {
+            return None;
+        }
+        let bytes = (0..value.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok())
+            .collect::<Option<Vec<_>>>()?;
+        String::from_utf8(bytes).ok()
+    }
+    let (runtime_id, worker_id) = resource_id.split_once(':')?;
+    Some(RuntimeWorkerRef::new(
+        decode(runtime_id)?,
+        decode(worker_id)?,
+    ))
+}
+
 fn allocate_resource_key(
     conn: &Connection,
     workspace_id: &str,
@@ -14742,6 +15107,160 @@ fn migrate_workdir_credential_candidate_snapshots_v58_to_v59(conn: &Connection) 
 mod tests {
     use super::*;
 
+    #[test]
+    fn schema_v74_migrates_historical_worker_projection_rows_without_revision_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workspace.db");
+        drop(SqliteWorkspaceStore::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        conn.execute_batch(
+            r#"
+            INSERT INTO accounts (
+                account_id, kind, handle, display_name, created_at, updated_at
+            ) VALUES ('owner', 'user', 'owner', 'Owner', '1', '1');
+            INSERT INTO workspaces (
+                workspace_id, owner_account_id, display_name, state, created_at, updated_at
+            ) VALUES ('workspace-a', 'owner', 'Workspace A', 'active', '1', '1');
+            INSERT INTO worker_registry (
+                workspace_id, worker_id, runtime_id, display_name, profile,
+                retention_state, created_at, updated_at
+            ) VALUES ('workspace-a', 'worker-a', 'runtime-a', 'Worker A', NULL,
+                      'normal', '1', '1');
+            CREATE UNIQUE INDEX worker_registry_v74_workspace_worker
+                ON worker_registry(workspace_id, worker_id);
+
+            ALTER TABLE worker_registry_observations
+                RENAME TO worker_registry_observations_v74;
+            CREATE TABLE worker_registry_observations (
+                workspace_id TEXT NOT NULL,
+                runtime_id TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                availability TEXT NOT NULL CHECK (availability IN ('observed', 'unavailable')),
+                worker_json TEXT,
+                connection_generation INTEGER NOT NULL,
+                subject_revision INTEGER NOT NULL,
+                snapshot_revision INTEGER NOT NULL,
+                projection_revision INTEGER NOT NULL,
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (workspace_id, runtime_id, worker_id),
+                FOREIGN KEY (workspace_id, worker_id)
+                    REFERENCES worker_registry(workspace_id, worker_id) ON DELETE CASCADE
+            );
+            INSERT INTO worker_registry_observations VALUES (
+                'workspace-a', 'runtime-a', 'worker-a', 'observed', '{}',
+                8, 13, 21, 34, '2'
+            );
+            DROP TABLE worker_registry_observations_v74;
+
+            CREATE TABLE worker_registry_projection_cursors (
+                workspace_id TEXT NOT NULL,
+                runtime_id TEXT NOT NULL,
+                connection_generation INTEGER NOT NULL,
+                snapshot_revision INTEGER NOT NULL,
+                PRIMARY KEY (workspace_id, runtime_id)
+            );
+            INSERT INTO worker_registry_projection_cursors
+                VALUES ('workspace-a', 'runtime-a', 8, 21);
+            CREATE TABLE worker_registry_projection_revisions (
+                workspace_id TEXT PRIMARY KEY,
+                revision INTEGER NOT NULL
+            );
+            INSERT INTO worker_registry_projection_revisions VALUES ('workspace-a', 34);
+
+            ALTER TABLE worker_registry_projection_removals
+                RENAME TO worker_registry_projection_removals_v74;
+            CREATE TABLE worker_registry_projection_removals (
+                workspace_id TEXT NOT NULL,
+                runtime_id TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                projection_revision INTEGER NOT NULL,
+                PRIMARY KEY (workspace_id, runtime_id, worker_id)
+            );
+            INSERT INTO worker_registry_projection_removals
+                VALUES ('workspace-a', 'runtime-a', 'removed-worker', 35);
+            DROP TABLE worker_registry_projection_removals_v74;
+
+            UPDATE __yoi_schema_migrations SET version = 73;
+            "#,
+        )
+        .unwrap();
+
+        migrate_ordered_worker_projection_v73_to_v74(&conn).unwrap();
+
+        assert_eq!(current_schema_version(&conn).unwrap(), 74);
+        assert_eq!(
+            table_columns(&conn, "worker_registry_observations").unwrap(),
+            vec![
+                "workspace_id",
+                "runtime_id",
+                "worker_id",
+                "availability",
+                "worker_json",
+                "observed_at",
+            ]
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT availability || ':' || observed_at FROM worker_registry_observations",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "observed:2"
+        );
+        assert!(!table_exists(&conn, "worker_registry_projection_cursors").unwrap());
+        assert!(!table_exists(&conn, "worker_registry_projection_revisions").unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT runtime_id || ':' || worker_id FROM worker_registry_projection_removals",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "runtime-a:removed-worker"
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        let foreign_key_failures: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_failures, 0);
+
+        conn.execute(
+            "INSERT INTO workspace_resource_keys (
+                 workspace_id, resource_kind, resource_id, sequence, resource_key, allocated_at
+             ) VALUES ('workspace-a', 'worker', 'worker-a', 1, 'W-1', '1')",
+            [],
+        )
+        .unwrap();
+        migrate_runtime_scoped_worker_identity_v74_to_v75(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 75);
+        let worker = RuntimeWorkerRef::new("runtime-a", "worker-a");
+        assert_eq!(
+            conn.query_row(
+                "SELECT resource_id FROM workspace_resource_keys
+                 WHERE workspace_id = 'workspace-a' AND resource_key = 'W-1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            worker_resource_id(&worker)
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+    }
+
     fn downgrade_schema_66_ticket_and_workdir_authority(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "DROP TABLE backend_job_deliveries;
@@ -14750,6 +15269,8 @@ mod tests {
              DROP TABLE typed_ticket_targets;
              ALTER TABLE typed_tickets ADD COLUMN repository_id TEXT;
              ALTER TABLE typed_tickets ADD COLUMN ref_selector TEXT;
+             CREATE UNIQUE INDEX worker_registry_v74_workspace_worker
+                 ON worker_registry(workspace_id, worker_id);
              ALTER TABLE worker_workdir_links DROP COLUMN capabilities;
              DELETE FROM ticket_schema_migrations;
              INSERT INTO ticket_schema_migrations(version, name, applied_at)
@@ -15665,6 +16186,8 @@ mod tests {
             DROP TABLE typed_ticket_targets;
             ALTER TABLE typed_tickets ADD COLUMN repository_id TEXT;
             ALTER TABLE typed_tickets ADD COLUMN ref_selector TEXT;
+            CREATE UNIQUE INDEX worker_registry_v74_workspace_worker
+                ON worker_registry(workspace_id, worker_id);
             DROP INDEX worker_workdir_links_active_workdir_unique;
             DROP INDEX worker_workdir_links_active_alias_unique;
             DROP INDEX worker_workdir_links_workdir;
@@ -16182,6 +16705,18 @@ mod tests {
                     version: 73,
                     name: WORKER_SINGLETON_OWNERSHIP_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 74,
+                    name: ORDERED_WORKER_PROJECTION_MIGRATION_NAME.to_string(),
+                },
+                WorkspaceSchemaMigrationStep {
+                    version: 75,
+                    name: RUNTIME_SCOPED_WORKER_IDENTITY_MIGRATION_NAME.to_string(),
+                },
+                WorkspaceSchemaMigrationStep {
+                    version: 76,
+                    name: ARCHIVE_OBSERVE_GRANTS_MIGRATION_NAME.to_string(),
+                },
             ]
         );
 
@@ -16259,6 +16794,12 @@ mod tests {
                         ),
                         (72, BACKEND_JOB_DISPATCH_QUEUE_MIGRATION_NAME.to_string()),
                         (73, WORKER_SINGLETON_OWNERSHIP_MIGRATION_NAME.to_string()),
+                        (74, ORDERED_WORKER_PROJECTION_MIGRATION_NAME.to_string()),
+                        (
+                            75,
+                            RUNTIME_SCOPED_WORKER_IDENTITY_MIGRATION_NAME.to_string(),
+                        ),
+                        (76, ARCHIVE_OBSERVE_GRANTS_MIGRATION_NAME.to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -16545,7 +17086,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72,
-                73
+                73, 74, 75, 76
             ]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
@@ -16554,7 +17095,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 24);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 27);
         assert!(column_exists(&conn, "worker_workdir_links", "alias").unwrap());
         assert!(column_exists(&conn, "worker_workdir_links", "capabilities").unwrap());
         assert!(!column_exists(&conn, "worker_workdir_links", "role").unwrap());
@@ -18067,20 +18608,16 @@ mod tests {
         );
         assert_eq!(
             store
-                .resource_key(
-                    "workspace-a",
-                    WorkspaceResourceKind::Worker,
-                    &reserved.worker_id.to_string()
-                )
+                .worker_resource_key("workspace-a", &reserved_worker)
                 .unwrap()
                 .as_deref(),
             Some("W-1")
         );
         assert_eq!(
             store
-                .resolve_resource_reference("workspace-a", WorkspaceResourceKind::Worker, "W-1")
+                .resolve_worker_resource_reference("workspace-a", "W-1")
                 .unwrap(),
-            Some(reserved.worker_id.to_string())
+            Some(reserved_worker.clone())
         );
         let second = store
             .reserve_worker_create(
@@ -18095,10 +18632,9 @@ mod tests {
         assert_eq!(second.memory_settings.settings_revision, 2);
         assert_eq!(
             store
-                .resource_key(
+                .worker_resource_key(
                     "workspace-a",
-                    WorkspaceResourceKind::Worker,
-                    &second.worker_id.to_string()
+                    &RuntimeWorkerRef::new("arcadia", second.worker_id.to_string()),
                 )
                 .unwrap()
                 .as_deref(),
@@ -18130,17 +18666,16 @@ mod tests {
         );
         assert_eq!(
             store
-                .resource_key(
+                .worker_resource_key(
                     "workspace-a",
-                    WorkspaceResourceKind::Worker,
-                    &second.worker_id.to_string()
+                    &RuntimeWorkerRef::new("arcadia", second.worker_id.to_string()),
                 )
                 .unwrap(),
             None
         );
         assert_eq!(
             store
-                .resolve_resource_reference("workspace-a", WorkspaceResourceKind::Worker, "W-2")
+                .resolve_worker_resource_reference("workspace-a", "W-2")
                 .unwrap(),
             None
         );
@@ -18232,11 +18767,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .resource_key(
-                    "workspace-a",
-                    WorkspaceResourceKind::Worker,
-                    &reserved.worker_id.to_string(),
-                )
+                .worker_resource_key("workspace-a", &reserved_worker)
                 .unwrap(),
             None
         );
@@ -18341,6 +18872,7 @@ mod tests {
             resolved_control_operation: None,
             resolved_workspace_api: None,
             resolved_memory_settings: None,
+            resolved_subjektiv_attached: false,
         };
         let stable_fingerprint =
             crate::hosts::worker_spawn_create_fingerprint(&request(Some("src"))).unwrap();
@@ -19648,6 +20180,171 @@ INSERT INTO worker_registry (
     }
 
     #[tokio::test]
+    async fn legacy_memory_reset_is_atomic_scoped_idempotent_and_exact() {
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        for (workspace_id, display_name) in [
+            ("local-dev", "Local Dev"),
+            ("other-workspace", "Other Workspace"),
+        ] {
+            store
+                .upsert_workspace(&WorkspaceRecord {
+                    workspace_id: workspace_id.to_string(),
+                    owner_account_id: "owner-account".to_string(),
+                    display_name: display_name.to_string(),
+                    state: "active".to_string(),
+                    created_at: "1".to_string(),
+                    updated_at: "1".to_string(),
+                })
+                .await
+                .unwrap();
+            store
+                .ensure_memory_document(workspace_id, "# Legacy Memory\n", "2")
+                .unwrap();
+            store
+                .upsert_memory_staging_record(&MemoryStagingRecord {
+                    workspace_id: workspace_id.to_string(),
+                    candidate_id: format!("candidate-{workspace_id}"),
+                    raw_json: r#"{"claim":"legacy"}"#.to_string(),
+                    source_path: None,
+                    imported_at: "3".to_string(),
+                })
+                .unwrap();
+            store
+                .insert_memory_staging_resolution(&MemoryStagingResolutionRecord {
+                    workspace_id: workspace_id.to_string(),
+                    candidate_id: format!("resolved-{workspace_id}"),
+                    action: "discarded".to_string(),
+                    reason: "fixture".to_string(),
+                    affected_refs_json: "[]".to_string(),
+                    staging_raw_json: r#"{"claim":"resolved"}"#.to_string(),
+                    source_path: None,
+                    imported_at: "3".to_string(),
+                    resolved_at: "4".to_string(),
+                })
+                .unwrap();
+        }
+
+        let unrelated_counts = |store: &SqliteWorkspaceStore| {
+            store
+                .with_conn(|connection| {
+                    let mut tables = connection.prepare(
+                        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+                    )?;
+                    let names = tables
+                        .query_map([], |row| row.get::<_, String>(0))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    drop(tables);
+                    let mut counts = std::collections::BTreeMap::new();
+                    for name in names {
+                        if matches!(
+                            name.as_str(),
+                            "workspace_memory_documents"
+                                | "memory_staging_records"
+                                | "memory_staging_resolutions"
+                        ) {
+                            continue;
+                        }
+                        let quoted = name.replace('"', "\"\"");
+                        let count = connection.query_row(
+                            &format!("SELECT COUNT(*) FROM \"{quoted}\""),
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )?;
+                        counts.insert(name, count);
+                    }
+                    Ok(counts)
+                })
+                .unwrap()
+        };
+        let before = unrelated_counts(&store);
+        assert_eq!(
+            store
+                .get_workspace_memory_settings("local-dev")
+                .unwrap()
+                .language,
+            "English"
+        );
+
+        // A failure after resolution deletion must roll the entire operation back.
+        store
+            .with_conn(|connection| {
+                connection.execute_batch(
+                    "CREATE TRIGGER fail_legacy_memory_reset
+                     BEFORE DELETE ON memory_staging_records
+                     WHEN OLD.workspace_id = 'local-dev'
+                     BEGIN SELECT RAISE(ABORT, 'reset failure fixture'); END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.reset_legacy_memory("local-dev").is_err());
+        assert!(store.get_memory_document("local-dev").unwrap().is_some());
+        assert_eq!(store.count_memory_staging_records("local-dev").unwrap(), 1);
+        assert_eq!(
+            store
+                .list_memory_staging_resolutions("local-dev", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        store
+            .with_conn(|connection| {
+                connection.execute_batch("DROP TRIGGER fail_legacy_memory_reset")?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            store.reset_legacy_memory("local-dev").unwrap(),
+            LegacyMemoryResetCounts {
+                documents: 1,
+                staging_records: 1,
+                staging_resolutions: 1,
+            }
+        );
+        assert_eq!(
+            store.reset_legacy_memory("local-dev").unwrap(),
+            LegacyMemoryResetCounts::default()
+        );
+        assert!(store.get_memory_document("local-dev").unwrap().is_none());
+        assert_eq!(store.count_memory_staging_records("local-dev").unwrap(), 0);
+        assert!(
+            store
+                .list_memory_staging_resolutions("local-dev", 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        assert!(
+            store
+                .get_memory_document("other-workspace")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .count_memory_staging_records("other-workspace")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .list_memory_staging_resolutions("other-workspace", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(unrelated_counts(&store), before);
+        assert_eq!(
+            store
+                .get_workspace_memory_settings("local-dev")
+                .unwrap()
+                .language,
+            "English"
+        );
+    }
+
+    #[tokio::test]
     async fn worker_workdir_registry_round_trips_and_preserves_pinned_retention() {
         let temp = tempfile::tempdir().unwrap();
         let db = temp.path().join("workspace.db");
@@ -19702,11 +20399,7 @@ INSERT INTO worker_registry (
         store.upsert_worker_registry(&runtime_sync_worker).unwrap();
         assert_eq!(
             store
-                .resource_key(
-                    "local-dev",
-                    WorkspaceResourceKind::Worker,
-                    &worker.worker.worker_id,
-                )
+                .worker_resource_key("local-dev", &worker.worker)
                 .unwrap()
                 .as_deref(),
             Some("W-1")
@@ -19926,6 +20619,131 @@ INSERT INTO worker_registry (
     }
 
     #[tokio::test]
+    async fn worker_projection_preserves_equal_local_ids_from_distinct_runtimes() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteWorkspaceStore::open(temp.path().join("workspace.db")).unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "local-dev".to_string(),
+                owner_account_id: "owner-account".to_string(),
+                display_name: "Local Dev".to_string(),
+                state: "active".to_string(),
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+            })
+            .await
+            .unwrap();
+        let record = |runtime_id: &str, display_name: &str| WorkerRegistryRecord {
+            workspace_id: "local-dev".to_string(),
+            worker: RuntimeWorkerRef::new(runtime_id, "shared-local-id"),
+            display_name: display_name.to_string(),
+            profile: None,
+            retention_state: "normal".to_string(),
+            transcript_ref: None,
+            session_ref: None,
+            summary_ref: None,
+            diagnostics_ref: None,
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+        let runtime_a = record("runtime-a", "Runtime A Worker");
+        let runtime_b = record("runtime-b", "Runtime B Worker");
+        store.upsert_worker_registry(&runtime_a).unwrap();
+        store.upsert_worker_registry(&runtime_b).unwrap();
+
+        for record in [&runtime_a, &runtime_b] {
+            let observed = SubscriptionWorker {
+                worker_id: SubscriptionWorkerId::new("shared-local-id").unwrap(),
+                runtime_id: Some(record.worker.runtime_id.clone()),
+                resource_key: None,
+                availability: SubscriptionWorkerAvailability::Observed,
+                worker_state: None,
+                state: protocol::subscription::SubscriptionWorkerState::Running,
+                has_running_internal_workers: false,
+                workspace_id: Some("local-dev".to_string()),
+                display_name: Some(record.display_name.clone()),
+                profile: None,
+                job: None,
+                workdir_attachments: Vec::new(),
+            };
+            store
+                .apply_worker_registry_observation(
+                    "local-dev",
+                    record.worker.runtime_id.as_str(),
+                    &observed,
+                    "2",
+                )
+                .unwrap();
+        }
+
+        let snapshot = store
+            .worker_registry_projection_snapshot("local-dev", 10)
+            .unwrap();
+        assert_eq!(snapshot.len(), 2);
+        assert!(
+            snapshot
+                .iter()
+                .any(|row| row.registry.worker == runtime_a.worker)
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|row| row.registry.worker == runtime_b.worker)
+        );
+        let runtime_a_key = store
+            .worker_resource_key("local-dev", &runtime_a.worker)
+            .unwrap()
+            .unwrap();
+        let runtime_b_key = store
+            .worker_resource_key("local-dev", &runtime_b.worker)
+            .unwrap()
+            .unwrap();
+        assert_ne!(runtime_a_key, runtime_b_key);
+        assert_eq!(
+            store
+                .resolve_worker_resource_reference("local-dev", runtime_a_key.as_str())
+                .unwrap(),
+            Some(runtime_a.worker.clone())
+        );
+        assert_eq!(
+            store
+                .resolve_worker_resource_reference("local-dev", runtime_b_key.as_str())
+                .unwrap(),
+            Some(runtime_b.worker.clone())
+        );
+        assert!(
+            store
+                .resolve_worker_resource_reference("local-dev", "shared-local-id")
+                .unwrap()
+                .is_none(),
+            "a bare local Worker ID must not resolve across multiple Runtimes"
+        );
+        let projected_keys = snapshot
+            .iter()
+            .map(|row| row.resource_key.as_deref().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(projected_keys.len(), 2);
+
+        store
+            .delete_worker_registry("local-dev", &runtime_a.worker)
+            .unwrap();
+        assert!(
+            store
+                .get_worker_registry("local-dev", &runtime_a.worker)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_worker_registry("local-dev", &runtime_b.worker)
+                .unwrap()
+                .unwrap()
+                .display_name,
+            "Runtime B Worker"
+        );
+    }
+
+    #[tokio::test]
     async fn worker_projection_reconciles_snapshots_and_preserves_unavailable_lifecycle() {
         let temp = tempfile::tempdir().unwrap();
         let store = SqliteWorkspaceStore::open(temp.path().join("workspace.db")).unwrap();
@@ -19956,7 +20774,7 @@ INSERT INTO worker_registry (
         store.upsert_worker_registry(&catalog).unwrap();
         assert_eq!(
             store
-                .resource_key("local-dev", WorkspaceResourceKind::Worker, "known")
+                .worker_resource_key("local-dev", &catalog.worker)
                 .unwrap()
                 .as_deref(),
             Some("W-1")
@@ -19975,7 +20793,6 @@ INSERT INTO worker_registry (
             runtime_id: Some("embedded".to_string()),
             resource_key: None,
             availability: SubscriptionWorkerAvailability::Observed,
-            subject_revision: 4,
             worker_state: None,
             state: protocol::subscription::SubscriptionWorkerState::Running,
             has_running_internal_workers: true,
@@ -19985,6 +20802,21 @@ INSERT INTO worker_registry (
             job: None,
             workdir_attachments: Vec::new(),
         };
+        let other_catalog = WorkerRegistryRecord {
+            worker: RuntimeWorkerRef::new("runtime-other", "other"),
+            display_name: "Other Runtime Worker".to_string(),
+            ..catalog.clone()
+        };
+        store.upsert_worker_registry(&other_catalog).unwrap();
+        let other_observed = SubscriptionWorker {
+            worker_id: SubscriptionWorkerId::new("other").unwrap(),
+            runtime_id: Some("runtime-other".to_string()),
+            display_name: Some("Other Runtime Worker".to_string()),
+            ..observed.clone()
+        };
+        store
+            .apply_worker_registry_observation("local-dev", "runtime-other", &other_observed, "2")
+            .unwrap();
         let orphan = SubscriptionWorker {
             worker_id: SubscriptionWorkerId::new("orphan").unwrap(),
             ..observed.clone()
@@ -19993,8 +20825,6 @@ INSERT INTO worker_registry (
             .reconcile_worker_registry_snapshot(
                 "local-dev",
                 "embedded",
-                1,
-                10,
                 &[observed.clone(), orphan],
                 "2",
             )
@@ -20003,15 +20833,19 @@ INSERT INTO worker_registry (
             first.changes.as_slice(),
             [WorkerCatalogChange::Upsert(record)] if record.registry.worker == catalog.worker
         ));
-        let (_, records) = store
+        let records = store
             .worker_registry_projection_snapshot("local-dev", 10)
             .unwrap();
         assert_eq!(
             records.len(),
-            1,
+            2,
             "orphan Runtime rows must not create catalog rows"
         );
-        let observation = records[0].observation.as_ref().unwrap();
+        let observation = records
+            .iter()
+            .find(|record| record.registry.worker == catalog.worker)
+            .and_then(|record| record.observation.as_ref())
+            .unwrap();
         assert_eq!(
             observation.availability,
             SubscriptionWorkerAvailability::Observed
@@ -20022,7 +20856,7 @@ INSERT INTO worker_registry (
         );
 
         let unavailable = store
-            .reconcile_worker_registry_snapshot("local-dev", "embedded", 1, 11, &[], "3")
+            .reconcile_worker_registry_snapshot("local-dev", "embedded", &[], "3")
             .unwrap();
         assert!(matches!(
             unavailable.changes.as_slice(),
@@ -20042,21 +20876,25 @@ INSERT INTO worker_registry (
             protocol::subscription::SubscriptionWorkerState::Running,
             "unavailable must retain the last lifecycle observation rather than becoming stopped"
         );
+        assert_eq!(
+            store
+                .worker_registry_projection("local-dev", &other_catalog.worker)
+                .unwrap()
+                .unwrap()
+                .observation
+                .unwrap()
+                .availability,
+            SubscriptionWorkerAvailability::Observed,
+            "reconciling one Runtime must not alter another Runtime's observations"
+        );
 
         let duplicate = store
-            .reconcile_worker_registry_snapshot("local-dev", "embedded", 1, 11, &[], "4")
+            .reconcile_worker_registry_snapshot("local-dev", "embedded", &[], "4")
             .unwrap();
         assert!(duplicate.changes.is_empty());
 
         let reconnected = store
-            .reconcile_worker_registry_snapshot(
-                "local-dev",
-                "embedded",
-                1,
-                11,
-                &[observed.clone()],
-                "5",
-            )
+            .reconcile_worker_registry_snapshot("local-dev", "embedded", &[observed.clone()], "5")
             .unwrap();
         assert!(matches!(
             reconnected.changes.as_slice(),
@@ -20069,10 +20907,10 @@ INSERT INTO worker_registry (
         assert_eq!(
             projection.observation.unwrap().availability,
             SubscriptionWorkerAvailability::Observed,
-            "an equal-revision reconnect snapshot must restore availability"
+            "a reconnect snapshot must restore availability"
         );
         let duplicate_reconnect = store
-            .reconcile_worker_registry_snapshot("local-dev", "embedded", 1, 11, &[observed], "6")
+            .reconcile_worker_registry_snapshot("local-dev", "embedded", &[observed], "6")
             .unwrap();
         assert!(duplicate_reconnect.changes.is_empty());
     }
@@ -20122,7 +20960,6 @@ INSERT INTO worker_registry (
             duplicate_removal.changes.as_slice(),
             [WorkerCatalogChange::Removed(worker)] if worker == &worker_ref
         ));
-        assert_eq!(duplicate_removal.revision, first_removal.revision);
         let stale_upsert = store
             .upsert_worker_registry(&WorkerRegistryRecord {
                 workspace_id: "local-dev".to_string(),
@@ -20139,7 +20976,6 @@ INSERT INTO worker_registry (
             })
             .unwrap();
         assert!(stale_upsert.changes.is_empty());
-        assert_eq!(stale_upsert.revision, first_removal.revision);
         assert!(
             store
                 .get_worker_registry("local-dev", &worker_ref)
@@ -20151,7 +20987,6 @@ INSERT INTO worker_registry (
             runtime_id: Some("embedded".to_string()),
             resource_key: None,
             availability: SubscriptionWorkerAvailability::Observed,
-            subject_revision: 99,
             worker_state: None,
             state: protocol::subscription::SubscriptionWorkerState::Running,
             has_running_internal_workers: false,
@@ -20162,7 +20997,7 @@ INSERT INTO worker_registry (
             workdir_attachments: Vec::new(),
         };
         let commit = store
-            .apply_worker_registry_observation("local-dev", "embedded", 2, &event, "2")
+            .apply_worker_registry_observation("local-dev", "embedded", &event, "2")
             .unwrap();
         assert!(commit.changes.is_empty());
         assert!(

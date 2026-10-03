@@ -16,9 +16,23 @@ pub struct WorkerProtocolSessionStreams {
     pub events: broadcast::Receiver<Event>,
 }
 
+fn subscribe_before_snapshot<Subscription, Snapshot>(
+    subscribe: impl FnOnce() -> Subscription,
+    snapshot: impl FnOnce() -> Snapshot,
+) -> (Snapshot, Subscription) {
+    // Subscription must exist before any snapshot field is read. A concurrent
+    // state update can then appear in both lanes, but it can never be absent
+    // from both the snapshot and the queued live stream.
+    let subscription = subscribe();
+    let snapshot = snapshot();
+    (snapshot, subscription)
+}
+
 pub fn subscribe_worker_protocol_session(handle: &WorkerHandle) -> WorkerProtocolSessionStreams {
-    let (snapshot_event, log_entries) = handle.snapshot_event_with_entry_subscription();
-    let (alert_snapshot, events) = handle.alerter.subscribe_with_snapshot();
+    let ((snapshot_event, log_entries), (alert_snapshot, events)) = subscribe_before_snapshot(
+        || handle.alerter.subscribe_with_snapshot(),
+        || handle.snapshot_event_with_entry_subscription(),
+    );
     WorkerProtocolSessionStreams {
         snapshot_event,
         alert_snapshot,
@@ -117,11 +131,158 @@ pub async fn dispatch_worker_protocol_method(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use session_store::Store;
+
+    use crate::segment_log_sink::SegmentLogSink;
+    use crate::worker::{LogWriterHandle, SegmentState};
+
+    fn committed_entry(event: Event) -> protocol::SessionSnapshotEntry {
+        match event {
+            Event::SessionEntryCommitted { entry } => entry,
+            other => panic!("expected SessionEntryCommitted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_publication_between_subscription_and_snapshot_cannot_be_missed() {
+        let (events, _) = broadcast::channel(4);
+        let context_tokens = std::cell::Cell::new(20_u64);
+
+        let (snapshot_tokens, mut receiver) = subscribe_before_snapshot(
+            || events.subscribe(),
+            || {
+                context_tokens.set(25);
+                events
+                    .send(Event::ContextUsage {
+                        usage: Some(protocol::ContextUsage {
+                            tokens: 25,
+                            source: protocol::ContextTokenSource::Estimated,
+                        }),
+                    })
+                    .unwrap();
+                context_tokens.get()
+            },
+        );
+
+        assert_eq!(snapshot_tokens, 25);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::ContextUsage {
+                usage: Some(protocol::ContextUsage { tokens: 25, .. })
+            })
+        ));
+    }
+
+    #[test]
+    fn persisted_run_transitions_keep_identity_across_live_and_snapshot_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = session_store::FsStore::new(temp.path()).unwrap();
+        let session_id = session_store::new_session_id();
+        let segment_id = session_store::new_segment_id();
+        let start = LogEntry::AnnotatedSegmentStart {
+            ts: 1,
+            session_id,
+            system_prompt: None,
+            config: agen::llm_client::RequestConfig::default(),
+            history: Vec::new(),
+            forked_from: None,
+            compacted_from: None,
+        };
+        store
+            .create_segment(session_id, segment_id, std::slice::from_ref(&start))
+            .unwrap();
+        let sink = SegmentLogSink::with_initial(vec![start]);
+        let writer = LogWriterHandle {
+            store: store.clone(),
+            state: SegmentState::new(session_id, segment_id, 1),
+            sink: sink.clone(),
+            in_flight: None,
+        };
+        let (_, mut receiver) = sink.subscribe_with_snapshot();
+        let transitions = [
+            LogEntry::RunYielded {
+                ts: 10,
+                entry_id: None,
+                reason: protocol::RunYieldReason::Compaction,
+                active_run_turn_count: 2,
+            },
+            LogEntry::RunResumed {
+                ts: 10,
+                entry_id: None,
+                source: protocol::RunResumeSource::Compaction,
+                active_run_turn_count: 2,
+            },
+            LogEntry::RunErrored {
+                ts: 10,
+                entry_id: None,
+                interrupted: false,
+                message: "same compaction failure".into(),
+                failure: Some(protocol::RunFailureKind::Compaction),
+            },
+            LogEntry::RunErrored {
+                ts: 10,
+                entry_id: None,
+                interrupted: false,
+                message: "same compaction failure".into(),
+                failure: Some(protocol::RunFailureKind::Compaction),
+            },
+            LogEntry::RunCancelled {
+                ts: 10,
+                entry_id: None,
+            },
+        ];
+
+        let mut live_ids = Vec::new();
+        for transition in transitions {
+            writer.append_entry(transition).unwrap();
+            let committed = receiver.try_recv().expect("committed transition broadcast");
+            live_ids.push(
+                committed_entry(live_log_entry_event(committed).expect("live projection")).entry_id,
+            );
+        }
+        assert_eq!(
+            live_ids
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            5
+        );
+
+        let (mirror, _) = sink.subscribe_with_snapshot();
+        let snapshot = session_store::public_snapshot::project_current_session_snapshot(&mirror);
+        let snapshot_ids: Vec<_> = snapshot
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.data,
+                    protocol::SessionSnapshotEntryData::RunYielded { .. }
+                        | protocol::SessionSnapshotEntryData::RunResumed { .. }
+                        | protocol::SessionSnapshotEntryData::RunError { .. }
+                        | protocol::SessionSnapshotEntryData::RunCancelled
+                )
+            })
+            .map(|entry| entry.entry_id.clone())
+            .collect();
+        assert_eq!(snapshot_ids, live_ids);
+
+        let persisted = store.read_all(session_id, segment_id).unwrap();
+        let persisted_snapshot =
+            session_store::public_snapshot::project_current_session_snapshot(&persisted);
+        let persisted_ids: Vec<_> = persisted_snapshot
+            .entries
+            .iter()
+            .filter(|entry| snapshot_ids.contains(&entry.entry_id))
+            .map(|entry| entry.entry_id.clone())
+            .collect();
+        assert_eq!(persisted_ids, live_ids);
+    }
 
     #[test]
     fn durable_run_transition_maps_to_session_entry_committed() {
         let event = live_log_entry_event(LogEntry::RunYielded {
             ts: 42,
+            entry_id: Some(session_store::LoggedSessionHistoryEntryId::new()),
             reason: protocol::RunYieldReason::Compaction,
             active_run_turn_count: 3,
         })

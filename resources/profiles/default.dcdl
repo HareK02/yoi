@@ -7,6 +7,7 @@ import "./base.dcdl" // {
     feature = {
         task = { enabled = true; };
         memory = { enabled = false; staging_tools = false; };
+        subjektiv = { enabled = false; extraction = { enabled = false; }; };
         web = { enabled = true; };
         image = { enabled = true; };
         sub_worker = { enabled = true; };

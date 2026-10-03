@@ -203,8 +203,7 @@ export function conversationTurnPreviewsFromLines(
         assistants: [],
       };
     } else if (
-      (line.kind === "assistant" ||
-        (line.kind === "in_flight" && line.title === "in-flight assistant text")) &&
+      line.kind === "assistant" &&
       current && line.body.trim().length > 0
     ) {
       current.assistants.push(line.body);

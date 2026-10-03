@@ -564,6 +564,30 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
                                     .await,
                             )
                         }
+                        WorkspaceServerOperation::SubjektivStageCandidate(request) => {
+                            generated_workspace_response(
+                                client
+                                    .subjektiv_stage_candidate(workspace_id, request)
+                                    .await,
+                            )
+                        }
+                        WorkspaceServerOperation::SubjektivRecordSession(request) => {
+                            generated_workspace_response(
+                                client.subjektiv_record_session(workspace_id, request).await,
+                            )
+                        }
+                        WorkspaceServerOperation::SubjektivMemory(request) => {
+                            generated_workspace_response(
+                                client.subjektiv_memory_backend(workspace_id, request).await,
+                            )
+                        }
+                        WorkspaceServerOperation::SubjektivSession(request) => {
+                            generated_workspace_response(
+                                client
+                                    .subjektiv_session_backend(workspace_id, request)
+                                    .await,
+                            )
+                        }
                     }
                 })
             })

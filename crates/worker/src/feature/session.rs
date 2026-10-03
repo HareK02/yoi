@@ -25,6 +25,9 @@ pub(crate) struct CommittedSessionCapture {
     /// Monotonic committed-log revision for the captured Segment.
     pub(crate) session_revision: u64,
     pub(crate) entry_count: usize,
+    /// Whether the durable capture contains a committed run boundary. This is
+    /// false for a newly materialized Session before its first Run commits.
+    pub(crate) has_committed_run: bool,
     pub(crate) run_exit: CommittedRunExit,
     pub(crate) history: Vec<HistoryEntry<SessionHistoryMetadata>>,
     pub(crate) usage_history: Vec<UsageRecord>,

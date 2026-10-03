@@ -96,11 +96,7 @@ function optional<T>(
   label: string,
   parse: (item: unknown, label: string) => T,
 ): T | null | undefined {
-  return value === undefined
-    ? undefined
-    : value === null
-    ? null
-    : parse(value, label);
+  return value === undefined ? undefined : value === null ? null : parse(value, label);
 }
 
 function diagnostic(value: unknown, label: string): Diagnostic {
@@ -388,17 +384,13 @@ export function parseWorkerSummary(
       `${label}.singleton_key`,
       string,
     ),
-    tags: item.tags === undefined
-      ? []
-      : array(item.tags, `${label}.tags`, string),
+    tags: item.tags === undefined ? [] : array(item.tags, `${label}.tags`, string),
     workspace: workspaceSummary(item.workspace, `${label}.workspace`),
     availability,
     state: string(item.state, `${label}.state`),
     worker_state: workerState,
     last_seen_at: optional(item.last_seen_at, `${label}.last_seen_at`, string),
-    pinned: item.pinned === undefined
-      ? false
-      : boolean(item.pinned, `${label}.pinned`),
+    pinned: item.pinned === undefined ? false : boolean(item.pinned, `${label}.pinned`),
     retention_state: item.retention_state === undefined
       ? ""
       : string(item.retention_state, `${label}.retention_state`),
@@ -406,13 +398,11 @@ export function parseWorkerSummary(
       item.implementation,
       `${label}.implementation`,
     ),
-    workdir_attachments: item.workdir_attachments === undefined
-      ? undefined
-      : array(
-        item.workdir_attachments,
-        `${label}.workdir_attachments`,
-        workerWorkdirAttachment,
-      ),
+    workdir_attachments: item.workdir_attachments === undefined ? undefined : array(
+      item.workdir_attachments,
+      `${label}.workdir_attachments`,
+      workerWorkdirAttachment,
+    ),
     diagnostics: item.diagnostics === undefined
       ? []
       : array(item.diagnostics, `${label}.diagnostics`, diagnostic),
@@ -622,15 +612,20 @@ function workerSummary(
       item.implementation,
       `${label}.implementation`,
     ),
-    workdir_attachments: item.workdir_attachments === undefined
-      ? undefined
-      : array(
-        item.workdir_attachments,
-        `${label}.workdir_attachments`,
-        runtimeWorkdirAttachment,
-      ),
+    workdir_attachments: item.workdir_attachments === undefined ? undefined : array(
+      item.workdir_attachments,
+      `${label}.workdir_attachments`,
+      runtimeWorkdirAttachment,
+    ),
     diagnostics: array(item.diagnostics, `${label}.diagnostics`, diagnostic),
   };
+}
+
+export function parseWorkerLaunchWorkerSummary(
+  value: unknown,
+  label = "Worker launch summary",
+): WorkerLaunchWorkerSummary {
+  return workerSummary(value, label);
 }
 
 export function parseBrowserCreateWorkerResponse(

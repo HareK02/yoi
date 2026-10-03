@@ -1,66 +1,83 @@
 <script lang="ts">
-  import DocumentMarkdown from '#lib/workspace/markdown/DocumentMarkdown.svelte';
-  import { formatDate } from '#lib/workspace/api/http.ts';
+  import { formatDate, workspaceRoute } from '#lib/workspace/api/http.ts';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
+
+  const subjects = $derived(data.subjects.data?.items ?? []);
+
+  function subjectHref(subjectId: string): string {
+    return workspaceRoute(data.workspaceId, `/memory/${encodeURIComponent(subjectId)}`);
+  }
+
+  function pageHref(cursor?: string | null): string {
+    const path = workspaceRoute(data.workspaceId, '/memory');
+    return cursor ? `${path}?cursor=${encodeURIComponent(cursor)}` : path;
+  }
 </script>
 
 <svelte:head>
-  <title>Memory · Yoi Workspace</title>
-  <meta name="description" content="Workspace Memory document" />
+  <title>Subjects · Memory · Yoi Workspace</title>
+  <meta name="description" content="Workspace Memory subjects" />
 </svelte:head>
 
-<section class="memory-document-page" aria-label="Memory document">
-  {#if data.memory.data}
-    <div class="memory-document-meta">
-      <p>
-        <span>Read-only</span>
-        <span aria-hidden="true">·</span>
-        <span>Updated <time datetime={data.memory.data.updated_at}>{formatDate(data.memory.data.updated_at)}</time></span>
-      </p>
-      <details>
-        <summary>Document details</summary>
-        <dl>
-          <div>
-            <dt>Created</dt>
-            <dd><time datetime={data.memory.data.created_at}>{formatDate(data.memory.data.created_at)}</time></dd>
-          </div>
-          <div>
-            <dt>Size</dt>
-            <dd>{data.memory.data.bytes} bytes</dd>
-          </div>
-          <div>
-            <dt>Source</dt>
-            <dd><code>{data.memory.data.record_source}</code></dd>
-          </div>
-        </dl>
-      </details>
+<section class="memory-page memory-subject-index" aria-labelledby="memory-subjects-heading" data-memory-view="subjects">
+  <header class="memory-page-header">
+    <div>
+      <p class="memory-eyebrow">Memory</p>
+      <h1 id="memory-subjects-heading">Subjects</h1>
+      <p>Read-only durable context, organized by explicit subject.</p>
     </div>
+    {#if data.subjects.data}
+      <span class="memory-count">{subjects.length}{data.subjects.data.has_more ? '+' : ''} subject{subjects.length === 1 ? '' : 's'}</span>
+    {/if}
+  </header>
 
-    {#if data.memory.data.body_md.trim().length === 0}
-      <div class="memory-document-state" role="status">
-        <strong>Memory document is empty.</strong>
-        <p>Durable Workspace context will appear here when it is available.</p>
+  {#if data.subjects.data}
+    {#if subjects.length === 0}
+      <div class="memory-state" role="status" data-memory-state="empty">
+        <strong>No Memory subjects.</strong>
+        <p>Subjects will appear here after they are created for this Workspace.</p>
+        {#if data.cursor}<p><a href={pageHref()}>Return to the first page</a></p>{/if}
       </div>
     {:else}
-      <article class="memory-document-content" aria-label="Memory document content">
-        <DocumentMarkdown text={data.memory.data.body_md} />
-      </article>
+      <div class="subject-list" aria-label="Memory subjects">
+        {#each subjects as subject (subject.id)}
+          <a class="subject-row" href={subjectHref(subject.id)}>
+            <div class="subject-copy">
+              <span class="memory-state-pill is-{subject.state}">{subject.state}</span>
+              <h2>{subject.role}</h2>
+              <code title={subject.id}>{subject.id}</code>
+            </div>
+            <dl class="subject-meta">
+              <div><dt>Store revision</dt><dd>{subject.store_revision}</dd></div>
+              <div><dt>Updated</dt><dd><time datetime={subject.updated_at}>{formatDate(subject.updated_at)}</time></dd></div>
+              <div><dt>Worker</dt><dd>{subject.current_worker?.display_name ?? 'None'}</dd></div>
+            </dl>
+          </a>
+        {/each}
+      </div>
+      <nav class="memory-pagination" aria-label="Subject pages">
+        {#if data.cursor}<a href={pageHref()}>First page</a>{/if}
+        {#if data.subjects.data.has_more && data.subjects.data.next_cursor}
+          <a href={pageHref(data.subjects.data.next_cursor)}>Next page →</a>
+        {/if}
+      </nav>
     {/if}
-  {:else if data.memory.error}
-    <div class="memory-document-state memory-document-error">
-      <p role="alert"><strong>Memory document unavailable.</strong> {data.memory.error}</p>
+  {:else if data.subjects.error}
+    <div class="memory-state is-error" role="alert" data-memory-state="error">
+      <strong>Subjects unavailable.</strong>
+      <p>{data.subjects.error}</p>
     </div>
   {:else}
-    <div class="memory-document-state" role="status">
-      <p>Memory document data is unavailable.</p>
+    <div class="memory-state" role="status" data-memory-state="unavailable">
+      <p>Subject data is unavailable.</p>
     </div>
   {/if}
 </section>
 
 <style>
-  .memory-document-page {
+  .memory-page {
     display: grid;
     flex: 0 0 auto;
     gap: var(--space-5);
@@ -70,96 +87,168 @@
     margin-inline: auto;
   }
 
-  .memory-document-meta {
+  .memory-page-header {
     display: flex;
-    align-items: baseline;
+    align-items: flex-end;
     justify-content: space-between;
-    gap: var(--space-4);
-    color: var(--text-muted);
-    font-size: var(--font-size-compact);
-    line-height: var(--line-height-compact);
+    gap: var(--space-5);
+    padding-bottom: var(--space-4);
+    border-bottom: 1px solid var(--line);
   }
 
-  .memory-document-meta > p {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-2);
+  .memory-page-header h1,
+  .subject-copy h2 {
     margin: 0;
-  }
-
-  .memory-document-meta details {
-    flex: 0 0 auto;
-  }
-
-  .memory-document-meta summary {
-    color: var(--text-muted);
-    cursor: pointer;
-  }
-
-  .memory-document-meta dl {
-    display: grid;
-    gap: var(--space-2);
-    min-width: min(24rem, calc(100vw - (2 * var(--space-4))));
-    margin: var(--space-3) 0 0;
-    padding: var(--space-3) 0 0;
-    border-top: 1px solid var(--line);
-  }
-
-  .memory-document-meta dl > div {
-    display: grid;
-    grid-template-columns: 5rem minmax(0, 1fr);
-    gap: var(--space-3);
-  }
-
-  .memory-document-meta dt {
-    color: var(--text-faint);
-  }
-
-  .memory-document-meta dd {
-    min-width: 0;
-    margin: 0;
-    color: var(--text);
-    overflow-wrap: anywhere;
-  }
-
-  .memory-document-content {
-    min-width: 0;
-  }
-
-  .memory-document-state {
-    padding-block: var(--space-5);
-    color: var(--text-muted);
-  }
-
-  .memory-document-state strong {
     color: var(--text-strong);
   }
 
-  .memory-document-state p {
+  .memory-page-header h1 {
+    font-size: var(--font-size-title);
+  }
+
+  .memory-page-header p:not(.memory-eyebrow) {
+    max-width: 46rem;
+    margin: var(--space-2) 0 0;
+    color: var(--text-muted);
+  }
+
+  .memory-eyebrow {
+    margin: 0 0 var(--space-1);
+    color: var(--accent);
+    font-size: var(--font-size-compact);
+    font-weight: 800;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+
+  .memory-count {
+    flex: 0 0 auto;
+    color: var(--text-muted);
+    font-size: var(--font-size-compact);
+  }
+
+  .subject-list {
+    display: grid;
+    border-top: 1px solid var(--line);
+  }
+
+  .subject-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(22rem, 0.8fr);
+    gap: var(--space-5);
+    min-width: 0;
+    padding: var(--space-4);
+    border-bottom: 1px solid var(--line);
+    color: inherit;
+    text-decoration: none;
+  }
+
+  .subject-row:hover,
+  .subject-row:focus-visible {
+    background: var(--interactive-hover);
+  }
+
+  .subject-copy {
+    display: grid;
+    justify-items: start;
+    gap: var(--space-1);
+    min-width: 0;
+  }
+
+  .subject-copy h2 {
+    font-size: var(--font-size-body);
+    overflow-wrap: anywhere;
+  }
+
+  .subject-copy code {
+    display: block;
+    max-width: 100%;
+    color: var(--text-muted);
+    font-size: var(--font-size-compact);
+    overflow-wrap: anywhere;
+  }
+
+  .memory-state-pill {
+    color: var(--success);
+    font-size: var(--font-size-compact);
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .memory-state-pill.is-retired {
+    color: var(--text-faint);
+  }
+
+  .subject-meta {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: var(--space-3);
+    align-self: center;
+  }
+
+  .subject-meta div {
+    display: block;
+    min-width: 0;
+  }
+
+  .subject-meta dt {
+    white-space: normal;
+  }
+
+  .subject-meta dd {
+    margin-top: var(--space-1);
+    color: var(--text-muted);
+    font-size: var(--font-size-compact);
+    overflow-wrap: anywhere;
+  }
+
+  .memory-state {
+    padding: var(--space-5) 0;
+    color: var(--text-muted);
+  }
+
+  .memory-state strong {
+    color: var(--text-strong);
+  }
+
+  .memory-pagination {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: var(--space-3);
+    font-size: var(--font-size-compact);
+  }
+
+  .memory-state p {
     margin: var(--space-1) 0 0;
+    color: var(--text-muted);
   }
 
-  .memory-document-state > p:first-child {
-    margin-top: 0;
-  }
-
-  .memory-document-error,
-  .memory-document-error strong {
+  .memory-state.is-error,
+  .memory-state.is-error strong {
     color: var(--danger);
   }
 
+  @media (max-width: 900px) {
+    .subject-row {
+      grid-template-columns: minmax(0, 1fr);
+      gap: var(--space-3);
+    }
+  }
+
   @media (max-width: 600px) {
-    .memory-document-meta {
+    .memory-page-header {
       display: grid;
       gap: var(--space-2);
     }
 
-    .memory-document-meta details {
-      width: 100%;
+    .subject-row {
+      padding-inline: 0;
     }
 
-    .memory-document-meta dl {
-      min-width: 0;
+    .subject-meta {
+      grid-template-columns: minmax(0, 1fr);
     }
   }
 </style>

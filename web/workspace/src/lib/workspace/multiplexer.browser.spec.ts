@@ -83,7 +83,7 @@ test('invalid inbound frame closes before dispatch and reconnects for a fresh sn
 
   first.message(
     JSON.stringify({
-      protocol_version: 1,
+      protocol_version: 2,
       frame: 'event',
       message: {
         event: 'subscription_closed',
@@ -141,7 +141,7 @@ test('valid subscription closure remains isolated and resubscribes only its sele
         : { topic: 'workspace_workdirs', data: { workdirs: [] } };
     socket.message(
       JSON.stringify({
-        protocol_version: 1,
+        protocol_version: 2,
         frame: 'response',
         message: {
           result: 'subscribed',
@@ -149,7 +149,6 @@ test('valid subscription closure remains isolated and resubscribes only its sele
             request_id: request.message.params.request_id,
             subscription_id: `subscription-${index + 1}`,
             selector,
-            snapshot_revision: 1,
             snapshot,
           },
         },
@@ -160,7 +159,7 @@ test('valid subscription closure remains isolated and resubscribes only its sele
   const sentBeforeClosure = socket.sent.length;
   socket.message(
     JSON.stringify({
-      protocol_version: 1,
+      protocol_version: 2,
       frame: 'event',
       message: {
         event: 'subscription_closed',

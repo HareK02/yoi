@@ -133,6 +133,21 @@ pub struct WorkerTombstone {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerSessionArchiveRecord {
+    pub archive_id: String,
+    pub workspace_id: String,
+    pub worker: RuntimeWorkerRef,
+    pub session_id: String,
+    pub checksum_sha256: String,
+    pub content_bytes: u64,
+    pub policy_id: String,
+    pub policy_revision: u64,
+    pub operation_id: String,
+    pub committed_at: String,
+    pub expires_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerOrphanDiagnostic {
     pub diagnostic_id: String,
     pub workspace_id: String,
@@ -454,6 +469,51 @@ impl SqliteWorkspaceStore {
                 if plan.archive_id.as_deref()!=Some(&a.archive_id)||a.workspace_id!=workspace_id||a.source_runtime_id!=plan.worker.runtime_id||a.source_worker_id.to_string()!=plan.worker.worker_id||a.policy_id!=plan.policy_id||a.policy_revision!=plan.policy_revision{return Err(StoreError::InvalidInput("archive manifest mismatch".into()));}
                 let expires_at=match plan.archive_retention { ArchiveRetention::Forever=>None, ArchiveRetention::ForSeconds{seconds}=>{let seconds=i64::try_from(seconds).map_err(|_|StoreError::InvalidInput("archive retention deadline overflow".into()))?;Some((Utc::now()+chrono::Duration::seconds(seconds)).to_rfc3339())} };
                 tx.execute("INSERT OR IGNORE INTO worker_session_archives(archive_id,workspace_id,runtime_id,worker_id,session_id,checksum_sha256,content_bytes,policy_id,policy_revision,operation_id,committed_at,expires_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![a.archive_id,workspace_id,plan.worker.runtime_id,plan.worker.worker_id,a.source_session_id,a.content_checksum_sha256,a.content_bytes,plan.policy_id,plan.policy_revision,operation_id,now,expires_at])?;
+                let observe_grants = {
+                    let mut statement = tx.prepare(
+                        "SELECT grant_id, controller_runtime_id, controller_worker_id,
+                                permissions_json, created_at
+                         FROM worker_control_grants
+                         WHERE workspace_id = ?1 AND subject_runtime_id = ?2
+                           AND subject_worker_id = ?3 AND revoked_at IS NULL",
+                    )?;
+                    statement
+                        .query_map(
+                            params![workspace_id, plan.worker.runtime_id, plan.worker.worker_id],
+                            |row| {
+                                Ok((
+                                    row.get::<_, String>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, String>(2)?,
+                                    row.get::<_, String>(3)?,
+                                    row.get::<_, String>(4)?,
+                                ))
+                            },
+                        )?
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                for (grant_id, controller_runtime_id, controller_worker_id, permissions, created_at) in observe_grants {
+                    let permissions: Vec<String> = serde_json::from_str(&permissions)
+                        .map_err(|error| StoreError::Store(format!("invalid Worker control grant permissions: {error}")))?;
+                    if permissions.iter().any(|permission| permission == "observe") {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO worker_session_archive_observe_grants
+                             (workspace_id,archive_id,controller_runtime_id,controller_worker_id,
+                              subject_runtime_id,subject_worker_id,source_grant_id,granted_at)
+                             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                            params![
+                                workspace_id,
+                                a.archive_id,
+                                controller_runtime_id,
+                                controller_worker_id,
+                                plan.worker.runtime_id,
+                                plan.worker.worker_id,
+                                grant_id,
+                                created_at
+                            ],
+                        )?;
+                    }
+                }
             }else if plan.session_disposition==SessionDisposition::Archive{return Err(StoreError::InvalidInput("archive manifest missing".into()));}
             match plan.diagnostics_disposition {
                 DiagnosticsDisposition::Purge if result.diagnostics_retained => return Err(StoreError::InvalidInput("Runtime retained diagnostics for purge disposition".into())),
@@ -591,6 +651,78 @@ impl SqliteWorkspaceStore {
         worker: &RuntimeWorkerRef,
     ) -> crate::Result<Option<WorkerTombstone>> {
         self.with_conn(|conn|conn.query_row("SELECT display_name,profile,worker_created_at,removed_at,archive_id,policy_id,policy_revision,operation_id FROM worker_tombstones WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",params![workspace_id,worker.runtime_id,worker.worker_id],|r|Ok(WorkerTombstone{workspace_id:workspace_id.into(),worker:worker.clone(),display_name:r.get(0)?,profile:r.get(1)?,created_at:r.get(2)?,removed_at:r.get(3)?,archive_id:r.get(4)?,policy_id:r.get(5)?,policy_revision:r.get::<_,i64>(6)? as u64,operation_id:r.get(7)?})).optional().map_err(StoreError::from))
+    }
+
+    pub fn worker_session_archive(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        session_id: &str,
+    ) -> crate::Result<Option<WorkerSessionArchiveRecord>> {
+        self.with_conn(|connection| {
+            connection
+                .query_row(
+                    "SELECT archive_id, checksum_sha256, content_bytes, policy_id,
+                            policy_revision, operation_id, committed_at, expires_at
+                     FROM worker_session_archives
+                     WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
+                       AND session_id = ?4",
+                    params![
+                        workspace_id,
+                        worker.runtime_id,
+                        worker.worker_id,
+                        session_id
+                    ],
+                    |row| {
+                        Ok(WorkerSessionArchiveRecord {
+                            archive_id: row.get(0)?,
+                            workspace_id: workspace_id.to_string(),
+                            worker: worker.clone(),
+                            session_id: session_id.to_string(),
+                            checksum_sha256: row.get(1)?,
+                            content_bytes: row.get::<_, i64>(2)? as u64,
+                            policy_id: row.get(3)?,
+                            policy_revision: row.get::<_, i64>(4)? as u64,
+                            operation_id: row.get(5)?,
+                            committed_at: row.get(6)?,
+                            expires_at: row.get(7)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(StoreError::from)
+        })
+    }
+
+    pub fn worker_session_archive_observable_by(
+        &self,
+        workspace_id: &str,
+        archive_id: &str,
+        controller: &RuntimeWorkerRef,
+        subject: &RuntimeWorkerRef,
+    ) -> crate::Result<bool> {
+        self.with_conn(|connection| {
+            connection
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM worker_session_archive_observe_grants
+                         WHERE workspace_id = ?1 AND archive_id = ?2
+                           AND controller_runtime_id = ?3 AND controller_worker_id = ?4
+                           AND subject_runtime_id = ?5 AND subject_worker_id = ?6
+                           AND revoked_at IS NULL
+                     )",
+                    params![
+                        workspace_id,
+                        archive_id,
+                        controller.runtime_id,
+                        controller.worker_id,
+                        subject.runtime_id,
+                        subject.worker_id
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(StoreError::from)
+        })
     }
 }
 
@@ -1170,6 +1302,32 @@ mod tests {
     #[test]
     fn purge_tombstone_commit_is_idempotent() {
         let s = setup();
+        let archived_grant_id = "archive-observe-grant";
+        let archived_controller =
+            RuntimeWorkerRef::new("r", WorkerId::from_legacy_u64(2).to_string());
+        s.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO worker_registry(\
+                    workspace_id,worker_id,runtime_id,display_name,profile,retention_state,created_at,updated_at\
+                 ) VALUES('w',?1,'r','controller','builtin:companion','normal','created','controller-rev1')",
+                [&archived_controller.worker_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        s.create_worker_control_grant(&crate::store::WorkerControlGrantRecord {
+            workspace_id: "w".into(),
+            grant_id: archived_grant_id.into(),
+            controller: archived_controller.clone(),
+            subject: req().worker,
+            relation: "subject_session".into(),
+            origin: "test".into(),
+            permissions: vec!["observe".into()],
+            operation_id: archived_grant_id.into(),
+            created_at: "2026-10-02T00:00:00Z".into(),
+            revoked_at: None,
+        })
+        .unwrap();
         s.with_conn(|conn| {
             conn.execute("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,body,workflow_state,workflow_state_explicit) VALUES('w','ticket-old','ticket-old','Old Ticket','open','task','normal','','planning',1)", [])?;
             conn.execute("INSERT INTO worker_registry(workspace_id,worker_id,runtime_id,display_name,profile,retention_state,created_at,updated_at) VALUES('w','1','r','old worker','builtin:coder','normal','created','rev1')", [])?;
@@ -1219,6 +1377,31 @@ mod tests {
                 .plan
                 .state,
             WorkerRemovalPlanState::Succeeded
+        );
+        assert!(
+            s.worker_session_archive_observable_by(
+                "w",
+                p.archive_id.as_deref().unwrap(),
+                &archived_controller,
+                &p.worker,
+            )
+            .unwrap(),
+            "the explicit observe grant survives Worker removal for the committed archive"
+        );
+        assert!(
+            s.revoke_worker_control_grant("w", archived_grant_id, "2026-10-02T00:01:00Z")
+                .unwrap(),
+            "the existing grant revocation authority must also revoke its archive projection"
+        );
+        assert!(
+            !s.worker_session_archive_observable_by(
+                "w",
+                p.archive_id.as_deref().unwrap(),
+                &archived_controller,
+                &p.worker,
+            )
+            .unwrap(),
+            "every later cursor page and direct Read must observe archive grant revocation"
         );
         assert!(s.worker_tombstone("w", &p.worker).unwrap().is_some());
         let reservation_state: String = s.with_conn(|conn| {

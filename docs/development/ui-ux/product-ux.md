@@ -57,8 +57,11 @@ Workspaceを選ぶ前のscopeを扱う。
 2. Objectives
 3. Merge Requests
 4. Memory
-   - Document
-   - Staging
+   - Subjects
+   - Surface
+   - Committed Memory
+   - Revisions
+   - Sources
 5. Workers
 
 ### Settings
@@ -121,6 +124,16 @@ Workspace pageは、次のいずれかを基本形とする。
 - 一つの判断に必要なfieldをgroup化する。
 - narrow viewportでは一列にする。
 - form内でfilled actionにするのはsave actionだけとする。
+
+### Memory
+
+- Memoryの入口はWorkspace全体のlegacy `Document` / `Staging`ではなく、明示的に選択したsubjectとする。
+- subject detailではcurrent Workerをkeyed-singleton projectionとして表示し、historical Worker／Session attributionをcurrent authorityとして扱わない。
+- `Surface`はresident contextのcurrent stateを表示する。`ready`、`ready-empty`、`ungenerated`、`stale`、`failed`を区別し、空表示やrequest failureへまとめない。
+- `Committed Memory`はcurrent confirmed revisionの一覧とdetailを持つ。revision historyはappend-only viewとして分離し、過去revisionをcurrentへ暗黙fallbackしない。
+- `Sources`は候補、resolution、exact Memory revision refs、Host-recorded Session attribution、閲覧可能なSession sourceをたどるviewとする。source IDをpermissionとして扱わず、現在のWorkspace／subject authorizationを毎回適用する。
+- legacy `/memory` の`Document` / `Staging` viewはdeprecated compatibility surfaceとして明示し、新しいsubject viewへ同じinputを別の意味で転送しない。
+- Markdown本文とdetail presentationはT-661の共有rendererを再利用する。Memory route独自のrenderer、application shell、Header、Sidebarを再実装せず、既存shellのmain contentとnested navigationを保つ。
 
 ### Worker Console
 

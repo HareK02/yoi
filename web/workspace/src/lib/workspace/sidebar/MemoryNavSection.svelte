@@ -7,8 +7,12 @@
   };
 
   let { currentPath = "/", workspaceId }: Props = $props();
-  let documentHref = $derived(workspaceId ? workspaceRoute(workspaceId, "/memory") : "/");
-  let stagingHref = $derived(workspaceId ? workspaceRoute(workspaceId, "/memory/staging") : "/");
+  let subjectsHref = $derived(
+    workspaceId ? workspaceRoute(workspaceId, "/memory") : "/",
+  );
+  let subjectsActive = $derived(
+    currentPath === subjectsHref || currentPath.startsWith(`${subjectsHref}/`),
+  );
 </script>
 
 <section class="sidebar-nav-section sidebar-nav-section--category">
@@ -16,15 +20,8 @@
 
   <a
     class="sidebar-link"
-    class:active={currentPath === documentHref}
-    href={documentHref}
-    aria-current={currentPath === documentHref ? "page" : undefined}
-  >Document</a>
-
-  <a
-    class="sidebar-link"
-    class:active={currentPath.startsWith(stagingHref)}
-    href={stagingHref}
-    aria-current={currentPath.startsWith(stagingHref) ? "page" : undefined}
-  >Staging</a>
+    class:active={subjectsActive}
+    href={subjectsHref}
+    aria-current={subjectsActive ? "page" : undefined}
+  >Subjects</a>
 </section>

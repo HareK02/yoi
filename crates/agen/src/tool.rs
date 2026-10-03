@@ -30,6 +30,9 @@ pub enum ToolError {
     /// Internal error
     #[error("Internal error: {0}")]
     Internal(String),
+    /// Machine-readable domain conflict that a tool adapter may project as structured output.
+    #[error("{code}: {message}")]
+    StructuredConflict { code: String, message: String },
     /// Cooperative cancellation completed with bounded terminal output.
     #[error("Tool execution cancelled")]
     Cancelled(ToolOutput),

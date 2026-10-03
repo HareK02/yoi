@@ -112,6 +112,8 @@ pub enum Error {
     },
     #[error("unknown local repository `{0}`")]
     UnknownRepository(String),
+    #[error("subjektiv subject `{0}` was not found in this Workspace")]
+    SubjektivSubjectNotFound(String),
     #[error(
         "Merge Request reopen requires an authenticated Browser session and explicit confirmation"
     )]

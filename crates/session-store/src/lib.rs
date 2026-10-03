@@ -75,6 +75,7 @@ pub mod history;
 mod legacy_session_log;
 pub mod logged_item;
 mod paste_artifact;
+pub mod public_index;
 pub mod public_snapshot;
 pub mod segment;
 pub mod segment_log;
@@ -95,6 +96,16 @@ pub use history::{
 };
 pub use logged_item::{LoggedContentPart, LoggedItem, LoggedRole, from_logged, to_logged};
 pub use paste_artifact::PasteArtifactLimits;
+pub use public_index::{
+    DEFAULT_SESSION_PUBLIC_INDEX_MAX_BYTES, DEFAULT_SESSION_PUBLIC_INDEX_MAX_ENTRIES,
+    DEFAULT_SESSION_PUBLIC_INDEX_MAX_SEGMENTS, SESSION_PUBLIC_INDEX_COMPACT_TEXT_MAX_BYTES,
+    SessionPublicIndex, SessionPublicIndexEntry, SessionPublicIndexEntryKind,
+    SessionPublicIndexEntryRead, SessionPublicIndexLimits, SessionPublicIndexLineage,
+    SessionPublicIndexOriginKind, SessionPublicIndexPage, SessionPublicIndexPageEntry,
+    SessionPublicIndexReadError, SessionPublicIndexScanPosition, SessionPublicIndexSegment,
+    SessionPublicIndexToolPart, read_session_public_index, read_session_public_index_entry,
+    read_session_public_index_page,
+};
 pub use public_snapshot::{
     DEFAULT_RETAINED_HISTORY_MAX_ENTRIES, DEFAULT_RETAINED_HISTORY_MAX_RESPONSE_BYTES,
     DEFAULT_RETAINED_HISTORY_MAX_SCAN_BYTES, DEFAULT_RETAINED_HISTORY_MAX_SEGMENTS,

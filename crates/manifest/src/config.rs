@@ -19,9 +19,10 @@ use crate::{
     CompactionConfig, EngineManifest, FeatureConfig, FeatureFlagConfig, FileUploadLimits,
     McpConfig, McpEnvValue, McpStdioCwdPolicy, MemoryConsolidationProfileConfig,
     MemoryExtractionProfileConfig, MemoryFeatureProfileConfig, MemoryResidentProfileConfig,
-    MergeRequestFeatureConfig, ResolvedMemoryFeatureConfig, ScopeConfig, SessionConfig,
-    SkillsConfig, TicketFeatureConfig, ToolOutputLimits, ToolPermissionConfig, ToolPermissionRule,
-    WebConfig, WorkerFeatureConfig, WorkerManifest, WorkerMeta,
+    MergeRequestFeatureConfig, ResolvedMemoryFeatureConfig, ResolvedSubjektivFeatureConfig,
+    ScopeConfig, SessionConfig, SkillsConfig, SubjektivFeatureProfileConfig, TicketFeatureConfig,
+    ToolOutputLimits, ToolPermissionConfig, ToolPermissionRule, WebConfig, WorkerFeatureConfig,
+    WorkerManifest, WorkerMeta,
 };
 
 /// Partial-form Worker manifest. Every field is optional; one or more
@@ -76,6 +77,8 @@ pub struct FeatureConfigPartial {
     #[serde(default)]
     pub memory: Option<MemoryFeatureConfigPartial>,
     #[serde(default)]
+    pub subjektiv: Option<SubjektivFeatureConfigPartial>,
+    #[serde(default)]
     pub web: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
     pub image: Option<FeatureFlagConfigPartial>,
@@ -104,6 +107,11 @@ impl FeatureConfigPartial {
         Self {
             task: merge_option(self.task, other.task, FeatureFlagConfigPartial::merge),
             memory: merge_option(self.memory, other.memory, MemoryFeatureConfigPartial::merge),
+            subjektiv: merge_option(
+                self.subjektiv,
+                other.subjektiv,
+                SubjektivFeatureConfigPartial::merge,
+            ),
             web: merge_option(self.web, other.web, FeatureFlagConfigPartial::merge),
             image: merge_option(self.image, other.image, FeatureFlagConfigPartial::merge),
             sub_worker: merge_option(
@@ -227,6 +235,28 @@ pub struct MemoryConsolidationProfileConfigPartial {
     pub request_enabled: Option<bool>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivFeatureConfigPartial {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub extraction: Option<MemoryExtractionProfileConfigPartial>,
+}
+
+impl SubjektivFeatureConfigPartial {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            enabled: other.enabled.or(self.enabled),
+            extraction: merge_option(
+                self.extraction,
+                other.extraction,
+                MemoryExtractionProfileConfigPartial::merge,
+            ),
+        }
+    }
+}
+
 impl MemoryFeatureConfigPartial {
     fn merge(self, other: Self) -> Self {
         Self {
@@ -330,6 +360,10 @@ impl From<FeatureConfigPartial> for FeatureConfig {
             memory: value
                 .memory
                 .map(ResolvedMemoryFeatureConfig::from)
+                .unwrap_or_default(),
+            subjektiv: value
+                .subjektiv
+                .map(ResolvedSubjektivFeatureConfig::from)
                 .unwrap_or_default(),
             web: value.web.map(FeatureFlagConfig::from).unwrap_or_default(),
             image: value.image.map(FeatureFlagConfig::from).unwrap_or_default(),
@@ -447,6 +481,42 @@ impl From<ResolvedMemoryFeatureConfig> for MemoryFeatureConfigPartial {
     }
 }
 
+impl From<SubjektivFeatureConfigPartial> for ResolvedSubjektivFeatureConfig {
+    fn from(value: SubjektivFeatureConfigPartial) -> Self {
+        let extraction = value.extraction.unwrap_or_default();
+        Self {
+            profile: SubjektivFeatureProfileConfig {
+                enabled: value.enabled.unwrap_or_default(),
+                extraction: MemoryExtractionProfileConfig {
+                    enabled: extraction.enabled.unwrap_or(true),
+                    model: extraction.model,
+                    reasoning: extraction.reasoning,
+                    threshold: extraction.threshold.or(Some(50_000)),
+                    worker_max_turns: extraction
+                        .worker_max_turns
+                        .or(defaults::MEMORY_EXTRACT_WORKER_MAX_TURNS),
+                },
+            },
+            workspace_settings: None,
+        }
+    }
+}
+
+impl From<ResolvedSubjektivFeatureConfig> for SubjektivFeatureConfigPartial {
+    fn from(value: ResolvedSubjektivFeatureConfig) -> Self {
+        Self {
+            enabled: Some(value.profile.enabled),
+            extraction: Some(MemoryExtractionProfileConfigPartial {
+                enabled: Some(value.profile.extraction.enabled),
+                model: value.profile.extraction.model,
+                reasoning: value.profile.extraction.reasoning,
+                threshold: value.profile.extraction.threshold,
+                worker_max_turns: value.profile.extraction.worker_max_turns,
+            }),
+        }
+    }
+}
+
 impl From<TicketFeatureConfigPartial> for TicketFeatureConfig {
     fn from(value: TicketFeatureConfigPartial) -> Self {
         Self {
@@ -500,6 +570,7 @@ impl From<FeatureConfig> for FeatureConfigPartial {
         Self {
             task: Some(value.task.into()),
             memory: Some(value.memory.into()),
+            subjektiv: Some(value.subjektiv.into()),
             web: Some(value.web.into()),
             image: Some(value.image.into()),
             sub_worker: Some(value.sub_worker.into()),
@@ -2488,6 +2559,36 @@ directories = [".claude/skills", ".cursor/skills"]
                 PathBuf::from(".cursor/skills"),
             ]
         );
+    }
+
+    #[test]
+    fn subjektiv_config_is_explicit_and_roundtrips_without_subject_identity() {
+        let config = WorkerManifestConfig::from_toml(
+            r#"
+[worker]
+name = "subject-worker"
+
+[feature.subjektiv]
+enabled = true
+
+[feature.subjektiv.extraction]
+enabled = true
+threshold = 321
+worker_max_turns = 7
+"#,
+        )
+        .unwrap();
+        let partial = config.feature.subjektiv.unwrap();
+        assert_eq!(partial.enabled, Some(true));
+        assert_eq!(partial.extraction.as_ref().unwrap().threshold, Some(321));
+
+        let resolved = ResolvedSubjektivFeatureConfig::from(partial);
+        assert!(resolved.profile.enabled);
+        assert_eq!(resolved.profile.extraction.threshold, Some(321));
+        assert_eq!(resolved.profile.extraction.worker_max_turns, Some(7));
+        let encoded = serde_json::to_value(SubjektivFeatureConfigPartial::from(resolved)).unwrap();
+        assert!(encoded.get("subject_id").is_none());
+        assert_eq!(encoded["enabled"], true);
     }
 
     #[test]

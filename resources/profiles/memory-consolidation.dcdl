@@ -7,7 +7,19 @@ import "./base.dcdl" // {
 
     feature = {
         task = { enabled = false; };
-        memory = { enabled = true; staging_tools = true; };
+        memory = {
+            enabled = true;
+            staging_tools = true;
+            resident = { inject_summary = true; };
+            extraction = {
+                enabled = true;
+                model = { ref = "codex-oauth/gpt-5.6-luna"; };
+                reasoning = "medium";
+                threshold = 50000;
+            };
+            consolidation = { request_enabled = true; };
+        };
+        subjektiv = { enabled = false; extraction = { enabled = false; }; };
         web = { enabled = false; };
         sub_worker = { enabled = false; };
         worker = { enabled = false; };

@@ -61,6 +61,8 @@ pub(crate) struct RetainedLogRecord {
 
 pub(crate) struct RetainedSegmentReader {
     file: File,
+    session_id: SessionId,
+    segment_id: SegmentId,
     read_end: u64,
     buffer_start: u64,
     buffer: Vec<u8>,
@@ -103,7 +105,12 @@ impl RetainedSegmentReader {
                             message: "empty retained Segment log record".to_string(),
                         });
                     }
-                    let entry = serde_json::from_slice(&record)?;
+                    let mut entry: LogEntry = serde_json::from_slice(&record)?;
+                    entry.ensure_legacy_session_entry_id(
+                        self.session_id,
+                        self.segment_id,
+                        record_start,
+                    );
                     return Ok((
                         Some(RetainedLogRecord {
                             start_offset: record_start,
@@ -255,7 +262,10 @@ impl WorkerSessionStore {
         if byte_len > max_bytes {
             return Err(StoreError::ReadLimitExceeded);
         }
-        Ok((parse_jsonl(&bytes)?, byte_len))
+        Ok((
+            parse_session_log_jsonl(&bytes, session_id, segment_id)?,
+            byte_len,
+        ))
     }
 
     pub(crate) fn read_first_log_record_read_only_bounded(
@@ -264,6 +274,7 @@ impl WorkerSessionStore {
         segment_id: SegmentId,
         max_bytes: u64,
     ) -> Result<(Option<RetainedLogRecord>, u64, u64), StoreError> {
+        let record_start = 0;
         self.validate_retained_session(session_id)?;
         let file = open_retained_file(&self.log_path(segment_id)).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -289,7 +300,8 @@ impl WorkerSessionStore {
                 message: "empty retained Segment log record".to_string(),
             });
         }
-        let entry = serde_json::from_slice(&record)?;
+        let mut entry: LogEntry = serde_json::from_slice(&record)?;
+        entry.ensure_legacy_session_entry_id(session_id, segment_id, record_start);
         Ok((
             Some(RetainedLogRecord {
                 start_offset: 0,
@@ -308,6 +320,7 @@ impl WorkerSessionStore {
         start_offset: u64,
         max_bytes: u64,
     ) -> Result<(Option<RetainedLogRecord>, u64), StoreError> {
+        let record_start = start_offset;
         self.validate_retained_session(session_id)?;
         let mut file = open_retained_file(&self.log_path(segment_id)).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -334,7 +347,8 @@ impl WorkerSessionStore {
                 message: "empty retained Segment log record".to_string(),
             });
         }
-        let entry = serde_json::from_slice(&record)?;
+        let mut entry: LogEntry = serde_json::from_slice(&record)?;
+        entry.ensure_legacy_session_entry_id(session_id, segment_id, record_start);
         Ok((
             Some(RetainedLogRecord {
                 start_offset,
@@ -353,6 +367,7 @@ impl WorkerSessionStore {
         end_offset: u64,
         max_bytes: u64,
     ) -> Result<RetainedLogRecord, StoreError> {
+        let record_start = start_offset;
         self.validate_retained_session(session_id)?;
         let record_len =
             end_offset
@@ -387,7 +402,8 @@ impl WorkerSessionStore {
             });
         }
         record.pop();
-        let entry = serde_json::from_slice(&record)?;
+        let mut entry: LogEntry = serde_json::from_slice(&record)?;
+        entry.ensure_legacy_session_entry_id(session_id, segment_id, record_start);
         Ok(RetainedLogRecord {
             start_offset,
             end_offset,
@@ -429,6 +445,8 @@ impl WorkerSessionStore {
         }
         Ok(RetainedSegmentReader {
             file,
+            session_id,
+            segment_id,
             read_end: before_offset,
             buffer_start: before_offset,
             buffer: Vec::new(),
@@ -448,6 +466,39 @@ impl WorkerSessionStore {
             });
         }
         Ok(())
+    }
+
+    /// Enumerate canonical Segment logs in ascending identity order without
+    /// creating or migrating state. Unlike the general [`Store`] listing, this
+    /// observation boundary rejects malformed names and non-regular files so a
+    /// persisted Segment cannot be silently omitted from a public index.
+    pub(crate) fn list_segments_read_only(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<SegmentId>, StoreError> {
+        self.validate_retained_session(session_id)?;
+        segment_log_paths(&self.root).map(|paths| {
+            paths
+                .into_iter()
+                .map(|(segment_id, _)| segment_id)
+                .collect()
+        })
+    }
+
+    pub(crate) fn segment_log_observation(
+        &self,
+        segment_id: SegmentId,
+    ) -> Result<(u64, u128), StoreError> {
+        let metadata = fs::metadata(self.log_path(segment_id))?;
+        let modified = metadata
+            .modified()?
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|_| StoreError::Corrupt {
+                line: 0,
+                message: "retained Segment modification time predates the Unix epoch".to_string(),
+            })?
+            .as_nanos();
+        Ok((metadata.len(), modified))
     }
 
     pub fn segment_log_len(&self, segment_id: SegmentId) -> Result<u64, StoreError> {
@@ -645,7 +696,7 @@ impl Store for WorkerSessionStore {
         if !path.exists() {
             return Err(StoreError::NotFound(segment_id));
         }
-        parse_jsonl(&fs::read(path)?)
+        parse_session_log_jsonl(&fs::read(path)?, session_id, segment_id)
     }
 
     fn list_sessions(&self) -> Result<Vec<SessionId>, StoreError> {
@@ -1152,6 +1203,38 @@ fn complete_jsonl_prefix(content: &[u8]) -> &[u8] {
         .rposition(|byte| *byte == b'\n')
         .map(|index| &content[..=index])
         .unwrap_or(&[])
+}
+
+fn parse_session_log_jsonl(
+    content: &[u8],
+    session_id: SessionId,
+    segment_id: SegmentId,
+) -> Result<Vec<LogEntry>, StoreError> {
+    let complete = complete_jsonl_prefix(content);
+    let content = std::str::from_utf8(complete).map_err(|error| StoreError::Corrupt {
+        line: complete[..error.valid_up_to()]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count()
+            + 1,
+        message: error.to_string(),
+    })?;
+    let mut entries = Vec::new();
+    let mut record_start = 0_u64;
+    for (index, record) in content.split_inclusive('\n').enumerate() {
+        let line = record.strip_suffix('\n').unwrap_or(record);
+        if !line.trim().is_empty() {
+            let mut entry: LogEntry =
+                serde_json::from_str(line).map_err(|error| StoreError::Corrupt {
+                    line: index + 1,
+                    message: error.to_string(),
+                })?;
+            entry.ensure_legacy_session_entry_id(session_id, segment_id, record_start);
+            entries.push(entry);
+        }
+        record_start = record_start.saturating_add(record.len() as u64);
+    }
+    Ok(entries)
 }
 
 fn parse_jsonl<T: serde::de::DeserializeOwned>(content: &[u8]) -> Result<Vec<T>, StoreError> {

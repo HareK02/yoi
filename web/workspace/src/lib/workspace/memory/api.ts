@@ -12,7 +12,24 @@ import type {
   MemoryStagingEvidence,
   MemoryStagingListResponse,
   MemoryStagingRecord,
+  SubjektivMemoryEvidence,
+  SubjektivMemoryEvidenceCandidate,
+  SubjektivMemoryListRevisionsResponse,
+  SubjektivMemoryQueryItem,
+  SubjektivMemoryQueryResponse,
+  SubjektivMemoryReadResponse,
+  SubjektivMemoryRevisionItem,
+  SubjektivMemoryRevisionRef,
+  SubjektivMemorySourceEvidenceRef,
+  SubjektivMemoryState,
+  SubjektivResidentSurfaceAvailability,
+  SubjektivResidentSurfaceResponse,
+  SubjektivResidentSurfaceSnapshot,
+  SubjektivSubjectListResponse,
+  SubjektivSubjectResponse,
+  SubjektivSubjectState,
 } from "#lib/generated/memory-api.ts";
+import { parseWorkerLaunchWorkerSummary } from "#lib/workspace/api/workers.ts";
 
 const MAX_STAGING_ITEMS = MEMORY_API_LIMITS.maxCollectionItems;
 const MAX_EVIDENCE_PER_RECORD = MEMORY_API_LIMITS.maxCollectionItems;
@@ -42,6 +59,27 @@ const diagnosticSeverities = new Set<DiagnosticSeverity>([
   "warning",
   "error",
 ]);
+const subjectStates = new Set<SubjektivSubjectState>(["active", "retired"]);
+const surfaceAvailabilities = new Set<SubjektivResidentSurfaceAvailability>([
+  "ungenerated",
+  "stale",
+  "failed",
+  "ready",
+]);
+const memoryStates = new Set<SubjektivMemoryState>([
+  "active",
+  "resolved",
+  "retracted",
+]);
+const MAX_SUBJECTS = 100;
+const MAX_CURRENT_MEMORIES = 100;
+const MAX_REVISIONS = 100;
+const MAX_MEMORY_REFS = MEMORY_API_LIMITS.maxCollectionItems;
+
+export const MEMORY_API_LOAD_POLICY = {
+  diagnosticLabel: "Memory API",
+  maxResponseBytes: MEMORY_API_LIMITS.maxResponseBytes,
+} as const;
 
 export function parseMemoryDocumentResponse(
   value: unknown,
@@ -283,6 +321,556 @@ function parseEvidenceOrigin(value: unknown): MemoryEvidenceOrigin {
   return result;
 }
 
+export function parseSubjektivSubjectResponse(
+  value: unknown,
+  expectedSubjectId?: string,
+): SubjektivSubjectResponse {
+  const record = strictRecord(
+    value,
+    [
+      "id",
+      "role",
+      "state",
+      "store_revision",
+      "created_at",
+      "updated_at",
+      "current_worker",
+    ],
+    "Subject response",
+    ["current_worker"],
+  );
+  const id = requiredIdentifier(record, "id");
+  if (expectedSubjectId !== undefined && id !== expectedSubjectId) {
+    invalid("Subject response identity does not match the requested subject");
+  }
+  const state = requiredString(record, "state") as SubjektivSubjectState;
+  if (!subjectStates.has(state)) invalid("unknown Subject state");
+  const result: SubjektivSubjectResponse = {
+    id,
+    role: requiredString(record, "role"),
+    state,
+    store_revision: requiredNonNegativeInteger(record, "store_revision"),
+    created_at: requiredString(record, "created_at"),
+    updated_at: requiredString(record, "updated_at"),
+  };
+  if ("current_worker" in record) {
+    result.current_worker = record.current_worker === null
+      ? null
+      : parseWorkerLaunchWorkerSummary(
+        record.current_worker,
+        "Subject current worker",
+      );
+  }
+  return result;
+}
+
+export function parseSubjektivSubjectListResponse(
+  value: unknown,
+): SubjektivSubjectListResponse {
+  const record = strictRecord(
+    value,
+    ["limit", "items", "next_cursor", "has_more"],
+    "Subject list response",
+    ["next_cursor"],
+  );
+  const limit = positiveInteger(record.limit, "limit");
+  if (limit > MAX_SUBJECTS) invalid("limit exceeds the Subject list bound");
+  const items = boundedArray(record.items, MAX_SUBJECTS, "items").map((item) =>
+    parseSubjektivSubjectResponse(item)
+  );
+  if (items.length > limit) invalid("items exceeds the declared Subject limit");
+  assertUnique(items.map((item) => item.id), "Subject ids");
+  const hasMore = requiredBoolean(record, "has_more");
+  const nextCursor = optionalNullableString(record, "next_cursor");
+  assertCursorInvariant(hasMore, nextCursor, "Subject list");
+  const result: SubjektivSubjectListResponse = {
+    limit,
+    items,
+    has_more: hasMore,
+  };
+  if (nextCursor !== undefined) result.next_cursor = nextCursor;
+  return result;
+}
+
+export function parseSubjektivResidentSurfaceResponse(
+  value: unknown,
+  expectedSubjectId?: string,
+): SubjektivResidentSurfaceResponse {
+  const record = strictRecord(
+    value,
+    ["subject_id", "availability", "snapshot"],
+    "Resident surface response",
+    ["snapshot"],
+  );
+  const subjectId = requiredIdentifier(record, "subject_id");
+  if (expectedSubjectId !== undefined && subjectId !== expectedSubjectId) {
+    invalid("Resident surface identity does not match the requested subject");
+  }
+  const availability = requiredString(
+    record,
+    "availability",
+  ) as SubjektivResidentSurfaceAvailability;
+  if (!surfaceAvailabilities.has(availability)) {
+    invalid("unknown resident surface availability");
+  }
+  const snapshot = "snapshot" in record && record.snapshot !== null
+    ? parseResidentSurfaceSnapshot(record.snapshot)
+    : null;
+  if (availability === "ready" && snapshot === null) {
+    invalid("ready resident surface requires a snapshot");
+  }
+  if (availability !== "ready" && snapshot !== null) {
+    invalid("non-ready resident surface must not include a snapshot");
+  }
+  const result: SubjektivResidentSurfaceResponse = {
+    subject_id: subjectId,
+    availability,
+  };
+  if (snapshot !== null) result.snapshot = snapshot;
+  return result;
+}
+
+function parseResidentSurfaceSnapshot(
+  value: unknown,
+): SubjektivResidentSurfaceSnapshot {
+  const record = strictRecord(
+    value,
+    [
+      "snapshot_id",
+      "body_md",
+      "memory_refs",
+      "built_from_store_revision",
+      "created_at",
+    ],
+    "Resident surface snapshot",
+  );
+  return {
+    snapshot_id: requiredIdentifier(record, "snapshot_id"),
+    body_md: requiredString(
+      record,
+      "body_md",
+      MEMORY_API_LIMITS.maxDocumentBytes,
+    ),
+    memory_refs: boundedArray(
+      record.memory_refs,
+      MAX_MEMORY_REFS,
+      "memory_refs",
+    ).map(parseMemoryRevisionRef),
+    built_from_store_revision: requiredNonNegativeInteger(
+      record,
+      "built_from_store_revision",
+    ),
+    created_at: requiredString(record, "created_at"),
+  };
+}
+
+export function parseSubjektivMemoryQueryResponse(
+  value: unknown,
+): SubjektivMemoryQueryResponse {
+  const record = strictRecord(
+    value,
+    ["items", "next_cursor", "has_more"],
+    "Current Memory list response",
+    ["next_cursor"],
+  );
+  const items = boundedArray(
+    record.items,
+    MAX_CURRENT_MEMORIES,
+    "items",
+  ).map(parseMemoryQueryItem);
+  assertUnique(items.map((item) => item.id), "Memory ids");
+  const hasMore = requiredBoolean(record, "has_more");
+  const nextCursor = optionalNullableString(record, "next_cursor");
+  assertCursorInvariant(hasMore, nextCursor, "Memory list");
+  const result: SubjektivMemoryQueryResponse = { items, has_more: hasMore };
+  if (nextCursor !== undefined) result.next_cursor = nextCursor;
+  return result;
+}
+
+function parseMemoryQueryItem(value: unknown): SubjektivMemoryQueryItem {
+  const record = strictRecord(
+    value,
+    ["id", "revision", "kind", "state", "claim", "excerpt", "updated_at"],
+    "Current Memory item",
+  );
+  return {
+    id: requiredIdentifier(record, "id"),
+    revision: requiredPositiveInteger(record, "revision"),
+    kind: parseCandidateKind(record.kind),
+    state: parseMemoryState(record.state),
+    claim: requiredString(record, "claim"),
+    excerpt: requiredString(record, "excerpt"),
+    updated_at: requiredString(record, "updated_at"),
+  };
+}
+
+export function parseSubjektivMemoryReadResponse(
+  value: unknown,
+  expectedMemoryId?: string,
+): SubjektivMemoryReadResponse {
+  const record = strictRecord(
+    value,
+    [
+      "memory_id",
+      "revision",
+      "current_revision",
+      "kind",
+      "state",
+      "claim",
+      "body_md",
+      "why_useful",
+      "staleness",
+      "change_reason",
+      "created_at",
+      "updated_at",
+      "body_offset",
+      "body_byte_offset",
+      "body_next_offset",
+      "body_next_byte_offset",
+      "body_truncated",
+      "source_candidate_ids",
+      "source_candidates",
+      "derived_from",
+      "evidence_next_cursor",
+      "evidence_has_more",
+    ],
+    "Memory detail response",
+    [
+      "staleness",
+      "body_next_offset",
+      "body_next_byte_offset",
+      "evidence_next_cursor",
+    ],
+  );
+  const memoryId = requiredIdentifier(record, "memory_id");
+  if (expectedMemoryId !== undefined && memoryId !== expectedMemoryId) {
+    invalid("Memory detail identity does not match the requested Memory");
+  }
+  const revision = requiredPositiveInteger(record, "revision");
+  const currentRevision = requiredPositiveInteger(record, "current_revision");
+  if (revision > currentRevision) invalid("revision exceeds current_revision");
+  const bodyTruncated = requiredBoolean(record, "body_truncated");
+  const bodyNextOffset = optionalNonNegativeInteger(record, "body_next_offset");
+  const bodyNextByteOffset = optionalNonNegativeInteger(
+    record,
+    "body_next_byte_offset",
+  );
+  if (
+    bodyTruncated !==
+      (bodyNextOffset !== undefined && bodyNextByteOffset !== undefined)
+  ) {
+    invalid("body continuation fields do not match body_truncated");
+  }
+  const sourceCandidateIds = boundedArray(
+    record.source_candidate_ids,
+    MAX_MEMORY_REFS,
+    "source_candidate_ids",
+  ).map((item) => identifier(item, "source_candidate_ids item"));
+  assertUnique(sourceCandidateIds, "source candidate ids");
+  const sourceCandidates = boundedArray(
+    record.source_candidates,
+    MAX_MEMORY_REFS,
+    "source_candidates",
+  ).map(parseMemoryEvidenceCandidate);
+  if (
+    sourceCandidateIds.length !== sourceCandidates.length ||
+    sourceCandidateIds.some((id, index) =>
+      sourceCandidates[index]?.candidate_id !== id
+    )
+  ) {
+    invalid("source candidate ids do not match source candidates");
+  }
+  const evidenceHasMore = requiredBoolean(record, "evidence_has_more");
+  const evidenceNextCursor = optionalNullableString(
+    record,
+    "evidence_next_cursor",
+  );
+  assertCursorInvariant(evidenceHasMore, evidenceNextCursor, "Memory evidence");
+  const result: SubjektivMemoryReadResponse = {
+    memory_id: memoryId,
+    revision,
+    current_revision: currentRevision,
+    kind: parseCandidateKind(record.kind),
+    state: parseMemoryState(record.state),
+    claim: requiredString(record, "claim"),
+    body_md: requiredString(
+      record,
+      "body_md",
+      MEMORY_API_LIMITS.maxDocumentBytes,
+    ),
+    why_useful: requiredString(record, "why_useful"),
+    change_reason: requiredString(record, "change_reason"),
+    created_at: requiredString(record, "created_at"),
+    updated_at: requiredString(record, "updated_at"),
+    body_offset: requiredNonNegativeInteger(record, "body_offset"),
+    body_byte_offset: requiredNonNegativeInteger(record, "body_byte_offset"),
+    body_truncated: bodyTruncated,
+    source_candidate_ids: sourceCandidateIds,
+    source_candidates: sourceCandidates,
+    derived_from: boundedArray(
+      record.derived_from,
+      MAX_MEMORY_REFS,
+      "derived_from",
+    ).map(parseMemoryRevisionRef),
+    evidence_has_more: evidenceHasMore,
+  };
+  if ("staleness" in record) {
+    result.staleness = nullableString(record, "staleness");
+  }
+  if (bodyNextOffset !== undefined) result.body_next_offset = bodyNextOffset;
+  if (bodyNextByteOffset !== undefined) {
+    result.body_next_byte_offset = bodyNextByteOffset;
+  }
+  if (evidenceNextCursor !== undefined) {
+    result.evidence_next_cursor = evidenceNextCursor;
+  }
+  return result;
+}
+
+function parseMemoryEvidenceCandidate(
+  value: unknown,
+): SubjektivMemoryEvidenceCandidate {
+  const record = strictRecord(
+    value,
+    [
+      "candidate_id",
+      "evidence",
+      "evidence_total",
+      "evidence_truncated",
+      "source_refs",
+      "source_refs_total",
+      "source_refs_truncated",
+    ],
+    "Memory evidence candidate",
+  );
+  const evidence = boundedArray(
+    record.evidence,
+    MAX_EVIDENCE_PER_RECORD,
+    "evidence",
+  ).map(parseMemoryEvidence);
+  assertUnique(evidence.map((item) => item.id), "evidence ids");
+  const evidenceTotal = requiredNonNegativeInteger(record, "evidence_total");
+  const evidenceTruncated = requiredBoolean(record, "evidence_truncated");
+  assertCollectionTotal(
+    evidence.length,
+    evidenceTotal,
+    evidenceTruncated,
+    "evidence",
+  );
+  const sourceRefs = boundedArray(
+    record.source_refs,
+    MAX_SOURCE_REFS_PER_RECORD,
+    "source_refs",
+  ).map(parseMemorySourceEvidenceRef);
+  const sourceRefsTotal = requiredNonNegativeInteger(
+    record,
+    "source_refs_total",
+  );
+  const sourceRefsTruncated = requiredBoolean(
+    record,
+    "source_refs_truncated",
+  );
+  assertCollectionTotal(
+    sourceRefs.length,
+    sourceRefsTotal,
+    sourceRefsTruncated,
+    "source refs",
+  );
+  return {
+    candidate_id: requiredIdentifier(record, "candidate_id"),
+    evidence,
+    evidence_total: evidenceTotal,
+    evidence_truncated: evidenceTruncated,
+    source_refs: sourceRefs,
+    source_refs_total: sourceRefsTotal,
+    source_refs_truncated: sourceRefsTruncated,
+  };
+}
+
+function parseMemoryEvidence(value: unknown): SubjektivMemoryEvidence {
+  const record = strictRecord(
+    value,
+    ["id", "kind", "entry_range", "origin", "excerpt", "summary"],
+    "Memory evidence",
+    ["entry_range", "origin", "excerpt", "summary"],
+  );
+  const result: SubjektivMemoryEvidence = {
+    id: requiredIdentifier(record, "id"),
+    kind: requiredString(record, "kind"),
+  };
+  if ("entry_range" in record) {
+    result.entry_range = record.entry_range === null
+      ? null
+      : parseEntryRange(record.entry_range, "entry_range");
+  }
+  if ("origin" in record) {
+    result.origin = record.origin === null
+      ? null
+      : parseEvidenceOrigin(record.origin);
+  }
+  if ("excerpt" in record) result.excerpt = nullableString(record, "excerpt");
+  if ("summary" in record) result.summary = nullableString(record, "summary");
+  return result;
+}
+
+function parseMemorySourceEvidenceRef(
+  value: unknown,
+): SubjektivMemorySourceEvidenceRef {
+  const keys = [
+    "session_id",
+    "segment_id",
+    "entry_range",
+    "evidence_id",
+    "origin",
+    "evidence_kind",
+    "label",
+    "summary",
+  ] as const;
+  const record = strictRecord(
+    value,
+    keys,
+    "Memory source evidence ref",
+    keys,
+  );
+  const result: SubjektivMemorySourceEvidenceRef = {};
+  for (
+    const key of [
+      "session_id",
+      "segment_id",
+      "evidence_id",
+      "evidence_kind",
+      "label",
+      "summary",
+    ] as const
+  ) {
+    if (key in record) result[key] = nullableString(record, key);
+  }
+  if ("entry_range" in record) {
+    result.entry_range = record.entry_range === null
+      ? null
+      : parseEntryRange(record.entry_range, "entry_range");
+  }
+  if ("origin" in record) {
+    result.origin = record.origin === null
+      ? null
+      : parseEvidenceOrigin(record.origin);
+  }
+  return result;
+}
+
+export function parseSubjektivMemoryListRevisionsResponse(
+  value: unknown,
+  expectedMemoryId?: string,
+): SubjektivMemoryListRevisionsResponse {
+  const record = strictRecord(
+    value,
+    ["memory_id", "current_revision", "items", "next_cursor", "has_more"],
+    "Memory revisions response",
+    ["next_cursor"],
+  );
+  const memoryId = requiredIdentifier(record, "memory_id");
+  if (expectedMemoryId !== undefined && memoryId !== expectedMemoryId) {
+    invalid("Memory revisions identity does not match the requested Memory");
+  }
+  const currentRevision = requiredPositiveInteger(record, "current_revision");
+  const items = boundedArray(record.items, MAX_REVISIONS, "items").map(
+    parseMemoryRevisionItem,
+  );
+  if (items.some((item) => item.revision > currentRevision)) {
+    invalid("revision history contains a future revision");
+  }
+  assertUnique(
+    items.map((item) => String(item.revision)),
+    "Memory revisions",
+  );
+  const hasMore = requiredBoolean(record, "has_more");
+  const nextCursor = optionalNullableString(record, "next_cursor");
+  assertCursorInvariant(hasMore, nextCursor, "Memory revisions");
+  const result: SubjektivMemoryListRevisionsResponse = {
+    memory_id: memoryId,
+    current_revision: currentRevision,
+    items,
+    has_more: hasMore,
+  };
+  if (nextCursor !== undefined) result.next_cursor = nextCursor;
+  return result;
+}
+
+function parseMemoryRevisionItem(value: unknown): SubjektivMemoryRevisionItem {
+  const record = strictRecord(
+    value,
+    ["revision", "kind", "state", "claim", "change_reason", "updated_at"],
+    "Memory revision item",
+  );
+  return {
+    revision: requiredPositiveInteger(record, "revision"),
+    kind: parseCandidateKind(record.kind),
+    state: parseMemoryState(record.state),
+    claim: requiredString(record, "claim"),
+    change_reason: requiredString(record, "change_reason"),
+    updated_at: requiredString(record, "updated_at"),
+  };
+}
+
+function parseMemoryRevisionRef(value: unknown): SubjektivMemoryRevisionRef {
+  const record = strictRecord(
+    value,
+    ["memory_id", "revision"],
+    "Memory revision ref",
+  );
+  return {
+    memory_id: requiredIdentifier(record, "memory_id"),
+    revision: requiredPositiveInteger(record, "revision"),
+  };
+}
+
+function parseCandidateKind(value: unknown): MemoryCandidateKind {
+  if (
+    typeof value !== "string" ||
+    !candidateKinds.has(value as MemoryCandidateKind)
+  ) {
+    invalid("unknown Memory candidate kind");
+  }
+  return value as MemoryCandidateKind;
+}
+
+function parseMemoryState(value: unknown): SubjektivMemoryState {
+  if (
+    typeof value !== "string" ||
+    !memoryStates.has(value as SubjektivMemoryState)
+  ) {
+    invalid("unknown Memory state");
+  }
+  return value as SubjektivMemoryState;
+}
+
+function assertCollectionTotal(
+  returned: number,
+  total: number,
+  truncated: boolean,
+  label: string,
+): void {
+  if (total < returned || truncated !== (total > returned)) {
+    invalid(`${label} total does not match its truncated state`);
+  }
+}
+
+function assertCursorInvariant(
+  hasMore: boolean,
+  cursor: string | null | undefined,
+  label: string,
+): void {
+  if (hasMore !== (typeof cursor === "string" && cursor.length > 0)) {
+    invalid(`${label} cursor does not match has_more`);
+  }
+}
+
+function assertUnique(values: string[], label: string): void {
+  if (new Set(values).size !== values.length) {
+    invalid(`${label} must be unique`);
+  }
+}
+
 function parseDiagnostic(value: unknown): Diagnostic {
   const record = strictRecord(
     value,
@@ -384,6 +972,55 @@ function requiredNonNegativeInteger(
   return nonNegativeInteger(record[key], key);
 }
 
+function requiredPositiveInteger(
+  record: Record<string, unknown>,
+  key: string,
+): number {
+  return positiveInteger(record[key], key);
+}
+
+function positiveInteger(value: unknown, label: string): number {
+  const result = nonNegativeInteger(value, label);
+  if (result === 0) invalid(`${label} must be a positive safe integer`);
+  return result;
+}
+
+function optionalNonNegativeInteger(
+  record: Record<string, unknown>,
+  key: string,
+): number | undefined {
+  if (!(key in record)) return undefined;
+  if (record[key] === null) return undefined;
+  return nonNegativeInteger(record[key], key);
+}
+
+function requiredIdentifier(
+  record: Record<string, unknown>,
+  key: string,
+): string {
+  return identifier(record[key], key);
+}
+
+function identifier(value: unknown, label: string): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    new TextEncoder().encode(value).byteLength >
+      MEMORY_API_LIMITS.maxIdentifierBytes
+  ) {
+    invalid(`${label} must be a non-empty bounded identifier`);
+  }
+  return value;
+}
+
+function optionalNullableString(
+  record: Record<string, unknown>,
+  key: string,
+): string | null | undefined {
+  if (!(key in record)) return undefined;
+  return nullableString(record, key);
+}
+
 function nonNegativeInteger(value: unknown, label: string): number {
   if (!Number.isSafeInteger(value) || (value as number) < 0) {
     invalid(`${label} must be a non-negative safe integer`);
@@ -395,10 +1032,10 @@ function parseEntryRange(value: unknown, label: string): [number, number] {
   if (!Array.isArray(value) || value.length !== 2) {
     invalid(`${label} must be a two-item entry range`);
   }
-  return [
-    nonNegativeInteger(value[0], label),
-    nonNegativeInteger(value[1], label),
-  ];
+  const start = nonNegativeInteger(value[0], label);
+  const end = nonNegativeInteger(value[1], label);
+  if (start > end) invalid(`${label} must be ordered`);
+  return [start, end];
 }
 
 function parseNullableEntryRange(

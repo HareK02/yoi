@@ -39,7 +39,7 @@ pub struct WorkerSharedState {
     pub worker_name: String,
     pub segment_id: SegmentId,
     pub manifest_toml: String,
-    pub greeting: protocol::Greeting,
+    greeting: RwLock<protocol::Greeting>,
     state: RwLock<WorkerStateSnapshot>,
     accepted_commands: RwLock<VecDeque<AcceptedWorkerCommand>>,
     /// Worker-from-the-inside view of the filesystem. Set once in
@@ -62,7 +62,7 @@ impl WorkerSharedState {
             worker_name,
             segment_id,
             manifest_toml,
-            greeting,
+            greeting: RwLock::new(greeting),
             state: RwLock::new(WorkerStateSnapshot::initial()),
             accepted_commands: RwLock::new(VecDeque::new()),
             fs_view: OnceLock::new(),
@@ -88,6 +88,22 @@ impl WorkerSharedState {
 
     pub fn flow_transition_enabled(&self) -> bool {
         self.flow_transition_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn greeting(&self) -> protocol::Greeting {
+        self.greeting
+            .read()
+            .expect("worker greeting lock poisoned")
+            .clone()
+    }
+
+    pub fn update_context_usage(&self, tokens: Option<u64>, source: protocol::ContextTokenSource) {
+        let mut greeting = self
+            .greeting
+            .write()
+            .expect("worker greeting lock poisoned");
+        greeting.context_tokens = tokens.unwrap_or_default();
+        greeting.context_usage = tokens.map(|tokens| protocol::ContextUsage { tokens, source });
     }
 
     pub fn transition(&self, state: WorkerState) -> WorkerStateSnapshot {
@@ -245,7 +261,30 @@ mod tests {
             tools: Vec::new(),
             context_window: 200_000,
             context_tokens: 0,
+            reasoning: None,
+            context_usage: None,
         }
+    }
+
+    #[test]
+    fn current_context_usage_is_reflected_in_reconnect_greeting() {
+        let state = test_state();
+        state.update_context_usage(Some(42_000), protocol::ContextTokenSource::Measured);
+
+        let greeting = state.greeting();
+        assert_eq!(greeting.context_tokens, 42_000);
+        assert_eq!(
+            greeting.context_usage,
+            Some(protocol::ContextUsage {
+                tokens: 42_000,
+                source: protocol::ContextTokenSource::Measured,
+            })
+        );
+
+        state.update_context_usage(None, protocol::ContextTokenSource::Measured);
+        let greeting = state.greeting();
+        assert_eq!(greeting.context_tokens, 0);
+        assert_eq!(greeting.context_usage, None);
     }
 
     #[test]

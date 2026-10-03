@@ -144,6 +144,7 @@ pub enum WorkspaceAuthorityRequirement {
     Flow,
     ManageWorkdir,
     Memory,
+    Subjektiv,
     MergeRequest,
     Objective,
     Orchestration,
@@ -157,6 +158,7 @@ impl fmt::Display for WorkspaceAuthorityRequirement {
             Self::Flow => formatter.write_str("feature.flow"),
             Self::ManageWorkdir => formatter.write_str("feature.manage_workdir"),
             Self::Memory => formatter.write_str("feature.memory"),
+            Self::Subjektiv => formatter.write_str("feature.subjektiv"),
             Self::MergeRequest => formatter.write_str("feature.merge_request"),
             Self::Objective => formatter.write_str("feature.objective"),
             Self::Orchestration => formatter.write_str("feature.orchestration"),
@@ -184,6 +186,9 @@ pub fn validate_profile_execution_target(
     }
     if feature.memory.profile.enabled || feature.memory.profile.staging_tools {
         requirements.insert(WorkspaceAuthorityRequirement::Memory);
+    }
+    if feature.subjektiv.profile.enabled {
+        requirements.insert(WorkspaceAuthorityRequirement::Subjektiv);
     }
     if feature.merge_request.show
         || feature.merge_request.open
@@ -1253,6 +1258,64 @@ mod tests {
     }
 
     #[test]
+    fn builtin_workspace_profiles_cut_over_to_subjektiv_without_legacy_memory() {
+        let tmp = TempDir::new().unwrap();
+        let resolve = |name: &str| {
+            ProfileResolver::new()
+                .with_workspace_base(tmp.path())
+                .resolve(
+                    &ProfileSelector::source_named(ProfileRegistrySource::Builtin, name),
+                    ProfileResolveOptions::with_worker_name(format!("{name}-worker")),
+                )
+                .unwrap()
+                .manifest
+        };
+
+        for name in ["coder", "companion", "intake", "reviewer", "orchestrator"] {
+            let manifest = resolve(name);
+            assert!(
+                manifest.feature.subjektiv.profile.enabled,
+                "{name} must enable subjektiv"
+            );
+            assert!(
+                manifest.feature.subjektiv.profile.extraction.enabled,
+                "{name} must enable subject extraction"
+            );
+            assert!(
+                !manifest.feature.memory.profile.enabled,
+                "{name} must not enable legacy Workspace Memory"
+            );
+        }
+
+        for name in ["default", "standalone", "backend-job"] {
+            let manifest = resolve(name);
+            assert!(!manifest.feature.memory.profile.enabled, "{name}");
+            assert!(!manifest.feature.subjektiv.profile.enabled, "{name}");
+        }
+
+        let legacy_consolidator = resolve("memory-consolidation");
+        assert!(legacy_consolidator.feature.memory.profile.enabled);
+        assert!(legacy_consolidator.feature.memory.profile.staging_tools);
+        assert!(
+            legacy_consolidator
+                .feature
+                .memory
+                .profile
+                .extraction
+                .enabled
+        );
+        assert!(
+            legacy_consolidator
+                .feature
+                .memory
+                .profile
+                .consolidation
+                .request_enabled
+        );
+        assert!(!legacy_consolidator.feature.subjektiv.profile.enabled);
+    }
+
+    #[test]
     fn builtin_profiles_pin_role_models_and_reasoning() {
         use crate::model::{ReasoningControl, ReasoningEffort};
 
@@ -1276,6 +1339,7 @@ mod tests {
             "coder",
             "reviewer",
             "memory-consolidation",
+            "subjektiv-memory-consolidation",
         ] {
             let role = resolve(name);
             assert_eq!(
@@ -1308,7 +1372,7 @@ mod tests {
                 role.manifest.engine.reasoning,
                 Some(ReasoningControl::Effort(ReasoningEffort::High))
             );
-            let extraction = &role.manifest.feature.memory.profile.extraction;
+            let extraction = &role.manifest.feature.subjektiv.profile.extraction;
             assert_eq!(
                 extraction
                     .model
@@ -1322,14 +1386,63 @@ mod tests {
             );
         }
 
-        let consolidation = resolve("memory-consolidation");
+        for name in ["memory-consolidation", "subjektiv-memory-consolidation"] {
+            let consolidation = resolve(name);
+            assert_eq!(
+                consolidation.manifest.model.ref_.as_deref(),
+                Some("codex-oauth/gpt-5.6-luna")
+            );
+            assert_eq!(
+                consolidation.manifest.engine.reasoning,
+                Some(ReasoningControl::Effort(ReasoningEffort::Medium))
+            );
+        }
+    }
+
+    #[test]
+    fn subjektiv_memory_consolidation_profile_is_lifecycle_and_capability_isolated() {
+        let tmp = TempDir::new().unwrap();
+        let resolved = ProfileResolver::new()
+            .with_workspace_base(tmp.path())
+            .resolve(
+                &ProfileSelector::source_named(
+                    ProfileRegistrySource::Builtin,
+                    "subjektiv-memory-consolidation",
+                ),
+                ProfileResolveOptions::with_worker_name("subject-consolidator"),
+            )
+            .unwrap();
+        let manifest = resolved.manifest;
+        let feature = &manifest.feature;
+
+        assert!(!feature.memory.profile.enabled);
+        assert!(!feature.memory.profile.staging_tools);
+        assert!(feature.subjektiv.profile.enabled);
+        assert!(!feature.subjektiv.profile.extraction.enabled);
+        assert!(!feature.task.enabled);
+        assert!(!feature.web.enabled);
+        assert!(!feature.image.enabled);
+        assert!(!feature.sub_worker.enabled);
+        assert!(!feature.flow.enabled);
+        assert!(!feature.worker.enabled);
+        assert!(!feature.worker.direct_spawn);
+        assert!(!feature.workspace_worker_discovery.enabled);
+        assert!(!feature.objective.enabled);
+        assert!(!feature.manage_workdir.enabled);
+        assert!(!feature.ticket.enabled);
+        assert!(!feature.ticket.authoring);
+        assert!(!feature.ticket.thread);
+        assert!(!feature.ticket.intake);
+        assert!(!feature.ticket.workflow);
+        assert!(!feature.merge_request.show);
+        assert!(!feature.merge_request.open);
+        assert!(!feature.merge_request.review);
+        assert!(!feature.merge_request.readiness_check);
+        assert!(!feature.merge_request.complete);
+        assert!(!feature.orchestration.enabled);
         assert_eq!(
-            consolidation.manifest.model.ref_.as_deref(),
-            Some("codex-oauth/gpt-5.6-luna")
-        );
-        assert_eq!(
-            consolidation.manifest.engine.reasoning,
-            Some(ReasoningControl::Effort(ReasoningEffort::Medium))
+            manifest.web.as_ref().and_then(|web| web.enabled),
+            Some(false)
         );
     }
 
@@ -1477,7 +1590,8 @@ mod tests {
             panic!("unexpected error: {error}");
         };
         assert_eq!(target, ProfileExecutionTarget::Standalone);
-        assert!(requirements.contains(&WorkspaceAuthorityRequirement::Memory));
+        assert!(requirements.contains(&WorkspaceAuthorityRequirement::Subjektiv));
+        assert!(!requirements.contains(&WorkspaceAuthorityRequirement::Memory));
         assert!(requirements.contains(&WorkspaceAuthorityRequirement::MergeRequest));
         assert!(requirements.contains(&WorkspaceAuthorityRequirement::Ticket));
         assert!(!diagnostic.contains(tmp.path().to_string_lossy().as_ref()));

@@ -108,6 +108,13 @@ pub const BUILTIN_PROFILE_RESOURCES: &[BuiltinProfileResource] = &[
         description: "Internal Memory consolidation service.",
         imports: BASE_IMPORT,
     },
+    BuiltinProfileResource {
+        selector: Some("builtin:subjektiv-memory-consolidation"),
+        path: "profiles/subjektiv-memory-consolidation.dcdl",
+        source: include_str!("../../../resources/profiles/subjektiv-memory-consolidation.dcdl"),
+        description: "Delegated subject Memory consolidation service.",
+        imports: BASE_IMPORT,
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]

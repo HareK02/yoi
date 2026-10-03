@@ -33,8 +33,15 @@ pub(crate) struct MemoryStagingOutputState {
     workspace_client: Arc<dyn WorkspaceClient>,
     source: SourceRef,
     extract_run_id: String,
+    destination: MemoryStagingDestination,
     staged: Arc<Mutex<Vec<String>>>,
     finished: Arc<Mutex<Option<FinishMemoryExtractionParams>>>,
+}
+
+#[derive(Clone)]
+enum MemoryStagingDestination {
+    WorkspaceMemory,
+    Subjektiv { session_id: String },
 }
 
 impl MemoryStagingOutputState {
@@ -49,6 +56,25 @@ impl MemoryStagingOutputState {
             workspace_client,
             source,
             extract_run_id,
+            destination: MemoryStagingDestination::WorkspaceMemory,
+            staged: Arc::new(Mutex::new(Vec::new())),
+            finished: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn new_subjektiv(
+        view: SessionCapture,
+        workspace_client: Arc<dyn WorkspaceClient>,
+        source: SourceRef,
+        extract_run_id: String,
+        session_id: String,
+    ) -> Self {
+        Self {
+            view: Arc::new(view),
+            workspace_client,
+            source,
+            extract_run_id,
+            destination: MemoryStagingDestination::Subjektiv { session_id },
             staged: Arc::new(Mutex::new(Vec::new())),
             finished: Arc::new(Mutex::new(None)),
         }
@@ -201,34 +227,72 @@ impl Tool for StageMemoryCandidateTool {
             staleness: params.staleness,
             evidence_ids: params.entry_refs,
         };
-        let result = self
-            .state
-            .workspace_client
-            .execute_memory_backend_operation(MemoryBackendOperation::StageCandidate(
-                MemoryStageCandidateOperation {
-                    source: self.state.source.clone(),
-                    extract_run_id: self.state.extract_run_id.clone(),
-                    candidate,
-                    evidence,
-                    source_refs,
-                },
-            ))
-            .await
-            .map_err(map_memory_stage_error)?;
-        let staging_ids = match result {
-            MemoryBackendOperationResult::StagingWritten(output) if output.staging_count == 1 => {
-                output.staging_ids
+        let operation = MemoryStageCandidateOperation {
+            source: self.state.source.clone(),
+            extract_run_id: self.state.extract_run_id.clone(),
+            candidate,
+            evidence,
+            source_refs,
+        };
+        let staging_ids = match &self.state.destination {
+            MemoryStagingDestination::WorkspaceMemory => {
+                let result = self
+                    .state
+                    .workspace_client
+                    .execute_memory_backend_operation(MemoryBackendOperation::StageCandidate(
+                        operation,
+                    ))
+                    .await
+                    .map_err(map_memory_stage_error)?;
+                match result {
+                    MemoryBackendOperationResult::StagingWritten(output)
+                        if output.staging_count == 1 =>
+                    {
+                        output.staging_ids
+                    }
+                    MemoryBackendOperationResult::StagingWritten(output) => {
+                        return Err(ToolError::ExecutionFailed(format!(
+                            "StageMemoryCandidate expected one staging record, backend wrote {}",
+                            output.staging_count
+                        )));
+                    }
+                    other => {
+                        return Err(ToolError::ExecutionFailed(format!(
+                            "unexpected Memory backend result for StageMemoryCandidate: {other:?}"
+                        )));
+                    }
+                }
             }
-            MemoryBackendOperationResult::StagingWritten(output) => {
-                return Err(ToolError::ExecutionFailed(format!(
-                    "StageMemoryCandidate expected one staging record, backend wrote {}",
-                    output.staging_count
-                )));
-            }
-            other => {
-                return Err(ToolError::ExecutionFailed(format!(
-                    "unexpected Memory backend result for StageMemoryCandidate: {other:?}"
-                )));
+            MemoryStagingDestination::Subjektiv { session_id } => {
+                let response = self
+                    .state
+                    .workspace_client
+                    .execute_server_operation(
+                        crate::worker::WorkspaceServerOperation::SubjektivStageCandidate(
+                            server_api::SubjektivStageCandidateRequest {
+                                session_id: session_id.clone(),
+                                operation,
+                            },
+                        ),
+                    )
+                    .map_err(|error| {
+                        ToolError::ExecutionFailed(format!(
+                            "write subjektiv staging failed: {error}"
+                        ))
+                    })?;
+                if !response.is_success() {
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "write subjektiv staging returned HTTP {}: {}",
+                        response.status, response.body
+                    )));
+                }
+                let output: server_api::SubjektivStageCandidateResponse =
+                    serde_json::from_str(&response.body).map_err(|error| {
+                        ToolError::ExecutionFailed(format!(
+                            "decode subjektiv staging response: {error}"
+                        ))
+                    })?;
+                vec![output.staging_id]
             }
         };
         let staging_id = staging_ids.into_iter().next().ok_or_else(|| {
@@ -346,7 +410,7 @@ fn evidence_origin(origin: &protocol::SessionEntryProvenance) -> EvidenceOrigin 
     }
 }
 
-fn staging_evidence(entry: &SessionEntryEvidence) -> StagingEvidence {
+pub(crate) fn staging_evidence(entry: &SessionEntryEvidence) -> StagingEvidence {
     StagingEvidence {
         id: entry.entry_ref.to_string(),
         kind: evidence_kind(entry),
@@ -357,7 +421,7 @@ fn staging_evidence(entry: &SessionEntryEvidence) -> StagingEvidence {
     }
 }
 
-fn source_evidence_ref(entry: &SessionEntryEvidence) -> SourceEvidenceRef {
+pub(crate) fn source_evidence_ref(entry: &SessionEntryEvidence) -> SourceEvidenceRef {
     SourceEvidenceRef {
         segment_id: Some(entry.segment_id.clone()),
         entry_range: Some(entry.entry_range),
@@ -425,9 +489,44 @@ fn truncate_line(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use agen::Item;
 
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct RecordingSubjektivClient {
+        requests: Mutex<Vec<crate::worker::WorkspaceRequest>>,
+    }
+
+    impl WorkspaceClient for RecordingSubjektivClient {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("workspace-1")
+        }
+
+        fn kind(&self) -> &str {
+            "subjektiv-test"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn execute(
+            &self,
+            request: crate::worker::WorkspaceRequest,
+        ) -> Result<crate::worker::WorkspaceResponse, crate::worker::WorkspaceClientError> {
+            self.requests.lock().unwrap().push(request);
+            Ok(crate::worker::WorkspaceResponse {
+                status: 200,
+                body: serde_json::to_string(&server_api::SubjektivStageCandidateResponse {
+                    staging_id: "subject-candidate-1".to_string(),
+                })
+                .unwrap(),
+            })
+        }
+    }
 
     fn state() -> MemoryStagingOutputState {
         MemoryStagingOutputState::new(
@@ -501,6 +600,39 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{error:?}").contains("exclusively HumanInput evidence"));
+    }
+
+    #[tokio::test]
+    async fn subjektiv_destination_sends_committed_session_without_subject_scope() {
+        let client = Arc::new(RecordingSubjektivClient::default());
+        let state = MemoryStagingOutputState::new_subjektiv(
+            SessionCapture::new("segment-1", vec![Item::user_message("durable decision")]),
+            client.clone(),
+            SourceRef {
+                segment_id: "segment-1".to_string(),
+                range: [0, 0],
+            },
+            "run-1".to_string(),
+            "session-committed".to_string(),
+        );
+        let tool = StageMemoryCandidateTool {
+            state: state.clone(),
+        };
+        tool.execute(
+            r#"{"kind":"decision","claim":"claim","why_useful":"useful","entry_refs":["E00000000"]}"#,
+            agen::tool::ToolExecutionContext::direct(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.staged(), vec!["subject-candidate-1"]);
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].path.ends_with("/subjektiv/staging"));
+        let body = requests[0].body.as_deref().unwrap();
+        assert!(body.contains("session-committed"));
+        assert!(body.contains("why_useful"));
+        assert!(!body.contains("subject_id"));
     }
 
     #[tokio::test]

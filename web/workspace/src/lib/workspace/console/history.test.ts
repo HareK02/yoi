@@ -346,6 +346,36 @@ Deno.test("line previews include a current turn outside the retained five-turn p
   );
 });
 
+Deno.test("line previews track a snapshot-restored assistant as its body streams", () => {
+  const lines = [{
+    id: "user",
+    entryId: "user-entry",
+    kind: "user" as const,
+    title: "User",
+    body: "question",
+    source: "event" as const,
+  }, {
+    id: "restored-assistant",
+    kind: "assistant" as const,
+    title: "assistant streaming",
+    body: "**hel",
+    source: "event" as const,
+    streaming: true,
+  }];
+
+  assert(
+    conversationTurnPreviewsFromLines(lines)[0].assistant.join("|") ===
+      "**hel",
+    "restored assistant prefix must use the ordinary assistant preview path",
+  );
+  const continued = [lines[0], { ...lines[1], body: "**hello**" }];
+  assert(
+    conversationTurnPreviewsFromLines(continued)[0].assistant.join("|") ===
+      "**hello**",
+    "live suffixes must update the same turn preview",
+  );
+});
+
 Deno.test("turn preview uses one user line and final non-empty assistant up to three lines", () => {
   const preview = conversationTurnPreviews([turn(4)])[0];
   assert(preview.user === "question 4", "user preview must use its first line");

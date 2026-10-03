@@ -1,8 +1,13 @@
 # subjektiv subject Memory store
 
-T-667 introduces a trusted Server-side `subjektiv` repository in
-`yoi_workspace_server::subjektiv`. It is a domain store, not a Worker tool or a
-cutover of the existing Workspace Memory authority.
+The trusted Server-side `subjektiv` repository in
+`yoi_workspace_server::subjektiv` is the persistence authority for subject-scoped
+Memory. It is a domain store, not a Worker tool. Legacy single-document Workspace
+Memory remains a separate, deprecated control-plane authority until an operator
+performs the explicit reset defined by the
+[subjektiv product cutover runbook](../development/subjektiv-product-cutover.md);
+legacy rows are never imported, dual-written, or silently reinterpreted as subject
+Memory.
 
 ## Ownership and scope
 
@@ -19,14 +24,17 @@ cutover of the existing Workspace Memory authority.
   Async callers must run these synchronous repository calls on a blocking
   executor.
 - The store contains no `current_worker_id` or equivalent current link. Yoi's
-  keyed singleton remains the sole authority for the current Worker. Historical
-  Worker/Session attribution is provenance and will be connected separately.
+  keyed singleton remains the sole authority for the current Worker. T-668
+  connects Workers using the opaque `subjektiv:<subject-id>` key and records
+  immutable historical Worker/Session attribution as provenance; that history is
+  never consulted as a current Worker link.
 
 Registration is deliberately separate from open. Trusted Server construction
 registers `REGISTRATION` once per `FeatureStorage` manager, then reuses its
 `RegisteredFeature` for each Workspace. Merely adding this module does not open
-or create a subjektiv database; product enablement and old-Memory cutover are
-later work.
+or create a subjektiv database. T-668 opens it lazily for explicit subject
+operations or an authenticated subject extraction write; leaving the Feature
+disabled has no subject-store side effect.
 
 ## Versioned records
 
@@ -82,8 +90,9 @@ immutable. A resolution stores both the resolution JSON and the exact staged JSO
 bytes that were resolved. Aggregate seal rows prevent evidence, derivations,
 resolution targets, or snapshot references from being appended after their
 parent JSON is finalized. Foreign keys plus retention triggers prevent dangling
-candidate, derivation, resolution-target, and snapshot references. There is no
-record deletion API in this baseline.
+candidate, derivation, resolution-target, and snapshot references. Ordinary
+subject operations expose no record deletion API; the legacy reset contract does
+not touch this Feature database.
 
 Search columns and JSON projections are written together by the typed repository.
 Raw SQL remains private trusted implementation detail. Existing Workspace Memory
@@ -120,3 +129,191 @@ online backup/restore includes the entire subjektiv database, including immutabl
 history and provenance. Workspace deletion and shutdown use the common lifecycle
 fences and close retained repository handles. Disabling subjektiv does not erase
 its database.
+
+## Extraction connection (T-668)
+
+`feature.subjektiv` is an explicit Worker profile boundary. It reuses the
+committed-run threshold, restricted Internal extraction Worker,
+`SessionEntryRef` evidence resolution, explicit finish, generation fence, and
+success-only pointer progression from the established Memory lifecycle. Its
+pointer domain is separate from legacy Workspace Memory, and a Worker is rejected
+at installation when both automatic extraction destinations are enabled. Ordinary
+SubWorkers and Reviewer SubWorkers have lifecycle Features disabled by their host;
+only evidence actually committed into the parent Session can enter the parent's
+capture.
+
+The staging request contains the existing model contract (`kind`, `claim`,
+`why_useful`, optional `staleness`, and entry references after host resolution)
+plus the committed parent `session_id`. It contains no subject id. The Server
+derives subject scope from authenticated Runtime/Worker source proof and the
+current keyed-singleton lease, then attaches the session id to every source
+reference and records immutable historical `{subject, runtime, worker, session}`
+provenance atomically with staging. A Session already attributed to another
+subject is rejected. Preference candidates still require exclusively HumanInput
+evidence.
+
+Subject retirement does not stop a Worker, and stopping/replacing a Worker does
+not retire the subject. A replacement uses the same `subjektiv:<subject-id>` key;
+retries therefore recover through Yoi's singleton authority without a second
+current-worker mapping in this database.
+
+Candidates are immutable writes that occur before `FinishMemoryExtraction`. If a
+run stages one or more candidates and then fails, is cancelled, or loses its
+generation fence, those candidates remain recorded and the extraction pointer
+does not advance. A retry may therefore produce semantically duplicate candidates;
+subsequent consolidation must compare them using the existing candidate
+identity/content boundary. The system must not claim that the partial writes were
+rolled back or silently delete them. Subject recall, consolidation, and legacy
+Memory migration remain separate work.
+
+## Recall and explicit proposal tools (T-669)
+
+An enabled `feature.subjektiv` installs five names that do not overlap the legacy
+single-Markdown Memory tools: `SubjektivMemoryQuery`, `SubjektivMemoryRead`,
+`SubjektivMemoryListRevisions`, `SubjektivMemoryRemember`, and
+`SubjektivMemoryProposeRevision`. Runtime-signed Worker source plus current
+`subjektiv:<subject-id>` singleton ownership is re-evaluated for every operation;
+none of the model-visible inputs contains a subject, Runtime, Worker, Session,
+origin, or raw provenance object.
+
+Query searches only current projections. Omitted `states` means `active`; explicit
+empty `states` or `kinds` is invalid. Output defaults to 20 and is capped at 100,
+ordered by `updated_at DESC, memory_id ASC`. Its opaque cursor binds the subject,
+canonical filters, offset, and subject `store_revision`; any confirmed-Memory
+change makes it a typed stale-cursor conflict rather than silently mixing
+snapshots. Revision conflicts and stale cursors retain their diagnostic code as a
+structured `{status: "error", error: {code, message}}` tool result instead of
+requiring models to parse prose. Revision history is ordered by revision
+descending. Its first page
+fixes the maximum revision, so later revisions neither duplicate nor displace old
+page members.
+
+Read accepts a positive exact revision or resolves the current revision once. A
+missing historical revision never falls back to current. Markdown pagination is
+line-based (default 200, maximum 1000) with a preliminary 16 KiB UTF-8 body
+cap and a global 56 KiB budget over the exact pretty-serialized model-visible
+response. JSON escaping, provenance, and metadata therefore reduce the current
+body page before the Worker content ceiling is reached. It reports
+`body_truncated`, `body_next_offset`, and `body_next_byte_offset`; an oversized
+or escape-heavy single line resumes from the returned UTF-8 byte boundary within
+that same line. Every continuation offset must also supply the exact revision
+returned by the first page, so a current-revision change cannot mix body versions.
+Provenance uses a separate immutable-revision-bound cursor and returns one
+candidate/derivation reference per page. New staged candidates contain at most 10
+evidence records and 10 source references; read pages project at most two of each,
+with displayed anchor text capped at 64 UTF-8 bytes and nested offsets carried by
+the ordinary evidence cursor. Compatible candidates persisted before the admission
+cap remain readable across as many evidence pages as needed, while every current
+staging path rejects new larger anchor sets. Candidate evidence is the bounded
+host-resolved anchor saved in staging; raw Session bodies are not copied
+into Memory responses. Resolved, retracted, and historical revisions remain
+addressable by ID.
+
+Remember and ProposeRevision only stage candidates. Entry references are resolved
+against the host's committed Session capture, and preference candidates continue
+to require exclusively `HumanInput` evidence. When no entry is supplied, a
+non-preference request returns `pending_commit`; after the run commits, the host
+reconstructs pending receipts from the durable tool-call/tool-result history and
+uses the committed tool-call entry itself as model-origin evidence. Receipt lookup
+reports `pending_commit`, `staged`, or `missing`; the post-commit hook retries
+immediately, the pre-request hook replays durable pending receipts after Worker
+restore, and the fail-closed pre-rewrite hook prevents compaction from dropping an
+unstaged receipt. Hook failure and process restart therefore retain an idempotent
+retry path, while an operation that never commits is not staged. Receipt identity is derived from Session and tool-call identity,
+and exact backend retries return the first candidate rather than creating another
+one. Neither path changes `memory_records`, `memory_revisions`, `store_revision`,
+or a surface snapshot.
+
+
+## Historical Session discovery (T-673)
+
+An enabled `feature.subjektiv` also installs exactly three read-only tools:
+`SubjektivSessionList`, `SubjektivSessionSearch`, and `SubjektivSessionRead`.
+The Server binds subject, Workspace, Runtime, Worker, retention catalogue, and
+archive authority from the authenticated caller. Model input contains only
+Session/segment/entry selectors, search filters, limits, and opaque cursors;
+knowing any identifier does not grant access. Reads use Yoi's retained or
+committed-archive Session storage and a shared public projection. They do not
+copy Session bodies into the subjektiv database, restore Workers, migrate
+Session storage, create candidates or Memories, revise a surface, or promote a
+re-read tool result to HumanInput.
+
+The public projection covers committed records in every persisted segment,
+including non-active branches and pre-compaction entries, while excluding
+system prompts, hidden reasoning, traces/diagnostics, unfinished run tails, and
+attachment or pasted-artifact bodies. Results preserve exact Session, segment,
+entry, provenance, and lineage identity so inherited entries are not presented
+as a current decision. Full entry reads are UTF-8-boundary paged and remain
+subject to the same projection as snippets and search.
+
+The subject's first committed primary-Worker Session is attributed independently
+of extraction thresholds or candidate creation. Recording is idempotent and is
+retried on later committed-run and pre-request lifecycle points after transient
+failure; no attribution is attempted before a committed capture exists. This is
+not a distributed transaction with Session persistence. In particular, the
+system does **not** backfill older unattributed Sessions from their text, display
+name, current singleton ownership, Memory references, or other inference.
+Historical Sessions without trustworthy Host-recorded attribution remain outside
+subject discovery until a separately authorized provenance mechanism exists.
+
+Pagination cursors bind scope, operation, filters, stable ordering, and the
+public storage generation and are never authorization credentials. Every page
+rechecks current subject and observation authority. Deleted-Worker archives are
+eligible only when both the committed Server catalogue and Runtime manifest
+agree and the archived observation grant remains valid; incomplete, expired,
+corrupt, unavailable, or changed sources are reported explicitly rather than as
+an empty successful search.
+
+Revision proposals add optional `revision_proposal` metadata to the existing v2
+`SubjectStagingRecord` envelope; automatic extraction remains proposal-free and
+its model schema is unchanged. The metadata is serialized atomically with the
+candidate and therefore remains present in candidate reads and immutable
+resolution copies:
+
+```json
+{
+  "intent": "revise",
+  "memory_id": "memory-…",
+  "expected_revision": 3,
+  "change_reason": "The committed evidence corrects the prior condition"
+}
+```
+
+This is the T-670 handoff fixture. Consolidation must re-read this typed metadata,
+re-check subject ownership, `expected_revision`, and the requested state
+transition in the same transaction that applies the candidate, and leave a stale
+proposal unresolved/conflicted. It must not parse target information from the
+claim, retarget to the latest revision, or revive a retracted Memory. Valid
+transitions at staging are revise while active/resolved, active→resolved,
+active/resolved→retracted, and resolved→active. Retraction remains terminal.
+
+## Candidate consolidation and corrections (T-670)
+
+The Backend starts a restricted `builtin:subjektiv-memory-consolidation` Worker
+for exactly one authenticated subject. The Host binds the subject; model-visible
+inputs cannot select a Workspace, subject, Runtime, Worker, or Session. Its tools
+list/read pending immutable candidates, query/read confirmed revisions, and make
+one candidate decision. Candidate text is evidence rather than authority.
+
+Every decision carries a stable request ID. An exact retry returns the committed
+receipt, while reuse with different input is a conflict. Applying a candidate
+atomically writes one new confirmed revision, its exact candidate and derivation
+edges, the immutable resolution and affected revision references, and advances
+the subject store revision. A non-applied decision explicitly records
+`discarded`, `invalid`, `duplicate`, or `already_covered`; an empty model response,
+transport failure, or aborted consolidation records no disposition and leaves the
+candidate pending. A successful applied response is the only evidence that
+confirmed Memory changed.
+
+A typed revision proposal must be applied to its exact `memory_id` and
+`expected_revision`, preserving its intent and change reason. The transaction
+rechecks the current revision and state transition. It never rebases or retargets
+a stale proposal, revives retracted Memory, or extracts a target from claim prose.
+Correction/refinement of the same experience appends under the same Memory ID;
+a corrected experience after terminal retraction receives a new Memory ID and may
+cite the retracted fixed revision as a derivation. Surface generation is a
+separate post-consolidation lifecycle: its failure cannot roll back a committed
+candidate decision.
+
+For the product activation, legacy reset, and operator recovery boundary, follow
+the [subjektiv product cutover runbook](../development/subjektiv-product-cutover.md).

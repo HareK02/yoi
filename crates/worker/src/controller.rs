@@ -151,7 +151,7 @@ impl WorkerHandle {
             .snapshot();
         let event = Event::Snapshot {
             session,
-            greeting: self.shared_state.greeting.clone(),
+            greeting: self.shared_state.greeting(),
             state: self.shared_state.snapshot(),
             in_flight,
             internal_workers: self.spawned_registry.internal_worker_snapshots(),
@@ -269,6 +269,17 @@ async fn set_controller_state(
     snapshot
 }
 
+fn publish_context_usage(
+    shared_state: &Arc<WorkerSharedState>,
+    working_event_tx: &broadcast::Sender<Event>,
+    tokens: Option<u64>,
+    source: protocol::ContextTokenSource,
+) {
+    shared_state.update_context_usage(tokens, source);
+    let usage = tokens.map(|tokens| protocol::ContextUsage { tokens, source });
+    let _ = working_event_tx.send(Event::ContextUsage { usage });
+}
+
 async fn set_controller_status(
     shared_state: &Arc<WorkerSharedState>,
     runtime_dir: &RuntimeDir,
@@ -303,6 +314,12 @@ async fn finish_controller_run<C, St>(
     // the terminal run boundary so reconnect snapshots cannot append stale
     // partial text/tool arguments after newer entries.
     worker.clear_in_flight_events();
+    publish_context_usage(
+        shared_state,
+        working_event_tx,
+        Some(worker.total_tokens().tokens),
+        protocol::ContextTokenSource::Estimated,
+    );
     set_controller_status(shared_state, runtime_dir, working_event_tx, new_status).await;
 }
 
@@ -767,6 +784,19 @@ impl WorkerController {
         // the actual registered set instead of a hand-maintained mirror.
         worker.engine().tool_server_handle().flush_pending();
 
+        // Runtime-owned Workers persist their current model-visible head before
+        // controller exposure. Feature installation above must happen first so a
+        // fresh subject Worker captures the current resident surface in its durable
+        // prompt. Restored Workers defer their one-shot append-only resident refresh
+        // until the next model-visible context materialization, after the Runtime has
+        // committed restoration of the existing durable head.
+        if runtime_managed && worker.needs_initial_session_head_materialization() {
+            worker
+                .materialize_durable_session_head()
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+        }
+
         // === 4. Initial runtime files + WorkerSharedState + WorkerHandle +
         //         SocketServer ===
         let manifest_toml = toml::to_string_pretty(worker.manifest()).unwrap_or_default();
@@ -781,6 +811,16 @@ impl WorkerController {
             manifest_toml.clone(),
             greeting,
         ));
+        let usage_state = shared_state.clone();
+        let usage_events = working_event_tx.clone();
+        worker.engine_mut().on_usage(move |event| {
+            publish_context_usage(
+                &usage_state,
+                &usage_events,
+                event.input_tokens,
+                protocol::ContextTokenSource::Measured,
+            );
+        });
         if let Some(fs_for_view) = fs_for_view {
             shared_state.set_fs_view(crate::fs_view::WorkerFsView::new(fs_for_view));
         }
@@ -1141,6 +1181,22 @@ pub(crate) fn wire_event_bridges_on_engine<C, St>(
     // per-item commit channel is wired at the top of this function.
 }
 
+fn validate_memory_lifecycle_targets(
+    memory: &manifest::MemoryFeatureProfileConfig,
+    subjektiv: &manifest::SubjektivFeatureProfileConfig,
+) -> std::io::Result<()> {
+    let legacy_lifecycle =
+        memory.enabled && (memory.extraction.enabled || memory.consolidation.request_enabled);
+    let subjektiv_lifecycle = subjektiv.enabled && subjektiv.extraction.enabled;
+    if legacy_lifecycle && subjektiv_lifecycle {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Workspace Memory and subjektiv lifecycles cannot both be enabled for one Worker",
+        ));
+    }
+    Ok(())
+}
+
 /// Register the builtin file-manipulation tools, optional memory tools,
 /// and the Worker-orchestration tools (SubWorkerSpawn + comm) on the Worker's
 /// Engine. Returns the WorkdirSession handle used to attach a `WorkerFsView` to
@@ -1250,28 +1306,95 @@ where
             ),
         );
     }
+    let memory_profile = &worker.manifest().feature.memory.profile;
+    let subjektiv_profile = &worker.manifest().feature.subjektiv.profile;
+    validate_memory_lifecycle_targets(memory_profile, subjektiv_profile)?;
     let memory_install_plan = crate::feature::builtin::memory::MemoryFeatureInstallPlan::prepare(
         worker.manifest(),
         worker.workspace_client_handle(),
         worker.prompts().load_full(),
     )?;
-    let memory_prompt_contribution = memory_install_plan.as_ref().map(|plan| {
+    let mut feature_prompt_contribution = memory_install_plan.as_ref().map(|plan| {
         (
             plan.resident_summary_source.clone(),
             plan.system_prompt_override.clone(),
         )
     });
-    let memory_lifecycle_config = memory_install_plan
-        .as_ref()
-        .map(|plan| plan.resolved_config.clone());
+    let memory_lifecycle_config = worker.manifest().feature.memory.clone();
     if let Some(plan) = memory_install_plan {
         feature_registry.add_module(plan.module);
     }
-    if let Some(memory_config) = memory_lifecycle_config
-        && let Some(memory_lifecycle) =
-            crate::feature::builtin::memory_lifecycle::MemoryLifecycleFeature::from_resolved_config(
+    let subjektiv_consolidation_plan =
+        crate::feature::builtin::memory::SubjektivConsolidationFeatureInstallPlan::prepare(
+            worker.manifest(),
+            worker.workspace_client_handle(),
+            worker.prompts().load_full(),
+        )?;
+    if let Some(plan) = subjektiv_consolidation_plan {
+        feature_prompt_contribution = Some((None, Some(plan.system_prompt_override)));
+        feature_registry.add_module(plan.module);
+    }
+    let ordinary_subjektiv_features_enabled =
+        crate::feature::builtin::memory::ordinary_subjektiv_features_enabled(worker.manifest());
+    if let Some(resident_summary_source) =
+        crate::feature::builtin::memory::ordinary_subjektiv_resident_summary_source(
+            worker.manifest(),
+            worker.workspace_client_handle(),
+        )?
+    {
+        feature_prompt_contribution = Some((Some(resident_summary_source), None));
+    }
+    if ordinary_subjektiv_features_enabled
+        && let Some(subjektiv_memory) =
+            crate::feature::builtin::subjektiv_memory::SubjektivMemoryFeature::from_resolved_config(
+                &worker.manifest().feature.subjektiv,
+                worker.committed_session_capture_handle(),
+                worker.workspace_client_handle(),
+            )?
+    {
+        feature_registry.add_module(subjektiv_memory);
+    }
+    if ordinary_subjektiv_features_enabled
+        && let Some(subjektiv_sessions) =
+            crate::feature::builtin::subjektiv_session::SubjektivSessionFeature::from_resolved_config(
+                &worker.manifest().feature.subjektiv,
+                worker.committed_session_capture_handle(),
+                worker.workspace_client_handle(),
+            )?
+    {
+        feature_registry.add_module(subjektiv_sessions);
+    }
+    if let Some(memory_lifecycle) =
+        crate::feature::builtin::memory_lifecycle::MemoryLifecycleFeature::from_resolved_config(
+            worker.manifest_lifecycle_features_enabled(),
+            memory_lifecycle_config,
+            worker.committed_session_capture_handle(),
+            worker.session_extension_handle(),
+            worker.workspace_client_handle(),
+            spawner_manifest.clone(),
+            worker.llm_client_handle(),
+            prompts.clone(),
+            spawner_workspace_context.clone(),
+            worker.working_event_sender(),
+        )?
+    {
+        feature_registry.add_module(memory_lifecycle);
+    }
+    if let Some(surface_lifecycle) = crate::feature::builtin::memory_surface_lifecycle::SubjektivSurfaceLifecycleFeature::from_manifest(
+        worker.manifest_lifecycle_features_enabled(),
+        worker.workspace_client_handle(),
+        spawner_manifest.clone(),
+        worker.llm_client_handle(),
+        prompts.clone(),
+        spawner_workspace_context.clone(),
+    )? {
+        feature_registry.add_module(surface_lifecycle);
+    }
+    if ordinary_subjektiv_features_enabled
+        && let Some(subjektiv_lifecycle) =
+            crate::feature::builtin::memory_lifecycle::SubjektivLifecycleFeature::from_resolved_config(
                 worker.manifest_lifecycle_features_enabled(),
-                memory_config,
+                worker.manifest().feature.subjektiv.clone(),
                 worker.committed_session_capture_handle(),
                 worker.session_extension_handle(),
                 worker.workspace_client_handle(),
@@ -1282,7 +1405,7 @@ where
                 worker.working_event_sender(),
             )?
     {
-        feature_registry.add_module(memory_lifecycle);
+        feature_registry.add_module(subjektiv_lifecycle);
     }
     if sub_worker_enabled && !worker_enabled {
         feature_registry.add_module(
@@ -1490,7 +1613,7 @@ where
             ),
         ));
     }
-    if let Some((resident_summary, system_prompt_override)) = memory_prompt_contribution {
+    if let Some((resident_summary, system_prompt_override)) = feature_prompt_contribution {
         worker.install_system_prompt_contribution(resident_summary, system_prompt_override);
     }
     worker.attach_tracker(tracker);
@@ -2443,6 +2566,12 @@ async fn controller_loop<C, St>(
                         }
                     }
                 };
+                publish_context_usage(
+                    &shared_state,
+                    &working_event_tx,
+                    Some(worker.total_tokens().tokens),
+                    protocol::ContextTokenSource::Estimated,
+                );
                 if !matches!(
                     result,
                     Err(WorkerError::Store(_))
@@ -2510,6 +2639,12 @@ async fn controller_loop<C, St>(
                     .await
                     {
                         worker.clear_in_flight_events();
+                        publish_context_usage(
+                            &shared_state,
+                            &working_event_tx,
+                            Some(worker.total_tokens().tokens),
+                            protocol::ContextTokenSource::Estimated,
+                        );
                         let snapshot = shared_state.transition(WorkerState::Idle);
                         let _ = working_event_tx.send(Event::WorkerState { snapshot });
                     }
@@ -3317,7 +3452,24 @@ fn model_supports_image_attachments(model: &manifest::ModelManifest) -> bool {
     })
 }
 
-fn build_greeting<C, St>(worker: &Worker<C, St>) -> protocol::Greeting
+fn public_reasoning_config(
+    reasoning: &agen::llm_client::capability::ReasoningControl,
+) -> protocol::ReasoningConfig {
+    match reasoning {
+        agen::llm_client::capability::ReasoningControl::Effort(effort) => {
+            protocol::ReasoningConfig::Effort {
+                effort: effort.as_str().to_owned(),
+            }
+        }
+        agen::llm_client::capability::ReasoningControl::BudgetTokens(budget_tokens) => {
+            protocol::ReasoningConfig::BudgetTokens {
+                budget_tokens: *budget_tokens,
+            }
+        }
+    }
+}
+
+pub(crate) fn build_greeting<C, St>(worker: &Worker<C, St>) -> protocol::Greeting
 where
     C: LlmClient + 'static,
     St: Store,
@@ -3360,6 +3512,7 @@ where
         .into_iter()
         .map(|def| def.name)
         .collect();
+    let context_tokens = worker.total_tokens().tokens;
     protocol::Greeting {
         worker_name: manifest.worker.name.clone(),
         cwd: worker
@@ -3368,10 +3521,19 @@ where
             .unwrap_or_default(),
         provider: provider_name,
         model: model_id,
+        reasoning: manifest
+            .engine
+            .reasoning
+            .as_ref()
+            .map(public_reasoning_config),
         scope_summary: worker.scope_snapshot().summary(),
         tools: tool_names,
         context_window,
-        context_tokens: worker.total_tokens().tokens,
+        context_tokens,
+        context_usage: Some(protocol::ContextUsage {
+            tokens: context_tokens,
+            source: protocol::ContextTokenSource::Estimated,
+        }),
     }
 }
 
@@ -3409,6 +3571,123 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio::net::UnixListener;
+
+    #[test]
+    fn runtime_session_head_is_materialized_after_feature_installation_before_exposure() {
+        let production = include_str!("controller.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .map(|(production, _)| production)
+            .expect("controller test module marker");
+        let startup = production
+            .split_once("async fn spawn_initialized")
+            .map(|(_, startup)| startup)
+            .expect("controller startup implementation");
+        let feature_install = startup
+            .find("let fs_for_view = register_worker_tools(")
+            .expect("feature installation call");
+        let materialize = startup
+            .find(".materialize_durable_session_head()")
+            .expect("runtime session-head materialization");
+        let exposure = startup
+            .find("let handle = WorkerHandle")
+            .expect("controller handle exposure");
+        let materialize_gate = startup[..materialize]
+            .rfind("if runtime_managed && worker.needs_initial_session_head_materialization() {")
+            .expect("fresh runtime-managed materialization gate");
+
+        assert!(feature_install < materialize_gate);
+        assert!(materialize_gate < materialize);
+        assert!(materialize < exposure);
+        assert!(
+            startup[materialize_gate..materialize]
+                .contains("needs_initial_session_head_materialization")
+        );
+    }
+
+    #[test]
+    fn public_reasoning_config_preserves_effort_and_signed_budget() {
+        let effort =
+            public_reasoning_config(&agen::llm_client::capability::ReasoningControl::Effort(
+                agen::llm_client::capability::ReasoningEffort::Other("provider-native".into()),
+            ));
+        assert_eq!(
+            effort,
+            protocol::ReasoningConfig::Effort {
+                effort: "provider-native".into(),
+            }
+        );
+
+        let budget = public_reasoning_config(
+            &agen::llm_client::capability::ReasoningControl::BudgetTokens(-1),
+        );
+        assert_eq!(
+            budget,
+            protocol::ReasoningConfig::BudgetTokens { budget_tokens: -1 }
+        );
+    }
+
+    #[test]
+    fn context_usage_publication_updates_reconnect_state_and_live_clients() {
+        let shared_state = Arc::new(WorkerSharedState::new(
+            "worker".into(),
+            session_store::new_segment_id(),
+            String::new(),
+            protocol::Greeting {
+                worker_name: "worker".into(),
+                cwd: "/tmp".into(),
+                provider: "provider".into(),
+                model: "model".into(),
+                reasoning: None,
+                scope_summary: String::new(),
+                tools: Vec::new(),
+                context_window: 100_000,
+                context_tokens: 0,
+                context_usage: None,
+            },
+        ));
+        let (events, mut receiver) = broadcast::channel(4);
+
+        publish_context_usage(
+            &shared_state,
+            &events,
+            Some(25_000),
+            protocol::ContextTokenSource::Estimated,
+        );
+
+        let expected = protocol::ContextUsage {
+            tokens: 25_000,
+            source: protocol::ContextTokenSource::Estimated,
+        };
+        assert_eq!(shared_state.greeting().context_usage, Some(expected));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::ContextUsage {
+                usage: Some(usage)
+            }) if usage == expected
+        ));
+    }
+
+    #[test]
+    fn legacy_and_subjektiv_lifecycles_are_mutually_exclusive() {
+        let mut memory = manifest::MemoryFeatureProfileConfig::default();
+        memory.enabled = true;
+        memory.extraction.enabled = true;
+        let mut subjektiv = manifest::SubjektivFeatureProfileConfig::default();
+        subjektiv.enabled = true;
+        subjektiv.extraction.enabled = true;
+
+        let error = validate_memory_lifecycle_targets(&memory, &subjektiv).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("cannot both be enabled"));
+
+        memory.extraction.enabled = false;
+        assert!(
+            validate_memory_lifecycle_targets(&memory, &subjektiv).is_err(),
+            "legacy consolidation still installs the legacy lifecycle"
+        );
+        memory.consolidation.request_enabled = false;
+        validate_memory_lifecycle_targets(&memory, &subjektiv).unwrap();
+    }
 
     #[test]
     fn no_controller_parent_notification_uses_durable_pending_authority() {
@@ -3551,6 +3830,8 @@ mod tests {
                 tools: Vec::new(),
                 context_window: 200_000,
                 context_tokens: 0,
+                reasoning: None,
+                context_usage: None,
             },
         ));
         let notify_buffer = NotifyBuffer::new();
@@ -3600,6 +3881,8 @@ mod tests {
                         tools: Vec::new(),
                         context_window: 200_000,
                         context_tokens: 0,
+                        reasoning: None,
+                        context_usage: None,
                     },
                     state: WorkerStatus::Idle.into(),
                     in_flight: Default::default(),
@@ -4308,6 +4591,8 @@ mod tests {
                 tools: Vec::new(),
                 context_window: 1,
                 context_tokens: 0,
+                reasoning: None,
+                context_usage: None,
             },
         );
         assert!(

@@ -12,7 +12,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::Event as WorkerProtocolEvent;
 
-pub const SUBSCRIPTION_PROTOCOL_VERSION: u16 = 1;
+pub const SUBSCRIPTION_PROTOCOL_VERSION: u16 = 2;
 /// Browser/runtime wire guardrails. These bounds are generated into the Workspace
 /// Browser validator so aggregate limits remain part of the Rust-owned contract.
 pub const MAX_SUBSCRIPTION_FRAME_JSON_BYTES: usize = 16 * 1024 * 1024;
@@ -426,7 +426,6 @@ pub enum SubscriptionResponse {
         request_id: SubscriptionRequestId,
         subscription_id: SubscriptionId,
         selector: EventSubscriptionSelector,
-        snapshot_revision: u64,
         snapshot: SubscriptionSnapshot,
     },
     Unsubscribed {
@@ -512,7 +511,6 @@ pub enum SubscriptionTerminationCode {
 pub enum SubscriptionEvent {
     Event {
         subscription_id: SubscriptionId,
-        subject_revision: u64,
         payload: SubscriptionEventPayload,
     },
     SubscriptionClosed {
@@ -666,9 +664,7 @@ pub struct SubscriptionWorker {
     /// `Unavailable` preserves catalog membership without claiming that execution stopped.
     #[serde(default)]
     pub availability: SubscriptionWorkerAvailability,
-    /// Producer-owned monotonic revision for this Worker subject.
-    pub subject_revision: u64,
-    /// Latest revisioned foreground state observed from the Worker. This remains
+    /// Latest foreground state observed from the Worker. This remains
     /// absent until an authoritative Worker snapshot/event has been applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_state: Option<crate::WorkerStateSnapshot>,
@@ -970,7 +966,6 @@ mod tests {
             runtime_id: None,
             resource_key: None,
             availability: SubscriptionWorkerAvailability::Observed,
-            subject_revision: 0,
             worker_state: None,
             state: SubscriptionWorkerState::Idle,
             has_running_internal_workers: false,
@@ -1093,7 +1088,7 @@ mod tests {
         assert_eq!(
             json,
             serde_json::json!({
-                "protocol_version": 1,
+                "protocol_version": 2,
                 "frame": "request",
                 "message": {
                     "method": "subscribe_events",
@@ -1119,7 +1114,6 @@ mod tests {
                 request_id: request_id(),
                 subscription_id: subscription_id(),
                 selector: EventSubscriptionSelector::RuntimeWorkers,
-                snapshot_revision: 7,
                 snapshot: SubscriptionSnapshot::Workers {
                     workers: vec![worker("worker-1")],
                 },
@@ -1158,10 +1152,10 @@ mod tests {
                 subscription_id: subscription_id(),
             },
         ));
-        frame.protocol_version = 2;
+        frame.protocol_version = 1;
         assert!(matches!(
             frame.validate(),
-            Err(SubscriptionValidationError::UnsupportedProtocolVersion { actual: 2 })
+            Err(SubscriptionValidationError::UnsupportedProtocolVersion { actual: 1 })
         ));
     }
 
@@ -1180,7 +1174,6 @@ mod tests {
 
         let event = SubscriptionEvent::Event {
             subscription_id: subscription_id(),
-            subject_revision: 8,
             payload: SubscriptionEventPayload::WorkerRemoved {
                 worker_id: worker_id("worker-2"),
                 runtime_id: None,
@@ -1211,7 +1204,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(frame).unwrap(),
             serde_json::json!({
-                "protocol_version": 1,
+                "protocol_version": 2,
                 "frame": "worker_protocol",
                 "message": {
                     "subscription_id": "subscription-1",
@@ -1253,7 +1246,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(frame).unwrap(),
             serde_json::json!({
-                "protocol_version": 1,
+                "protocol_version": 2,
                 "frame": "event",
                 "message": {
                     "event": "subscription_closed",

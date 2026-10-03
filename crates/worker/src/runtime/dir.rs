@@ -212,6 +212,8 @@ mod tests {
                 tools: Vec::new(),
                 context_window: 200_000,
                 context_tokens: 0,
+                reasoning: None,
+                context_usage: None,
             },
         )
     }

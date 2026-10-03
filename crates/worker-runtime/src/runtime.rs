@@ -77,6 +77,41 @@ impl RuntimeWorkspaceScope {
 }
 
 const SUBSCRIPTION_QUEUE_CAPACITY: usize = 256;
+
+#[cfg(feature = "fs-store")]
+fn session_public_source_unavailable(
+    source: &runtime_api::SessionPublicSource,
+    error: &RuntimeError,
+) -> Option<(runtime_api::SessionPublicUnavailableReason, &'static str)> {
+    use runtime_api::SessionPublicUnavailableReason as Reason;
+
+    match (source, error) {
+        (
+            runtime_api::SessionPublicSource::Retained { .. },
+            RuntimeError::WorkerNotFound { .. },
+        ) => Some((
+            Reason::RetentionMissing,
+            "retained Session storage is missing",
+        )),
+        (runtime_api::SessionPublicSource::Archived { .. }, RuntimeError::StoreMissing { .. }) => {
+            Some((
+                Reason::ArchiveIncomplete,
+                "committed Session archive is incomplete",
+            ))
+        }
+        (runtime_api::SessionPublicSource::Archived { .. }, RuntimeError::StoreCorrupt { .. }) => {
+            Some((
+                Reason::ArchiveIncomplete,
+                "committed Session archive failed integrity validation",
+            ))
+        }
+        (_, RuntimeError::StoreIo { .. } | RuntimeError::StoreCommitOutcomeUnknown { .. }) => {
+            Some((Reason::StorageUnavailable, "Session storage is unavailable"))
+        }
+        _ => None,
+    }
+}
+
 const WORKER_DELETE_FAILURE_DIAGNOSTIC_CODE: &str = "worker_delete_persistence_failed";
 const WORKER_DELETE_FAILURE_DIAGNOSTIC_MESSAGE: &str =
     "Worker metadata deletion failed; the persisted Worker identity was retained for retry";
@@ -151,7 +186,6 @@ impl RuntimeWorkerRestoreResult {
 
 #[derive(Clone, Debug)]
 pub struct RuntimeSubscriptionUpdate {
-    pub subject_revision: u64,
     pub payload: SubscriptionEventPayload,
 }
 
@@ -168,7 +202,6 @@ pub enum RuntimeSubscriptionRecvError {
 pub struct RuntimeEventSelectorSubscription {
     subscription_id: u64,
     selector: EventSubscriptionSelector,
-    snapshot_revision: u64,
     snapshot: SubscriptionSnapshot,
     receiver: mpsc::Receiver<RuntimeSubscriptionUpdate>,
     lagged: Arc<AtomicBool>,
@@ -178,10 +211,6 @@ pub struct RuntimeEventSelectorSubscription {
 impl RuntimeEventSelectorSubscription {
     pub fn selector(&self) -> &EventSubscriptionSelector {
         &self.selector
-    }
-
-    pub fn snapshot_revision(&self) -> u64 {
-        self.snapshot_revision
     }
 
     pub fn snapshot(&self) -> &SubscriptionSnapshot {
@@ -1280,7 +1309,6 @@ impl Runtime {
             state.persist_runtime_snapshot()?;
         }
         let snapshot = state.subscription_snapshot(scope, &selector)?;
-        let snapshot_revision = state.subscription_revision;
         let subscription_id = state.next_event_subscription_id;
         state.next_event_subscription_id = state.next_event_subscription_id.saturating_add(1);
         let (sender, receiver) = mpsc::channel(SUBSCRIPTION_QUEUE_CAPACITY);
@@ -1298,7 +1326,6 @@ impl Runtime {
         Ok(RuntimeEventSelectorSubscription {
             subscription_id,
             selector,
-            snapshot_revision,
             snapshot,
             receiver,
             lagged,
@@ -2217,9 +2244,9 @@ impl Runtime {
         if let Some(payload) = input_protocol_event(&input) {
             state.push_worker_observation_event(worker_ref.clone(), payload);
         }
-        state.publish_worker_upsert(worker_ref.worker_id)?;
         state.persist_runtime_snapshot()?;
         state.persist_worker(&worker_ref.worker_id)?;
+        state.publish_worker_upsert(worker_ref.worker_id)?;
 
         Ok(WorkerInteractionAck {
             worker_ref: worker_ref.clone(),
@@ -2500,9 +2527,9 @@ impl Runtime {
             worker.workdir_attachments = workdir_attachments;
             worker.detail()
         };
-        state.publish_worker_upsert(worker_ref.worker_id)?;
         state.persist_runtime_snapshot()?;
         state.persist_worker(&worker_ref.worker_id)?;
+        state.publish_worker_upsert(worker_ref.worker_id)?;
         Ok(detail)
     }
 
@@ -2541,8 +2568,8 @@ impl Runtime {
             state
                 .observation_events
                 .retain(|event| event.worker_ref != *worker_ref);
-            state.publish_worker_removed(worker_ref.worker_id, workspace_id.as_deref())?;
             state.persist_runtime_snapshot()?;
+            state.publish_worker_removed(worker_ref.worker_id, workspace_id.as_deref())?;
         }
         Ok(())
     }
@@ -2564,9 +2591,9 @@ impl Runtime {
         let mut state = self.lock()?;
         let worker = state.worker_mut(worker_ref)?;
         worker.apply_worker_state(&snapshot);
-        state.publish_worker_upsert(worker_ref.worker_id)?;
         state.persist_runtime_snapshot()?;
         state.persist_worker(&worker_ref.worker_id)?;
+        state.publish_worker_upsert(worker_ref.worker_id)?;
         Ok(())
     }
 
@@ -2870,8 +2897,8 @@ impl Runtime {
         state
             .observation_events
             .retain(|event| event.worker_ref != *worker_ref);
-        state.publish_worker_removed(worker_ref.worker_id, removed_workspace_id.as_deref())?;
         state.persist_runtime_snapshot()?;
+        state.publish_worker_removed(worker_ref.worker_id, removed_workspace_id.as_deref())?;
         Ok(WorkerDeleteResult {
             worker_id: removed.worker_id,
             deleted: true,
@@ -2959,12 +2986,12 @@ impl Runtime {
         let worker_state_changed =
             state.project_protocol_event_to_worker_state(worker_ref, &payload);
         let activity_changed = state.project_internal_worker_activity(worker_ref, &payload);
-        if worker_state_changed || activity_changed {
-            state.publish_worker_upsert(worker_ref.worker_id)?;
-        }
         if worker_state_changed {
             state.persist_runtime_snapshot()?;
             state.persist_worker(&worker_ref.worker_id)?;
+        }
+        if worker_state_changed || activity_changed {
+            state.publish_worker_upsert(worker_ref.worker_id)?;
         }
         let event = state.push_worker_observation_event(worker_ref.clone(), payload);
         Ok(event)
@@ -3021,12 +3048,12 @@ impl Runtime {
                     state.project_protocol_event_to_worker_state(&worker_ref, &payload);
                 let activity_changed =
                     state.project_internal_worker_activity(&worker_ref, &payload);
-                if worker_state_changed || activity_changed {
-                    state.publish_worker_upsert(worker_ref.worker_id)?;
-                }
                 if worker_state_changed {
                     state.persist_runtime_snapshot()?;
                     state.persist_worker(&worker_ref.worker_id)?;
+                }
+                if worker_state_changed || activity_changed {
+                    state.publish_worker_upsert(worker_ref.worker_id)?;
                 }
                 Ok(state.push_worker_observation_event(worker_ref, payload))
             }),
@@ -3054,12 +3081,12 @@ impl Runtime {
                     state.project_protocol_event_to_worker_state(&worker_ref, &payload);
                 let activity_changed =
                     state.project_internal_worker_activity(&worker_ref, &payload);
-                if worker_state_changed || activity_changed {
-                    state.publish_worker_upsert(worker_ref.worker_id)?;
-                }
                 if worker_state_changed {
                     state.persist_runtime_snapshot()?;
                     state.persist_worker(&worker_ref.worker_id)?;
+                }
+                if worker_state_changed || activity_changed {
+                    state.publish_worker_upsert(worker_ref.worker_id)?;
                 }
                 Ok(state.push_worker_observation_event(worker_ref, payload))
             }),
@@ -3454,8 +3481,8 @@ impl Runtime {
             logical_workdir_attachments_from_statuses(&workdir_attachments, claims);
         candidate.workdir_attachments = workdir_attachments;
         state.workers.insert(worker_ref.worker_id, candidate);
-        state.publish_worker_upsert(worker_ref.worker_id)?;
         state.persist_worker(&worker_ref.worker_id)?;
+        state.publish_worker_upsert(worker_ref.worker_id)?;
         Ok(())
     }
 
@@ -3549,6 +3576,123 @@ impl Runtime {
             runtime_id,
             worker.worker_id,
         )
+    }
+
+    /// Search the committed public projection of one Backend-selected retained
+    /// Session or verified archive without restoring a Worker.
+    #[cfg(feature = "fs-store")]
+    pub fn session_public_search_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        request: &runtime_api::SessionPublicSearchRequest,
+    ) -> Result<runtime_api::SessionPublicSearchAvailability, RuntimeError> {
+        let (session_root, archive) =
+            match self.resolve_session_public_source(scope, &request.source) {
+                Ok(source) => source,
+                Err(error) => {
+                    if let Some((reason, message)) =
+                        session_public_source_unavailable(&request.source, &error)
+                    {
+                        return Ok(runtime_api::SessionPublicSearchAvailability::Unavailable {
+                            reason,
+                            message: message.to_string(),
+                        });
+                    }
+                    return Err(error);
+                }
+            };
+        Ok(crate::session_public::search(
+            &session_root,
+            request,
+            archive.as_ref(),
+        ))
+    }
+
+    /// Read one exact public entry from a Backend-selected retained Session or
+    /// verified archive. No fallback Worker, Segment, or entry is selected.
+    #[cfg(feature = "fs-store")]
+    pub fn session_public_read_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        request: &runtime_api::SessionPublicReadRequest,
+    ) -> Result<runtime_api::SessionPublicReadAvailability, RuntimeError> {
+        let (session_root, archive) =
+            match self.resolve_session_public_source(scope, &request.source) {
+                Ok(source) => source,
+                Err(error) => {
+                    if let Some((reason, message)) =
+                        session_public_source_unavailable(&request.source, &error)
+                    {
+                        return Ok(runtime_api::SessionPublicReadAvailability::Unavailable {
+                            reason,
+                            message: message.to_string(),
+                        });
+                    }
+                    return Err(error);
+                }
+            };
+        Ok(crate::session_public::read(
+            &session_root,
+            request,
+            archive.as_ref(),
+        ))
+    }
+
+    #[cfg(feature = "fs-store")]
+    fn resolve_session_public_source(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        source: &runtime_api::SessionPublicSource,
+    ) -> Result<
+        (
+            std::path::PathBuf,
+            Option<crate::retention::WorkerSessionArchiveManifest>,
+        ),
+        RuntimeError,
+    > {
+        let state = self.lock()?;
+        let store = state.fs_store().ok_or_else(|| {
+            RuntimeError::InvalidRequest(
+                "Session public reads require an fs-backed Runtime".to_string(),
+            )
+        })?;
+        match source {
+            runtime_api::SessionPublicSource::Retained { worker_id } => {
+                let worker_ref = WorkerRef::new(*worker_id);
+                let worker = state.worker(&worker_ref)?;
+                if worker.workspace_id.as_deref() != Some(scope.workspace_id.as_str()) {
+                    return Err(RuntimeError::WorkerNotFound {
+                        worker_id: *worker_id,
+                    });
+                }
+                Ok((
+                    store
+                        .runtime_dir()
+                        .join("workers")
+                        .join(worker_id.to_string())
+                        .join("session"),
+                    None,
+                ))
+            }
+            runtime_api::SessionPublicSource::Archived { archive_id } => {
+                let runtime_id = state.runtime_identity.as_deref().ok_or_else(|| {
+                    RuntimeError::InvalidRequest(
+                        "Runtime identity is not bound for Session archive reads".to_string(),
+                    )
+                })?;
+                let provider = FsWorkerRetentionProvider::new(store.runtime_dir());
+                let (manifest, session_root) = provider.session_archive(archive_id)?;
+                if manifest.workspace_id != scope.workspace_id
+                    || manifest.source_runtime_id != runtime_id
+                {
+                    return Err(RuntimeError::InvalidRequest(
+                        "Session archive scope does not match the authenticated Runtime capability"
+                            .to_string(),
+                    ));
+                }
+                Ok((session_root, Some(manifest)))
+            }
+        }
     }
 
     /// Enumerate host-authoritative Runtime inventory for Backend orphan
@@ -3702,8 +3846,6 @@ struct RuntimeState {
     workspace_config_latest: BTreeMap<String, ConfigBundleRef>,
     workspace_config_fetch_gates: BTreeMap<String, Arc<Mutex<()>>>,
     diagnostics: Vec<RuntimeDiagnostic>,
-    subscription_revision: u64,
-    worker_subject_revisions: BTreeMap<WorkerId, u64>,
     next_event_subscription_id: u64,
     subscriptions: BTreeMap<u64, SubscriptionSink>,
     #[cfg(feature = "ws-server")]
@@ -3733,8 +3875,6 @@ impl RuntimeState {
             workspace_config_latest: BTreeMap::new(),
             workspace_config_fetch_gates: BTreeMap::new(),
             diagnostics: Vec::new(),
-            subscription_revision: 0,
-            worker_subject_revisions: BTreeMap::new(),
             next_event_subscription_id: 1,
             subscriptions: BTreeMap::new(),
             #[cfg(feature = "ws-server")]
@@ -3765,8 +3905,6 @@ impl RuntimeState {
             workspace_config_latest: BTreeMap::new(),
             workspace_config_fetch_gates: BTreeMap::new(),
             diagnostics: Vec::new(),
-            subscription_revision: 0,
-            worker_subject_revisions: BTreeMap::new(),
             next_event_subscription_id: 1,
             subscriptions: BTreeMap::new(),
             #[cfg(feature = "ws-server")]
@@ -3895,8 +4033,6 @@ impl RuntimeState {
             workspace_config_fetch_gates: BTreeMap::new(),
             workspace_owners: persisted.workspace_owners,
             diagnostics,
-            subscription_revision: 0,
-            worker_subject_revisions: BTreeMap::new(),
             next_event_subscription_id: 1,
             subscriptions: BTreeMap::new(),
             #[cfg(feature = "ws-server")]
@@ -4215,11 +4351,6 @@ impl RuntimeState {
             runtime_id: None,
             resource_key: None,
             availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
-            subject_revision: self
-                .worker_subject_revisions
-                .get(&worker.worker_id)
-                .copied()
-                .unwrap_or(0),
             worker_state: worker.worker_state.clone(),
             state: subscription_worker_state(worker.status),
             has_running_internal_workers: worker.internal_workers.has_running_worker(),
@@ -4232,25 +4363,17 @@ impl RuntimeState {
     }
 
     fn publish_worker_upsert(&mut self, worker_id: WorkerId) -> Result<(), RuntimeError> {
-        self.subscription_revision = self.subscription_revision.saturating_add(1);
-        let subject_revision = {
-            let revision = self.worker_subject_revisions.entry(worker_id).or_insert(0);
-            *revision = revision.saturating_add(1);
-            *revision
-        };
         let worker = self
             .workers
             .get(&worker_id)
             .ok_or(RuntimeError::WorkerNotFound { worker_id })?;
         let workspace_id = worker.workspace_id.clone();
-        let mut projected = self.subscription_worker(worker)?;
-        projected.subject_revision = subject_revision;
+        let projected = self.subscription_worker(worker)?;
         let projected_worker_id = projected.worker_id.clone();
         self.deliver_worker_subscription_update(
             &projected_worker_id,
             workspace_id.as_deref(),
             RuntimeSubscriptionUpdate {
-                subject_revision,
                 payload: SubscriptionEventPayload::WorkerUpserted { worker: projected },
             },
         );
@@ -4262,19 +4385,12 @@ impl RuntimeState {
         worker_id: WorkerId,
         workspace_id: Option<&str>,
     ) -> Result<(), RuntimeError> {
-        self.subscription_revision = self.subscription_revision.saturating_add(1);
-        let subject_revision = {
-            let revision = self.worker_subject_revisions.entry(worker_id).or_insert(0);
-            *revision = revision.saturating_add(1);
-            *revision
-        };
         let worker_id = SubscriptionWorkerId::new(worker_id.to_string())
             .map_err(subscription_validation_error)?;
         self.deliver_worker_subscription_update(
             &worker_id,
             workspace_id,
             RuntimeSubscriptionUpdate {
-                subject_revision,
                 payload: SubscriptionEventPayload::WorkerRemoved {
                     worker_id: worker_id.clone(),
                     runtime_id: None,
@@ -4417,8 +4533,8 @@ impl RuntimeState {
             worker_ref: Some(worker_ref.clone()),
         });
         self.workers.insert(worker_ref.worker_id, candidate);
-        self.publish_worker_upsert(worker_ref.worker_id)?;
         self.persist_runtime_snapshot()?;
+        self.publish_worker_upsert(worker_ref.worker_id)?;
         Ok(())
     }
 
@@ -5520,6 +5636,7 @@ mod tests {
             worker,
             revision,
             status,
+            greeting: None,
             session: protocol::SessionSnapshot {
                 pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                 entries: Vec::new(),
@@ -5545,6 +5662,8 @@ mod tests {
                 tools: Vec::new(),
                 context_window: 0,
                 context_tokens: 0,
+                reasoning: None,
+                context_usage: None,
             },
             state: protocol::WorkerStatus::Idle.into(),
             in_flight: protocol::InFlightSnapshot::default(),
@@ -5883,6 +6002,7 @@ mod tests {
                 settings_revision: 1,
                 language: "English".to_string(),
             }),
+            subjektiv_attached: false,
         }
     }
 
@@ -6647,7 +6767,6 @@ mod tests {
         let mut subscription = runtime
             .subscribe_event_selector(EventSubscriptionSelector::RuntimeWorkers)
             .unwrap();
-        assert_eq!(subscription.snapshot_revision(), 0);
         let SubscriptionSnapshot::Workers { workers } = subscription.snapshot() else {
             panic!("runtime_workers must return a Worker snapshot");
         };
@@ -6655,11 +6774,9 @@ mod tests {
 
         let created = runtime.create_worker(task_request("live")).unwrap();
         let update = receive_subscription_update(&mut subscription).unwrap();
-        assert_eq!(update.subject_revision, 1);
         match update.payload {
             SubscriptionEventPayload::WorkerUpserted { worker } => {
                 assert_eq!(worker.worker_id.as_str(), created.worker_id.to_string());
-                assert_eq!(worker.subject_revision, 1);
                 assert_eq!(worker.state, SubscriptionWorkerState::Idle);
             }
             payload => panic!("unexpected subscription payload: {payload:?}"),
@@ -6676,7 +6793,6 @@ mod tests {
             )
             .unwrap();
         let update = receive_subscription_update(&mut subscription).unwrap();
-        assert_eq!(update.subject_revision, 2);
         match update.payload {
             SubscriptionEventPayload::WorkerUpserted { worker } => {
                 assert_eq!(worker.state, SubscriptionWorkerState::Idle);
@@ -6695,7 +6811,6 @@ mod tests {
             )
             .unwrap();
         let update = receive_subscription_update(&mut subscription).unwrap();
-        assert_eq!(update.subject_revision, 3);
         match update.payload {
             SubscriptionEventPayload::WorkerUpserted { worker } => {
                 assert_eq!(worker.state, SubscriptionWorkerState::Idle);
@@ -6737,7 +6852,6 @@ mod tests {
             )
             .unwrap();
         let update = receive_subscription_update(&mut subscription).unwrap();
-        assert_eq!(update.subject_revision, 4);
         match update.payload {
             SubscriptionEventPayload::WorkerUpserted { worker } => {
                 assert_eq!(worker.state, SubscriptionWorkerState::Idle);
@@ -6748,7 +6862,6 @@ mod tests {
 
         runtime.stop_worker(&created.worker_ref, None).unwrap();
         let update = receive_subscription_update(&mut subscription).unwrap();
-        assert_eq!(update.subject_revision, 5);
         match update.payload {
             SubscriptionEventPayload::WorkerUpserted { worker } => {
                 assert_eq!(worker.worker_id.as_str(), created.worker_id.to_string());
@@ -6758,6 +6871,87 @@ mod tests {
             payload => panic!("unexpected subscription payload: {payload:?}"),
         }
         runtime.stop_runtime().unwrap();
+    }
+
+    #[test]
+    fn concurrent_snapshot_and_worker_creation_cross_the_boundary_exactly_once() {
+        let runtime = runtime_with_backend();
+        let barrier = Arc::new(Barrier::new(2));
+        let subscribing_runtime = runtime.clone();
+        let subscribing_barrier = barrier.clone();
+        let subscriber = std::thread::spawn(move || {
+            subscribing_barrier.wait();
+            subscribing_runtime
+                .subscribe_event_selector(EventSubscriptionSelector::RuntimeWorkers)
+                .unwrap()
+        });
+        let creating_runtime = runtime.clone();
+        let creating_barrier = barrier.clone();
+        let creator = std::thread::spawn(move || {
+            creating_barrier.wait();
+            creating_runtime
+                .create_worker(task_request("concurrent-boundary"))
+                .unwrap()
+        });
+
+        let mut subscription = subscriber.join().unwrap();
+        let created = creator.join().unwrap();
+        let SubscriptionSnapshot::Workers { workers } = subscription.snapshot() else {
+            panic!("runtime_workers must return a Worker snapshot");
+        };
+        let in_snapshot = workers
+            .iter()
+            .any(|worker| worker.worker_id.as_str() == created.worker_id.to_string());
+        let in_event = match subscription.receiver.try_recv() {
+            Ok(RuntimeSubscriptionUpdate {
+                payload: SubscriptionEventPayload::WorkerUpserted { worker },
+            }) => worker.worker_id.as_str() == created.worker_id.to_string(),
+            Ok(update) => panic!("unexpected subscription update: {update:?}"),
+            Err(mpsc::error::TryRecvError::Empty) => false,
+            Err(error) => panic!("unexpected subscription receive error: {error}"),
+        };
+        assert_ne!(
+            in_snapshot, in_event,
+            "the concurrent creation must appear in the snapshot or its ordered suffix, never both"
+        );
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn restarted_runtime_subscription_starts_from_persisted_authoritative_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let options = crate::fs_store::FsRuntimeStoreOptions {
+            root: root.path().join("runtime"),
+            runtime_id: "subscription-restart".to_string(),
+            display_name: None,
+        };
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            options.clone(),
+            Arc::new(TestExecutionBackend::default()),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("persisted-subscription-worker"))
+            .unwrap();
+        drop(runtime);
+
+        let restarted = Runtime::with_fs_store_and_execution_backend(
+            options,
+            Arc::new(TestExecutionBackend::default()),
+        )
+        .unwrap();
+        let subscription = restarted
+            .subscribe_event_selector(EventSubscriptionSelector::RuntimeWorkers)
+            .unwrap();
+        let SubscriptionSnapshot::Workers { workers } = subscription.snapshot() else {
+            panic!("runtime_workers must return a Worker snapshot");
+        };
+        assert!(workers.iter().any(|candidate| {
+            candidate.worker_id.as_str() == worker.worker_id.to_string()
+                && candidate.availability
+                    == protocol::subscription::SubscriptionWorkerAvailability::Observed
+        }));
     }
 
     #[test]
@@ -8108,6 +8302,8 @@ mod tests {
                     tools: Vec::new(),
                     context_window: 128,
                     context_tokens: 64,
+                    reasoning: None,
+                    context_usage: None,
                 },
                 state: protocol::WorkerStatus::Running.into(),
                 in_flight: protocol::InFlightSnapshot {

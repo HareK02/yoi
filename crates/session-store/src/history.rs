@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::LoggedItem;
 
-/// Stable logical identity of one model-visible history entry.
+/// Stable logical identity of one durable public Session entry.
+///
+/// Model-visible history entries and typed Run transitions share this identity
+/// space so every projection can reconcile the same committed record.
 ///
 /// This value is generated at the trusted Worker session boundary and copied
 /// unchanged across fork, rewind, compaction retention, restore, and reboot.

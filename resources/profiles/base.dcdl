@@ -26,16 +26,15 @@ compaction = {
 
 feature = {
     task = { enabled = true; };
-    memory = {
+    memory = { enabled = false; staging_tools = false; };
+    subjektiv = {
         enabled = true;
-        resident = { inject_summary = true; };
         extraction = {
             enabled = true;
             model = { ref = "codex-oauth/gpt-5.6-luna"; };
             reasoning = "medium";
             threshold = 50000;
         };
-        consolidation = { request_enabled = true; };
     };
     web = { enabled = true; };
     image = { enabled = true; };

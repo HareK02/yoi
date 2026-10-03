@@ -356,6 +356,26 @@ impl FsWorkerRetentionProvider {
             .join(archive_id))
     }
 
+    pub(crate) fn session_archive(
+        &self,
+        archive_id: &str,
+    ) -> Result<(WorkerSessionArchiveManifest, PathBuf), RuntimeError> {
+        let archive_dir = self.archive_dir(archive_id)?;
+        let manifest: WorkerSessionArchiveManifest = read_json(
+            &archive_dir.join("manifest.json"),
+            "read Worker Session archive",
+        )?;
+        if manifest.schema_version != ARCHIVE_SCHEMA_VERSION || manifest.archive_id != archive_id {
+            return Err(RuntimeError::StoreCorrupt {
+                operation: "read Worker Session archive",
+                path: archive_dir.join("manifest.json"),
+                message: "archive manifest identity mismatch".to_string(),
+            });
+        }
+        let manifest = validate_existing_archive(&archive_dir, &manifest)?;
+        Ok((manifest, archive_dir.join("session")))
+    }
+
     fn diagnostics_dir(&self, operation_id: &str) -> Result<PathBuf, RuntimeError> {
         validate_id("operation_id", operation_id)?;
         Ok(self

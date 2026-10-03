@@ -51,6 +51,7 @@ webauthn-rs = { workspace = true }
 
 [dev-dependencies]
 agen.workspace = true
+session-store.workspace = true
 tempfile.workspace = true
 tools.workspace = true
 yoi = { path = "../yoi" }

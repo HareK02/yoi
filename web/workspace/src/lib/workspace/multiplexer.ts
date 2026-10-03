@@ -138,7 +138,7 @@ export class WorkspaceMultiplexer {
     subscription.requestId = requestId;
     this.#requests.set(requestId, subscription.clientId);
     this.#send({
-      protocol_version: 1,
+      protocol_version: 2,
       frame: 'request',
       message: {
         method: 'subscribe_events',
@@ -213,7 +213,7 @@ export class WorkspaceMultiplexer {
     const subscription = this.#subscriptions.get(clientId);
     if (!subscription?.subscriptionId) throw new Error('Worker protocol subscription is not open');
     this.#send({
-      protocol_version: 1,
+      protocol_version: 2,
       frame: 'worker_protocol',
       message: { subscription_id: subscription.subscriptionId, method },
     });
@@ -225,7 +225,7 @@ export class WorkspaceMultiplexer {
     this.#subscriptions.delete(clientId);
     if (subscription.subscriptionId && this.#socket?.readyState === WebSocket.OPEN) {
       this.#send({
-        protocol_version: 1,
+        protocol_version: 2,
         frame: 'request',
         message: {
           method: 'unsubscribe_events',

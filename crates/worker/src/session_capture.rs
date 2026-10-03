@@ -4,6 +4,7 @@
 //! assigns append-stable `SessionEntryRef` values, and provides sparse overview, bounded
 //! range/search, read, and generic evidence projections without granting mutation authority.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::session_history::{SessionHistoryMetadata, WorkerHistoryProvenance};
@@ -205,6 +206,14 @@ pub(crate) struct ReadEntry {
 pub(crate) struct ReadResult {
     pub entries: Vec<ReadEntry>,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CommittedToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub arguments: String,
+    pub evidence: SessionEntryEvidence,
 }
 
 #[derive(Debug, Clone)]
@@ -598,6 +607,76 @@ impl SessionCapture {
         }
 
         ReadResult { entries, truncated }
+    }
+
+    /// Resolves the committed tool-call input for a provider call id. This is
+    /// used by explicit-memory receipts only after the containing run is durable,
+    /// so a model-authored claim can cite its own committed tool invocation
+    /// without inventing a SessionEntryRef.
+    pub(crate) fn evidence_for_tool_call(&self, call_id: &str) -> Option<SessionEntryEvidence> {
+        let entry_index = self.entries.iter().position(|entry| {
+            matches!(
+                &entry.item,
+                Item::ToolCall {
+                    call_id: stored_call_id,
+                    ..
+                } if stored_call_id == call_id
+            )
+        })?;
+        let reference = self.index.iter().find(|entry| {
+            entry.entry_range[0] == entry_index as u64
+                && entry.kind == ReferenceKind::Tool
+                && entry.tool_part == Some(ToolPart::Input)
+        })?;
+        self.evidence_for(reference.id.as_str())
+    }
+
+    pub(crate) fn committed_pending_tool_calls(&self, names: &[&str]) -> Vec<CommittedToolCall> {
+        let pending_call_ids = self
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                let Item::ToolResult {
+                    call_id,
+                    content: Some(content),
+                    is_error: false,
+                    ..
+                } = &entry.item
+                else {
+                    return None;
+                };
+                (serde_json::from_str::<serde_json::Value>(content)
+                    .ok()
+                    .and_then(|value| value.get("status").cloned())
+                    .as_ref()
+                    .and_then(serde_json::Value::as_str)
+                    == Some("pending_commit"))
+                .then_some(call_id.as_str())
+            })
+            .collect::<HashSet<_>>();
+        self.entries
+            .iter()
+            .filter_map(|entry| {
+                let Item::ToolCall {
+                    call_id,
+                    name,
+                    arguments,
+                    ..
+                } = &entry.item
+                else {
+                    return None;
+                };
+                if !names.contains(&name.as_str()) || !pending_call_ids.contains(call_id.as_str()) {
+                    return None;
+                }
+                Some(CommittedToolCall {
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                    evidence: self.evidence_for_tool_call(call_id)?,
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn evidence_for(&self, id: &str) -> Option<SessionEntryEvidence> {
@@ -1027,5 +1106,21 @@ mod tests {
         assert_eq!(source.segment_id, "segment-1");
         assert_eq!(source.entry_range, [0, 0]);
         assert_eq!(source.entry_ref.as_str(), "E00000000");
+    }
+
+    #[test]
+    fn committed_tool_call_can_be_resolved_by_provider_call_id() {
+        let view = SessionCapture::new(
+            "segment-1",
+            vec![Item::tool_call(
+                "call-remember",
+                "SubjektivMemoryRemember",
+                r#"{"claim":"remember this"}"#,
+            )],
+        );
+        let evidence = view.evidence_for_tool_call("call-remember").unwrap();
+        assert_eq!(evidence.entry_ref.as_str(), "E00000000");
+        assert_eq!(evidence.tool_part, Some(ToolPart::Input));
+        assert!(view.evidence_for_tool_call("missing").is_none());
     }
 }

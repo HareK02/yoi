@@ -1,5 +1,6 @@
 import type {
   Event,
+  InFlightBlock,
   SessionSnapshotEntry,
   WorkerStateSnapshot,
   WorkerStatus,
@@ -175,6 +176,127 @@ function snapshotEvent(cwd: string, entries: unknown[] = []): Event {
     },
   };
 }
+
+type SnapshotEvent = Extract<Event, { event: "snapshot" }>;
+
+function snapshotWithInFlight(
+  blocks: InFlightBlock[],
+  entries: unknown[] = [],
+): SnapshotEvent {
+  const snapshot = snapshotEvent("/repo", entries) as SnapshotEvent;
+  snapshot.data.in_flight = { blocks };
+  return snapshot;
+}
+
+function semanticOutput(lines: readonly ConsoleLine[]) {
+  return lines.map((line) => ({
+    kind: line.kind,
+    title: line.title,
+    body: line.body,
+    streaming: line.streaming,
+    entryId: line.entryId,
+    toolCall: line.toolCall
+      ? {
+        id: line.toolCall.id,
+        name: line.toolCall.name,
+        argsStream: line.toolCall.argsStream,
+        arguments: line.toolCall.arguments,
+        state: line.toolCall.state,
+        summary: line.toolCall.summary,
+        output: line.toolCall.output,
+        isError: line.toolCall.isError,
+      }
+      : undefined,
+  }));
+}
+
+Deno.test("snapshot and usage keep current context separate from run traffic", () => {
+  const snapshot = snapshotEvent("/repo") as SnapshotEvent;
+  snapshot.data.greeting.model = "gpt-6-astra";
+  snapshot.data.greeting.reasoning = { kind: "effort", effort: "high" };
+  snapshot.data.greeting.context_window = 272_000;
+  snapshot.data.greeting.context_tokens = 1;
+  snapshot.data.greeting.context_usage = { tokens: 142_000, source: "estimated" };
+  const projection = projectConsole([
+    { eventId: "snapshot", event: snapshot, observedAtMs: 1 },
+    { eventId: "usage", event: { event: "usage", data: {
+      input_tokens: 150_000,
+      cache_read_input_tokens: 140_000,
+      output_tokens: 2_000,
+    } }, observedAtMs: 2 },
+    { eventId: "context", event: { event: "context_usage", data: {
+      usage: { tokens: 158_000, source: "estimated" },
+    } }, observedAtMs: 3 },
+  ]);
+
+  assertEquals(projection.workerMetadata, {
+    model: "gpt-6-astra",
+    reasoning: { kind: "effort", effort: "high" },
+    contextWindow: 272_000,
+    contextTokens: 158_000,
+    contextSource: "estimated",
+  });
+  assertEquals(projection.runActivity.uploadTokens, 10_000);
+  assertEquals(projection.runActivity.outputTokens, 2_000);
+});
+
+Deno.test("snapshot metadata supports budget reasoning and legacy context fallback", () => {
+  const snapshot = snapshotEvent("/repo") as SnapshotEvent;
+  snapshot.data.greeting.reasoning = { kind: "budget_tokens", budget_tokens: 16_384 };
+  delete snapshot.data.greeting.context_usage;
+  const projection = projectConsole([{ eventId: "snapshot", event: snapshot }]);
+
+  assertEquals(projection.workerMetadata, {
+    model: "model",
+    reasoning: { kind: "budget_tokens", budget_tokens: 16_384 },
+    contextWindow: 100,
+    contextTokens: 20,
+    contextSource: "estimated",
+  });
+});
+
+Deno.test("unknown and destructive boundaries never fabricate context percentages", () => {
+  const retained = snapshotEvent("") as SnapshotEvent;
+  retained.data.greeting.model = "";
+  retained.data.greeting.context_window = 0;
+  retained.data.greeting.context_tokens = 0;
+  delete retained.data.greeting.context_usage;
+  let projection = projectConsole([{ eventId: "retained", event: retained }]);
+  assertEquals(projection.workerMetadata, {
+    model: null,
+    reasoning: null,
+    contextWindow: null,
+    contextTokens: null,
+    contextSource: null,
+  });
+
+  const live = snapshotEvent("/repo") as SnapshotEvent;
+  live.data.greeting.context_usage = { tokens: 20, source: "measured" };
+  projection = projectConsole([
+    { eventId: "live", event: live },
+    { eventId: "rewind", event: { event: "rewind_applied", data: {
+      session: canonicalSession([]),
+      input: [],
+      summary: { truncated_to_entries: 0, discarded_entries: 1, tool_side_effect_warning: false },
+    } } },
+  ]);
+  assertEquals(projection.workerMetadata?.contextTokens, null);
+  assertEquals(projection.workerMetadata?.contextSource, null);
+
+  projection = projectConsole([
+    { eventId: "live", event: live },
+    { eventId: "rewind", event: { event: "rewind_applied", data: {
+      session: canonicalSession([]),
+      input: [],
+      summary: { truncated_to_entries: 0, discarded_entries: 1, tool_side_effect_warning: false },
+    } } },
+    { eventId: "post-rewind-context", event: { event: "context_usage", data: {
+      usage: { tokens: 12, source: "estimated" },
+    } } },
+  ]);
+  assertEquals(projection.workerMetadata?.contextTokens, 12);
+  assertEquals(projection.workerMetadata?.contextSource, "estimated");
+});
 
 Deno.test("large paste segments project compact artifact metadata", () => {
   const body = "secret pasted body";
@@ -2334,8 +2456,270 @@ Deno.test("projectConsole renders snapshot entries and in-flight output", () => 
       "user:new user:false",
       "assistant:assistant reply:false",
       "tool:Read(1 file)\n  /tmp/a.md:false",
-      "in_flight:partial:true",
+      "assistant:partial:true",
     ],
+  );
+});
+
+Deno.test("snapshot text blocks match live prefixes, suffixes, and ordered commits", () => {
+  const committedPrefix = [{
+    kind: "user_input",
+    segments: [{ kind: "text", content: "question" }],
+  }];
+  const livePrefix: ConsoleEventInput[] = [
+    { eventId: "live-base", event: snapshotEvent("/repo", committedPrefix) },
+    {
+      eventId: "live-first-delta",
+      event: { event: "text_delta", data: { text: "first draft" } },
+    },
+    {
+      eventId: "live-first-done",
+      event: { event: "text_done", data: { text: "first draft" } },
+    },
+    {
+      eventId: "live-second-delta",
+      event: { event: "text_delta", data: { text: "**hel" } },
+    },
+  ];
+  const restoredPrefix: ConsoleEventInput[] = [{
+    eventId: "restored-base",
+    event: snapshotWithInFlight([
+      { kind: "text", text: "first draft", finished: true },
+      { kind: "text", text: "**hel", finished: false },
+    ], committedPrefix),
+  }];
+
+  assertEquals(
+    semanticOutput(projectConsole(restoredPrefix).lines),
+    semanticOutput(projectConsole(livePrefix).lines),
+  );
+
+  const firstCommit: SessionSnapshotEntry = {
+    entry_id: "assistant-first",
+    timestamp: 2,
+    provenance: "model_output",
+    kind: "message",
+    role: "assistant",
+    content: [{ kind: "text", text: "first canonical" }],
+  };
+  const secondCommit: SessionSnapshotEntry = {
+    entry_id: "assistant-second",
+    timestamp: 3,
+    provenance: "model_output",
+    kind: "message",
+    role: "assistant",
+    content: [{ kind: "text", text: "**hello**" }],
+  };
+  const suffix: ConsoleEventInput[] = [
+    {
+      eventId: "commit-first",
+      event: {
+        event: "session_entry_committed",
+        data: { entry: firstCommit },
+      },
+    },
+    {
+      eventId: "second-suffix",
+      event: { event: "text_delta", data: { text: "lo**" } },
+    },
+    {
+      eventId: "second-done",
+      event: { event: "text_done", data: { text: "**hello**" } },
+    },
+    {
+      eventId: "commit-second",
+      event: {
+        event: "session_entry_committed",
+        data: { entry: secondCommit },
+      },
+    },
+  ];
+  const liveFinal = projectConsole([...livePrefix, ...suffix]);
+  const restoredFinal = projectConsole([...restoredPrefix, ...suffix]);
+
+  assertEquals(
+    semanticOutput(restoredFinal.lines),
+    semanticOutput(liveFinal.lines),
+  );
+  assertEquals(
+    restoredFinal.lines.filter((line) => line.kind === "assistant").map(
+      (line) => [line.body, line.entryId, line.streaming],
+    ),
+    [
+      ["first canonical", "assistant-first", false],
+      ["**hello**", "assistant-second", false],
+    ],
+  );
+});
+
+Deno.test("snapshot thinking blocks preserve boundaries and live continuation", () => {
+  const livePrefix: ConsoleEventInput[] = [
+    { eventId: "base", event: snapshotEvent("/repo") },
+    { eventId: "thinking-1-start", event: { event: "thinking_start" } },
+    {
+      eventId: "thinking-1-delta",
+      event: { event: "thinking_delta", data: { text: "finished thought" } },
+    },
+    {
+      eventId: "thinking-1-done",
+      event: { event: "thinking_done", data: { text: "finished thought" } },
+    },
+    { eventId: "thinking-2-start", event: { event: "thinking_start" } },
+    {
+      eventId: "thinking-2-delta",
+      event: { event: "thinking_delta", data: { text: "next tho" } },
+    },
+  ];
+  const restoredPrefix: ConsoleEventInput[] = [{
+    eventId: "restored",
+    event: snapshotWithInFlight([
+      { kind: "thinking", text: "finished thought", finished: true },
+      { kind: "thinking", text: "next tho", finished: false },
+    ]),
+  }];
+
+  assertEquals(
+    semanticOutput(projectConsole(restoredPrefix).lines),
+    semanticOutput(projectConsole(livePrefix).lines),
+  );
+
+  const suffix: ConsoleEventInput[] = [
+    {
+      eventId: "thinking-2-suffix",
+      event: { event: "thinking_delta", data: { text: "ught" } },
+    },
+    {
+      eventId: "thinking-2-done",
+      event: { event: "thinking_done", data: { text: "next thought" } },
+    },
+  ];
+  const restored = projectConsole([...restoredPrefix, ...suffix]);
+  assertEquals(
+    semanticOutput(restored.lines),
+    semanticOutput(projectConsole([...livePrefix, ...suffix]).lines),
+  );
+  assertEquals(
+    restored.lines.map((line) => [line.kind, line.body, line.streaming]),
+    [
+      ["thinking", "finished thought", false],
+      ["thinking", "next thought", false],
+    ],
+  );
+  assertEquals(projectOverviewLines(restored.lines), []);
+});
+
+Deno.test("snapshot tool calls retain identity and state through live suffixes", () => {
+  const livePrefix: ConsoleEventInput[] = [
+    { eventId: "base", event: snapshotEvent("/repo") },
+    {
+      eventId: "pending-start",
+      event: {
+        event: "tool_call_start",
+        data: { id: "pending", name: "Read" },
+      },
+    },
+    {
+      eventId: "streaming-start",
+      event: {
+        event: "tool_call_start",
+        data: { id: "streaming", name: "Bash" },
+      },
+    },
+    {
+      eventId: "streaming-args",
+      event: {
+        event: "tool_call_args_delta",
+        data: { id: "streaming", json: '{"command":"ec' },
+      },
+    },
+    {
+      eventId: "done-start",
+      event: { event: "tool_call_start", data: { id: "done", name: "Glob" } },
+    },
+    {
+      eventId: "done-args",
+      event: {
+        event: "tool_call_args_delta",
+        data: { id: "done", json: '{"pattern":"*.ts"}' },
+      },
+    },
+    {
+      eventId: "done-call",
+      event: {
+        event: "tool_call_done",
+        data: { id: "done", name: "Glob", arguments: '{"pattern":"*.ts"}' },
+      },
+    },
+  ];
+  const restoredPrefix: ConsoleEventInput[] = [{
+    eventId: "restored",
+    event: snapshotWithInFlight([
+      {
+        kind: "tool_call",
+        id: "pending",
+        name: "Read",
+        args: "",
+        state: "pending",
+      },
+      {
+        kind: "tool_call",
+        id: "streaming",
+        name: "Bash",
+        args: '{"command":"ec',
+        state: "streaming_args",
+      },
+      {
+        kind: "tool_call",
+        id: "done",
+        name: "Glob",
+        args: '{"pattern":"*.ts"}',
+        state: "done",
+      },
+    ]),
+  }];
+
+  assertEquals(
+    semanticOutput(projectConsole(restoredPrefix).lines),
+    semanticOutput(projectConsole(livePrefix).lines),
+  );
+
+  const suffix: ConsoleEventInput[] = [
+    {
+      eventId: "pending-done",
+      event: {
+        event: "tool_call_done",
+        data: { id: "pending", name: "Read", arguments: '{"file_path":"a"}' },
+      },
+    },
+    {
+      eventId: "streaming-suffix",
+      event: {
+        event: "tool_call_args_delta",
+        data: { id: "streaming", json: 'ho hi"}' },
+      },
+    },
+    {
+      eventId: "streaming-done",
+      event: {
+        event: "tool_call_done",
+        data: {
+          id: "streaming",
+          name: "Bash",
+          arguments: '{"command":"echo hi"}',
+        },
+      },
+    },
+    ...["pending", "streaming", "done"].map((id): ConsoleEventInput => ({
+      eventId: `${id}-result`,
+      event: {
+        event: "tool_result",
+        data: { id, summary: `${id} result`, output: id, is_error: false },
+      },
+    })),
+  ];
+  assertEquals(
+    semanticOutput(projectConsole([...restoredPrefix, ...suffix]).lines),
+    semanticOutput(projectConsole([...livePrefix, ...suffix]).lines),
   );
 });
 
@@ -2664,6 +3048,133 @@ Deno.test("Internal Worker output stays separate and revision-fenced", () => {
     "child output",
   );
   assertEquals(resolveConsoleWorkerView(projection, "missing").sessionId, null);
+});
+
+Deno.test("live-created Internal Worker receives own metadata without reconnect", () => {
+  const worker = {
+    session_id: "live-child",
+    name: "research",
+    parent_session_id: "parent-session",
+    kind: "sub_worker" as const,
+  };
+  const childSnapshot = snapshotEvent("/child") as SnapshotEvent;
+  childSnapshot.data.greeting.worker_name = "research";
+  childSnapshot.data.greeting.model = "child-model";
+  childSnapshot.data.greeting.reasoning = { kind: "effort", effort: "high" };
+  childSnapshot.data.greeting.context_window = 64_000;
+  childSnapshot.data.greeting.context_usage = { tokens: 12_000, source: "measured" };
+
+  const projection = projectConsole([
+    {
+      eventId: "child-snapshot",
+      event: {
+        event: "internal_worker",
+        data: { worker, revision: 1, event: childSnapshot },
+      },
+    },
+    {
+      eventId: "child-context",
+      event: {
+        event: "internal_worker",
+        data: {
+          worker,
+          revision: 2,
+          event: {
+            event: "context_usage",
+            data: { usage: { tokens: 14_000, source: "estimated" } },
+          },
+        },
+      },
+    },
+  ]);
+
+  assertEquals(projection.workerMetadata, null);
+  assertEquals(projection.internalWorkers[0].console.workerMetadata, {
+    model: "child-model",
+    reasoning: { kind: "effort", effort: "high" },
+    contextWindow: 64_000,
+    contextTokens: 14_000,
+    contextSource: "estimated",
+  });
+});
+
+Deno.test("Internal Worker snapshot output continues without entering the parent view", () => {
+  const worker = {
+    session_id: "child-reconnect",
+    name: "research",
+    parent_session_id: "parent-session",
+    kind: "sub_worker" as const,
+  };
+  const snapshot = snapshotEvent("/repo") as SnapshotEvent;
+  snapshot.data.in_flight = {
+    blocks: [{ kind: "text", text: "parent", finished: false }],
+  };
+  snapshot.data.internal_workers = [{
+    worker,
+    revision: 4,
+    session: canonicalSession([]),
+    greeting: {
+      worker_name: "research",
+      cwd: "/child",
+      provider: "anthropic",
+      model: "child-model",
+      reasoning: { kind: "budget_tokens", budget_tokens: 8_192 },
+      scope_summary: "child scope",
+      tools: [],
+      context_window: 64_000,
+      context_tokens: 12_000,
+      context_usage: { tokens: 12_000, source: "measured" },
+    },
+    status: "running",
+    in_flight: {
+      blocks: [{ kind: "text", text: "**chi", finished: false }],
+    },
+    internal_workers: [],
+  }];
+
+  const projector = createConsoleProjector();
+  let projection = projector.append([{ eventId: "snapshot", event: snapshot }]);
+  assertEquals(projection.lines.map((line) => line.body), ["parent"]);
+  assertEquals(
+    projection.internalWorkers[0].console.lines.map((line) => line.body),
+    ["**chi"],
+  );
+  assertEquals(projection.workerMetadata?.model, "model");
+  assertEquals(projection.internalWorkers[0].console.workerMetadata, {
+    model: "child-model",
+    reasoning: { kind: "budget_tokens", budget_tokens: 8_192 },
+    contextWindow: 64_000,
+    contextTokens: 12_000,
+    contextSource: "measured",
+  });
+
+  projection = projector.append([
+    {
+      eventId: "parent-suffix",
+      event: { event: "text_delta", data: { text: " only" } },
+    },
+    {
+      eventId: "child-suffix",
+      event: {
+        event: "internal_worker",
+        data: {
+          worker,
+          revision: 5,
+          event: { event: "text_delta", data: { text: "ld**" } },
+        },
+      },
+    },
+  ]);
+
+  assertEquals(projection.lines.map((line) => line.body), ["parent only"]);
+  assertEquals(
+    projection.internalWorkers[0].console.lines.map((line) => [
+      line.kind,
+      line.body,
+      line.streaming,
+    ]),
+    [["assistant", "**child**", true]],
+  );
 });
 
 Deno.test("console Worker views expose only direct Internal Workers", () => {
@@ -3032,10 +3543,7 @@ Deno.test("overview hides thinking and aggregates uninterrupted tool activity", 
 
 Deno.test("overview keeps tool failure counts without marking the activity as an error", () => {
   const overview = projectOverviewLines([
-    {
-      ...consoleLine("thinking-in-flight", "in_flight"),
-      title: "in-flight thinking",
-    },
+    consoleLine("thinking-active", "thinking"),
     {
       ...consoleLine("failed-read", "tool"),
       error: true,
@@ -3398,7 +3906,8 @@ Deno.test("committed history inserts current live rows after their last stable a
   historyUser.entryId = "user-1";
   const currentUser = consoleLine("current-user", "user");
   currentUser.entryId = "user-1";
-  const live = consoleLine("live-assistant", "in_flight");
+  const live = consoleLine("live-assistant", "assistant");
+  live.streaming = true;
 
   assertEquals(
     mergeCommittedHistoryLines([historyUser], [currentUser, live]).map((line) =>

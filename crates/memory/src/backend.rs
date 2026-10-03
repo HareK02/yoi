@@ -41,6 +41,7 @@ pub enum MemoryBackendHttpResponse {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MemoryBackendOperationResult {
     ToolOutput(MemoryToolOutput),
+    ResidentSummary(MemoryResidentSummaryOutput),
     Acknowledged(MemoryBackendAckOutput),
     StagingWritten(MemoryStagingWriteOutput),
 }
@@ -48,6 +49,23 @@ pub enum MemoryBackendOperationResult {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MemoryToolOutput {
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryResidentSummaryAvailability {
+    Ready,
+    Ungenerated,
+    Stale,
+    Failed,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryResidentSummaryOutput {
+    pub availability: MemoryResidentSummaryAvailability,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
 }

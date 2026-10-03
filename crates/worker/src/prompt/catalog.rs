@@ -94,6 +94,8 @@ pub enum WorkerPrompt {
     CompactSystem,
     MemoryExtractSystem,
     MemoryConsolidationSystem,
+    SubjektivMemoryConsolidationSystem,
+    SubjektivMemorySurfaceSystem,
     FlowVerifierSystem,
     BackendJobSystem,
     NotifyWrapper,
@@ -102,6 +104,7 @@ pub enum WorkerPrompt {
     WorkingBoundariesSection,
     AgentsMdSection,
     ResidentMemorySummarySection,
+    ResidentMemoryRestoreSection,
     WorkerOrchestrationGuidanceSection,
     SubWorkerSpawnToolDescription,
 }
@@ -112,6 +115,10 @@ impl WorkerPrompt {
             Self::CompactSystem => "internal.compact_system",
             Self::MemoryExtractSystem => "internal.memory_extract_system",
             Self::MemoryConsolidationSystem => "internal.memory_consolidation_system",
+            Self::SubjektivMemoryConsolidationSystem => {
+                "internal.subjektiv_memory_consolidation_system"
+            }
+            Self::SubjektivMemorySurfaceSystem => "internal.subjektiv_memory_surface_system",
             Self::FlowVerifierSystem => "internal.flow_verifier_system",
             Self::BackendJobSystem => "internal.backend_job_system",
             Self::NotifyWrapper => "internal.notify_wrapper",
@@ -120,6 +127,7 @@ impl WorkerPrompt {
             Self::WorkingBoundariesSection => "internal.working_boundaries_section",
             Self::AgentsMdSection => "internal.agents_md_section",
             Self::ResidentMemorySummarySection => "internal.resident_memory_summary_section",
+            Self::ResidentMemoryRestoreSection => "internal.resident_memory_restore_section",
             Self::WorkerOrchestrationGuidanceSection => {
                 "internal.worker_orchestration_guidance_section"
             }
@@ -131,6 +139,8 @@ impl WorkerPrompt {
         WorkerPrompt::CompactSystem,
         WorkerPrompt::MemoryExtractSystem,
         WorkerPrompt::MemoryConsolidationSystem,
+        WorkerPrompt::SubjektivMemoryConsolidationSystem,
+        WorkerPrompt::SubjektivMemorySurfaceSystem,
         WorkerPrompt::FlowVerifierSystem,
         WorkerPrompt::BackendJobSystem,
         WorkerPrompt::NotifyWrapper,
@@ -139,6 +149,7 @@ impl WorkerPrompt {
         WorkerPrompt::WorkingBoundariesSection,
         WorkerPrompt::AgentsMdSection,
         WorkerPrompt::ResidentMemorySummarySection,
+        WorkerPrompt::ResidentMemoryRestoreSection,
         WorkerPrompt::WorkerOrchestrationGuidanceSection,
         WorkerPrompt::SubWorkerSpawnToolDescription,
     ];
@@ -449,6 +460,21 @@ impl PromptCatalog {
             single("language", language),
         )
     }
+    pub fn subjektiv_memory_consolidation_system(
+        &self,
+        language: &str,
+    ) -> Result<String, CatalogError> {
+        self.render(
+            WorkerPrompt::SubjektivMemoryConsolidationSystem,
+            single("language", language),
+        )
+    }
+    pub fn subjektiv_memory_surface_system(&self, language: &str) -> Result<String, CatalogError> {
+        self.render(
+            WorkerPrompt::SubjektivMemorySurfaceSystem,
+            single("language", language),
+        )
+    }
     pub fn flow_verifier_system(&self) -> Result<String, CatalogError> {
         self.render(WorkerPrompt::FlowVerifierSystem, Value::UNDEFINED)
     }
@@ -477,6 +503,19 @@ impl PromptCatalog {
         self.render(
             WorkerPrompt::ResidentMemorySummarySection,
             single("summary", summary),
+        )
+    }
+    pub fn resident_memory_restore_section(
+        &self,
+        surface_ready: bool,
+        summary: Option<&str>,
+    ) -> Result<String, CatalogError> {
+        self.render(
+            WorkerPrompt::ResidentMemoryRestoreSection,
+            minijinja::context! {
+                surface_ready => surface_ready,
+                summary => summary.unwrap_or_default(),
+            },
         )
     }
     pub fn worker_orchestration_guidance_section(&self) -> Result<String, CatalogError> {
@@ -913,6 +952,23 @@ mod tests {
                 .unwrap()
                 .contains("LANGUAGE_MARKER")
         );
+        let surface = catalog
+            .subjektiv_memory_surface_system("SURFACE_LANGUAGE")
+            .unwrap();
+        assert!(surface.contains("SURFACE_LANGUAGE"));
+        for required in [
+            "conditions",
+            "negation",
+            "contradictions",
+            "staleness",
+            "SubmitMemorySurface",
+            "not semantic verification",
+        ] {
+            assert!(
+                surface.contains(required),
+                "missing surface rule {required}"
+            );
+        }
         assert!(
             catalog
                 .notify_wrapper("NOTIFICATION_MARKER")

@@ -1037,25 +1037,15 @@ permission = "write"
 #[tokio::test]
 async fn builtin_orchestrator_exposes_worker_remove_and_workdir_delete() {
     let workspace = tempfile::tempdir().unwrap();
-    let mut resolved = ProfileResolver::new()
+    let resolved = ProfileResolver::new()
         .with_workspace_base(workspace.path())
         .resolve(
             &ProfileSelector::source_named(ProfileRegistrySource::Builtin, "orchestrator"),
             ProfileResolveOptions::with_worker_name("orchestrator-worker"),
         )
         .unwrap();
-    if resolved.manifest.feature.memory.enabled() {
-        resolved
-            .manifest
-            .feature
-            .memory
-            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
-                workspace_id: "workspace-test".to_string(),
-                settings_revision: 1,
-                language: "English".to_string(),
-            })
-            .unwrap();
-    }
+    assert!(resolved.manifest.feature.subjektiv.enabled());
+    assert!(!resolved.manifest.feature.subjektiv.execution_enabled());
     let workspace_context =
         WorkerWorkspaceContext::with_client(None, Arc::new(NoopWorkspaceClient));
     let client = MockClient::new(simple_text_events());
@@ -1081,6 +1071,47 @@ async fn builtin_orchestrator_exposes_worker_remove_and_workdir_delete() {
 
     assert!(installed.iter().any(|name| name == "WorkerRemove"));
     assert!(installed.iter().any(|name| name == "WorkdirDelete"));
+    assert!(
+        installed.iter().all(|name| !name.starts_with("Subjektiv")),
+        "ordinary Orchestrator must not install subject-scoped tools: {installed:?}"
+    );
+}
+
+#[tokio::test]
+async fn builtin_coder_commits_without_unattached_subjektiv_lifecycle() {
+    let workspace = tempfile::tempdir().unwrap();
+    let resolved = ProfileResolver::new()
+        .with_workspace_base(workspace.path())
+        .resolve(
+            &ProfileSelector::source_named(ProfileRegistrySource::Builtin, "coder"),
+            ProfileResolveOptions::with_worker_name("coder-worker"),
+        )
+        .unwrap();
+    assert!(resolved.manifest.feature.subjektiv.enabled());
+    assert!(!resolved.manifest.feature.subjektiv.execution_enabled());
+    let client = MockClient::new(simple_text_events());
+    let client_for_assert = client.clone();
+    let (worker, _pwd) = make_worker_with_manifest_and_workspace_context(
+        client,
+        resolved.manifest,
+        WorkerWorkspaceContext::with_client(None, Arc::new(NoopWorkspaceClient)),
+    )
+    .await;
+    let handle = spawn_controller(worker).await;
+
+    handle
+        .send(Method::submit_text(
+            protocol::new_submission_request_id(),
+            "Hello",
+        ))
+        .await
+        .unwrap();
+    wait_for_status(&handle, WorkerStatus::Idle).await;
+    let installed = request_tool_names(&wait_for_captured_request(&client_for_assert).await);
+    assert!(
+        installed.iter().all(|name| !name.starts_with("Subjektiv")),
+        "ordinary Coder must not install subject-scoped tools: {installed:?}"
+    );
 }
 
 #[tokio::test]

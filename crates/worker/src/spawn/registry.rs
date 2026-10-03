@@ -29,7 +29,9 @@ use tokio::sync::{Notify, broadcast};
 use tracing::warn;
 use workdir::WorkdirScopeLeaseSet;
 
-use crate::internal_worker::{InternalWorkerSessionHandle, InternalWorkerVisibility};
+use crate::internal_worker::{
+    InternalWorkerSessionHandle, InternalWorkerSessionSnapshot, InternalWorkerVisibility,
+};
 use crate::runtime::dir::{RuntimeDir, SpawnedWorkerRecord};
 use crate::runtime::worker_allocation;
 
@@ -648,6 +650,14 @@ impl SpawnedWorkerRegistry {
         let protocol_emit_lock = record.protocol_emit_lock.clone();
         let protocol_terminal = record.protocol_terminal.clone();
         let mut child_rx = record.session.subscribe_events();
+        publish_initial_internal_snapshot(
+            &parent_tx,
+            &worker,
+            &protocol_revision,
+            &protocol_emit_lock,
+            &protocol_terminal,
+            &record.session,
+        );
         tokio::spawn(async move {
             loop {
                 match child_rx.recv().await {
@@ -710,6 +720,14 @@ impl SpawnedWorkerRegistry {
         let protocol_emit_lock = record.protocol_emit_lock.clone();
         let protocol_terminal = record.protocol_terminal.clone();
         let mut child_rx = record.session.subscribe_events();
+        publish_initial_internal_snapshot(
+            &parent_tx,
+            &worker,
+            &protocol_revision,
+            &protocol_emit_lock,
+            &protocol_terminal,
+            &record.session,
+        );
         tokio::spawn(async move {
             loop {
                 match child_rx.recv().await {
@@ -985,6 +1003,41 @@ impl SpawnedWorkerRegistry {
     }
 }
 
+fn publish_initial_internal_snapshot(
+    parent_tx: &broadcast::Sender<Event>,
+    worker: &InternalWorkerRef,
+    protocol_revision: &AtomicU64,
+    protocol_emit_lock: &Mutex<()>,
+    protocol_terminal: &AtomicBool,
+    session: &InternalWorkerSessionHandle,
+) {
+    let Some(event) = internal_worker_live_snapshot(session.protocol_snapshot()) else {
+        return;
+    };
+    let _emit_guard = protocol_emit_lock
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if protocol_terminal.load(Ordering::Acquire) {
+        return;
+    }
+    let revision = protocol_revision.fetch_add(1, Ordering::AcqRel) + 1;
+    let _ = parent_tx.send(Event::InternalWorker {
+        worker: worker.clone(),
+        revision,
+        event: Box::new(event),
+    });
+}
+
+fn internal_worker_live_snapshot(snapshot: InternalWorkerSessionSnapshot) -> Option<Event> {
+    Some(Event::Snapshot {
+        session: snapshot.session,
+        greeting: snapshot.greeting?,
+        state: snapshot.status.into(),
+        in_flight: snapshot.in_flight,
+        internal_workers: snapshot.internal_workers,
+    })
+}
+
 fn internal_worker_snapshot(
     worker: InternalWorkerRef,
     revision: u64,
@@ -995,6 +1048,7 @@ fn internal_worker_snapshot(
         worker,
         revision,
         session: snapshot.session,
+        greeting: snapshot.greeting,
         status: snapshot.status,
         error: snapshot.error,
         in_flight: snapshot.in_flight,
@@ -1121,7 +1175,10 @@ mod tests {
     use session_store::LogEntry;
 
     use super::*;
-    use crate::internal_worker::{InternalWorkerSessionStatus, test_internal_worker_session};
+    use crate::internal_worker::{
+        InternalWorkerSessionStatus, test_internal_worker_session,
+        test_internal_worker_session_with_greeting,
+    };
 
     fn registry() -> Arc<SpawnedWorkerRegistry> {
         let scope = Scope::from_config(&ScopeConfig {
@@ -1141,7 +1198,15 @@ mod tests {
         name: &str,
         visibility: InternalWorkerVisibility,
     ) -> (InternalSpawnedWorkerRecord, broadcast::Sender<Event>) {
-        let (session, sender) = test_internal_worker_session(visibility);
+        record_with_greeting(name, visibility, None).await
+    }
+
+    async fn record_with_greeting(
+        name: &str,
+        visibility: InternalWorkerVisibility,
+        greeting: Option<protocol::Greeting>,
+    ) -> (InternalSpawnedWorkerRecord, broadcast::Sender<Event>) {
+        let (session, sender) = test_internal_worker_session_with_greeting(visibility, greeting);
         let root = std::path::PathBuf::from("/tmp");
         let scope = Scope::from_config(&ScopeConfig {
             allow: vec![ScopeRule {
@@ -1191,6 +1256,95 @@ mod tests {
             ),
             sender,
         )
+    }
+
+    #[tokio::test]
+    async fn visible_internal_worker_starts_with_own_live_snapshot_metadata() {
+        let registry = registry();
+        let (parent_tx, mut parent_rx) = broadcast::channel(16);
+        registry.attach_parent_protocol(parent_tx, "parent-session".into());
+        let greeting = protocol::Greeting {
+            worker_name: "research".into(),
+            cwd: "/child".into(),
+            provider: "provider".into(),
+            model: "child-model".into(),
+            reasoning: Some(protocol::ReasoningConfig::Effort {
+                effort: "high".into(),
+            }),
+            scope_summary: "child scope".into(),
+            tools: Vec::new(),
+            context_window: 64_000,
+            context_tokens: 12_000,
+            context_usage: Some(protocol::ContextUsage {
+                tokens: 12_000,
+                source: protocol::ContextTokenSource::Measured,
+            }),
+        };
+        let (record, child_tx) = record_with_greeting(
+            "research",
+            InternalWorkerVisibility::ParentClient,
+            Some(greeting),
+        )
+        .await;
+        registry
+            .internal_records
+            .lock()
+            .unwrap()
+            .push(record.clone());
+
+        registry.start_protocol_forwarding(record);
+
+        let initial = tokio::time::timeout(Duration::from_secs(1), parent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            initial,
+            Event::InternalWorker {
+                revision: 1,
+                event,
+                ..
+            } if matches!(
+                *event,
+                Event::Snapshot {
+                    greeting: protocol::Greeting {
+                        ref model,
+                        context_window: 64_000,
+                        ..
+                    },
+                    ..
+                } if model == "child-model"
+            )
+        ));
+
+        child_tx
+            .send(Event::ContextUsage {
+                usage: Some(protocol::ContextUsage {
+                    tokens: 14_000,
+                    source: protocol::ContextTokenSource::Estimated,
+                }),
+            })
+            .unwrap();
+        let update = tokio::time::timeout(Duration::from_secs(1), parent_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            update,
+            Event::InternalWorker {
+                revision: 2,
+                event,
+                ..
+            } if matches!(
+                *event,
+                Event::ContextUsage {
+                    usage: Some(protocol::ContextUsage {
+                        tokens: 14_000,
+                        source: protocol::ContextTokenSource::Estimated,
+                    })
+                }
+            )
+        ));
     }
 
     #[tokio::test]

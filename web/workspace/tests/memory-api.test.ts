@@ -3,12 +3,29 @@ declare const Deno: {
 };
 
 import {
-  parseMemoryDocumentResponse,
   parseMemoryStagingListResponse,
+  parseSubjektivMemoryListRevisionsResponse,
+  parseSubjektivMemoryQueryResponse,
+  parseSubjektivMemoryReadResponse,
+  parseSubjektivResidentSurfaceResponse,
+  parseSubjektivSubjectListResponse,
+  parseSubjektivSubjectResponse,
 } from "../src/lib/workspace/memory/api.ts";
 
+function stable(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stable);
+  if (typeof value === "object" && value !== null) {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, item]) => [key, stable(item)]),
+    );
+  }
+  return value;
+}
+
 function assertEquals(actual: unknown, expected: unknown): void {
-  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+  if (JSON.stringify(stable(actual)) !== JSON.stringify(stable(expected))) {
     throw new Error(
       `expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
     );
@@ -27,8 +44,404 @@ function assertThrows(fn: () => void, expectedMessage: string): void {
   throw new Error(`expected function to throw ${expectedMessage}`);
 }
 
-function fixture(origin: Record<string, unknown>) {
+function subject(id = "subject-1") {
   return {
+    id,
+    role: "Release coordinator",
+    state: "active",
+    store_revision: 12,
+    created_at: "2026-09-01T00:00:00Z",
+    updated_at: "2026-09-02T00:00:00Z",
+  };
+}
+
+function queryItem(id = "memory-1") {
+  return {
+    id,
+    revision: 3,
+    kind: "decision",
+    state: "active",
+    claim: "Keep provenance typed.",
+    excerpt: "Preserve source and derivation references.",
+    updated_at: "2026-09-02T03:04:05Z",
+  };
+}
+
+function detailFixture() {
+  const origin = {
+    kind: "flow_instruction",
+    workspace_id: "workspace-1",
+    runtime_id: "runtime-1",
+    worker_id: "worker-1",
+    flow_selector: "builtin:coder-review",
+    flow_definition_id: "flow-1",
+    flow_definition_revision: 7,
+  };
+  return {
+    memory_id: "memory-1",
+    revision: 2,
+    current_revision: 3,
+    kind: "decision",
+    state: "resolved",
+    claim: "Keep provenance typed.",
+    body_md: "# Committed Memory\n\nBounded body segment.",
+    why_useful: "Prevents origin loss.",
+    staleness: null,
+    change_reason: "Resolved after implementation.",
+    created_at: "2026-09-01T00:00:00Z",
+    updated_at: "2026-09-02T03:04:05Z",
+    body_offset: 0,
+    body_byte_offset: 0,
+    body_next_offset: 2,
+    body_next_byte_offset: 0,
+    body_truncated: true,
+    source_candidate_ids: ["candidate-1"],
+    source_candidates: [{
+      candidate_id: "candidate-1",
+      evidence: [{
+        id: "evidence-1",
+        kind: "message",
+        entry_range: [10, 12],
+        origin,
+        excerpt: "Use exact DTOs.",
+        summary: "The decision was explicit.",
+      }],
+      evidence_total: 2,
+      evidence_truncated: true,
+      source_refs: [{
+        session_id: "session-1",
+        segment_id: "segment-1",
+        entry_range: [10, 12],
+        evidence_id: "evidence-1",
+        origin,
+        evidence_kind: "message",
+        label: "Decision discussion",
+        summary: "Bounded host summary.",
+      }],
+      source_refs_total: 2,
+      source_refs_truncated: true,
+    }],
+    derived_from: [{ memory_id: "memory-parent", revision: 4 }],
+    evidence_next_cursor: "evidence-page-2",
+    evidence_has_more: true,
+  };
+}
+
+Deno.test("Subject parsers enforce identity, exact enums, safe revisions, and bounds", () => {
+  assertEquals(
+    parseSubjektivSubjectResponse(subject(), "subject-1"),
+    subject(),
+  );
+  assertThrows(
+    () => parseSubjektivSubjectResponse(subject(), "another-subject"),
+    "identity does not match",
+  );
+  assertThrows(
+    () => parseSubjektivSubjectResponse({ ...subject(), state: "paused" }),
+    "unknown Subject state",
+  );
+  assertThrows(
+    () =>
+      parseSubjektivSubjectResponse({
+        ...subject(),
+        store_revision: Number.MAX_SAFE_INTEGER + 1,
+      }),
+    "safe integer",
+  );
+  assertThrows(
+    () => parseSubjektivSubjectResponse({ ...subject(), id: "x".repeat(513) }),
+    "bounded identifier",
+  );
+  assertThrows(
+    () => parseSubjektivSubjectResponse({ ...subject(), future: true }),
+    "unknown field",
+  );
+  assertThrows(
+    () =>
+      parseSubjektivSubjectListResponse({
+        limit: 100,
+        items: Array.from({ length: 101 }, (_, index) =>
+          subject(`subject-${index}`)),
+        has_more: false,
+      }),
+    "bounded array",
+  );
+});
+
+Deno.test("Subject list parser preserves the exact bounded response", () => {
+  const response = { limit: 100, items: [subject()], has_more: false };
+  assertEquals(parseSubjektivSubjectListResponse(response), response);
+  const nextPage = {
+    limit: 1,
+    items: [subject()],
+    next_cursor: "subjektiv.subjects.next",
+    has_more: true,
+  };
+  assertEquals(parseSubjektivSubjectListResponse(nextPage), nextPage);
+  assertThrows(
+    () =>
+      parseSubjektivSubjectListResponse({
+        limit: 1,
+        items: [subject()],
+        has_more: true,
+      }),
+    "cursor does not match has_more",
+  );
+  assertThrows(
+    () =>
+      parseSubjektivSubjectListResponse({
+        limit: 100,
+        items: [subject("duplicate"), subject("duplicate")],
+        has_more: false,
+      }),
+    "Subject ids must be unique",
+  );
+});
+
+Deno.test("Resident surface parser accepts ready-empty and enforces snapshot invariants", () => {
+  const readyEmpty = {
+    subject_id: "subject-1",
+    availability: "ready",
+    snapshot: {
+      snapshot_id: "snapshot-empty",
+      body_md: "",
+      memory_refs: [],
+      built_from_store_revision: 0,
+      created_at: "2026-09-02T00:00:00Z",
+    },
+  };
+  assertEquals(
+    parseSubjektivResidentSurfaceResponse(readyEmpty, "subject-1"),
+    readyEmpty,
+  );
+  assertEquals(
+    parseSubjektivResidentSurfaceResponse({
+      subject_id: "subject-1",
+      availability: "ungenerated",
+    }),
+    { subject_id: "subject-1", availability: "ungenerated" },
+  );
+  assertThrows(
+    () =>
+      parseSubjektivResidentSurfaceResponse({
+        subject_id: "subject-1",
+        availability: "ready",
+      }),
+    "requires a snapshot",
+  );
+  for (const availability of ["ungenerated", "stale", "failed"]) {
+    assertThrows(
+      () =>
+        parseSubjektivResidentSurfaceResponse({
+          ...readyEmpty,
+          availability,
+        }),
+      "must not include a snapshot",
+    );
+  }
+  assertThrows(
+    () =>
+      parseSubjektivResidentSurfaceResponse({
+        subject_id: "subject-1",
+        availability: "refreshing",
+      }),
+    "unknown resident surface availability",
+  );
+  assertThrows(
+    () => parseSubjektivResidentSurfaceResponse(readyEmpty, "subject-2"),
+    "identity does not match",
+  );
+});
+
+Deno.test("Current Memory list parser rejects unknown variants, unsafe integers, cursors, and oversized pages", () => {
+  const response = {
+    items: [queryItem()],
+    has_more: true,
+    next_cursor: "memory-page-2",
+  };
+  assertEquals(parseSubjektivMemoryQueryResponse(response), response);
+  assertThrows(
+    () =>
+      parseSubjektivMemoryQueryResponse({
+        ...response,
+        items: [{ ...queryItem(), state: "pending" }],
+      }),
+    "unknown Memory state",
+  );
+  assertThrows(
+    () =>
+      parseSubjektivMemoryQueryResponse({
+        ...response,
+        items: [{ ...queryItem(), kind: "future_kind" }],
+      }),
+    "unknown Memory candidate kind",
+  );
+  assertThrows(
+    () =>
+      parseSubjektivMemoryQueryResponse({
+        ...response,
+        items: [{ ...queryItem(), revision: 0 }],
+      }),
+    "positive safe integer",
+  );
+  assertThrows(
+    () =>
+      parseSubjektivMemoryQueryResponse({
+        items: [queryItem()],
+        has_more: true,
+      }),
+    "cursor does not match",
+  );
+  assertThrows(
+    () =>
+      parseSubjektivMemoryQueryResponse({
+        items: Array.from({ length: 101 }, (_, index) =>
+          queryItem(`memory-${index}`)),
+        has_more: false,
+      }),
+    "bounded array",
+  );
+});
+
+Deno.test("Memory detail parser preserves body/evidence continuation, sources, origins, and derivation", () => {
+  const fixture = detailFixture();
+  const parsed = parseSubjektivMemoryReadResponse(fixture, "memory-1");
+  assertEquals(parsed, fixture);
+  assertEquals(parsed.body_next_offset, 2);
+  assertEquals(parsed.body_next_byte_offset, 0);
+  assertEquals(parsed.evidence_next_cursor, "evidence-page-2");
+  assertEquals(
+    parsed.source_candidates[0].evidence[0].origin,
+    fixture.source_candidates[0].evidence[0].origin,
+  );
+  assertEquals(
+    parsed.source_candidates[0].source_refs,
+    fixture.source_candidates[0].source_refs,
+  );
+  assertEquals(parsed.derived_from, [{
+    memory_id: "memory-parent",
+    revision: 4,
+  }]);
+});
+
+Deno.test("Memory detail parser fails closed on identity, variants, bounds, and continuation mismatch", () => {
+  const fixture = detailFixture();
+  assertThrows(
+    () => parseSubjektivMemoryReadResponse(fixture, "memory-2"),
+    "identity does not match",
+  );
+  assertThrows(
+    () =>
+      parseSubjektivMemoryReadResponse({
+        ...fixture,
+        current_revision: Number.MAX_SAFE_INTEGER + 1,
+      }),
+    "safe integer",
+  );
+  const missingBodyContinuation = structuredClone(fixture) as Record<
+    string,
+    unknown
+  >;
+  delete missingBodyContinuation.body_next_byte_offset;
+  assertThrows(
+    () => parseSubjektivMemoryReadResponse(missingBodyContinuation),
+    "body continuation fields",
+  );
+  assertThrows(
+    () =>
+      parseSubjektivMemoryReadResponse({
+        ...fixture,
+        source_candidate_ids: ["different-candidate"],
+      }),
+    "source candidate ids do not match",
+  );
+  assertThrows(
+    () =>
+      parseSubjektivMemoryReadResponse({
+        ...fixture,
+        source_candidates: [{
+          ...fixture.source_candidates[0],
+          evidence: [{
+            ...fixture.source_candidates[0].evidence[0],
+            entry_range: [12, 10],
+          }],
+        }],
+      }),
+    "must be ordered",
+  );
+  const unknownOrigin = structuredClone(fixture);
+  unknownOrigin.source_candidates[0].evidence[0].origin.kind = "future_origin";
+  assertThrows(
+    () => parseSubjektivMemoryReadResponse(unknownOrigin),
+    "unknown Memory evidence origin kind",
+  );
+  assertThrows(
+    () =>
+      parseSubjektivMemoryReadResponse({
+        ...fixture,
+        evidence_has_more: false,
+      }),
+    "cursor does not match",
+  );
+});
+
+Deno.test("Memory revision parser preserves immutable states and checks response identity", () => {
+  const response = {
+    memory_id: "memory-1",
+    current_revision: 3,
+    items: [{
+      revision: 3,
+      kind: "decision",
+      state: "active",
+      claim: "Current claim.",
+      change_reason: "Clarified wording.",
+      updated_at: "2026-09-03T00:00:00Z",
+    }, {
+      revision: 2,
+      kind: "decision",
+      state: "resolved",
+      claim: "Earlier claim.",
+      change_reason: "Resolved.",
+      updated_at: "2026-09-02T00:00:00Z",
+    }, {
+      revision: 1,
+      kind: "decision",
+      state: "retracted",
+      claim: "Original claim.",
+      change_reason: "Retracted.",
+      updated_at: "2026-09-01T00:00:00Z",
+    }],
+    has_more: false,
+  };
+  assertEquals(
+    parseSubjektivMemoryListRevisionsResponse(response, "memory-1"),
+    response,
+  );
+  assertThrows(
+    () => parseSubjektivMemoryListRevisionsResponse(response, "memory-2"),
+    "identity does not match",
+  );
+  assertThrows(
+    () =>
+      parseSubjektivMemoryListRevisionsResponse({
+        ...response,
+        items: [{ ...response.items[0], state: "archived" }],
+      }),
+    "unknown Memory state",
+  );
+  assertThrows(
+    () =>
+      parseSubjektivMemoryListRevisionsResponse({
+        ...response,
+        items: [{ ...response.items[0], revision: 4 }],
+      }),
+    "future revision",
+  );
+});
+
+Deno.test("Legacy staging parser remains strict for deprecated compatibility", () => {
+  const origin = { kind: "worker_input", worker_id: "worker-1" };
+  const response = {
     limit: 100,
     returned_count: 1,
     total_valid_count: 1,
@@ -70,97 +483,19 @@ function fixture(origin: Record<string, unknown>) {
     }],
     diagnostics: [],
   };
-}
-
-Deno.test("Memory document response requires the generated DTO fields", () => {
-  assertEquals(
-    parseMemoryDocumentResponse({
-      body_md: "# Memory\n",
-      created_at: "2026-09-01T00:00:00Z",
-      updated_at: "2026-09-01T00:00:00Z",
-      bytes: 9,
-      record_source: "sqlite_workspace_authority.memory_document",
-    }).bytes,
-    9,
-  );
-  assertThrows(
-    () => parseMemoryDocumentResponse({ body_md: "# Memory\n" }),
-    "missing a required field",
-  );
-});
-
-for (
-  const [kind, fields] of [
-    ["human_input", { account_id: "account-1" }],
-    [
-      "worker_input",
-      {
-        workspace_id: "workspace-1",
-        runtime_id: "runtime-1",
-        worker_id: "worker-1",
-      },
-    ],
-    ["model_output", { runtime_id: "runtime-1", worker_id: "worker-1" }],
-    ["tool_output", { runtime_id: "runtime-1", worker_id: "worker-1" }],
-    ["legacy_unknown", {}],
-  ] as const
-) {
-  Deno.test(`Memory staging parser preserves ${kind} origin`, () => {
-    const parsed = parseMemoryStagingListResponse(fixture({ kind, ...fields }));
-    assertEquals(parsed.items[0].record.evidence[0].origin, {
-      kind,
-      ...fields,
-    });
-    assertEquals(parsed.items[0].record.source_refs[0].origin, {
-      kind,
-      ...fields,
-    });
-  });
-}
-
-Deno.test("Memory staging parser preserves Flow origin fields", () => {
-  const origin = {
-    kind: "flow_instruction" as const,
-    workspace_id: "workspace-1",
-    runtime_id: "runtime-1",
-    worker_id: "worker-1",
-    flow_selector: "builtin:coder-review",
-    flow_definition_id: "flow-1",
-    flow_definition_revision: 7,
-  };
-  const parsed = parseMemoryStagingListResponse(fixture(origin));
-  assertEquals(parsed.items[0].record.source_refs[0].origin, origin);
-});
-
-Deno.test("Memory staging parser rejects unknown or newer origin shapes", () => {
-  assertThrows(
-    () => parseMemoryStagingListResponse(fixture({ kind: "future_origin" })),
-    "unknown Memory evidence origin kind",
-  );
+  assertEquals(parseMemoryStagingListResponse(response), response);
   assertThrows(
     () =>
-      parseMemoryStagingListResponse(
-        fixture({ kind: "human_input", future_field: "must not be accepted" }),
-      ),
-    "unknown field",
-  );
-});
-
-Deno.test("Memory staging parser rejects malformed records and unbounded origins", () => {
-  const malformed = fixture({ kind: "legacy_unknown" });
-  malformed.items[0].record.source_refs[0].entry_range = [1] as unknown as [
-    number,
-    number,
-  ];
-  assertThrows(
-    () => parseMemoryStagingListResponse(malformed),
-    "two-item entry range",
-  );
-  assertThrows(
-    () =>
-      parseMemoryStagingListResponse(
-        fixture({ kind: "worker_input", worker_id: "x".repeat(513) }),
-      ),
-    "exceeds the Memory origin limit",
+      parseMemoryStagingListResponse({
+        ...response,
+        items: [{
+          ...response.items[0],
+          record: {
+            ...response.items[0].record,
+            source: { segment_id: "segment-1", range: [20, 10] },
+          },
+        }],
+      }),
+    "must be ordered",
   );
 });

@@ -944,7 +944,7 @@ fn bind_workspace_memory_settings(
     request: &CreateWorkerRequest,
 ) -> Result<(), String> {
     let Some(snapshot) = request.memory_settings.as_ref() else {
-        if request.workspace_api.is_some() {
+        if request.workspace_api.is_some() || request.subjektiv_attached {
             return Err(
                 "Workspace Worker request is missing its bound Memory settings snapshot"
                     .to_string(),
@@ -960,14 +960,33 @@ fn bind_workspace_memory_settings(
             snapshot.workspace_id, workspace_api.workspace_id
         ));
     }
+    if manifest.feature.memory.profile.enabled {
+        manifest
+            .feature
+            .memory
+            .bind_workspace_settings(snapshot.clone())
+            .map_err(str::to_string)?;
+    }
+    if request.subjektiv_attached {
+        if !manifest.feature.subjektiv.profile.enabled {
+            return Err(
+                "subject-attached Worker profile does not enable subjektiv policy".to_string(),
+            );
+        }
+        manifest
+            .feature
+            .subjektiv
+            .bind_workspace_settings(snapshot.clone())
+            .map_err(str::to_string)?;
+    }
     manifest
         .feature
         .memory
-        .bind_workspace_settings(snapshot.clone())
+        .validate_execution()
         .map_err(str::to_string)?;
     manifest
         .feature
-        .memory
+        .subjektiv
         .validate_execution()
         .map_err(str::to_string)?;
     Ok(())
@@ -978,6 +997,12 @@ fn validate_worker_memory_settings(
     request: &CreateWorkerRequest,
 ) -> Result<(), String> {
     let Some(expected) = request.memory_settings.as_ref() else {
+        if request.subjektiv_attached {
+            return Err(
+                "subject-attached Worker restore is missing its trusted settings snapshot"
+                    .to_string(),
+            );
+        }
         return Ok(());
     };
     manifest
@@ -985,17 +1010,21 @@ fn validate_worker_memory_settings(
         .memory
         .validate_execution()
         .map_err(str::to_string)?;
-    if !manifest.feature.memory.profile.enabled {
-        return Ok(());
-    }
-    let actual = manifest
+    manifest
         .feature
-        .memory
-        .workspace_settings()
-        .ok_or_else(|| {
-            "Workspace Worker restored without its bound Memory settings snapshot".to_string()
-        })?;
-    if &actual != expected {
+        .subjektiv
+        .validate_execution()
+        .map_err(str::to_string)?;
+    if manifest.feature.memory.profile.enabled
+        && manifest.feature.memory.workspace_settings().as_ref() != Some(expected)
+    {
+        let actual = manifest
+            .feature
+            .memory
+            .workspace_settings()
+            .ok_or_else(|| {
+                "Workspace Worker restored without its bound Memory settings snapshot".to_string()
+            })?;
         return Err(format!(
             "Workspace Worker Memory settings snapshot mismatch: expected {} revision {}, restored {} revision {}",
             expected.workspace_id,
@@ -1003,6 +1032,33 @@ fn validate_worker_memory_settings(
             actual.workspace_id,
             actual.settings_revision
         ));
+    }
+    let subjektiv_settings = manifest.feature.subjektiv.workspace_settings();
+    if request.subjektiv_attached {
+        if !manifest.feature.subjektiv.profile.enabled {
+            return Err(
+                "subject-attached Worker restored with a Profile that disables subjektiv policy"
+                    .to_string(),
+            );
+        }
+        if subjektiv_settings.as_ref() != Some(expected) {
+            let actual = subjektiv_settings.ok_or_else(|| {
+                "subject-attached Worker restored without its bound subjektiv settings snapshot"
+                    .to_string()
+            })?;
+            return Err(format!(
+                "Workspace Worker subjektiv settings snapshot mismatch: expected {} revision {}, restored {} revision {}",
+                expected.workspace_id,
+                expected.settings_revision,
+                actual.workspace_id,
+                actual.settings_revision
+            ));
+        }
+    } else if subjektiv_settings.is_some() {
+        return Err(
+            "ordinary Workspace Worker restored with an unauthorized subjektiv attachment"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -1241,10 +1297,6 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             }
         }
 
-        worker
-            .materialize_durable_session_head()
-            .await
-            .map_err(|error| format!("materialize durable Worker session head: {error}"))?;
         let workspace_client = worker.workspace_client_handle();
         let started = prepared.start().await.map_err(|error| match error {
             WorkerBootstrapError::Worker(source) => {
@@ -4391,7 +4443,68 @@ mod tests {
             worker_observation_grants: Vec::new(),
             workspace_api: None,
             memory_settings: None,
+            subjektiv_attached: false,
         }
+    }
+
+    #[test]
+    fn host_attachment_alone_activates_subjektiv_profile_policy() {
+        let manifest = || {
+            let mut manifest = WorkerManifest::from_toml(
+                r#"
+                [worker]
+                name = "subjektiv-attachment-test"
+                pwd = "./"
+
+                [model]
+                scheme = "anthropic"
+                model_id = "test-model"
+                auth = { kind = "none" }
+
+                [engine]
+                max_tokens = 100
+
+                [[scope.allow]]
+                target = "./"
+                permission = "read"
+                "#,
+            )
+            .unwrap();
+            manifest.feature.subjektiv.profile.enabled = true;
+            manifest.feature.subjektiv.profile.extraction.enabled = true;
+            manifest
+        };
+        let settings = manifest::WorkspaceMemorySettingsSnapshot {
+            workspace_id: "workspace-subject".to_string(),
+            settings_revision: 3,
+            language: "English".to_string(),
+        };
+        let mut ordinary_request = create_request("ordinary");
+        ordinary_request.workspace_api = Some(WorkspaceApiRef {
+            workspace_id: settings.workspace_id.clone(),
+            base_url: "http://workspace.invalid".to_string(),
+        });
+        ordinary_request.memory_settings = Some(settings.clone());
+        let mut ordinary = manifest();
+        bind_workspace_memory_settings(&mut ordinary, &ordinary_request).unwrap();
+        assert!(ordinary.feature.subjektiv.profile.enabled);
+        assert!(!ordinary.feature.subjektiv.execution_enabled());
+        validate_worker_memory_settings(&ordinary, &ordinary_request).unwrap();
+
+        let mut attached_request = ordinary_request.clone();
+        attached_request.subjektiv_attached = true;
+        let mut attached = manifest();
+        bind_workspace_memory_settings(&mut attached, &attached_request).unwrap();
+        assert!(attached.feature.subjektiv.execution_enabled());
+        assert_eq!(
+            attached.feature.subjektiv.workspace_settings(),
+            Some(settings.clone())
+        );
+        validate_worker_memory_settings(&attached, &attached_request).unwrap();
+        assert!(validate_worker_memory_settings(&attached, &ordinary_request).is_err());
+
+        attached_request.memory_settings = None;
+        assert!(bind_workspace_memory_settings(&mut manifest(), &attached_request).is_err());
     }
 
     fn git(path: &std::path::Path, args: &[&str]) {
@@ -4499,6 +4612,8 @@ mod tests {
                 tools: Vec::new(),
                 context_window: 1_000,
                 context_tokens: 0,
+                reasoning: None,
+                context_usage: None,
             },
         ));
         hub.workers.lock().unwrap().insert(
