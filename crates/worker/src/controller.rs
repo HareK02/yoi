@@ -1558,6 +1558,30 @@ where
         let workspace_client = worker.workspace_client_handle();
         let engine = worker.engine_mut();
 
+        if feature_config.merge_request.any() && wip_mode {
+            let feature_route = wip_mount_registry
+                .allocate_feature_route("merge-request")
+                .map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("allocate Merge Request WIP route: {error}"),
+                    )
+                })?;
+            crate::feature::builtin::merge_request::mount_workspace_http_merge_request_wip(
+                &mut wip_mount_registry,
+                workspace_client.clone(),
+                feature_config.merge_request,
+                wip_permissions.clone(),
+                &feature_route,
+            )
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("mount Merge Request WIP projection: {error}"),
+                )
+            })?;
+        }
+
         if feature_config.ticket.enabled && wip_mode {
             let ticket_access = crate::feature::builtin::ticket::TicketFeatureAccess {
                 authoring: feature_config.ticket.authoring,

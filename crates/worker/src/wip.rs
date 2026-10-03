@@ -2908,6 +2908,394 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merge_request_native_runtime_covers_coder_reviewer_and_orchestrator_authority() {
+        use crate::worker::{ReviewerChildWorkspaceClient, ReviewerContext};
+        use manifest::MergeRequestFeatureConfig;
+
+        let coder_client = Arc::new(ScriptedWorkspaceClient::new([
+            crate::worker::WorkspaceResponse {
+                status: 200,
+                body: json!({
+                    "workspace_id": "workspace",
+                    "merge_request_id": "MR-1",
+                    "repository_key": "main",
+                    "state": "open",
+                    "selector_from": "work/T-685-native-mr",
+                    "selector_to": "develop",
+                    "ticket_ids": ["ticket-internal"],
+                    "created_at": "2026-10-03T00:00:00Z",
+                    "updated_at": "2026-10-03T00:00:00Z",
+                    "thread": []
+                })
+                .to_string(),
+            },
+            crate::worker::WorkspaceResponse {
+                status: 200,
+                body: json!({
+                    "workspace_id": "workspace",
+                    "merge_request_id": "MR-1",
+                    "repository_key": "main",
+                    "state": "open",
+                    "selector_from": "work/T-685-native-mr",
+                    "selector_to": "develop",
+                    "ticket_ids": ["ticket-internal"],
+                    "created_at": "2026-10-03T00:00:00Z",
+                    "updated_at": "2026-10-03T00:00:00Z",
+                    "thread": [],
+                    "source": {"status": "known", "ref": "source-1", "observed_at": "2026-10-03T00:00:00Z"},
+                    "target": {"status": "known", "ref": "target-1", "observed_at": "2026-10-03T00:00:00Z"},
+                    "linked_tickets": [{"ticket_id": "ticket-internal", "key": "T-685"}]
+                })
+                .to_string(),
+            },
+        ]));
+        let coder_config = MergeRequestFeatureConfig {
+            show: true,
+            open: true,
+            ..Default::default()
+        };
+        let mut coder_engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
+        for definition in crate::feature::builtin::merge_request::enabled_merge_request_definitions(
+            coder_client.clone(),
+            coder_config,
+        ) {
+            coder_engine.register_tool(definition);
+        }
+        let mut coder_registry = WipMountRegistry::new();
+        let route = coder_registry
+            .allocate_feature_route("merge-request")
+            .unwrap();
+        crate::feature::builtin::merge_request::mount_workspace_http_merge_request_wip(
+            &mut coder_registry,
+            coder_client.clone(),
+            coder_config,
+            None,
+            &route,
+        )
+        .unwrap();
+        let coder = install_wip_mode_with_mounts(
+            &mut coder_engine,
+            None,
+            "coder-worker".into(),
+            coder_registry,
+        )
+        .unwrap();
+        let discovered = coder.discover("/".into(), 3, false).await.unwrap();
+        let discovered = discovered.content.unwrap();
+        assert!(discovered.contains("/features/merge-request/merge-requests"));
+        assert!(!discovered.contains("/tools/OpenMergeRequest"));
+        assert!(!discovered.contains("/tools/ShowMergeRequest"));
+        coder
+            .inspect("yoi.merge-request/collection/v1".into(), false)
+            .await
+            .unwrap();
+        let collection = "/features/merge-request/merge-requests";
+        let opened = coder
+            .call(
+                collection.into(),
+                "yoi.merge-request/collection/v1".into(),
+                "open".into(),
+                json!({
+                    "ticket": "T-685",
+                    "repository_key": "main",
+                    "selector_from": "work/T-685-native-mr",
+                    "selector_to": "develop"
+                }),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            opened
+                .content
+                .unwrap()
+                .contains(&format!("{collection}/MR-1"))
+        );
+        let item = format!("{collection}/MR-1");
+        coder.discover(item.clone(), 0, false).await.unwrap();
+        coder
+            .inspect("yoi.merge-request/item/v1".into(), false)
+            .await
+            .unwrap();
+        coder
+            .call(
+                item.clone(),
+                "yoi.merge-request/item/v1".into(),
+                "read".into(),
+                json!({"after": 7, "limit": 25}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        let coder_requests = coder_client.requests();
+        assert_eq!(coder_requests.len(), 2);
+        assert_eq!(
+            coder_requests[0].path,
+            "/api/w/workspace/tickets/T-685/merge-request"
+        );
+        let open_body: Json =
+            serde_json::from_str(coder_requests[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(open_body["repository_key"], "main");
+        assert_eq!(open_body["selector_from"], "work/T-685-native-mr");
+        assert_eq!(open_body["selector_to"], "develop");
+        assert_eq!(
+            coder_requests[1].path,
+            "/api/w/workspace/merge-requests/MR-1?after=7&limit=25"
+        );
+
+        let reviewer_inner = Arc::new(ScriptedWorkspaceClient::new([
+            crate::worker::WorkspaceResponse {
+                status: 200,
+                body: json!({
+                    "event_id": "review-1",
+                    "sequence": 2,
+                    "request_event_id": "request-1",
+                    "subject_ref": "source-1",
+                    "ticket_item_revision": "ticket-rev-1",
+                    "ticket_merge_request_subjects": [{"merge_request_id": "MR-1", "subject_ref": "source-1"}],
+                    "decision": "approve",
+                    "body": "approved",
+                    "findings": [],
+                    "reviewer": {"runtime_id": "runtime", "worker_id": "reviewer"},
+                    "created_at": "2026-10-03T00:00:00Z"
+                })
+                .to_string(),
+            },
+        ]));
+        let reviewer_client: Arc<dyn crate::worker::WorkspaceClient> =
+            Arc::new(ReviewerChildWorkspaceClient::new(
+                reviewer_inner.clone(),
+                ReviewerContext {
+                    ticket_id: "T-685".into(),
+                    merge_request_id: "MR-1".into(),
+                },
+                "review-capability-secret".into(),
+            ));
+        let reviewer_config = MergeRequestFeatureConfig {
+            show: true,
+            review: true,
+            ..Default::default()
+        };
+        let mut reviewer_engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
+        for definition in crate::feature::builtin::merge_request::enabled_merge_request_definitions(
+            reviewer_client.clone(),
+            reviewer_config,
+        ) {
+            reviewer_engine.register_tool(definition);
+        }
+        let mut reviewer_registry = WipMountRegistry::new();
+        let route = reviewer_registry
+            .allocate_feature_route("merge-request")
+            .unwrap();
+        crate::feature::builtin::merge_request::mount_workspace_http_merge_request_wip(
+            &mut reviewer_registry,
+            reviewer_client,
+            reviewer_config,
+            None,
+            &route,
+        )
+        .unwrap();
+        let reviewer = install_wip_mode_with_mounts(
+            &mut reviewer_engine,
+            None,
+            "reviewer-worker".into(),
+            reviewer_registry,
+        )
+        .unwrap();
+        reviewer.discover(item.clone(), 0, false).await.unwrap();
+        reviewer
+            .inspect("yoi.merge-request/item/v1".into(), false)
+            .await
+            .unwrap();
+        reviewer
+            .call(
+                item.clone(),
+                "yoi.merge-request/item/v1".into(),
+                "review".into(),
+                json!({"decision": "approve", "body": "approved", "findings": []}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        let reviewer_requests = reviewer_inner.requests();
+        assert_eq!(reviewer_requests.len(), 1);
+        assert_eq!(
+            reviewer_requests[0].path,
+            "/api/w/workspace/merge-requests/MR-1/reviews"
+        );
+        let review_body: Json =
+            serde_json::from_str(reviewer_requests[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(review_body["capability_token"], "review-capability-secret");
+
+        let orchestrator_client = Arc::new(ScriptedWorkspaceClient::new([
+            crate::worker::WorkspaceResponse {
+                status: 200,
+                body: json!({
+                    "ready": true,
+                    "blockers": [],
+                    "subject_ref": "source-1",
+                    "review": {"event_id": "review-1", "decision": "approve"}
+                })
+                .to_string(),
+            },
+            crate::worker::WorkspaceResponse {
+                status: 200,
+                body: json!({
+                    "event_id": "merge-1",
+                    "approved_source_ref": "source-1",
+                    "target_ref_before": "target-1",
+                    "target_ref_after": "result-1"
+                })
+                .to_string(),
+            },
+            crate::worker::WorkspaceResponse {
+                status: 200,
+                body: json!({
+                    "operation_id": "complete-ticket-1",
+                    "ticket_id": "ticket-internal",
+                    "item_revision": "ticket-rev-1",
+                    "merge_request_ids": ["MR-1"],
+                    "requirement_approval_event_id": "review-1"
+                })
+                .to_string(),
+            },
+        ]));
+        let orchestrator_config = MergeRequestFeatureConfig {
+            readiness_check: true,
+            complete: true,
+            ..Default::default()
+        };
+        let mut orchestrator_engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
+        for definition in crate::feature::builtin::merge_request::enabled_merge_request_definitions(
+            orchestrator_client.clone(),
+            orchestrator_config,
+        ) {
+            orchestrator_engine.register_tool(definition);
+        }
+        let mut orchestrator_registry = WipMountRegistry::new();
+        let route = orchestrator_registry
+            .allocate_feature_route("merge-request")
+            .unwrap();
+        crate::feature::builtin::merge_request::mount_workspace_http_merge_request_wip(
+            &mut orchestrator_registry,
+            orchestrator_client.clone(),
+            orchestrator_config,
+            None,
+            &route,
+        )
+        .unwrap();
+        let orchestrator = install_wip_mode_with_mounts(
+            &mut orchestrator_engine,
+            None,
+            "orchestrator-worker".into(),
+            orchestrator_registry,
+        )
+        .unwrap();
+        orchestrator.discover(item.clone(), 0, false).await.unwrap();
+        orchestrator
+            .inspect("yoi.merge-request/item/v1".into(), false)
+            .await
+            .unwrap();
+        orchestrator
+            .call(
+                item.clone(),
+                "yoi.merge-request/item/v1".into(),
+                "check_readiness".into(),
+                json!({}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        orchestrator
+            .call(
+                item.clone(),
+                "yoi.merge-request/item/v1".into(),
+                "complete".into(),
+                json!({
+                    "operation_id": "merge-op-1",
+                    "approval_event_id": "review-1",
+                    "target_ref_before": "target-1",
+                    "target_ref_after": "result-1",
+                    "strategy": "fast_forward",
+                    "resolution": "clean"
+                }),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        orchestrator
+            .discover(collection.into(), 0, false)
+            .await
+            .unwrap();
+        orchestrator
+            .inspect("yoi.merge-request/collection/v1".into(), false)
+            .await
+            .unwrap();
+        let before_ticket_completion = orchestrator
+            .host
+            .projection(&item)
+            .unwrap()
+            .object
+            .validator;
+        orchestrator
+            .call(
+                collection.into(),
+                "yoi.merge-request/collection/v1".into(),
+                "complete_ticket".into(),
+                json!({
+                    "ticket": "T-685",
+                    "operation_id": "complete-ticket-1",
+                    "item_revision": "ticket-rev-1",
+                    "merge_request_ids": ["MR-1"],
+                    "requirement_approval_event_id": "review-1"
+                }),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            before_ticket_completion,
+            orchestrator
+                .host
+                .projection(&item)
+                .unwrap()
+                .object
+                .validator,
+            "Ticket completion must stale every Merge Request in its exact result set"
+        );
+        let stale = orchestrator
+            .call(
+                item,
+                "yoi.merge-request/item/v1".into(),
+                "check_readiness".into(),
+                json!({}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .expect_err("affected Merge Request observation must be stale");
+        assert!(stale.to_string().contains("ValidatorMismatch"));
+        let orchestrator_requests = orchestrator_client.requests();
+        assert_eq!(orchestrator_requests.len(), 3);
+        assert_eq!(
+            orchestrator_requests[0].path,
+            "/api/w/workspace/merge-requests/MR-1/readiness"
+        );
+        assert_eq!(
+            orchestrator_requests[1].path,
+            "/api/w/workspace/merge-requests/MR-1/complete"
+        );
+        let completion_body: Json =
+            serde_json::from_str(orchestrator_requests[1].body.as_deref().unwrap()).unwrap();
+        assert_eq!(completion_body["approval_event_id"], "review-1");
+        assert_eq!(completion_body["target_ref_before"], "target-1");
+        assert_eq!(completion_body["target_ref_after"], "result-1");
+        assert_eq!(
+            orchestrator_requests[2].path,
+            "/api/w/workspace/tickets/T-685/complete"
+        );
+    }
+
+    #[tokio::test]
     async fn objective_native_runtime_covers_discovery_and_all_backend_operations() {
         let query_response = crate::worker::WorkspaceResponse {
             status: 200,
