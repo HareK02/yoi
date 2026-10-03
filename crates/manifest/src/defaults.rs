@@ -88,7 +88,7 @@ pub const COMPACT_SUMMARY_TARGET_TOKENS: u64 = 2_000;
 /// See [`crate::CompactionConfig::summary_max_tokens`].
 pub const COMPACT_SUMMARY_MAX_TOKENS: u64 = 4_000;
 
-/// Dry-run cap for the compacted session's initial request context.
+/// Warning threshold for the assembled compacted history. Compaction continues.
 /// See [`crate::CompactionConfig::result_context_max_tokens`].
 pub const COMPACT_RESULT_CONTEXT_MAX_TOKENS: u64 = 60_000;
 

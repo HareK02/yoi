@@ -6260,10 +6260,25 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         ));
         let result_estimate = agen::token_counter::total_tokens(&new_history, &[]);
         if result_context_max_tokens > 0 && result_estimate.tokens > result_context_max_tokens {
-            return Err(WorkerError::CompactResultContextTooLarge {
-                tokens: result_estimate.tokens,
-                max: result_context_max_tokens,
-            });
+            // This history estimate includes retained items and auto-read files, not
+            // just the summary. Treat the configured result target as advisory;
+            // request-time context safety checks still apply after activation.
+            warn!(
+                result_tokens = result_estimate.tokens,
+                warning_threshold = result_context_max_tokens,
+                retained_tokens = retained_estimate.tokens,
+                summary_tokens,
+                auto_read_tokens,
+                "compacted result context exceeds warning threshold; continuing"
+            );
+            self.alert(
+                AlertLevel::Warn,
+                AlertSource::Compactor,
+                format!(
+                    "compacted result context is larger than expected (≈{} tokens; warning threshold {}); continuing compaction",
+                    result_estimate.tokens, result_context_max_tokens
+                ),
+            );
         }
         let original_entries = self.session.history().entries();
         let derived_sources = original_entries
@@ -8036,9 +8051,6 @@ fn compact_failure_category(error: &WorkerError) -> CompactFailureCategory {
         WorkerError::CompactCancelled => CompactFailureCategory::Cancelled,
         WorkerError::CompactSummaryMissing => CompactFailureCategory::SummaryMissing,
         WorkerError::CompactSummaryTooLarge { .. } => CompactFailureCategory::SummaryTooLarge,
-        WorkerError::CompactResultContextTooLarge { .. } => {
-            CompactFailureCategory::ResultContextTooLarge
-        }
         WorkerError::WorkerStore(_)
         | WorkerError::CompactActiveSegmentChanged
         | WorkerError::SegmentActivationIncomplete { .. } => {
@@ -8155,9 +8167,6 @@ pub enum WorkerError {
 
     #[error("compact summary too large: {tokens} tokens exceeds max {max}")]
     CompactSummaryTooLarge { tokens: u64, max: u64 },
-
-    #[error("compacted result context too large: {tokens} tokens exceeds max {max}")]
-    CompactResultContextTooLarge { tokens: u64, max: u64 },
 
     #[error("invalid system prompt template: {source}")]
     InvalidSystemPromptTemplate {

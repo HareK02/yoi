@@ -20,6 +20,12 @@ Compaction output is not automatically safe. The post-compact context must be re
 
 A `just_compacted` flag must not bypass safety checks. It is easy for a compact summary, retained tail, or prompt resource change to still exceed a context limit.
 
+`result_context_max_tokens` is an advisory warning threshold for the assembled replacement
+history, not a hard activation cap or a provider context limit. Its estimate includes the summary,
+auto-read files, references, retained tail, and TaskStore context. Exceeding it emits a Compactor
+warning and continues without discarding the generated summary or stripping auto-read/retained
+content. `0` disables this warning. Normal request-time safety checks still apply after activation.
+
 ## Large sessions
 
 Large-session compaction should not send an entire prefix transcript as the summary input. Prefer bounded overview/index inputs plus exploration, then keep the retained tail small and explicit.

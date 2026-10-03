@@ -582,6 +582,157 @@ fn system_texts_in_sink_session_start(
 }
 
 #[tokio::test]
+async fn result_context_warning_preserves_auto_read_and_continues() {
+    // The auto-read contents alone exceed the warning threshold in the middle
+    // case. Disabled and larger thresholds must remain silent.
+    for (threshold, expect_warning) in [(0, false), (1_000, true), (50_000, false)] {
+        let mark_input = serde_json::json!({ "file_path": "context.txt" }).to_string();
+        let client = MockClient::new(vec![
+            single_text_events("retained response"),
+            write_summary_tool_use_events("summary-1", "replacement summary"),
+            vec![
+                LlmEvent::tool_use_start(0, "mark-1", "mark_read_required"),
+                LlmEvent::tool_input_delta(0, mark_input),
+                LlmEvent::tool_use_stop(0),
+                LlmEvent::Status(StatusEvent {
+                    status: ResponseStatus::Completed,
+                }),
+            ],
+            single_text_events("done"),
+            text_events_with_usage("continued on replacement", 4_000),
+        ]);
+        let calls = Arc::clone(&client.call_count);
+        let manifest = MANUAL_ONLY_MANIFEST_TOML.replace(
+            "[compaction]",
+            &format!("[compaction]\nresult_context_max_tokens = {threshold}"),
+        );
+        let (mut worker, store) = make_worker_with_manifest_and_store(&manifest, client).await;
+        let file_contents = "load-bearing file contents\n".repeat(300);
+        let file = worker
+            .filesystem_authority()
+            .as_local()
+            .unwrap()
+            .root
+            .join("context.txt");
+        std::fs::write(file, &file_contents).unwrap();
+        let (tx, mut rx) = broadcast::channel::<Event>(64);
+        worker.attach_alerter(worker::Alerter::new(tx));
+        worker.run_text("retained input").await.unwrap();
+        let source_segment = worker.segment_id();
+        let _ = drain(&mut rx);
+
+        let replacement_segment = worker.compact(100).await.unwrap();
+        assert_ne!(replacement_segment, source_segment);
+        assert_eq!(worker.segment_id(), replacement_segment);
+        assert_eq!(
+            WorkerMetadataStore::read_by_name(&store, "test-worker")
+                .unwrap()
+                .unwrap()
+                .active
+                .unwrap()
+                .segment_id,
+            Some(replacement_segment)
+        );
+        let system_texts = system_texts_in_sink_session_start(&worker);
+        assert!(
+            system_texts
+                .iter()
+                .any(|text| text.contains("replacement summary"))
+        );
+        assert!(
+            system_texts
+                .iter()
+                .any(|text| text.contains(&file_contents))
+        );
+        let result_tokens = agen::token_counter::total_tokens(&worker.history(), &[]).tokens;
+        assert!(result_tokens > 1_000 && result_tokens < 50_000);
+        assert!(worker.history().iter().any(|item| {
+            matches!(item, Item::Message { content, .. }
+                if content.iter().any(|part| part.as_text().contains("retained response")))
+        }));
+        let warnings = drain(&mut rx)
+            .into_iter()
+            .filter(|event| {
+                matches!(event, Event::Alert(alert)
+                if alert.level == protocol::AlertLevel::Warn
+                    && alert.source == protocol::AlertSource::Compactor
+                    && alert.message.contains("compacted result context"))
+            })
+            .count();
+        assert_eq!(warnings, usize::from(expect_warning));
+
+        worker.run_text("continue").await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        assert_eq!(worker.segment_id(), replacement_segment);
+        let metrics = session_metrics::read_session_metrics(&store, worker.session_id()).unwrap();
+        let finish = metrics
+            .iter()
+            .find(|record| record.metric.name == "compact.finish")
+            .unwrap();
+        assert_eq!(finish.metric.dimensions["outcome"], "succeeded");
+        let auto_read = metrics
+            .iter()
+            .find(|record| record.metric.name == "compact.auto_read_tokens")
+            .unwrap();
+        assert!(auto_read.metric.value.unwrap() > 1_000.0);
+    }
+}
+
+#[tokio::test]
+async fn result_context_warning_does_not_stop_automatic_resume() {
+    let client = MockClient::new(vec![
+        text_events_with_usage("seed", 100_000),
+        write_summary_tool_use_events("summary-1", "replacement summary"),
+        single_text_events("done"),
+        text_events_with_usage("continued on replacement", 1_000),
+    ]);
+    let calls = Arc::clone(&client.call_count);
+    let manifest = MID_TURN_MANIFEST_TOML.replace(
+        "compact_request_threshold = 100",
+        "compact_request_threshold = 50000\nresult_context_max_tokens = 1",
+    );
+    let (mut worker, store) = make_worker_with_manifest_and_store(&manifest, client).await;
+    let (tx, mut rx) = broadcast::channel::<Event>(64);
+    worker.attach_alerter(worker::Alerter::new(tx));
+    worker.run_text("seed input").await.unwrap();
+    let source_segment = worker.segment_id();
+
+    worker.run_text("continue").await.unwrap();
+    assert_ne!(worker.segment_id(), source_segment);
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert!(
+        drain(&mut rx)
+            .iter()
+            .any(|event| matches!(event, Event::Alert(alert)
+        if alert.level == protocol::AlertLevel::Warn
+            && alert.source == protocol::AlertSource::Compactor
+            && alert.message.contains("compacted result context")))
+    );
+    let entries = store
+        .read_all(worker.session_id(), worker.segment_id())
+        .unwrap();
+    assert!(entries.iter().any(|entry| matches!(
+        entry,
+        LogEntry::RunResumed {
+            source: protocol::RunResumeSource::Compaction,
+            ..
+        }
+    )));
+    assert!(entries.iter().any(|entry| matches!(
+        entry,
+        LogEntry::RunCompleted {
+            result: agen::EngineResult::Finished,
+            ..
+        }
+    )));
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| matches!(entry, LogEntry::RunErrored { .. }))
+    );
+}
+
+#[tokio::test]
 async fn active_segment_cas_rejects_stale_compaction_writer() {
     let client = MockClient::new(vec![
         single_text_events("seed response"),
