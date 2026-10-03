@@ -1545,11 +1545,15 @@ fn model_ticket_reference(
 ) -> Result<String, ToolError> {
     let ticket = backend
         .show(TicketIdOrSlug::Id(reference.to_string()))
-        .map_err(|error| backend_error(tool_name, error))?;
+        .map_err(|error| {
+            ToolError::Internal(format!(
+                "{tool_name} outcome unknown after mutation while resolving Ticket reference: {error}"
+            ))
+        })?;
     match ticket.meta.resource_key {
         Some(resource_key) if is_canonical_ticket_resource_key(&resource_key) => Ok(resource_key),
-        Some(_) => Err(ToolError::ExecutionFailed(format!(
-            "{tool_name} failed: required Ticket key is unavailable"
+        Some(_) => Err(ToolError::Internal(format!(
+            "{tool_name} outcome unknown after mutation: required Ticket key is unavailable"
         ))),
         None => Ok(ticket.meta.id),
     }
@@ -1996,6 +2000,18 @@ mod tests {
                 (meta.name == name).then_some(meta.description)
             })
             .expect("tool exists")
+    }
+
+    #[test]
+    fn post_mutation_reference_failures_are_outcome_unknown() {
+        let temp = TempDir::new().unwrap();
+        let backend = TicketToolBackend::new(backend(&temp));
+        let error = model_ticket_reference(&backend, "missing", "TicketClose").unwrap_err();
+        assert!(matches!(
+            error,
+            ToolError::Internal(message)
+                if message.contains("outcome unknown after mutation")
+        ));
     }
 
     #[test]

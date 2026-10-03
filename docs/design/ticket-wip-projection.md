@@ -60,9 +60,9 @@ No native operation is inferred for a Tool that the Feature did not register. En
 
 `query` uses the authoritative Workspace bounded query and cursor contract. Results include canonical `T-*` references and native item paths without embedding unbounded thread or evidence history. `read` uses the authoritative bounded detail projection for thread events, relations, Objective references, assignments, Merge Requests and evidence. Objective and Merge Request values remain references/data; this projection neither assumes their native routes nor grants their authority.
 
-Backend 401/403 failures map to permission denial, 404 to missing objects, and deterministic 400/409/422 validation or workflow failures to invalid arguments. Cancellation and interruption remain distinct. Transport, server, or malformed post-dispatch results retain unknown outcome, and mutating operations are not retried automatically.
+Backend 401/403 failures map to permission denial, 404 to missing objects, and deterministic 400/409/422 validation or workflow failures to invalid arguments when the typed operation fails before any successful mutation. Cancellation and interruption remain distinct. Post-mutation canonical-reference lookups are explicitly marked as unknown-outcome stages, so even a later deterministic HTTP status cannot misreport an already-committed write as a rejection. Transport, server, malformed response, and other post-dispatch failures retain unknown outcome, and mutating operations are not retried automatically.
 
-Successful reads observe the authoritative update marker. Successful mutations advance a local observation generation and invalidate every known canonical/internal alias for the same Ticket. A stale validator is rejected by the common WIP Host before another Backend dispatch; the caller must rediscover/reinspect and explicitly decide whether to call again.
+Successful reads observe the authoritative item revision. Successful mutations advance a local observation generation even when the first call uses an internal ID whose canonical alias has not yet been learned. Once a read or mutation reveals the canonical key, the canonical/internal alias groups are merged and invalidated together. Relation mutations also invalidate the reported target Ticket, while queue results invalidate every reported queued Ticket, because those objects' incoming relations or workflow states changed. A stale validator is rejected by the common WIP Host before another Backend dispatch; the caller must rediscover/reinspect and explicitly decide whether to call again.
 
 ## Preserved Ticket contracts
 
@@ -77,4 +77,4 @@ The projection invokes the existing Tool and scoped Backend routes, so the follo
 - exact forward relation ownership, inverse views and relation target validation;
 - orchestration-plan validation and bounded query behavior.
 
-The ordinary JSON Schema is retained as a second validation boundary behind the WIP descriptor. Optional fields omitted by the caller stay omitted when reconstructing permission input; defaults are applied only by the same ordinary typed Tool that applies them in Tool mode.
+The ordinary JSON Schema is retained as a second validation boundary behind the WIP descriptor. Optional fields omitted by the caller stay omitted, while an explicitly supplied `null` stays present as JSON `null`, so permission matching sees the same input shape as normal Tool mode. Defaults are applied only by the same ordinary typed Tool that applies them in Tool mode.

@@ -1604,6 +1604,9 @@ impl WipOperationHandler for TicketItemWipHandler {
             &response,
             tool.projection.mutating,
         );
+        if tool.projection.mutating {
+            record_affected_ticket_mutations(&self.revisions, &self.ticket_reference, &response);
+        }
         Ok(WipOperationOutput::native(
             json_to_wip(&response).map_err(WipOperationError::OutcomeUnknown)?,
         ))
@@ -1652,9 +1655,6 @@ fn native_ticket_input(
     }
     let mut input = serde_json::Map::new();
     for (name, value) in arguments {
-        if matches!(value, WipValue::Unit) {
-            continue;
-        }
         input.insert(
             name.clone(),
             wip_to_json(value).map_err(|message| {
@@ -1702,7 +1702,7 @@ fn map_ticket_tool_error(error: ToolError) -> WipOperationError {
             ProtocolErrorCode::InvalidArguments,
             format!("{code}: {message}"),
         ),
-        ToolError::ExecutionFailed(message) | ToolError::Internal(message) => {
+        ToolError::ExecutionFailed(message) => {
             if message.contains("HTTP status 401") || message.contains("HTTP status 403") {
                 protocol_failure(ProtocolErrorCode::PermissionDenied, message)
             } else if message.contains("HTTP status 404") {
@@ -1716,6 +1716,7 @@ fn map_ticket_tool_error(error: ToolError) -> WipOperationError {
                 WipOperationError::OutcomeUnknown(message)
             }
         }
+        ToolError::Internal(message) => WipOperationError::OutcomeUnknown(message),
     }
 }
 
@@ -1753,6 +1754,7 @@ fn add_ticket_paths(response: &mut Value, collection_route: &str) {
 fn ticket_reference(response: &Value) -> Option<&str> {
     response
         .get("ticket")
+        .or_else(|| response.get("ticket_id"))
         .or_else(|| response.get("id"))
         .or_else(|| response.get("meta").and_then(|meta| meta.get("id")))
         .and_then(Value::as_str)
@@ -1774,35 +1776,49 @@ fn record_ticket_observation(
     response: &Value,
     mutation: bool,
 ) {
-    let canonical = ticket_reference(response)
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            bound_reference
-                .filter(|reference| is_canonical_ticket_resource_key(reference))
-                .map(ToOwned::to_owned)
-        });
+    let observed_canonical = ticket_reference(response).map(ToOwned::to_owned);
     let mut state = revisions.lock().unwrap_or_else(|error| error.into_inner());
-    let canonical = canonical.or_else(|| {
-        bound_reference.and_then(|reference| {
-            state
-                .aliases_by_canonical
-                .iter()
-                .find(|(_, aliases)| aliases.contains(reference))
-                .map(|(canonical, _)| canonical.clone())
-        })
+    let existing_bound_group = bound_reference.and_then(|reference| {
+        state
+            .aliases_by_canonical
+            .iter()
+            .find(|(_, aliases)| aliases.contains(reference))
+            .map(|(canonical, _)| canonical.clone())
     });
-    let Some(canonical) = canonical else {
+    let existing_canonical_group = observed_canonical.as_deref().and_then(|reference| {
+        state
+            .aliases_by_canonical
+            .iter()
+            .find(|(_, aliases)| aliases.contains(reference))
+            .map(|(canonical, _)| canonical.clone())
+    });
+    let Some(group_key) = observed_canonical
+        .clone()
+        .or(existing_canonical_group.clone())
+        .or(existing_bound_group.clone())
+        .or_else(|| bound_reference.map(ToOwned::to_owned))
+    else {
         return;
     };
-    let aliases = state
-        .aliases_by_canonical
-        .entry(canonical.clone())
-        .or_default();
-    aliases.insert(canonical.clone());
+
+    let mut aliases = BTreeSet::from([group_key.clone()]);
+    for prior_group in [existing_bound_group, existing_canonical_group]
+        .into_iter()
+        .flatten()
+        .chain(std::iter::once(group_key.clone()))
+        .collect::<BTreeSet<_>>()
+    {
+        if let Some(existing) = state.aliases_by_canonical.remove(&prior_group) {
+            aliases.extend(existing);
+        }
+    }
+    if let Some(canonical) = observed_canonical {
+        aliases.insert(canonical);
+    }
     if let Some(reference) = bound_reference {
         aliases.insert(reference.to_string());
     }
-    let aliases = aliases.clone();
+
     let revision = if mutation {
         state.mutation_sequence = state.mutation_sequence.saturating_add(1);
         format!(
@@ -1818,8 +1834,40 @@ fn record_ticket_observation(
             .find_map(|alias| state.revisions.get(alias).cloned())
             .unwrap_or_else(|| "observed".into())
     };
-    for alias in aliases {
-        state.revisions.insert(alias, revision.clone());
+    for alias in &aliases {
+        state.revisions.insert(alias.clone(), revision.clone());
+    }
+    state.aliases_by_canonical.insert(group_key, aliases);
+}
+
+fn record_affected_ticket_mutations(
+    revisions: &TicketRevisions,
+    bound_reference: &str,
+    response: &Value,
+) {
+    let mut subject_references = BTreeSet::from([bound_reference.to_string()]);
+    if let Some(reference) = ticket_reference(response) {
+        subject_references.insert(reference.to_string());
+    }
+    let mut affected = BTreeSet::new();
+    if let Some(target) = response
+        .get("target")
+        .and_then(Value::as_str)
+        .filter(|reference| is_ticket_route_reference(reference))
+    {
+        affected.insert(target.to_string());
+    }
+    if let Some(queued) = response.get("queued_tickets").and_then(Value::as_array) {
+        affected.extend(
+            queued
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|reference| is_ticket_route_reference(reference))
+                .map(ToOwned::to_owned),
+        );
+    }
+    for reference in affected.difference(&subject_references) {
+        record_ticket_observation(revisions, Some(reference), &Value::Null, true);
     }
 }
 
@@ -2094,7 +2142,17 @@ mod tests {
         ]);
         let input = native_ticket_input(&arguments, Some("T-42"), Some("ticket"))
             .unwrap_or_else(|_| panic!("route-bound Ticket input should project"));
-        assert_eq!(input, json!({"ticket": "T-42", "body": "comment"}));
+        assert_eq!(
+            input,
+            json!({"ticket": "T-42", "body": "comment", "reason": null})
+        );
+        let omitted = native_ticket_input(
+            &BTreeMap::from([("body".into(), WipValue::String("comment".into()))]),
+            Some("T-42"),
+            Some("ticket"),
+        )
+        .unwrap_or_else(|_| panic!("omitted optional Ticket input should project"));
+        assert_eq!(omitted, json!({"ticket": "T-42", "body": "comment"}));
         let replaced = native_ticket_input(
             &BTreeMap::from([("ticket".into(), WipValue::String("T-99".into()))]),
             Some("T-42"),
@@ -2128,18 +2186,31 @@ mod tests {
     #[test]
     fn ticket_alias_validators_refresh_together_after_mutation() {
         let revisions = Arc::new(Mutex::new(TicketRevisionState::default()));
-        record_ticket_observation(
-            &revisions,
-            Some("00001TICKET"),
-            &json!({"ticket": "T-42", "updated_at": "rev-1"}),
-            false,
-        );
         let resolver = TicketItemResolver {
             tools: HashMap::new(),
             permissions: None,
             collection_route: "/features/ticket/tickets".into(),
             revisions: Arc::clone(&revisions),
         };
+        let unobserved_internal = resolver.resolve("00001TICKET").unwrap().object.validator;
+        record_ticket_observation(
+            &revisions,
+            Some("00001TICKET"),
+            &json!({"ticket": "00001TICKET", "ok": true}),
+            true,
+        );
+        assert_ne!(
+            unobserved_internal,
+            resolver.resolve("00001TICKET").unwrap().object.validator,
+            "a first mutation through an internal-id route must stale that route"
+        );
+
+        record_ticket_observation(
+            &revisions,
+            Some("00001TICKET"),
+            &json!({"ticket": "T-42", "item_revision": "rev-1"}),
+            false,
+        );
         let canonical_v1 = resolver.resolve("T-42").unwrap().object.validator;
         let internal_v1 = resolver.resolve("00001TICKET").unwrap().object.validator;
         record_ticket_observation(
@@ -2155,6 +2226,44 @@ mod tests {
         assert_ne!(
             internal_v1,
             resolver.resolve("00001TICKET").unwrap().object.validator
+        );
+    }
+
+    #[test]
+    fn related_ticket_mutations_invalidate_target_and_queue_observations() {
+        let revisions = Arc::new(Mutex::new(TicketRevisionState::default()));
+        for ticket in ["T-42", "T-43", "T-44"] {
+            record_ticket_observation(
+                &revisions,
+                Some(ticket),
+                &json!({"ticket": ticket, "item_revision": "rev-1"}),
+                false,
+            );
+        }
+        let resolver = TicketItemResolver {
+            tools: HashMap::new(),
+            permissions: None,
+            collection_route: "/features/ticket/tickets".into(),
+            revisions: Arc::clone(&revisions),
+        };
+        let target_v1 = resolver.resolve("T-43").unwrap().object.validator;
+        let queued_v1 = resolver.resolve("T-44").unwrap().object.validator;
+        record_affected_ticket_mutations(
+            &revisions,
+            "T-42",
+            &json!({
+                "ticket": "T-42",
+                "target": "T-43",
+                "queued_tickets": ["T-42", "T-44"]
+            }),
+        );
+        assert_ne!(
+            target_v1,
+            resolver.resolve("T-43").unwrap().object.validator
+        );
+        assert_ne!(
+            queued_v1,
+            resolver.resolve("T-44").unwrap().object.validator
         );
     }
 
@@ -2175,6 +2284,12 @@ mod tests {
         }
         assert!(matches!(
             map_ticket_tool_error(ToolError::ExecutionFailed("transport disconnected".into())),
+            WipOperationError::OutcomeUnknown(_)
+        ));
+        assert!(matches!(
+            map_ticket_tool_error(ToolError::Internal(
+                "TicketClose outcome unknown after mutation: HTTP status 404".into()
+            )),
             WipOperationError::OutcomeUnknown(_)
         ));
     }
