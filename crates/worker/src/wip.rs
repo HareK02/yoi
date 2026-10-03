@@ -1955,6 +1955,7 @@ mod tests {
     use agen::llm_client::client::LlmClient;
     use agen::llm_client::{ClientError, Request as LlmRequest, ResponseStream};
     use futures::stream;
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use wip_protocol::{EnumCase, FieldDeclaration, TypeDeclaration, UnionCase};
 
@@ -1971,6 +1972,82 @@ mod tests {
         ) -> Result<ToolOutput, ToolError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(input.to_string().into())
+        }
+    }
+
+    #[derive(Debug)]
+    struct ScriptedWorkspaceClient {
+        responses: Mutex<VecDeque<crate::worker::WorkspaceResponse>>,
+        requests: Mutex<Vec<crate::worker::WorkspaceRequest>>,
+    }
+
+    impl ScriptedWorkspaceClient {
+        fn new(responses: impl IntoIterator<Item = crate::worker::WorkspaceResponse>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into_iter().collect()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<crate::worker::WorkspaceRequest> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        }
+    }
+
+    impl crate::worker::WorkspaceClient for ScriptedWorkspaceClient {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("workspace")
+        }
+
+        fn kind(&self) -> &str {
+            "scripted-test"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn execute(
+            &self,
+            request: crate::worker::WorkspaceRequest,
+        ) -> Result<crate::worker::WorkspaceResponse, crate::worker::WorkspaceClientError> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(request);
+            self.responses
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .pop_front()
+                .ok_or_else(|| {
+                    crate::worker::WorkspaceClientError::Unavailable(
+                        "scripted response queue is empty".into(),
+                    )
+                })
+        }
+    }
+
+    fn objective_detail_response(revision: &str) -> crate::worker::WorkspaceResponse {
+        crate::worker::WorkspaceResponse {
+            status: 200,
+            body: json!({
+                "id": "00001OBJECTIVE",
+                "resource_key": "O-3",
+                "title": "Objective",
+                "body": "Body",
+                "body_truncated": false,
+                "state": "active",
+                "revision": revision,
+                "created_at": null,
+                "updated_at": null,
+                "linked_ticket_summaries": [],
+                "events": [],
+                "event_page": {"next_cursor": null, "has_more": false}
+            })
+            .to_string(),
         }
     }
 
@@ -2634,6 +2711,156 @@ mod tests {
                 .projection("/features/objective/objectives")
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn objective_native_runtime_covers_discovery_and_all_backend_operations() {
+        let query_response = crate::worker::WorkspaceResponse {
+            status: 200,
+            body: json!({
+                "items": [{
+                    "id": "00001OBJECTIVE",
+                    "resource_key": "O-3",
+                    "title": "Objective",
+                    "state": "active",
+                    "created_at": null,
+                    "updated_at": null,
+                    "matched_fields": [],
+                    "snippet": null,
+                    "linked_ticket_count": 0,
+                    "linked_tickets": [],
+                    "linked_ticket_keys": []
+                }],
+                "page": {"next_cursor": null, "has_more": false},
+                "record_authority": "workspace_sqlite"
+            })
+            .to_string(),
+        };
+        let ticket_response = || crate::worker::WorkspaceResponse {
+            status: 200,
+            body: json!({"resource_key": "T-7"}).to_string(),
+        };
+        let client = Arc::new(ScriptedWorkspaceClient::new([
+            query_response,
+            objective_detail_response("rev-1"),
+            objective_detail_response("rev-1"),
+            objective_detail_response("rev-2"),
+            objective_detail_response("rev-3"),
+            ticket_response(),
+            objective_detail_response("rev-4"),
+            ticket_response(),
+            objective_detail_response("rev-5"),
+        ]));
+        let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
+        for definition in
+            crate::feature::builtin::objective::workspace_http_objective_tools(client.clone())
+        {
+            engine.register_tool(definition);
+        }
+        let permissions = Some(ToolPermissionConfig {
+            default_action: ToolPermissionAction::Allow,
+            rules: vec![manifest::ToolPermissionRule {
+                tool: "ObjectiveCreate".into(),
+                pattern: serde_json::to_string(&json!({"title": "Denied"})).unwrap(),
+                action: ToolPermissionAction::Deny,
+            }],
+        });
+        let mut registry = WipMountRegistry::new();
+        let feature_route = registry.allocate_feature_route("objective").unwrap();
+        crate::feature::builtin::objective::mount_workspace_http_objective_wip(
+            &mut registry,
+            client.clone(),
+            permissions.clone(),
+            &feature_route,
+        )
+        .unwrap();
+        let runtime =
+            install_wip_mode_with_mounts(&mut engine, permissions, "worker-a".into(), registry)
+                .unwrap();
+
+        let discovered = runtime.discover("/".into(), 3, false).await.unwrap();
+        let discovered = discovered.content.unwrap();
+        assert!(discovered.contains("/features/objective/objectives"));
+        assert!(!discovered.contains("/tools/QueryObjective"));
+        runtime
+            .inspect("yoi.objective/collection/v1".into(), false)
+            .await
+            .unwrap();
+        let collection_path = "/features/objective/objectives";
+        runtime
+            .call(
+                collection_path.into(),
+                "yoi.objective/collection/v1".into(),
+                "query".into(),
+                json!({}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        let denied = runtime
+            .call(
+                collection_path.into(),
+                "yoi.objective/collection/v1".into(),
+                "create".into(),
+                json!({"title": "Denied"}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap_err();
+        assert!(denied.to_string().contains("PermissionDenied"));
+        assert_eq!(client.requests().len(), 1);
+        let created = runtime
+            .call(
+                collection_path.into(),
+                "yoi.objective/collection/v1".into(),
+                "create".into(),
+                json!({"title": "Objective"}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            created
+                .content
+                .unwrap()
+                .contains("/features/objective/objectives/O-3")
+        );
+
+        let item_path = "/features/objective/objectives/O-3";
+        runtime.discover(item_path.into(), 0, false).await.unwrap();
+        runtime
+            .inspect("yoi.objective/item/v1".into(), false)
+            .await
+            .unwrap();
+        for (operation, arguments) in [
+            ("read", json!({})),
+            ("edit", json!({"title": "Changed"})),
+            ("set_state", json!({"state": "paused"})),
+            ("link_ticket", json!({"ticket_id": "T-7"})),
+            ("unlink_ticket", json!({"ticket_id": "T-7"})),
+        ] {
+            runtime
+                .call(
+                    item_path.into(),
+                    "yoi.objective/item/v1".into(),
+                    operation.into(),
+                    arguments,
+                    ToolExecutionContext::direct(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let requests = client.requests();
+        assert_eq!(requests.len(), 9);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.path.contains("ticket-links"))
+                .count(),
+            2
+        );
+        assert!(requests.iter().all(|request| !request.path.contains("//")));
     }
 
     struct FailingTool {
