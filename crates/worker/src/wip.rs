@@ -872,10 +872,38 @@ impl WipRuntime {
         arguments: Json,
         execution: ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
-        let arguments = BTreeMap::from([(
-            "input".to_string(),
-            json_to_wip(&arguments).map_err(ToolError::InvalidArgument)?,
-        )]);
+        let arguments = match self
+            .host
+            .projection(&path)
+            .map(|projection| projection.kind)
+        {
+            Some(WipProjectionKind::Compatibility) => BTreeMap::from([(
+                "input".to_string(),
+                json_to_wip(&arguments).map_err(ToolError::InvalidArgument)?,
+            )]),
+            Some(WipProjectionKind::Native) => {
+                let Json::Object(arguments) = &arguments else {
+                    return Err(ToolError::InvalidArgument(
+                        "native WIP operation arguments must be a JSON object keyed by descriptor parameter name"
+                            .into(),
+                    ));
+                };
+                arguments
+                    .iter()
+                    .map(|(name, value)| {
+                        Ok((
+                            name.clone(),
+                            json_to_wip(value).map_err(ToolError::InvalidArgument)?,
+                        ))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, ToolError>>()?
+            }
+            None => {
+                return Err(ToolError::InvalidArgument(format!(
+                    "WIP target `{path}` is not published"
+                )));
+            }
+        };
         let prepared = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             let session = state.session.clone();
@@ -1782,6 +1810,98 @@ mod tests {
             registry.mount(collision),
             Err(WipMountError::RouteCollision { .. })
         ));
+    }
+
+    struct NativeConcat;
+
+    #[async_trait]
+    impl WipOperationHandler for NativeConcat {
+        async fn call(
+            &self,
+            operation: &str,
+            arguments: &BTreeMap<String, Value>,
+            _context: WipCallContext,
+        ) -> Result<WipOperationOutput, WipOperationError> {
+            assert_eq!(operation, "concat");
+            let (Some(Value::String(left)), Some(Value::String(right))) =
+                (arguments.get("left"), arguments.get("right"))
+            else {
+                panic!("descriptor validation must run before native handler")
+            };
+            Ok(WipOperationOutput::native(Value::String(format!(
+                "{left}{right}"
+            ))))
+        }
+    }
+
+    fn native_concat_projection() -> WipProjection {
+        WipProjection {
+            route: "/native/concat".into(),
+            capability: "native:concat".into(),
+            kind: WipProjectionKind::Native,
+            object: Object {
+                name: "concat".into(),
+                description: Some("native concat sample".into()),
+                interfaces: vec!["yoi.native/concat/v1".into()],
+                r#ref: Some("native:concat".into()),
+                validator: Some(vec![1]),
+            },
+            interface: "yoi.native/concat/v1".into(),
+            descriptor: InterfaceDescriptor {
+                format: INTERFACE_FORMAT_V1.into(),
+                documentation: None,
+                types: Vec::new(),
+                operations: vec![OperationDeclaration {
+                    name: "concat".into(),
+                    documentation: None,
+                    parameters: vec![
+                        ParameterDeclaration {
+                            name: "left".into(),
+                            required: true,
+                            documentation: None,
+                            r#type: TypeExpr::String,
+                        },
+                        ParameterDeclaration {
+                            name: "right".into(),
+                            required: true,
+                            documentation: None,
+                            r#type: TypeExpr::String,
+                        },
+                    ],
+                    returns: ReturnDeclaration {
+                        documentation: None,
+                        r#type: TypeExpr::String,
+                    },
+                }],
+            },
+            interface_validator: Some(vec![1]),
+            handler: Arc::new(NativeConcat),
+        }
+    }
+
+    #[tokio::test]
+    async fn native_projection_accepts_descriptor_named_arguments_end_to_end() {
+        let mut registry = WipMountRegistry::new();
+        registry.mount(native_concat_projection()).unwrap();
+        let runtime =
+            WipRuntime::new(WipHost::new(registry), SecurityContext::new("worker-a"), 0).unwrap();
+        runtime.discover("/".into(), 2, false).await.unwrap();
+        runtime
+            .inspect("yoi.native/concat/v1".into(), false)
+            .await
+            .unwrap();
+        let output = runtime
+            .call(
+                "/native/concat".into(),
+                "yoi.native/concat/v1".into(),
+                "concat".into(),
+                json!({"left": "W", "right": "IP"}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.summary, "WIP operation completed");
+        assert_eq!(output.content.as_deref(), Some("\"WIP\""));
     }
 
     #[tokio::test]
