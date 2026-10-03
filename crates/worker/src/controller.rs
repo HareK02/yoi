@@ -1558,6 +1558,36 @@ where
         let workspace_client = worker.workspace_client_handle();
         let engine = worker.engine_mut();
 
+        if feature_config.ticket.enabled && wip_mode {
+            let ticket_access = crate::feature::builtin::ticket::TicketFeatureAccess {
+                authoring: feature_config.ticket.authoring,
+                thread: feature_config.ticket.thread,
+                intake: feature_config.ticket.intake,
+                workflow: feature_config.ticket.workflow,
+            };
+            let feature_route = wip_mount_registry
+                .allocate_feature_route("ticket")
+                .map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("allocate Ticket WIP route: {error}"),
+                    )
+                })?;
+            crate::feature::builtin::ticket::mount_workspace_http_ticket_wip(
+                &mut wip_mount_registry,
+                workspace_client.clone(),
+                ticket_access,
+                wip_permissions.clone(),
+                &feature_route,
+            )
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("mount Ticket WIP projection: {error}"),
+                )
+            })?;
+        }
+
         // Objective tools expose scoped project Objective reads and mutations through
         // the Backend Workspace API. Workers must not guess local `.yoi/objectives`
         // paths or read/edit Objective files directly.

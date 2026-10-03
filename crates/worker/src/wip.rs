@@ -2714,6 +2714,200 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ticket_native_runtime_covers_authoring_and_workflow_role_surfaces() {
+        let query_response = crate::worker::WorkspaceResponse {
+            status: 200,
+            body: json!({
+                "items": [],
+                "page": {"next_cursor": null, "has_more": false}
+            })
+            .to_string(),
+        };
+        let create_response = crate::worker::WorkspaceResponse {
+            status: 200,
+            body: json!({
+                "id": "00001TICKET",
+                "resource_key": "T-9",
+                "slug": "new-ticket",
+                "status": "Open"
+            })
+            .to_string(),
+        };
+        let comment_response = crate::worker::WorkspaceResponse {
+            status: 204,
+            body: String::new(),
+        };
+        let authoring_client = Arc::new(ScriptedWorkspaceClient::new([
+            query_response,
+            create_response,
+            comment_response,
+        ]));
+        let authoring_access =
+            crate::feature::builtin::ticket::TicketFeatureAccess::workspace_authoring();
+        let mut authoring_engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
+        for definition in crate::feature::builtin::ticket::enabled_ticket_definitions(
+            authoring_client.clone(),
+            authoring_access,
+        ) {
+            authoring_engine.register_tool(definition);
+        }
+        let mut authoring_registry = WipMountRegistry::new();
+        let route = authoring_registry.allocate_feature_route("ticket").unwrap();
+        crate::feature::builtin::ticket::mount_workspace_http_ticket_wip(
+            &mut authoring_registry,
+            authoring_client.clone(),
+            authoring_access,
+            None,
+            &route,
+        )
+        .unwrap();
+        let authoring = install_wip_mode_with_mounts(
+            &mut authoring_engine,
+            None,
+            "authoring-worker".into(),
+            authoring_registry,
+        )
+        .unwrap();
+
+        let discovered = authoring.discover("/".into(), 3, false).await.unwrap();
+        let discovered = discovered.content.unwrap();
+        assert!(discovered.contains("/features/ticket/tickets"));
+        assert!(!discovered.contains("/tools/QueryTicket"));
+        assert!(!discovered.contains("/tools/TicketCreate"));
+        authoring
+            .inspect("yoi.ticket/collection/v1".into(), false)
+            .await
+            .unwrap();
+        let collection = "/features/ticket/tickets";
+        authoring
+            .call(
+                collection.into(),
+                "yoi.ticket/collection/v1".into(),
+                "query".into(),
+                json!({}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        let created = authoring
+            .call(
+                collection.into(),
+                "yoi.ticket/collection/v1".into(),
+                "create".into(),
+                json!({"title": "New ticket"}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            created
+                .content
+                .unwrap()
+                .contains("/features/ticket/tickets/T-9")
+        );
+        let item = "/features/ticket/tickets/T-9";
+        authoring.discover(item.into(), 0, false).await.unwrap();
+        authoring
+            .inspect("yoi.ticket/item/v1".into(), false)
+            .await
+            .unwrap();
+        authoring
+            .call(
+                item.into(),
+                "yoi.ticket/item/v1".into(),
+                "comment".into(),
+                json!({"body": "Native comment"}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        let authoring_requests = authoring_client.requests();
+        assert_eq!(authoring_requests.len(), 3);
+        assert!(authoring_requests[0].path.ends_with("/tickets/query"));
+        assert!(authoring_requests[1].path.ends_with("/tickets"));
+        assert!(
+            authoring_requests[2]
+                .path
+                .ends_with("/tickets/T-9/thread-events")
+        );
+
+        let workflow_client = Arc::new(ScriptedWorkspaceClient::new([
+            crate::worker::WorkspaceResponse {
+                status: 200,
+                body: json!({"id": "00001SOURCE", "resource_key": "T-9"}).to_string(),
+            },
+            crate::worker::WorkspaceResponse {
+                status: 200,
+                body: json!({"id": "00001TARGET", "resource_key": "T-10"}).to_string(),
+            },
+            crate::worker::WorkspaceResponse {
+                status: 200,
+                body: json!({
+                    "ticket_id": "00001SOURCE",
+                    "kind": "depends_on",
+                    "target": "00001TARGET",
+                    "note": null,
+                    "author": "workspace",
+                    "at": "2026-10-03T00:00:00Z"
+                })
+                .to_string(),
+            },
+        ]));
+        let workflow_access = crate::feature::builtin::ticket::TicketFeatureAccess::workflow();
+        let mut workflow_engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
+        for definition in crate::feature::builtin::ticket::enabled_ticket_definitions(
+            workflow_client.clone(),
+            workflow_access,
+        ) {
+            workflow_engine.register_tool(definition);
+        }
+        let mut workflow_registry = WipMountRegistry::new();
+        let route = workflow_registry.allocate_feature_route("ticket").unwrap();
+        crate::feature::builtin::ticket::mount_workspace_http_ticket_wip(
+            &mut workflow_registry,
+            workflow_client.clone(),
+            workflow_access,
+            None,
+            &route,
+        )
+        .unwrap();
+        let workflow = install_wip_mode_with_mounts(
+            &mut workflow_engine,
+            None,
+            "workflow-worker".into(),
+            workflow_registry,
+        )
+        .unwrap();
+        workflow.discover(item.into(), 0, false).await.unwrap();
+        workflow
+            .inspect("yoi.ticket/item/v1".into(), false)
+            .await
+            .unwrap();
+        let result = workflow
+            .call(
+                item.into(),
+                "yoi.ticket/item/v1".into(),
+                "record_relation".into(),
+                json!({"kind": "depends_on", "target": "T-10"}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        let result = result.content.unwrap();
+        assert!(result.contains("T-9"));
+        assert!(result.contains("T-10"));
+        let workflow_requests = workflow_client.requests();
+        assert_eq!(workflow_requests.len(), 3);
+        assert!(workflow_requests[0].path.ends_with("/tickets/T-9"));
+        assert!(workflow_requests[1].path.ends_with("/tickets/T-10"));
+        assert!(
+            workflow_requests[2]
+                .path
+                .ends_with("/tickets/T-9/relations")
+        );
+    }
+
+    #[tokio::test]
     async fn objective_native_runtime_covers_discovery_and_all_backend_operations() {
         let query_response = crate::worker::WorkspaceResponse {
             status: 200,

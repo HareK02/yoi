@@ -4,12 +4,15 @@
 //! module binds an authority-scoped Workspace client, declares the built-in
 //! feature, and contributes those tools through the normal registry path.
 
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use manifest::{ToolPermissionAction, ToolPermissionConfig};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use ticket::{
     MarkdownText, NewOrchestrationPlanRecord, NewTicket, NewTicketEvent, NewTicketRelation,
     OrchestrationPlanKind, OrchestrationPlanRecord, Result as TicketResult, Ticket, TicketBackend,
@@ -18,11 +21,22 @@ use ticket::{
     TicketRelationKind, TicketRelationView, TicketStateChange, TicketSummary, TicketWorkflowState,
     tool::{TICKET_TOOL_NAMES, TicketToolBackend, ticket_tool_description, ticket_tools},
 };
+use wip_protocol::{
+    Documentation, INTERFACE_FORMAT_V1, InterfaceDescriptor, Object, OperationDeclaration,
+    ParameterDeclaration, ProtocolError, ProtocolErrorCode, ReturnDeclaration, TypeExpr,
+    Value as WipValue,
+};
 
 use crate::feature::{
     FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureInstructionContribution,
     FeatureInstructionDeclaration, FeatureInstructionId, FeatureModule, ServiceDeclaration,
     ServiceId, ToolContribution, ToolDeclaration, ToolDefinition,
+};
+use crate::permission::permission_action_for;
+use crate::wip::{
+    WipCallContext, WipDynamicItem, WipDynamicItemResolver, WipDynamicMount, WipFeatureRoute,
+    WipMountError, WipMountRegistry, WipOperationError, WipOperationHandler, WipOperationOutput,
+    WipProjection, WipProjectionKind, json_to_wip, wip_to_json,
 };
 use crate::worker::{WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod};
 use agen::tool::{Tool, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
@@ -487,10 +501,6 @@ impl TicketFeature {
     fn workspace_client(&self) -> Arc<dyn WorkspaceClient> {
         self.workspace_client.clone()
     }
-
-    fn tool_backend(&self) -> TicketToolBackend {
-        TicketToolBackend::new(WorkspaceHttpTicketBackend::new(self.workspace_client()))
-    }
 }
 
 impl FeatureModule for TicketFeature {
@@ -514,7 +524,6 @@ impl FeatureModule for TicketFeature {
     }
 
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
-        let backend = self.tool_backend();
         let workspace_client = self.workspace_client();
         let ticket_service: Arc<dyn TicketService> = Arc::new(WorkspaceTicketService {
             backend: WorkspaceHttpTicketBackend::new(workspace_client.clone()),
@@ -532,28 +541,10 @@ impl FeatureModule for TicketFeature {
             .register(FeatureInstructionContribution::new(
                 ticket_workflow_instruction(),
             ))?;
-        let allowed_tool_names = self.enabled_tool_names();
         let mut tools = context.tools();
-        for definition in ticket_tools(backend) {
+        for definition in enabled_ticket_definitions(workspace_client, self.access) {
             let (meta, _) = definition();
             let name = meta.name.clone();
-            if !allowed_tool_names
-                .iter()
-                .any(|allowed| *allowed == name.as_str())
-            {
-                continue;
-            }
-            let definition = match name.as_str() {
-                "QueryTicket" => workspace_ticket_read_definition(
-                    workspace_client.clone(),
-                    WorkspaceTicketReadKind::Query,
-                ),
-                "ShowTicket" => workspace_ticket_read_definition(
-                    workspace_client.clone(),
-                    WorkspaceTicketReadKind::Show,
-                ),
-                _ => definition,
-            };
             tools.register(ToolContribution::new(name, definition))?;
         }
         Ok(())
@@ -1227,6 +1218,739 @@ impl TicketBackend for WorkspaceHttpTicketBackend {
     }
 }
 
+const TICKET_COLLECTION_INTERFACE: &str = "yoi.ticket/collection/v1";
+const TICKET_ITEM_INTERFACE: &str = "yoi.ticket/item/v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeTicketSurface {
+    Collection,
+    Item,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativeTicketOperation {
+    operation: &'static str,
+    surface: NativeTicketSurface,
+    identity_field: Option<&'static str>,
+    mutating: bool,
+}
+
+fn native_ticket_operation(tool_name: &str) -> Option<NativeTicketOperation> {
+    let operation = match tool_name {
+        "QueryTicket" => NativeTicketOperation {
+            operation: "query",
+            surface: NativeTicketSurface::Collection,
+            identity_field: None,
+            mutating: false,
+        },
+        "TicketCreate" => NativeTicketOperation {
+            operation: "create",
+            surface: NativeTicketSurface::Collection,
+            identity_field: None,
+            mutating: true,
+        },
+        "ShowTicket" => NativeTicketOperation {
+            operation: "read",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("id"),
+            mutating: false,
+        },
+        "TicketEditItem" => NativeTicketOperation {
+            operation: "edit",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("ticket"),
+            mutating: true,
+        },
+        "TicketComment" => NativeTicketOperation {
+            operation: "comment",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("ticket"),
+            mutating: true,
+        },
+        "TicketMarkReady" => NativeTicketOperation {
+            operation: "mark_ready",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("ticket"),
+            mutating: true,
+        },
+        "TicketIntakeReady" => NativeTicketOperation {
+            operation: "intake_ready",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("ticket"),
+            mutating: true,
+        },
+        "TicketQueue" => NativeTicketOperation {
+            operation: "queue",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("ticket"),
+            mutating: true,
+        },
+        "TicketWorkflowState" => NativeTicketOperation {
+            operation: "transition",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("ticket"),
+            mutating: true,
+        },
+        "TicketClose" => NativeTicketOperation {
+            operation: "close",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("ticket"),
+            mutating: true,
+        },
+        "TicketDependencyCheck" => NativeTicketOperation {
+            operation: "dependency_check",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("ticket"),
+            mutating: false,
+        },
+        "TicketRelationRecord" => NativeTicketOperation {
+            operation: "record_relation",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("ticket"),
+            mutating: true,
+        },
+        "TicketRelationRemove" => NativeTicketOperation {
+            operation: "remove_relation",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("ticket"),
+            mutating: true,
+        },
+        "TicketOrchestrationPlanRecord" => NativeTicketOperation {
+            operation: "record_orchestration_plan",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("ticket"),
+            mutating: true,
+        },
+        "TicketOrchestrationPlanQuery" => NativeTicketOperation {
+            operation: "query_orchestration_plans",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("ticket"),
+            mutating: false,
+        },
+        _ => return None,
+    };
+    Some(operation)
+}
+
+#[derive(Clone)]
+struct NativeTicketTool {
+    name: String,
+    schema: Value,
+    tool: Arc<dyn Tool>,
+    projection: NativeTicketOperation,
+    description: String,
+}
+
+pub(crate) fn enabled_ticket_definitions(
+    client: Arc<dyn WorkspaceClient>,
+    access: TicketFeatureAccess,
+) -> Vec<ToolDefinition> {
+    let backend = TicketToolBackend::new(WorkspaceHttpTicketBackend::new(client.clone()));
+    let allowed = access.tool_names();
+    ticket_tools(backend)
+        .into_iter()
+        .filter_map(|definition| {
+            let (meta, _) = definition();
+            if !allowed.iter().any(|allowed| *allowed == meta.name) {
+                return None;
+            }
+            Some(match meta.name.as_str() {
+                "QueryTicket" => {
+                    workspace_ticket_read_definition(client.clone(), WorkspaceTicketReadKind::Query)
+                }
+                "ShowTicket" => {
+                    workspace_ticket_read_definition(client.clone(), WorkspaceTicketReadKind::Show)
+                }
+                _ => definition,
+            })
+        })
+        .collect()
+}
+
+fn native_ticket_tools(
+    client: Arc<dyn WorkspaceClient>,
+    access: TicketFeatureAccess,
+) -> Result<Vec<NativeTicketTool>, WipMountError> {
+    enabled_ticket_definitions(client, access)
+        .into_iter()
+        .map(|definition| {
+            let (meta, tool) = definition();
+            let projection = native_ticket_operation(&meta.name).ok_or_else(|| {
+                WipMountError::InvalidProjection {
+                    route: "/features/ticket/tickets".into(),
+                    message: format!(
+                        "enabled Ticket tool `{}` has no native projection",
+                        meta.name
+                    ),
+                }
+            })?;
+            jsonschema::validator_for(&meta.input_schema).map_err(|error| {
+                WipMountError::InvalidProjection {
+                    route: "/features/ticket/tickets".into(),
+                    message: format!("Ticket tool schema cannot be retained: {error}"),
+                }
+            })?;
+            Ok(NativeTicketTool {
+                name: meta.name,
+                schema: meta.input_schema,
+                tool,
+                projection,
+                description: meta.description,
+            })
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct TicketRevisionState {
+    revisions: HashMap<String, String>,
+    aliases_by_canonical: HashMap<String, BTreeSet<String>>,
+    mutation_sequence: u64,
+}
+
+type TicketRevisions = Arc<Mutex<TicketRevisionState>>;
+
+/// Mount the enabled Ticket Feature surface as native collection and route-bound
+/// item objects. Only tools already enabled for this Worker are projected and
+/// claimed from the WIP compatibility surface.
+pub fn mount_workspace_http_ticket_wip(
+    registry: &mut WipMountRegistry,
+    client: Arc<dyn WorkspaceClient>,
+    access: TicketFeatureAccess,
+    permissions: Option<ToolPermissionConfig>,
+    feature_route: &WipFeatureRoute,
+) -> Result<(), WipMountError> {
+    let collection_route = feature_route.child("tickets")?;
+    let tools = native_ticket_tools(client, access)?;
+    let claimed_tools = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    let collection_tools = tools
+        .iter()
+        .filter(|tool| tool.projection.surface == NativeTicketSurface::Collection)
+        .cloned()
+        .collect::<Vec<_>>();
+    let item_tools = tools
+        .iter()
+        .filter(|tool| tool.projection.surface == NativeTicketSurface::Item)
+        .cloned()
+        .collect::<Vec<_>>();
+    let revisions = Arc::new(Mutex::new(TicketRevisionState::default()));
+
+    let collection_descriptor = ticket_descriptor(
+        &collection_tools,
+        "Search and create authoritative Workspace Tickets",
+        "Search results remain bounded and carry canonical item paths. Operations are exactly the Ticket tools enabled for this Worker.",
+    )?;
+    registry.mount(WipProjection {
+        route: collection_route.clone(),
+        capability: "ticket:collection".into(),
+        kind: WipProjectionKind::Native,
+        object: Object {
+            name: "tickets".into(),
+            description: Some(
+                "Authoritative Ticket collection through scoped Backend authority".into(),
+            ),
+            interfaces: vec![TICKET_COLLECTION_INTERFACE.into()],
+            r#ref: Some("ticket:collection".into()),
+            validator: Some(route_validator(&collection_route, "collection")),
+        },
+        interface: TICKET_COLLECTION_INTERFACE.into(),
+        interface_validator: Some(descriptor_validator(&collection_descriptor)),
+        descriptor: collection_descriptor,
+        handler: Arc::new(TicketCollectionWipHandler {
+            tools: operation_map(collection_tools),
+            permissions: permissions.clone(),
+            collection_route: collection_route.clone(),
+            revisions: Arc::clone(&revisions),
+        }),
+    })?;
+
+    let item_descriptor = ticket_descriptor(
+        &item_tools,
+        "Read and operate on the Ticket bound to this object route",
+        "The subject Ticket identity comes exclusively from the target route. Separate relation and dependency targets remain explicit operation inputs.",
+    )?;
+    registry.mount_dynamic(WipDynamicMount {
+        collection_route: collection_route.clone(),
+        capability: "ticket:item".into(),
+        interface: TICKET_ITEM_INTERFACE.into(),
+        interface_validator: Some(descriptor_validator(&item_descriptor)),
+        descriptor: item_descriptor,
+        resolver: Arc::new(TicketItemResolver {
+            tools: operation_map(item_tools),
+            permissions,
+            collection_route: collection_route.clone(),
+            revisions,
+        }),
+    })?;
+    registry.replace_compatibility_tools(&collection_route, claimed_tools)?;
+    Ok(())
+}
+
+fn operation_map(tools: Vec<NativeTicketTool>) -> HashMap<String, NativeTicketTool> {
+    tools
+        .into_iter()
+        .map(|tool| (tool.projection.operation.to_string(), tool))
+        .collect()
+}
+
+struct TicketCollectionWipHandler {
+    tools: HashMap<String, NativeTicketTool>,
+    permissions: Option<ToolPermissionConfig>,
+    collection_route: String,
+    revisions: TicketRevisions,
+}
+
+#[async_trait]
+impl WipOperationHandler for TicketCollectionWipHandler {
+    async fn call(
+        &self,
+        operation: &str,
+        arguments: &BTreeMap<String, WipValue>,
+        context: WipCallContext,
+    ) -> Result<WipOperationOutput, WipOperationError> {
+        let tool = self.tools.get(operation).ok_or_else(operation_not_found)?;
+        let input = native_ticket_input(arguments, None, tool.projection.identity_field)?;
+        let output = execute_native_ticket_tool(tool, &self.permissions, input, context).await?;
+        let mut response = ticket_tool_output_json(output)?;
+        match operation {
+            "query" => add_ticket_paths(&mut response, &self.collection_route),
+            "create" => {
+                record_ticket_observation(&self.revisions, None, &response, true);
+                if let Some(reference) = ticket_reference(&response).map(ToOwned::to_owned) {
+                    response.as_object_mut().map(|object| {
+                        object.insert(
+                            "path".into(),
+                            Value::String(format!("{}/{}", self.collection_route, reference)),
+                        )
+                    });
+                }
+            }
+            _ => {}
+        }
+        Ok(WipOperationOutput::native(
+            json_to_wip(&response).map_err(WipOperationError::OutcomeUnknown)?,
+        ))
+    }
+}
+
+struct TicketItemResolver {
+    tools: HashMap<String, NativeTicketTool>,
+    permissions: Option<ToolPermissionConfig>,
+    collection_route: String,
+    revisions: TicketRevisions,
+}
+
+impl WipDynamicItemResolver for TicketItemResolver {
+    fn resolve(&self, item_reference: &str) -> Option<WipDynamicItem> {
+        if !is_ticket_route_reference(item_reference) {
+            return None;
+        }
+        let revision = self
+            .revisions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .revisions
+            .get(item_reference)
+            .cloned()
+            .unwrap_or_else(|| "unobserved".into());
+        let route = format!("{}/{}", self.collection_route, item_reference);
+        Some(WipDynamicItem {
+            object: Object {
+                name: item_reference.into(),
+                description: Some("Authoritative Ticket bound to this object route".into()),
+                interfaces: vec![TICKET_ITEM_INTERFACE.into()],
+                r#ref: Some(format!("ticket:{item_reference}")),
+                validator: Some(route_validator(&route, &revision)),
+            },
+            handler: Arc::new(TicketItemWipHandler {
+                tools: self.tools.clone(),
+                permissions: self.permissions.clone(),
+                ticket_reference: item_reference.into(),
+                revisions: Arc::clone(&self.revisions),
+            }),
+        })
+    }
+}
+
+struct TicketItemWipHandler {
+    tools: HashMap<String, NativeTicketTool>,
+    permissions: Option<ToolPermissionConfig>,
+    ticket_reference: String,
+    revisions: TicketRevisions,
+}
+
+#[async_trait]
+impl WipOperationHandler for TicketItemWipHandler {
+    async fn call(
+        &self,
+        operation: &str,
+        arguments: &BTreeMap<String, WipValue>,
+        context: WipCallContext,
+    ) -> Result<WipOperationOutput, WipOperationError> {
+        let tool = self.tools.get(operation).ok_or_else(operation_not_found)?;
+        let input = native_ticket_input(
+            arguments,
+            Some(&self.ticket_reference),
+            tool.projection.identity_field,
+        )?;
+        let output = execute_native_ticket_tool(tool, &self.permissions, input, context).await?;
+        let response = ticket_tool_output_json(output)?;
+        record_ticket_observation(
+            &self.revisions,
+            Some(&self.ticket_reference),
+            &response,
+            tool.projection.mutating,
+        );
+        Ok(WipOperationOutput::native(
+            json_to_wip(&response).map_err(WipOperationError::OutcomeUnknown)?,
+        ))
+    }
+}
+
+async fn execute_native_ticket_tool(
+    tool: &NativeTicketTool,
+    permissions: &Option<ToolPermissionConfig>,
+    input: Value,
+    context: WipCallContext,
+) -> Result<ToolOutput, WipOperationError> {
+    let validator = jsonschema::validator_for(&tool.schema).map_err(|error| {
+        protocol_failure(
+            ProtocolErrorCode::Internal,
+            format!("stored Ticket tool schema is invalid: {error}"),
+        )
+    })?;
+    if let Err(error) = validator.validate(&input) {
+        return Err(protocol_failure(
+            ProtocolErrorCode::InvalidArguments,
+            format!("Ticket operation input violates its typed Tool schema: {error}"),
+        ));
+    }
+    authorize_native_ticket(permissions, &tool.name, &input)?;
+    let input = serde_json::to_string(&input).map_err(|error| {
+        protocol_failure(ProtocolErrorCode::InvalidArguments, error.to_string())
+    })?;
+    tool.tool
+        .execute(&input, context.execution)
+        .await
+        .map_err(map_ticket_tool_error)
+}
+
+fn native_ticket_input(
+    arguments: &BTreeMap<String, WipValue>,
+    bound_ticket: Option<&str>,
+    identity_field: Option<&str>,
+) -> Result<Value, WipOperationError> {
+    if bound_ticket.is_some() && (arguments.contains_key("ticket") || arguments.contains_key("id"))
+    {
+        return Err(protocol_failure(
+            ProtocolErrorCode::InvalidArguments,
+            "the subject Ticket is bound exclusively by the object route",
+        ));
+    }
+    let mut input = serde_json::Map::new();
+    for (name, value) in arguments {
+        if matches!(value, WipValue::Unit) {
+            continue;
+        }
+        input.insert(
+            name.clone(),
+            wip_to_json(value).map_err(|message| {
+                protocol_failure(ProtocolErrorCode::InvalidArguments, message)
+            })?,
+        );
+    }
+    if let (Some(ticket), Some(field)) = (bound_ticket, identity_field) {
+        input.insert(field.into(), Value::String(ticket.into()));
+    }
+    Ok(Value::Object(input))
+}
+
+fn authorize_native_ticket(
+    permissions: &Option<ToolPermissionConfig>,
+    tool_name: &str,
+    input: &Value,
+) -> Result<(), WipOperationError> {
+    let Some(permissions) = permissions else {
+        return Ok(());
+    };
+    match permission_action_for(permissions, tool_name, input) {
+        ToolPermissionAction::Allow => Ok(()),
+        ToolPermissionAction::Deny => Err(protocol_failure(
+            ProtocolErrorCode::PermissionDenied,
+            format!("permission denied for projected tool `{tool_name}`"),
+        )),
+        ToolPermissionAction::Ask => Err(protocol_failure(
+            ProtocolErrorCode::PermissionDenied,
+            format!(
+                "permission approval is unavailable for projected tool `{tool_name}`; denied fail-closed"
+            ),
+        )),
+    }
+}
+
+fn map_ticket_tool_error(error: ToolError) -> WipOperationError {
+    match error {
+        ToolError::InvalidArgument(message) => {
+            protocol_failure(ProtocolErrorCode::InvalidArguments, message)
+        }
+        ToolError::Cancelled(output) => WipOperationError::Cancelled(output),
+        ToolError::Interrupted(output) => WipOperationError::Interrupted(output),
+        ToolError::StructuredConflict { code, message } => protocol_failure(
+            ProtocolErrorCode::InvalidArguments,
+            format!("{code}: {message}"),
+        ),
+        ToolError::ExecutionFailed(message) | ToolError::Internal(message) => {
+            if message.contains("HTTP status 401") || message.contains("HTTP status 403") {
+                protocol_failure(ProtocolErrorCode::PermissionDenied, message)
+            } else if message.contains("HTTP status 404") {
+                protocol_failure(ProtocolErrorCode::NotFound, message)
+            } else if message.contains("HTTP status 400")
+                || message.contains("HTTP status 409")
+                || message.contains("HTTP status 422")
+            {
+                protocol_failure(ProtocolErrorCode::InvalidArguments, message)
+            } else {
+                WipOperationError::OutcomeUnknown(message)
+            }
+        }
+    }
+}
+
+fn ticket_tool_output_json(output: ToolOutput) -> Result<Value, WipOperationError> {
+    match output.content {
+        Some(content) => serde_json::from_str(&content)
+            .map_err(|error| WipOperationError::OutcomeUnknown(error.to_string())),
+        None => Ok(json!({"summary": output.summary, "ok": true})),
+    }
+}
+
+fn add_ticket_paths(response: &mut Value, collection_route: &str) {
+    let Some(tickets) = response.get_mut("tickets").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for ticket in tickets {
+        let Some(reference) = ticket
+            .get("ticket")
+            .or_else(|| ticket.get("id"))
+            .and_then(Value::as_str)
+            .filter(|reference| is_canonical_ticket_resource_key(reference))
+            .map(ToOwned::to_owned)
+        else {
+            continue;
+        };
+        if let Some(object) = ticket.as_object_mut() {
+            object.insert(
+                "path".into(),
+                Value::String(format!("{collection_route}/{reference}")),
+            );
+        }
+    }
+}
+
+fn ticket_reference(response: &Value) -> Option<&str> {
+    response
+        .get("ticket")
+        .or_else(|| response.get("id"))
+        .or_else(|| response.get("meta").and_then(|meta| meta.get("id")))
+        .and_then(Value::as_str)
+        .filter(|reference| is_canonical_ticket_resource_key(reference))
+}
+
+fn response_revision(response: &Value) -> Option<&str> {
+    response
+        .get("item_revision")
+        .or_else(|| response.get("revision"))
+        .or_else(|| response.get("updated_at"))
+        .or_else(|| response.get("meta").and_then(|meta| meta.get("updated_at")))
+        .and_then(Value::as_str)
+}
+
+fn record_ticket_observation(
+    revisions: &TicketRevisions,
+    bound_reference: Option<&str>,
+    response: &Value,
+    mutation: bool,
+) {
+    let canonical = ticket_reference(response)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            bound_reference
+                .filter(|reference| is_canonical_ticket_resource_key(reference))
+                .map(ToOwned::to_owned)
+        });
+    let mut state = revisions.lock().unwrap_or_else(|error| error.into_inner());
+    let canonical = canonical.or_else(|| {
+        bound_reference.and_then(|reference| {
+            state
+                .aliases_by_canonical
+                .iter()
+                .find(|(_, aliases)| aliases.contains(reference))
+                .map(|(canonical, _)| canonical.clone())
+        })
+    });
+    let Some(canonical) = canonical else {
+        return;
+    };
+    let aliases = state
+        .aliases_by_canonical
+        .entry(canonical.clone())
+        .or_default();
+    aliases.insert(canonical.clone());
+    if let Some(reference) = bound_reference {
+        aliases.insert(reference.to_string());
+    }
+    let aliases = aliases.clone();
+    let revision = if mutation {
+        state.mutation_sequence = state.mutation_sequence.saturating_add(1);
+        format!(
+            "{}#mutation-{}",
+            response_revision(response).unwrap_or("observed"),
+            state.mutation_sequence
+        )
+    } else if let Some(revision) = response_revision(response) {
+        revision.to_string()
+    } else {
+        aliases
+            .iter()
+            .find_map(|alias| state.revisions.get(alias).cloned())
+            .unwrap_or_else(|| "observed".into())
+    };
+    for alias in aliases {
+        state.revisions.insert(alias, revision.clone());
+    }
+}
+
+fn is_ticket_route_reference(reference: &str) -> bool {
+    is_canonical_ticket_resource_key(reference)
+        || (reference.len() >= 8
+            && reference.len() <= 128
+            && reference.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+}
+
+fn route_validator(route: &str, revision: &str) -> Vec<u8> {
+    let mut digest = Sha256::new();
+    digest.update(route.as_bytes());
+    digest.update([0]);
+    digest.update(revision.as_bytes());
+    digest.finalize().to_vec()
+}
+
+fn descriptor_validator(descriptor: &InterfaceDescriptor) -> Vec<u8> {
+    let mut digest = Sha256::new();
+    digest.update(format!("{descriptor:?}").as_bytes());
+    digest.finalize().to_vec()
+}
+
+fn ticket_descriptor(
+    tools: &[NativeTicketTool],
+    summary: &str,
+    details: &str,
+) -> Result<InterfaceDescriptor, WipMountError> {
+    let operations = tools
+        .iter()
+        .map(ticket_operation_declaration)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(InterfaceDescriptor {
+        format: INTERFACE_FORMAT_V1.into(),
+        documentation: Some(Documentation {
+            summary: summary.into(),
+            details: Some(details.into()),
+        }),
+        types: Vec::new(),
+        operations,
+    })
+}
+
+fn ticket_operation_declaration(
+    tool: &NativeTicketTool,
+) -> Result<OperationDeclaration, WipMountError> {
+    let properties = tool
+        .schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .ok_or_else(|| WipMountError::InvalidProjection {
+            route: "/features/ticket/tickets".into(),
+            message: format!("Ticket tool `{}` schema has no properties", tool.name),
+        })?;
+    let required = tool
+        .schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    let parameters = properties
+        .iter()
+        .filter(|(name, _)| tool.projection.identity_field != Some(name.as_str()))
+        .map(|(name, schema)| ParameterDeclaration {
+            name: name.clone(),
+            required: required.contains(name.as_str()),
+            documentation: schema
+                .get("description")
+                .and_then(Value::as_str)
+                .map(|summary| Documentation {
+                    summary: summary.into(),
+                    details: None,
+                }),
+            r#type: schema_type_expr(schema),
+        })
+        .collect();
+    Ok(OperationDeclaration {
+        name: tool.projection.operation.into(),
+        documentation: Some(Documentation {
+            summary: tool.description.clone(),
+            details: Some(format!(
+                "Delegates to the existing `{}` typed Ticket operation and retains its exact JSON Schema validation.",
+                tool.name
+            )),
+        }),
+        parameters,
+        returns: ReturnDeclaration {
+            documentation: Some(Documentation {
+                summary: "Authoritative bounded Ticket operation result".into(),
+                details: None,
+            }),
+            r#type: TypeExpr::Json,
+        },
+    })
+}
+
+fn schema_type_expr(schema: &Value) -> TypeExpr {
+    match schema.get("type").and_then(Value::as_str) {
+        Some("string") => TypeExpr::String,
+        Some("boolean") => TypeExpr::Boolean,
+        Some("integer") => TypeExpr::Integer,
+        Some("number") => TypeExpr::Number,
+        Some("array") => TypeExpr::List {
+            items: Box::new(
+                schema
+                    .get("items")
+                    .map(schema_type_expr)
+                    .unwrap_or(TypeExpr::Json),
+            ),
+        },
+        _ => TypeExpr::Json,
+    }
+}
+
+fn protocol_failure(code: ProtocolErrorCode, message: impl Into<String>) -> WipOperationError {
+    WipOperationError::Protocol(ProtocolError {
+        code,
+        message: message.into(),
+    })
+}
+
+fn operation_not_found() -> WipOperationError {
+    protocol_failure(
+        ProtocolErrorCode::OperationNotFound,
+        "operation is not published by this Ticket interface",
+    )
+}
+
 pub fn ticket_tools_feature(
     workspace_client: Arc<dyn WorkspaceClient>,
     access: TicketFeatureAccess,
@@ -1242,6 +1966,218 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn native_ticket_projection_matches_role_inventory_and_binds_item_identity() {
+        let client: Arc<dyn WorkspaceClient> = Arc::new(
+            crate::worker::TestWorkspaceHttpClient::new("workspace", "http://backend"),
+        );
+        let authoring =
+            native_ticket_tools(client.clone(), TicketFeatureAccess::workspace_authoring())
+                .unwrap();
+        let authoring_operations = authoring
+            .iter()
+            .map(|tool| tool.projection.operation)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            authoring_operations,
+            [
+                "create",
+                "edit",
+                "query",
+                "read",
+                "comment",
+                "mark_ready",
+                "queue",
+                "close",
+                "record_relation",
+                "remove_relation",
+            ]
+        );
+        let item = ticket_descriptor(
+            &authoring
+                .iter()
+                .filter(|tool| tool.projection.surface == NativeTicketSurface::Item)
+                .cloned()
+                .collect::<Vec<_>>(),
+            "items",
+            "route bound",
+        )
+        .unwrap();
+        assert!(item.operations.iter().all(|operation| {
+            operation
+                .parameters
+                .iter()
+                .all(|parameter| parameter.name != "ticket" && parameter.name != "id")
+        }));
+        let relation = item
+            .operations
+            .iter()
+            .find(|operation| operation.name == "record_relation")
+            .unwrap();
+        assert!(
+            relation
+                .parameters
+                .iter()
+                .any(|parameter| parameter.name == "target")
+        );
+
+        let workflow =
+            native_ticket_tools(client.clone(), TicketFeatureAccess::workflow()).unwrap();
+        assert_eq!(
+            workflow
+                .iter()
+                .map(|tool| tool.projection.operation)
+                .collect::<Vec<_>>(),
+            [
+                "query",
+                "read",
+                "comment",
+                "transition",
+                "close",
+                "dependency_check",
+                "record_relation",
+                "remove_relation",
+                "record_orchestration_plan",
+                "query_orchestration_plans",
+            ]
+        );
+        assert_eq!(
+            native_ticket_tools(client, TicketFeatureAccess::review())
+                .unwrap()
+                .iter()
+                .map(|tool| tool.projection.operation)
+                .collect::<Vec<_>>(),
+            ["query", "read"]
+        );
+    }
+
+    #[test]
+    fn native_ticket_mount_uses_host_route_and_rejects_non_ticket_children() {
+        let mut registry = WipMountRegistry::new();
+        let feature_route = registry.allocate_feature_route("ticket").unwrap();
+        mount_workspace_http_ticket_wip(
+            &mut registry,
+            Arc::new(crate::worker::TestWorkspaceHttpClient::new(
+                "workspace",
+                "http://backend",
+            )),
+            TicketFeatureAccess::review(),
+            None,
+            &feature_route,
+        )
+        .unwrap();
+        assert_eq!(
+            registry.routes().collect::<Vec<_>>(),
+            ["/features/ticket/tickets"]
+        );
+        assert!(feature_route.child("../objectives").is_err());
+
+        let revisions = Arc::new(Mutex::new(TicketRevisionState::default()));
+        let resolver = TicketItemResolver {
+            tools: HashMap::new(),
+            permissions: None,
+            collection_route: "/features/ticket/tickets".into(),
+            revisions,
+        };
+        assert!(resolver.resolve("T-42").is_some());
+        assert!(resolver.resolve("00001TICKET").is_some());
+        assert!(resolver.resolve("O-42").is_none());
+        assert!(resolver.resolve("T-42/nested").is_none());
+    }
+
+    #[test]
+    fn native_ticket_permission_input_preserves_presence_and_route_identity() {
+        let arguments = BTreeMap::from([
+            ("body".into(), WipValue::String("comment".into())),
+            ("reason".into(), WipValue::Unit),
+        ]);
+        let input = native_ticket_input(&arguments, Some("T-42"), Some("ticket"))
+            .unwrap_or_else(|_| panic!("route-bound Ticket input should project"));
+        assert_eq!(input, json!({"ticket": "T-42", "body": "comment"}));
+        let replaced = native_ticket_input(
+            &BTreeMap::from([("ticket".into(), WipValue::String("T-99".into()))]),
+            Some("T-42"),
+            Some("ticket"),
+        );
+        assert!(matches!(
+            replaced,
+            Err(WipOperationError::Protocol(ProtocolError {
+                code: ProtocolErrorCode::InvalidArguments,
+                ..
+            }))
+        ));
+
+        let permissions = Some(ToolPermissionConfig {
+            default_action: ToolPermissionAction::Allow,
+            rules: vec![manifest::ToolPermissionRule {
+                tool: "TicketComment".into(),
+                pattern: serde_json::to_string(&input).unwrap(),
+                action: ToolPermissionAction::Deny,
+            }],
+        });
+        assert!(matches!(
+            authorize_native_ticket(&permissions, "TicketComment", &input),
+            Err(WipOperationError::Protocol(ProtocolError {
+                code: ProtocolErrorCode::PermissionDenied,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn ticket_alias_validators_refresh_together_after_mutation() {
+        let revisions = Arc::new(Mutex::new(TicketRevisionState::default()));
+        record_ticket_observation(
+            &revisions,
+            Some("00001TICKET"),
+            &json!({"ticket": "T-42", "updated_at": "rev-1"}),
+            false,
+        );
+        let resolver = TicketItemResolver {
+            tools: HashMap::new(),
+            permissions: None,
+            collection_route: "/features/ticket/tickets".into(),
+            revisions: Arc::clone(&revisions),
+        };
+        let canonical_v1 = resolver.resolve("T-42").unwrap().object.validator;
+        let internal_v1 = resolver.resolve("00001TICKET").unwrap().object.validator;
+        record_ticket_observation(
+            &revisions,
+            Some("T-42"),
+            &json!({"ticket": "T-42", "updated_at": "rev-2"}),
+            true,
+        );
+        assert_ne!(
+            canonical_v1,
+            resolver.resolve("T-42").unwrap().object.validator
+        );
+        assert_ne!(
+            internal_v1,
+            resolver.resolve("00001TICKET").unwrap().object.validator
+        );
+    }
+
+    #[test]
+    fn native_ticket_errors_keep_deterministic_protocol_outcomes() {
+        for (status, code) in [
+            (401, ProtocolErrorCode::PermissionDenied),
+            (403, ProtocolErrorCode::PermissionDenied),
+            (404, ProtocolErrorCode::NotFound),
+            (409, ProtocolErrorCode::InvalidArguments),
+        ] {
+            assert!(matches!(
+                map_ticket_tool_error(ToolError::ExecutionFailed(format!(
+                    "ticket REST API request failed with HTTP status {status}"
+                ))),
+                WipOperationError::Protocol(ProtocolError { code: actual, .. }) if actual == code
+            ));
+        }
+        assert!(matches!(
+            map_ticket_tool_error(ToolError::ExecutionFailed("transport disconnected".into())),
+            WipOperationError::OutcomeUnknown(_)
+        ));
+    }
 
     #[test]
     fn production_source_has_no_local_ticket_feature_backend() {

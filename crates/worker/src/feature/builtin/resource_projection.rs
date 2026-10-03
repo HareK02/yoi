@@ -34,6 +34,7 @@ struct ModelTicketQueryItem {
 #[derive(Debug, Serialize)]
 pub(super) struct ModelTicketDetail {
     ticket: String,
+    item_revision: String,
     title: String,
     body: String,
     state: String,
@@ -277,6 +278,7 @@ pub(super) fn project_ticket_detail(value: Value) -> Result<ModelTicketDetail, S
 
     Ok(ModelTicketDetail {
         ticket: resource_ref(root, "resource_key", "T-")?,
+        item_revision: string_field(root, "item_revision")?,
         title: string_field(root, "title")?,
         body: string_field(root, "body")?,
         state: string_field(root, "state")?,
@@ -780,6 +782,7 @@ mod tests {
         let projected = project_ticket_detail(json!({
             "id": "internal-ticket",
             "resource_key": "T-588",
+            "item_revision": "revision-1",
             "title": "Queued Submit",
             "body": "Body",
             "state": "planning",
@@ -829,6 +832,7 @@ mod tests {
         .expect("current Ticket blocker shape must project");
 
         let projected = serde_json::to_value(projected).expect("serialize Ticket detail");
+        assert_eq!(projected["item_revision"], "revision-1");
         assert_eq!(
             projected["relations"]["blockers"],
             json!([{
