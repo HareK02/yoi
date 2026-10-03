@@ -25,7 +25,10 @@ vi.mock("svelte/motion", () => ({ prefersReducedMotion: { current: true } }));
 const multiplexer = vi.hoisted(() => {
   type Listener = {
     onFrame(frame: unknown): void;
-    onStatus?(status: "connecting" | "open" | "closed", message?: string): void;
+    onStatus?(
+      status: "connecting" | "open" | "closed",
+      failure?: { kind: "protocol" | "transport"; message: string },
+    ): void;
   };
   const listeners: Listener[] = [];
   return {
@@ -393,7 +396,7 @@ test("queue-only state hides notifications and disables cancellation when discon
   await screen.findByText("送信内容");
   expect(screen.queryByRole("group", { name: "Notifications" })).toBeNull();
   expect(screen.queryByRole("heading", { name: "Notifications" })).toBeNull();
-  latestListener().onStatus?.("closed", "connection lost");
+  latestListener().onStatus?.("closed", { kind: "transport", message: "connection lost" });
   await waitFor(() => expect((screen.getByRole("button", { name: "Cancel queued input 1" }) as HTMLButtonElement).disabled).toBe(true));
 });
 
@@ -450,7 +453,7 @@ test("file completions consume stale responses before the latest prefix and clos
   expect(screen.queryByRole("option")).toBeNull();
   receive("new-result");
   expect((await screen.findByRole("option")).textContent).toContain("@new-result");
-  latestListener().onStatus?.("closed", "connection lost");
+  latestListener().onStatus?.("closed", { kind: "transport", message: "connection lost" });
   await waitFor(() => expect(screen.queryByRole("listbox")).toBeNull());
   receive("late-result");
   await settleMicrotasks();
@@ -689,7 +692,10 @@ test("distinguishes typed unavailability and an initial live connection closure"
   );
   await fireEvent.click(screen.getByRole("button", { name: "Retry" }));
   await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
-  latestListener().onStatus?.("closed", "subscription ended before snapshot");
+  latestListener().onStatus?.("closed", {
+    kind: "transport",
+    message: "subscription ended before snapshot",
+  });
 
   expect((await screen.findByRole("alert")).textContent).toContain(
     "subscription ended before snapshot",
@@ -714,7 +720,10 @@ test("preserves rendered content while reconnecting", async () => {
       .findByText("kept message"),
   ).not.toBeNull();
 
-  latestListener().onStatus?.("closed", "Workspace subscription disconnected");
+  latestListener().onStatus?.("closed", {
+    kind: "transport",
+    message: "Workspace subscription disconnected",
+  });
   expect(await screen.findByText("Conversation updates are unavailable")).not
     .toBeNull();
   expect(
@@ -724,7 +733,7 @@ test("preserves rendered content while reconnecting", async () => {
   ).not.toBeNull();
   expect(screen.queryByText("No conversation to display")).toBeNull();
 
-  latestListener().onStatus?.("connecting", "resubscribing");
+  latestListener().onStatus?.("connecting");
   expect(await screen.findByText("Refreshing conversation")).not.toBeNull();
   expect(
     within(screen.getByRole("article", { name: "main transcript" })).getByText(
@@ -761,8 +770,11 @@ test("reconnect snapshot refreshes lineage and removes stale sibling history", a
     expectHistoryTurn("question 1")
   );
 
-  latestListener().onStatus?.("closed", "disconnected during rewind");
-  latestListener().onStatus?.("connecting", "reconnecting");
+  latestListener().onStatus?.("closed", {
+    kind: "transport",
+    message: "disconnected during rewind",
+  });
+  latestListener().onStatus?.("connecting");
   latestListener().onFrame(
     subscribedFrame(sessionWithUserMessage("lineage B current")),
   );
@@ -898,7 +910,10 @@ test("route changes clear prior content and fence stale Session responses", asyn
       .findByText("previous worker content"),
   ).not.toBeNull();
 
-  latestListener().onStatus?.("closed", "reload old worker");
+  latestListener().onStatus?.("closed", {
+    kind: "transport",
+    message: "reload old worker",
+  });
   await fireEvent.click(
     await screen.findByRole("button", { name: "Retry" }),
   );

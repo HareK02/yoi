@@ -1387,14 +1387,14 @@
                         ];
                     }
                 },
-                onStatus: (status, message) => {
+                onStatus: (status, failure) => {
                     if (token !== reloadToken) return;
                     protocolState = status === "open" ? "connecting" : status;
                     if (status === "connecting" || status === "open") {
-                        showConsoleReconnecting(message);
+                        showConsoleReconnecting(failure?.message);
                     }
                     if (status === "closed") {
-                        showConsoleFailure(message);
+                        showConsoleFailure(failure?.message);
                         rejectPendingCompletion(new Error("Worker protocol WebSocket closed."));
                     }
                 },

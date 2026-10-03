@@ -30,7 +30,6 @@
 
   let { currentPath = '/', workspaceId }: Props = $props();
   let loading = $state(true);
-  let error = $state<string | null>(null);
   let workers = $state<SidebarWorker[]>([]);
   let expanded = $state(false);
   let openWorkerKey = $state<string | null>(null);
@@ -141,7 +140,6 @@
     const subscription = workspaceWorkersStore(workspaceId);
     return subscription.subscribe((state) => {
       loading = state.loading;
-      error = state.error;
       workers = state.workers.filter(canShowWorkerInSidebar);
     });
   });
@@ -167,7 +165,7 @@
     >
       New
     </a>
-    {#if !loading && !error && workers.length > 0}
+    {#if !loading && workers.length > 0}
       <span class="section-count">{workers.length}</span>
     {/if}
   </div>
@@ -175,9 +173,8 @@
   {#if loading}
     <p class="section-state">Checking workers…</p>
   {:else if workers.length === 0}
-    <p class="section-state" class:error={Boolean(error)}>{error ?? 'No Workers are active.'}</p>
+    <p class="section-state">No Workers are active.</p>
   {:else}
-    {#if error}<p class="section-state error">{error}</p>{/if}
     <ul class="nav-list" aria-label="Workers">
       {#each visibleWorkers as worker (`${worker.runtime_id}:${worker.worker_id}`)}
         {@const href = workerConsoleHref(workspaceId, worker)}

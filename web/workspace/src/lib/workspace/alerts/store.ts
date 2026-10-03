@@ -40,6 +40,14 @@ export function pushWorkspaceAlert(
 ): string {
   const id = options.id ??
     `${Date.now().toString(36)}-${(sequence++).toString(36)}`;
+  const existing = alerts.find((alert) => alert.id === id);
+  if (
+    existing?.level === level &&
+    existing.title === options.title &&
+    existing.message === message
+  ) {
+    return id;
+  }
   alerts = [
     ...alerts.filter((alert) => alert.id !== id),
     {

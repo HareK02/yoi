@@ -1438,7 +1438,7 @@ Deno.test("Workspace Worker list and Console share the multiplexed connection", 
     consolePage.includes("workspaceMultiplexer(target.workspaceId)") &&
       sidebarStore.includes("workspaceMultiplexer(workspaceId)") &&
       multiplexer.includes("const multiplexers = new Map") &&
-      multiplexer.includes("frame: 'worker_protocol'"),
+      multiplexer.includes('frame: "worker_protocol"'),
     "Sidebar and Console should share one Workspace multiplexer and route Worker methods through a subscription lane",
   );
   assert(

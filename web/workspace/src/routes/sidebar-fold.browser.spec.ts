@@ -30,6 +30,23 @@ afterEach(() => {
   localStorage.clear();
 });
 
+test("Workspace catalog failure uses the shared alert without rendering diagnostics in the sidebar", async () => {
+  render(Layout, {
+    props: {
+      ...props,
+      data: {
+        accessibleWorkspaces: [],
+        workspaceCatalogError: "Workspace catalog request failed",
+      },
+    },
+  });
+  expect((await screen.findByRole("alert")).textContent).toContain(
+    "Workspace catalog request failed",
+  );
+  expect(frame().textContent).not.toContain("Workspace catalog request failed");
+  expect(frame().textContent).not.toContain("Workspace list unavailable");
+});
+
 test("unpinning changes mode, and pointer departure closes the preview", async () => {
   render(Layout, { props });
   expect(screen.getByRole("button", { name: "Unpin sidebar" }).getAttribute("aria-pressed")).toBe("true");

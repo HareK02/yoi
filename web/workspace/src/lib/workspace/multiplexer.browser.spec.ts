@@ -99,7 +99,10 @@ test('invalid inbound frame closes before dispatch and reconnects for a fresh sn
 
   expect(onFrame).not.toHaveBeenCalled();
   expect(first.closes).toEqual([[4002, 'Invalid workspace protocol frame']]);
-  expect(onStatus).toHaveBeenLastCalledWith('closed', 'Workspace protocol frame rejected');
+  expect(onStatus).toHaveBeenLastCalledWith('closed', {
+    kind: 'protocol',
+    message: 'Workspace protocol frame rejected',
+  });
   expect(JSON.stringify(onStatus.mock.calls)).not.toContain('untrusted detail');
 
   vi.advanceTimersByTime(500);
@@ -108,7 +111,82 @@ test('invalid inbound frame closes before dispatch and reconnects for a fresh sn
   second.open();
   expect(second.sent).toHaveLength(1);
   expect(JSON.parse(second.sent[0]).message.method).toBe('subscribe_events');
+
+  first.open();
+  first.message('{"protocol_version":2,"frame":"invalid"}');
+  expect(second.sent).toHaveLength(1);
+  expect(second.closes).toEqual([]);
   multiplexer.dispose();
+});
+
+test('normal disposal closes silently and never schedules a reconnect', () => {
+  vi.useFakeTimers();
+  const multiplexer = new WorkspaceMultiplexer('workspace-dispose-test');
+  const onStatus = vi.fn();
+  multiplexer.subscribe(
+    { topic: 'workspace_workers' },
+    { onFrame: vi.fn(), onStatus },
+  );
+
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  onStatus.mockClear();
+  multiplexer.dispose();
+
+  expect(socket.closes).toEqual([[undefined, undefined]]);
+  expect(onStatus).not.toHaveBeenCalled();
+  vi.advanceTimersByTime(1_000);
+  expect(FakeWebSocket.instances).toHaveLength(1);
+});
+
+test('terminal subscription closure does not retry or report normal socket cleanup as transport failure', () => {
+  vi.useFakeTimers();
+  const multiplexer = new WorkspaceMultiplexer('workspace-terminal-test');
+  const onFrame = vi.fn();
+  const onStatus = vi.fn();
+  multiplexer.subscribe(
+    { topic: 'workspace_workers' },
+    { onFrame, onStatus },
+  );
+
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  const request = JSON.parse(socket.sent[0]);
+  socket.message(JSON.stringify({
+    protocol_version: 2,
+    frame: 'response',
+    message: {
+      result: 'subscribed',
+      payload: {
+        request_id: request.message.params.request_id,
+        subscription_id: 'subscription-terminal',
+        selector: { topic: 'workspace_workers' },
+        snapshot: { topic: 'workers', data: { workers: [] } },
+      },
+    },
+  }));
+  onStatus.mockClear();
+  const sentBeforeClosure = socket.sent.length;
+
+  socket.message(JSON.stringify({
+    protocol_version: 2,
+    frame: 'event',
+    message: {
+      event: 'subscription_closed',
+      data: {
+        subscription_id: 'subscription-terminal',
+        code: 'unauthorized',
+        message: 'Workspace Worker subscription is no longer authorized',
+      },
+    },
+  }));
+
+  expect(onFrame).toHaveBeenCalledTimes(2);
+  expect(onStatus).not.toHaveBeenCalled();
+  expect(socket.sent).toHaveLength(sentBeforeClosure);
+  expect(socket.closes).toEqual([[undefined, undefined]]);
+  vi.advanceTimersByTime(1_000);
+  expect(FakeWebSocket.instances).toHaveLength(1);
 });
 
 test('valid subscription closure remains isolated and resubscribes only its selector', () => {
@@ -173,15 +251,9 @@ test('valid subscription closure remains isolated and resubscribes only its sele
   );
 
   expect(workersFrame).toHaveBeenCalledTimes(2);
-  expect(workersStatus).toHaveBeenLastCalledWith(
-    'connecting',
-    'resubscribe for a fresh snapshot',
-  );
+  expect(workersStatus).toHaveBeenLastCalledWith('connecting');
   expect(workdirsFrame).toHaveBeenCalledTimes(1);
-  expect(workdirsStatus).not.toHaveBeenCalledWith(
-    'connecting',
-    'resubscribe for a fresh snapshot',
-  );
+  expect(workdirsStatus).not.toHaveBeenCalledWith('connecting');
   expect(socket.sent).toHaveLength(sentBeforeClosure + 1);
   expect(JSON.parse(socket.sent.at(-1)!).message.params.selector).toEqual({
     topic: 'workspace_workers',
