@@ -14075,8 +14075,13 @@ fn migrate_runtime_scoped_worker_identity_v74_to_v75(conn: &Connection) -> Resul
                 FOREIGN KEY (workspace_id, workdir_id)
                     REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE
             );
-            INSERT INTO worker_workdir_links
-            SELECT * FROM worker_workdir_links_v74;
+            INSERT INTO worker_workdir_links (
+                workspace_id, runtime_id, worker_id, workdir_id, alias,
+                linked_at, unlinked_at, capabilities
+            )
+            SELECT workspace_id, runtime_id, worker_id, workdir_id, alias,
+                   linked_at, unlinked_at, capabilities
+            FROM worker_workdir_links_v74;
 
             DROP TABLE worker_registry_observations_v74;
             DROP TABLE worker_control_grants_v74;
@@ -15251,6 +15256,94 @@ mod tests {
             )
             .unwrap(),
             worker_resource_id(&worker)
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn schema_v75_preserves_workdir_links_from_migrated_v74_column_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workspace.db");
+        prepare_schema_v50(&path, Some("workspace-a"));
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 74)
+        {
+            (migration.apply)(&conn).unwrap();
+        }
+        conn.execute_batch(
+            r#"
+            INSERT INTO repositories (
+                workspace_id, repository_id, repository_key, kind, provider, uri, default_ref,
+                created_at, updated_at, source_kind, source_uri, source_revision,
+                source_fingerprint, observed_status
+            ) VALUES (
+                'workspace-a', 'repository-a', 'repository-a', 'git', 'git', '/repository-a',
+                'develop', '1', '1', 'local_path', '/repository-a', 1,
+                'sha256:repository-a', 'unverified'
+            );
+            INSERT INTO worker_registry (
+                workspace_id, worker_id, runtime_id, display_name, retention_state,
+                created_at, updated_at
+            ) VALUES (
+                'workspace-a', 'worker-a', 'runtime-a', 'Worker A', 'normal', '1', '1'
+            );
+            INSERT INTO workdir_registry (
+                workspace_id, workdir_id, display_name, source_kind, runtime_id, repository_id,
+                materialization_status, cleanliness, created_at, updated_at
+            ) VALUES (
+                'workspace-a', 'workdir-a', 'Checkout', 'repository', 'runtime-a',
+                'repository-a', 'present', 'clean', '1', '1'
+            );
+            INSERT INTO worker_workdir_links (
+                workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities,
+                linked_at, unlinked_at
+            ) VALUES (
+                'workspace-a', 'runtime-a', 'worker-a', 'workdir-a', 'repo', 'read_only',
+                'linked-at', NULL
+            );
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            table_columns(&conn, "worker_workdir_links").unwrap(),
+            vec![
+                "workspace_id",
+                "runtime_id",
+                "worker_id",
+                "workdir_id",
+                "alias",
+                "capabilities",
+                "linked_at",
+                "unlinked_at",
+            ]
+        );
+
+        migrate_runtime_scoped_worker_identity_v74_to_v75(&conn).unwrap();
+
+        assert_eq!(current_schema_version(&conn).unwrap(), 75);
+        assert_eq!(
+            conn.query_row(
+                "SELECT capabilities, linked_at, unlinked_at FROM worker_workdir_links",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .unwrap(),
+            ("read_only".to_string(), "linked-at".to_string(), None)
         );
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
