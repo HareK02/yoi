@@ -283,6 +283,34 @@ impl SystemItemAppendHandle {
     }
 }
 
+/// Host-created narrow append authority exposed only at a restore lifecycle
+/// boundary. It cannot emit arbitrary system items.
+pub struct RestoreSystemItemAppendHandle {
+    pending: Arc<Mutex<Vec<SystemItem>>>,
+}
+
+impl RestoreSystemItemAppendHandle {
+    pub(crate) fn new(pending: Arc<Mutex<Vec<SystemItem>>>) -> Self {
+        Self { pending }
+    }
+
+    /// Queue a Feature-rendered resident-summary refresh for durable append at
+    /// the restore lifecycle boundary.
+    pub fn append_resident_summary_refresh(
+        &self,
+        body: impl Into<String>,
+        prompt_provenance: session_store::PromptRenderProvenance,
+    ) {
+        self.pending
+            .lock()
+            .expect("restore system-item append queue poisoned")
+            .push(SystemItem::ResidentSummaryRefresh {
+                body: body.into(),
+                prompt_provenance: Some(prompt_provenance),
+            });
+    }
+}
+
 // =============================================================================
 // Hook input summary/context types (read-only)
 // =============================================================================
@@ -524,9 +552,34 @@ pub struct WorkerStoppingContext {
     pub reason: String,
 }
 
+/// Context delivered once after a persisted Worker has been restored and all
+/// enabled Features have been installed, before the next model-visible turn.
+pub struct WorkerRestoredContext {
+    pub invocation: HookInvocationContext,
+    system_items: RestoreSystemItemAppendHandle,
+}
+
+impl WorkerRestoredContext {
+    pub(crate) fn new(
+        invocation: HookInvocationContext,
+        system_items: RestoreSystemItemAppendHandle,
+    ) -> Self {
+        Self {
+            invocation,
+            system_items,
+        }
+    }
+
+    /// Narrow durable append authority for restore-owned typed system items.
+    pub fn system_items(&self) -> &RestoreSystemItemAppendHandle {
+        &self.system_items
+    }
+}
+
 pub struct RunExit;
 pub struct RunCommitted;
 pub struct BeforeSessionRewrite;
+pub struct WorkerRestored;
 pub struct WorkerStopping;
 
 impl HookEventKind for RunExit {
@@ -542,6 +595,11 @@ impl HookEventKind for RunCommitted {
 impl HookEventKind for BeforeSessionRewrite {
     type Input = BeforeSessionRewriteContext;
     type Output = BeforeSessionRewriteAction;
+}
+
+impl HookEventKind for WorkerRestored {
+    type Input = WorkerRestoredContext;
+    type Output = ();
 }
 
 impl HookEventKind for WorkerStopping {
@@ -609,6 +667,7 @@ pub struct HookRegistryBuilder {
     run_exit: Vec<RegisteredHook<RunExit>>,
     run_committed: Vec<RegisteredHook<RunCommitted>>,
     before_session_rewrite: Vec<RegisteredHook<BeforeSessionRewrite>>,
+    worker_restored: Vec<RegisteredHook<WorkerRestored>>,
     worker_stopping: Vec<RegisteredHook<WorkerStopping>>,
 }
 
@@ -685,13 +744,19 @@ impl HookRegistryBuilder {
         BeforeSessionRewrite
     );
     add_hook_methods!(
+        add_worker_restored,
+        add_named_worker_restored,
+        worker_restored,
+        WorkerRestored
+    );
+    add_hook_methods!(
         add_worker_stopping,
         add_named_worker_stopping,
         worker_stopping,
         WorkerStopping
     );
 
-    pub(crate) fn checkpoint(&self) -> [usize; 9] {
+    pub(crate) fn checkpoint(&self) -> [usize; 10] {
         [
             self.on_prompt_submit.len(),
             self.pre_llm_request.len(),
@@ -701,11 +766,12 @@ impl HookRegistryBuilder {
             self.run_exit.len(),
             self.run_committed.len(),
             self.before_session_rewrite.len(),
+            self.worker_restored.len(),
             self.worker_stopping.len(),
         ]
     }
 
-    pub(crate) fn rollback_to(&mut self, checkpoint: [usize; 9]) {
+    pub(crate) fn rollback_to(&mut self, checkpoint: [usize; 10]) {
         self.on_prompt_submit.truncate(checkpoint[0]);
         self.pre_llm_request.truncate(checkpoint[1]);
         self.pre_tool_call.truncate(checkpoint[2]);
@@ -714,7 +780,8 @@ impl HookRegistryBuilder {
         self.run_exit.truncate(checkpoint[5]);
         self.run_committed.truncate(checkpoint[6]);
         self.before_session_rewrite.truncate(checkpoint[7]);
-        self.worker_stopping.truncate(checkpoint[8]);
+        self.worker_restored.truncate(checkpoint[8]);
+        self.worker_stopping.truncate(checkpoint[9]);
     }
 
     pub fn build(self) -> HookRegistry {
@@ -727,6 +794,7 @@ impl HookRegistryBuilder {
             run_exit: self.run_exit,
             run_committed: self.run_committed,
             before_session_rewrite: self.before_session_rewrite,
+            worker_restored: self.worker_restored,
             worker_stopping: self.worker_stopping,
             diagnostics: std::sync::Mutex::new(Vec::new()),
         }
@@ -743,6 +811,7 @@ pub struct HookRegistry {
     run_exit: Vec<RegisteredHook<RunExit>>,
     run_committed: Vec<RegisteredHook<RunCommitted>>,
     before_session_rewrite: Vec<RegisteredHook<BeforeSessionRewrite>>,
+    worker_restored: Vec<RegisteredHook<WorkerRestored>>,
     worker_stopping: Vec<RegisteredHook<WorkerStopping>>,
     diagnostics: std::sync::Mutex<Vec<HookExecutionError>>,
 }
@@ -840,6 +909,26 @@ impl HookRegistry {
             .unwrap_or(BeforeSessionRewriteAction::Continue))
     }
 
+    pub async fn on_worker_restored(
+        &self,
+        context: &WorkerRestoredContext,
+    ) -> Result<(), HookExecutionError> {
+        for registration in &self.worker_restored {
+            if let Err(error) = registration.call(context).await {
+                self.record_diagnostic(error.clone());
+                match error.policy {
+                    HookFailurePolicy::FailOpenWithDiagnostic => {
+                        tracing::warn!(owner = %error.owner, error = %error.source, "worker-restored hook failed open");
+                    }
+                    HookFailurePolicy::FailClosed | HookFailurePolicy::AttentionRequired => {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn on_worker_stopping(
         &self,
         context: &WorkerStoppingContext,
@@ -879,6 +968,29 @@ mod tests {
             }
             other => panic!("unexpected system item: {other:?}"),
         }
+    }
+
+    #[test]
+    fn restore_append_handle_queues_only_resident_refresh_items() {
+        let pending = Arc::new(Mutex::new(Vec::new()));
+        let handle = RestoreSystemItemAppendHandle::new(Arc::clone(&pending));
+        let provenance = session_store::PromptRenderProvenance {
+            workspace_id: Some("workspace".into()),
+            config_revision: 1,
+            source_digest: "source".into(),
+            projection_digest: "projection".into(),
+            logical_name: "internal.resident_memory_restore_section".into(),
+        };
+
+        handle.append_resident_summary_refresh("current surface", provenance.clone());
+
+        assert!(matches!(
+            pending.lock().unwrap().as_slice(),
+            [SystemItem::ResidentSummaryRefresh {
+                body,
+                prompt_provenance: Some(actual),
+            }] if body == "current surface" && actual == &provenance
+        ));
     }
 
     #[test]

@@ -787,9 +787,9 @@ impl WorkerController {
         // Runtime-owned Workers persist their current model-visible head before
         // controller exposure. Feature installation above must happen first so a
         // fresh subject Worker captures the current resident surface in its durable
-        // prompt. Restored Workers defer their one-shot append-only resident refresh
-        // until the next model-visible context materialization, after the Runtime has
-        // committed restoration of the existing durable head.
+        // prompt. Restored Workers defer generic Feature restore notification until
+        // the next model-visible context materialization; only an installed
+        // Feature may then request a typed durable history append.
         if runtime_managed && worker.needs_initial_session_head_materialization() {
             worker
                 .materialize_durable_session_head()
@@ -1342,6 +1342,21 @@ where
             worker.workspace_client_handle(),
         )?
     {
+        let workspace_id = worker
+            .workspace_client()
+            .workspace_id()
+            .expect("validated subject resident source has Workspace identity")
+            .to_string();
+        if let Some(refresh_feature) =
+            crate::feature::builtin::memory::SubjektivResidentRestoreRefreshFeature::for_host(
+                worker.manifest_lifecycle_features_enabled(),
+                Arc::clone(&resident_summary_source),
+                worker.prompts(),
+                workspace_id,
+            )
+        {
+            feature_registry.add_module(refresh_feature);
+        }
         feature_prompt_contribution = Some((Some(resident_summary_source), None));
     }
     if ordinary_subjektiv_features_enabled

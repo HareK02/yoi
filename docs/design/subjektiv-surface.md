@@ -42,14 +42,24 @@ and exact references remain immutable history, while current state points at the
 applicable result.
 
 Runtime-owned new Workers install Features before durably materializing the
-initial Session head, so `ready` content or the explicit `ready-empty` result is
-represented at initial prompt construction. Restored Workers preserve their
-persisted prompt and all prior history verbatim. They append one durable
-restore-boundary system item that supersedes earlier resident summaries with the
-latest `ready` surface, an explicit `ready-empty` state, or a
-no-current-surface tombstone for `ungenerated`, `stale`, or `failed`; subsequent
-turns in that restored process do not append the boundary again. No regeneration,
-correction, failure, or cutover rewrites a committed Session entry.
+initial Session head. Initial resident prompt construction uses the host's shared
+prompt-contribution source contract, so an enabled Feature can contribute its
+current surface without owning Session persistence. Restore refresh is different:
+it is a subjektiv Feature lifecycle hook installed only for an execution-enabled,
+subject-attached Worker. The generic Worker host announces the restore boundary
+and durably commits typed system items requested by installed Features; it does
+not infer refresh behavior from the presence of a resident source. Consequently,
+legacy Memory-only Workers, policy-only unattached Workers, and lifecycle-suppressed
+Internal Workers/Reviewers do not read a subjektiv surface, render the restore
+template, or append a refresh.
+
+The subjektiv restore hook preserves the persisted prompt and all prior history
+verbatim. It requests one durable restore-boundary system item that supersedes
+earlier resident summaries with the latest `ready` surface, an explicit
+`ready-empty` state, or a no-current-surface tombstone for `ungenerated`, `stale`,
+or `failed`; subsequent turns in that restored process do not append the boundary
+again. No regeneration, correction, failure, or cutover rewrites a committed
+Session entry.
 
 ## Semantic fixture and verification
 
