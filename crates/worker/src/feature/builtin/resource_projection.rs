@@ -78,18 +78,14 @@ pub(super) struct ModelObjectiveDetail {
     objective: String,
     title: String,
     body: String,
+    body_truncated: bool,
     state: String,
+    revision: String,
     created_at: Option<String>,
     updated_at: Option<String>,
     linked_tickets: Vec<ModelTicketSummary>,
     events: Vec<ModelObjectiveEvent>,
     event_page: ModelObjectiveEventPage,
-}
-
-impl ModelObjectiveDetail {
-    pub(super) fn objective_ref(&self) -> &str {
-        &self.objective
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -363,7 +359,9 @@ pub(super) fn project_objective_detail(value: Value) -> Result<ModelObjectiveDet
         objective: resource_ref(root, "resource_key", "O-")?,
         title: string_field(root, "title")?,
         body: string_field(root, "body")?,
+        body_truncated: bool_field(root, "body_truncated")?,
         state: string_field(root, "state")?,
+        revision: string_field(root, "revision")?,
         created_at: optional_string(root, "created_at")?,
         updated_at: optional_string(root, "updated_at")?,
         linked_tickets: array_field(root, "linked_ticket_summaries")?
@@ -671,7 +669,9 @@ mod tests {
             "resource_key": "O-543",
             "title": "Objective",
             "body": "Body",
+            "body_truncated": false,
             "state": "active",
+            "revision": "rev-3",
             "created_at": "2026-01-01T00:00:00Z",
             "updated_at": "2026-01-02T00:00:00Z",
             "linked_tickets": ["00001M0E82D1V"],
@@ -695,6 +695,8 @@ mod tests {
         let text = json.to_string();
         assert!(text.contains("O-543"));
         assert!(text.contains("T-496"));
+        assert_eq!(json["revision"], "rev-3");
+        assert_eq!(json["body_truncated"], false);
         assert!(!text.contains("00001M10HW6BV"));
         assert!(!text.contains("00001M0E82D1V"));
         assert!(!text.contains("event_ref"));

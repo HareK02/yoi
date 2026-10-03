@@ -52,14 +52,15 @@ The interface descriptor uses WIP `Json` for compatibility input and includes th
 
 ## Native projection extension and collisions
 
-`worker::wip::WipMountRegistry` is the Host-owned mount allocator. A Feature can independently construct a `WipProjection` with an async `WipOperationHandler`, then pass its aggregate registry through `install_wip_mode_with_mounts` before compatibility finalization.
+`worker::wip::WipMountRegistry` is the Host-owned mount allocator. A Feature can independently construct a `WipProjection` with an async `WipOperationHandler`, then pass its aggregate registry through `install_wip_mode_with_mounts` before compatibility finalization. A Feature first requests a Host-owned `/features/<feature>` namespace with `allocate_feature_route`; checked direct-child joins prevent a Feature from claiming an ambient global route.
 
 - Routes must be canonical absolute WIP paths.
 - Object names must match the final route segment.
 - A projected object exposes exactly its declared interface.
-- Unrelated duplicate routes and conflicting interface descriptors fail startup.
-- A native projection replaces a compatibility projection only when both declare the same semantic capability (`tool:<registration-name>` for compatibility tools).
-- When native is already selected, the compatibility tool is hidden rather than exposed through a second entry.
+- Unrelated duplicate routes and conflicting interface descriptors or validators fail startup.
+- A bounded dynamic mount may resolve exactly one item segment below an already mounted native collection; deeper paths never fall through to the resolver.
+- A native projection replaces a compatibility projection either by the original same-route semantic capability or by an explicit registry capability claim owned by a mounted native route.
+- Conflicting native claims fail startup. When native is selected, the claimed compatibility tool is hidden rather than exposed through a second entry. Normal Tool mode is unaffected because it does not install the WIP registry.
 
 `WipInspect` renders the complete descriptor, including descriptor-local named declarations and recursive record, list, enum, and union shapes with required flags and declaration documentation. The unit samples `mount_collision_and_native_replacement_are_explicit` and `native_projection_preserves_descriptor_and_decodes_typed_arguments_end_to_end` demonstrate independent native registration, deterministic replacement, collision rejection, complete descriptor inspection, and a descriptor-typed native invocation.
 

@@ -127,6 +127,7 @@ pub trait WipOperationHandler: Send + Sync {
 
 /// One route contribution. Native projections replace compatibility projections
 /// only when both declare the same semantic capability; unrelated collisions fail.
+#[derive(Clone)]
 pub struct WipProjection {
     pub route: String,
     pub capability: String,
@@ -138,6 +139,55 @@ pub struct WipProjection {
     pub handler: Arc<dyn WipOperationHandler>,
 }
 
+/// One dynamically resolved direct-child object beneath a Feature-owned
+/// collection route. The Host retains route allocation and descriptor authority;
+/// the Feature only binds a validated child segment to an object and handler.
+pub struct WipDynamicItem {
+    pub object: Object,
+    pub handler: Arc<dyn WipOperationHandler>,
+}
+
+pub trait WipDynamicItemResolver: Send + Sync {
+    fn resolve(&self, item_reference: &str) -> Option<WipDynamicItem>;
+}
+
+pub struct WipDynamicMount {
+    pub collection_route: String,
+    pub capability: String,
+    pub interface: String,
+    pub descriptor: InterfaceDescriptor,
+    pub interface_validator: Option<Vec<u8>>,
+    pub resolver: Arc<dyn WipDynamicItemResolver>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WipFeatureRoute {
+    root: String,
+}
+
+impl WipFeatureRoute {
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
+    pub fn child(&self, segment: &str) -> Result<String, WipMountError> {
+        if segment.is_empty()
+            || segment == "."
+            || segment == ".."
+            || segment.contains('/')
+            || !segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(WipMountError::InvalidRoute {
+                route: format!("{}/{}", self.root, segment),
+                message: "Feature child must be one canonical path segment".into(),
+            });
+        }
+        Ok(format!("{}/{}", self.root, segment))
+    }
+}
+
 struct MountedProjection {
     projection: WipProjection,
 }
@@ -145,6 +195,9 @@ struct MountedProjection {
 #[derive(Default)]
 pub struct WipMountRegistry {
     mounts: BTreeMap<String, MountedProjection>,
+    dynamic_mounts: Vec<WipDynamicMount>,
+    feature_routes: BTreeSet<String>,
+    replaced_compatibility_capabilities: BTreeMap<String, String>,
 }
 
 impl WipMountRegistry {
@@ -152,11 +205,47 @@ impl WipMountRegistry {
         Self::default()
     }
 
+    /// Allocate the Host namespace owned by one enabled Feature. Features join
+    /// checked relative segments to this route instead of selecting global paths.
+    pub fn allocate_feature_route(
+        &mut self,
+        feature: &str,
+    ) -> Result<WipFeatureRoute, WipMountError> {
+        if feature.is_empty()
+            || !feature
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(WipMountError::InvalidRoute {
+                route: format!("/features/{feature}"),
+                message: "Feature name must use lowercase ASCII letters, digits, or '-'".into(),
+            });
+        }
+        let root = format!("/features/{feature}");
+        if !self.feature_routes.insert(root.clone()) {
+            return Err(WipMountError::RouteCollision {
+                route: root,
+                existing: format!("feature:{feature}"),
+            });
+        }
+        Ok(WipFeatureRoute { root })
+    }
+
     pub fn mount(
         &mut self,
         projection: WipProjection,
     ) -> Result<WipMountDisposition, WipMountError> {
         validate_projection(&projection)?;
+        if self.dynamic_mounts.iter().any(|dynamic| {
+            projection
+                .route
+                .starts_with(&format!("{}/", dynamic.collection_route))
+        }) {
+            return Err(WipMountError::RouteCollision {
+                route: projection.route,
+                existing: "dynamic Feature collection".into(),
+            });
+        }
         if let Some(existing) = self.mounts.get(&projection.route) {
             if existing.projection.capability != projection.capability {
                 return Err(WipMountError::RouteCollision {
@@ -188,16 +277,150 @@ impl WipMountRegistry {
         Ok(WipMountDisposition::Mounted)
     }
 
+    /// Mount a one-segment item family below an already mounted collection.
+    /// Dynamic resolution never creates authority: the collection route must be
+    /// native and every resolved child is validated before it is exposed.
+    pub fn mount_dynamic(&mut self, mount: WipDynamicMount) -> Result<(), WipMountError> {
+        wip_protocol::validate_path(&mount.collection_route).map_err(|error| {
+            WipMountError::InvalidRoute {
+                route: mount.collection_route.clone(),
+                message: error.to_string(),
+            }
+        })?;
+        let Some(collection) = self.mounts.get(&mount.collection_route) else {
+            return Err(WipMountError::InvalidProjection {
+                route: mount.collection_route,
+                message: "dynamic item mount requires an existing collection projection".into(),
+            });
+        };
+        if collection.projection.kind != WipProjectionKind::Native {
+            return Err(WipMountError::InvalidProjection {
+                route: mount.collection_route,
+                message: "dynamic item mount requires a native collection projection".into(),
+            });
+        }
+        mount
+            .descriptor
+            .validate()
+            .map_err(|error| WipMountError::InvalidProjection {
+                route: mount.collection_route.clone(),
+                message: error.to_string(),
+            })?;
+        if let Some(existing) = self.dynamic_mounts.iter().find(|existing| {
+            existing.collection_route == mount.collection_route
+                || mount
+                    .collection_route
+                    .starts_with(&format!("{}/", existing.collection_route))
+                || existing
+                    .collection_route
+                    .starts_with(&format!("{}/", mount.collection_route))
+        }) {
+            return Err(WipMountError::RouteCollision {
+                route: mount.collection_route,
+                existing: existing.capability.clone(),
+            });
+        }
+        if let Some((_, existing)) = self
+            .mounts
+            .iter()
+            .find(|(route, _)| route.starts_with(&format!("{}/", mount.collection_route)))
+        {
+            return Err(WipMountError::RouteCollision {
+                route: mount.collection_route,
+                existing: existing.projection.capability.clone(),
+            });
+        }
+        if self.interface_conflicts(
+            &mount.interface,
+            &mount.descriptor,
+            mount.interface_validator.as_deref(),
+            None,
+        ) {
+            return Err(WipMountError::InterfaceCollision {
+                interface: mount.interface,
+            });
+        }
+        self.dynamic_mounts.push(mount);
+        Ok(())
+    }
+
+    /// Declare ordinary tool capabilities fully represented by native mounts.
+    /// Claimed compatibility projections are removed from WIP mode while the
+    /// normal Tool-mode registration remains unchanged.
+    pub fn replace_compatibility_tools<'a>(
+        &mut self,
+        owner_route: &str,
+        tool_names: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), WipMountError> {
+        if !self.mounts.contains_key(owner_route)
+            && !self
+                .dynamic_mounts
+                .iter()
+                .any(|mount| mount.collection_route == owner_route)
+        {
+            return Err(WipMountError::InvalidProjection {
+                route: owner_route.to_string(),
+                message: "compatibility replacement owner is not mounted".into(),
+            });
+        }
+        let capabilities = tool_names
+            .into_iter()
+            .map(|name| format!("tool:{name}"))
+            .collect::<Vec<_>>();
+        for capability in &capabilities {
+            if let Some(existing) = self
+                .replaced_compatibility_capabilities
+                .get(capability)
+                .filter(|existing| existing.as_str() != owner_route)
+            {
+                return Err(WipMountError::RouteCollision {
+                    route: owner_route.to_string(),
+                    existing: existing.clone(),
+                });
+            }
+        }
+        for capability in capabilities {
+            self.replaced_compatibility_capabilities
+                .insert(capability, owner_route.to_string());
+        }
+        Ok(())
+    }
+
+    fn replaces_compatibility(&self, capability: &str) -> bool {
+        self.replaced_compatibility_capabilities
+            .contains_key(capability)
+    }
+
+    fn interface_conflicts(
+        &self,
+        interface: &str,
+        descriptor: &InterfaceDescriptor,
+        validator: Option<&[u8]>,
+        replacing_route: Option<&str>,
+    ) -> bool {
+        self.mounts.iter().any(|(route, mounted)| {
+            Some(route.as_str()) != replacing_route
+                && mounted.projection.interface == interface
+                && (mounted.projection.descriptor != *descriptor
+                    || mounted.projection.interface_validator.as_deref() != validator)
+        }) || self.dynamic_mounts.iter().any(|mounted| {
+            mounted.interface == interface
+                && (mounted.descriptor != *descriptor
+                    || mounted.interface_validator.as_deref() != validator)
+        })
+    }
+
     fn ensure_interface_available(
         &self,
         candidate: &WipProjection,
         replacing_route: Option<&str>,
     ) -> Result<(), WipMountError> {
-        if self.mounts.iter().any(|(route, mounted)| {
-            Some(route.as_str()) != replacing_route
-                && mounted.projection.interface == candidate.interface
-                && mounted.projection.descriptor != candidate.descriptor
-        }) {
+        if self.interface_conflicts(
+            &candidate.interface,
+            &candidate.descriptor,
+            candidate.interface_validator.as_deref(),
+            replacing_route,
+        ) {
             return Err(WipMountError::InterfaceCollision {
                 interface: candidate.interface.clone(),
             });
@@ -274,13 +497,38 @@ impl WipHost {
                     mounted.projection.interface_validator.as_deref(),
                 )
             })
+            .or_else(|| {
+                self.registry
+                    .dynamic_mounts
+                    .iter()
+                    .find(|mounted| mounted.interface == reference)
+                    .map(|mounted| (&mounted.descriptor, mounted.interface_validator.as_deref()))
+            })
     }
 
-    fn projection(&self, path: &str) -> Option<&WipProjection> {
-        self.registry
-            .mounts
-            .get(path)
-            .map(|mounted| &mounted.projection)
+    fn projection(&self, path: &str) -> Option<WipProjection> {
+        if let Some(mounted) = self.registry.mounts.get(path) {
+            return Some(mounted.projection.clone());
+        }
+        self.registry.dynamic_mounts.iter().find_map(|mounted| {
+            let item_reference = path.strip_prefix(&format!("{}/", mounted.collection_route))?;
+            if item_reference.is_empty() || item_reference.contains('/') {
+                return None;
+            }
+            let item = mounted.resolver.resolve(item_reference)?;
+            let projection = WipProjection {
+                route: path.to_string(),
+                capability: mounted.capability.clone(),
+                kind: WipProjectionKind::Native,
+                object: item.object,
+                interface: mounted.interface.clone(),
+                descriptor: mounted.descriptor.clone(),
+                interface_validator: mounted.interface_validator.clone(),
+                handler: item.handler,
+            };
+            validate_projection(&projection).ok()?;
+            Some(projection)
+        })
     }
 
     fn object_at(&self, path: &str) -> Option<Object> {
@@ -1358,6 +1606,7 @@ fn wip_tool_definitions(runtime: Arc<WipRuntime>) -> Vec<ToolDefinition> {
 
 /// Replace all currently registered ordinary tools with one WIP client surface.
 /// Call this once after every enabled Feature has contributed its tools.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn install_wip_mode<C: LlmClient, A: Send + Sync>(
     engine: &mut Engine<C, Mutable, A>,
     permissions: Option<ToolPermissionConfig>,
@@ -1403,12 +1652,16 @@ pub fn install_wip_mode_with_mounts<C: LlmClient, A: Send + Sync>(
         let (meta, tool) = handle
             .get_tool(&definition.name)
             .ok_or_else(|| format!("registered tool `{}` disappeared", definition.name))?;
-        let projection = compatibility_projection(meta, tool, permissions.clone())
-            .map_err(|error| error.to_string())?;
-        registry
-            .mount(projection)
-            .map_err(|error| error.to_string())?;
-        names.push(definition.name);
+        let capability = format!("tool:{}", meta.name);
+        let name = meta.name.clone();
+        if !registry.replaces_compatibility(&capability) {
+            let projection = compatibility_projection(meta, tool, permissions.clone())
+                .map_err(|error| error.to_string())?;
+            registry
+                .mount(projection)
+                .map_err(|error| error.to_string())?;
+        }
+        names.push(name);
     }
     let runtime = Arc::new(WipRuntime::new(
         WipHost::new(registry),
@@ -1632,7 +1885,7 @@ fn decode_native_arguments(
         .map_err(|error| format!("native WIP arguments do not match the descriptor: {error}"))
 }
 
-fn json_to_wip(value: &Json) -> Result<Value, String> {
+pub(crate) fn json_to_wip(value: &Json) -> Result<Value, String> {
     match value {
         Json::Null => Ok(Value::Unit),
         Json::Bool(value) => Ok(Value::Boolean(*value)),
@@ -1670,7 +1923,7 @@ fn json_to_wip(value: &Json) -> Result<Value, String> {
     }
 }
 
-fn wip_to_json(value: &Value) -> Result<Json, String> {
+pub(crate) fn wip_to_json(value: &Value) -> Result<Json, String> {
     match value {
         Value::Unit => Ok(Json::Null),
         Value::Boolean(value) => Ok(Json::Bool(*value)),
@@ -2225,6 +2478,162 @@ mod tests {
         let state = runtime.state.lock().unwrap();
         assert!(state.client.known_space(&state.session).unwrap().is_empty());
         assert_eq!(state.session.security_context().as_str(), "worker-a");
+    }
+
+    struct DynamicResolver {
+        revision: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct DynamicHandler {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl WipOperationHandler for DynamicHandler {
+        async fn call(
+            &self,
+            _operation: &str,
+            _arguments: &BTreeMap<String, Value>,
+            _context: WipCallContext,
+        ) -> Result<WipOperationOutput, WipOperationError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(WipOperationOutput::native(Value::Unit))
+        }
+    }
+
+    impl WipDynamicItemResolver for DynamicResolver {
+        fn resolve(&self, item_reference: &str) -> Option<WipDynamicItem> {
+            let sequence = item_reference.strip_prefix("O-")?;
+            if sequence.is_empty() || !sequence.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            Some(WipDynamicItem {
+                object: Object {
+                    name: item_reference.into(),
+                    description: None,
+                    interfaces: vec!["test.dynamic/v1".into()],
+                    r#ref: Some(format!("objective:{item_reference}")),
+                    validator: Some(vec![self.revision.load(Ordering::SeqCst) as u8]),
+                },
+                handler: Arc::new(DynamicHandler {
+                    calls: Arc::clone(&self.calls),
+                }),
+            })
+        }
+    }
+
+    fn dynamic_registry(revision: Arc<AtomicUsize>, calls: Arc<AtomicUsize>) -> WipMountRegistry {
+        let mut registry = WipMountRegistry::new();
+        let feature = registry.allocate_feature_route("objective").unwrap();
+        let collection_route = feature.child("objectives").unwrap();
+        let mut collection = compatibility_projection(
+            meta("Dynamic"),
+            Arc::new(EchoTool {
+                calls: Arc::clone(&calls),
+            }),
+            None,
+        )
+        .unwrap();
+        collection.route = collection_route.clone();
+        collection.capability = "objective:collection".into();
+        collection.kind = WipProjectionKind::Native;
+        collection.object.name = "objectives".into();
+        collection.object.interfaces = vec!["test.dynamic/v1".into()];
+        collection.interface = "test.dynamic/v1".into();
+        collection.handler = Arc::new(DynamicHandler {
+            calls: Arc::clone(&calls),
+        });
+        let descriptor = collection.descriptor.clone();
+        let interface_validator = collection.interface_validator.clone();
+        registry.mount(collection).unwrap();
+        registry
+            .mount_dynamic(WipDynamicMount {
+                collection_route,
+                capability: "objective:item".into(),
+                interface: "test.dynamic/v1".into(),
+                descriptor,
+                interface_validator,
+                resolver: Arc::new(DynamicResolver { revision, calls }),
+            })
+            .unwrap();
+        registry
+    }
+
+    #[tokio::test]
+    async fn dynamic_routes_resolve_only_direct_children_and_reject_stale_calls() {
+        let revision = Arc::new(AtomicUsize::new(1));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let host = WipHost::new(dynamic_registry(Arc::clone(&revision), Arc::clone(&calls)));
+        let initial = host
+            .projection("/features/objective/objectives/O-3")
+            .unwrap();
+        assert!(
+            host.projection("/features/objective/objectives/O-3/other")
+                .is_none()
+        );
+        assert!(
+            host.projection("/features/objective/objectives/T-3")
+                .is_none()
+        );
+        assert!(host.projection("/hidden/objectives/O-3").is_none());
+
+        revision.store(2, Ordering::SeqCst);
+        let result = host
+            .call(
+                CallOperationRequest {
+                    target: wip_protocol::Target {
+                        path: "/features/objective/objectives/O-3".into(),
+                        validator: initial.object.validator,
+                    },
+                    interface: wip_protocol::InterfaceTarget {
+                        reference: initial.interface,
+                        validator: initial.interface_validator,
+                    },
+                    operation: "call".into(),
+                    arguments: BTreeMap::from([(
+                        "input".into(),
+                        json_to_wip(&json!({"message": "ok"})).unwrap(),
+                    )]),
+                },
+                WipCallContext {
+                    execution: ToolExecutionContext::direct(),
+                    security_context: "worker-a".into(),
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(WipOperationError::Protocol(ProtocolError {
+                code: ProtocolErrorCode::ValidatorMismatch,
+                ..
+            }))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn native_capability_claim_hides_only_claimed_compatibility_route() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
+        engine.register_tool(echo_definition("Echo".into(), Arc::clone(&calls)));
+        engine.register_tool(echo_definition("Other".into(), Arc::clone(&calls)));
+
+        let revision = Arc::new(AtomicUsize::new(1));
+        let mut registry = dynamic_registry(revision, calls);
+        registry
+            .replace_compatibility_tools("/features/objective/objectives", ["Echo"])
+            .unwrap();
+        let runtime =
+            install_wip_mode_with_mounts(&mut engine, None, "worker-a".into(), registry).unwrap();
+        assert!(runtime.host.projection("/tools/Echo").is_none());
+        assert!(runtime.host.projection("/tools/Other").is_some());
+        assert!(
+            runtime
+                .host
+                .projection("/features/objective/objectives")
+                .is_some()
+        );
     }
 
     struct FailingTool {

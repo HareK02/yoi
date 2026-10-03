@@ -1551,19 +1551,44 @@ where
     }
 
     let host_worker_observation_provider = worker.worker_observation_provider();
+    let wip_mode = worker.manifest().worker.mode == manifest::WorkerMode::Wip;
+    let wip_permissions = worker.manifest().permissions.clone();
+    let mut wip_mount_registry = crate::wip::WipMountRegistry::new();
     {
         let workspace_client = worker.workspace_client_handle();
         let engine = worker.engine_mut();
 
-        // Objective tools expose read-only project Objective context through the
-        // Backend Workspace API. Workers must not guess local `.yoi/objectives`
-        // paths or read Objective files directly.
+        // Objective tools expose scoped project Objective reads and mutations through
+        // the Backend Workspace API. Workers must not guess local `.yoi/objectives`
+        // paths or read/edit Objective files directly.
         if feature_config.objective.enabled {
             if workspace_client.is_available() && workspace_client.workspace_id().is_some() {
                 for definition in crate::feature::builtin::objective::workspace_http_objective_tools(
                     workspace_client.clone(),
                 ) {
                     engine.register_tool(definition);
+                }
+                if wip_mode {
+                    let feature_route = wip_mount_registry
+                        .allocate_feature_route("objective")
+                        .map_err(|error| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!("allocate Objective WIP route: {error}"),
+                            )
+                        })?;
+                    crate::feature::builtin::objective::mount_workspace_http_objective_wip(
+                        &mut wip_mount_registry,
+                        workspace_client.clone(),
+                        wip_permissions.clone(),
+                        &feature_route,
+                    )
+                    .map_err(|error| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("mount Objective WIP projection: {error}"),
+                        )
+                    })?;
                 }
             } else {
                 return Err(std::io::Error::new(
@@ -1631,22 +1656,25 @@ where
     if let Some((resident_summary, system_prompt_override)) = feature_prompt_contribution {
         worker.install_system_prompt_contribution(resident_summary, system_prompt_override);
     }
-    if worker.manifest().worker.mode == manifest::WorkerMode::Wip {
-        let permissions = worker.manifest().permissions.clone();
+    if wip_mode {
         let security_context = format!(
             "workspace={};worker={};session={}",
             worker.workspace_id().map_or("standalone", |id| id.as_str()),
             worker.manifest().worker.name,
             worker.session_id()
         );
-        crate::wip::install_wip_mode(worker.engine_mut(), permissions, security_context).map_err(
-            |error| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("install WIP Worker surface: {error}"),
-                )
-            },
-        )?;
+        crate::wip::install_wip_mode_with_mounts(
+            worker.engine_mut(),
+            wip_permissions,
+            security_context,
+            wip_mount_registry,
+        )
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("install WIP Worker surface: {error}"),
+            )
+        })?;
     }
     worker.attach_tracker(tracker);
     Ok(workdir_for_view)
