@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use memory::backend::{
     MemoryBackendHttpResponse, MemoryBackendOperation, MemoryBackendOperationResult,
@@ -19,9 +20,11 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 
 use crate::feature::{
-    FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureModule, ToolContribution,
-    ToolDeclaration,
+    FeatureDescriptor, FeatureHookPoint, FeatureInstallContext, FeatureInstallError, FeatureModule,
+    HookDeclaration, ToolContribution, ToolDeclaration,
 };
+use crate::hook::{Hook, HookError, HookErrorCategory, HookExecutionPolicy, WorkerRestored};
+use crate::prompt::catalog::{PromptCatalog, WorkerPrompt};
 use crate::worker::{
     SystemPromptContribution, SystemPromptContributionSource, WorkspaceClient,
     WorkspaceClientError, WorkspaceRequest, WorkspaceRequestMethod,
@@ -719,6 +722,102 @@ impl SystemPromptContributionSource for WorkspaceSubjektivResidentSummarySource 
                 SystemPromptContribution::Unavailable
             }
         }
+    }
+}
+
+const SUBJEKTIV_RESTORE_REFRESH_HOOK: &str = "refresh-resident-surface-after-restore";
+
+/// subjektiv-owned restore behavior. Initial prompt contribution remains a
+/// shared host facility, while loading and rendering a post-restore refresh is
+/// installed only with an execution-enabled, subject-attached subjektiv Feature.
+#[derive(Clone)]
+pub(crate) struct SubjektivResidentRestoreRefreshFeature {
+    source: Arc<dyn SystemPromptContributionSource>,
+    prompts: Arc<ArcSwap<PromptCatalog>>,
+    workspace_id: String,
+}
+
+impl SubjektivResidentRestoreRefreshFeature {
+    pub(crate) fn for_host(
+        lifecycle_enabled: bool,
+        source: Arc<dyn SystemPromptContributionSource>,
+        prompts: Arc<ArcSwap<PromptCatalog>>,
+        workspace_id: impl Into<String>,
+    ) -> Option<Self> {
+        lifecycle_enabled.then(|| Self::new(source, prompts, workspace_id))
+    }
+
+    pub(crate) fn new(
+        source: Arc<dyn SystemPromptContributionSource>,
+        prompts: Arc<ArcSwap<PromptCatalog>>,
+        workspace_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            source,
+            prompts,
+            workspace_id: workspace_id.into(),
+        }
+    }
+}
+
+impl FeatureModule for SubjektivResidentRestoreRefreshFeature {
+    fn descriptor(&self) -> FeatureDescriptor {
+        FeatureDescriptor::builtin(
+            "subjektiv-resident-restore-refresh",
+            "subjektiv Resident Restore Refresh",
+        )
+        .with_description(
+            "Refreshes the current subject resident Memory surface at a Worker restore boundary.",
+        )
+        .with_hook(HookDeclaration::new(
+            SUBJEKTIV_RESTORE_REFRESH_HOOK,
+            FeatureHookPoint::WorkerRestored,
+        ))
+    }
+
+    fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
+        context.hooks().add_worker_restored(
+            SUBJEKTIV_RESTORE_REFRESH_HOOK,
+            HookExecutionPolicy::fail_closed(),
+            SubjektivResidentRestoreRefreshHook {
+                source: Arc::clone(&self.source),
+                prompts: Arc::clone(&self.prompts),
+                workspace_id: self.workspace_id.clone(),
+            },
+        )
+    }
+}
+
+struct SubjektivResidentRestoreRefreshHook {
+    source: Arc<dyn SystemPromptContributionSource>,
+    prompts: Arc<ArcSwap<PromptCatalog>>,
+    workspace_id: String,
+}
+
+#[async_trait]
+impl Hook<WorkerRestored> for SubjektivResidentRestoreRefreshHook {
+    async fn call(&self, context: &crate::hook::WorkerRestoredContext) -> Result<(), HookError> {
+        let contribution = self.source.load().await;
+        let (surface_ready, summary) = match &contribution {
+            SystemPromptContribution::Ready(summary) => (true, Some(summary.as_str())),
+            SystemPromptContribution::Unavailable => (false, None),
+        };
+        let prompts = self.prompts.load_full();
+        let body = prompts
+            .resident_memory_restore_section(surface_ready, summary)
+            .map_err(|error| HookError::new(HookErrorCategory::Internal, error.to_string()))?;
+        let projection = prompts.projection();
+        context.system_items().append_resident_summary_refresh(
+            body,
+            session_store::PromptRenderProvenance {
+                workspace_id: Some(self.workspace_id.clone()),
+                config_revision: projection.config_revision,
+                source_digest: projection.source_digest.clone(),
+                projection_digest: projection.catalog_digest.clone(),
+                logical_name: WorkerPrompt::ResidentMemoryRestoreSection.key().to_string(),
+            },
+        );
+        Ok(())
     }
 }
 
@@ -1463,8 +1562,57 @@ permission = "write"
                 .is_none()
         );
 
+        let mut policy_only = disabled.clone();
+        policy_only.feature.subjektiv.profile.enabled = true;
+        let unattached_client = Arc::new(SubjectResidentClient::new(
+            memory::backend::MemoryResidentSummaryAvailability::Ready,
+            Some("policy-only surface must not load"),
+        ));
+        assert!(
+            ordinary_subjektiv_resident_summary_source(&policy_only, unattached_client.clone())
+                .unwrap()
+                .is_none()
+        );
+        assert!(unattached_client.paths.lock().unwrap().is_empty());
+
         let foreign = subject_manifest("other-workspace");
         assert!(ordinary_subjektiv_resident_summary_source(&foreign, test_client()).is_err());
+    }
+
+    #[test]
+    fn subject_restore_refresh_is_suppressed_for_internal_hosts() {
+        let manifest = subject_manifest("workspace");
+        let source = ordinary_subjektiv_resident_summary_source(&manifest, test_client())
+            .unwrap()
+            .unwrap();
+        let prompts = Arc::new(ArcSwap::from(
+            crate::prompt::catalog::PromptCatalog::builtins_only().unwrap(),
+        ));
+
+        assert!(
+            SubjektivResidentRestoreRefreshFeature::for_host(false, source, prompts, "workspace",)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn subject_restore_refresh_feature_declares_only_restore_lifecycle() {
+        let manifest = subject_manifest("workspace");
+        let source = ordinary_subjektiv_resident_summary_source(&manifest, test_client())
+            .unwrap()
+            .unwrap();
+        let feature = SubjektivResidentRestoreRefreshFeature::new(
+            source,
+            Arc::new(ArcSwap::from(
+                crate::prompt::catalog::PromptCatalog::builtins_only().unwrap(),
+            )),
+            "workspace",
+        );
+        let descriptor = feature.descriptor();
+
+        assert!(descriptor.tools.is_empty());
+        assert_eq!(descriptor.hooks.len(), 1);
+        assert_eq!(descriptor.hooks[0].point, FeatureHookPoint::WorkerRestored);
     }
 
     #[test]

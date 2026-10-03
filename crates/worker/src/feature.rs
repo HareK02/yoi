@@ -25,7 +25,8 @@ use thiserror::Error;
 
 use crate::hook::{
     BeforeSessionRewrite, Hook, HookExecutionPolicy, HookRegistryBuilder, OnPromptSubmit,
-    OnTurnEnd, PostToolCall, PreLlmRequest, PreToolCall, RunCommitted, RunExit, WorkerStopping,
+    OnTurnEnd, PostToolCall, PreLlmRequest, PreToolCall, RunCommitted, RunExit, WorkerRestored,
+    WorkerStopping,
 };
 use background::{
     BackgroundTaskSpec, FeatureBackgroundTask, FeatureBackgroundTaskRegistry,
@@ -268,6 +269,7 @@ pub enum FeatureHookPoint {
     RunExit,
     RunCommitted,
     BeforeSessionRewrite,
+    WorkerRestored,
     WorkerStopping,
 }
 
@@ -1205,6 +1207,25 @@ impl HookContributionRegistrar<'_> {
         self.require_declared(&declaration)?;
         self.hook_builder
             .add_named_before_session_rewrite(
+                format!("{}:{}", self.feature_id, declaration.name),
+                policy,
+                hook,
+            )
+            .map_err(|error| FeatureInstallError::InvalidDescriptor(error.to_string()))?;
+        self.record(declaration);
+        Ok(())
+    }
+
+    pub fn add_worker_restored(
+        &mut self,
+        name: impl Into<String>,
+        policy: HookExecutionPolicy,
+        hook: impl Hook<WorkerRestored> + 'static,
+    ) -> Result<(), FeatureInstallError> {
+        let declaration = HookDeclaration::new(name, FeatureHookPoint::WorkerRestored);
+        self.require_declared(&declaration)?;
+        self.hook_builder
+            .add_named_worker_restored(
                 format!("{}:{}", self.feature_id, declaration.name),
                 policy,
                 hook,
