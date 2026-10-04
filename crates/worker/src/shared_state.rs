@@ -117,6 +117,23 @@ impl WorkerSharedState {
         snapshot.clone()
     }
 
+    /// Publish the post-Run state and the exact Submit request whose controller
+    /// invocation has returned. Updating both in one snapshot prevents observers
+    /// from treating an earlier Idle state as evidence for a later Run.
+    pub(crate) fn finish_submission_run(
+        &self,
+        state: WorkerState,
+        submission_request_id: String,
+    ) -> WorkerStateSnapshot {
+        let mut snapshot = self
+            .state
+            .write()
+            .expect("worker state lock poisoned; refusing an inferred fallback state");
+        snapshot.state = state;
+        snapshot.last_finished_submission_request_id = Some(submission_request_id);
+        snapshot.clone()
+    }
+
     pub(crate) fn admit_command(
         &self,
         envelope: WorkerCommandEnvelope,
@@ -305,6 +322,14 @@ mod tests {
         assert_eq!(snapshot.state, paused);
         assert_eq!(snapshot.last_command_id, 0);
         assert_eq!(state.catalog_status(), WorkerStatus::Paused);
+
+        let finished = state.finish_submission_run(WorkerState::Idle, "request-1".to_string());
+        assert_eq!(finished.state, WorkerState::Idle);
+        assert_eq!(
+            finished.last_finished_submission_request_id.as_deref(),
+            Some("request-1")
+        );
+        assert_eq!(finished.last_command_id, 0);
     }
 
     #[test]
@@ -319,6 +344,7 @@ mod tests {
             state.snapshot(),
             WorkerStateSnapshot {
                 last_command_id: 9,
+                last_finished_submission_request_id: None,
                 state: WorkerState::Idle,
             }
         );

@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "id": "worker-launch-dark",
+  "title": "Ordinary Worker launch with optional subject connection — dark",
+  "baseUrl": "http://127.0.0.1:15288",
+  "colorScheme": "dark",
+  "reducedMotion": "reduce",
+  "personas": [{
+    "id": "fixture",
+    "label": "Authorized Workspace member fixture",
+    "auth": { "kind": "anonymous" }
+  }],
+  "viewports": [
+    { "label": "desktop", "width": 1440, "height": 900 },
+    { "label": "narrow", "width": 768, "height": 900 },
+    { "label": "mobile", "width": 390, "height": 844 },
+    { "label": "compact", "width": 320, "height": 700 }
+  ],
+  "routes": [{
+    "id": "representative",
+    "label": "Worker launch",
+    "path": "/w/memory-review/workers/new",
+    "goal": "Start an ordinary Worker with a compatible Profile and optionally connect an authorized existing subject.",
+    "dataState": "Compatible and incompatible Profiles with active, retired, long-identity, and paginated subjects.",
+    "ready": { "kind": "selector", "selector": "form.worker-launch-form" },
+    "capturePoints": [{ "id": "initial", "label": "Worker launch form" }]
+  }],
+  "processes": [{
+    "id": "worker-launch-fixture",
+    "command": "deno",
+    "cwd": "..",
+    "args": [
+      "run",
+      "--allow-net",
+      "--allow-read",
+      "browser-tests/memory_document_fixture_server.ts",
+      "15288",
+      "../../web/workspace/build"
+    ],
+    "readyUrl": "http://127.0.0.1:15288/health"
+  }]
+}

@@ -1085,6 +1085,8 @@ pub const RUNTIME_ROUTE_WORKER_PROTOCOL_WS: &str = "/v1/workers/{worker_id}/prot
 pub const RUNTIME_ROUTE_WORKER_ATTACHMENTS: &str = "/v1/workers/{worker_id}/attachments";
 pub const RUNTIME_ROUTE_WORKER_ATTACHMENT: &str =
     "/v1/workers/{worker_id}/attachments/{artifact_id}";
+pub const RUNTIME_ROUTE_WORKER_SESSION_ATTACHMENT: &str =
+    "/v1/workers/{worker_id}/sessions/{session_id}/attachments/{attachment_id}";
 
 /// Intentionally out-of-contract Runtime routes. This inventory keeps manual paths visible rather
 /// than letting them be mistaken for management-contract omissions.
@@ -1188,6 +1190,11 @@ pub const REMAINING_RUNTIME_ROUTES: &[RemainingRuntimeRoute] = &[
         method: "DELETE",
         path: RUNTIME_ROUTE_WORKER_ATTACHMENT,
         reason: "Binary attachment transport",
+    },
+    RemainingRuntimeRoute {
+        method: "GET",
+        path: RUNTIME_ROUTE_WORKER_SESSION_ATTACHMENT,
+        reason: "Session image attachment transport",
     },
 ];
 
@@ -1478,7 +1485,7 @@ mod tests {
 
     #[test]
     fn remaining_route_inventory_does_not_overlap_contract() {
-        assert_eq!(REMAINING_RUNTIME_ROUTES.len(), 20);
+        assert_eq!(REMAINING_RUNTIME_ROUTES.len(), 21);
         for remaining in REMAINING_RUNTIME_ROUTES {
             assert!(!RuntimeApiMetadata::OPERATIONS.iter().any(|operation| {
                 format!("{:?}", operation.method).eq_ignore_ascii_case(remaining.method)

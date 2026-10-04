@@ -259,6 +259,9 @@ pub struct InternalWorkerSummary {
     pub availability: protocol::subscription::SubscriptionWorkerAvailability,
     /// Runtime catalog lifecycle compatibility state.
     pub state: String,
+    /// Runtime-process reconstruction evidence used only for lifecycle coordination.
+    #[serde(skip)]
+    pub execution_reconstructed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_state: Option<protocol::WorkerStateSnapshot>,
     pub last_seen_at: Option<String>,
@@ -771,6 +774,12 @@ pub struct WorkerProxyConnectPoint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeSessionAttachment {
+    pub media_type: String,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeRegistryError {
     InvalidIdentifier {
         kind: &'static str,
@@ -1217,6 +1226,23 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         Ok(runtime_api::WorkerSessionHistoryAvailability::Unavailable {
             reason: runtime_api::WorkerSessionHistoryUnavailableReason::Unsupported,
             message: "session history paging is not supported by this Runtime".to_string(),
+        })
+    }
+
+    fn worker_session_attachment(
+        &self,
+        _workspace_id: &str,
+        worker_ref: &EmbeddedWorkerRef,
+        _session_id: &str,
+        _attachment_id: &str,
+    ) -> Result<RuntimeSessionAttachment, RuntimeRegistryError> {
+        Err(RuntimeRegistryError::RuntimeOperationFailed {
+            runtime_id: self.runtime_id().to_string(),
+            code: "session_attachment_unsupported".to_string(),
+            message: format!(
+                "Session attachment reads are not supported for Worker `{}`",
+                worker_ref.worker_id
+            ),
         })
     }
 
@@ -2096,6 +2122,27 @@ impl RuntimeRegistry {
             })
     }
 
+    pub fn worker_session_attachment(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        session_id: &str,
+        attachment_id: &str,
+    ) -> Result<RuntimeSessionAttachment, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", &worker.runtime_id)?;
+        validate_backend_identifier("worker_id", &worker.worker_id)?;
+        validate_backend_identifier("session_id", session_id)?;
+        validate_backend_identifier("attachment_id", attachment_id)?;
+        let runtime = self.runtime(&worker.runtime_id)?;
+        let worker_ref =
+            EmbeddedWorkerRef::new(EmbeddedWorkerId::parse(&worker.worker_id).ok_or_else(
+                || RuntimeRegistryError::UnknownWorker {
+                    worker: worker.clone(),
+                },
+            )?);
+        runtime.worker_session_attachment(workspace_id, &worker_ref, session_id, attachment_id)
+    }
+
     pub fn session_public_search(
         &self,
         runtime_id: &str,
@@ -2333,6 +2380,7 @@ impl EmbeddedWorkerRuntime {
                 summary.execution_metadata_available,
             )
             .to_string(),
+            execution_reconstructed: false,
             worker_state: summary.worker_state.clone(),
             last_seen_at: None,
             pinned: false,
@@ -2373,6 +2421,7 @@ impl EmbeddedWorkerRuntime {
             availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
             state: embedded_worker_state_label(detail.status, detail.execution_metadata_available)
                 .to_string(),
+            execution_reconstructed: detail.execution_reconstructed,
             worker_state: detail.worker_state.clone(),
             last_seen_at: None,
             pinned: false,
@@ -3015,6 +3064,46 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         self.runtime
             .worker_session_history_scoped(&scope, worker_ref, cursor, limit)
             .map_err(|error| error.to_string())
+    }
+
+    fn worker_session_attachment(
+        &self,
+        workspace_id: &str,
+        worker_ref: &EmbeddedWorkerRef,
+        session_id: &str,
+        attachment_id: &str,
+    ) -> Result<RuntimeSessionAttachment, RuntimeRegistryError> {
+        let scope = RuntimeWorkspaceScope::new(workspace_id, "embedded-backend");
+        self.runtime
+            .worker_session_attachment_scoped(
+                &scope,
+                worker_ref,
+                session_id.to_string(),
+                attachment_id.to_string(),
+            )
+            .map(|attachment| RuntimeSessionAttachment {
+                media_type: attachment.media_type,
+                data: attachment.data,
+            })
+            .map_err(|error| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: self.runtime_id.clone(),
+                code: match error {
+                    session_store::RetainedAttachmentReadError::RetentionMissing
+                    | session_store::RetainedAttachmentReadError::ActivePointerMissing => {
+                        "session_attachment_expired"
+                    }
+                    session_store::RetainedAttachmentReadError::SessionMismatch
+                    | session_store::RetainedAttachmentReadError::NotFound => {
+                        "session_attachment_not_found"
+                    }
+                    session_store::RetainedAttachmentReadError::ResourceLimit => {
+                        "session_attachment_too_large"
+                    }
+                    _ => "session_attachment_unavailable",
+                }
+                .to_string(),
+                message: error.to_string(),
+            })
     }
 
     fn session_public_search(
@@ -3732,7 +3821,7 @@ fn workspace_runtime_operation(method: &str, path_and_query: &str) -> &'static s
     }
     if path.ends_with("/input")
         || path.ends_with("/restore")
-        || path.contains("/attachments")
+        || (path.contains("/attachments") && method != "GET")
         || path.contains("/workdir-attachments")
     {
         return "workers:input";
@@ -4059,6 +4148,64 @@ impl RemoteWorkerRuntime {
         self.send_json(path, "GET", &[], self.http.get(self.endpoint(path)))
     }
 
+    fn get_session_attachment(
+        &self,
+        path: &str,
+    ) -> Result<RuntimeSessionAttachment, RuntimeDiagnostic> {
+        let runtime_id = self.runtime_id.clone();
+        let workspace_id = self.workspace_id.clone();
+        let bearer_token = self.bearer_token.clone();
+        let capability_token = match &self.workspace_authorization {
+            Some(authorization) => Some(authorization.issue(
+                "GET",
+                path,
+                workspace_runtime_operation("GET", path),
+                worker_id_from_remote_path(path).as_deref(),
+                &[],
+            )?),
+            None => None,
+        };
+        let request = self.http.get(self.endpoint(path));
+        run_blocking_http(move || {
+            let mut request = request.header(RUNTIME_WORKSPACE_SCOPE_HEADER, &workspace_id);
+            if let Some(token) = capability_token.as_deref().or(bearer_token.as_deref()) {
+                request = request.header(AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let response = request
+                .send()
+                .map_err(|error| remote_reqwest_diagnostic(&runtime_id, error))?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(remote_http_status_diagnostic(&runtime_id, status, response));
+            }
+            let media_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            let mut data = Vec::new();
+            response
+                .take((MAX_REMOTE_RUNTIME_RESPONSE_BYTES + 1) as u64)
+                .read_to_end(&mut data)
+                .map_err(|_| {
+                    diagnostic(
+                        "remote_runtime_response_read_failed",
+                        HostDiagnosticSeverity::Error,
+                        "Remote Runtime attachment response could not be read".to_string(),
+                    )
+                })?;
+            if data.len() > MAX_REMOTE_RUNTIME_RESPONSE_BYTES {
+                return Err(diagnostic(
+                    "remote_runtime_response_too_large",
+                    HostDiagnosticSeverity::Error,
+                    "Remote Runtime attachment response exceeded the allowed size".to_string(),
+                ));
+            }
+            Ok(RuntimeSessionAttachment { media_type, data })
+        })
+    }
+
     fn post_json<B, T>(&self, path: &str, body: &B) -> Result<T, RuntimeDiagnostic>
     where
         B: Serialize + ?Sized,
@@ -4226,6 +4373,7 @@ impl RemoteWorkerRuntime {
                 summary.execution_metadata_available,
             )
             .to_string(),
+            execution_reconstructed: false,
             worker_state: summary.worker_state.clone(),
             last_seen_at: None,
             pinned: false,
@@ -4264,6 +4412,7 @@ impl RemoteWorkerRuntime {
             availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
             state: embedded_worker_state_label(detail.status, detail.execution_metadata_available)
                 .to_string(),
+            execution_reconstructed: detail.execution_reconstructed,
             worker_state: detail.worker_state.clone(),
             last_seen_at: None,
             pinned: false,
@@ -5091,6 +5240,29 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             move |client| async move { client.worker_session_history(worker_id, request).await },
         )
         .map_err(|diagnostic| diagnostic.message)
+    }
+
+    fn worker_session_attachment(
+        &self,
+        workspace_id: &str,
+        worker_ref: &EmbeddedWorkerRef,
+        session_id: &str,
+        attachment_id: &str,
+    ) -> Result<RuntimeSessionAttachment, RuntimeRegistryError> {
+        let path = format!(
+            "/v1/workers/{}/sessions/{}/attachments/{}?workspace_id={}",
+            url_path_segment_encode(&worker_ref.worker_id.to_string()),
+            url_path_segment_encode(session_id),
+            url_path_segment_encode(attachment_id),
+            url_query_value_encode(workspace_id),
+        );
+        self.get_session_attachment(&path).map_err(|diagnostic| {
+            RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: self.runtime_id.clone(),
+                code: diagnostic.code,
+                message: diagnostic.message,
+            }
+        })
     }
 
     fn session_public_search(
@@ -6106,6 +6278,7 @@ pub fn placeholder_worker(host_id: impl Into<String>) -> InternalWorkerSummary {
         },
         availability: protocol::subscription::SubscriptionWorkerAvailability::Unavailable,
         state: "unsupported".to_string(),
+        execution_reconstructed: false,
         worker_state: None,
         last_seen_at: None,
         pinned: false,
@@ -6834,6 +7007,7 @@ mod tests {
                     },
                     availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
                     state: "available".to_string(),
+                    execution_reconstructed: false,
                     worker_state: None,
                     last_seen_at: None,
                     pinned: false,
@@ -7647,6 +7821,13 @@ mod tests {
                 &format!("/v1/workers/{worker_id}/workdir-attachments")
             ),
             "workers:input"
+        );
+        assert_eq!(
+            workspace_runtime_operation(
+                "GET",
+                &format!("/v1/workers/{worker_id}/sessions/session-1/attachments/attachment-1")
+            ),
+            "workers:read"
         );
         assert_eq!(
             workspace_runtime_operation("POST", SSH_HOST_KEY_PROBE_PATH),

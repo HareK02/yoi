@@ -44,6 +44,7 @@
         RewindTarget,
         Segment,
         SessionHistoryPage,
+        SessionToolAttachment,
     } from "#lib/generated/protocol.ts";
     import {
         MAX_FILES_PER_SUBMISSION,
@@ -219,6 +220,17 @@
     const selectedHistory = $derived(
         historyByView[selectedHistoryKey] ?? emptyConsoleHistoryState(),
     );
+    const selectedAttachmentSessionId = $derived(
+        selectedWorkerView.sessionId ?? selectedHistory.sessionId,
+    );
+    function attachmentUrl(attachment: SessionToolAttachment): string | null {
+        if (!runtimeId || !workerId || !selectedAttachmentSessionId) return null;
+        return workerApiPath(
+            `runtimes/${encodeURIComponent(runtimeId)}/workers/${encodeURIComponent(workerId)}` +
+            `/sessions/${encodeURIComponent(selectedAttachmentSessionId)}` +
+            `/attachments/${encodeURIComponent(attachment.attachment_id)}`,
+        );
+    }
     const committedHistoryLines = $derived(
         projectSessionHistoryEntries(
             historyEntries(selectedHistory),
@@ -1743,7 +1755,7 @@
                 {#if (consoleDisplayState.kind === "ready" || consoleDisplayState.kind === "stale") && lines.length > 0}
                     <ol class="console-log">
                         {#each lines as item (item.id)}
-                            <ConsoleLineItem {item} />
+                            <ConsoleLineItem {item} {attachmentUrl} />
                         {/each}
                     </ol>
                 {/if}

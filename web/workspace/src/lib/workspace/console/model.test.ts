@@ -3741,6 +3741,11 @@ Deno.test("committed tool identities reconcile one live call block", () => {
             summary: "read",
             content: "contents",
             is_error: false,
+            attachments: [{
+              attachment_id: "attachment-1",
+              media_type: "image/png",
+              byte_len: 5_735_340,
+            }],
           },
         },
       },
@@ -3753,6 +3758,15 @@ Deno.test("committed tool identities reconcile one live call block", () => {
   );
   assertEquals(lines[0].entryId, "tool-result-entry");
   assertEquals(lines[0].toolCall?.state, "done");
+  assertEquals(lines[0].attachments, [{
+    attachment_id: "attachment-1",
+    media_type: "image/png",
+    byte_len: 5_735_340,
+  }]);
+  assertEquals(
+    projectConsoleLines(lines, "overview")[0].attachments,
+    lines[0].attachments,
+  );
 });
 
 function readHistory(ids: string[], summary: string): ConsoleLine[] {
