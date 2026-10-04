@@ -64,6 +64,62 @@ Deno.test("Console pending scopes are independent and match Tasks row typography
                 `${url}/w/console-history-review/workers/W-900-console-fixture/console?pending=${mode}`,
               );
               await page.locator(".task-mini-row").waitFor();
+              const metadata = page.getByLabel("Worker model and context", { exact: true });
+              const statusGeometry = await metadata.evaluate((status) => {
+                const task = document.querySelector(".task-mini-row")!;
+                const composer = document.querySelector(".console-composer")!;
+                const metrics = (node: Element) => {
+                  const style = getComputedStyle(node);
+                  return [style.fontFamily, style.fontSize, style.lineHeight];
+                };
+                const rect = status.getBoundingClientRect();
+                return {
+                  typography: metrics(status),
+                  taskTypography: metrics(task),
+                  height: rect.height,
+                  belowComposer: rect.top >= composer.getBoundingClientRect().bottom,
+                  alignedWithTasks: rect.left + parseFloat(getComputedStyle(status).paddingLeft) === task.getBoundingClientRect().left,
+                  visible: rect.bottom <= innerHeight,
+                  wrap: getComputedStyle(status).flexWrap,
+                  pageOverflow: document.documentElement.scrollWidth > innerWidth,
+                };
+              });
+              assertEquals(statusGeometry.typography, statusGeometry.taskTypography);
+              assertEquals(statusGeometry.height, 16);
+              assertEquals(statusGeometry.belowComposer, true);
+              assertEquals(statusGeometry.alignedWithTasks, true);
+              assertEquals(statusGeometry.visible, true);
+              assertEquals(statusGeometry.wrap, "nowrap");
+              assertEquals(statusGeometry.pageOverflow, false);
+              const details = metadata.getByRole("button", { name: "Details", exact: true });
+              assertEquals(await page.locator(".console-header").getByRole("button", { name: "Details" }).count(), 0);
+              const detailsGeometry = await details.evaluate((button) => {
+                const row = button.closest(".worker-context-status")!;
+                const rect = button.getBoundingClientRect();
+                const rowRect = row.getBoundingClientRect();
+                return {
+                  rightAligned: Math.abs(rect.right - (rowRect.right - parseFloat(getComputedStyle(row).paddingRight))) < 1,
+                  centered: Math.abs(rect.top + rect.height / 2 - (rowRect.top + rowRect.height / 2)) < 1,
+                  width: rect.width,
+                };
+              });
+              assertEquals(detailsGeometry.rightAligned, true);
+              assertEquals(detailsGeometry.centered, true);
+              assert(detailsGeometry.width > 0);
+              await details.focus();
+              await page.keyboard.press("Enter");
+              assertEquals(await details.getAttribute("aria-expanded"), "true");
+              await page.getByRole("button", { name: "Close", exact: true }).waitFor();
+              await page.keyboard.press("Space");
+              assertEquals(await details.getAttribute("aria-expanded"), "false");
+              await details.click();
+              assertEquals(await details.getAttribute("aria-expanded"), "true");
+              await page.getByRole("button", { name: "Close", exact: true }).click();
+              assertEquals(await details.getAttribute("aria-expanded"), "false");
+              if (mode === "both") {
+                await Deno.mkdir(join(root, "target/web-ux/composer-metadata"), { recursive: true });
+                await page.screenshot({ path: join(root, `target/web-ux/composer-metadata/${colorScheme}-${width}.png`) });
+              }
               const queue = mode === "both" || mode === "queue";
               const notifications = ["both", "notifications", "legacy"].includes(mode);
               assertEquals(

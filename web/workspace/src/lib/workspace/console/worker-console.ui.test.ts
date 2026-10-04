@@ -738,6 +738,26 @@ Deno.test("Worker Console renders Edit diffs without preformatted template gaps"
   );
 });
 
+Deno.test("Model information stays below Composer in one compact monospace row", async () => {
+  const page = await Deno.readTextFile(new URL(
+    "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
+    import.meta.url,
+  ));
+  const composer = page.indexOf('<form class="console-composer"');
+  const composerEnd = page.indexOf("</form>", composer);
+  const status = page.indexOf("<WorkerContextStatus");
+  assert(composer >= 0 && composerEnd > composer && status > composerEnd, "Model information must follow Composer");
+  assert(page.includes("metadata={selectedConsoleProjection.workerMetadata}"), "Keep selected Worker metadata");
+  assert(page.indexOf("<WorkerContextStatus", status + 1) === -1, "Render model information only once");
+  const component = await Deno.readTextFile(new URL("./WorkerContextStatus.svelte", import.meta.url));
+  for (const rule of [
+    "flex-wrap: nowrap", "white-space: nowrap", "text-overflow: ellipsis",
+    "font-family: var(--font-mono)", "font-size: var(--font-size-compact)",
+    "line-height: var(--line-height-compact)", "padding-inline: var(--space-3)",
+  ]) assert(component.includes(rule), rule);
+  assert(!component.includes("@media"), "Narrow layouts must retain the same single row");
+});
+
 Deno.test("Console spacing and text metrics use existing design tokens", async () => {
   const files = [
     "ComposerInput.svelte",

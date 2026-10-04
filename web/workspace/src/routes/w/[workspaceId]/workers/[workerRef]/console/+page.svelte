@@ -1652,7 +1652,6 @@
 
 <div class="console-shell worker-console-shell">
     <section class="console-header card" aria-label="Worker controls">
-        <WorkerContextStatus metadata={selectedConsoleProjection.workerMetadata} />
         <div class="console-header-actions">
             <div
                 class="console-view-modes"
@@ -1676,17 +1675,6 @@
                     Normal
                 </button>
             </div>
-            <button
-                type="button"
-                class="secondary-button"
-                aria-expanded={workerDetailsOpen}
-                onclick={() => {
-                    workerDetailsOpen = !workerDetailsOpen;
-                    if (workerDetailsOpen) taskPaneOpen = false;
-                }}
-            >
-                Details
-            </button>
         </div>
     </section>
 
@@ -2094,6 +2082,14 @@
             </div>
         </div>
     </form>
+    <WorkerContextStatus
+        metadata={selectedConsoleProjection.workerMetadata}
+        detailsOpen={workerDetailsOpen}
+        onToggleDetails={() => {
+            workerDetailsOpen = !workerDetailsOpen;
+            if (workerDetailsOpen) taskPaneOpen = false;
+        }}
+    />
 </div>
 
 <style>
@@ -2123,7 +2119,7 @@
         display: flex;
         min-width: 0;
         align-items: center;
-        justify-content: space-between;
+        justify-content: flex-end;
         gap: var(--space-4);
     }
 
