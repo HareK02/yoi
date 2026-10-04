@@ -284,6 +284,38 @@ pub struct BackendJobRecord {
     pub completed_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendJobWorkerCleanupState {
+    Pending,
+    Executing,
+    Completed,
+    Failed,
+}
+
+impl BackendJobWorkerCleanupState {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Executing => "executing",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "executing" => Ok(Self::Executing),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            other => Err(Error::Store(format!(
+                "unknown Backend Job Worker cleanup state `{other}`"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BackendJobAttemptRecord {
     pub workspace_id: String,
@@ -300,6 +332,11 @@ pub struct BackendJobAttemptRecord {
     pub result_digest: Option<String>,
     pub failure_category: Option<String>,
     pub failure_detail: Option<String>,
+    pub worker_cleanup_state: Option<BackendJobWorkerCleanupState>,
+    pub worker_cleanup_failure_category: Option<String>,
+    pub worker_cleanup_failure_detail: Option<String>,
+    pub worker_cleanup_updated_at: Option<String>,
+    pub worker_cleanup_completed_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub completed_at: Option<String>,

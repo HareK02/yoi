@@ -875,6 +875,13 @@ CREATE TABLE backend_job_attempts (
             result_digest TEXT,
             failure_category TEXT,
             failure_detail TEXT,
+            worker_cleanup_state TEXT CHECK (
+                worker_cleanup_state IN ('pending', 'executing', 'completed', 'failed')
+            ),
+            worker_cleanup_failure_category TEXT,
+            worker_cleanup_failure_detail TEXT,
+            worker_cleanup_updated_at TEXT,
+            worker_cleanup_completed_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             completed_at TEXT,
@@ -889,6 +896,8 @@ CREATE TABLE backend_job_attempts (
         );
 CREATE INDEX backend_job_attempts_recovery
         ON backend_job_attempts(workspace_id, state, deadline_at);
+CREATE INDEX backend_job_attempts_worker_cleanup
+        ON backend_job_attempts(workspace_id, worker_cleanup_state, updated_at);
 CREATE TABLE backend_job_deliveries (
             workspace_id TEXT NOT NULL,
             delivery_id TEXT NOT NULL,
