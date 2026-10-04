@@ -116,6 +116,17 @@ pub(crate) fn restore_history_entries(
             }
             LogEntry::AnnotatedAssistantItem { entry, .. }
             | LogEntry::AnnotatedToolResult { entry, .. } => history.push(from_logged(entry)),
+            LogEntry::ToolResultCorrected { entry, .. } => {
+                let target = history
+                    .iter_mut()
+                    .find(|existing| existing.annotation.entry_id == entry.metadata.entry_id)
+                    .ok_or_else(|| "tool result correction target is missing".to_string())?;
+                if !matches!((&target.item, &entry.item), (Item::ToolResult { call_id, .. }, session_store::LoggedItem::ToolResult { call_id: replacement, .. }) if call_id == replacement)
+                {
+                    return Err("tool result correction changed call identity".to_string());
+                }
+                *target = from_logged(entry);
+            }
             LogEntry::AnnotatedSystemItem { entry, .. } => history.push(HistoryEntry::new(
                 entry.item.to_history_item(),
                 entry.metadata.clone(),

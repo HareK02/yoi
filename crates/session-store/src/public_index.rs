@@ -1071,6 +1071,7 @@ fn persisted_entry_units(entries: &[LogEntry]) -> usize {
             | LogEntry::AnnotatedUserInput { history, .. } => history.len(),
             LogEntry::AnnotatedAssistantItem { .. }
             | LogEntry::AnnotatedToolResult { .. }
+            | LogEntry::ToolResultCorrected { .. }
             | LogEntry::AnnotatedSystemItem { .. } => 1,
             _ => 0,
         };

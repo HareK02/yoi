@@ -32,6 +32,7 @@ reqwest = { version = "0.13", default-features = false, features = ["stream", "j
 eventsource-stream = "0.2"
 zstd = "0.13"
 base64 = "0.22.1"
+imagesize = "0.14"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"], optional = true }
 agen-macros = { workspace = true }
 

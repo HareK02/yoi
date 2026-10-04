@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "image_recovery_tests.rs"]
+mod image_recovery_tests;
+
 use std::collections::{HashMap, VecDeque};
 #[cfg(test)]
 use std::path::Path;
@@ -4046,6 +4050,24 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         St: Clone + 'static,
     {
         self.materialize_durable_session_head().await?;
+        let writer = self.log_writer_handle();
+        let activity = self.ai_activity_counter.clone();
+        self.engine_mut()
+            .set_image_rejection_handler(move |original, replacement| {
+                writer
+                    .append_entry(LogEntry::ToolResultCorrected {
+                        ts: segment_log::now_millis(),
+                        entry: session_store::LoggedHistoryEntry {
+                            item: replacement.clone().into(),
+                            metadata: original.annotation.clone(),
+                        },
+                    })
+                    .map_err(|error| error.to_string())?;
+                // A later Cancel must not roll back this committed correction while
+                // leaving the in-memory result changed (the original may predate Run).
+                activity.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
         self.ensure_interceptor_installed();
         if self.should_pre_run_compact() {
             self.try_pre_run_compact().await?;
