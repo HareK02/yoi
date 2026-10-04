@@ -5,6 +5,7 @@
 //! workspace backend instead of resolving `.yoi/memory` from a Worker workdir.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
 use arc_swap::ArcSwap;
@@ -150,9 +151,24 @@ impl dyn WorkspaceClient + '_ {
     }
 }
 
+const RESIDENT_SUMMARY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
 async fn execute_subjektiv_memory_operation(
     client: &dyn WorkspaceClient,
     operation: server_api::SubjektivMemoryBackendOperation,
+) -> Result<server_api::SubjektivMemoryBackendResponse, WorkspaceMemoryBackendError> {
+    execute_subjektiv_memory_operation_with(client, operation, |client, request| {
+        client.execute(request)
+    })
+}
+
+fn execute_subjektiv_memory_operation_with(
+    client: &dyn WorkspaceClient,
+    operation: server_api::SubjektivMemoryBackendOperation,
+    execute: impl FnOnce(
+        &dyn WorkspaceClient,
+        WorkspaceRequest,
+    ) -> Result<crate::worker::WorkspaceResponse, WorkspaceClientError>,
 ) -> Result<server_api::SubjektivMemoryBackendResponse, WorkspaceMemoryBackendError> {
     let workspace_id =
         client
@@ -163,11 +179,14 @@ async fn execute_subjektiv_memory_operation(
                     client.kind()
                 ),
             })?;
-    let response = client.execute(WorkspaceRequest::json(
-        WorkspaceRequestMethod::Post,
-        format!("/api/w/{workspace_id}/subjektiv/memory"),
-        serde_json::to_string(&server_api::SubjektivMemoryBackendRequest { operation })?,
-    ))?;
+    let response = execute(
+        client,
+        WorkspaceRequest::json(
+            WorkspaceRequestMethod::Post,
+            format!("/api/w/{workspace_id}/subjektiv/memory"),
+            serde_json::to_string(&server_api::SubjektivMemoryBackendRequest { operation })?,
+        ),
+    )?;
     let status = reqwest::StatusCode::from_u16(response.status)
         .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
     if !response.is_success() {
@@ -699,12 +718,13 @@ impl SystemPromptContributionSource for WorkspaceResidentSummarySource {
 #[async_trait]
 impl SystemPromptContributionSource for WorkspaceSubjektivResidentSummarySource {
     async fn load(&self) -> SystemPromptContribution {
-        match execute_subjektiv_memory_operation(
+        match execute_subjektiv_memory_operation_with(
             self.client.as_ref(),
             server_api::SubjektivMemoryBackendOperation::ResidentSummary(Default::default()),
-        )
-        .await
-        {
+            |client, request| {
+                client.execute_with_timeout(request, RESIDENT_SUMMARY_REQUEST_TIMEOUT)
+            },
+        ) {
             Ok(server_api::SubjektivMemoryBackendResponse::ResidentSummary(output)) => {
                 match resident_summary_contribution(output) {
                     SystemPromptContribution::Ready(content) if content.trim().is_empty() => {
@@ -1113,6 +1133,7 @@ mod tests {
         content: Option<String>,
         scope_allowed: bool,
         paths: Mutex<Vec<String>>,
+        timeouts: Mutex<Vec<Duration>>,
     }
 
     impl SubjectResidentClient {
@@ -1125,6 +1146,7 @@ mod tests {
                 content: content.map(str::to_string),
                 scope_allowed: true,
                 paths: Mutex::new(Vec::new()),
+                timeouts: Mutex::new(Vec::new()),
             }
         }
 
@@ -1134,6 +1156,7 @@ mod tests {
                 content: Some("must not be injected".into()),
                 scope_allowed: false,
                 paths: Mutex::new(Vec::new()),
+                timeouts: Mutex::new(Vec::new()),
             }
         }
     }
@@ -1181,6 +1204,15 @@ mod tests {
                 )
                 .unwrap(),
             })
+        }
+
+        fn execute_with_timeout(
+            &self,
+            request: WorkspaceRequest,
+            timeout: Duration,
+        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            self.timeouts.lock().unwrap().push(timeout);
+            self.execute(request)
         }
     }
 
@@ -1489,6 +1521,10 @@ permission = "write"
         assert_eq!(
             ready_client.paths.lock().unwrap().clone(),
             vec!["/api/w/workspace/subjektiv/memory".to_string()]
+        );
+        assert_eq!(
+            ready_client.timeouts.lock().unwrap().as_slice(),
+            &[RESIDENT_SUMMARY_REQUEST_TIMEOUT]
         );
 
         let ready_empty_client = Arc::new(SubjectResidentClient::new(

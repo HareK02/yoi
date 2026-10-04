@@ -738,6 +738,17 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
     fn execute(&self, request: WorkspaceRequest)
     -> Result<WorkspaceResponse, WorkspaceClientError>;
 
+    /// Executes one bounded Workspace request when the caller is on a
+    /// latency-sensitive lifecycle boundary. Implementations without transport
+    /// timeout support retain their existing execution semantics.
+    fn execute_with_timeout(
+        &self,
+        request: WorkspaceRequest,
+        _timeout: Duration,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        self.execute(request)
+    }
+
     fn execute_server_operation(
         &self,
         operation: WorkspaceServerOperation,

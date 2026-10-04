@@ -381,10 +381,10 @@ impl RuntimeOwnedWorkspaceClient {
         self
     }
 
-    fn execute_with_permission(
+    fn execute_with_optional_timeout(
         &self,
         request: WorkspaceRequest,
-        permission: &'static str,
+        timeout: Option<Duration>,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         let method = match request.method {
             WorkspaceRequestMethod::Get => reqwest::Method::GET,
@@ -409,9 +409,9 @@ impl RuntimeOwnedWorkspaceClient {
                 path_and_query: request.path,
                 body,
                 headers,
-                permission: permission.to_string(),
+                permission: WORKSPACE_REQUEST_PERMISSION.to_string(),
                 worker_id: Some(self.worker_id.clone()),
-                timeout: self.request_timeout,
+                timeout,
                 max_response_bytes: 8 * 1024 * 1024,
             })
             .map_err(|error| {
@@ -478,7 +478,15 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
         &self,
         request: WorkspaceRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
-        self.execute_with_permission(request, WORKSPACE_REQUEST_PERMISSION)
+        self.execute_with_optional_timeout(request, self.request_timeout)
+    }
+
+    fn execute_with_timeout(
+        &self,
+        request: WorkspaceRequest,
+        timeout: Duration,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        self.execute_with_optional_timeout(request, Some(timeout))
     }
 
     fn execute_server_operation(
@@ -1338,6 +1346,25 @@ mod tests {
             .unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, r#"{"ok":true}"#);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn runtime_owned_workspace_client_honors_per_request_timeouts() {
+        let (base_url, server) = delayed_workspace_response(Duration::from_millis(75));
+        let client =
+            RuntimeOwnedWorkspaceClient::new("workspace-a", base_url, "runtime-a", "worker-a");
+
+        let error = client
+            .execute_with_timeout(
+                WorkspaceRequest::json(WorkspaceRequestMethod::Post, "/api/test", "{}"),
+                Duration::from_millis(20),
+            )
+            .unwrap_err();
+        assert_eq!(client.request_timeout, None);
+        let message = error.to_string();
+        assert!(message.contains("POST /api/test"), "{message}");
+        assert!(message.contains("timed out"), "{message}");
         server.join().unwrap();
     }
 
