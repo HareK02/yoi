@@ -114,7 +114,8 @@ pub use public_snapshot::{
     RetainedHistoryReadLimits, RetainedSessionAttachment, RetainedSessionIdentity,
     RetainedSessionSnapshot, RetainedSnapshotReadError, project_session_snapshot,
     read_retained_session_attachment, read_retained_session_history_page,
-    read_retained_session_snapshot, session_tool_attachment_id,
+    read_retained_session_snapshot, read_session_attachment_from_entries,
+    session_tool_attachment_id,
 };
 pub use segment::{
     SegmentStartState, append_entry, append_system_item, classify_logged_history_entry,

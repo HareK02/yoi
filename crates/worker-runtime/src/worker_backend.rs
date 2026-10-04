@@ -2448,6 +2448,24 @@ where
         request: crate::execution::WorkerSessionAttachmentRequest,
     ) -> Result<session_store::RetainedSessionAttachment, session_store::RetainedAttachmentReadError>
     {
+        let live = self
+            .workers
+            .lock()
+            .map_err(|_| session_store::RetainedAttachmentReadError::StorageUnavailable)?
+            .get(&request.worker_ref)
+            .map(|execution| execution.handle.clone());
+        if let Some(handle) = live {
+            match handle.session_attachment(
+                &request.session_id,
+                &request.attachment_id,
+                10 * 1024 * 1024,
+            ) {
+                Ok(attachment) => return Ok(attachment),
+                Err(session_store::RetainedAttachmentReadError::SessionMismatch)
+                | Err(session_store::RetainedAttachmentReadError::NotFound) => {}
+                Err(error) => return Err(error),
+            }
+        }
         self.factory.retained_session_attachment(
             &request.worker_ref,
             &request.session_id,

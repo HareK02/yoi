@@ -129,6 +129,27 @@ impl WorkerHandle {
         self.sink.subscribe_with_snapshot().0
     }
 
+    pub fn session_attachment(
+        &self,
+        session_id: &str,
+        attachment_id: &str,
+        max_attachment_bytes: u64,
+    ) -> Result<session_store::RetainedSessionAttachment, session_store::RetainedAttachmentReadError>
+    {
+        if session_id == self.session_id.to_string() {
+            return session_store::read_session_attachment_from_entries(
+                &self.committed_entries(),
+                attachment_id,
+                max_attachment_bytes,
+            );
+        }
+        self.spawned_registry
+            .session_attachment(session_id, attachment_id, max_attachment_bytes)
+            .unwrap_or(Err(
+                session_store::RetainedAttachmentReadError::SessionMismatch,
+            ))
+    }
+
     pub fn snapshot_event(&self) -> Event {
         self.snapshot_event_with_entry_subscription().0
     }

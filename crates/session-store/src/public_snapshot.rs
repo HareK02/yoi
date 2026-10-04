@@ -251,28 +251,80 @@ pub fn read_retained_session_attachment(
         .ok_or(RetainedAttachmentReadError::ActivePointerMissing)?;
     let store = WorkerSessionStore::open_read_only(aggregate_root.join("session"))
         .map_err(map_attachment_store_error)?;
-    if store
-        .segment_log_len(segment_id)
-        .map_err(map_attachment_store_error)?
-        > max_scan_bytes
-    {
-        return Err(RetainedAttachmentReadError::ResourceLimit);
-    }
-    let entries = store
-        .read_all_read_only(active.session_id, segment_id)
-        .map_err(map_attachment_store_error)?;
-    for record in &entries {
-        let mut found = None;
-        visit_record_history(record, &mut |entry| {
-            if found.is_none() {
-                found = attachment_from_entry(entry, attachment_id, max_attachment_bytes);
+    let limits = RetainedHistoryReadLimits {
+        max_scan_bytes,
+        ..RetainedHistoryReadLimits::default()
+    };
+    let (lineage, _, mut scanned_bytes, mut scanned_entries) =
+        load_adopted_lineage(&store, active.session_id, segment_id, limits)
+            .map_err(map_history_attachment_error)?;
+    for segment in &lineage {
+        let adopted_end = locate_adopted_segment_end(
+            &store,
+            active.session_id,
+            segment,
+            limits,
+            &mut scanned_bytes,
+            &mut scanned_entries,
+        )
+        .map_err(map_history_attachment_error)?;
+        let mut reader = store
+            .open_retained_segment_reader(active.session_id, segment.segment_id, adopted_end)
+            .map_err(map_attachment_store_error)?;
+        loop {
+            let remaining = limits.max_scan_bytes.saturating_sub(scanned_bytes);
+            let (record, bytes) = reader
+                .previous_record(remaining)
+                .map_err(map_attachment_store_error)?;
+            scanned_bytes = scanned_bytes
+                .checked_add(bytes)
+                .ok_or(RetainedAttachmentReadError::ResourceLimit)?;
+            let Some(record) = record else {
+                break;
+            };
+            scanned_entries = scanned_entries
+                .checked_add(persisted_entry_units(std::slice::from_ref(&record.entry)))
+                .ok_or(RetainedAttachmentReadError::ResourceLimit)?;
+            if scanned_entries > limits.max_entries {
+                return Err(RetainedAttachmentReadError::ResourceLimit);
             }
-        });
-        if let Some(result) = found {
+            if let Some(result) =
+                session_attachment_from_record(&record.entry, attachment_id, max_attachment_bytes)
+            {
+                return result;
+            }
+        }
+    }
+    Err(RetainedAttachmentReadError::NotFound)
+}
+
+pub fn read_session_attachment_from_entries(
+    entries: &[LogEntry],
+    attachment_id: &str,
+    max_attachment_bytes: u64,
+) -> Result<RetainedSessionAttachment, RetainedAttachmentReadError> {
+    for record in entries {
+        if let Some(result) =
+            session_attachment_from_record(record, attachment_id, max_attachment_bytes)
+        {
             return result;
         }
     }
     Err(RetainedAttachmentReadError::NotFound)
+}
+
+fn session_attachment_from_record(
+    record: &LogEntry,
+    attachment_id: &str,
+    max_attachment_bytes: u64,
+) -> Option<Result<RetainedSessionAttachment, RetainedAttachmentReadError>> {
+    let mut found = None;
+    visit_record_history(record, &mut |entry| {
+        if found.is_none() {
+            found = attachment_from_entry(entry, attachment_id, max_attachment_bytes);
+        }
+    });
+    found
 }
 
 fn visit_record_history(record: &LogEntry, visit: &mut impl FnMut(&LoggedHistoryEntry)) {
@@ -1052,6 +1104,25 @@ fn map_history_store_error(error: StoreError) -> RetainedHistoryReadError {
             RetainedHistoryReadError::CorruptLog
         }
         _ => RetainedHistoryReadError::CorruptLog,
+    }
+}
+
+fn map_history_attachment_error(error: RetainedHistoryReadError) -> RetainedAttachmentReadError {
+    match error {
+        RetainedHistoryReadError::RetentionMissing => RetainedAttachmentReadError::RetentionMissing,
+        RetainedHistoryReadError::ActivePointerMissing => {
+            RetainedAttachmentReadError::ActivePointerMissing
+        }
+        RetainedHistoryReadError::MigrationRequired => {
+            RetainedAttachmentReadError::MigrationRequired
+        }
+        RetainedHistoryReadError::CorruptLog | RetainedHistoryReadError::InvalidCursor => {
+            RetainedAttachmentReadError::CorruptLog
+        }
+        RetainedHistoryReadError::StorageUnavailable => {
+            RetainedAttachmentReadError::StorageUnavailable
+        }
+        RetainedHistoryReadError::ResourceLimit => RetainedAttachmentReadError::ResourceLimit,
     }
 }
 
@@ -3479,6 +3550,92 @@ mod tests {
             read_retained_session_snapshot(&aggregate_root, "worker-a", 0),
             Err(RetainedSnapshotReadError::SnapshotTooLarge)
         ));
+    }
+
+    #[test]
+    fn retained_attachment_resolves_from_an_adopted_compaction_ancestor() {
+        let worker_name = "worker-ancestor-image";
+        let session_id = crate::new_session_id();
+        let source_segment = crate::new_segment_id();
+        let active_segment = crate::new_segment_id();
+        let image_entry = LoggedHistoryEntry {
+            item: LoggedItem::ToolResult {
+                call_id: "call-ancestor-image".into(),
+                summary: "ancestor screenshot".into(),
+                content: None,
+                attachments: vec![crate::logged_item::LoggedAttachment::Image {
+                    mime_type: "image/png".into(),
+                    data: vec![7, 8, 9],
+                }],
+                disposition: agen::tool::ToolResultDisposition::Success,
+                is_error: false,
+            },
+            metadata: LoggedSessionHistoryMetadata {
+                entry_id: LoggedSessionHistoryEntryId("ancestor-image".into()),
+                origin: LoggedSessionHistoryOrigin::LegacyUnknown,
+                derivation: None,
+            },
+        };
+        let mut source_log = vec![segment_start(session_id, Vec::new(), None, None)];
+        source_log.push(LogEntry::AnnotatedUserInput {
+            ts: 2,
+            segments: vec![Segment::Text {
+                content: "show image".into(),
+            }],
+            history: vec![user_message(1)],
+            extensions: Vec::new(),
+        });
+        source_log.push(LogEntry::AnnotatedToolResult {
+            ts: 3,
+            entry: image_entry,
+        });
+        source_log.push(LogEntry::TurnEnd {
+            ts: 4,
+            turn_count: 1,
+        });
+        let active_log = vec![segment_start(
+            session_id,
+            Vec::new(),
+            None,
+            Some(SegmentOrigin {
+                segment_id: source_segment,
+                at_turn_index: 1,
+            }),
+        )];
+        let (_root, aggregate_root) = persist_history_fixture(
+            worker_name,
+            session_id,
+            active_segment,
+            vec![(source_segment, source_log), (active_segment, active_log)],
+        );
+
+        let page = read_retained_session_history_page(
+            &aggregate_root,
+            worker_name,
+            None,
+            None,
+            RetainedHistoryReadLimits::default(),
+        )
+        .unwrap();
+        let attachment = page.turns[0]
+            .entries
+            .iter()
+            .find_map(|entry| match &entry.data {
+                SessionSnapshotEntryData::ToolResult { attachments, .. } => attachments.first(),
+                _ => None,
+            })
+            .expect("ancestor attachment reference");
+        let body = read_retained_session_attachment(
+            &aggregate_root,
+            worker_name,
+            &session_id.to_string(),
+            &attachment.attachment_id,
+            DEFAULT_RETAINED_HISTORY_MAX_SCAN_BYTES,
+            10 * 1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!(body.media_type, "image/png");
+        assert_eq!(body.data, vec![7, 8, 9]);
     }
 
     #[test]
