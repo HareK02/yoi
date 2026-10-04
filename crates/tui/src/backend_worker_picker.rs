@@ -579,6 +579,7 @@ mod tests {
                     protocol::WorkerRunState::Running,
                 )),
                 last_command_id: 0,
+                last_finished_submission_request_id: None,
             }),
             last_seen_at: None,
             pinned: false,
@@ -869,6 +870,7 @@ mod tests {
         short.worker_state = Some(protocol::WorkerStateSnapshot {
             state: protocol::WorkerState::Idle,
             last_command_id: 0,
+            last_finished_submission_request_id: None,
         });
 
         let mut long = worker("runtime-a", "worker-b", None);
