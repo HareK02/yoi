@@ -459,7 +459,8 @@ Deno.test("production subject Memory and Worker launch shells preserve exact sco
         `/api/w/${workspaceId}/subjektiv/subjects`,
         `/api/w/${workspaceId}/subjektiv/subjects`,
       ]);
-      const createEvidence = await (await fetch(`${baseUrl}/fixture/subject-create-requests`)).json();
+      const createEvidence = await (await fetch(`${baseUrl}/fixture/subject-create-requests`))
+        .json();
       assertEquals(createEvidence, {
         count: 2,
         requests: [{ role: "Permission denied" }, { role: "  Release steward  " }],
