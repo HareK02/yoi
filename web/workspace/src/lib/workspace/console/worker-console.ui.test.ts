@@ -756,6 +756,12 @@ Deno.test("Model information stays below Composer in one compact monospace row",
     "line-height: var(--line-height-compact)", "padding-inline: var(--space-3)",
   ]) assert(component.includes(rule), rule);
   assert(!component.includes("@media"), "Narrow layouts must retain the same single row");
+  const modes = page.indexOf('class="console-view-toggle"');
+  assert(modes > status && modes < page.indexOf("</WorkerContextStatus>", status), "Display toggle must be in the model information row");
+  assert(!page.includes("console-header"), "Remove the empty header and its styles");
+  assert(component.indexOf("{@render controls?.()}") < component.indexOf('class="details-button"'), "Display controls must precede Details");
+  assert(/\.worker-context-actions\s*\{[^}]*flex: 0 0 auto/.test(component), "Keep display controls from shrinking on narrow screens");
+  assert(component.includes("margin-left: auto"), "Align footer controls to the right");
 });
 
 Deno.test("Console spacing and text metrics use existing design tokens", async () => {
@@ -1571,14 +1577,10 @@ Deno.test("Composer owns TUI-style completion and replaces Compact/Rewind header
   const input = await Deno.readTextFile(
     new URL("./ComposerInput.svelte", import.meta.url),
   );
-  const header = page.slice(
-    page.indexOf('<section class="console-header'),
-    page.indexOf("{#if rewindTargets.length"),
-  );
   assert(
-    !header.includes("Compact") && !header.includes("Rewind") &&
+    !page.includes('class="console-header') &&
       !page.includes("requestRewindTargets"),
-    "Header must defer Compact/Rewind to commands",
+    "Compact/Rewind must remain commands without a dedicated header",
   );
   assert(
     input.includes('role="listbox"') && input.includes('role="option"') &&
@@ -1608,12 +1610,8 @@ Deno.test("mini task summary owns pane toggling instead of the header", async ()
   const component = await Deno.readTextFile(
     new URL("./ConsoleTasks.svelte", import.meta.url),
   );
-  const header = page.slice(
-    page.indexOf('<section class="console-header'),
-    page.indexOf("{#if rewindTargets.length"),
-  );
   assert(
-    !header.includes("taskPaneOpen = !taskPaneOpen") &&
+    !page.includes('class="console-header') &&
       page.includes("onTogglePane={() => {"),
     "Only the mini summary should own Tasks toggling",
   );

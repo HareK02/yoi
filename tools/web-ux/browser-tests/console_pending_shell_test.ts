@@ -85,14 +85,14 @@ Deno.test("Console pending scopes are independent and match Tasks row typography
                 };
               });
               assertEquals(statusGeometry.typography, statusGeometry.taskTypography);
-              assertEquals(statusGeometry.height, 16);
+              assertEquals(statusGeometry.height, 24);
               assertEquals(statusGeometry.belowComposer, true);
               assertEquals(statusGeometry.alignedWithTasks, true);
               assertEquals(statusGeometry.visible, true);
               assertEquals(statusGeometry.wrap, "nowrap");
               assertEquals(statusGeometry.pageOverflow, false);
               const details = metadata.getByRole("button", { name: "Details", exact: true });
-              assertEquals(await page.locator(".console-header").getByRole("button", { name: "Details" }).count(), 0);
+              assertEquals(await page.locator(".console-header").count(), 0);
               const detailsGeometry = await details.evaluate((button) => {
                 const row = button.closest(".worker-context-status")!;
                 const rect = button.getBoundingClientRect();
@@ -105,7 +105,49 @@ Deno.test("Console pending scopes are independent and match Tasks row typography
               });
               assertEquals(detailsGeometry.rightAligned, true);
               assertEquals(detailsGeometry.centered, true);
-              assert(detailsGeometry.width > 0);
+              assertEquals(detailsGeometry.width, 24);
+              const overview = metadata.getByRole("switch", { name: "Overview", exact: true });
+              const controls = await overview.evaluate((group) => {
+                const row = group.closest(".worker-context-status")!;
+                const rowRect = row.getBoundingClientRect();
+                const buttons = [...row.querySelectorAll("button")];
+                return {
+                  buttonsInsideRow: buttons.every((button) => {
+                    const rect = button.getBoundingClientRect();
+                    return rect.left >= rowRect.left && rect.right <= rowRect.right &&
+                      rect.top >= rowRect.top && rect.bottom <= rowRect.bottom;
+                  }),
+                  heights: buttons.map((button) => button.getBoundingClientRect().height),
+                  modeFont: getComputedStyle(buttons[0]).fontFamily,
+                  divider: getComputedStyle(buttons[1]).borderLeftWidth,
+                  beforeDetails: group.nextElementSibling?.getAttribute("aria-label") === "Details",
+                };
+              });
+              assertEquals(controls.buttonsInsideRow, true);
+              assertEquals(controls.heights, [24, 24]);
+              assertEquals(controls.modeFont.includes("mono"), false);
+              assertEquals(controls.divider, "0px");
+              assertEquals(controls.beforeDetails, true);
+              const onSize = (await overview.boundingBox())!;
+              assert(onSize.width < 90, "Switch and fixed label should use less than 90px");
+              assertEquals(await overview.getAttribute("aria-checked"), "true");
+              await overview.focus();
+              assertEquals(await overview.evaluate((button) => getComputedStyle(button).outlineStyle), "solid");
+              await page.keyboard.press("Enter");
+              assertEquals(await overview.getAttribute("aria-checked"), "false");
+              assertEquals((await overview.textContent())!.trim(), "Overview");
+              assertEquals((await overview.boundingBox())!.width, onSize.width);
+              if (mode === "both") {
+                await Deno.mkdir(join(root, "target/web-ux/console-footer-switch"), { recursive: true });
+                await page.screenshot({ path: join(root, `target/web-ux/console-footer-switch/${colorScheme}-${width}-off.png`) });
+              }
+              await page.keyboard.press("Space");
+              assertEquals(await overview.getAttribute("aria-checked"), "true");
+              assertEquals((await overview.boundingBox())!.width, onSize.width);
+              await overview.locator("span").last().click();
+              assertEquals(await overview.getAttribute("aria-checked"), "false");
+              await overview.locator(".console-view-toggle-track").click();
+              assertEquals(await overview.getAttribute("aria-checked"), "true");
               await details.focus();
               await page.keyboard.press("Enter");
               assertEquals(await details.getAttribute("aria-expanded"), "true");
@@ -117,8 +159,8 @@ Deno.test("Console pending scopes are independent and match Tasks row typography
               await page.getByRole("button", { name: "Close", exact: true }).click();
               assertEquals(await details.getAttribute("aria-expanded"), "false");
               if (mode === "both") {
-                await Deno.mkdir(join(root, "target/web-ux/composer-metadata"), { recursive: true });
-                await page.screenshot({ path: join(root, `target/web-ux/composer-metadata/${colorScheme}-${width}.png`) });
+                await Deno.mkdir(join(root, "target/web-ux/console-footer-switch"), { recursive: true });
+                await page.screenshot({ path: join(root, `target/web-ux/console-footer-switch/${colorScheme}-${width}.png`) });
               }
               const queue = mode === "both" || mode === "queue";
               const notifications = ["both", "notifications", "legacy"].includes(mode);

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { Snippet } from "svelte";
   import type { ConsoleWorkerMetadata } from "./model";
   import {
     formatContextSummary,
@@ -7,33 +8,39 @@
 
   type Props = {
     metadata: ConsoleWorkerMetadata | null;
+    controls?: Snippet;
     detailsOpen?: boolean;
     onToggleDetails?: () => void;
   };
 
-  let { metadata, detailsOpen = false, onToggleDetails }: Props = $props();
+  let { metadata, controls, detailsOpen = false, onToggleDetails }: Props = $props();
   const modelSummary = $derived(formatModelSummary(metadata));
   const contextSummary = $derived(formatContextSummary(metadata));
 </script>
 
 <div class="worker-context-status" aria-label="Worker model and context">
   <span class="worker-model" title={modelSummary}>{modelSummary}</span>
-  <span class="separator" aria-hidden="true">|</span>
+  <span class="separator" aria-hidden="true">·</span>
   <span class="worker-context" title={contextSummary}>{contextSummary}</span>
-  {#if onToggleDetails}
-    <button
-      type="button"
-      class="details-button"
-      aria-label="Details"
-      aria-expanded={detailsOpen}
-      onclick={onToggleDetails}
-    >
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <circle cx="5" cy="12" r="2" />
-        <circle cx="12" cy="12" r="2" />
-        <circle cx="19" cy="12" r="2" />
-      </svg>
-    </button>
+  {#if controls || onToggleDetails}
+    <div class="worker-context-actions">
+      {@render controls?.()}
+      {#if onToggleDetails}
+        <button
+          type="button"
+          class="details-button"
+          aria-label="Details"
+          aria-expanded={detailsOpen}
+          onclick={onToggleDetails}
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="5" cy="12" r="2" />
+            <circle cx="12" cy="12" r="2" />
+            <circle cx="19" cy="12" r="2" />
+          </svg>
+        </button>
+      {/if}
+    </div>
   {/if}
 </div>
 
@@ -72,30 +79,39 @@
     color: var(--line-strong);
   }
 
+  .worker-context-actions {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: var(--space-2);
+    margin-left: auto;
+  }
+
   .details-button {
     display: inline-flex;
     flex: 0 0 auto;
     align-items: center;
     justify-content: center;
-    width: 20px;
-    height: var(--line-height-compact);
-    margin-left: auto;
+    width: var(--space-5);
+    height: var(--space-5);
     padding: 0;
     border: 0;
+    border-radius: var(--space-1);
     background: transparent;
     color: var(--text-muted);
     cursor: pointer;
   }
 
   .details-button:hover,
-  .details-button[aria-expanded="true"],
-  .details-button:focus-visible {
-    color: var(--text);
+  .details-button[aria-expanded="true"] {
+    background: var(--bg-subtle);
+    color: var(--text-strong);
   }
 
   .details-button:focus-visible {
+    color: var(--text-strong);
     outline: 1px solid currentColor;
-    outline-offset: -1px;
+    outline-offset: -2px;
   }
 
   .details-button svg {
