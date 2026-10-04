@@ -1,4 +1,5 @@
 import { MEMORY_API_LIMITS } from "#lib/generated/memory-api.ts";
+import { readBoundedJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
 import type {
   Diagnostic,
   DiagnosticSeverity,
@@ -25,6 +26,7 @@ import type {
   SubjektivResidentSurfaceAvailability,
   SubjektivResidentSurfaceResponse,
   SubjektivResidentSurfaceSnapshot,
+  SubjektivSubjectCreateRequest,
   SubjektivSubjectListResponse,
   SubjektivSubjectResponse,
   SubjektivSubjectState,
@@ -80,6 +82,128 @@ export const MEMORY_API_LOAD_POLICY = {
   diagnosticLabel: "Memory API",
   maxResponseBytes: MEMORY_API_LIMITS.maxResponseBytes,
 } as const;
+
+const MAX_SUBJECT_ROLE_BYTES = 256;
+const MAX_SUBJECT_CREATE_ERROR_BYTES = 1024 * 1024;
+
+export type SubjektivSubjectCreateErrorKind =
+  | "validation"
+  | "rejected"
+  | "unknown_outcome";
+
+export class SubjektivSubjectCreateError extends Error {
+  readonly kind: SubjektivSubjectCreateErrorKind;
+  readonly status: number | null;
+
+  constructor(
+    kind: SubjektivSubjectCreateErrorKind,
+    message: string,
+    status: number | null = null,
+  ) {
+    super(message);
+    this.name = "SubjektivSubjectCreateError";
+    this.kind = kind;
+    this.status = status;
+  }
+}
+
+export function validateSubjektivSubjectCreateRequest(
+  request: SubjektivSubjectCreateRequest,
+): SubjektivSubjectCreateRequest {
+  if (request.role.trim().length === 0) {
+    throw new SubjektivSubjectCreateError(
+      "validation",
+      "Subject role must not be empty.",
+    );
+  }
+  if (
+    new TextEncoder().encode(request.role).byteLength >
+      MAX_SUBJECT_ROLE_BYTES ||
+    /\p{Cc}/u.test(request.role)
+  ) {
+    throw new SubjektivSubjectCreateError(
+      "validation",
+      "Subject role must be at most 256 bytes and contain no control characters.",
+    );
+  }
+  return { role: request.role };
+}
+
+export async function createSubjektivSubject(
+  fetchFn: typeof fetch,
+  workspaceId: string,
+  request: SubjektivSubjectCreateRequest,
+): Promise<SubjektivSubjectResponse> {
+  const validated = validateSubjektivSubjectCreateRequest(request);
+  const path = workspaceApiPath(workspaceId, "/subjektiv/subjects");
+  let response: Response;
+  try {
+    response = await fetchFn(path, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(validated),
+    });
+  } catch {
+    throw new SubjektivSubjectCreateError(
+      "unknown_outcome",
+      "The request outcome is unknown. A Subject may have been created.",
+    );
+  }
+
+  if (!response.ok) {
+    const message = await subjektivSubjectCreateErrorMessage(response);
+    if (response.status >= 400 && response.status < 500) {
+      throw new SubjektivSubjectCreateError(
+        "rejected",
+        message,
+        response.status,
+      );
+    }
+    throw new SubjektivSubjectCreateError(
+      "unknown_outcome",
+      "The request outcome is unknown. A Subject may have been created.",
+      response.status,
+    );
+  }
+
+  try {
+    const subject = parseSubjektivSubjectResponse(
+      await readBoundedJson(response, MEMORY_API_LIMITS.maxResponseBytes),
+    );
+    if (subject.role !== validated.role) {
+      throw new Error("created Subject role does not match the request");
+    }
+    return subject;
+  } catch {
+    throw new SubjektivSubjectCreateError(
+      "unknown_outcome",
+      "The Subject may have been created, but the response could not be confirmed.",
+    );
+  }
+}
+
+async function subjektivSubjectCreateErrorMessage(
+  response: Response,
+): Promise<string> {
+  try {
+    const payload = await readBoundedJson(
+      response,
+      MAX_SUBJECT_CREATE_ERROR_BYTES,
+    );
+    if (typeof payload === "object" && payload !== null) {
+      const record = payload as Record<string, unknown>;
+      if (typeof record.message === "string" && record.message.length > 0) {
+        return record.message;
+      }
+      if (typeof record.error === "string" && record.error.length > 0) {
+        return record.error;
+      }
+    }
+  } catch {
+    // A rejected request still has a known outcome even when its body is invalid.
+  }
+  return `Subject creation failed with HTTP ${response.status}.`;
+}
 
 export function parseMemoryDocumentResponse(
   value: unknown,

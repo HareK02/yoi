@@ -38954,6 +38954,67 @@ mod tests {
         )
         .await;
         assert_eq!(subjects["items"][0]["id"], subject.id);
+
+        request_json(
+            app.clone(),
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects"),
+            Some(serde_json::json!({ "role": "Browser author" })),
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+        let created = request_json_authenticated(
+            app.clone(),
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects"),
+            Some(serde_json::json!({ "role": "  Browser author  " })),
+            &owner_token,
+            StatusCode::CREATED,
+        )
+        .await;
+        assert_eq!(created["role"], "  Browser author  ");
+        assert_eq!(created["state"], "active");
+        assert_eq!(created["store_revision"], 0);
+        assert!(created.get("current_worker").is_none());
+        let created_id = created["id"].as_str().unwrap();
+        let persisted = store.subject(created_id).unwrap().unwrap();
+        assert_eq!(persisted.role.as_str(), "  Browser author  ");
+        assert!(
+            api.store
+                .current_worker_singleton_owner(
+                    TEST_WORKSPACE_ID,
+                    &crate::subjektiv::subject_worker_singleton_key(created_id).unwrap(),
+                )
+                .unwrap()
+                .is_none()
+        );
+        let subject_count_after_create = store.list_subjects(100).unwrap().items.len();
+        request_json_authenticated(
+            app.clone(),
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects"),
+            Some(serde_json::json!({ "role": "   " })),
+            &owner_token,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_eq!(
+            store.list_subjects(100).unwrap().items.len(),
+            subject_count_after_create
+        );
+        request_json_authenticated(
+            app.clone(),
+            "POST",
+            "/api/w/another-workspace/subjektiv/subjects",
+            Some(serde_json::json!({ "role": "Cross Workspace" })),
+            &owner_token,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_eq!(
+            store.list_subjects(100).unwrap().items.len(),
+            subject_count_after_create
+        );
         for uri in [
             subject_root.clone(),
             format!("{subject_root}/surface"),

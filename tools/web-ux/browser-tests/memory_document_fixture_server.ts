@@ -23,8 +23,13 @@ const ungeneratedSubjectId = "ungenerated-subject";
 const errorSubjectId = "error-subject";
 const pagedSubjectId = "paged-subject";
 const subjectPageCursor = "fixture-subject-page-2";
+const emptySubjectPageCursor = "fixture-empty-subject-page";
+const errorSubjectPageCursor = "fixture-error-subject-page";
 const memoryPageCursor = "fixture-memory-page-2";
 const revisionPageCursor = "fixture-revision-page-2";
+const createdSubjectIds = new Set<string>();
+const subjectCreateRequests: unknown[] = [];
+let createdSubjectCount = 0;
 
 const paragraphs = Array.from(
   { length: sectionCount },
@@ -82,6 +87,7 @@ function subject(id: string, role: string, state: "active" | "retired", storeRev
 }
 
 function memoriesFor(subjectId: string) {
+  if (createdSubjectIds.has(subjectId)) return [];
   if (subjectId === emptySubjectId || subjectId === ungeneratedSubjectId) return [];
   if (subjectId === staleSubjectId) {
     return [
@@ -314,6 +320,9 @@ async function staticResponse(pathname: string): Promise<Response> {
 Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
   const url = new URL(request.url);
   if (url.pathname === "/health") return new Response("ok");
+  if (url.pathname === "/fixture/subject-create-requests") {
+    return json({ count: subjectCreateRequests.length, requests: subjectCreateRequests });
+  }
   if (url.pathname === "/api/workspaces") {
     return json([{
       workspace_id: workspaceId,
@@ -393,7 +402,31 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
 
   const subjectsPath = `/api/w/${workspaceId}/subjektiv/subjects`;
   if (url.pathname === subjectsPath) {
-    const continued = url.searchParams.get("cursor") === subjectPageCursor;
+    if (request.method === "POST") {
+      const payload = await request.json().catch(() => null) as { role?: unknown } | null;
+      subjectCreateRequests.push(payload);
+      if (!payload || typeof payload.role !== "string" || payload.role.trim().length === 0) {
+        return json({ error: "Bad Request", message: "subject role must not be empty" }, 400);
+      }
+      if (payload.role === "Permission denied") {
+        return json({ error: "Forbidden", message: "workspace permission denied" }, 403);
+      }
+      createdSubjectCount += 1;
+      const id = `created-subject-${String(createdSubjectCount).padStart(4, "0")}`;
+      const created = subject(id, payload.role, "active", 0);
+      createdSubjectIds.add(id);
+      subjects.unshift(created);
+      return json(created, 201);
+    }
+    if (request.method !== "GET") return new Response("method not allowed", { status: 405 });
+    const cursor = url.searchParams.get("cursor");
+    if (cursor === errorSubjectPageCursor) {
+      return json({ error: "Service Unavailable", message: "subject list unavailable" }, 503);
+    }
+    if (cursor === emptySubjectPageCursor) {
+      return json({ limit: 100, items: [], has_more: false });
+    }
+    const continued = cursor === subjectPageCursor;
     return json({
       limit: 100,
       items: continued ? [pagedSubject] : subjects,

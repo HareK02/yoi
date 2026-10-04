@@ -35,6 +35,8 @@ export type MemoryStagingListResponse = { limit: number, returned_count: number,
 
 export type SubjektivSubjectState = "active" | "retired";
 
+export type SubjektivSubjectCreateRequest = { role: string, };
+
 export type SubjektivSubjectResponse = { id: string, role: string, state: SubjektivSubjectState, store_revision: number, created_at: string, updated_at: string, current_worker?: | import("./worker-launch-api").WorkerLaunchWorkerSummary | null, };
 
 export type SubjektivSubjectListResponse = { limit: number, items: Array<SubjektivSubjectResponse>, next_cursor?: string | null, has_more: boolean, };

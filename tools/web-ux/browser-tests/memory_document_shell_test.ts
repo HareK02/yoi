@@ -13,6 +13,11 @@ const subjectId =
   "release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review";
 const memoryId =
   "memory-decision-with-a-deliberately-long-stable-identity-for-overflow-review-0000000001";
+const subjectPageCursor = "fixture-subject-page-2";
+const createInteractionArtifacts = join(
+  repositoryRoot,
+  "target/web-ux/t-689-browser-interactions",
+);
 
 async function freePort(): Promise<number> {
   const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
@@ -158,6 +163,7 @@ Deno.test("production subject Memory and Worker launch shells preserve exact sco
       `Workspace production build failed:\n${new TextDecoder().decode(build.stderr)}`,
     );
   }
+  await Deno.mkdir(createInteractionArtifacts, { recursive: true });
 
   const port = await freePort();
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -373,6 +379,94 @@ Deno.test("production subject Memory and Worker launch shells preserve exact sco
       assert(new URL(paginationPage.url()).searchParams.has("cursor"));
       await assertNoPageWideOverflow(paginationPage);
       await paginationContext.close();
+
+      const emptyContext = await browser.newContext({
+        viewport: { width: 390, height: 844 },
+        colorScheme: "dark",
+      });
+      const emptyPage = await emptyContext.newPage();
+      await emptyPage.route(`**/api/w/${workspaceId}/subjektiv/subjects?*`, async (route) => {
+        if (route.request().method() === "GET") {
+          await route.fulfill({
+            status: 200,
+            contentType: "application/json",
+            body: JSON.stringify({ limit: 100, items: [], has_more: false }),
+          });
+          return;
+        }
+        await route.continue();
+      });
+      await emptyPage.goto(`${baseUrl}/w/${workspaceId}/memory`);
+      await emptyPage.getByText("No Memory subjects.").waitFor();
+      await emptyPage.getByRole("button", { name: "New Subject" }).click();
+      const emptyRole = emptyPage.getByRole("textbox", { name: "Role" });
+      await emptyRole.waitFor();
+      assertEquals(
+        await emptyRole.evaluate((input) => input === (globalThis as any).document.activeElement),
+        true,
+      );
+      await assertNoPageWideOverflow(emptyPage);
+      await emptyPage.screenshot({
+        path: join(createInteractionArtifacts, "empty-create-form-mobile-dark.png"),
+      });
+      await emptyPage.getByRole("button", { name: "Cancel" }).click();
+      assertEquals(
+        await emptyPage.getByRole("button", { name: "New Subject" }).evaluate((button) =>
+          button === (globalThis as any).document.activeElement
+        ),
+        true,
+      );
+      await emptyContext.close();
+
+      const createContext = await browser.newContext({
+        viewport: { width: 1440, height: 900 },
+        colorScheme: "light",
+      });
+      const createPage = await createContext.newPage();
+      const mutationPaths: string[] = [];
+      createPage.on("request", (request) => {
+        if (request.method() === "POST") mutationPaths.push(new URL(request.url()).pathname);
+      });
+      await createPage.goto(`${baseUrl}/w/${workspaceId}/memory?cursor=${subjectPageCursor}`);
+      await createPage.getByText("Subject on the next page").waitFor();
+      await createPage.getByRole("button", { name: "New Subject" }).click();
+      const createRole = createPage.getByRole("textbox", { name: "Role" });
+      await createRole.fill("Permission denied");
+      await createPage.getByRole("button", { name: "Create Subject" }).click();
+      const permissionAlert = createPage.getByRole("alert");
+      await permissionAlert.waitFor();
+      assert((await permissionAlert.textContent())?.includes("do not have permission"));
+      assertEquals(await createRole.inputValue(), "Permission denied");
+      await createPage.screenshot({
+        path: join(createInteractionArtifacts, "permission-error-desktop-light.png"),
+      });
+
+      await createPage.getByRole("button", { name: "Cancel" }).click();
+      await createPage.getByRole("button", { name: "New Subject" }).click();
+      await createPage.getByRole("textbox", { name: "Role" }).fill("  Release steward  ");
+      await createPage.getByRole("button", { name: "Create Subject" }).click();
+      await createPage.waitForURL("**/memory/created-subject-0001");
+      await createPage.getByRole("heading", { name: "Release steward", level: 1 }).waitFor();
+      assertEquals(
+        await createPage.locator("code.subject-id", { hasText: "created-subject-0001" }).count(),
+        1,
+      );
+      const currentWorker = createPage.locator(".subject-facts div").filter({
+        hasText: "Current worker",
+      });
+      assert((await currentWorker.textContent())?.includes("None"));
+      assertEquals(mutationPaths, [
+        `/api/w/${workspaceId}/subjektiv/subjects`,
+        `/api/w/${workspaceId}/subjektiv/subjects`,
+      ]);
+      const createEvidence = await (await fetch(`${baseUrl}/fixture/subject-create-requests`))
+        .json();
+      assertEquals(createEvidence, {
+        count: 2,
+        requests: [{ role: "Permission denied" }, { role: "  Release steward  " }],
+      });
+      await assertNoPageWideOverflow(createPage);
+      await createContext.close();
 
       const stateContext = await browser.newContext({ viewport: { width: 390, height: 844 } });
       const stateCases = [

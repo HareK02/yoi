@@ -3,6 +3,7 @@ declare const Deno: {
 };
 
 import {
+  createSubjektivSubject,
   parseMemoryStagingListResponse,
   parseSubjektivMemoryListRevisionsResponse,
   parseSubjektivMemoryQueryResponse,
@@ -10,6 +11,8 @@ import {
   parseSubjektivResidentSurfaceResponse,
   parseSubjektivSubjectListResponse,
   parseSubjektivSubjectResponse,
+  SubjektivSubjectCreateError,
+  validateSubjektivSubjectCreateRequest,
 } from "../src/lib/workspace/memory/api.ts";
 
 function stable(value: unknown): unknown {
@@ -42,6 +45,30 @@ function assertThrows(fn: () => void, expectedMessage: string): void {
     throw error;
   }
   throw new Error(`expected function to throw ${expectedMessage}`);
+}
+
+async function assertSubjectCreateRejects(
+  fn: () => Promise<unknown>,
+  expectedKind: SubjektivSubjectCreateError["kind"],
+  expectedMessage: string,
+  expectedStatus: number | null = null,
+): Promise<void> {
+  try {
+    await fn();
+  } catch (error) {
+    if (!(error instanceof SubjektivSubjectCreateError)) throw error;
+    assertEquals(error.kind, expectedKind);
+    assertEquals(error.status, expectedStatus);
+    if (!error.message.includes(expectedMessage)) {
+      throw new Error(
+        `expected ${JSON.stringify(error.message)} to include ${
+          JSON.stringify(expectedMessage)
+        }`,
+      );
+    }
+    return;
+  }
+  throw new Error(`expected Subject creation to reject with ${expectedKind}`);
 }
 
 function subject(id = "subject-1") {
@@ -196,6 +223,117 @@ Deno.test("Subject list parser preserves the exact bounded response", () => {
       }),
     "Subject ids must be unique",
   );
+});
+
+Deno.test("Subject create request mirrors Backend role validation without rewriting input", () => {
+  assertEquals(
+    validateSubjektivSubjectCreateRequest({ role: "  Release coordinator  " }),
+    { role: "  Release coordinator  " },
+  );
+  assertThrows(
+    () => validateSubjektivSubjectCreateRequest({ role: "   " }),
+    "must not be empty",
+  );
+  assertThrows(
+    () => validateSubjektivSubjectCreateRequest({ role: "line\nbreak" }),
+    "control characters",
+  );
+  assertThrows(
+    () => validateSubjektivSubjectCreateRequest({ role: "界".repeat(86) }),
+    "at most 256 bytes",
+  );
+});
+
+Deno.test("Subject create client sends the exact typed body once and parses the created Subject", async () => {
+  const requests: Array<{ path: string; init?: RequestInit }> = [];
+  const fetchFn = (async (path: string | URL | Request, init?: RequestInit) => {
+    requests.push({ path: String(path), init });
+    return Response.json({
+      ...subject("subject-created"),
+      role: "  Release coordinator  ",
+    }, { status: 201 });
+  }) as typeof fetch;
+
+  const created = await createSubjektivSubject(fetchFn, "workspace one", {
+    role: "  Release coordinator  ",
+  });
+  assertEquals(created, {
+    ...subject("subject-created"),
+    role: "  Release coordinator  ",
+  });
+  assertEquals(requests.length, 1);
+  assertEquals(requests[0].path, "/api/w/workspace%20one/subjektiv/subjects");
+  assertEquals(requests[0].init?.method, "POST");
+  assertEquals(requests[0].init?.body, '{"role":"  Release coordinator  "}');
+});
+
+Deno.test("Subject create client distinguishes rejected and unknown outcomes without retrying", async () => {
+  let rejectedCalls = 0;
+  const rejectedFetch = (async () => {
+    rejectedCalls += 1;
+    return Response.json(
+      {
+        error: "Forbidden",
+        message: "workspace permission denied",
+        diagnostics: [],
+      },
+      { status: 403 },
+    );
+  }) as typeof fetch;
+  await assertSubjectCreateRejects(
+    () =>
+      createSubjektivSubject(rejectedFetch, "workspace-1", {
+        role: "Reviewer",
+      }),
+    "rejected",
+    "workspace permission denied",
+    403,
+  );
+  assertEquals(rejectedCalls, 1);
+
+  let serverErrorCalls = 0;
+  const serverErrorFetch = (async () => {
+    serverErrorCalls += 1;
+    return Response.json({ error: "Internal Server Error" }, { status: 500 });
+  }) as typeof fetch;
+  await assertSubjectCreateRejects(
+    () =>
+      createSubjektivSubject(serverErrorFetch, "workspace-1", {
+        role: "Reviewer",
+      }),
+    "unknown_outcome",
+    "may have been created",
+    500,
+  );
+  assertEquals(serverErrorCalls, 1);
+
+  let mismatchCalls = 0;
+  const mismatchFetch = (async () => {
+    mismatchCalls += 1;
+    return Response.json(subject("subject-created"), { status: 201 });
+  }) as typeof fetch;
+  await assertSubjectCreateRejects(
+    () =>
+      createSubjektivSubject(mismatchFetch, "workspace-1", {
+        role: "Reviewer",
+      }),
+    "unknown_outcome",
+    "could not be confirmed",
+  );
+  assertEquals(mismatchCalls, 1);
+
+  let unknownCalls = 0;
+  const unknownFetch = (async () => {
+    unknownCalls += 1;
+    throw new TypeError("connection reset");
+  }) as typeof fetch;
+  await assertSubjectCreateRejects(
+    () =>
+      createSubjektivSubject(unknownFetch, "workspace-1", { role: "Reviewer" }),
+    "unknown_outcome",
+    "may have been created",
+  );
+  assertEquals(unknownCalls, 1);
 });
 
 Deno.test("Resident surface parser accepts ready-empty and enforces snapshot invariants", () => {

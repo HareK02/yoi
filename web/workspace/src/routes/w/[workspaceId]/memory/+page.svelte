@@ -1,10 +1,26 @@
 <script lang="ts">
+  import { goto } from '$app/navigation';
+  import { tick } from 'svelte';
   import { formatDate, workspaceRoute } from '#lib/workspace/api/http.ts';
+  import {
+    createSubjektivSubject,
+    SubjektivSubjectCreateError,
+  } from '#lib/workspace/memory/api.ts';
+  import type { SubjektivSubjectResponse } from '#lib/generated/memory-api.ts';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
 
   const subjects = $derived(data.subjects.data?.items ?? []);
+  let createExpanded = $state(false);
+  let role = $state('');
+  let submitting = $state(false);
+  let createError = $state<string | null>(null);
+  let roleInvalid = $state(false);
+  let createOutcomeUnknown = $state(false);
+  let createdSubject = $state<SubjektivSubjectResponse | null>(null);
+  let createButton = $state<HTMLButtonElement>();
+  let roleInput = $state<HTMLInputElement>();
 
   function subjectHref(subjectId: string): string {
     return workspaceRoute(data.workspaceId, `/memory/${encodeURIComponent(subjectId)}`);
@@ -13,6 +29,69 @@
   function pageHref(cursor?: string | null): string {
     const path = workspaceRoute(data.workspaceId, '/memory');
     return cursor ? `${path}?cursor=${encodeURIComponent(cursor)}` : path;
+  }
+
+  async function openCreateForm(): Promise<void> {
+    createExpanded = true;
+    createError = null;
+    roleInvalid = false;
+    createOutcomeUnknown = false;
+    createdSubject = null;
+    await tick();
+    roleInput?.focus();
+  }
+
+  async function cancelCreate(): Promise<void> {
+    if (submitting) return;
+    createExpanded = false;
+    role = '';
+    createError = null;
+    roleInvalid = false;
+    createOutcomeUnknown = false;
+    createdSubject = null;
+    await tick();
+    createButton?.focus();
+  }
+
+  async function submitCreate(): Promise<void> {
+    if (submitting || createdSubject) return;
+    submitting = true;
+    createError = null;
+    roleInvalid = false;
+    createOutcomeUnknown = false;
+    try {
+      const subject = await createSubjektivSubject(fetch, data.workspaceId, { role });
+      createdSubject = subject;
+      try {
+        await goto(subjectHref(subject.id));
+      } catch {
+        createError = 'Subject created, but navigation failed. Open the created Subject below.';
+      }
+    } catch (error) {
+      if (error instanceof SubjektivSubjectCreateError) {
+        roleInvalid = error.kind === 'validation';
+        createOutcomeUnknown = error.kind === 'unknown_outcome';
+        createError = error.status === 401 || error.status === 403
+          ? 'You do not have permission to create Subjects in this Workspace.'
+          : error.message;
+        if (roleInvalid) {
+          await tick();
+          roleInput?.focus();
+        }
+      } else {
+        createOutcomeUnknown = true;
+        createError = 'The request outcome is unknown. A Subject may have been created.';
+      }
+    } finally {
+      submitting = false;
+    }
+  }
+
+  function createFormKeydown(event: KeyboardEvent): void {
+    if (event.key === 'Escape' && !submitting) {
+      event.preventDefault();
+      void cancelCreate();
+    }
   }
 </script>
 
@@ -26,12 +105,72 @@
     <div>
       <p class="memory-eyebrow">Memory</p>
       <h1 id="memory-subjects-heading">Subjects</h1>
-      <p>Read-only durable context, organized by explicit subject.</p>
+      <p>Durable context, organized by explicit subject.</p>
     </div>
-    {#if data.subjects.data}
-      <span class="memory-count">{subjects.length}{data.subjects.data.has_more ? '+' : ''} subject{subjects.length === 1 ? '' : 's'}</span>
-    {/if}
+    <div class="memory-header-actions">
+      {#if data.subjects.data}
+        <span class="memory-count">{subjects.length}{data.subjects.data.has_more ? '+' : ''} subject{subjects.length === 1 ? '' : 's'}</span>
+      {/if}
+      <button
+        bind:this={createButton}
+        type="button"
+        class="subject-create-trigger"
+        aria-expanded={createExpanded}
+        aria-controls="subject-create-panel"
+        onclick={() => void openCreateForm()}
+      >New Subject</button>
+    </div>
   </header>
+
+  {#if createExpanded}
+    <form
+      id="subject-create-panel"
+      class="subject-create-panel"
+      aria-labelledby="subject-create-heading"
+      aria-busy={submitting}
+      onsubmit={(event) => { event.preventDefault(); void submitCreate(); }}
+    >
+      <div class="subject-create-copy">
+        <h2 id="subject-create-heading">Create Subject</h2>
+        <p id="subject-role-help">Role describes the Subject’s durable identity. The service assigns its ID; creating it does not start or attach a Worker.</p>
+      </div>
+      <label class="subject-role-field">
+        <span>Role</span>
+        <input
+          bind:this={roleInput}
+          bind:value={role}
+          type="text"
+          autocomplete="off"
+          required
+          disabled={submitting || createdSubject !== null}
+          onkeydown={createFormKeydown}
+          aria-invalid={roleInvalid ? 'true' : undefined}
+          aria-describedby={createError ? 'subject-role-help subject-create-error' : 'subject-role-help'}
+        />
+      </label>
+      {#if createError}
+        <div
+          id="subject-create-error"
+          class:unknown-outcome={createOutcomeUnknown}
+          class="subject-create-error"
+          role="alert"
+        >
+          <p>{createError}</p>
+          {#if createOutcomeUnknown}
+            <p><a href={pageHref()}>Check the first Subjects page before retrying.</a></p>
+          {:else if createdSubject}
+            <p><a href={subjectHref(createdSubject.id)}>Open {createdSubject.id}</a></p>
+          {/if}
+        </div>
+      {/if}
+      <div class="subject-create-actions">
+        <button type="submit" disabled={submitting || createdSubject !== null}>
+          {submitting ? 'Creating…' : 'Create Subject'}
+        </button>
+        <button type="button" class="subject-create-cancel" disabled={submitting} onclick={() => void cancelCreate()}>Cancel</button>
+      </div>
+    </form>
+  {/if}
 
   {#if data.subjects.data}
     {#if subjects.length === 0}
@@ -125,6 +264,111 @@
     flex: 0 0 auto;
     color: var(--text-muted);
     font-size: var(--font-size-compact);
+  }
+
+  .memory-header-actions,
+  .subject-create-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+  }
+
+  .memory-header-actions {
+    justify-content: flex-end;
+  }
+
+  .subject-create-trigger,
+  .subject-create-actions button {
+    min-height: 2.25rem;
+    border: 0;
+    border-radius: var(--radius-soft);
+    padding: var(--space-2) var(--space-4);
+    background: var(--accent);
+    color: var(--bg);
+    font-weight: 700;
+    cursor: pointer;
+  }
+
+  .subject-create-trigger:hover,
+  .subject-create-trigger:focus-visible,
+  .subject-create-actions button:hover:not(:disabled),
+  .subject-create-actions button:focus-visible:not(:disabled) {
+    filter: brightness(1.08);
+  }
+
+  .subject-create-actions button:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+
+  .subject-create-actions .subject-create-cancel {
+    border: 1px solid var(--line);
+    background: transparent;
+    color: var(--text-strong);
+  }
+
+  .subject-create-actions {
+    grid-column: 3;
+    grid-row: 1;
+  }
+
+  .subject-create-panel {
+    display: grid;
+    grid-template-columns: minmax(14rem, 0.8fr) minmax(18rem, 1fr) auto;
+    align-items: end;
+    gap: var(--space-4);
+    padding: var(--space-4);
+    background: var(--bg-raised);
+    border-radius: var(--radius-soft);
+  }
+
+  .subject-create-copy h2,
+  .subject-create-copy p,
+  .subject-create-error p {
+    margin: 0;
+  }
+
+  .subject-create-copy p,
+  .subject-create-error {
+    margin-top: var(--space-1);
+    color: var(--text-muted);
+    font-size: var(--font-size-compact);
+  }
+
+  .subject-role-field {
+    display: grid;
+    gap: var(--space-1);
+    color: var(--text-muted);
+    font-size: var(--font-size-compact);
+    font-weight: 700;
+  }
+
+  .subject-role-field input {
+    width: 100%;
+    min-width: 0;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-soft);
+    padding: var(--space-2) var(--space-3);
+    background: var(--bg);
+    color: var(--text-strong);
+  }
+
+  .subject-role-field input[aria-invalid='true'] {
+    border-color: var(--danger);
+  }
+
+  .subject-create-error {
+    grid-column: 2 / -1;
+    color: var(--danger);
+  }
+
+  .subject-create-error a {
+    color: inherit;
+  }
+
+  .subject-create-error.unknown-outcome {
+    color: var(--warning);
   }
 
   .subject-list {
@@ -231,6 +475,17 @@
   }
 
   @media (max-width: 900px) {
+    .subject-create-panel {
+      grid-template-columns: minmax(0, 1fr);
+      align-items: stretch;
+    }
+
+    .subject-create-error,
+    .subject-create-actions {
+      grid-column: 1;
+      grid-row: auto;
+    }
+
     .subject-row {
       grid-template-columns: minmax(0, 1fr);
       gap: var(--space-3);
@@ -241,6 +496,14 @@
     .memory-page-header {
       display: grid;
       gap: var(--space-2);
+    }
+
+    .memory-header-actions {
+      justify-content: flex-start;
+    }
+
+    .subject-create-panel {
+      padding: var(--space-3);
     }
 
     .subject-row {
