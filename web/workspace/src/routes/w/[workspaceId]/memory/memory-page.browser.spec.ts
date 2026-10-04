@@ -1,12 +1,29 @@
 // @vitest-environment happy-dom
 
-import { cleanup, render, screen, waitFor } from "@testing-library/svelte";
-import { afterEach, expect, test } from "vitest";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/svelte";
+import { afterEach, expect, test, vi } from "vitest";
+
+const { gotoMock } = vi.hoisted(() => ({
+  gotoMock: vi.fn(async () => {}),
+}));
+
+vi.mock("$app/navigation", () => ({ goto: gotoMock }));
+
 import SubjectIndexPage from "./+page.svelte";
 import SubjectPage from "./[subjectId]/+page.svelte";
 import MemoryDetailPage from "./[subjectId]/[memoryId]/+page.svelte";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+  vi.clearAllMocks();
+});
 
 const result = <T>(data: T | null, error: string | null = null) => ({
   data,
@@ -21,6 +38,18 @@ function subject() {
     store_revision: 9,
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-02T03:04:05Z",
+  };
+}
+
+function subjectIndexData(items = [subject()]) {
+  return {
+    workspaceId: "workspace-1",
+    cursor: null,
+    subjects: result({
+      limit: 100,
+      items,
+      has_more: false,
+    }),
   };
 }
 
@@ -40,6 +69,7 @@ test("renders the subject index as the Memory product entry", () => {
 
   expect(screen.getByRole("heading", { name: "Subjects", level: 1 })).not
     .toBeNull();
+  expect(screen.getByRole("button", { name: "New Subject" })).not.toBeNull();
   expect(screen.getByRole("link", { name: /Release coordinator/ })).not
     .toBeNull();
   expect(screen.getByText("subject-1")).not.toBeNull();
@@ -48,6 +78,134 @@ test("renders the subject index as the Memory product entry", () => {
   expect(screen.getByRole("link", { name: /Next page/ }).getAttribute("href"))
     .toContain("cursor=subject-next");
   expect(screen.queryByText("Staging")).toBeNull();
+});
+
+test("creates one Subject with the exact role and navigates to its generated detail", async () => {
+  let resolveRequest!: (response: Response) => void;
+  const response = new Promise<Response>((resolve) => {
+    resolveRequest = resolve;
+  });
+  const fetchMock = vi.fn(() => response);
+  vi.stubGlobal("fetch", fetchMock);
+  render(SubjectIndexPage, { data: subjectIndexData() } as never);
+
+  const trigger = screen.getByRole("button", { name: "New Subject" });
+  await fireEvent.click(trigger);
+  const roleInput = screen.getByRole("textbox", {
+    name: "Role",
+  }) as HTMLInputElement;
+  await waitFor(() => expect(document.activeElement).toBe(roleInput));
+  await fireEvent.input(roleInput, { target: { value: "  Review lead  " } });
+
+  const submit = screen.getByRole("button", { name: "Create Subject" });
+  await fireEvent.click(submit);
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+  expect(
+    screen.getByRole("button", { name: "Creating…" }).hasAttribute("disabled"),
+  )
+    .toBe(true);
+  await fireEvent.click(screen.getByRole("button", { name: "Creating…" }));
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+
+  resolveRequest(Response.json({
+    id: "generated-subject-1",
+    role: "  Review lead  ",
+    state: "active",
+    store_revision: 0,
+    created_at: "2026-01-03T00:00:00Z",
+    updated_at: "2026-01-03T00:00:00Z",
+  }, { status: 201 }));
+  await waitFor(() => {
+    expect(gotoMock).toHaveBeenCalledWith(
+      "/w/workspace-1/memory/generated-subject-1",
+    );
+  });
+
+  const [path, init] = fetchMock.mock.calls[0] as unknown as [
+    string,
+    RequestInit,
+  ];
+  expect(path).toBe("/api/w/workspace-1/subjektiv/subjects");
+  expect(init.method).toBe("POST");
+  expect(init.body).toBe('{"role":"  Review lead  "}');
+});
+
+test("keeps creation available for an empty list and restores focus on cancel", async () => {
+  vi.stubGlobal("fetch", vi.fn());
+  render(SubjectIndexPage, { data: subjectIndexData([]) } as never);
+
+  expect(screen.getByText("No Memory subjects.")).not.toBeNull();
+  const trigger = screen.getByRole("button", { name: "New Subject" });
+  await fireEvent.click(trigger);
+  const input = screen.getByRole("textbox", {
+    name: "Role",
+  }) as HTMLInputElement;
+  await fireEvent.input(input, { target: { value: "Draft role" } });
+  await fireEvent.keyDown(input, { key: "Escape" });
+  await waitFor(() => expect(document.activeElement).toBe(trigger));
+  expect(screen.queryByRole("textbox", { name: "Role" })).toBeNull();
+});
+
+test("preserves invalid and rejected role drafts with accessible errors", async () => {
+  const fetchMock = vi.fn(() =>
+    Promise.resolve(Response.json(
+      {
+        error: "Forbidden",
+        message: "workspace permission denied",
+        diagnostics: [],
+      },
+      { status: 403 },
+    ))
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  render(SubjectIndexPage, { data: subjectIndexData() } as never);
+
+  await fireEvent.click(screen.getByRole("button", { name: "New Subject" }));
+  const input = screen.getByRole("textbox", {
+    name: "Role",
+  }) as HTMLInputElement;
+  await fireEvent.input(input, { target: { value: "   " } });
+  await fireEvent.click(screen.getByRole("button", { name: "Create Subject" }));
+  expect(screen.getByRole("alert").textContent).toContain("must not be empty");
+  expect(input.getAttribute("aria-invalid")).toBe("true");
+  expect(input.value).toBe("   ");
+  expect(fetchMock).not.toHaveBeenCalled();
+
+  await fireEvent.input(input, { target: { value: "Release reviewer" } });
+  await fireEvent.click(screen.getByRole("button", { name: "Create Subject" }));
+  await waitFor(() => {
+    expect(screen.getByRole("alert").textContent).toContain(
+      "do not have permission",
+    );
+  });
+  expect(input.value).toBe("Release reviewer");
+  expect(input.getAttribute("aria-invalid")).toBeNull();
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+});
+
+test("warns about an unknown create outcome without replaying the POST", async () => {
+  const fetchMock = vi.fn(() =>
+    Promise.reject(new TypeError("connection reset"))
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  render(SubjectIndexPage, { data: subjectIndexData() } as never);
+
+  await fireEvent.click(screen.getByRole("button", { name: "New Subject" }));
+  const input = screen.getByRole("textbox", {
+    name: "Role",
+  }) as HTMLInputElement;
+  await fireEvent.input(input, { target: { value: "Incident coordinator" } });
+  await fireEvent.click(screen.getByRole("button", { name: "Create Subject" }));
+  await waitFor(() => {
+    expect(screen.getByRole("alert").textContent).toContain(
+      "may have been created",
+    );
+  });
+  expect(screen.getByRole("link", { name: /Check the first Subjects page/ }))
+    .not.toBeNull();
+  expect(input.value).toBe("Incident coordinator");
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  expect(gotoMock).not.toHaveBeenCalled();
 });
 
 test("renders a ready resident surface and committed Memory lifecycle states", async () => {
@@ -62,7 +220,8 @@ test("renders a ready resident surface and committed Memory lifecycle states", a
         availability: "ready" as const,
         snapshot: {
           snapshot_id: "snapshot-1",
-          body_md: "# Resident context\n\nUse the **current** committed record.",
+          body_md:
+            "# Resident context\n\nUse the **current** committed record.",
           memory_refs: [{ memory_id: "memory-1", revision: 3 }],
           built_from_store_revision: 9,
           created_at: "2026-01-02T03:04:05Z",

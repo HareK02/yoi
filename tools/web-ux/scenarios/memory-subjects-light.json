@@ -21,10 +21,98 @@
       "id": "subjects",
       "label": "Subject index",
       "path": "/w/memory-review/memory",
-      "goal": "Choose an explicit Memory subject and inspect state, role, store revision, worker availability, and long identities.",
-      "dataState": "Active and retired subjects spanning representative, empty, stale, failed, ungenerated, and unavailable states.",
-      "ready": { "kind": "selector", "selector": "[data-memory-view='subjects'] .subject-list" },
-      "capturePoints": [{ "id": "initial", "label": "Subjects" }]
+      "goal": "Choose an explicit Memory subject or create one with a Backend-validated role.",
+      "dataState": "Active and retired subjects across a paginated list, plus create-form and permission-rejection states.",
+      "ready": {
+        "kind": "selector",
+        "selector": "[data-memory-view='subjects'] .subject-list"
+      },
+      "capturePoints": [
+        { "id": "initial", "label": "Subjects" },
+        {
+          "id": "create-form",
+          "label": "Create Subject form",
+          "interaction": [
+            { "action": "click", "selector": "button.subject-create-trigger" }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": "#subject-create-panel input"
+          }
+        },
+        {
+          "id": "permission-error",
+          "label": "Create permission error",
+          "interaction": [
+            {
+              "action": "fill",
+              "selector": "#subject-create-panel input",
+              "value": "Permission denied"
+            },
+            {
+              "action": "click",
+              "selector": "#subject-create-panel button[type='submit']"
+            },
+            {
+              "action": "wait",
+              "ready": {
+                "kind": "selector",
+                "selector": "#subject-create-error"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "subjects-empty",
+      "label": "Empty Subject index",
+      "path": "/w/memory-review/memory?cursor=fixture-empty-subject-page",
+      "goal": "Create the first visible Subject when the current bounded page is empty.",
+      "dataState": "Successful empty Subject page with a return-to-first-page recovery link.",
+      "ready": {
+        "kind": "selector",
+        "selector": "[data-memory-state='empty']"
+      },
+      "capturePoints": [
+        { "id": "initial", "label": "Empty Subjects" },
+        {
+          "id": "create-form",
+          "label": "Create from empty Subjects",
+          "interaction": [
+            { "action": "click", "selector": "button.subject-create-trigger" }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": "#subject-create-panel input"
+          }
+        }
+      ]
+    },
+    {
+      "id": "subjects-error",
+      "label": "Subject list error",
+      "path": "/w/memory-review/memory?cursor=fixture-error-subject-page",
+      "goal": "Keep explicit Subject creation available while the existing list cannot load.",
+      "dataState": "Intentional Subject-list HTTP 503 with the independent create disclosure still available.",
+      "ready": {
+        "kind": "selector",
+        "selector": "[data-memory-state='error']"
+      },
+      "capturePoints": [
+        { "id": "initial", "label": "Subjects unavailable" },
+        {
+          "id": "create-form",
+          "label": "Create while list unavailable",
+          "interaction": [
+            { "action": "click", "selector": "button.subject-create-trigger" }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": "#subject-create-panel input"
+          }
+        }
+      ]
     },
     {
       "id": "representative",
@@ -44,7 +132,10 @@
       "path": "/w/memory-review/memory/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review/memory-decision-with-a-deliberately-long-stable-identity-for-overflow-review-0000000001",
       "goal": "Audit immutable Memory body, candidate evidence, source refs, derivations, and revision history.",
       "dataState": "Current active revision with bounded typed provenance and active/resolved/retracted immutable history.",
-      "ready": { "kind": "selector", "selector": "[data-memory-view='detail'] .revision-list" },
+      "ready": {
+        "kind": "selector",
+        "selector": "[data-memory-view='detail'] .revision-list"
+      },
       "capturePoints": [{ "id": "initial", "label": "Memory detail" }]
     },
     {
