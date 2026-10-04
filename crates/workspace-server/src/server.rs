@@ -38983,7 +38983,7 @@ mod tests {
             api.store
                 .current_worker_singleton_owner(
                     TEST_WORKSPACE_ID,
-                    &subjektiv_singleton_key(created_id).unwrap(),
+                    &crate::subjektiv::subject_worker_singleton_key(created_id).unwrap(),
                 )
                 .unwrap()
                 .is_none()
