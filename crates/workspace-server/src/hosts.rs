@@ -259,6 +259,9 @@ pub struct InternalWorkerSummary {
     pub availability: protocol::subscription::SubscriptionWorkerAvailability,
     /// Runtime catalog lifecycle compatibility state.
     pub state: String,
+    /// Runtime-process reconstruction evidence used only for lifecycle coordination.
+    #[serde(skip)]
+    pub execution_reconstructed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_state: Option<protocol::WorkerStateSnapshot>,
     pub last_seen_at: Option<String>,
@@ -2377,6 +2380,7 @@ impl EmbeddedWorkerRuntime {
                 summary.execution_metadata_available,
             )
             .to_string(),
+            execution_reconstructed: false,
             worker_state: summary.worker_state.clone(),
             last_seen_at: None,
             pinned: false,
@@ -2417,6 +2421,7 @@ impl EmbeddedWorkerRuntime {
             availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
             state: embedded_worker_state_label(detail.status, detail.execution_metadata_available)
                 .to_string(),
+            execution_reconstructed: detail.execution_reconstructed,
             worker_state: detail.worker_state.clone(),
             last_seen_at: None,
             pinned: false,
@@ -4368,6 +4373,7 @@ impl RemoteWorkerRuntime {
                 summary.execution_metadata_available,
             )
             .to_string(),
+            execution_reconstructed: false,
             worker_state: summary.worker_state.clone(),
             last_seen_at: None,
             pinned: false,
@@ -4406,6 +4412,7 @@ impl RemoteWorkerRuntime {
             availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
             state: embedded_worker_state_label(detail.status, detail.execution_metadata_available)
                 .to_string(),
+            execution_reconstructed: detail.execution_reconstructed,
             worker_state: detail.worker_state.clone(),
             last_seen_at: None,
             pinned: false,
@@ -6271,6 +6278,7 @@ pub fn placeholder_worker(host_id: impl Into<String>) -> InternalWorkerSummary {
         },
         availability: protocol::subscription::SubscriptionWorkerAvailability::Unavailable,
         state: "unsupported".to_string(),
+        execution_reconstructed: false,
         worker_state: None,
         last_seen_at: None,
         pinned: false,
@@ -6999,6 +7007,7 @@ mod tests {
                     },
                     availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
                     state: "available".to_string(),
+                    execution_reconstructed: false,
                     worker_state: None,
                     last_seen_at: None,
                     pinned: false,

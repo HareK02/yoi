@@ -3785,6 +3785,7 @@ impl WorkspaceApi {
             match self.runtime.worker(worker) {
                 Ok(detail)
                     if detail.state.eq_ignore_ascii_case("stopped")
+                        || detail.execution_reconstructed
                         || detail.worker_state.as_ref().is_some_and(|snapshot| {
                             snapshot.state == protocol::WorkerState::Idle
                                 && snapshot.last_finished_submission_request_id.as_deref()
@@ -3794,10 +3795,13 @@ impl WorkspaceApi {
                     return Ok(());
                 }
                 Ok(_) => {
-                    // The result capability runs inside this tracked Submit. The
-                    // Worker controller publishes this exact request id together
-                    // with its post-Run state only after the invocation returns,
-                    // so an unrelated initial Idle snapshot cannot release cleanup.
+                    // In this process incarnation the result capability runs inside
+                    // this tracked Submit. The controller publishes the exact request
+                    // id only after the invocation returns. A Worker reconstructed
+                    // from durable state is handled above instead: opening the
+                    // Worker store exclusively proves its prior process and any
+                    // pre-marker Run are gone, even if execution restoration has
+                    // not yet produced a fresh live snapshot.
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
                 Err(RuntimeRegistryError::UnknownWorker { .. }) => return Ok(()),
@@ -30374,6 +30378,7 @@ fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> InternalWorker
         singleton_key: None,
         tags: Vec::new(),
         state: "missing".to_string(),
+        execution_reconstructed: false,
         worker_state: None,
         last_seen_at: Some(record.updated_at.clone()),
         pinned: record.retention_state == "pinned",
@@ -34429,6 +34434,7 @@ mod tests {
                 },
                 availability: protocol::subscription::SubscriptionWorkerAvailability::Observed,
                 state: "idle".to_string(),
+                execution_reconstructed: false,
                 worker_state: None,
                 last_seen_at: None,
                 pinned: false,
@@ -41602,6 +41608,7 @@ mod tests {
             Option<Box<dyn FnOnce(&worker_runtime::identity::WorkerRef) + Send + 'static>>,
         >,
         input_request_ids: std::sync::Mutex<Vec<Option<String>>>,
+        accept_restores: std::sync::atomic::AtomicBool,
         inputs: std::sync::Mutex<Vec<(worker_runtime::identity::WorkerRef, String)>>,
         protocol_methods:
             std::sync::Mutex<Vec<(worker_runtime::identity::WorkerRef, protocol::Method)>>,
@@ -41626,6 +41633,7 @@ mod tests {
                 input_failure: std::sync::Mutex::new(None),
                 input_hook: std::sync::Mutex::new(None),
                 input_request_ids: std::sync::Mutex::new(Vec::new()),
+                accept_restores: std::sync::atomic::AtomicBool::new(false),
                 inputs: std::sync::Mutex::new(Vec::new()),
                 protocol_methods: std::sync::Mutex::new(Vec::new()),
             }
@@ -41635,6 +41643,11 @@ mod tests {
     impl DeterministicExecutionBackend {
         fn reject_inputs(&self, message: impl Into<String>) {
             *self.input_failure.lock().unwrap() = Some(message.into());
+        }
+
+        fn accept_restores(&self) {
+            self.accept_restores
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
         fn before_input_returns(
@@ -41761,6 +41774,43 @@ mod tests {
                 worker_state: protocol::WorkerStateSnapshot {
                     ..protocol::WorkerStatus::Idle.into()
                 },
+                workdir_attachments,
+            }
+        }
+
+        fn restore_worker(
+            &self,
+            request: worker_runtime::execution::WorkerExecutionRestoreRequest,
+        ) -> worker_runtime::execution::WorkerExecutionSpawnResult {
+            if !self
+                .accept_restores
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return worker_runtime::execution::WorkerExecutionSpawnResult::Rejected(
+                    worker_runtime::execution::WorkerExecutionResult::rejected(
+                        worker_runtime::execution::WorkerExecutionOperation::Restore,
+                        "deterministic test backend restore disabled",
+                    ),
+                );
+            }
+            let workdir_attachments = request
+                .workdir_attachments
+                .iter()
+                .map(|(alias, binding)| WorkingDirectoryAttachmentStatus {
+                    alias: alias.clone(),
+                    working_directory: binding.status(),
+                })
+                .collect();
+            self.contexts
+                .lock()
+                .unwrap()
+                .insert(request.worker_ref.clone(), request.context);
+            worker_runtime::execution::WorkerExecutionSpawnResult::Connected {
+                handle: worker_runtime::execution::WorkerExecutionHandle::new(
+                    request.worker_ref,
+                    self.backend_id(),
+                ),
+                worker_state: protocol::WorkerStateSnapshot::initial(),
                 workdir_attachments,
             }
         }
@@ -43122,14 +43172,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backend_job_cleanup_restart_recovery_converges_interrupted_and_removed_workers() {
+    async fn backend_job_cleanup_restart_before_run_finish_marker_converges() {
         let temp = tempfile::tempdir().unwrap();
-        let (api, _execution) = test_api_with_recording_backend(temp.path()).await;
+        let config = test_server_config(temp.path());
         let request = BackendJobRequest {
-            job_id: "runner-cleanup-restart-1".to_string(),
-            purpose: "cleanup_restart_contract_check".to_string(),
+            job_id: "runner-cleanup-pre-marker-restart-1".to_string(),
+            purpose: "cleanup_pre_marker_restart_contract_check".to_string(),
             input_revision: "revision-1".to_string(),
-            input_ref: "test://runner/cleanup-restart/1".to_string(),
+            input_ref: "test://runner/cleanup-pre-marker-restart/1".to_string(),
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Return a structured check result.".to_string(),
             profile: "builtin:backend-job".to_string(),
@@ -43137,59 +43187,165 @@ mod tests {
             notification_target: None,
             limits: crate::backend_job::BackendJobLimits::default(),
         };
-        let dispatched = api.dispatch_backend_job(&request).unwrap();
-        let worker = dispatched.attempt.worker.clone().unwrap();
+        let store = Arc::new(SqliteWorkspaceStore::open(config.database_path.clone()).unwrap());
+        seed_test_registered_workspace(store.as_ref(), &config)
+            .await
+            .unwrap();
+        let execution = Arc::new(DeterministicExecutionBackend::default());
+        let embedded = EmbeddedWorkerRuntime::new_fs_store_with_execution_backend(
+            TEST_WORKSPACE_ID,
+            config.embedded_runtime_store_root.clone(),
+            execution.clone(),
+        )
+        .unwrap();
+        let binding = test_create_binding();
+        let runtime = embedded.subscription_runtime();
+        let runtime_worker_ref = worker_runtime::identity::WorkerRef::new(binding.worker_id);
+        let detail = runtime
+            .create_worker_scoped(
+                &worker_runtime::RuntimeWorkspaceScope::new(TEST_WORKSPACE_ID, "embedded-backend"),
+                worker_runtime::catalog::CreateWorkerRequest {
+                    worker_id: binding.worker_id,
+                    create_fingerprint: binding.create_fingerprint,
+                    profile: ProfileSelector::Builtin(request.profile.clone()),
+                    display_name: Some("job:cleanup_pre_marker_restart_contract_check".to_string()),
+                    config_bundle: None,
+                    profile_source: worker_runtime::catalog::ProfileSourceArchiveSource::Embedded {
+                        archive: crate::profile_settings::builtin_profile_source_archive(
+                            &ProfileSelector::Builtin(request.profile.clone()),
+                        )
+                        .unwrap(),
+                    },
+                    initial_input: None,
+                    workdir_attachment_requests: Vec::new(),
+                    workdir_attachments: Vec::new(),
+                    worker_observation_enabled: false,
+                    worker_observation_grants: Vec::new(),
+                    workspace_api: Some(test_worker_workspace_api(EMBEDDED_WORKER_RUNTIME_ID)),
+                    memory_settings: Some(test_worker_memory_settings()),
+                    subjektiv_attached: false,
+                },
+            )
+            .unwrap();
+        let worker =
+            RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, detail.worker_id.to_string());
+        runtime
+            .observe_worker_event(
+                &runtime_worker_ref,
+                protocol::Event::WorkerState {
+                    snapshot: protocol::WorkerStateSnapshot {
+                        last_command_id: 0,
+                        last_finished_submission_request_id: None,
+                        state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                            protocol::WorkerRunState::Running,
+                        )),
+                    },
+                },
+            )
+            .unwrap();
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let reservation = store
+            .reserve_backend_job(TEST_WORKSPACE_ID, &request, &now)
+            .unwrap();
+        let (_, claimed) = store
+            .claim_backend_job_attempt_dispatch(
+                TEST_WORKSPACE_ID,
+                &request.job_id,
+                &reservation.attempt.attempt_id,
+                &now,
+            )
+            .unwrap();
+        assert!(claimed);
+        let runtime_run_id = crate::backend_job::runtime_run_id(&reservation.attempt.attempt_id);
+        store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                worker: worker.clone(),
+                display_name: "job:cleanup_pre_marker_restart_contract_check".to_string(),
+                profile: Some(request.profile.clone()),
+                retention_state: "normal".to_string(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            })
+            .unwrap();
+        store
+            .bind_backend_job_attempt_worker(
+                TEST_WORKSPACE_ID,
+                &request.job_id,
+                &reservation.attempt.attempt_id,
+                &worker,
+                Some(&runtime_run_id),
+                &now,
+            )
+            .unwrap();
         seed_worker_session_for_cleanup(temp.path(), &worker);
-        api.store
+        let before_restart = runtime.worker_detail(&runtime_worker_ref).unwrap();
+        assert!(!before_restart.execution_reconstructed);
+        assert!(before_restart.worker_state.is_some_and(|snapshot| {
+            snapshot.last_command_id == 0
+                && snapshot.last_finished_submission_request_id.is_none()
+                && snapshot.state
+                    == protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                        protocol::WorkerRunState::Running,
+                    ))
+        }));
+        store
             .accept_backend_job_result(
                 TEST_WORKSPACE_ID,
                 &worker,
                 &BackendJobResultSubmission {
                     job_id: request.job_id.clone(),
-                    attempt_id: dispatched.attempt.attempt_id.clone(),
+                    attempt_id: reservation.attempt.attempt_id.clone(),
                     input_revision: request.input_revision.clone(),
                     result: serde_json::json!({"persisted": true}),
                 },
-                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                &now,
             )
             .unwrap();
-        let (claimed, did_claim) = api
-            .store
-            .claim_backend_job_worker_cleanup(
-                TEST_WORKSPACE_ID,
-                &request.job_id,
-                &dispatched.attempt.attempt_id,
-                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-            )
-            .unwrap();
-        assert!(did_claim);
         assert_eq!(
-            claimed.worker_cleanup_state,
-            Some(BackendJobWorkerCleanupState::Executing)
-        );
-
-        api.recover_backend_jobs().unwrap();
-        let cleaned = wait_for_backend_job_worker_cleanup(
-            &api,
-            &request.job_id,
-            &dispatched.attempt.attempt_id,
-            BackendJobWorkerCleanupState::Completed,
-        )
-        .await;
-        assert_eq!(cleaned.result, Some(serde_json::json!({"persisted": true})));
-        api.recover_backend_jobs().unwrap();
-        assert_eq!(
-            api.store
+            store
                 .get_backend_job_attempt(
                     TEST_WORKSPACE_ID,
                     &request.job_id,
-                    &dispatched.attempt.attempt_id,
+                    &reservation.attempt.attempt_id,
                 )
                 .unwrap()
                 .unwrap()
                 .worker_cleanup_state,
-            Some(BackendJobWorkerCleanupState::Completed)
+            Some(BackendJobWorkerCleanupState::Pending)
         );
+        let attempt_id = reservation.attempt.attempt_id;
+        drop(runtime);
+        drop(embedded);
+        drop(store);
+        drop(execution);
+
+        let restarted_store = SqliteWorkspaceStore::open(config.database_path.clone()).unwrap();
+        let restarted_execution = Arc::new(DeterministicExecutionBackend::default());
+        restarted_execution.accept_restores();
+        let restarted = WorkspaceApi::new_with_execution_backend(
+            config,
+            Arc::new(restarted_store),
+            restarted_execution,
+        )
+        .await
+        .unwrap();
+        let cleaned = wait_for_backend_job_worker_cleanup(
+            &restarted,
+            &request.job_id,
+            &attempt_id,
+            BackendJobWorkerCleanupState::Completed,
+        )
+        .await;
+        assert_eq!(cleaned.result, Some(serde_json::json!({"persisted": true})));
+        assert!(matches!(
+            restarted.runtime.worker(&worker),
+            Err(RuntimeRegistryError::UnknownWorker { .. })
+        ));
     }
 
     #[tokio::test]

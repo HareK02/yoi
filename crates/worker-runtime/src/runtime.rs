@@ -1096,6 +1096,7 @@ impl Runtime {
                 status: WorkerStatus::Stopped,
                 worker_state: None,
                 last_finished_submission_request_id: None,
+                execution_reconstructed: false,
                 workspace_id: scope.map(|scope| scope.workspace_id.clone()),
                 profile: durable_request.profile.clone(),
                 display_name: durable_request.display_name.clone(),
@@ -4041,6 +4042,7 @@ impl RuntimeState {
                     status: worker.status,
                     worker_state: None,
                     last_finished_submission_request_id: worker.last_finished_submission_request_id,
+                    execution_reconstructed: true,
                     workspace_id: worker.workspace_id,
                     profile: worker.profile,
                     display_name: worker.display_name,
@@ -4939,6 +4941,7 @@ struct WorkerRecord {
     status: WorkerStatus,
     worker_state: Option<protocol::WorkerStateSnapshot>,
     last_finished_submission_request_id: Option<String>,
+    execution_reconstructed: bool,
     workspace_id: Option<String>,
     profile: ProfileSelector,
     display_name: Option<String>,
@@ -5008,6 +5011,7 @@ impl WorkerRecord {
             status: self.status,
             created_at_ms: self.created_at_ms,
             execution_metadata_available: self.execution_metadata_available,
+            execution_reconstructed: self.execution_reconstructed,
             worker_state: self.worker_state.clone(),
             workspace_id: self.workspace_id.clone(),
             workdir_attachments: self.workdir_attachments.clone(),
@@ -9283,6 +9287,12 @@ mod tests {
         let mut input = WorkerInput::user("run durable Backend Job attempt");
         input.submission_request_id = Some("job-attempt-request".to_string());
         runtime.send_input(&worker.worker_ref, input).unwrap();
+        assert!(
+            !runtime
+                .worker_detail(&worker.worker_ref)
+                .unwrap()
+                .execution_reconstructed
+        );
 
         let aggregate_path = root
             .join("workers")
@@ -9301,9 +9311,9 @@ mod tests {
             Arc::new(TestExecutionBackend::default()),
         )
         .unwrap();
-        let restored_state = restored
-            .worker_detail(&worker.worker_ref)
-            .unwrap()
+        let restored_detail = restored.worker_detail(&worker.worker_ref).unwrap();
+        assert!(restored_detail.execution_reconstructed);
+        let restored_state = restored_detail
             .worker_state
             .expect("automatic restore publishes fresh Worker state");
         assert_eq!(restored_state.last_command_id, 0);
