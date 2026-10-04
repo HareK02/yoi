@@ -175,6 +175,11 @@ pub struct WorkerStateSnapshot {
         schemars(range(min = 0, max = 9_007_199_254_740_991_u64))
     )]
     pub last_command_id: u64,
+    /// Most recent Submit request whose controller Run has returned and whose
+    /// post-Run state transition has been published. This is a teardown fence,
+    /// not a successful-result claim; cancelled and failed Runs may also finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_finished_submission_request_id: Option<String>,
     pub state: WorkerState,
 }
 
@@ -182,6 +187,7 @@ impl WorkerStateSnapshot {
     pub fn initial() -> Self {
         Self {
             last_command_id: 0,
+            last_finished_submission_request_id: None,
             state: WorkerState::Idle,
         }
     }
@@ -209,6 +215,7 @@ impl From<WorkerStatus> for WorkerStateSnapshot {
         };
         Self {
             last_command_id: 0,
+            last_finished_submission_request_id: None,
             state,
         }
     }
@@ -1925,6 +1932,7 @@ mod tests {
     fn worker_state_snapshot_wire_shape_has_one_authoritative_state() {
         let snapshot = WorkerStateSnapshot {
             last_command_id: 7,
+            last_finished_submission_request_id: Some("request-7".to_string()),
             state: WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Running)),
         };
         let value = serde_json::to_value(&snapshot).unwrap();
@@ -1932,6 +1940,7 @@ mod tests {
             value,
             serde_json::json!({
                 "last_command_id": 7,
+                "last_finished_submission_request_id": "request-7",
                 "state": {
                     "kind": "busy",
                     "state": { "kind": "run", "state": "running" }
@@ -2648,6 +2657,7 @@ mod tests {
         let event = Event::WorkerState {
             snapshot: WorkerStateSnapshot {
                 last_command_id: 9,
+                last_finished_submission_request_id: None,
                 state: WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Running)),
             },
         };
@@ -2669,6 +2679,7 @@ mod tests {
                 snapshot: WorkerStateSnapshot {
                     last_command_id: 9,
                     state: WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Running)),
+                    ..
                 }
             }
         ));

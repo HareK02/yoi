@@ -8028,6 +8028,7 @@ mod tests {
                 protocol::WorkerRunState::Running,
             )),
             last_command_id: 2,
+            last_finished_submission_request_id: Some("request-old".to_string()),
         };
         {
             let mut state = runtime.lock().unwrap();
@@ -8049,6 +8050,7 @@ mod tests {
         let fresh = protocol::WorkerStateSnapshot {
             state: protocol::WorkerState::Idle,
             last_command_id: 0,
+            last_finished_submission_request_id: None,
         };
         {
             let mut state = runtime.lock().unwrap();

@@ -3774,21 +3774,30 @@ impl WorkspaceApi {
         let worker = attempt.worker.as_ref().ok_or_else(|| {
             Error::Store("claimed Backend Job Worker cleanup lost its binding".to_string())
         })?;
+        let Some(runtime_run_id) = attempt.runtime_run_id.as_deref() else {
+            // Attempts created before tracked Runtime submissions can only be
+            // recovered after a Backend restart, which has already ended their
+            // in-process result response and Run. Canonical stop/remove remains
+            // the safety boundary for those legacy leftovers.
+            return Ok(());
+        };
         loop {
             match self.runtime.worker(worker) {
                 Ok(detail)
                     if detail.state.eq_ignore_ascii_case("stopped")
                         || detail.worker_state.as_ref().is_some_and(|snapshot| {
-                            snapshot.last_command_id > 0
-                                && snapshot.state == protocol::WorkerState::Idle
+                            snapshot.state == protocol::WorkerState::Idle
+                                && snapshot.last_finished_submission_request_id.as_deref()
+                                    == Some(runtime_run_id)
                         }) =>
                 {
                     return Ok(());
                 }
                 Ok(_) => {
-                    // The result capability runs inside this Worker Run. Idle
-                    // with a committed command is the Runtime-owned fence that
-                    // the HTTP response and Run post-processing have completed.
+                    // The result capability runs inside this tracked Submit. The
+                    // Worker controller publishes this exact request id together
+                    // with its post-Run state only after the invocation returns,
+                    // so an unrelated initial Idle snapshot cannot release cleanup.
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
                 Err(RuntimeRegistryError::UnknownWorker { .. }) => return Ok(()),
@@ -41796,12 +41805,13 @@ mod tests {
             } else if let Some(submission_request_id) = submission_request_id {
                 worker_runtime::execution::WorkerExecutionResult::accepted_submission(
                     worker_runtime::execution::WorkerExecutionOperation::Input,
-                    submission_request_id,
+                    submission_request_id.clone(),
                     uuid::Uuid::now_v7().to_string(),
                     protocol::SubmissionDisposition::Started,
                 )
                 .with_worker_state(protocol::WorkerStateSnapshot {
-                    last_command_id: 1,
+                    last_command_id: 0,
+                    last_finished_submission_request_id: Some(submission_request_id),
                     state: protocol::WorkerState::Idle,
                 })
             } else {
@@ -43175,7 +43185,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backend_job_result_http_response_precedes_cleanup_until_run_idle() {
+    async fn backend_job_result_http_response_precedes_cleanup_until_tracked_run_finishes() {
         let temp = tempfile::tempdir().unwrap();
         let (api, execution) = test_api_with_recording_backend(temp.path()).await;
         let request = BackendJobRequest {
@@ -43192,11 +43202,13 @@ mod tests {
         };
         let dispatched = api.dispatch_backend_job(&request).unwrap();
         let worker = dispatched.attempt.worker.clone().unwrap();
+        let runtime_run_id = dispatched.attempt.runtime_run_id.clone().unwrap();
         seed_worker_session_for_cleanup(temp.path(), &worker);
         execution.publish_worker_state(
             &worker,
             protocol::WorkerStateSnapshot {
-                last_command_id: 1,
+                last_command_id: 0,
+                last_finished_submission_request_id: None,
                 state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
                     protocol::WorkerRunState::Running,
                 )),
@@ -43249,7 +43261,8 @@ mod tests {
         execution.publish_worker_state(
             &worker,
             protocol::WorkerStateSnapshot {
-                last_command_id: 2,
+                last_command_id: 0,
+                last_finished_submission_request_id: Some(runtime_run_id),
                 state: protocol::WorkerState::Idle,
             },
         );

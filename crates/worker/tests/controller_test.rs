@@ -1299,12 +1299,10 @@ async fn run_end_returns_to_idle_without_busy_status() {
     let worker = make_worker(client).await;
     let handle = spawn_controller(worker).await;
     let mut rx = handle.subscribe();
+    let submission_request_id = protocol::new_submission_request_id();
 
     handle
-        .send(Method::submit_text(
-            protocol::new_submission_request_id(),
-            "Hello",
-        ))
+        .send(Method::submit_text(submission_request_id.clone(), "Hello"))
         .await
         .unwrap();
 
@@ -1319,7 +1317,11 @@ async fn run_end_returns_to_idle_without_busy_status() {
                         saw_run_end = true;
                     }
                     Ok(Event::WorkerState { snapshot })
-                        if saw_run_end && snapshot.catalog_status() == WorkerStatus::Idle => {
+                        if saw_run_end
+                            && snapshot.catalog_status() == WorkerStatus::Idle
+                            && snapshot.last_finished_submission_request_id.as_deref()
+                                == Some(submission_request_id.as_str()) =>
+                    {
                         saw_idle_status = true;
                         break;
                     }
@@ -1334,7 +1336,7 @@ async fn run_end_returns_to_idle_without_busy_status() {
     assert!(saw_run_end, "expected RunEnd::Finished");
     assert!(
         saw_idle_status,
-        "expected idle status immediately after RunEnd"
+        "expected exact Submit teardown fence in idle status immediately after RunEnd"
     );
     assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Idle);
 }

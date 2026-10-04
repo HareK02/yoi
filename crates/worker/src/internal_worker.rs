@@ -335,6 +335,7 @@ fn send_internal_worker_state(
     let _ = event_tx.send(Event::WorkerState {
         snapshot: protocol::WorkerStateSnapshot {
             last_command_id: 0,
+            last_finished_submission_request_id: None,
             state,
         },
     });

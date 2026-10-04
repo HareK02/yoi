@@ -508,6 +508,7 @@ impl RetainedSnapshotSocket {
                 },
                 state: protocol::WorkerStateSnapshot {
                     last_command_id: 0,
+                    last_finished_submission_request_id: None,
                     state: protocol::WorkerState::Idle,
                 },
                 in_flight: protocol::InFlightSnapshot::default(),

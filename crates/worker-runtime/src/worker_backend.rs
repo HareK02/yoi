@@ -3824,11 +3824,13 @@ mod tests {
                 protocol::WorkerRunState::Running,
             )),
             last_command_id: 2,
+            last_finished_submission_request_id: Some("request-old".to_string()),
         };
         let current = Arc::new(RwLock::new(running));
         let idle = protocol::WorkerStateSnapshot {
             state: protocol::WorkerState::Idle,
             last_command_id: 0,
+            last_finished_submission_request_id: None,
         };
         let mut replacement = Event::WorkerState {
             snapshot: idle.clone(),
@@ -3841,6 +3843,7 @@ mod tests {
                 protocol::WorkerRunState::Paused,
             )),
             last_command_id: 3,
+            last_finished_submission_request_id: None,
         };
         let mut acknowledgement = Event::CommandAcknowledged {
             acknowledgement: protocol::WorkerCommandAcknowledgement {

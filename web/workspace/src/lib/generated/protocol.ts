@@ -34,7 +34,13 @@ export type WorkerStateSnapshot = {
 /**
  * Highest lifecycle command id observed by this controller instance.
  */
-last_command_id: number, state: WorkerState, };
+last_command_id: number,
+/**
+ * Most recent Submit request whose controller Run has returned and whose
+ * post-Run state transition has been published. This is a teardown fence,
+ * not a successful-result claim; cancelled and failed Runs may also finish.
+ */
+last_finished_submission_request_id?: string | null, state: WorkerState, };
 
 export type TurnResult = "finished" | "paused";
 

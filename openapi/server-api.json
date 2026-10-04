@@ -12568,6 +12568,13 @@
             "minimum": 0,
             "type": "integer"
           },
+          "last_finished_submission_request_id": {
+            "description": "Most recent Submit request whose controller Run has returned and whose\npost-Run state transition has been published. This is a teardown fence,\nnot a successful-result claim; cancelled and failed Runs may also finish.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "state": {
             "$ref": "#/components/schemas/WorkerState"
           }
@@ -14787,7 +14794,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:cba261b44424ef69fde6339246ed891300b456ac3f8cc3b99103cb90e5fa32d6"
+    "x-yoi-source-digest": "sha256:f9f0f8918dbcce386e94d5368fa938f02565ca98f9f67f07537bd88ed8c49870"
   },
   "openapi": "3.1.0",
   "paths": {
