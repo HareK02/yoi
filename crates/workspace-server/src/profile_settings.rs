@@ -447,6 +447,23 @@ pub fn build_virtual_profile_config_bundle_with_prompt_projection(
     Ok(Some(bundle))
 }
 
+pub(crate) fn resolve_profile_manifest_from_config_bundle(
+    bundle: &ConfigBundle,
+    selector: &str,
+) -> Result<manifest::WorkerManifest> {
+    let archive = bundle.profile_source_archive.as_ref().ok_or_else(|| {
+        Error::Config(format!(
+            "resolved Profile {selector:?} is missing its source archive"
+        ))
+    })?;
+    let verified = archive.verify().map_err(|error| {
+        Error::Config(format!("failed to verify Profile {selector:?}: {error}"))
+    })?;
+    verified
+        .resolve_profile(selector, Path::new("/"), "worker-launch-validation")
+        .map_err(|error| Error::Config(format!("failed to resolve Profile {selector:?}: {error}")))
+}
+
 fn build_virtual_profile_archive(
     selector: &str,
     entry: &VirtualProfileEntry,

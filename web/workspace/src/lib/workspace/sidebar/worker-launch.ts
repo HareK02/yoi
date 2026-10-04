@@ -16,6 +16,7 @@ export type WorkerLaunchFormState = {
   runtime_id: string;
   display_name: string;
   profile: string;
+  subjektiv_subject_id: string;
   initial_text: string;
   workdir_attachments: WorkerLaunchAttachmentFormState[];
   working_directory_repository_key: string;
@@ -103,6 +104,7 @@ export function defaultWorkerLaunchForm(
       options?.profiles.some((candidate) => candidate.id === current.profile)
         ? current.profile
         : preferredProfile?.id || "",
+    subjektiv_subject_id: current.subjektiv_subject_id,
     initial_text: current.initial_text,
     workdir_attachments: workdirAttachments,
     working_directory_repository_key:
@@ -179,6 +181,9 @@ export function buildCreateWorkspaceWorkerRequest(
       ? [{ kind: "text", content: form.initial_text }]
       : [],
     workdir_attachments: validatedAttachments(form.workdir_attachments),
+    feature_connections: form.subjektiv_subject_id.trim()
+      ? { subjektiv: { subject_id: form.subjektiv_subject_id.trim() } }
+      : {},
     control_operation_id: null,
   });
 }

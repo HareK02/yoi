@@ -522,6 +522,7 @@ fn workspace_worker_create_request(
                 relative_cwd: attachment.relative_cwd,
             })
             .collect(),
+        feature_connections: Default::default(),
         control_operation_id: Some(control_operation_id),
     })
 }

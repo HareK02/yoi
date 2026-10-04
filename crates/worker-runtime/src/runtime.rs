@@ -1095,6 +1095,8 @@ impl Runtime {
                 worker_id: worker_id.clone(),
                 status: WorkerStatus::Stopped,
                 worker_state: None,
+                last_finished_submission_request_id: None,
+                execution_reconstructed: false,
                 workspace_id: scope.map(|scope| scope.workspace_id.clone()),
                 profile: durable_request.profile.clone(),
                 display_name: durable_request.display_name.clone(),
@@ -1670,6 +1672,39 @@ impl Runtime {
                 reason: runtime_api::WorkerSessionHistoryUnavailableReason::Unsupported,
                 message: "session history paging is not supported by this Runtime".to_string(),
             },
+        })
+    }
+
+    pub fn worker_session_attachment_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        worker_ref: &WorkerRef,
+        session_id: String,
+        attachment_id: String,
+    ) -> Result<session_store::RetainedSessionAttachment, session_store::RetainedAttachmentReadError>
+    {
+        let operation_lock = self
+            .worker_operation_lock(worker_ref.worker_id)
+            .map_err(|_| session_store::RetainedAttachmentReadError::RetentionMissing)?;
+        let _operation_guard = operation_lock
+            .lock()
+            .map_err(|_| session_store::RetainedAttachmentReadError::StorageUnavailable)?;
+        self.ensure_worker_in_workspace(scope, worker_ref)
+            .map_err(|_| session_store::RetainedAttachmentReadError::NotFound)?;
+        let backend = {
+            let state = self
+                .lock()
+                .map_err(|_| session_store::RetainedAttachmentReadError::StorageUnavailable)?;
+            state
+                .worker(worker_ref)
+                .map_err(|_| session_store::RetainedAttachmentReadError::NotFound)?;
+            state.execution_backend.clone()
+        }
+        .ok_or(session_store::RetainedAttachmentReadError::StorageUnavailable)?;
+        backend.worker_session_attachment(crate::execution::WorkerSessionAttachmentRequest {
+            worker_ref: worker_ref.clone(),
+            session_id,
+            attachment_id,
         })
     }
 
@@ -3386,6 +3421,16 @@ impl Runtime {
         candidate.pending_stop = None;
         candidate.restore_candidate_context = None;
         candidate.status = status;
+        let mut worker_state = worker_state;
+        if worker_state.last_finished_submission_request_id.is_none() {
+            // The restored controller starts with fresh live state, but this
+            // historical fence proves that a previously accepted Submit Run
+            // already returned. Preserve it across process reconstruction so
+            // durable consumers can finish post-restart cleanup without
+            // waiting for an old request to run again.
+            worker_state.last_finished_submission_request_id =
+                candidate.last_finished_submission_request_id.clone();
+        }
         let _ = candidate.apply_worker_state(&worker_state);
         candidate.restore_intent = restore_intent_for_status(candidate.status);
         candidate.workdir_attachments = workdir_attachments;
@@ -3996,6 +4041,8 @@ impl RuntimeState {
                     worker_id: worker.worker_id,
                     status: worker.status,
                     worker_state: None,
+                    last_finished_submission_request_id: worker.last_finished_submission_request_id,
+                    execution_reconstructed: true,
                     workspace_id: worker.workspace_id,
                     profile: worker.profile,
                     display_name: worker.display_name,
@@ -4893,6 +4940,8 @@ struct WorkerRecord {
     worker_id: WorkerId,
     status: WorkerStatus,
     worker_state: Option<protocol::WorkerStateSnapshot>,
+    last_finished_submission_request_id: Option<String>,
+    execution_reconstructed: bool,
     workspace_id: Option<String>,
     profile: ProfileSelector,
     display_name: Option<String>,
@@ -4914,6 +4963,9 @@ struct WorkerRecord {
 
 impl WorkerRecord {
     fn apply_worker_state(&mut self, incoming: &protocol::WorkerStateSnapshot) {
+        if let Some(request_id) = &incoming.last_finished_submission_request_id {
+            self.last_finished_submission_request_id = Some(request_id.clone());
+        }
         self.worker_state = Some(incoming.clone());
     }
 
@@ -4959,6 +5011,7 @@ impl WorkerRecord {
             status: self.status,
             created_at_ms: self.created_at_ms,
             execution_metadata_available: self.execution_metadata_available,
+            execution_reconstructed: self.execution_reconstructed,
             worker_state: self.worker_state.clone(),
             workspace_id: self.workspace_id.clone(),
             workdir_attachments: self.workdir_attachments.clone(),
@@ -5022,6 +5075,7 @@ impl WorkerRecord {
             config_bundle: self.config_bundle.clone(),
             created_at_ms: self.created_at_ms,
             status: self.status,
+            last_finished_submission_request_id: self.last_finished_submission_request_id.clone(),
             execution_state,
             workspace_id: self.workspace_id.clone(),
             workdir_attachments: self.workdir_attachments.clone(),
@@ -8028,6 +8082,7 @@ mod tests {
                 protocol::WorkerRunState::Running,
             )),
             last_command_id: 2,
+            last_finished_submission_request_id: Some("request-old".to_string()),
         };
         {
             let mut state = runtime.lock().unwrap();
@@ -8049,6 +8104,7 @@ mod tests {
         let fresh = protocol::WorkerStateSnapshot {
             state: protocol::WorkerState::Idle,
             last_command_id: 0,
+            last_finished_submission_request_id: None,
         };
         {
             let mut state = runtime.lock().unwrap();
@@ -9192,6 +9248,81 @@ mod tests {
         restored
             .send_input(&worker.worker_ref, WorkerInput::user("after restart"))
             .unwrap();
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn fs_store_preserves_finished_submission_fence_across_active_restore() {
+        let root = fs_store_root("finished-submission-restore");
+        let options = crate::fs_store::FsRuntimeStoreOptions {
+            root: root.clone(),
+            runtime_id: "test-runtime".to_string(),
+            display_name: None,
+        };
+        let execution = Arc::new(TestExecutionBackend::default());
+        let runtime =
+            Runtime::with_fs_store_and_execution_backend(options.clone(), execution.clone())
+                .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("persist finished submission fence"))
+            .unwrap();
+        execution.set_dispatch_result(
+            WorkerExecutionResult::accepted_submission(
+                WorkerExecutionOperation::Input,
+                "job-attempt-request",
+                "submission-id",
+                protocol::SubmissionDisposition::Started,
+            )
+            .with_worker_state(protocol::WorkerStateSnapshot {
+                state: protocol::WorkerState::Idle,
+                // Production Submit Run does not consume a lifecycle command
+                // id, so this intentionally remains zero.
+                last_command_id: 0,
+                last_finished_submission_request_id: Some("job-attempt-request".to_string()),
+            }),
+        );
+        let mut input = WorkerInput::user("run durable Backend Job attempt");
+        input.submission_request_id = Some("job-attempt-request".to_string());
+        runtime.send_input(&worker.worker_ref, input).unwrap();
+        assert!(
+            !runtime
+                .worker_detail(&worker.worker_ref)
+                .unwrap()
+                .execution_reconstructed
+        );
+
+        let aggregate_path = root
+            .join("workers")
+            .join(worker.worker_id.to_string())
+            .join("worker.json");
+        let aggregate: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&aggregate_path).unwrap()).unwrap();
+        assert_eq!(
+            aggregate["last_finished_submission_request_id"],
+            serde_json::json!("job-attempt-request")
+        );
+        drop(runtime);
+
+        let restored = Runtime::with_fs_store_and_execution_backend(
+            options,
+            Arc::new(TestExecutionBackend::default()),
+        )
+        .unwrap();
+        let restored_detail = restored.worker_detail(&worker.worker_ref).unwrap();
+        assert!(restored_detail.execution_reconstructed);
+        let restored_state = restored_detail
+            .worker_state
+            .expect("automatic restore publishes fresh Worker state");
+        assert_eq!(restored_state.last_command_id, 0);
+        assert_eq!(
+            restored_state
+                .last_finished_submission_request_id
+                .as_deref(),
+            Some("job-attempt-request")
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

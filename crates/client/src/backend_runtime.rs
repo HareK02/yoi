@@ -819,7 +819,8 @@ mod tests {
             "profiles": [{
                 "id": "builtin:default",
                 "label": "Default",
-                "description": ""
+                "description": "",
+                "feature_connections": { "subjektiv": false }
             }],
             "repositories": [],
             "working_directories": [],
@@ -883,6 +884,7 @@ mod tests {
             ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachments: Vec::new(),
+            feature_connections: Default::default(),
             control_operation_id: None,
         };
 

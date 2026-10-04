@@ -1528,6 +1528,10 @@
           "display_name": {
             "type": "string"
           },
+          "feature_connections": {
+            "$ref": "#/components/schemas/WorkspaceWorkerFeatureConnectionsRequest",
+            "description": "Explicit product Feature connections. Backend validation turns these into\ntrusted host attachments; Runtime and Profile inputs cannot self-attest them."
+          },
           "initial_submit": {
             "default": [],
             "items": {
@@ -1574,7 +1578,8 @@
         },
         "required": [
           "runtime_id",
-          "display_name"
+          "display_name",
+          "feature_connections"
         ],
         "type": "object"
       },
@@ -9428,15 +9433,15 @@
         ],
         "type": "string"
       },
-      "SubjektivSubjectWorkerStartRequest": {
+      "SubjektivWorkerConnectionRequest": {
         "additionalProperties": false,
         "properties": {
-          "worker": {
-            "$ref": "#/components/schemas/CreateWorkspaceWorkerRequest"
+          "subject_id": {
+            "type": "string"
           }
         },
         "required": [
-          "worker"
+          "subject_id"
         ],
         "type": "object"
       },
@@ -12069,6 +12074,18 @@
         ],
         "type": "object"
       },
+      "WorkerLaunchFeatureConnectionOptions": {
+        "additionalProperties": false,
+        "properties": {
+          "subjektiv": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "subjektiv"
+        ],
+        "type": "object"
+      },
       "WorkerLaunchOptionsResponse": {
         "additionalProperties": false,
         "properties": {
@@ -12128,6 +12145,9 @@
           "description": {
             "type": "string"
           },
+          "feature_connections": {
+            "$ref": "#/components/schemas/WorkerLaunchFeatureConnectionOptions"
+          },
           "id": {
             "type": "string"
           },
@@ -12138,7 +12158,8 @@
         "required": [
           "id",
           "label",
-          "description"
+          "description",
+          "feature_connections"
         ],
         "type": "object"
       },
@@ -12546,6 +12567,13 @@
             "maximum": 9007199254740991,
             "minimum": 0,
             "type": "integer"
+          },
+          "last_finished_submission_request_id": {
+            "description": "Most recent Submit request whose controller Run has returned and whose\npost-Run state transition has been published. This is a teardown fence,\nnot a successful-result claim; cancelled and failed Runs may also finish.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "state": {
             "$ref": "#/components/schemas/WorkerState"
@@ -14706,6 +14734,22 @@
         ],
         "type": "object"
       },
+      "WorkspaceWorkerFeatureConnectionsRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "subjektiv": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SubjektivWorkerConnectionRequest"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
       "WorkspaceWorkerSubject": {
         "oneOf": [
           {
@@ -14750,7 +14794,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:318ce25c5d41452715ccb31e81798bfe2b894796a1f885afb37c83cdb7525098"
+    "x-yoi-source-digest": "sha256:f9f0f8918dbcce386e94d5368fa938f02565ca98f9f67f07537bd88ed8c49870"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -29622,143 +29666,6 @@
             "description": "Error response"
           },
           "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          },
-          {
-            "browserSession": []
-          }
-        ]
-      }
-    },
-    "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/worker": {
-      "post": {
-        "operationId": "subjektiv_subject_worker_start",
-        "parameters": [
-          {
-            "explode": false,
-            "in": "path",
-            "name": "workspace_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          },
-          {
-            "explode": false,
-            "in": "path",
-            "name": "subject_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/SubjektivSubjectWorkerStartRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/BrowserCreateWorkerResponse"
-                }
-              }
-            },
-            "description": "Successful response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "502": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "503": {
             "content": {
               "application/json": {
                 "schema": {

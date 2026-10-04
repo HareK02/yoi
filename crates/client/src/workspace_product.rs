@@ -532,6 +532,7 @@ impl BackendWorkspaceProductClient {
                 content: format!("Please handle intake for Ticket {ticket_id}."),
             }],
             workdir_attachments: Vec::new(),
+            feature_connections: Default::default(),
             control_operation_id: None,
         };
         let workspace_id = self.workspace_id.clone();

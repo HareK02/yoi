@@ -335,6 +335,7 @@ fn send_internal_worker_state(
     let _ = event_tx.send(Event::WorkerState {
         snapshot: protocol::WorkerStateSnapshot {
             last_command_id: 0,
+            last_finished_submission_request_id: None,
             state,
         },
     });
@@ -519,6 +520,19 @@ impl InternalWorkerSessionHandle {
         self.store
             .read_all(self.session_id, self.segment_id)
             .unwrap_or_default()
+    }
+
+    pub(crate) fn session_attachment(
+        &self,
+        attachment_id: &str,
+        max_attachment_bytes: u64,
+    ) -> Result<session_store::RetainedSessionAttachment, session_store::RetainedAttachmentReadError>
+    {
+        session_store::read_session_attachment_from_entries(
+            &self.entries(),
+            attachment_id,
+            max_attachment_bytes,
+        )
     }
 
     pub(crate) async fn send(
@@ -1445,6 +1459,50 @@ permission = "write"
         assert!(matches!(result.lifecycle, WorkerRunResult::Finished));
         assert!(result.history_entries >= 4);
         assert_eq!(result.identity.kind, "test");
+    }
+
+    #[tokio::test]
+    async fn visible_internal_session_resolves_its_projected_image_attachment() {
+        let (handle, _events) =
+            test_internal_worker_session(InternalWorkerVisibility::ParentClient);
+        let image = vec![1, 3, 5, 7];
+        let entry_id = "internal-image-entry";
+        let attachment_id =
+            session_store::session_tool_attachment_id(entry_id, 0, "image/png", &image);
+        handle.publish_test_entry(LogEntry::AnnotatedToolResult {
+            ts: 1,
+            entry: session_store::LoggedHistoryEntry {
+                item: session_store::LoggedItem::ToolResult {
+                    call_id: "internal-image-call".into(),
+                    summary: "internal screenshot".into(),
+                    content: None,
+                    attachments: vec![session_store::logged_item::LoggedAttachment::Image {
+                        mime_type: "image/png".into(),
+                        data: image.clone(),
+                    }],
+                    disposition: agen::tool::ToolResultDisposition::Success,
+                    is_error: false,
+                },
+                metadata: session_store::LoggedSessionHistoryMetadata {
+                    entry_id: session_store::LoggedSessionHistoryEntryId(entry_id.into()),
+                    origin: session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
+                    derivation: None,
+                },
+            },
+        });
+
+        let projected = handle.protocol_snapshot();
+        let protocol::SessionSnapshotEntryData::ToolResult { attachments, .. } =
+            &projected.session.entries[0].data
+        else {
+            panic!("expected projected tool result");
+        };
+        assert_eq!(attachments[0].attachment_id, attachment_id);
+        let attachment = handle
+            .session_attachment(&attachment_id, 1024)
+            .expect("internal image body");
+        assert_eq!(attachment.media_type, "image/png");
+        assert_eq!(attachment.data, image);
     }
 
     #[test]

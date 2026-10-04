@@ -151,7 +151,7 @@ async function swipeMainToEnd(page: Page): Promise<void> {
   throw new Error("touch input did not reach the end of the resident Memory surface");
 }
 
-Deno.test("production subject Memory shell renders exact states, safe Markdown, provenance, and one scroll owner", async () => {
+Deno.test("production subject Memory and Worker launch shells preserve exact scoped behavior", async () => {
   const build = await new Deno.Command(Deno.execPath(), {
     args: ["task", "build"],
     cwd: workspaceRoot,
@@ -500,6 +500,49 @@ Deno.test("production subject Memory shell renders exact states, safe Markdown, 
         await page.close();
       }
       await stateContext.close();
+
+      const launchContext = await browser.newContext({ viewport: { width: 768, height: 900 } });
+      const launchPage = await launchContext.newPage();
+      await launchPage.goto(`${baseUrl}/w/${workspaceId}/workers/new`);
+      await launchPage.getByRole("heading", { name: "New Worker", level: 1 }).waitFor();
+      const subjectConnection = launchPage.locator(
+        '[data-worker-feature-connection="subjektiv"]',
+      );
+      await subjectConnection.waitFor();
+      const subjectSelect = launchPage.getByRole("combobox", {
+        name: "Subject Memory connection",
+      });
+      assertEquals(await subjectSelect.locator('option[value="error-subject"]').count(), 0);
+      assertEquals(await subjectSelect.locator('option[value="paged-subject"]').count(), 0);
+      await launchPage.getByRole("button", { name: "Load more subjects" }).click();
+      await subjectSelect.locator('option[value="paged-subject"]').waitFor({ state: "attached" });
+      await subjectSelect.selectOption(subjectId);
+      assertEquals(await subjectSelect.inputValue(), subjectId);
+      assertEquals(
+        await subjectConnection.locator("code", { hasText: subjectId }).count(),
+        1,
+      );
+
+      const profileSelect = launchPage.getByRole("combobox", { name: "Profile" });
+      await profileSelect.selectOption("builtin:standalone");
+      assertEquals(await subjectConnection.count(), 0);
+      await profileSelect.selectOption("builtin:companion");
+      await subjectConnection.waitFor();
+      assertEquals(await subjectSelect.inputValue(), "");
+
+      await subjectSelect.selectOption(subjectId);
+      const createRequestPromise = launchPage.waitForRequest((request) =>
+        request.method() === "POST" &&
+        new URL(request.url()).pathname === `/api/w/${workspaceId}/workers`
+      );
+      await launchPage.getByRole("button", { name: "Start Worker" }).click();
+      const createRequest = await createRequestPromise;
+      const createPayload = createRequest.postDataJSON();
+      assertEquals(createPayload.profile, "builtin:companion");
+      assertEquals(createPayload.feature_connections, {
+        subjektiv: { subject_id: subjectId },
+      });
+      await launchContext.close();
     } finally {
       await browser.close();
     }

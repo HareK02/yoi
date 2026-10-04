@@ -11,6 +11,7 @@
     parseWorkerApiError,
     parseWorkerLaunchOptionsResponse,
   } from '#lib/workspace/api/workers.ts';
+  import { parseSubjektivSubjectListResponse } from '#lib/workspace/memory/api.ts';
   import { formatCurrentWorkdirRevision } from '#lib/workspace/settings/workdir-revision.ts';
   import { formatExternalGrantPermissionLevel } from '#lib/workspace/settings/workdir-permissions.ts';
   import {
@@ -24,6 +25,7 @@
     WorkerLaunchOptionsResponse,
     WorkingDirectorySummary,
   } from '#lib/workspace/sidebar/types.ts';
+  import type { SubjektivSubjectResponse } from '#lib/generated/memory-api.ts';
   import type { PageProps } from './$types';
 
   type DisplayError = {
@@ -69,6 +71,14 @@
         : 'builtin:coder'
       : '',
   );
+  let subjektivSubjectId = $state('');
+  let subjects = $state<SubjektivSubjectResponse[]>([]);
+  let subjectsLoading = $state(false);
+  let subjectsLoaded = $state(false);
+  let subjectsError = $state<string | null>(null);
+  let subjectsNextCursor = $state<string | null>(null);
+  let subjectsHaveMore = $state(false);
+  let previousProfile = $state('');
   let initialText = $state(ticketContext?.initialInput ?? '');
   let workdirAttachments = $state<WorkerLaunchAttachmentFormState[]>([]);
   let workingDirectoryDisplayName = $state('');
@@ -80,6 +90,10 @@
   );
   let isNewWorkingDirectorySelected = $derived(newWorkingDirectoryAttachmentIndex >= 0);
   let selectedRuntime = $derived(options?.runtimes.find((runtime) => runtime.runtime_id === runtimeId));
+  let selectedProfile = $derived(options?.profiles.find((candidate) => candidate.id === profile));
+  let subjektivConnectionAvailable = $derived(selectedProfile?.feature_connections.subjektiv === true);
+  let activeSubjects = $derived(subjects.filter((subject) => subject.state === 'active'));
+  let selectedSubject = $derived(activeSubjects.find((subject) => subject.id === subjektivSubjectId));
   let selectedRuntimeAllowsNoWorkdir = $derived(selectedRuntime?.working_directory_required === false);
   let availableWorkingDirectories = $derived(
     selectedRuntimeAllowsNoWorkdir
@@ -127,6 +141,16 @@
         working_directory_id: availableWorkingDirectories[0]?.working_directory_id ?? '',
         relative_cwd: '',
       }];
+    }
+  });
+
+  $effect(() => {
+    if (profile !== previousProfile) {
+      subjektivSubjectId = '';
+      previousProfile = profile;
+    }
+    if (subjektivConnectionAvailable && !subjectsLoaded && !subjectsLoading) {
+      void loadSubjects(false);
     }
   });
 
@@ -178,6 +202,7 @@
         runtime_id: runtimeId,
         display_name: displayName,
         profile,
+        subjektiv_subject_id: subjektivSubjectId,
         initial_text: initialText,
         workdir_attachments: workdirAttachments,
         working_directory_repository_key: workingDirectoryRepositoryKey,
@@ -186,6 +211,7 @@
       runtimeId = form.runtime_id;
       displayName = form.display_name;
       profile = form.profile;
+      subjektivSubjectId = form.subjektiv_subject_id;
       const runtimeRequiresWorkdir = payload.runtimes.find((runtime) =>
         runtime.runtime_id === form.runtime_id
       )?.working_directory_required !== false;
@@ -212,6 +238,45 @@
       if (!signal?.aborted) {
         loading = false;
       }
+    }
+  }
+
+  async function loadSubjects(append: boolean) {
+    if (!workspaceId || subjectsLoading) return;
+    const cursor = append ? subjectsNextCursor : null;
+    if (append && !cursor) return;
+    subjectsLoading = true;
+    subjectsLoaded = true;
+    subjectsError = null;
+    try {
+      const query = new URLSearchParams({ limit: '100' });
+      if (cursor) query.set('cursor', cursor);
+      const response = await fetch(workerApiPath(`/subjektiv/subjects?${query}`));
+      if (!response.ok) {
+        throw new Error(`subject list failed (${response.status})`);
+      }
+      const payload = parseSubjektivSubjectListResponse(
+        await readBoundedJson(response, 8 * 1024 * 1024),
+      );
+      if (append) {
+        const byId = new Map(subjects.map((subject) => [subject.id, subject]));
+        for (const subject of payload.items) byId.set(subject.id, subject);
+        subjects = [...byId.values()];
+      } else {
+        subjects = payload.items;
+      }
+      subjectsNextCursor = payload.next_cursor ?? null;
+      subjectsHaveMore = payload.has_more;
+      if (
+        subjektivSubjectId &&
+        !subjects.some((subject) => subject.id === subjektivSubjectId && subject.state === 'active')
+      ) {
+        subjektivSubjectId = '';
+      }
+    } catch (err) {
+      subjectsError = err instanceof Error ? err.message : 'subject list failed';
+    } finally {
+      subjectsLoading = false;
     }
   }
 
@@ -304,6 +369,7 @@
           runtime_id: runtimeId,
           display_name: displayName,
           profile,
+          subjektiv_subject_id: subjektivSubjectId,
           initial_text: initialText,
           workdir_attachments: workdirAttachments,
           working_directory_repository_key: workingDirectoryRepositoryKey,
@@ -511,6 +577,55 @@
             </select>
           </label>
         </div>
+
+        {#if subjektivConnectionAvailable}
+          <div class="worker-feature-connection" data-worker-feature-connection="subjektiv">
+            <div class="worker-feature-connection-heading">
+              <div>
+                <h3>Subject Memory</h3>
+                <p>Optionally connect this Worker to one existing active subject.</p>
+              </div>
+              <span>Optional</span>
+            </div>
+            <label>
+              <span>Subject</span>
+              <select bind:value={subjektivSubjectId} aria-label="Subject Memory connection">
+                <option value="">Do not connect a subject</option>
+                {#each activeSubjects as subject (subject.id)}
+                  <option value={subject.id}>{subject.role} · {subject.id}</option>
+                {/each}
+              </select>
+            </label>
+            {#if selectedSubject}
+              <p class="worker-feature-connection-selection">
+                <strong>{selectedSubject.role}</strong>
+                <code title={selectedSubject.id}>{selectedSubject.id}</code>
+                {#if selectedSubject.current_worker}
+                  <span>Current Worker: {selectedSubject.current_worker.display_name}</span>
+                {/if}
+              </p>
+            {/if}
+            {#if subjectsLoading && subjects.length === 0}
+              <p class="worker-feature-connection-state" role="status">Loading authorized subjects…</p>
+            {:else if subjectsError}
+              <div class="worker-feature-connection-state is-error" role="alert">
+                <span>{subjectsError}</span>
+                <button type="button" class="secondary-button" onclick={() => void loadSubjects(false)}>Retry</button>
+              </div>
+            {:else if subjectsLoaded && activeSubjects.length === 0}
+              <p class="worker-feature-connection-state" role="status">No active subjects are available.</p>
+            {/if}
+            {#if subjectsHaveMore}
+              <button
+                type="button"
+                class="secondary-button worker-subject-load-more"
+                disabled={subjectsLoading}
+                onclick={() => void loadSubjects(true)}
+              >{subjectsLoading ? 'Loading…' : 'Load more subjects'}</button>
+            {/if}
+            <p class="worker-feature-connection-note">Profile enablement does not connect a subject by itself.</p>
+          </div>
+        {/if}
         <label>
           <span>Initial text</span>
           <textarea bind:value={initialText} rows="7" placeholder="Optional first instruction"></textarea>

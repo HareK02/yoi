@@ -166,7 +166,12 @@ Deno.test("Worker launch options parser accepts the generated wire shape", () =>
       diagnostics: [],
     }],
     default_profile: null,
-    profiles: [{ id: "builtin:coder", label: "Coder", description: "Code" }],
+    profiles: [{
+      id: "builtin:coder",
+      label: "Coder",
+      description: "Code",
+      feature_connections: { subjektiv: true },
+    }],
     repositories: [{ repository_key: "main" }],
     working_directories: [],
     diagnostics: [],
@@ -235,10 +240,27 @@ Deno.test("Worker create request parser requires the complete shared request", (
       working_directory_id: "workdir-a",
       relative_cwd: null,
     }],
+    feature_connections: {},
     control_operation_id: null,
   };
 
   assertEquals(parseCreateWorkspaceWorkerRequest(request), request);
+  assertEquals(
+    parseCreateWorkspaceWorkerRequest({
+      ...request,
+      feature_connections: { subjektiv: { subject_id: "subject-42" } },
+    }).feature_connections,
+    { subjektiv: { subject_id: "subject-42" } },
+  );
+  assertThrows(
+    () =>
+      parseCreateWorkspaceWorkerRequest({
+        ...request,
+        resolved_subjektiv_attached: true,
+      }),
+    Error,
+    "unknown field resolved_subjektiv_attached",
+  );
   assertThrows(
     () =>
       parseCreateWorkspaceWorkerRequest({

@@ -523,6 +523,7 @@ pub(crate) struct PersistedWorkerRecord {
     pub(crate) config_bundle: Option<ConfigBundleRef>,
     pub(crate) created_at_ms: Option<u64>,
     pub(crate) status: WorkerStatus,
+    pub(crate) last_finished_submission_request_id: Option<String>,
     pub(crate) execution_state: PersistedWorkerExecutionState,
     pub(crate) workspace_id: Option<String>,
     pub(crate) workdir_attachments: Vec<WorkingDirectoryAttachmentStatus>,
@@ -1824,6 +1825,8 @@ struct WorkerAggregateRecord {
     created_at_ms: Option<u64>,
     status: WorkerStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_finished_submission_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     workdir_attachments: Vec<WorkingDirectoryAttachmentStatus>,
@@ -1874,6 +1877,7 @@ impl WorkerAggregateRecord {
             config_bundle: worker.config_bundle.clone(),
             created_at_ms: worker.created_at_ms,
             status: worker.status,
+            last_finished_submission_request_id: worker.last_finished_submission_request_id.clone(),
             workspace_id: worker.workspace_id.clone(),
             workdir_attachments: worker.workdir_attachments.clone(),
             logical_workdir_attachments: worker.logical_workdir_attachments.clone(),
@@ -1893,6 +1897,7 @@ impl WorkerAggregateRecord {
     }
 
     fn validate(self, path: &Path) -> Result<PersistedWorkerRecord, RuntimeError> {
+        let last_finished_submission_request_id = self.last_finished_submission_request_id;
         let identity = WorkerIdentityRecord {
             schema_version: self.schema_version,
             worker_ref: self.worker_ref,
@@ -1984,7 +1989,9 @@ impl WorkerAggregateRecord {
             }
             WorkerExecutionStateRecord::Unavailable => PersistedWorkerExecutionState::Unavailable,
         };
-        Ok(identity.into_persisted(execution_state))
+        let mut persisted = identity.into_persisted(execution_state);
+        persisted.last_finished_submission_request_id = last_finished_submission_request_id;
+        Ok(persisted)
     }
 }
 
@@ -2164,6 +2171,7 @@ impl WorkerIdentityRecord {
             config_bundle: self.config_bundle,
             created_at_ms: self.created_at_ms,
             status: self.status,
+            last_finished_submission_request_id: None,
             execution_state,
             workspace_id: self.workspace_id,
             workdir_attachments,

@@ -367,6 +367,10 @@ pub struct WorkerDetail {
     pub created_at_ms: Option<u64>,
     /// Whether the persisted execution metadata was valid when this identity was loaded.
     pub execution_metadata_available: bool,
+    /// Whether this Runtime process reconstructed the Worker from durable execution state.
+    /// This proves that work from the prior process incarnation is no longer running.
+    #[serde(default)]
+    pub execution_reconstructed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_state: Option<protocol::WorkerStateSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

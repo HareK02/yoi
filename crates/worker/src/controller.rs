@@ -129,6 +129,27 @@ impl WorkerHandle {
         self.sink.subscribe_with_snapshot().0
     }
 
+    pub fn session_attachment(
+        &self,
+        session_id: &str,
+        attachment_id: &str,
+        max_attachment_bytes: u64,
+    ) -> Result<session_store::RetainedSessionAttachment, session_store::RetainedAttachmentReadError>
+    {
+        if session_id == self.session_id.to_string() {
+            return session_store::read_session_attachment_from_entries(
+                &self.committed_entries(),
+                attachment_id,
+                max_attachment_bytes,
+            );
+        }
+        self.spawned_registry
+            .session_attachment(session_id, attachment_id, max_attachment_bytes)
+            .unwrap_or(Err(
+                session_store::RetainedAttachmentReadError::SessionMismatch,
+            ))
+    }
+
     pub fn snapshot_event(&self) -> Event {
         self.snapshot_event_with_entry_subscription().0
     }
@@ -300,6 +321,7 @@ async fn finish_controller_run<C, St>(
     runtime_dir: &RuntimeDir,
     working_event_tx: &broadcast::Sender<Event>,
     new_status: WorkerStatus,
+    finished_submission_request_id: Option<String>,
 ) where
     C: LlmClient + Clone + 'static,
     St: Store + WorkerMetadataStore + Clone + 'static,
@@ -320,7 +342,20 @@ async fn finish_controller_run<C, St>(
         Some(worker.total_tokens().tokens),
         protocol::ContextTokenSource::Estimated,
     );
-    set_controller_status(shared_state, runtime_dir, working_event_tx, new_status).await;
+    if let Some(submission_request_id) = finished_submission_request_id {
+        let state = match new_status {
+            WorkerStatus::Idle | WorkerStatus::Stopped => WorkerState::Idle,
+            WorkerStatus::Running => {
+                WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Running))
+            }
+            WorkerStatus::Paused => WorkerState::Busy(WorkerBusyState::Run(WorkerRunState::Paused)),
+        };
+        let snapshot = shared_state.finish_submission_run(state, submission_request_id);
+        let _ = runtime_dir.write_status(shared_state).await;
+        let _ = working_event_tx.send(Event::WorkerState { snapshot });
+    } else {
+        set_controller_status(shared_state, runtime_dir, working_event_tx, new_status).await;
+    }
 }
 
 /// Pending turn launch staged by an event handler for the next outer-loop
@@ -2023,6 +2058,10 @@ async fn controller_loop<C, St>(
             // interrupted/error turn from being carried into the next snapshot.
             worker.clear_in_flight_events();
             let parent_originated = run.is_parent_originated();
+            let finished_submission_request_id = match &run {
+                PendingRun::Submit(submission) => Some(submission.submission_request_id.clone()),
+                PendingRun::RunForNotification { .. } | PendingRun::Resume => None,
+            };
             let user_input_submit = matches!(&run, PendingRun::Submit(_));
             if !user_input_submit {
                 set_controller_status(
@@ -2121,12 +2160,16 @@ async fn controller_loop<C, St>(
                     }
                 }
             }
+            let finished_submission_request_id = (new_status != WorkerStatus::Paused)
+                .then_some(finished_submission_request_id)
+                .flatten();
             finish_controller_run(
                 &mut worker,
                 &shared_state,
                 &runtime_dir,
                 &working_event_tx,
                 new_status,
+                finished_submission_request_id,
             )
             .await;
             if shutdown {

@@ -3761,6 +3761,7 @@ mod completion_flow_tests {
                 protocol::WorkerRunState::Running,
             )),
             last_command_id: 0,
+            last_finished_submission_request_id: None,
         };
         app.handle_worker_event(Event::WorkerState {
             snapshot: running.clone(),
@@ -3780,6 +3781,7 @@ mod completion_flow_tests {
                 protocol::WorkerRunState::Running,
             )),
             last_command_id: 2,
+            last_finished_submission_request_id: Some("request-old".to_string()),
         };
         app.handle_worker_event(Event::WorkerState {
             snapshot: running.clone(),
@@ -3789,6 +3791,7 @@ mod completion_flow_tests {
         let fresh_idle = WorkerStateSnapshot {
             state: protocol::WorkerState::Idle,
             last_command_id: 0,
+            last_finished_submission_request_id: None,
         };
         app.handle_worker_event(Event::WorkerState {
             snapshot: fresh_idle.clone(),
@@ -3800,6 +3803,7 @@ mod completion_flow_tests {
                 protocol::WorkerRunState::Paused,
             )),
             last_command_id: 3,
+            last_finished_submission_request_id: None,
         };
         app.handle_worker_event(Event::CommandAcknowledged {
             acknowledgement: protocol::WorkerCommandAcknowledgement {

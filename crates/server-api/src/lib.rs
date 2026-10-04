@@ -249,7 +249,6 @@ impl_openapi_schema!(
     SubjektivMemoryQueryResponse,
     SubjektivMemoryReadResponse,
     SubjektivMemoryListRevisionsResponse,
-    SubjektivSubjectWorkerStartRequest,
     SubjektivStageCandidateRequest,
     SubjektivStageCandidateResponse,
     SubjektivRecordSessionRequest,
@@ -1234,21 +1233,6 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] subject_id: String,
     ) -> Result<SubjektivSubjectResponse, RepositoryApiError>;
-    #[post(
-        "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/worker",
-        status = 200,
-        error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
-        bearer_auth = true,
-        browser_auth = true,
-    )]
-    async fn subjektiv_subject_worker_start(
-        &self,
-        #[extension] context: ServerRequestContext,
-        #[path] workspace_id: String,
-        #[path] subject_id: String,
-        #[body] request: SubjektivSubjectWorkerStartRequest,
-    ) -> Result<BrowserCreateWorkerResponse, RepositoryApiError>;
     #[post(
         "/api/w/{workspace_id}/subjektiv/staging",
         status = 200,
@@ -4778,12 +4762,6 @@ pub struct SubjektivMemoryRevisionsQuery {
     pub limit: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct SubjektivSubjectWorkerStartRequest {
-    pub worker: CreateWorkspaceWorkerRequest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -9489,6 +9467,14 @@ pub struct WorkerLaunchProfileCandidate {
     pub id: String,
     pub label: String,
     pub description: String,
+    pub feature_connections: WorkerLaunchFeatureConnectionOptions,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkerLaunchFeatureConnectionOptions {
+    pub subjektiv: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -9520,6 +9506,22 @@ pub struct CreateWorkspaceWorkerTicketAssignmentRequest {
     pub operation_id: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceWorkerFeatureConnectionsRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub subjektiv: Option<SubjektivWorkerConnectionRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivWorkerConnectionRequest {
+    pub subject_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
@@ -9537,6 +9539,9 @@ pub struct CreateWorkspaceWorkerRequest {
     pub initial_submit: Vec<protocol::Segment>,
     #[serde(default)]
     pub workdir_attachments: Vec<BrowserWorkerWorkingDirectorySelection>,
+    /// Explicit product Feature connections. Backend validation turns these into
+    /// trusted host attachments; Runtime and Profile inputs cannot self-attest them.
+    pub feature_connections: WorkspaceWorkerFeatureConnectionsRequest,
     /// Backend idempotency key used only for authenticated Worker-owned spawn/control.
     #[serde(default)]
     pub control_operation_id: Option<String>,
@@ -10705,11 +10710,14 @@ pub fn worker_launch_api_typescript() -> String {
         RuntimeWorkerWorkdirAttachmentSummary::decl(&config),
         WorkerLaunchWorkerSummary::decl(&config),
         WorkerLaunchRuntimeOption::decl(&config),
+        WorkerLaunchFeatureConnectionOptions::decl(&config),
         WorkerLaunchProfileCandidate::decl(&config),
         WorkingDirectoryRepositoryOption::decl(&config),
         WorkerLaunchOptionsResponse::decl(&config),
         BrowserWorkerWorkingDirectorySelection::decl(&config),
         CreateWorkspaceWorkerTicketAssignmentRequest::decl(&config),
+        SubjektivWorkerConnectionRequest::decl(&config),
+        WorkspaceWorkerFeatureConnectionsRequest::decl(&config),
         CreateWorkspaceWorkerRequest::decl(&config),
         BrowserCreateWorkerResponse::decl(&config),
         BrowserWorkspaceOrchestratorResponse::decl(&config),
@@ -11750,6 +11758,7 @@ mod tests {
             ticket_assignment: None,
             initial_submit: Vec::new(),
             workdir_attachments: Vec::new(),
+            feature_connections: Default::default(),
             control_operation_id: None,
         })
         .unwrap();
@@ -11763,6 +11772,7 @@ mod tests {
                 "ticket_assignment": null,
                 "initial_submit": [],
                 "workdir_attachments": [],
+                "feature_connections": {},
                 "control_operation_id": null,
             })
         );
