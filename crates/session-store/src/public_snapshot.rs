@@ -1,7 +1,4 @@
-use base64::{
-    Engine as _,
-    engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD},
-};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use protocol::{
     Segment, SessionContentPart, SessionConversationTurn, SessionEntryProvenance,
     SessionHistoryLineageBoundary, SessionHistoryPage, SessionMessageRole, SessionSnapshot,
@@ -52,6 +49,32 @@ pub enum RetainedSnapshotReadError {
     StorageUnavailable,
     #[error("retained session snapshot exceeds the observation limit")]
     SnapshotTooLarge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedSessionAttachment {
+    pub media_type: String,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum RetainedAttachmentReadError {
+    #[error("retained worker state is unavailable")]
+    RetentionMissing,
+    #[error("retained worker state has no active session pointer")]
+    ActivePointerMissing,
+    #[error("retained session identity does not match")]
+    SessionMismatch,
+    #[error("session attachment was not found")]
+    NotFound,
+    #[error("retained session requires migration")]
+    MigrationRequired,
+    #[error("retained session log is corrupt")]
+    CorruptLog,
+    #[error("retained session storage is unavailable")]
+    StorageUnavailable,
+    #[error("retained session attachment exceeds a resource limit")]
+    ResourceLimit,
 }
 
 pub const DEFAULT_RETAINED_HISTORY_PAGE_TURNS: usize = 5;
@@ -175,7 +198,9 @@ pub fn read_retained_session_snapshot(
         .ok_or(RetainedSnapshotReadError::ActivePointerMissing)?;
     let store = WorkerSessionStore::open_read_only(aggregate_root.join("session"))
         .map_err(map_store_error)?;
-    if store.segment_log_len(segment_id).map_err(map_store_error)? > max_bytes {
+    if store.segment_log_len(segment_id).map_err(map_store_error)?
+        > DEFAULT_RETAINED_HISTORY_MAX_SCAN_BYTES
+    {
         return Err(RetainedSnapshotReadError::SnapshotTooLarge);
     }
     let entries = store
@@ -197,6 +222,101 @@ pub fn read_retained_session_snapshot(
         },
         snapshot,
     })
+}
+
+/// Resolve one immutable image body from the active retained Session. The
+/// caller supplies only public identities; storage paths never cross this API.
+pub fn read_retained_session_attachment(
+    aggregate_root: &Path,
+    worker_name: &str,
+    expected_session_id: &str,
+    attachment_id: &str,
+    max_scan_bytes: u64,
+    max_attachment_bytes: u64,
+) -> Result<RetainedSessionAttachment, RetainedAttachmentReadError> {
+    let aggregate = WorkerAggregateStore::open_read_only(aggregate_root, worker_name)
+        .map_err(map_attachment_worker_store_error)?;
+    let metadata = aggregate
+        .read_read_only()
+        .map_err(map_attachment_worker_store_error)?
+        .ok_or(RetainedAttachmentReadError::RetentionMissing)?;
+    let active = metadata
+        .active
+        .ok_or(RetainedAttachmentReadError::ActivePointerMissing)?;
+    if active.session_id.to_string() != expected_session_id {
+        return Err(RetainedAttachmentReadError::SessionMismatch);
+    }
+    let segment_id = active
+        .segment_id
+        .ok_or(RetainedAttachmentReadError::ActivePointerMissing)?;
+    let store = WorkerSessionStore::open_read_only(aggregate_root.join("session"))
+        .map_err(map_attachment_store_error)?;
+    if store
+        .segment_log_len(segment_id)
+        .map_err(map_attachment_store_error)?
+        > max_scan_bytes
+    {
+        return Err(RetainedAttachmentReadError::ResourceLimit);
+    }
+    let entries = store
+        .read_all_read_only(active.session_id, segment_id)
+        .map_err(map_attachment_store_error)?;
+    for record in &entries {
+        let mut found = None;
+        visit_record_history(record, &mut |entry| {
+            if found.is_none() {
+                found = attachment_from_entry(entry, attachment_id, max_attachment_bytes);
+            }
+        });
+        if let Some(result) = found {
+            return result;
+        }
+    }
+    Err(RetainedAttachmentReadError::NotFound)
+}
+
+fn visit_record_history(record: &LogEntry, visit: &mut impl FnMut(&LoggedHistoryEntry)) {
+    match record {
+        LogEntry::AnnotatedSegmentStart { history, .. }
+        | LogEntry::AnnotatedUserInput { history, .. } => {
+            for entry in history {
+                visit(entry);
+            }
+        }
+        LogEntry::AnnotatedAssistantItem { entry, .. }
+        | LogEntry::AnnotatedToolResult { entry, .. } => visit(entry),
+        _ => {}
+    }
+}
+
+fn attachment_from_entry(
+    entry: &LoggedHistoryEntry,
+    requested_id: &str,
+    max_attachment_bytes: u64,
+) -> Option<Result<RetainedSessionAttachment, RetainedAttachmentReadError>> {
+    let LoggedItem::ToolResult { attachments, .. } = &entry.item else {
+        return None;
+    };
+    for (attachment_index, attachment) in attachments.iter().enumerate() {
+        let crate::logged_item::LoggedAttachment::Image { mime_type, data } = attachment;
+        if session_tool_attachment_id(
+            &entry.metadata.entry_id.0,
+            attachment_index,
+            mime_type,
+            data,
+        ) != requested_id
+        {
+            continue;
+        }
+        if data.len() as u64 > max_attachment_bytes {
+            return Some(Err(RetainedAttachmentReadError::ResourceLimit));
+        }
+        return Some(Ok(RetainedSessionAttachment {
+            media_type: mime_type.clone(),
+            data: data.clone(),
+        }));
+    }
+    None
 }
 
 /// Read one bounded backward page from the retained active Segment's adopted
@@ -935,6 +1055,35 @@ fn map_history_store_error(error: StoreError) -> RetainedHistoryReadError {
     }
 }
 
+fn map_attachment_worker_store_error(error: WorkerStoreError) -> RetainedAttachmentReadError {
+    match error {
+        WorkerStoreError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            RetainedAttachmentReadError::RetentionMissing
+        }
+        WorkerStoreError::Serde(_) | WorkerStoreError::InvalidWorkerName(_) => {
+            RetainedAttachmentReadError::CorruptLog
+        }
+        WorkerStoreError::Io(_) => RetainedAttachmentReadError::StorageUnavailable,
+    }
+}
+
+fn map_attachment_store_error(error: StoreError) -> RetainedAttachmentReadError {
+    match error {
+        StoreError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            RetainedAttachmentReadError::RetentionMissing
+        }
+        StoreError::Corrupt { message, .. } if message.contains("requires migration") => {
+            RetainedAttachmentReadError::MigrationRequired
+        }
+        StoreError::ReadLimitExceeded => RetainedAttachmentReadError::ResourceLimit,
+        StoreError::Io(_) => RetainedAttachmentReadError::StorageUnavailable,
+        StoreError::Serde(_) | StoreError::Corrupt { .. } | StoreError::NotFound(_) => {
+            RetainedAttachmentReadError::CorruptLog
+        }
+        _ => RetainedAttachmentReadError::CorruptLog,
+    }
+}
+
 fn map_worker_store_error(error: WorkerStoreError) -> RetainedSnapshotReadError {
     match error {
         WorkerStoreError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1028,7 +1177,7 @@ pub(crate) fn project_session_snapshot_for_segment(
             } => extend_history(&mut entries, history, Some(segments), *ts),
             LogEntry::AnnotatedAssistantItem { ts, entry }
             | LogEntry::AnnotatedToolResult { ts, entry } => {
-                if let Some(data) = project_item(&entry.item) {
+                if let Some(data) = project_item(&entry.metadata.entry_id.0, &entry.item) {
                     entries.push(history_entry(entry, *ts, data));
                 }
             }
@@ -1188,7 +1337,7 @@ fn extend_history(
                 segments: input_segments.cloned().unwrap_or_default(),
             }
         } else {
-            let Some(data) = project_item(&entry.item) else {
+            let Some(data) = project_item(&entry.metadata.entry_id.0, &entry.item) else {
                 continue;
             };
             data
@@ -1306,7 +1455,25 @@ fn provenance(origin: &LoggedSessionHistoryOrigin) -> SessionEntryProvenance {
     }
 }
 
-fn project_item(item: &LoggedItem) -> Option<SessionSnapshotEntryData> {
+pub fn session_tool_attachment_id(
+    entry_id: &str,
+    attachment_index: usize,
+    media_type: &str,
+    data: &[u8],
+) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"yoi-session-tool-attachment-v1\0");
+    hash.update((entry_id.len() as u64).to_be_bytes());
+    hash.update(entry_id.as_bytes());
+    hash.update((attachment_index as u64).to_be_bytes());
+    hash.update((media_type.len() as u64).to_be_bytes());
+    hash.update(media_type.as_bytes());
+    hash.update((data.len() as u64).to_be_bytes());
+    hash.update(data);
+    URL_SAFE_NO_PAD.encode(hash.finalize())
+}
+
+fn project_item(entry_id: &str, item: &LoggedItem) -> Option<SessionSnapshotEntryData> {
     match item {
         LoggedItem::Message { role, content } => {
             let role = match role {
@@ -1355,11 +1522,18 @@ fn project_item(item: &LoggedItem) -> Option<SessionSnapshotEntryData> {
             is_error: *is_error,
             attachments: attachments
                 .iter()
-                .map(|attachment| match attachment {
+                .enumerate()
+                .map(|(attachment_index, attachment)| match attachment {
                     crate::logged_item::LoggedAttachment::Image { mime_type, data } => {
                         SessionToolAttachment {
+                            attachment_id: session_tool_attachment_id(
+                                entry_id,
+                                attachment_index,
+                                mime_type,
+                                data,
+                            ),
                             media_type: mime_type.clone(),
-                            data_base64: BASE64.encode(data),
+                            byte_len: data.len() as u64,
                         }
                     }
                 })
@@ -3305,6 +3479,120 @@ mod tests {
             read_retained_session_snapshot(&aggregate_root, "worker-a", 0),
             Err(RetainedSnapshotReadError::SnapshotTooLarge)
         ));
+    }
+
+    #[test]
+    fn large_legacy_inline_images_project_as_bounded_refs_and_fetch_from_retained_storage() {
+        let worker_name = "worker-images";
+        let session_id = crate::new_session_id();
+        let segment_id = crate::new_segment_id();
+        // Approximate the decoded byte sizes of the four W-296 screenshots.
+        let sizes = [3_475_194_usize, 3_459_051, 5_735_340, 5_703_924];
+        let attachments = sizes
+            .iter()
+            .enumerate()
+            .map(
+                |(index, size)| crate::logged_item::LoggedAttachment::Image {
+                    mime_type: "image/png".into(),
+                    data: vec![index as u8 + 1; *size],
+                },
+            )
+            .collect();
+        let tool_result = LoggedHistoryEntry {
+            item: LoggedItem::ToolResult {
+                call_id: "call-images".into(),
+                summary: "four screenshots".into(),
+                content: None,
+                attachments,
+                disposition: agen::tool::ToolResultDisposition::Success,
+                is_error: false,
+            },
+            metadata: LoggedSessionHistoryMetadata {
+                entry_id: LoggedSessionHistoryEntryId("tool-images".into()),
+                origin: LoggedSessionHistoryOrigin::LegacyUnknown,
+                derivation: None,
+            },
+        };
+        let live = project_current_session_snapshot(&[LogEntry::AnnotatedToolResult {
+            ts: 2,
+            entry: tool_result.clone(),
+        }]);
+        let log = vec![LogEntry::AnnotatedSegmentStart {
+            ts: 1,
+            session_id,
+            system_prompt: None,
+            config: RequestConfig::default(),
+            history: vec![tool_result],
+            forked_from: None,
+            compacted_from: None,
+        }];
+        let (_root, aggregate_root) =
+            persist_history_fixture(worker_name, session_id, segment_id, vec![(segment_id, log)]);
+
+        let retained = read_retained_session_snapshot(
+            &aggregate_root,
+            worker_name,
+            DEFAULT_RETAINED_SNAPSHOT_MAX_BYTES,
+        )
+        .unwrap();
+        let SessionSnapshotEntryData::ToolResult { attachments, .. } =
+            &retained.snapshot.entries[0].data
+        else {
+            panic!("expected tool result");
+        };
+        assert_eq!(attachments.len(), 4);
+        let SessionSnapshotEntryData::ToolResult {
+            attachments: live_attachments,
+            ..
+        } = &live.entries[0].data
+        else {
+            panic!("expected live tool result");
+        };
+        assert_eq!(live_attachments, attachments);
+        let snapshot_json = serde_json::to_vec(&retained.snapshot).unwrap();
+        assert!(snapshot_json.len() < 16 * 1024);
+        assert!(!String::from_utf8_lossy(&snapshot_json).contains("data_base64"));
+
+        for (index, attachment) in attachments.iter().enumerate() {
+            assert_eq!(attachment.byte_len, sizes[index] as u64);
+            assert_eq!(attachment.attachment_id.len(), 43);
+            let body = read_retained_session_attachment(
+                &aggregate_root,
+                worker_name,
+                &session_id.to_string(),
+                &attachment.attachment_id,
+                DEFAULT_RETAINED_HISTORY_MAX_SCAN_BYTES,
+                10 * 1024 * 1024,
+            )
+            .unwrap();
+            assert_eq!(body.media_type, "image/png");
+            assert_eq!(body.data.len(), sizes[index]);
+            assert!(body.data.iter().all(|byte| *byte == index as u8 + 1));
+        }
+        assert_eq!(
+            read_retained_session_attachment(
+                &aggregate_root,
+                worker_name,
+                &crate::new_session_id().to_string(),
+                &attachments[0].attachment_id,
+                DEFAULT_RETAINED_HISTORY_MAX_SCAN_BYTES,
+                10 * 1024 * 1024,
+            )
+            .unwrap_err(),
+            RetainedAttachmentReadError::SessionMismatch
+        );
+        assert_eq!(
+            read_retained_session_attachment(
+                &aggregate_root,
+                worker_name,
+                &session_id.to_string(),
+                "../../metadata.json",
+                DEFAULT_RETAINED_HISTORY_MAX_SCAN_BYTES,
+                10 * 1024 * 1024,
+            )
+            .unwrap_err(),
+            RetainedAttachmentReadError::NotFound
+        );
     }
 
     #[test]

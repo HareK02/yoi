@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use async_trait::async_trait;
 use axum::extract::ws::{CloseFrame, Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Extension, Path as AxumPath, Query, Request, State};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, LOCATION, ORIGIN};
 #[cfg(test)]
-use axum::http::header::{CACHE_CONTROL, ETAG, IF_NONE_MATCH};
-use axum::http::header::{CONTENT_TYPE, LOCATION, ORIGIN};
+use axum::http::header::{ETAG, IF_NONE_MATCH};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -10268,6 +10268,72 @@ impl server_api::ServerApi for ServerApiContractService {
     }
 }
 
+async fn scoped_worker_session_attachment(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, runtime_id, worker_id, session_id, attachment_id)): AxumPath<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+    Extension(_actor): Extension<RequestActor>,
+) -> Response {
+    if workspace_id != api.config.workspace_id {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"code": "workspace_not_found"})),
+        )
+            .into_response();
+    }
+    let worker = RuntimeWorkerRef::new(runtime_id, worker_id);
+    match api
+        .runtime
+        .worker_session_attachment(&workspace_id, &worker, &session_id, &attachment_id)
+    {
+        Ok(attachment) => {
+            let Ok(content_type) = HeaderValue::from_str(&attachment.media_type) else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"code": "session_attachment_media_type_invalid"})),
+                )
+                    .into_response();
+            };
+            (
+                [
+                    (CONTENT_TYPE, content_type),
+                    (
+                        CACHE_CONTROL,
+                        HeaderValue::from_static("private, max-age=3600"),
+                    ),
+                ],
+                attachment.data,
+            )
+                .into_response()
+        }
+        Err(crate::hosts::RuntimeRegistryError::RuntimeOperationFailed {
+            code, message, ..
+        }) => {
+            let status = match code.as_str() {
+                "session_attachment_expired" => StatusCode::GONE,
+                "session_attachment_not_found" => StatusCode::NOT_FOUND,
+                "session_attachment_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
+                _ => StatusCode::BAD_GATEWAY,
+            };
+            (
+                status,
+                Json(serde_json::json!({"code": code, "message": message})),
+            )
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"code": "session_attachment_not_found"})),
+        )
+            .into_response(),
+    }
+}
+
 fn build_inner_router(api: WorkspaceApi) -> Router {
     let contract_service = ServerApiContractService::Workspace(api.clone());
     let auth = generated_auth_contract_router(contract_service.clone());
@@ -10296,6 +10362,10 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
         _,
         _,
     >(workspace, scoped_worker_protocol_ws)
+    .route(
+        "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/sessions/{session_id}/attachments/{attachment_id}",
+        get(scoped_worker_session_attachment),
+    )
     .route(
         "/api/w/{workspace_id}/workers/self/backend-job-result",
         post(scoped_submit_backend_job_result),

@@ -336,6 +336,13 @@ fn runtime_http_router_with_auth_and_ssh_keyscan_program(
         .route(
             remaining_route(runtime_api::RUNTIME_ROUTE_WORKER_ATTACHMENT, &["DELETE"]),
             delete(delete_worker_uploaded_file),
+        )
+        .route(
+            remaining_route(
+                runtime_api::RUNTIME_ROUTE_WORKER_SESSION_ATTACHMENT,
+                &["GET"],
+            ),
+            get(get_worker_session_attachment),
         );
 
     #[cfg(feature = "ws-server")]
@@ -1980,6 +1987,60 @@ async fn delete_worker_uploaded_file(
     }))
 }
 
+async fn get_worker_session_attachment(
+    State(state): State<RuntimeHttpState>,
+    auth: Option<Extension<RuntimeAuthContext>>,
+    Path((worker_id, session_id, attachment_id)): Path<(String, String, String)>,
+    Query(request): Query<runtime_api::WorkerSessionRequest>,
+) -> Result<Response, RuntimeHttpRestError> {
+    let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
+    let scope = auth_workspace_scope(&state, auth.as_ref())?.ok_or_else(|| {
+        RuntimeHttpRestError::new(
+            StatusCode::FORBIDDEN,
+            "runtime_worker_session_scope_required",
+            "Worker Session attachment reads require a Workspace-scoped capability",
+        )
+    })?;
+    if scope.workspace_id != request.workspace_id {
+        return Err(RuntimeHttpRestError::new(
+            StatusCode::FORBIDDEN,
+            "runtime_worker_session_workspace_scope_mismatch",
+            "Worker Session Workspace scope does not match the authenticated capability",
+        ));
+    }
+    let attachment = state
+        .runtime
+        .worker_session_attachment_scoped(&scope, &worker_ref, session_id, attachment_id)
+        .map_err(|error| {
+            use session_store::RetainedAttachmentReadError as Error;
+            let (status, code) = match error {
+                Error::RetentionMissing | Error::ActivePointerMissing => {
+                    (StatusCode::GONE, "session_attachment_expired")
+                }
+                Error::SessionMismatch | Error::NotFound => {
+                    (StatusCode::NOT_FOUND, "session_attachment_not_found")
+                }
+                Error::ResourceLimit => (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "session_attachment_too_large",
+                ),
+                Error::MigrationRequired | Error::CorruptLog | Error::StorageUnavailable => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "session_attachment_unavailable",
+                ),
+            };
+            RuntimeHttpRestError::new(status, code, error.to_string())
+        })?;
+    let content_type = axum::http::HeaderValue::from_str(&attachment.media_type).map_err(|_| {
+        RuntimeHttpRestError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "session_attachment_media_type_invalid",
+            "Session attachment media type is invalid",
+        )
+    })?;
+    Ok(([(header::CONTENT_TYPE, content_type)], attachment.data).into_response())
+}
+
 #[allow(dead_code)]
 async fn stop_worker(
     State(state): State<RuntimeHttpState>,
@@ -2289,7 +2350,7 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     }
     if path.ends_with("/input")
         || path.ends_with("/restore")
-        || path.contains("/attachments")
+        || (path.contains("/attachments") && *method != Method::GET)
         || path.contains("/workdir-attachments")
     {
         return Some("workers:input");
@@ -3030,6 +3091,13 @@ mod tests {
                 "/v1/workers/7/attachments/019ca7c8-57b6-7f05-8edf-524147aba7b3"
             ),
             Some("workers:input")
+        );
+        assert_eq!(
+            required_runtime_permission(
+                &Method::GET,
+                "/v1/workers/7/sessions/session-1/attachments/attachment-1"
+            ),
+            Some("workers:read")
         );
         assert_eq!(
             required_runtime_permission(&Method::POST, "/v1/workers/7/workdir-attachments"),

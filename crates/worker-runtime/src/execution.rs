@@ -514,6 +514,13 @@ pub struct WorkerSessionHistoryRequest {
     pub limit: Option<usize>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerSessionAttachmentRequest {
+    pub worker_ref: WorkerRef,
+    pub session_id: String,
+    pub attachment_id: String,
+}
+
 pub trait WorkerExecutionBackend: Send + Sync + 'static {
     fn backend_id(&self) -> &str;
 
@@ -542,6 +549,14 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
             reason: runtime_api::WorkerSessionHistoryUnavailableReason::Unsupported,
             message: "session history paging is not supported by this Runtime".to_string(),
         }
+    }
+
+    fn worker_session_attachment(
+        &self,
+        _request: WorkerSessionAttachmentRequest,
+    ) -> Result<session_store::RetainedSessionAttachment, session_store::RetainedAttachmentReadError>
+    {
+        Err(session_store::RetainedAttachmentReadError::RetentionMissing)
     }
 
     fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult;
@@ -778,6 +793,14 @@ impl WorkerExecutionBackendRef {
         request: WorkerSessionHistoryRequest,
     ) -> runtime_api::WorkerSessionHistoryAvailability {
         self.backend.worker_session_history(request)
+    }
+
+    pub(crate) fn worker_session_attachment(
+        &self,
+        request: WorkerSessionAttachmentRequest,
+    ) -> Result<session_store::RetainedSessionAttachment, session_store::RetainedAttachmentReadError>
+    {
+        self.backend.worker_session_attachment(request)
     }
 
     pub(crate) fn spawn_worker(

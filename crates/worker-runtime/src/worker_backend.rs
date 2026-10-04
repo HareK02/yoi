@@ -186,6 +186,16 @@ pub trait RuntimeWorkerFactory: Send + Sync + 'static {
         Err(session_store::RetainedHistoryReadError::RetentionMissing)
     }
 
+    fn retained_session_attachment(
+        &self,
+        _worker_ref: &WorkerRef,
+        _session_id: &str,
+        _attachment_id: &str,
+    ) -> Result<session_store::RetainedSessionAttachment, session_store::RetainedAttachmentReadError>
+    {
+        Err(session_store::RetainedAttachmentReadError::RetentionMissing)
+    }
+
     async fn spawn_controller(
         &self,
         request: WorkerExecutionSpawnRequest,
@@ -1113,6 +1123,27 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             cursor,
             limit,
             session_store::RetainedHistoryReadLimits::default(),
+        )
+    }
+
+    fn retained_session_attachment(
+        &self,
+        worker_ref: &WorkerRef,
+        session_id: &str,
+        attachment_id: &str,
+    ) -> Result<session_store::RetainedSessionAttachment, session_store::RetainedAttachmentReadError>
+    {
+        let aggregate_dir = self
+            .worker_aggregate_dir(worker_ref)
+            .map_err(|_| session_store::RetainedAttachmentReadError::RetentionMissing)?;
+        let worker_name = Self::runtime_worker_name_for_ref(worker_ref);
+        session_store::read_retained_session_attachment(
+            &aggregate_dir,
+            &worker_name,
+            session_id,
+            attachment_id,
+            session_store::DEFAULT_RETAINED_HISTORY_MAX_SCAN_BYTES,
+            10 * 1024 * 1024,
         )
     }
 
@@ -2410,6 +2441,18 @@ where
                 }
             }
         }
+    }
+
+    fn worker_session_attachment(
+        &self,
+        request: crate::execution::WorkerSessionAttachmentRequest,
+    ) -> Result<session_store::RetainedSessionAttachment, session_store::RetainedAttachmentReadError>
+    {
+        self.factory.retained_session_attachment(
+            &request.worker_ref,
+            &request.session_id,
+            &request.attachment_id,
+        )
     }
 
     fn observe_workspace_prompt_projection(

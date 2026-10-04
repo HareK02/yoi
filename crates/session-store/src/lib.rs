@@ -110,9 +110,11 @@ pub use public_snapshot::{
     DEFAULT_RETAINED_HISTORY_MAX_ENTRIES, DEFAULT_RETAINED_HISTORY_MAX_RESPONSE_BYTES,
     DEFAULT_RETAINED_HISTORY_MAX_SCAN_BYTES, DEFAULT_RETAINED_HISTORY_MAX_SEGMENTS,
     DEFAULT_RETAINED_HISTORY_PAGE_TURNS, DEFAULT_RETAINED_SNAPSHOT_MAX_BYTES,
-    MAX_RETAINED_HISTORY_PAGE_TURNS, RetainedHistoryReadError, RetainedHistoryReadLimits,
-    RetainedSessionIdentity, RetainedSessionSnapshot, RetainedSnapshotReadError,
-    project_session_snapshot, read_retained_session_history_page, read_retained_session_snapshot,
+    MAX_RETAINED_HISTORY_PAGE_TURNS, RetainedAttachmentReadError, RetainedHistoryReadError,
+    RetainedHistoryReadLimits, RetainedSessionAttachment, RetainedSessionIdentity,
+    RetainedSessionSnapshot, RetainedSnapshotReadError, project_session_snapshot,
+    read_retained_session_attachment, read_retained_session_history_page,
+    read_retained_session_snapshot, session_tool_attachment_id,
 };
 pub use segment::{
     SegmentStartState, append_entry, append_system_item, classify_logged_history_entry,
