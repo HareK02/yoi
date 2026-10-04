@@ -1,13 +1,16 @@
 <script lang="ts">
   import AnsiText from '#lib/workspace/console/AnsiText.svelte';
+  import ConsoleAttachmentImage from '#lib/workspace/console/ConsoleAttachmentImage.svelte';
   import RichMarkdown from '#lib/workspace/console/RichMarkdown.svelte';
+  import type { SessionToolAttachment } from '#lib/generated/protocol.ts';
   import type { ConsoleLine } from '#lib/workspace/console/model.ts';
 
   type Props = {
     item: ConsoleLine;
+    attachmentUrl?: (attachment: SessionToolAttachment) => string | null;
   };
 
-  let { item }: Props = $props();
+  let { item, attachmentUrl = () => null }: Props = $props();
   let detailOpen = $state(false);
   let nowMs = $state(Date.now());
 
@@ -139,6 +142,13 @@
     <RichMarkdown text={item.body || '—'} streamId={item.id} />
   {:else}
     <p class="console-plain-text">{item.body || '—'}</p>
+  {/if}
+  {#if item.attachments?.length}
+    <div class="console-attachments">
+      {#each item.attachments as attachment (attachment.attachment_id)}
+        <ConsoleAttachmentImage {attachment} url={attachmentUrl(attachment)} />
+      {/each}
+    </div>
   {/if}
   {#if item.diff}
     <div class="console-diff" role="group" aria-label="Edit diff">

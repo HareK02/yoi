@@ -1673,6 +1673,39 @@ impl Runtime {
         })
     }
 
+    pub fn worker_session_attachment_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        worker_ref: &WorkerRef,
+        session_id: String,
+        attachment_id: String,
+    ) -> Result<session_store::RetainedSessionAttachment, session_store::RetainedAttachmentReadError>
+    {
+        let operation_lock = self
+            .worker_operation_lock(worker_ref.worker_id)
+            .map_err(|_| session_store::RetainedAttachmentReadError::RetentionMissing)?;
+        let _operation_guard = operation_lock
+            .lock()
+            .map_err(|_| session_store::RetainedAttachmentReadError::StorageUnavailable)?;
+        self.ensure_worker_in_workspace(scope, worker_ref)
+            .map_err(|_| session_store::RetainedAttachmentReadError::NotFound)?;
+        let backend = {
+            let state = self
+                .lock()
+                .map_err(|_| session_store::RetainedAttachmentReadError::StorageUnavailable)?;
+            state
+                .worker(worker_ref)
+                .map_err(|_| session_store::RetainedAttachmentReadError::NotFound)?;
+            state.execution_backend.clone()
+        }
+        .ok_or(session_store::RetainedAttachmentReadError::StorageUnavailable)?;
+        backend.worker_session_attachment(crate::execution::WorkerSessionAttachmentRequest {
+            worker_ref: worker_ref.clone(),
+            session_id,
+            attachment_id,
+        })
+    }
+
     /// Attach a live execution through a workspace-scoped Runtime authorization context.
     pub fn restore_worker_scoped(
         &self,

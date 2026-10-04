@@ -135,12 +135,12 @@ export type SessionMessageRole = "user" | "assistant";
 
 export type SessionContentPart = { "kind": "text", text: string, } | { "kind": "refusal", refusal: string, };
 
-export type SessionToolAttachment = { media_type: string,
+export type SessionToolAttachment = {
 /**
- * Base64-encoded durable attachment body. Public snapshots preserve the
- * committed multimodal value instead of replacing it with placeholder text.
+ * Stable, bounded identity derived from the owning Session entry, attachment
+ * position, and immutable image bytes. It is a locator, not a bearer secret.
  */
-data_base64: string, };
+attachment_id: string, media_type: string, byte_len: number, };
 
 export type RunYieldReason = "compaction";
 

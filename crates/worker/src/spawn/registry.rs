@@ -774,6 +774,41 @@ impl SpawnedWorkerRegistry {
         });
     }
 
+    pub(crate) fn session_attachment(
+        &self,
+        session_id: &str,
+        attachment_id: &str,
+        max_attachment_bytes: u64,
+    ) -> Option<
+        Result<
+            session_store::RetainedSessionAttachment,
+            session_store::RetainedAttachmentReadError,
+        >,
+    > {
+        let internal_session = self
+            .internal_records
+            .lock()
+            .ok()?
+            .iter()
+            .find(|record| {
+                record.session.visibility() == InternalWorkerVisibility::ParentClient
+                    && record.session.session_id_string() == session_id
+            })
+            .map(|record| record.session.clone());
+        let session = internal_session.or_else(|| {
+            self.service_records
+                .lock()
+                .ok()?
+                .iter()
+                .find(|record| {
+                    record.session.visibility() == InternalWorkerVisibility::ParentClient
+                        && record.session.session_id_string() == session_id
+                })
+                .map(|record| record.session.clone())
+        })?;
+        Some(session.session_attachment(attachment_id, max_attachment_bytes))
+    }
+
     pub(crate) fn internal_worker_snapshots(&self) -> Vec<InternalWorkerSnapshot> {
         let parent_session_id = self
             .parent_protocol
@@ -1256,6 +1291,59 @@ mod tests {
             ),
             sender,
         )
+    }
+
+    #[tokio::test]
+    async fn parent_visible_internal_attachment_resolves_by_session_identity() {
+        let registry = registry();
+        let (visible, _visible_tx) =
+            record("visible", InternalWorkerVisibility::ParentClient).await;
+        let session_id = visible.session.session_id_string();
+        let image = vec![2, 4, 6, 8];
+        let entry_id = "visible-image-entry";
+        let attachment_id =
+            session_store::session_tool_attachment_id(entry_id, 0, "image/png", &image);
+        visible
+            .session
+            .publish_test_entry(LogEntry::AnnotatedToolResult {
+                ts: 1,
+                entry: session_store::LoggedHistoryEntry {
+                    item: session_store::LoggedItem::ToolResult {
+                        call_id: "visible-image-call".into(),
+                        summary: "visible image".into(),
+                        content: None,
+                        attachments: vec![session_store::logged_item::LoggedAttachment::Image {
+                            mime_type: "image/png".into(),
+                            data: image.clone(),
+                        }],
+                        disposition: agen::tool::ToolResultDisposition::Success,
+                        is_error: false,
+                    },
+                    metadata: session_store::LoggedSessionHistoryMetadata {
+                        entry_id: session_store::LoggedSessionHistoryEntryId(entry_id.into()),
+                        origin: session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
+                        derivation: None,
+                    },
+                },
+            });
+        registry.internal_records.lock().unwrap().push(visible);
+
+        let attachment = registry
+            .session_attachment(&session_id, &attachment_id, 1024)
+            .expect("visible session")
+            .expect("visible attachment");
+        assert_eq!(attachment.data, image);
+
+        let (private, _private_tx) =
+            record("private", InternalWorkerVisibility::ServicePrivate).await;
+        let private_session_id = private.session.session_id_string();
+        registry.internal_records.lock().unwrap().push(private);
+        assert!(
+            registry
+                .session_attachment(&private_session_id, &attachment_id, 1024)
+                .is_none(),
+            "service-private sessions must not become parent-fetchable"
+        );
     }
 
     #[tokio::test]

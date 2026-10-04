@@ -1044,10 +1044,11 @@ pub enum SessionContentPart {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct SessionToolAttachment {
+    /// Stable, bounded identity derived from the owning Session entry, attachment
+    /// position, and immutable image bytes. It is a locator, not a bearer secret.
+    pub attachment_id: String,
     pub media_type: String,
-    /// Base64-encoded durable attachment body. Public snapshots preserve the
-    /// committed multimodal value instead of replacing it with placeholder text.
-    pub data_base64: String,
+    pub byte_len: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -14,6 +14,7 @@ import type {
   ReasoningConfig,
   Segment,
   SessionSnapshotEntry,
+  SessionToolAttachment,
   WorkerState,
   WorkerStateSnapshot,
   WorkerStatus,
@@ -63,6 +64,7 @@ type ToolCallView = {
   isError?: boolean;
   cwd?: string | null;
   command?: CommandSnapshot;
+  attachments?: SessionToolAttachment[];
 };
 
 export type ConsoleDiffLine = {
@@ -99,6 +101,7 @@ export type ConsoleLine = {
   streaming?: boolean;
   error?: boolean;
   toolCall?: ToolCallView;
+  attachments?: SessionToolAttachment[];
   /** Number of calls represented by a lower-level aggregate line. */
   toolCallCount?: number;
   /** Original Read rows, retained so history can reconcile before aggregation. */
@@ -593,7 +596,12 @@ export function projectOverviewLines(lines: ConsoleLine[]): ConsoleLine[] {
     if (line.systemItemKind === "task_reminder") continue;
     if (isOverviewThinkingLine(line)) continue;
     if (line.kind === "tool" && line.toolCall) {
-      toolGroup.push(line);
+      if (line.attachments?.length) {
+        flushTools();
+        overview.push(line);
+      } else {
+        toolGroup.push(line);
+      }
       continue;
     }
     flushTools();
@@ -1634,7 +1642,7 @@ function attachToolResult(
   projection: ConsoleProjection,
   eventId: string,
   id: string,
-  result: Pick<ToolCallView, "summary" | "output" | "isError">,
+  result: Pick<ToolCallView, "summary" | "output" | "isError" | "attachments">,
 ): void {
   const index = findToolCallLineIndex(projection, id);
   if (index < 0) {
@@ -1711,6 +1719,7 @@ function refreshedToolLine(item: ConsoleLine): ConsoleLine {
     toolStatus: toolCallStatus(toolCall),
     detail: toolCallDetail(toolCall),
     diff: toolCall.name === "Edit" ? editDiff(toolCall) : undefined,
+    attachments: toolCall.attachments,
     streaming: !["done", "error"].includes(toolCall.state) && !commandTerminal,
     error: toolCall.state === "error" || commandError,
   };
@@ -1816,6 +1825,7 @@ function readAggregateLine(group: ConsoleLine[]): ConsoleLine {
   const hasError = calls.some((call) => call.state === "error");
   const paths = calls.map(readPath);
   const visiblePaths = inProgress ? paths.slice(-3) : paths;
+  const attachments = group.flatMap((line) => line.attachments ?? []);
   const body = compactLines([
     visiblePaths.map((path) => `  ${path}`).join("\n"),
     inProgress && paths.length > visiblePaths.length
@@ -1835,8 +1845,10 @@ function readAggregateLine(group: ConsoleLine[]): ConsoleLine {
     source: "event",
     streaming: inProgress,
     error: hasError,
+    attachments,
     toolCall: {
       ...calls[0]!,
+      attachments,
       state: hasError ? "error" : inProgress ? "running" : "done",
       isError: hasError,
     },
@@ -2361,6 +2373,7 @@ function applySessionEntry(
         summary: value["summary"],
         content: value["content"],
         is_error: value["is_error"],
+        attachments: value["attachments"],
       });
       break;
     case "system_item": {
@@ -2509,6 +2522,10 @@ function applyLoggedItem(
           summary: stringField(item, "summary") ?? "",
           output: stringField(item, "content"),
           isError: item["is_error"] === true,
+          attachments: arrayField(
+            item,
+            "attachments",
+          ) as SessionToolAttachment[],
         },
       );
       break;
