@@ -34,9 +34,9 @@ use crate::feature::{
 };
 use crate::permission::permission_action_for;
 use crate::wip::{
-    WipCallContext, WipDynamicItem, WipDynamicItemResolver, WipDynamicMount, WipFeatureRoute,
-    WipMountError, WipMountRegistry, WipOperationError, WipOperationHandler, WipOperationOutput,
-    WipProjection, WipProjectionKind, json_to_wip, wip_to_json,
+    WipCallContext, WipDynamicItem, WipDynamicItemResolver, WipDynamicMount, WipMountError,
+    WipMountRegistry, WipNamespaceRoute, WipOperationError, WipOperationHandler,
+    WipOperationOutput, WipProjection, WipProjectionKind, json_to_wip, wip_to_json,
 };
 use crate::worker::{WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod};
 use agen::tool::{Tool, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
@@ -1377,7 +1377,7 @@ fn native_ticket_tools(
             let (meta, tool) = definition();
             let projection = native_ticket_operation(&meta.name).ok_or_else(|| {
                 WipMountError::InvalidProjection {
-                    route: "/features/ticket/tickets".into(),
+                    route: "/tickets".into(),
                     message: format!(
                         "enabled Ticket tool `{}` has no native projection",
                         meta.name
@@ -1386,7 +1386,7 @@ fn native_ticket_tools(
             })?;
             jsonschema::validator_for(&meta.input_schema).map_err(|error| {
                 WipMountError::InvalidProjection {
-                    route: "/features/ticket/tickets".into(),
+                    route: "/tickets".into(),
                     message: format!("Ticket tool schema cannot be retained: {error}"),
                 }
             })?;
@@ -1418,9 +1418,9 @@ pub fn mount_workspace_http_ticket_wip(
     client: Arc<dyn WorkspaceClient>,
     access: TicketFeatureAccess,
     permissions: Option<ToolPermissionConfig>,
-    feature_route: &WipFeatureRoute,
+    namespace_route: &WipNamespaceRoute,
 ) -> Result<(), WipMountError> {
-    let collection_route = feature_route.child("tickets")?;
+    let collection_route = namespace_route.root().to_string();
     let tools = native_ticket_tools(client, access)?;
     let claimed_tools = tools
         .iter()
@@ -1920,7 +1920,7 @@ fn ticket_operation_declaration(
         .get("properties")
         .and_then(Value::as_object)
         .ok_or_else(|| WipMountError::InvalidProjection {
-            route: "/features/ticket/tickets".into(),
+            route: "/tickets".into(),
             message: format!("Ticket tool `{}` schema has no properties", tool.name),
         })?;
     let required = tool
@@ -2103,7 +2103,7 @@ mod tests {
     #[test]
     fn native_ticket_mount_uses_host_route_and_rejects_non_ticket_children() {
         let mut registry = WipMountRegistry::new();
-        let feature_route = registry.allocate_feature_route("ticket").unwrap();
+        let namespace_route = registry.allocate_namespace("ticket", "tickets").unwrap();
         mount_workspace_http_ticket_wip(
             &mut registry,
             Arc::new(crate::worker::TestWorkspaceHttpClient::new(
@@ -2112,20 +2112,21 @@ mod tests {
             )),
             TicketFeatureAccess::review(),
             None,
-            &feature_route,
+            &namespace_route,
         )
         .unwrap();
-        assert_eq!(
-            registry.routes().collect::<Vec<_>>(),
-            ["/features/ticket/tickets"]
+        assert_eq!(registry.routes().collect::<Vec<_>>(), ["/tickets"]);
+        assert!(
+            registry
+                .allocate_namespace("ticket", "../objectives")
+                .is_err()
         );
-        assert!(feature_route.child("../objectives").is_err());
 
         let revisions = Arc::new(Mutex::new(TicketRevisionState::default()));
         let resolver = TicketItemResolver {
             tools: HashMap::new(),
             permissions: None,
-            collection_route: "/features/ticket/tickets".into(),
+            collection_route: "/tickets".into(),
             revisions,
         };
         assert!(resolver.resolve("T-42").is_some());
@@ -2189,7 +2190,7 @@ mod tests {
         let resolver = TicketItemResolver {
             tools: HashMap::new(),
             permissions: None,
-            collection_route: "/features/ticket/tickets".into(),
+            collection_route: "/tickets".into(),
             revisions: Arc::clone(&revisions),
         };
         let unobserved_internal = resolver.resolve("00001TICKET").unwrap().object.validator;
@@ -2243,7 +2244,7 @@ mod tests {
         let resolver = TicketItemResolver {
             tools: HashMap::new(),
             permissions: None,
-            collection_route: "/features/ticket/tickets".into(),
+            collection_route: "/tickets".into(),
             revisions: Arc::clone(&revisions),
         };
         let target_v1 = resolver.resolve("T-43").unwrap().object.validator;
