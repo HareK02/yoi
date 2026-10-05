@@ -9,6 +9,10 @@ export const MEMORY_API_LIMITS = {
   maxIdentifierBytes: 512,
 } as const;
 
+export const SUBJEKTIV_API_LIMITS = {
+  maxBehaviorBytes: 16384,
+} as const;
+
 export type DiagnosticSeverity = "info" | "warning" | "error";
 
 export type Diagnostic = { code: string, severity: DiagnosticSeverity, message: string, };
@@ -35,9 +39,11 @@ export type MemoryStagingListResponse = { limit: number, returned_count: number,
 
 export type SubjektivSubjectState = "active" | "retired";
 
-export type SubjektivSubjectCreateRequest = { role: string, };
+export type SubjektivSubjectCreateRequest = { role: string, behavior_md?: string, };
 
-export type SubjektivSubjectResponse = { id: string, role: string, state: SubjektivSubjectState, store_revision: number, created_at: string, updated_at: string, current_worker?: | import("./worker-launch-api").WorkerLaunchWorkerSummary | null, };
+export type SubjektivSubjectBehaviorUpdateRequest = { expected_behavior_revision: number, behavior_md: string, };
+
+export type SubjektivSubjectResponse = { id: string, role: string, behavior_md: string, behavior_revision: number, state: SubjektivSubjectState, store_revision: number, created_at: string, updated_at: string, current_worker?: | import("./worker-launch-api").WorkerLaunchWorkerSummary | null, };
 
 export type SubjektivSubjectListResponse = { limit: number, items: Array<SubjektivSubjectResponse>, next_cursor?: string | null, has_more: boolean, };
 

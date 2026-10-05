@@ -1,4 +1,7 @@
-import { MEMORY_API_LIMITS } from "#lib/generated/memory-api.ts";
+import {
+  MEMORY_API_LIMITS,
+  SUBJEKTIV_API_LIMITS,
+} from "#lib/generated/memory-api.ts";
 import { readBoundedJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
 import type {
   Diagnostic,
@@ -26,6 +29,7 @@ import type {
   SubjektivResidentSurfaceAvailability,
   SubjektivResidentSurfaceResponse,
   SubjektivResidentSurfaceSnapshot,
+  SubjektivSubjectBehaviorUpdateRequest,
   SubjektivSubjectCreateRequest,
   SubjektivSubjectListResponse,
   SubjektivSubjectResponse,
@@ -84,6 +88,7 @@ export const MEMORY_API_LOAD_POLICY = {
 } as const;
 
 const MAX_SUBJECT_ROLE_BYTES = 256;
+export const MAX_SUBJECT_BEHAVIOR_BYTES = SUBJEKTIV_API_LIMITS.maxBehaviorBytes;
 const MAX_SUBJECT_CREATE_ERROR_BYTES = 1024 * 1024;
 
 export type SubjektivSubjectCreateErrorKind =
@@ -126,7 +131,31 @@ export function validateSubjektivSubjectCreateRequest(
       "Subject role must be at most 256 bytes and contain no control characters.",
     );
   }
-  return { role: request.role };
+  const behaviorMd = request.behavior_md ?? "";
+  validateSubjectBehavior(behaviorMd);
+  return { role: request.role, behavior_md: behaviorMd };
+}
+
+function validateSubjectBehavior(behaviorMd: string): void {
+  const bytes = new TextEncoder().encode(behaviorMd).byteLength;
+  if (bytes > MAX_SUBJECT_BEHAVIOR_BYTES) {
+    throw new SubjektivSubjectCreateError(
+      "validation",
+      `Subject behavior must be at most ${MAX_SUBJECT_BEHAVIOR_BYTES} bytes.`,
+    );
+  }
+  if (behaviorMd.length > 0 && behaviorMd.trim().length === 0) {
+    throw new SubjektivSubjectCreateError(
+      "validation",
+      "Subject behavior must be empty or contain non-whitespace text.",
+    );
+  }
+  if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/u.test(behaviorMd)) {
+    throw new SubjektivSubjectCreateError(
+      "validation",
+      "Subject behavior contains an unsupported control character.",
+    );
+  }
 }
 
 export async function createSubjektivSubject(
@@ -170,14 +199,79 @@ export async function createSubjektivSubject(
     const subject = parseSubjektivSubjectResponse(
       await readBoundedJson(response, MEMORY_API_LIMITS.maxResponseBytes),
     );
-    if (subject.role !== validated.role) {
-      throw new Error("created Subject role does not match the request");
+    if (
+      subject.role !== validated.role ||
+      subject.behavior_md !== validated.behavior_md
+    ) {
+      throw new Error("created Subject does not match the request");
     }
     return subject;
   } catch {
     throw new SubjektivSubjectCreateError(
       "unknown_outcome",
       "The Subject may have been created, but the response could not be confirmed.",
+    );
+  }
+}
+
+export async function updateSubjektivSubjectBehavior(
+  fetchFn: typeof fetch,
+  workspaceId: string,
+  subjectId: string,
+  request: SubjektivSubjectBehaviorUpdateRequest,
+): Promise<SubjektivSubjectResponse> {
+  validateSubjectBehavior(request.behavior_md);
+  if (
+    !Number.isSafeInteger(request.expected_behavior_revision) ||
+    request.expected_behavior_revision < 0
+  ) {
+    throw new SubjektivSubjectCreateError(
+      "validation",
+      "Subject behavior revision is invalid.",
+    );
+  }
+  let response: Response;
+  try {
+    response = await fetchFn(
+      workspaceApiPath(
+        workspaceId,
+        `/subjektiv/subjects/${encodeURIComponent(subjectId)}/behavior`,
+      ),
+      {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(request),
+      },
+    );
+  } catch {
+    throw new SubjektivSubjectCreateError(
+      "unknown_outcome",
+      "The save outcome is unknown. Reload the Subject before retrying.",
+    );
+  }
+  if (!response.ok) {
+    const message = await subjektivSubjectCreateErrorMessage(response);
+    throw new SubjektivSubjectCreateError(
+      response.status >= 500 ? "unknown_outcome" : "rejected",
+      response.status === 409
+        ? "The behavior changed elsewhere. Reload the Subject and review the latest text."
+        : message,
+      response.status,
+    );
+  }
+  try {
+    const subject = parseSubjektivSubjectResponse(
+      await readBoundedJson(response, MEMORY_API_LIMITS.maxResponseBytes),
+      subjectId,
+    );
+    if (subject.behavior_md !== request.behavior_md) {
+      throw new Error("saved Subject behavior does not match the request");
+    }
+    return subject;
+  } catch {
+    throw new SubjektivSubjectCreateError(
+      "unknown_outcome",
+      "The behavior may have been saved, but the response could not be confirmed. Reload the Subject.",
     );
   }
 }
@@ -202,7 +296,7 @@ async function subjektivSubjectCreateErrorMessage(
   } catch {
     // A rejected request still has a known outcome even when its body is invalid.
   }
-  return `Subject creation failed with HTTP ${response.status}.`;
+  return `Subject request failed with HTTP ${response.status}.`;
 }
 
 export function parseMemoryDocumentResponse(
@@ -454,6 +548,8 @@ export function parseSubjektivSubjectResponse(
     [
       "id",
       "role",
+      "behavior_md",
+      "behavior_revision",
       "state",
       "store_revision",
       "created_at",
@@ -472,6 +568,12 @@ export function parseSubjektivSubjectResponse(
   const result: SubjektivSubjectResponse = {
     id,
     role: requiredString(record, "role"),
+    behavior_md: requiredString(
+      record,
+      "behavior_md",
+      MAX_SUBJECT_BEHAVIOR_BYTES,
+    ),
+    behavior_revision: requiredNonNegativeInteger(record, "behavior_revision"),
     state,
     store_revision: requiredNonNegativeInteger(record, "store_revision"),
     created_at: requiredString(record, "created_at"),

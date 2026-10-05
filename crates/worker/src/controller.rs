@@ -1375,6 +1375,7 @@ where
         crate::feature::builtin::memory::ordinary_subjektiv_resident_summary_source(
             worker.manifest(),
             worker.workspace_client_handle(),
+            worker.prompts(),
         )?
     {
         let workspace_id = worker

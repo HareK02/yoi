@@ -2361,9 +2361,30 @@ pub(crate) enum SystemPromptContribution {
     Unavailable,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResidentContextRefresh {
+    pub body: String,
+    pub revision: u64,
+}
+
 #[async_trait::async_trait]
 pub(crate) trait SystemPromptContributionSource: Send + Sync {
     async fn load(&self) -> SystemPromptContribution;
+
+    /// Returns a durable model-visible refresh only when user-managed resident
+    /// context changed since the last successful load.
+    async fn load_changed_resident_context(
+        &self,
+    ) -> Result<Option<ResidentContextRefresh>, String> {
+        Ok(None)
+    }
+
+    /// Acknowledges that the revision's typed refresh was durably committed.
+    fn confirm_resident_context_revision(&self, _revision: u64) {}
+
+    /// Invalidates the in-memory representation fence before history may be
+    /// compacted or rewound.
+    fn invalidate_resident_context_representation(&self) {}
 }
 
 #[derive(Debug, Clone)]
@@ -3840,6 +3861,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             )
             .with_usage_tracker(self.usage_tracker.clone())
             .with_metrics_tracker(self.metrics_tracker.clone())
+            .with_resident_context_source(self.feature_resident_summary_source.clone())
             .with_prompt_workspace_id(
                 self.workspace_context
                     .workspace_id()
@@ -9224,16 +9246,20 @@ mod build_summary_prompt_tests {
                 serde_json::from_str(request.body.as_deref().unwrap_or_default()).unwrap();
             assert!(matches!(
                 request.operation,
-                server_api::SubjektivMemoryBackendOperation::ResidentSummary(_)
+                server_api::SubjektivMemoryBackendOperation::ResidentContext(_)
             ));
             self.load_count.fetch_add(1, Ordering::SeqCst);
             Ok(WorkspaceResponse {
                 status: 200,
                 body: serde_json::to_string(
-                    &server_api::SubjektivMemoryBackendResponse::ResidentSummary(
-                        memory::backend::MemoryResidentSummaryOutput {
-                            availability: self.availability,
-                            content: self.content.clone(),
+                    &server_api::SubjektivMemoryBackendResponse::ResidentContext(
+                        server_api::SubjektivResidentContextOutput {
+                            behavior_md: "restore behavior".to_string(),
+                            behavior_revision: 1,
+                            memory_surface: memory::backend::MemoryResidentSummaryOutput {
+                                availability: self.availability,
+                                content: self.content.clone(),
+                            },
                         },
                     ),
                 )
@@ -9254,7 +9280,9 @@ mod build_summary_prompt_tests {
             load_count: Arc::clone(&load_count),
         });
         let source = crate::feature::builtin::memory::ordinary_subjektiv_resident_summary_source(
-            manifest, client,
+            manifest,
+            client,
+            Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap())),
         )
         .unwrap()
         .unwrap();
@@ -12219,9 +12247,10 @@ permission = "write"
             .unwrap()
             .to_string();
         assert!(
-            empty_boundary.contains("current ready resident memory surface is intentionally empty")
+            empty_boundary
+                .contains("current generated Memory surface is ready and intentionally empty")
         );
-        assert!(!empty_boundary.contains("No current ready resident memory surface"));
+        assert!(!empty_boundary.contains("No generated Memory surface exists yet"));
         drop(empty_restore);
 
         for availability in [
@@ -12273,7 +12302,22 @@ permission = "write"
                 .as_text()
                 .unwrap()
                 .to_string();
-            assert!(tombstone.contains("No current ready resident memory surface"));
+            let unavailable_message = match availability {
+                memory::backend::MemoryResidentSummaryAvailability::Ungenerated => {
+                    "No generated Memory surface exists yet"
+                }
+                memory::backend::MemoryResidentSummaryAvailability::Stale => {
+                    "generated Memory surface is stale"
+                }
+                memory::backend::MemoryResidentSummaryAvailability::Failed => {
+                    "Generation of the Memory surface failed"
+                }
+                memory::backend::MemoryResidentSummaryAvailability::Unavailable => {
+                    "Host could not fetch the Subject resident context"
+                }
+                memory::backend::MemoryResidentSummaryAvailability::Ready => unreachable!(),
+            };
+            assert!(tombstone.contains(unavailable_message));
             assert!(!tombstone.contains("latest subject surface"));
             assert!(!tombstone.contains("LEGACY_MEMORY_SENTINEL_MUST_NOT_REFRESH"));
             let entries = store.read_all(session_id, segment_id).unwrap();

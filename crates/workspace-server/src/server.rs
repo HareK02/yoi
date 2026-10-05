@@ -5811,6 +5811,7 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::subjektiv_subject_get(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::subjektiv_subject_behavior_update(service.clone()))
         .merge(server_api::server_api_axum::subjektiv_resident_surface(
             service.clone(),
         ))
@@ -7480,6 +7481,26 @@ impl server_api::ServerApi for ServerApiContractService {
                 workspace_id,
                 subject_id,
             }),
+        )
+        .await
+        .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn subjektiv_subject_behavior_update(
+        &self,
+        workspace_id: String,
+        subject_id: String,
+        request: server_api::SubjektivSubjectBehaviorUpdateRequest,
+    ) -> std::result::Result<server_api::SubjektivSubjectResponse, server_api::RepositoryApiError>
+    {
+        scoped_update_subjektiv_subject_behavior(
+            State(self.workspace_api()?.clone()),
+            AxumPath(ScopedSubjektivSubjectPath {
+                workspace_id,
+                subject_id,
+            }),
+            Json(request),
         )
         .await
         .map(|Json(response)| response)
@@ -17447,6 +17468,8 @@ fn subjektiv_subject_response(
     server_api::SubjektivSubjectResponse {
         id: subject.id,
         role: subject.role.as_str().to_string(),
+        behavior_md: subject.behavior_md,
+        behavior_revision: subject.behavior_revision,
         state: match subject.state {
             crate::subjektiv::SubjectState::Active => server_api::SubjektivSubjectState::Active,
             crate::subjektiv::SubjectState::Retired => server_api::SubjektivSubjectState::Retired,
@@ -17466,9 +17489,11 @@ async fn scoped_create_subjektiv_subject(
     validate_workspace_scope(&api, &path.workspace_id)?;
     let role = crate::subjektiv::SubjectRole::new(request.role)
         .map_err(|error| Error::InvalidInput(error.to_string()))?;
+    crate::subjektiv::validate_subject_behavior(&request.behavior_md)
+        .map_err(|error| Error::InvalidInput(error.to_string()))?;
     let subject = open_subjektiv_store(&api)?
-        .create_subject(role)
-        .map_err(|error| Error::Store(error.to_string()))?;
+        .create_subject_with_behavior(role, request.behavior_md)
+        .map_err(subjektiv_store_error)?;
     Ok((
         StatusCode::CREATED,
         Json(subjektiv_subject_response(&api, subject)),
@@ -17557,6 +17582,24 @@ async fn scoped_get_subjektiv_subject(
         .subject(&path.subject_id)
         .map_err(|error| Error::Store(error.to_string()))?
         .ok_or_else(|| Error::SubjektivSubjectNotFound(path.subject_id.clone()))?;
+    Ok(Json(subjektiv_subject_response(&api, subject)))
+}
+
+async fn scoped_update_subjektiv_subject_behavior(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedSubjektivSubjectPath>,
+    Json(request): Json<server_api::SubjektivSubjectBehaviorUpdateRequest>,
+) -> ApiResult<Json<server_api::SubjektivSubjectResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    crate::subjektiv::validate_subject_behavior(&request.behavior_md)
+        .map_err(|error| Error::InvalidInput(error.to_string()))?;
+    let subject = open_subjektiv_store(&api)?
+        .update_subject_behavior(
+            &path.subject_id,
+            request.expected_behavior_revision,
+            request.behavior_md,
+        )
+        .map_err(subjektiv_store_error)?;
     Ok(Json(subjektiv_subject_response(&api, subject)))
 }
 
@@ -19166,6 +19209,23 @@ async fn scoped_subjektiv_memory_backend(
                 resident,
             ))
         }
+        server_api::SubjektivMemoryBackendOperation::ResidentContext(_) => {
+            require_subjektiv_worker_authority(
+                authority,
+                SubjektivWorkerAuthority::Subject,
+                "resident subject context read",
+            )?;
+            let resident = store
+                .resident_context(&subject_id)
+                .map_err(subjektiv_store_error)?;
+            server_api::SubjektivMemoryBackendResponse::ResidentContext(
+                server_api::SubjektivResidentContextOutput {
+                    behavior_md: resident.subject.behavior_md,
+                    behavior_revision: resident.subject.behavior_revision,
+                    memory_surface: resident_summary_output(resident.surface),
+                },
+            )
+        }
         server_api::SubjektivMemoryBackendOperation::Query(input) => {
             server_api::SubjektivMemoryBackendResponse::Query(subjektiv_memory_query(
                 &store,
@@ -20540,6 +20600,7 @@ fn subjektiv_store_error(error: crate::subjektiv::SubjektivError) -> Error {
             Error::WorkspacePermissionDenied(format!("subject_scope_mismatch: {error}"))
         }
         crate::subjektiv::SubjektivError::RevisionConflict { .. }
+        | crate::subjektiv::SubjektivError::SubjectBehaviorConflict { .. }
         | crate::subjektiv::SubjektivError::SurfaceGenerationConflict(_) => {
             Error::RepositoryConflict(format!("revision_conflict: {error}"))
         }
@@ -39199,18 +39260,80 @@ mod tests {
             app.clone(),
             "POST",
             &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects"),
-            Some(serde_json::json!({ "role": "  Browser author  " })),
+            Some(serde_json::json!({
+                "role": "  Browser author  ",
+                "behavior_md": "Prefer explicit evidence.\nAsk when uncertain."
+            })),
             &owner_token,
             StatusCode::CREATED,
         )
         .await;
         assert_eq!(created["role"], "  Browser author  ");
+        assert_eq!(
+            created["behavior_md"],
+            "Prefer explicit evidence.\nAsk when uncertain."
+        );
+        assert_eq!(created["behavior_revision"], 0);
         assert_eq!(created["state"], "active");
         assert_eq!(created["store_revision"], 0);
         assert!(created.get("current_worker").is_none());
         let created_id = created["id"].as_str().unwrap();
         let persisted = store.subject(created_id).unwrap().unwrap();
         assert_eq!(persisted.role.as_str(), "  Browser author  ");
+        assert_eq!(persisted.behavior_revision, 0);
+        let behavior_uri =
+            format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{created_id}/behavior");
+        request_json(
+            app.clone(),
+            "PATCH",
+            &behavior_uri,
+            Some(serde_json::json!({
+                "expected_behavior_revision": 0,
+                "behavior_md": "Updated without rewriting history."
+            })),
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+        let updated = request_json_authenticated(
+            app.clone(),
+            "PATCH",
+            &behavior_uri,
+            Some(serde_json::json!({
+                "expected_behavior_revision": 0,
+                "behavior_md": "Updated without rewriting history."
+            })),
+            &owner_token,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(updated["behavior_md"], "Updated without rewriting history.");
+        assert_eq!(updated["behavior_revision"], 1);
+        request_json_authenticated(
+            app.clone(),
+            "PATCH",
+            &behavior_uri,
+            Some(serde_json::json!({
+                "expected_behavior_revision": 0,
+                "behavior_md": "stale write"
+            })),
+            &owner_token,
+            StatusCode::CONFLICT,
+        )
+        .await;
+        let cleared = request_json_authenticated(
+            app.clone(),
+            "PATCH",
+            &behavior_uri,
+            Some(serde_json::json!({
+                "expected_behavior_revision": 1,
+                "behavior_md": ""
+            })),
+            &owner_token,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(cleared["behavior_md"], "");
+        assert_eq!(cleared["behavior_revision"], 2);
         assert!(
             api.store
                 .current_worker_singleton_owner(
@@ -39309,6 +39432,90 @@ mod tests {
                 .revision,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn subjektiv_browser_behavior_create_update_clear_and_conflict_are_typed() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+
+        let (status, Json(created)) = scoped_create_subjektiv_subject(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            Json(server_api::SubjektivSubjectCreateRequest {
+                role: "companion".to_string(),
+                behavior_md: "Prefer explicit evidence.".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created.behavior_revision, 0);
+        assert_eq!(created.behavior_md, "Prefer explicit evidence.");
+
+        let Json(updated) = scoped_update_subjektiv_subject_behavior(
+            State(api.clone()),
+            AxumPath(ScopedSubjektivSubjectPath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                subject_id: created.id.clone(),
+            }),
+            Json(server_api::SubjektivSubjectBehaviorUpdateRequest {
+                expected_behavior_revision: 0,
+                behavior_md: "Ask when uncertain.".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.behavior_revision, 1);
+        assert_eq!(updated.behavior_md, "Ask when uncertain.");
+
+        let conflict = scoped_update_subjektiv_subject_behavior(
+            State(api.clone()),
+            AxumPath(ScopedSubjektivSubjectPath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                subject_id: created.id.clone(),
+            }),
+            Json(server_api::SubjektivSubjectBehaviorUpdateRequest {
+                expected_behavior_revision: 0,
+                behavior_md: "Stale edit".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(conflict.into_response().status(), StatusCode::CONFLICT);
+
+        let Json(cleared) = scoped_update_subjektiv_subject_behavior(
+            State(api.clone()),
+            AxumPath(ScopedSubjektivSubjectPath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                subject_id: created.id,
+            }),
+            Json(server_api::SubjektivSubjectBehaviorUpdateRequest {
+                expected_behavior_revision: 1,
+                behavior_md: String::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cleared.behavior_revision, 2);
+        assert!(cleared.behavior_md.is_empty());
+
+        let oversized = scoped_create_subjektiv_subject(
+            State(api),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            Json(server_api::SubjektivSubjectCreateRequest {
+                role: "reviewer".to_string(),
+                behavior_md: "x".repeat(server_api::SUBJEKTIV_MAX_BEHAVIOR_BYTES + 1),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(oversized.into_response().status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -39733,7 +39940,10 @@ mod tests {
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
         let subject = open_subjektiv_store(&api)
             .unwrap()
-            .create_subject(crate::subjektiv::SubjectRole::new("companion").unwrap())
+            .create_subject_with_behavior(
+                crate::subjektiv::SubjectRole::new("companion").unwrap(),
+                "Prefer explicit evidence.".to_string(),
+            )
             .unwrap();
         let request = CreateWorkspaceWorkerRequest {
             runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
@@ -39851,6 +40061,33 @@ mod tests {
                     content: None,
                 }
             )
+        ));
+        let Json(resident_context) = scoped_subjektiv_memory_backend(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            context.clone(),
+            Json(server_api::SubjektivMemoryBackendRequest {
+                operation: server_api::SubjektivMemoryBackendOperation::ResidentContext(
+                    Default::default(),
+                ),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            resident_context,
+            server_api::SubjektivMemoryBackendResponse::ResidentContext(
+                server_api::SubjektivResidentContextOutput {
+                    behavior_md,
+                    behavior_revision: 0,
+                    memory_surface: memory::backend::MemoryResidentSummaryOutput {
+                        availability: memory::backend::MemoryResidentSummaryAvailability::Ungenerated,
+                        content: None,
+                    },
+                }
+            ) if behavior_md == "Prefer explicit evidence."
         ));
         let missing_legacy = scoped_record_subjektiv_session(
             State(api.clone()),
