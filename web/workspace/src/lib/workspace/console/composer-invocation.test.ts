@@ -65,6 +65,27 @@ Deno.test("selected invocation parsing preserves Unicode, spaces, slashes, prose
   ]);
 });
 
+Deno.test("multiple positional arguments advance once per value independent of descriptor order", () => {
+  const positional: FeatureInvocationDescriptor = {
+    ...descriptor,
+    arguments: [
+      { name: "enabled", position: 2, required: true, value_type: { kind: "boolean" }, completion: { kind: "none" } },
+      { name: "mode", position: 0, required: true, value_type: { kind: "enum", values: ["brief", "full"] }, completion: { kind: "none" } },
+      { name: "limit", position: 1, required: true, value_type: { kind: "integer" }, completion: { kind: "none" } },
+      { name: "note", required: false, value_type: { kind: "string" }, completion: { kind: "none" } },
+    ],
+  };
+  for (const input of ['/run("brief", 2, true) following prose', '/run("brief", note="資料/a b", 2, true) following prose']) {
+    const parsed = selectedFeatureInvocationRanges(input, [positional])[0];
+    assertEquals(input.slice(parsed.end), " following prose");
+    assertEquals(parsed.invocation.arguments.filter((argument) => argument.name !== "note"), [
+      { name: "mode", value: { kind: "string", value: "brief" } },
+      { name: "limit", value: { kind: "integer", value: 2 } },
+      { name: "enabled", value: { kind: "boolean", value: true } },
+    ]);
+  }
+});
+
 Deno.test("unselected text, URLs, paths, and paste content are never promoted", () => {
   assertEquals(
     finalizeSelectedFeatureInvocations(

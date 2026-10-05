@@ -1075,6 +1075,70 @@
         ],
         "type": "object"
       },
+      "CompletionContext": {
+        "properties": {
+          "argument": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "invocation": {
+            "$ref": "#/components/schemas/FeatureInvocationIdentity"
+          }
+        },
+        "required": [
+          "invocation"
+        ],
+        "type": "object"
+      },
+      "CompletionEntry": {
+        "description": "One completion candidate for a prefix query.",
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "invocation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FeatureInvocationDescriptor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "is_dir": {
+            "default": false,
+            "type": "boolean"
+          },
+          "usage": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "type": "object"
+      },
+      "CompletionKind": {
+        "description": "Kind of completion requested by `Method::ListCompletions`.\n\n`File` is the existing `@` path lane. `Feature` lists installed chat\ninvocations. `FeatureArgument` resolves a declared argument using the\nsource-qualified [`CompletionContext`].",
+        "enum": [
+          "file",
+          "feature",
+          "feature_argument"
+        ],
+        "type": "string"
+      },
       "ConfigCommitRequest": {
         "additionalProperties": false,
         "description": "Compare-and-swap request for applying a complete set of source-tree changes.",
@@ -2232,6 +2296,98 @@
         },
         "type": "object"
       },
+      "FeatureInvocation": {
+        "properties": {
+          "arguments": {
+            "items": {
+              "$ref": "#/components/schemas/InvocationArgumentValue"
+            },
+            "type": "array"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/FeatureInvocationIdentity"
+          },
+          "invocation_id": {
+            "description": "Stable client-generated id retained across queueing and transport retry.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Selected public name, retained for exact draft/history restoration. Host\nresolution is always by `identity`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "invocation_id",
+          "identity",
+          "name",
+          "arguments"
+        ],
+        "type": "object"
+      },
+      "FeatureInvocationDescriptor": {
+        "properties": {
+          "aliases": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "arguments": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/InvocationArgumentDescriptor"
+            },
+            "type": "array"
+          },
+          "client_adapter": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InvocationClientAdapter"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "description": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/FeatureInvocationIdentity"
+          },
+          "name": {
+            "type": "string"
+          },
+          "syntax": {
+            "$ref": "#/components/schemas/FeatureInvocationSyntax"
+          }
+        },
+        "required": [
+          "identity",
+          "name",
+          "display_name",
+          "description",
+          "syntax"
+        ],
+        "type": "object"
+      },
+      "FeatureInvocationIdentity": {
+        "description": "Source-qualified identity of one invocation contribution, for example\n`builtin:attachments/attach`. Display names and aliases are never authority.",
+        "type": "string"
+      },
+      "FeatureInvocationSyntax": {
+        "oneOf": [
+          {
+            "const": "parenthesized",
+            "description": "`/name(value, key=value)` with JSON-style quoted strings and `)` as the\nexplicit boundary before following natural language.",
+            "type": "string"
+          }
+        ]
+      },
       "FindingSeverity": {
         "enum": [
           "blocker",
@@ -2608,6 +2764,285 @@
           "reason"
         ],
         "type": "object"
+      },
+      "InvocationArgumentDescriptor": {
+        "properties": {
+          "completion": {
+            "$ref": "#/components/schemas/InvocationCompletion",
+            "default": {
+              "kind": "none"
+            }
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "position": {
+            "description": "Zero-based positional index. `None` means named-only. A positional\nargument may also be supplied by name; this makes chip editing stable.",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "required": {
+            "default": false,
+            "type": "boolean"
+          },
+          "value_type": {
+            "$ref": "#/components/schemas/InvocationArgumentType"
+          }
+        },
+        "required": [
+          "name",
+          "value_type"
+        ],
+        "type": "object"
+      },
+      "InvocationArgumentType": {
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "string",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "integer",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "boolean",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "enum",
+                "type": "string"
+              },
+              "values": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "kind",
+              "values"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A Worker-readable path. This does not grant filesystem authority.",
+            "properties": {
+              "kind": {
+                "const": "worker_file",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A resource selected and staged by the client. It must never be resolved\nas a path on the Worker host.",
+            "properties": {
+              "kind": {
+                "const": "client_file",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "InvocationArgumentValue": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "value": {
+            "$ref": "#/components/schemas/InvocationValue"
+          }
+        },
+        "required": [
+          "name",
+          "value"
+        ],
+        "type": "object"
+      },
+      "InvocationClientAdapter": {
+        "oneOf": [
+          {
+            "const": "attachment",
+            "description": "The client stages a local file and replaces the draft invocation with an\n`UploadedFile` chip. Local paths are not sent to or persisted by Worker.",
+            "type": "string"
+          }
+        ]
+      },
+      "InvocationCompletion": {
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "none",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "static",
+                "type": "string"
+              },
+              "values": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "kind",
+              "values"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "worker_file",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "client_file",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Host-owned provider selected by source-qualified id. Metadata lookup is\nside-effect free; implementations never cross this wire boundary.",
+            "properties": {
+              "kind": {
+                "const": "provider",
+                "type": "string"
+              },
+              "provider": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "provider"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "InvocationValue": {
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "string",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "integer",
+                "type": "string"
+              },
+              "value": {
+                "format": "int32",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "boolean",
+                "type": "string"
+              },
+              "value": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "LegacyMemoryResetRequest": {
         "additionalProperties": false,
@@ -7356,7 +7791,19 @@
       "RuntimeWorkerCompletionsRequest": {
         "additionalProperties": false,
         "properties": {
-          "kind": true,
+          "context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CompletionContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/CompletionKind"
+          },
           "prefix": {
             "default": "",
             "type": "string"
@@ -7378,10 +7825,14 @@
             "type": "array"
           },
           "entries": {
-            "items": true,
+            "items": {
+              "$ref": "#/components/schemas/CompletionEntry"
+            },
             "type": "array"
           },
-          "kind": true,
+          "kind": {
+            "$ref": "#/components/schemas/CompletionKind"
+          },
           "prefix": {
             "type": "string"
           },
@@ -7415,7 +7866,9 @@
             ]
           },
           "segments": {
-            "items": true,
+            "items": {
+              "$ref": "#/components/schemas/Segment"
+            },
             "type": [
               "array",
               "null"
@@ -8259,6 +8712,23 @@
             "required": [
               "kind",
               "path"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Explicitly selected, source-qualified Feature invocation. The host never\npromotes free text to this variant and validates it against the installed\ndeclaration before execution.",
+            "properties": {
+              "invocation": {
+                "$ref": "#/components/schemas/FeatureInvocation"
+              },
+              "kind": {
+                "const": "feature_invoke",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "invocation"
             ],
             "type": "object"
           },
@@ -14794,7 +15264,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:f9f0f8918dbcce386e94d5368fa938f02565ca98f9f67f07537bd88ed8c49870"
+    "x-yoi-source-digest": "sha256:0dc47aa72f9cace6e0026fbf5d9385f51b6d79c8f6a70a04954067a35e01c887"
   },
   "openapi": "3.1.0",
   "paths": {

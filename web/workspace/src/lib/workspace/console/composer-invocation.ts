@@ -278,7 +278,8 @@ function parseFeatureInvocation(
       while (/\s/.test(text[cursor] ?? "")) cursor++;
     } else {
       cursor = itemStart;
-      argument = descriptor.arguments.find((candidate) => candidate.position === position++);
+      argument = descriptor.arguments.find((candidate) => candidate.position === position);
+      position++;
       if (!argument) throw new Error("Too many positional Feature arguments.");
     }
     const parsed = parseRawValue(text, cursor);
