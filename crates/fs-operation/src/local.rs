@@ -639,9 +639,21 @@ fn require_access(
     write: bool,
     allow_symlink_directory: bool,
 ) -> Result<PathBuf, FsError> {
-    let resolved = access
-        .resolve_access_path(path)
-        .map_err(|error| map_io(logical, error))?;
+    let resolved = access.resolve_access_path(path).map_err(|error| {
+        // A dangling direct link has no resolved identity, but still needs the
+        // existing sanitized repair diagnostic rather than an ordinary missing-file error.
+        if error.kind() == std::io::ErrorKind::NotFound
+            && direct_symlink(path).is_some_and(|info| !info.target_exists)
+        {
+            FsError::BrokenSymlink {
+                path: PathBuf::from(logical.as_str()),
+                link: PathBuf::from(logical.as_str()),
+                target: PathBuf::from("<provider-internal target>"),
+            }
+        } else {
+            map_io(logical, error)
+        }
+    })?;
     let symlink = (resolved != path).then(|| direct_symlink(path)).flatten();
     if let Some(info) = symlink.as_ref()
         && !info.target_exists
