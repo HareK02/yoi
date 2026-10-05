@@ -25,6 +25,8 @@ Does not own:
 
 Profiles are reusable recipes; resolved Manifests are runtime contracts. Keep runtime-bound fields such as Worker name, concrete delegated scope, sockets, session pointers, and raw secrets out of reusable Profiles.
 
+`feature.workdir_catalog.enabled` defaults to `true` for read-only Repository/Workdir/attachment reference discovery in WIP mode. It is independent of `feature.manage_workdir` (which defaults disabled), registers no normal Tools, and does not grant filesystem, attachment, or Workspace authority. Permissions remain independent. Standalone Tools-mode profiles may retain this default; only WIP installation consumes the flag. Set it to `false` to opt out.
+
 ## See also
 
 - [`../../docs/design/profiles-manifests-prompts.md`](../../docs/design/profiles-manifests-prompts.md)

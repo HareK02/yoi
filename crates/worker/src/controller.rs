@@ -1504,7 +1504,13 @@ where
             ),
         );
     }
-    if feature_config.manage_workdir.enabled {
+    let wip_mode = worker.manifest().worker.mode == manifest::WorkerMode::Wip;
+    let mut workdir_wip_feature = None;
+    if feature_config.manage_workdir.enabled
+        || (wip_mode
+            && feature_config.workdir_catalog.enabled
+            && worker.workspace_client_handle().is_available())
+    {
         // Workdir lifecycle is Workspace control-plane authority. The Worker
         // receives only the injected WorkspaceClient and never Runtime URLs,
         // repository paths, materializer handles, or cleanup sessions.
@@ -1520,7 +1526,7 @@ where
         }
         let shutdown_registry = spawned_registry.clone();
         let reopen_registry = spawned_registry.clone();
-        feature_registry.add_module(
+        let module =
             crate::feature::builtin::manage_workdir::ManageWorkdirFeature::with_child_lifecycle(
                 workspace_client,
                 worker.workdir_sessions(),
@@ -1529,8 +1535,11 @@ where
                     Box::pin(async move { child_registry.shutdown_internal().await })
                 }),
                 Arc::new(move || reopen_registry.reopen_internal()),
-            ),
-        );
+            );
+        if feature_config.manage_workdir.enabled {
+            feature_registry.add_module(module.clone());
+        }
+        workdir_wip_feature = Some(module);
     }
     if feature_config.workspace_worker_discovery.enabled {
         let workspace_client = worker.workspace_client_handle();
@@ -1585,9 +1594,23 @@ where
     }
 
     let host_worker_observation_provider = worker.worker_observation_provider();
-    let wip_mode = worker.manifest().worker.mode == manifest::WorkerMode::Wip;
     let wip_permissions = worker.manifest().permissions.clone();
     let mut wip_mount_registry = crate::wip::WipMountRegistry::new();
+    if wip_mode && let Some(feature) = &workdir_wip_feature {
+        crate::feature::builtin::manage_workdir::wip::mount_workspace_workdir_wip(
+            &mut wip_mount_registry,
+            feature,
+            feature_config.workdir_catalog.enabled,
+            feature_config.manage_workdir.enabled,
+            wip_permissions.clone(),
+        )
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("mount Workdir WIP projection: {error}"),
+            )
+        })?;
+    }
     {
         let workspace_client = worker.workspace_client_handle();
         let engine = worker.engine_mut();

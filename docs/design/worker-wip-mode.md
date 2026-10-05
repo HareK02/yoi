@@ -75,7 +75,7 @@ The built-in native route migration is:
 | `/features/objective/objectives[/<reference>]` | `/objectives[/<reference>]` |
 | `/features/merge-request/merge-requests[/<reference>]` | `/merge-requests[/<reference>]` |
 
-`/repositories` and `/workdirs` can be allocated by a later provider using the same registration contract; this layer does not implement or pre-allocate those domains. `/checkouts` content projection is likewise outside this contract.
+The built-in Repository/Workdir reference provider allocates `/repositories`, `/workdirs`, and `/workdir-attachments` using this contract; `manage-workdir` contributes operations rather than owning another Object. See [Repository, Workdir and attachment WIP projection](workdir-wip-projection.md) for identity encoding, reference/management permissions, attachment lifetime safety, and first-Workspace discovery. `/checkouts` content projection remains a separate provider.
 
 ### Registering a subsequent provider
 
