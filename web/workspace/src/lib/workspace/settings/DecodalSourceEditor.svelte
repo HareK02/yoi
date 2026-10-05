@@ -9,6 +9,7 @@
     type CompletionContext,
     type CompletionResult,
   } from '@codemirror/autocomplete';
+  import { indentWithTab, insertNewlineAndIndent } from '@codemirror/commands';
   import { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
   import { Compartment, EditorState } from '@codemirror/state';
   import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection, type ViewUpdate } from '@codemirror/view';
@@ -129,6 +130,8 @@
           decodal({ highlight: false }),
           syntaxHighlighting(syntaxTheme),
           autocompletion({
+            // Use the explicit keymap below so Enter never accepts a suggestion.
+            defaultKeymap: false,
             activateOnTyping: false,
             override: [
               async (context: CompletionContext) => {
@@ -139,6 +142,10 @@
             ],
           }),
           keymap.of(completionKeymapWithoutEnter),
+          keymap.of([
+            { key: 'Enter', run: insertNewlineAndIndent },
+            indentWithTab,
+          ]),
           fixedSchemaWrapperCompartment.of(
             initialFixedSchemaWrapper ? fixedSchemaWrapperExtension() : [],
           ),
