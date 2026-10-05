@@ -124,6 +124,8 @@ The adapter keeps these outcomes distinct:
 - **disconnected/timeout after dispatch**: `wip-client` records an unknown outcome;
 - **operation outcome unknown**: an executing provider fails without a rollback/non-execution guarantee, a response cannot be completed after dispatch, or the call future is force-closed.
 
+Cooperative cancellation is scoped to the active execution's selected operation and exact resolved handler instance. Static/dynamic dispatchers forward `cancel_operation` only to that operation's provider, once per cancellation request, never to unrelated contributors or every alias backed by a shared handler. The runtime pins the dispatcher used for execution rather than resolving the Object again on cancellation, since dynamic resolvers may return stateful instances. Providers may implement `cancel_operation` for operation-specific control or the shared `cancel` default. Terminal completion or a dropped execution future releases the active binding; unknown/finished execution IDs do not invoke any provider. A cancellation request is not itself terminal confirmation.
+
 An unknown mutating outcome must never be retried automatically. The model must inspect external state or ask for operator guidance. Retrieval failures may be explicitly refreshed.
 
 ## Measurement

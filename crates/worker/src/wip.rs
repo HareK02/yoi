@@ -131,6 +131,16 @@ pub trait WipOperationHandler: Send + Sync {
     async fn cancel(&self, _context: &ToolExecutionContext) -> Result<(), ToolError> {
         Ok(())
     }
+
+    /// Cancel the selected operation on this exact handler instance. Providers
+    /// that share a cancellation boundary may keep implementing `cancel`.
+    async fn cancel_operation(
+        &self,
+        _operation: &str,
+        context: &ToolExecutionContext,
+    ) -> Result<(), ToolError> {
+        self.cancel(context).await
+    }
 }
 
 /// One route contribution. Native projections replace compatibility projections
@@ -249,11 +259,15 @@ impl WipOperationHandler for OperationDispatchHandler {
         handler.call(operation, arguments, context).await
     }
 
-    async fn cancel(&self, context: &ToolExecutionContext) -> Result<(), ToolError> {
-        for handler in self.handlers.values() {
-            handler.cancel(context).await?;
-        }
-        Ok(())
+    async fn cancel_operation(
+        &self,
+        operation: &str,
+        context: &ToolExecutionContext,
+    ) -> Result<(), ToolError> {
+        let handler = self.handlers.get(operation).ok_or_else(|| {
+            ToolError::InvalidArgument("WIP cancellation operation is not published".into())
+        })?;
+        handler.cancel_operation(operation, context).await
     }
 }
 
@@ -1027,6 +1041,7 @@ impl WipHost {
         })
     }
 
+    #[cfg(test)]
     async fn call(
         &self,
         request: CallOperationRequest,
@@ -1035,6 +1050,15 @@ impl WipHost {
         let projection = self.projection(&request.target.path).ok_or_else(|| {
             WipOperationError::Protocol(unpublished_path_error(&request.target.path))
         })?;
+        self.call_projection(projection, request, context).await
+    }
+
+    async fn call_projection(
+        &self,
+        projection: WipProjection,
+        request: CallOperationRequest,
+        context: WipCallContext,
+    ) -> Result<WipOperationOutput, WipOperationError> {
         let expected_object_validator = projection.object.validator.as_deref();
         match (
             expected_object_validator,
@@ -1102,13 +1126,6 @@ impl WipHost {
             .handler
             .call(&request.operation, &request.arguments, context)
             .await
-    }
-
-    async fn cancel(&self, path: &str, context: &ToolExecutionContext) -> Result<(), ToolError> {
-        let projection = self.projection(path).ok_or_else(|| {
-            ToolError::InvalidArgument("WIP cancellation target is no longer published".into())
-        })?;
-        projection.handler.cancel(context).await
     }
 }
 
@@ -1367,6 +1384,12 @@ struct ClientState {
     session: SessionId,
 }
 
+#[derive(Clone)]
+struct ActiveOperation {
+    operation: String,
+    handler: Arc<dyn WipOperationHandler>,
+}
+
 pub struct WipRuntime {
     endpoint: Endpoint,
     wire_limits: Limits,
@@ -1374,7 +1397,7 @@ pub struct WipRuntime {
     security_context: SecurityContext,
     state: Arc<Mutex<ClientState>>,
     host: Arc<WipHost>,
-    active: Arc<Mutex<HashMap<String, String>>>,
+    active: Arc<Mutex<HashMap<String, ActiveOperation>>>,
     audit: Arc<Mutex<VecDeque<WipAuditRecord>>>,
     metrics: Arc<WipMetrics>,
 }
@@ -1576,10 +1599,6 @@ impl WipRuntime {
             .operation_round_trips
             .fetch_add(1, Ordering::Relaxed);
         let execution_id = execution.execution_id();
-        self.active
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(execution_id.clone(), path.clone());
         let mut guard = DispatchedCallGuard::new(
             Arc::clone(&self.state),
             Arc::clone(&self.active),
@@ -1621,14 +1640,19 @@ impl WipRuntime {
     }
 
     async fn cancel(&self, execution: &ToolExecutionContext) -> Result<(), ToolError> {
-        let path = self
+        let active = self
             .active
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(&execution.execution_id())
             .cloned();
-        match path {
-            Some(path) => self.host.cancel(&path, execution).await,
+        match active {
+            Some(active) => {
+                active
+                    .handler
+                    .cancel_operation(&active.operation, execution)
+                    .await
+            }
             None => Ok(()),
         }
     }
@@ -1724,7 +1748,29 @@ impl WipRuntime {
             execution,
             security_context: self.security_context.as_str().to_string(),
         };
-        match self.host.call(request_value.clone(), context).await {
+        let result = match self.host.projection(&request_value.target.path) {
+            Some(projection) => {
+                // Pin the exact resolved instance used for dispatch. A dynamic
+                // resolver may return a fresh stateful handler on each lookup.
+                self.active
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(
+                        context.execution.execution_id(),
+                        ActiveOperation {
+                            operation: request_value.operation.clone(),
+                            handler: Arc::clone(&projection.handler),
+                        },
+                    );
+                self.host
+                    .call_projection(projection, request_value.clone(), context)
+                    .await
+            }
+            None => Err(WipOperationError::Protocol(unpublished_path_error(
+                &request_value.target.path,
+            ))),
+        };
+        match result {
             Ok(output) => {
                 let response = encode_call_operation_response(
                     &request_value,
@@ -1807,7 +1853,7 @@ impl WipRuntime {
 
 struct DispatchedCallGuard {
     state: Arc<Mutex<ClientState>>,
-    active: Arc<Mutex<HashMap<String, String>>>,
+    active: Arc<Mutex<HashMap<String, ActiveOperation>>>,
     request_id: RequestId,
     execution_id: String,
     armed: bool,
@@ -1816,7 +1862,7 @@ struct DispatchedCallGuard {
 impl DispatchedCallGuard {
     fn new(
         state: Arc<Mutex<ClientState>>,
-        active: Arc<Mutex<HashMap<String, String>>>,
+        active: Arc<Mutex<HashMap<String, ActiveOperation>>>,
         request_id: RequestId,
         execution_id: String,
     ) -> Self {
@@ -4524,6 +4570,212 @@ mod tests {
             .await
             .unwrap();
         runtime
+    }
+
+    struct UnrelatedCancellation {
+        cancellations: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl WipOperationHandler for UnrelatedCancellation {
+        async fn call(
+            &self,
+            _: &str,
+            _: &BTreeMap<String, Value>,
+            _: WipCallContext,
+        ) -> Result<WipOperationOutput, WipOperationError> {
+            panic!("unrelated provider must not execute");
+        }
+
+        async fn cancel(&self, _: &ToolExecutionContext) -> Result<(), ToolError> {
+            self.cancellations.fetch_add(1, Ordering::SeqCst);
+            Err(ToolError::InvalidArgument(
+                "unknown execution in unrelated provider".into(),
+            ))
+        }
+    }
+
+    struct PendingCancellation {
+        started: Arc<tokio::sync::Notify>,
+        cancelled: tokio::sync::Notify,
+        was_called: AtomicBool,
+        cancellations: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl WipOperationHandler for PendingCancellation {
+        async fn call(
+            &self,
+            _: &str,
+            _: &BTreeMap<String, Value>,
+            _: WipCallContext,
+        ) -> Result<WipOperationOutput, WipOperationError> {
+            self.was_called.store(true, Ordering::SeqCst);
+            self.started.notify_one();
+            self.cancelled.notified().await;
+            Err(WipOperationError::Cancelled(
+                "provider confirmed cancellation".to_string().into(),
+            ))
+        }
+
+        async fn cancel(&self, _: &ToolExecutionContext) -> Result<(), ToolError> {
+            // A second resolution of the same path would produce another instance.
+            assert!(
+                self.was_called.load(Ordering::SeqCst),
+                "cancel must use the dispatched instance"
+            );
+            self.cancellations.fetch_add(1, Ordering::SeqCst);
+            self.cancelled.notify_one();
+            Ok(())
+        }
+    }
+
+    struct PendingCancellationResolver {
+        started: Arc<tokio::sync::Notify>,
+        cancellations: Arc<AtomicUsize>,
+    }
+
+    impl WipDynamicOperationResolver for PendingCancellationResolver {
+        fn handler(&self, _: &str) -> Arc<dyn WipOperationHandler> {
+            Arc::new(PendingCancellation {
+                started: Arc::clone(&self.started),
+                cancelled: tokio::sync::Notify::new(),
+                was_called: AtomicBool::new(false),
+                cancellations: Arc::clone(&self.cancellations),
+            })
+        }
+    }
+
+    struct CancellationItemResolver {
+        unrelated: Arc<AtomicUsize>,
+    }
+
+    impl WipDynamicItemResolver for CancellationItemResolver {
+        fn resolve(&self, item: &str) -> Option<WipDynamicItem> {
+            if item != "A-1" {
+                return None;
+            }
+            let projection = contribution_projection(Arc::new(UnrelatedCancellation {
+                cancellations: Arc::clone(&self.unrelated),
+            }));
+            Some(WipDynamicItem {
+                object: projection.object,
+                handler: projection.handler,
+            })
+        }
+    }
+
+    async fn assert_contributed_cancellation_is_selected_once(dynamic: bool) {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let unrelated = Arc::new(AtomicUsize::new(0));
+        let mut registry = WipMountRegistry::new();
+        registry.allocate_namespace("asset", "assets").unwrap();
+        let projection = contribution_projection(Arc::new(UnrelatedCancellation {
+            cancellations: Arc::clone(&unrelated),
+        }));
+        let mut descriptor = projection.descriptor.clone();
+        // Two names share one provider; read sorts first and fails cancellation.
+        descriptor.operations = vec![
+            contributed_operation("write"),
+            contributed_operation("write_again"),
+        ];
+        if dynamic {
+            let mut collection = projection.clone();
+            collection.route = "/assets".into();
+            collection.object.name = "assets".into();
+            collection.interface = "test.asset/collection/v1".into();
+            collection.object.interfaces = vec![collection.interface.clone()];
+            registry.mount(collection).unwrap();
+            registry
+                .mount_dynamic(WipDynamicMount {
+                    collection_route: "/assets".into(),
+                    capability: "asset:item".into(),
+                    interface: projection.interface.clone(),
+                    descriptor: projection.descriptor,
+                    interface_validator: projection.interface_validator,
+                    resolver: Arc::new(CancellationItemResolver {
+                        unrelated: Arc::clone(&unrelated),
+                    }),
+                })
+                .unwrap();
+            registry
+                .contribute_dynamic_operations(WipDynamicOperationContribution {
+                    collection_route: "/assets".into(),
+                    contributor: "management".into(),
+                    interface: projection.interface,
+                    descriptor,
+                    resolver: Arc::new(PendingCancellationResolver {
+                        started: Arc::clone(&started),
+                        cancellations: Arc::clone(&cancellations),
+                    }),
+                })
+                .unwrap();
+        } else {
+            registry.mount(projection).unwrap();
+            registry
+                .contribute_operations(WipOperationContribution {
+                    route: "/assets/A-1".into(),
+                    contributor: "management".into(),
+                    interface: "test.asset/item/v1".into(),
+                    descriptor,
+                    handler: PendingCancellationResolver {
+                        started: Arc::clone(&started),
+                        cancellations: Arc::clone(&cancellations),
+                    }
+                    .handler("A-1"),
+                })
+                .unwrap();
+        }
+        let runtime =
+            WipRuntime::new(WipHost::new(registry), SecurityContext::new("worker-a"), 0).unwrap();
+        runtime
+            .discover("/assets/A-1".into(), 0, false)
+            .await
+            .unwrap();
+        runtime
+            .inspect("test.asset/item/v1".into(), false)
+            .await
+            .unwrap();
+        let execution = ToolExecutionContext::direct();
+        let call = runtime.call(
+            "/assets/A-1".into(),
+            "test.asset/item/v1".into(),
+            "write".into(),
+            json!({}),
+            execution.clone(),
+        );
+        let cancel = async {
+            started.notified().await;
+            // Unknown executions must not invoke any provider.
+            runtime
+                .cancel(&ToolExecutionContext::new("unknown", "other-batch", 0))
+                .await
+                .unwrap();
+            runtime.cancel(&execution).await.unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(call, cancel)
+        })
+        .await
+        .expect("selected provider must receive cancellation");
+        assert!(matches!(result, Err(ToolError::Cancelled(_))));
+        assert_eq!(unrelated.load(Ordering::SeqCst), 0);
+        assert_eq!(cancellations.load(Ordering::SeqCst), 1);
+        assert!(runtime.active.lock().unwrap().is_empty());
+        assert_eq!(runtime.audit()[0].outcome, WipAuditOutcome::Cancelled);
+        runtime.cancel(&execution).await.unwrap();
+        assert_eq!(cancellations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn static_contributed_cancellation_ignores_unrelated_and_shared_handlers() {
+        assert_contributed_cancellation_is_selected_once(false).await;
+    }
+
+    #[tokio::test]
+    async fn dynamic_contributed_cancellation_pins_the_dispatched_instance() {
+        assert_contributed_cancellation_is_selected_once(true).await;
     }
 
     #[tokio::test]
