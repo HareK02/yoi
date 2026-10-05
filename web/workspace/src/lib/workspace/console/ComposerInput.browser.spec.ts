@@ -363,6 +363,72 @@ test("restored invocation chips fetch declarative descriptors and stay editable 
   expect(snapshot.segments[0].kind).toBe("feature_invoke");
 });
 
+// Fixture of the Workspace config Feature declaration, consumed by the same
+// generic composer as other Features. Backend/WIP acceptance is tested in Rust;
+// this test proves the real input component's selection and typed-submit edge.
+const workspaceConfigDescriptor: FeatureInvocationDescriptor = {
+  identity: "builtin:workspace-config/attach", name: "workspace-config", aliases: [],
+  display_name: "Workspace config", description: "Select the logical Workspace config attachment",
+  syntax: "parenthesized", arguments: [{ name: "access", position: 0, required: false,
+    value_type: { kind: "enum", values: ["effective", "read_only", "read_write"] },
+    completion: { kind: "none" } }],
+};
+
+test("workspace-config completion prepares a typed invocation without consuming the request prose", async () => {
+  const onsubmit = vi.fn();
+  const resolveFeatureCompletions = vi.fn(async () => [
+    { value: workspaceConfigDescriptor.name, invocation: workspaceConfigDescriptor },
+  ]);
+  const ui = render(ComposerInput, { historyScope: "workspace-config-selected", onsubmit,
+    resolveFeatureCompletions });
+  const cm = editor(ui.container);
+  type(cm, "/workspace-con");
+  await ui.findByRole("option");
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter" });
+  expect(onsubmit).not.toHaveBeenCalled();
+  const suffix = ') このWorkspaceのモデル設定を変更して';
+  cm.dispatch({ changes: { from: cm.state.doc.length, insert: suffix },
+    selection: { anchor: cm.state.doc.length + suffix.length } });
+  await waitFor(() => expect(ui.container.querySelectorAll(".composer-typed-chip")).toHaveLength(1));
+  const snapshot = ui.component.snapshot();
+  expect(snapshot.segments).toEqual([
+    { kind: "feature_invoke", invocation: {
+      invocation_id: expect.any(String), identity: workspaceConfigDescriptor.identity,
+      name: workspaceConfigDescriptor.name, arguments: [],
+    } },
+    { kind: "text", content: " このWorkspaceのモデル設定を変更して" },
+  ]);
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter", ctrlKey: true });
+  expect(onsubmit).toHaveBeenCalledOnce();
+  // Sending is not string scanning: identity and arguments survive intact.
+  expect(ui.component.snapshot().segments).toEqual(snapshot.segments);
+});
+
+test("workspace-config text alone is not invoked and a selected intent is removable", async () => {
+  const ui = render(ComposerInput, { historyScope: "workspace-config-literal",
+    resolveFeatureCompletions: async () => [{ value: workspaceConfigDescriptor.name, invocation: workspaceConfigDescriptor }] });
+  const cm = editor(ui.container);
+  const prose = "/workspace-config このWorkspaceのモデル設定を変更して";
+  ui.component.restoreSegments([{ kind: "text", content: prose }]);
+  expect(ui.component.snapshot().segments).toEqual([{ kind: "text", content: prose }]);
+  ui.component.clear();
+  type(cm, "/workspace-con");
+  await ui.findByRole("option");
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter" });
+  cm.dispatch({ changes: { from: cm.state.doc.length, insert: '"read_only")' },
+    selection: { anchor: cm.state.doc.length + '"read_only")'.length } });
+  await waitFor(() => expect(ui.container.querySelectorAll(".composer-typed-chip")).toHaveLength(1));
+  expect(ui.component.snapshot().segments[0]).toMatchObject({ kind: "feature_invoke", invocation: {
+    arguments: [{ name: "access", value: { kind: "string", value: "read_only" } }],
+  } });
+  // happy-dom's focused DOM selection can reenter CodeMirror during range
+  // replacement. Use the existing component suite's unfocused range fixture.
+  cm.contentDOM.blur();
+  cm.dispatch({ selection: { anchor: 0, head: cm.state.doc.length } });
+  await fireEvent.keyDown(cm.contentDOM, { key: "Backspace" });
+  expect(ui.component.snapshot().segments).toEqual([]);
+});
+
 test("attachment adapter uses descriptor capability rather than a hardcoded slash name", async () => {
   const onclientadapter = vi.fn();
   const adapter = { ...invocationDescriptor, name: "send-file", arguments: [], client_adapter: "attachment" as const };

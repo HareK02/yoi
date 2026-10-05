@@ -116,6 +116,52 @@ pub struct EvaluatedConfigCandidate {
     pub evaluation: EvaluationResult,
 }
 
+/// Validate feature semantics before committing a schema-valid candidate.
+///
+/// Keep this shared by the UI and logical config operations. Schema evaluation
+/// alone does not resolve Profile sources or reject blocking Skill diagnostics.
+/// This function has no publication or repository-secret side effects.
+pub(crate) fn validate_workspace_config_candidate_projections(
+    workspace_id: &str,
+    candidate: &EvaluatedConfigCandidate,
+) -> Result<()> {
+    let state = WorkspaceConfigState {
+        snapshot: candidate.snapshot.clone(),
+        contract: candidate.contract.clone(),
+        projection_digest: candidate.evaluation.projection_digest.clone(),
+    };
+    let has_provider = |id: &str| {
+        state
+            .contract
+            .schema_bundle
+            .contributions
+            .iter()
+            .any(|provider| provider.provider_id == id)
+    };
+    crate::prompt_settings::validate_evaluated_prompt_catalog(&candidate.evaluation)?;
+    if has_provider("builtin:profile") {
+        crate::profile_settings::project_profiles_from_workspace_config(workspace_id, &state)?;
+    }
+    if has_provider("builtin:runtime") {
+        crate::runtime_settings::project_runtime_from_workspace_config(workspace_id, &state)?;
+    }
+    if has_provider("builtin:skills") {
+        let catalog = crate::skills::catalog(&state)
+            .map_err(|_| Error::InvalidInput("invalid Workspace Skill projection".to_string()))?;
+        if catalog.entries.iter().any(|entry| {
+            entry
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity == server_api::SkillDiagnosticSeverity::Error)
+        }) {
+            return Err(Error::InvalidInput(
+                "Workspace Skills have blocking diagnostics".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 pub struct ConfigCommitRequest {
     #[ts(type = "number")]
@@ -909,6 +955,93 @@ mod tests {
             expected_digest: main.content_digest.clone(),
             content: content.to_string(),
         }
+    }
+
+    fn semantic_candidate(
+        contribution: ConfigSchemaContribution,
+        source: &str,
+    ) -> EvaluatedConfigCandidate {
+        let schema = WorkspaceConfigSchemaBundle::compose([
+            crate::prompt_settings::PromptConfigSchemaProvider
+                .contribution()
+                .unwrap(),
+            contribution,
+        ])
+        .unwrap();
+        let current = initial_state_with_schema(schema.clone()).unwrap();
+        let change = update_main(&current, source);
+        evaluate_candidate(current, &[change], schema).unwrap()
+    }
+
+    #[test]
+    fn candidate_semantics_reject_unknown_default_profile() {
+        let candidate = semantic_candidate(
+            crate::profile_settings::ProfileConfigSchemaProvider
+                .contribution()
+                .unwrap(),
+            r#"{ profile = { default_profile = "project:missing"; }; }"#,
+        );
+        let error =
+            validate_workspace_config_candidate_projections("w-config", &candidate).unwrap_err();
+        assert!(error.to_string().contains("unknown_default_profile"));
+        let valid = semantic_candidate(
+            crate::profile_settings::ProfileConfigSchemaProvider
+                .contribution()
+                .unwrap(),
+            "{}",
+        );
+        validate_workspace_config_candidate_projections("w-config", &valid).unwrap();
+    }
+
+    #[test]
+    fn candidate_semantics_reject_invalid_runtime_identifier() {
+        let candidate = semantic_candidate(
+            crate::runtime_settings::RuntimeConfigSchemaProvider
+                .contribution()
+                .unwrap(),
+            r#"{ runtime = { default_runtime_id = "bad\nidentifier"; }; }"#,
+        );
+        assert!(matches!(
+            validate_workspace_config_candidate_projections("w-config", &candidate),
+            Err(Error::InvalidRuntimeIdentifier { .. })
+        ));
+        let valid = semantic_candidate(
+            crate::runtime_settings::RuntimeConfigSchemaProvider
+                .contribution()
+                .unwrap(),
+            "{}",
+        );
+        validate_workspace_config_candidate_projections("w-config", &valid).unwrap();
+    }
+
+    #[test]
+    fn candidate_semantics_reject_skill_without_canonical_source() {
+        let candidate = semantic_candidate(
+            crate::skills::SkillConfigSchemaProvider
+                .contribution()
+                .unwrap(),
+            r#"{
+                skills = {
+                    debug_rust = {
+                        frontmatter = { name = "debug-rust"; description = "Debug Rust"; };
+                        content = "inline";
+                    };
+                };
+            }"#,
+        );
+        let error =
+            validate_workspace_config_candidate_projections("w-config", &candidate).unwrap_err();
+        assert!(error.to_string().contains("blocking diagnostics"));
+        // Do not copy Skill source bodies or diagnostic paths into this error.
+        assert!(!error.to_string().contains("inline"));
+        assert!(!error.to_string().contains("SKILL.md"));
+        let valid = semantic_candidate(
+            crate::skills::SkillConfigSchemaProvider
+                .contribution()
+                .unwrap(),
+            "{}",
+        );
+        validate_workspace_config_candidate_projections("w-config", &valid).unwrap();
     }
 
     #[tokio::test]

@@ -47,6 +47,18 @@ function attachment(
   };
 }
 
+Deno.test("logical config sidebar label is not fabricated as a repository revision", () => {
+  const meta = sidebarWorkdirMeta([attachment("workspace-config", {
+    display_name: "Workspace configuration",
+    source: { kind: "workspace_config", access: "read_write", content_path: "/workspace-config", purpose: "Configuration" },
+    materializer_kind: "logical_workspace_config",
+  })]);
+  assertEquals(meta.text, "Workspace configuration");
+  assert(!meta.text.includes("unknown-repo"), "config must not be labeled as a repository");
+  assert(!meta.text.includes("editable"), "catalog grant ceiling must not claim effective connection editability");
+  assert(meta.details.includes("workspace-config — Workspace configuration"), "logical alias remains visible");
+});
+
 Deno.test("Worker sidebar Workdir label prefers the current branch selector", () => {
   const meta = sidebarWorkdirMeta([
     attachment("checkout", {

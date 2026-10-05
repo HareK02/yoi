@@ -98,6 +98,8 @@ pub struct FeatureConfigPartial {
     #[serde(default)]
     pub workdir_catalog: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
+    pub workspace_config: Option<WorkspaceConfigFeatureConfigPartial>,
+    #[serde(default)]
     pub ticket: Option<TicketFeatureConfigPartial>,
     #[serde(default)]
     pub merge_request: Option<MergeRequestFeatureConfigPartial>,
@@ -144,6 +146,11 @@ impl FeatureConfigPartial {
                 other.workdir_catalog,
                 FeatureFlagConfigPartial::merge,
             ),
+            workspace_config: merge_option(
+                self.workspace_config,
+                other.workspace_config,
+                WorkspaceConfigFeatureConfigPartial::merge,
+            ),
             ticket: merge_option(self.ticket, other.ticket, TicketFeatureConfigPartial::merge),
             merge_request: merge_option(
                 self.merge_request,
@@ -169,6 +176,38 @@ impl FeatureFlagConfigPartial {
     fn merge(self, other: Self) -> Self {
         Self {
             enabled: other.enabled.or(self.enabled),
+        }
+    }
+}
+
+/// Activation only: no Workspace/grant/source/permission fields are accepted.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceConfigFeatureConfigPartial {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+impl WorkspaceConfigFeatureConfigPartial {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            enabled: other.enabled.or(self.enabled),
+        }
+    }
+}
+
+impl From<WorkspaceConfigFeatureConfigPartial> for FeatureFlagConfig {
+    fn from(value: WorkspaceConfigFeatureConfigPartial) -> Self {
+        Self {
+            enabled: value.enabled.unwrap_or_default(),
+        }
+    }
+}
+
+impl From<FeatureFlagConfig> for WorkspaceConfigFeatureConfigPartial {
+    fn from(value: FeatureFlagConfig) -> Self {
+        Self {
+            enabled: Some(value.enabled),
         }
     }
 }
@@ -402,6 +441,10 @@ impl From<FeatureConfigPartial> for FeatureConfig {
                     .and_then(|flag| flag.enabled)
                     .unwrap_or(defaults::WORKDIR_CATALOG_ENABLED),
             },
+            workspace_config: value
+                .workspace_config
+                .map(FeatureFlagConfig::from)
+                .unwrap_or_default(),
             ticket: value
                 .ticket
                 .map(TicketFeatureConfig::from)
@@ -594,6 +637,7 @@ impl From<FeatureConfig> for FeatureConfigPartial {
             objective: Some(value.objective.into()),
             manage_workdir: Some(value.manage_workdir.into()),
             workdir_catalog: Some(value.workdir_catalog.into()),
+            workspace_config: Some(value.workspace_config.into()),
             ticket: Some(value.ticket.into()),
             merge_request: Some(value.merge_request.into()),
             orchestration: Some(value.orchestration.into()),
@@ -2257,8 +2301,115 @@ worker_max_turns = 7
         assert!(!manifest.feature.objective.enabled);
         assert!(!manifest.feature.manage_workdir.enabled);
         assert!(manifest.feature.workdir_catalog.enabled);
+        assert!(!manifest.feature.workspace_config.enabled);
         assert!(!manifest.feature.ticket.enabled);
         assert!(!manifest.feature.merge_request.any());
+    }
+
+    #[test]
+    fn workspace_config_defaults_disabled_for_partial_and_resolved_configs() {
+        assert!(!FeatureConfig::default().workspace_config.enabled);
+        assert!(FeatureConfigPartial::default().workspace_config.is_none());
+        for source in ["", "[feature]\n", "[feature.workspace_config]\n"] {
+            let partial = WorkerManifestConfig::from_toml(source).unwrap();
+            assert!(
+                !FeatureConfig::from(partial.feature)
+                    .workspace_config
+                    .enabled
+            );
+        }
+        for source in ["{}", r#"{"workspace_config": {}}"#] {
+            let feature: FeatureConfig = serde_json::from_str(source).unwrap();
+            assert!(!feature.workspace_config.enabled);
+        }
+    }
+
+    #[test]
+    fn workspace_config_enabled_only_merges_and_roundtrips_snapshots() {
+        for enabled in [false, true] {
+            let lower = WorkerManifestConfig::from_toml(&format!(
+                "[feature.workspace_config]\nenabled = {enabled}\n"
+            ))
+            .unwrap();
+            let empty = WorkerManifestConfig::from_toml("[feature.workspace_config]\n").unwrap();
+            let manifest: WorkerManifest = minimal_valid()
+                .merge(lower.clone())
+                .merge(empty)
+                .try_into()
+                .unwrap();
+            assert_eq!(manifest.feature.workspace_config.enabled, enabled);
+            assert!(!manifest.feature.manage_workdir.enabled);
+            let partial = FeatureConfigPartial::from(manifest.feature.clone());
+            assert_eq!(
+                partial.workspace_config.as_ref().unwrap().enabled,
+                Some(enabled)
+            );
+            let serialized = toml::to_string(&partial).unwrap();
+            let restored: FeatureConfigPartial = toml::from_str(&serialized).unwrap();
+            assert_eq!(FeatureConfig::from(restored), manifest.feature);
+            let json = serde_json::to_value(&manifest.feature).unwrap();
+            assert_eq!(
+                json["workspace_config"],
+                serde_json::json!({"enabled": enabled})
+            );
+            assert_eq!(
+                serde_json::from_value::<FeatureConfig>(json).unwrap(),
+                manifest.feature
+            );
+            let snapshot = crate::write_persisted_worker_manifest_snapshot(&manifest).unwrap();
+            assert_eq!(
+                crate::read_persisted_worker_manifest_snapshot(snapshot.clone())
+                    .unwrap()
+                    .feature
+                    .workspace_config
+                    .enabled,
+                enabled
+            );
+            let mut old_snapshot = snapshot;
+            old_snapshot["manifest"]["feature"]
+                .as_object_mut()
+                .unwrap()
+                .remove("workspace_config");
+            assert!(
+                !crate::read_persisted_worker_manifest_snapshot(old_snapshot)
+                    .unwrap()
+                    .feature
+                    .workspace_config
+                    .enabled
+            );
+            let upper = WorkerManifestConfig::from_toml(&format!(
+                "[feature.workspace_config]\nenabled = {}\n",
+                !enabled
+            ))
+            .unwrap();
+            let manifest: WorkerManifest = minimal_valid()
+                .merge(lower)
+                .merge(upper)
+                .try_into()
+                .unwrap();
+            assert_eq!(manifest.feature.workspace_config.enabled, !enabled);
+        }
+    }
+
+    #[test]
+    fn workspace_config_rejects_manifest_authority_fields() {
+        for (field, value) in [
+            ("grant_id", "\"grant-1\""),
+            ("workspace_id", "\"workspace-1\""),
+            ("access", "\"read_write\""),
+            ("config_root", "\"/host/config\""),
+            ("source", "\"config\""),
+        ] {
+            let source = format!("[feature.workspace_config]\nenabled = true\n{field} = {value}\n");
+            assert!(WorkerManifestConfig::from_toml(&source).is_err(), "{field}");
+            assert!(
+                toml::from_str::<FeatureConfig>(&format!(
+                    "[workspace_config]\nenabled = true\n{field} = {value}\n"
+                ))
+                .is_err(),
+                "{field}"
+            );
+        }
     }
 
     #[test]

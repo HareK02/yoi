@@ -1583,6 +1583,15 @@ where
         );
     }
     let wip_mode = worker.manifest().worker.mode == manifest::WorkerMode::Wip;
+    let workspace_config_feature =
+        crate::feature::builtin::workspace_config::WorkspaceConfigFeature::configured(
+            worker.workspace_client_handle(),
+            feature_config.workspace_config.enabled,
+            wip_mode,
+        );
+    if let Some(module) = &workspace_config_feature {
+        feature_registry.add_module(module.clone());
+    }
     let mut workdir_wip_feature = None;
     if feature_config.manage_workdir.enabled
         || (wip_mode
@@ -1674,6 +1683,18 @@ where
     let host_worker_observation_provider = worker.worker_observation_provider();
     let wip_permissions = worker.manifest().permissions.clone();
     let mut wip_mount_registry = crate::wip::WipMountRegistry::new();
+    if let Some(feature) = &workspace_config_feature {
+        crate::feature::builtin::workspace_config::wip::mount_workspace_config_wip(
+            &mut wip_mount_registry,
+            feature,
+        )
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("mount Workspace config WIP projection: {error}"),
+            )
+        })?;
+    }
     if wip_mode && !backend_job_profile {
         crate::checkout::mount_checkouts(
             &mut wip_mount_registry,

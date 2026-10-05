@@ -27,6 +27,11 @@ export function sidebarWorkdirMeta(
 
 function attachmentLabel(attachment: SidebarWorkdirAttachment): string {
   const workdir = attachment.working_directory;
+  if (workdir?.source.kind === "workspace_config") {
+    // Catalog access is the grant ceiling, not this connection's effective
+    // restriction. The invocation result reports effective attachment access.
+    return clean(workdir.display_name) ?? "Workspace config";
+  }
   if (workdir?.source.kind === "external_grant") {
     return clean(workdir.display_name) ?? "external";
   }

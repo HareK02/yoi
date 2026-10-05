@@ -11,6 +11,7 @@ pub use api_macros::axum as server_support;
 pub use api_macros::reqwest as client_support;
 pub use api_macros::{ApiContract, BinaryBody, HttpMethod, TransportMetadata, WebSocketOperation};
 pub mod repository_openapi_typescript;
+mod workspace_config;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -18,6 +19,7 @@ use webauthn_rs_proto::{
     CreationChallengeResponse, PublicKeyCredential, RegisterPublicKeyCredential,
     RequestChallengeResponse,
 };
+pub use workspace_config::*;
 
 #[allow(dead_code)]
 #[derive(JsonSchema)]
@@ -200,6 +202,22 @@ impl_openapi_schema!(
     CurrentWorkerWorkdirDetachQuery,
     CurrentWorkerWorkdirOperationRequest,
     CurrentWorkerWorkdirOperationResponse,
+    WorkspaceConfigAccess,
+    WorkspaceConfigNodeKind,
+    WorkspaceConfigFailureClassification,
+    WorkspaceConfigAttachRequest,
+    WorkspaceConfigAttachment,
+    WorkspaceConfigCurrentResponse,
+    WorkspaceConfigObserveRequest,
+    WorkspaceConfigNode,
+    WorkspaceConfigObserveResponse,
+    WorkspaceConfigReadRequest,
+    WorkspaceConfigReadResponse,
+    WorkspaceConfigCommitRequest,
+    WorkspaceConfigCommitResponse,
+    WorkspaceConfigApiError,
+    WorkspaceConfigGrantCreateRequest,
+    WorkspaceConfigGrantResponse,
     ExternalWorkdirGrantCreateRequest,
     ExternalWorkdirGrantResponse,
     WorkspaceResponse,
@@ -2570,6 +2588,55 @@ pub trait ServerApi {
         #[path] working_directory_id: String,
         #[body] request: WorkingDirectoryRemovalRequest,
     ) -> Result<WorkingDirectoryRemovalResponse, RepositoryApiError>;
+    #[get("/api/w/{workspace_id}/workers/self/workspace-config", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,500,503], openapi = false)]
+    async fn current_worker_workspace_config_get(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+    ) -> Result<WorkspaceConfigCurrentResponse, WorkspaceConfigApiError>;
+    #[post("/api/w/{workspace_id}/workers/self/workspace-config", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,500,503], openapi = false)]
+    async fn current_worker_workspace_config_attach(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: WorkspaceConfigAttachRequest,
+    ) -> Result<WorkspaceConfigAttachment, WorkspaceConfigApiError>;
+    #[post("/api/w/{workspace_id}/workers/self/workspace-config/observe", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,500,503], openapi = false)]
+    async fn current_worker_workspace_config_observe(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: WorkspaceConfigObserveRequest,
+    ) -> Result<WorkspaceConfigObserveResponse, WorkspaceConfigApiError>;
+    #[post("/api/w/{workspace_id}/workers/self/workspace-config/read", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,500,503], openapi = false)]
+    async fn current_worker_workspace_config_read(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: WorkspaceConfigReadRequest,
+    ) -> Result<WorkspaceConfigReadResponse, WorkspaceConfigApiError>;
+    #[post("/api/w/{workspace_id}/workers/self/workspace-config/commit", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,500,503], openapi = false)]
+    async fn current_worker_workspace_config_commit(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: WorkspaceConfigCommitRequest,
+    ) -> Result<WorkspaceConfigCommitResponse, WorkspaceConfigApiError>;
+    #[post("/api/w/{workspace_id}/workspace-config-grants", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,500], bearer_auth = true, browser_auth = true)]
+    async fn workspace_config_grant_create(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[body] request: WorkspaceConfigGrantCreateRequest,
+    ) -> Result<WorkspaceConfigGrantResponse, WorkspaceConfigApiError>;
+    #[delete("/api/w/{workspace_id}/workspace-config-grants/{grant_id}", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,500], bearer_auth = true, browser_auth = true)]
+    async fn workspace_config_grant_revoke(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] grant_id: String,
+    ) -> Result<WorkspaceConfigGrantResponse, WorkspaceConfigApiError>;
+
     #[get(
         "/api/w/{workspace_id}/workers/self/workdir-catalog",
         status = 200,
@@ -6323,6 +6390,7 @@ pub struct Diagnostic {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkingDirectoryMaterializerKind {
+    LogicalWorkspaceConfig,
     #[default]
     RuntimeGitClone,
     ClientHostedExternal,
@@ -6462,6 +6530,11 @@ pub struct RuntimeWorkingDirectorySummary {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkingDirectorySource {
+    WorkspaceConfig {
+        access: WorkspaceConfigAccess,
+        content_path: String,
+        purpose: String,
+    },
     Repository {
         repository_key: String,
     },
@@ -10723,6 +10796,22 @@ pub fn legacy_catalog_typescript() -> String {
         ToolchainContract::decl(&config),
         WorkspaceConfigTreeResponse::decl(&config),
         ConfigCommitRequest::decl(&config),
+        WorkspaceConfigAccess::decl(&config),
+        WorkspaceConfigNodeKind::decl(&config),
+        WorkspaceConfigFailureClassification::decl(&config),
+        WorkspaceConfigAttachRequest::decl(&config),
+        WorkspaceConfigAttachment::decl(&config),
+        WorkspaceConfigCurrentResponse::decl(&config),
+        WorkspaceConfigObserveRequest::decl(&config),
+        WorkspaceConfigNode::decl(&config),
+        WorkspaceConfigObserveResponse::decl(&config),
+        WorkspaceConfigReadRequest::decl(&config),
+        WorkspaceConfigReadResponse::decl(&config),
+        WorkspaceConfigCommitRequest::decl(&config),
+        WorkspaceConfigCommitResponse::decl(&config),
+        WorkspaceConfigApiError::decl(&config),
+        WorkspaceConfigGrantCreateRequest::decl(&config),
+        WorkspaceConfigGrantResponse::decl(&config),
         ProfileSettingsResponse::decl(&config),
         WorkspaceProfileSummary::decl(&config),
         WorkspaceProfileSourceSummary::decl(&config),
@@ -13214,6 +13303,11 @@ mod openapi_artifact_tests {
         // identity, or a one-use Reviewer capability. They remain generated Rust client/Axum
         // operations, but must not appear as unauthenticated operations in the public OpenAPI.
         const SIGNED_INTERNAL: &[&str] = &[
+            "current_worker_workspace_config_get",
+            "current_worker_workspace_config_attach",
+            "current_worker_workspace_config_observe",
+            "current_worker_workspace_config_read",
+            "current_worker_workspace_config_commit",
             "current_worker_workdir_catalog",
             "current_worker_workdir_attachment_list",
             "current_worker_workdir_attach",

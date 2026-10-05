@@ -269,6 +269,107 @@ export type ConfigCommitRequest = {
   entrypoints: Array<string>;
 };
 
+export type WorkspaceConfigAccess = "read_only" | "read_write";
+
+export type WorkspaceConfigNodeKind = "directory" | "file" | "missing";
+
+export type WorkspaceConfigFailureClassification = "not_committed" | "unknown";
+
+export type WorkspaceConfigAttachRequest = {
+  alias: string | null;
+  access: WorkspaceConfigAccess | null;
+};
+
+export type WorkspaceConfigAttachment = {
+  workspace_id: string;
+  connection_id: string;
+  alias: string;
+  working_directory_id: string;
+  access: WorkspaceConfigAccess;
+  name: string;
+  purpose: string;
+  content_path: string;
+  already_attached: boolean;
+};
+
+export type WorkspaceConfigCurrentResponse = WorkspaceConfigAttachment | null;
+
+export type WorkspaceConfigObserveRequest = {
+  connection_id: string;
+  paths: Array<string>;
+  depth: number;
+};
+
+export type WorkspaceConfigNode = {
+  path: string;
+  kind: WorkspaceConfigNodeKind;
+  validator: string;
+  digest: string | null;
+  content_type: ConfigContentType | null;
+  operations: Array<string>;
+};
+
+export type WorkspaceConfigObserveResponse = {
+  connection_id: string;
+  validator: string;
+  revision: number;
+  digest: string;
+  /**
+   * Canonical commit entrypoints from this exact metadata snapshot.
+   */
+  entrypoints: Array<string>;
+  nodes: Array<WorkspaceConfigNode>;
+};
+
+export type WorkspaceConfigReadRequest = {
+  connection_id: string;
+  path: string;
+  validator: string;
+};
+
+export type WorkspaceConfigReadResponse = {
+  path: string;
+  content: string;
+  content_type: ConfigContentType;
+  digest: string;
+  validator: string;
+};
+
+export type WorkspaceConfigCommitRequest = {
+  connection_id: string;
+  validator: string;
+  request: ConfigCommitRequest;
+};
+
+export type WorkspaceConfigCommitResponse = {
+  validator: string;
+  revision: number;
+  digest: string;
+};
+
+export type WorkspaceConfigApiError = {
+  status: number;
+  code: string;
+  message: string;
+  classification: WorkspaceConfigFailureClassification;
+};
+
+export type WorkspaceConfigGrantCreateRequest = {
+  runtime_id: string;
+  worker_id: string;
+  access: WorkspaceConfigAccess;
+};
+
+export type WorkspaceConfigGrantResponse = {
+  grant_id: string;
+  workspace_id: string;
+  runtime_id: string;
+  worker_id: string;
+  working_directory_id: string;
+  access: WorkspaceConfigAccess;
+  revoked: boolean;
+};
+
 export type ProfileSettingsResponse = {
   workspace_id: string;
   registry_revision: string;

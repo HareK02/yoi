@@ -1,3 +1,5 @@
+#[path = "server_workspace_config.rs"]
+mod workspace_config;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
@@ -4985,6 +4987,7 @@ impl WorkspaceApi {
                             .map_err(RuntimeRegistryError::into_error)?;
                     }
                 }
+                WorkdirRegistrySource::WorkspaceConfig { .. } => continue,
                 WorkdirRegistrySource::ExternalGrant { grant_id } => {
                     let grant = self
                         .store
@@ -5151,7 +5154,8 @@ impl WorkspaceApi {
                     runtime_id,
                     repository_id,
                 } => (runtime_id, repository_id),
-                WorkdirRegistrySource::ExternalGrant { .. } => {
+                WorkdirRegistrySource::ExternalGrant { .. }
+                | WorkdirRegistrySource::WorkspaceConfig { .. } => {
                     return Err(Error::InvalidInput(format!(
                         "Ticket `{ticket_id}` attachment `{}` is an ExternalGrant and cannot satisfy a persisted Repository target",
                         claim.alias
@@ -5294,6 +5298,9 @@ fn workdir_source_capabilities(
 ) -> Result<workdir::WorkdirSessionCapabilities> {
     match &workdir.source {
         WorkdirRegistrySource::Repository { .. } => Ok(workdir::WorkdirSessionCapabilities::ALL),
+        WorkdirRegistrySource::WorkspaceConfig { grant_id } => {
+            workspace_config::grant_capabilities(api, grant_id)
+        }
         WorkdirRegistrySource::ExternalGrant { grant_id } => api
             .store
             .get_external_workdir_grant(&api.config.workspace_id, grant_id)?
@@ -5399,6 +5406,14 @@ fn ticket_target_capabilities_for_workdir(
     workdir: &WorkdirRegistryRecord,
 ) -> Result<workdir::WorkdirSessionCapabilities> {
     let source_capabilities = workdir_source_capabilities(api, workdir)?;
+    if let WorkdirRegistrySource::WorkspaceConfig { grant_id } = &workdir.source {
+        if !workspace_config::granted_to(api, worker, grant_id) {
+            return Err(Error::WorkspacePermissionDenied(
+                "Workspace config grant unavailable".into(),
+            ));
+        }
+        return Ok(source_capabilities);
+    }
     let Some(assignment) = api
         .store
         .get_current_ticket_role_assignment_for_worker(&api.config.workspace_id, worker)?
@@ -5501,12 +5516,23 @@ fn validate_manual_ticket_coder_workdir_binding(
             ))
             .into());
         }
+        if let WorkdirRegistrySource::WorkspaceConfig { grant_id } = &workdir.source {
+            if !workspace_config::granted_to(api, worker, grant_id) {
+                return Err(Error::WorkspacePermissionDenied(
+                    "Workspace config grant unavailable".into(),
+                )
+                .into());
+            }
+            effective_links.push(link.clone());
+            continue;
+        }
         let (workdir_runtime_id, repository_id) = match &workdir.source {
             WorkdirRegistrySource::Repository {
                 runtime_id,
                 repository_id,
             } => (runtime_id, repository_id),
-            WorkdirRegistrySource::ExternalGrant { .. } => {
+            WorkdirRegistrySource::ExternalGrant { .. }
+            | WorkdirRegistrySource::WorkspaceConfig { .. } => {
                 return Err(Error::InvalidInput(format!(
                     "Ticket `{ticket_id}` attachment `{}` is an ExternalGrant and cannot satisfy a persisted Repository target",
                     link.alias
@@ -6042,6 +6068,19 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
             service.clone(),
         ))
         .merge(server_api::server_api_axum::current_worker_workdir_catalog(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::current_worker_workspace_config_get(service.clone()))
+        .merge(server_api::server_api_axum::current_worker_workspace_config_attach(service.clone()))
+        .merge(
+            server_api::server_api_axum::current_worker_workspace_config_observe(service.clone()),
+        )
+        .merge(server_api::server_api_axum::current_worker_workspace_config_read(service.clone()))
+        .merge(server_api::server_api_axum::current_worker_workspace_config_commit(service.clone()))
+        .merge(server_api::server_api_axum::workspace_config_grant_create(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::workspace_config_grant_revoke(
             service.clone(),
         ))
         .merge(server_api::server_api_axum::current_worker_workdir_attachment_list(service.clone()))
@@ -10579,6 +10618,110 @@ impl server_api::ServerApi for ServerApiContractService {
         .map_err(ApiError::into_repository_api_error)
     }
 
+    async fn current_worker_workspace_config_get(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+    ) -> std::result::Result<
+        server_api::WorkspaceConfigCurrentResponse,
+        server_api::WorkspaceConfigApiError,
+    > {
+        let api = self.workspace_api().map_err(|_| {
+            workspace_config::pre_error(Error::Store("Workspace unavailable".into()))
+        })?;
+        let worker = workspace_config::identity(api, &context, &workspace_id)?;
+        workspace_config::get(api, &worker)
+            .await
+            .map(server_api::WorkspaceConfigCurrentResponse)
+    }
+    async fn current_worker_workspace_config_attach(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::WorkspaceConfigAttachRequest,
+    ) -> std::result::Result<
+        server_api::WorkspaceConfigAttachment,
+        server_api::WorkspaceConfigApiError,
+    > {
+        let api = self.workspace_api().map_err(|_| {
+            workspace_config::pre_error(Error::Store("Workspace unavailable".into()))
+        })?;
+        let worker = workspace_config::identity(api, &context, &workspace_id)?;
+        workspace_config::attach(api, &worker, request).await
+    }
+    async fn current_worker_workspace_config_observe(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::WorkspaceConfigObserveRequest,
+    ) -> std::result::Result<
+        server_api::WorkspaceConfigObserveResponse,
+        server_api::WorkspaceConfigApiError,
+    > {
+        let api = self.workspace_api().map_err(|_| {
+            workspace_config::pre_error(Error::Store("Workspace unavailable".into()))
+        })?;
+        let worker = workspace_config::identity(api, &context, &workspace_id)?;
+        workspace_config::observe(api, &worker, request).await
+    }
+    async fn current_worker_workspace_config_read(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::WorkspaceConfigReadRequest,
+    ) -> std::result::Result<
+        server_api::WorkspaceConfigReadResponse,
+        server_api::WorkspaceConfigApiError,
+    > {
+        let api = self.workspace_api().map_err(|_| {
+            workspace_config::pre_error(Error::Store("Workspace unavailable".into()))
+        })?;
+        let worker = workspace_config::identity(api, &context, &workspace_id)?;
+        workspace_config::read(api, &worker, request).await
+    }
+    async fn current_worker_workspace_config_commit(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::WorkspaceConfigCommitRequest,
+    ) -> std::result::Result<
+        server_api::WorkspaceConfigCommitResponse,
+        server_api::WorkspaceConfigApiError,
+    > {
+        let api = self.workspace_api().map_err(|_| {
+            workspace_config::pre_error(Error::Store("Workspace unavailable".into()))
+        })?;
+        let worker = workspace_config::identity(api, &context, &workspace_id)?;
+        workspace_config::commit(api, &worker, request).await
+    }
+    async fn workspace_config_grant_create(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        request: server_api::WorkspaceConfigGrantCreateRequest,
+    ) -> std::result::Result<
+        server_api::WorkspaceConfigGrantResponse,
+        server_api::WorkspaceConfigApiError,
+    > {
+        let api = self.workspace_api().map_err(|_| {
+            workspace_config::pre_error(Error::Store("Workspace unavailable".into()))
+        })?;
+        workspace_config::create_grant(api, &actor, &workspace_id, request).await
+    }
+    async fn workspace_config_grant_revoke(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        grant_id: String,
+    ) -> std::result::Result<
+        server_api::WorkspaceConfigGrantResponse,
+        server_api::WorkspaceConfigApiError,
+    > {
+        let api = self.workspace_api().map_err(|_| {
+            workspace_config::pre_error(Error::Store("Workspace unavailable".into()))
+        })?;
+        workspace_config::revoke_grant(api, &actor, &workspace_id, &grant_id).await
+    }
     async fn current_worker_workdir_catalog(
         &self,
         context: server_api::ServerRequestContext,
@@ -10591,14 +10734,19 @@ impl server_api::ServerApi for ServerApiContractService {
         let api = self.workspace_api()?;
         validate_workspace_scope(api, &workspace_id)
             .map_err(ApiError::into_repository_api_error)?;
-        current_worker_identity(
+        let worker = current_worker_identity(
             api,
             &workspace_id,
             &current_worker_contract_headers(&context)?,
         )
         .map_err(ApiError::from)
         .map_err(ApiError::into_repository_api_error)?;
-        list_current_worker_workdir_catalog(api, query).map_err(ApiError::into_repository_api_error)
+        {
+            let session_lock = current_worker_session_lock(api, &worker);
+            let _guard = session_lock.lock().await;
+            list_current_worker_workdir_catalog_for_worker(api, &worker, query)
+        }
+        .map_err(ApiError::into_repository_api_error)
     }
 
     async fn current_worker_workdir_attachment_list(
@@ -12185,35 +12333,68 @@ async fn scoped_commit_workspace_config_tree(
 ) -> ApiResult<(StatusCode, Json<server_api::WorkspaceConfigTreeResponse>)> {
     let request = config_commit_request_from_api(request)?;
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let candidate = api
-        .config_store
-        .evaluate_workspace_config_candidate_with_schema(
-            &path.workspace_id,
-            &request,
-            api.config_schema_registry.compose()?,
-        )?;
-    crate::prompt_settings::validate_evaluated_prompt_catalog(&candidate.evaluation)?;
-    project_repository_access_candidate(
-        &*api.store,
-        &api.repository_secrets,
-        &path.workspace_id,
-        &candidate,
-    )?;
-    let state = api
-        .config_store
-        .commit_evaluated_workspace_config(&path.workspace_id, &candidate)?;
-    if let Ok(projection) = api
-        .prompt_projection_cache
-        .resolve(&path.workspace_id, &state)
-    {
-        let _diagnostics = api
-            .runtime
-            .observe_workspace_prompt_projection((*projection).clone());
-    }
+    let state = commit_workspace_config_tree(&api, &path.workspace_id, &request)?;
     Ok((
         StatusCode::CREATED,
         Json(workspace_config_state_to_api(state)),
     ))
+}
+
+/// Shared canonical commit and activation boundary for UI and logical config operations.
+/// Callers must authorize access before entering this boundary.
+///
+/// Repository access projection may materialize a default credential before the
+/// config CAS commits. An error here therefore does not promise that every
+/// auxiliary side effect was rolled back. Prompt publication is best effort,
+/// exactly as it is for UI saves, and must not turn a committed save into an error.
+fn commit_workspace_config_tree(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    request: &ConfigCommitRequest,
+) -> Result<crate::config_source::WorkspaceConfigState> {
+    let candidate = prepare_workspace_config_tree(api, workspace_id, request)?;
+    persist_workspace_config_candidate(api, workspace_id, &candidate)
+}
+
+fn prepare_workspace_config_tree(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    request: &ConfigCommitRequest,
+) -> Result<crate::config_source::EvaluatedConfigCandidate> {
+    let candidate = api
+        .config_store
+        .evaluate_workspace_config_candidate_with_schema(
+            workspace_id,
+            request,
+            api.config_schema_registry.compose()?,
+        )?;
+    crate::config_source::validate_workspace_config_candidate_projections(
+        workspace_id,
+        &candidate,
+    )?;
+    Ok(candidate)
+}
+
+fn persist_workspace_config_candidate(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    candidate: &crate::config_source::EvaluatedConfigCandidate,
+) -> Result<crate::config_source::WorkspaceConfigState> {
+    project_repository_access_candidate(
+        &*api.store,
+        &api.repository_secrets,
+        workspace_id,
+        candidate,
+    )?;
+    let state = api
+        .config_store
+        .commit_evaluated_workspace_config(workspace_id, &candidate)?;
+    if let Ok(projection) = api.prompt_projection_cache.resolve(workspace_id, &state) {
+        let _diagnostics = api
+            .runtime
+            .observe_workspace_prompt_projection((*projection).clone());
+    }
+    Ok(state)
 }
 
 async fn scoped_get_profile_settings(
@@ -16184,6 +16365,14 @@ async fn open_current_worker_workdir_session_locked(
                 link.workdir_id
             ),
         })?;
+    if matches!(
+        workdir.source,
+        WorkdirRegistrySource::WorkspaceConfig { .. }
+    ) {
+        return Err(Error::WorkspacePermissionDenied(
+            "Logical config has no filesystem session".into(),
+        ));
+    }
     let effective_capabilities =
         effective_worker_workdir_capabilities(api, worker, &workdir, link.capabilities)?;
     if let WorkdirRegistrySource::ExternalGrant { grant_id } = &workdir.source {
@@ -16263,7 +16452,8 @@ async fn open_current_worker_workdir_session_locked(
             runtime_id,
             repository_id,
         } => (runtime_id.as_str(), repository_id.as_str()),
-        WorkdirRegistrySource::ExternalGrant { .. } => {
+        WorkdirRegistrySource::ExternalGrant { .. }
+        | WorkdirRegistrySource::WorkspaceConfig { .. } => {
             return Err(Error::RuntimeOperationFailed {
                 runtime_id: "workspace-backend".to_string(),
                 code: "external_workdir_provider_unavailable".to_string(),
@@ -16389,6 +16579,15 @@ fn sync_runtime_worker_workdir_attachments(
         .list_worker_workdir_links(&api.config.workspace_id, worker)?
         .into_iter()
         .filter(|link| link.unlinked_at.is_none())
+        .filter(|link| {
+            api.store
+                .get_workdir_registry(&api.config.workspace_id, &link.workdir_id)
+                .ok()
+                .flatten()
+                .is_none_or(|record| {
+                    !matches!(record.source, WorkdirRegistrySource::WorkspaceConfig { .. })
+                })
+        })
         .map(|mut link| {
             let workdir = api
                 .store
@@ -16446,6 +16645,15 @@ async fn refresh_current_worker_session_locked(
         .list_worker_workdir_links(&api.config.workspace_id, worker)?
         .into_iter()
         .filter(|link| link.unlinked_at.is_none())
+        .filter(|link| {
+            api.store
+                .get_workdir_registry(&api.config.workspace_id, &link.workdir_id)
+                .ok()
+                .flatten()
+                .is_none_or(|record| {
+                    !matches!(record.source, WorkdirRegistrySource::WorkspaceConfig { .. })
+                })
+        })
         .collect::<Vec<_>>();
     if remaining.len() == 1 {
         open_current_worker_workdir_session_locked(api, worker, &remaining[0]).await?;
@@ -16529,6 +16737,12 @@ async fn scoped_attach_current_worker_workdir(
     }
     match &workdir.source {
         WorkdirRegistrySource::Repository { .. } => {}
+        WorkdirRegistrySource::WorkspaceConfig { .. } => {
+            return Err(Error::WorkspacePermissionDenied(
+                "Use the grant-bound Workspace config attachment operation".into(),
+            )
+            .into());
+        }
         WorkdirRegistrySource::ExternalGrant { grant_id } => {
             let grant = api
                 .store
@@ -16633,6 +16847,15 @@ async fn scoped_attach_current_worker_workdir(
         .list_worker_workdir_links(&api.config.workspace_id, &worker)?
         .into_iter()
         .filter(|link| link.unlinked_at.is_none())
+        .filter(|link| {
+            api.store
+                .get_workdir_registry(&api.config.workspace_id, &link.workdir_id)
+                .ok()
+                .flatten()
+                .is_none_or(|record| {
+                    !matches!(record.source, WorkdirRegistrySource::WorkspaceConfig { .. })
+                })
+        })
         .count();
     if active_count == 1
         && let Err(error) = open_current_worker_workdir_session_locked(&api, &worker, &link).await
@@ -16670,8 +16893,21 @@ async fn scoped_attach_current_worker_workdir(
     }))
 }
 
+#[cfg(test)]
 fn list_current_worker_workdir_catalog(
     api: &WorkspaceApi,
+    query: server_api::CurrentWorkerWorkdirCatalogQuery,
+) -> ApiResult<server_api::CurrentWorkerWorkdirCatalogResponse> {
+    list_current_worker_workdir_catalog_for_worker(
+        api,
+        &RuntimeWorkerRef::new("catalog-test", "ungranted"),
+        query,
+    )
+}
+
+fn list_current_worker_workdir_catalog_for_worker(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
     query: server_api::CurrentWorkerWorkdirCatalogQuery,
 ) -> ApiResult<server_api::CurrentWorkerWorkdirCatalogResponse> {
     // No Runtime inventory refresh: both projection inputs and complete digest are authoritative
@@ -16685,6 +16921,19 @@ fn list_current_worker_workdir_catalog(
         .entries
         .into_iter()
         .filter_map(|entry| {
+            if let WorkdirRegistrySource::WorkspaceConfig { grant_id } = &entry.record.source {
+                if !workspace_config::granted_to(api, worker, grant_id) {
+                    return None;
+                }
+                let grant = api
+                    .store
+                    .get_workspace_config_grant(&api.config.workspace_id, grant_id)
+                    .ok()
+                    .flatten()?;
+                let mut summary = workspace_config::summary(&grant, &entry.record);
+                summary.occupied_by = entry.occupied_by.map(Into::into);
+                return Some(summary);
+            }
             if matches!(
                 entry.record.source,
                 WorkdirRegistrySource::ExternalGrant { .. }
@@ -16818,6 +17067,15 @@ async fn detach_current_worker_workdir(
         .list_worker_workdir_links(&api.config.workspace_id, worker)?
         .into_iter()
         .filter(|link| link.unlinked_at.is_none())
+        .filter(|link| {
+            api.store
+                .get_workdir_registry(&api.config.workspace_id, &link.workdir_id)
+                .ok()
+                .flatten()
+                .is_none_or(|record| {
+                    !matches!(record.source, WorkdirRegistrySource::WorkspaceConfig { .. })
+                })
+        })
         .collect::<Vec<_>>();
     if remaining.len() == 1
         && let Err(error) =
@@ -24143,6 +24401,20 @@ async fn scoped_working_directory_detail(
             code: "working_directory_not_found".to_string(),
             message: format!("Unknown Workdir `{}`", path.working_directory_id),
         })?;
+    if let WorkdirRegistrySource::WorkspaceConfig { grant_id } = &record.source {
+        let grant = api
+            .store
+            .get_workspace_config_grant(&api.config.workspace_id, grant_id)?
+            .ok_or_else(|| {
+                Error::WorkspacePermissionDenied("Workspace config grant unavailable".into())
+            })?;
+        return Ok(Json(BrowserWorkingDirectoryDetailResponse {
+            workspace_id: api.config.workspace_id.clone(),
+            runtime_id: None,
+            item: workspace_config::summary(&grant, &record),
+            diagnostics: vec![],
+        }));
+    }
     if let Some(runtime_id) = record.source.runtime_id().map(str::to_string) {
         working_directory_detail_for_runtime(api, &runtime_id, &path.working_directory_id)
     } else {
@@ -30790,6 +31062,9 @@ fn working_directory_summaries(
         .list_workdir_registry(&api.config.workspace_id, 200)?;
     let mut items = Vec::new();
     for record in records {
+        if matches!(record.source, WorkdirRegistrySource::WorkspaceConfig { .. }) {
+            continue;
+        }
         if let Some(grant_id) = legacy_external_workdir_grant_id(api, &record)? {
             diagnostics.push(RuntimeDiagnostic {
                 code: "external_workdir_legacy_permissions".to_string(),
@@ -30818,6 +31093,9 @@ fn available_working_directory_summaries(
         .list_workdir_registry(&api.config.workspace_id, 200)?;
     let mut available = Vec::new();
     for record in records {
+        if matches!(record.source, WorkdirRegistrySource::WorkspaceConfig { .. }) {
+            continue;
+        }
         if legacy_external_workdir_grant_id(api, &record)?.is_some() {
             continue;
         }
@@ -30827,6 +31105,7 @@ fn available_working_directory_summaries(
                 summary.cleanliness.as_deref() == Some("clean")
             }
             WorkdirRegistrySource::ExternalGrant { .. } => true,
+            WorkdirRegistrySource::WorkspaceConfig { .. } => false,
         };
         if summary.status != WorkingDirectoryStatusKind::Active || !source_is_available {
             continue;
@@ -31057,6 +31336,30 @@ fn project_worker_registry_projection(
         else {
             continue;
         };
+        if let WorkdirRegistrySource::WorkspaceConfig { grant_id } = &workdir.source {
+            if !workspace_config::granted_to(api, &record.worker, grant_id) {
+                continue;
+            }
+            let grant = api
+                .store
+                .get_workspace_config_grant(&api.config.workspace_id, grant_id)?
+                .ok_or_else(|| {
+                    Error::WorkspacePermissionDenied("Workspace config grant unavailable".into())
+                })?;
+            workdir_attachments.push(server_api::WorkerWorkdirAttachmentSummary {
+                alias: link.alias,
+                effective_permissions: workdir_permission_summary(
+                    effective_worker_workdir_capabilities(
+                        api,
+                        &record.worker,
+                        workdir,
+                        link.capabilities,
+                    )?,
+                ),
+                working_directory: workspace_config::summary(&grant, workdir),
+            });
+            continue;
+        }
         let effective_permissions = workdir_permission_summary(
             effective_worker_workdir_capabilities(api, &record.worker, workdir, link.capabilities)?,
         );
@@ -31458,6 +31761,9 @@ fn workdir_summary_from_record(
         _ => WorkingDirectoryStatusKind::Unknown,
     };
     let (source, materializer_kind, cleanup_target) = match &record.source {
+        WorkdirRegistrySource::WorkspaceConfig { .. } => {
+            unreachable!("logical config never enters filesystem summary")
+        }
         WorkdirRegistrySource::Repository { .. } => {
             let repository_key =
                 repository_key.expect("Repository Workdir projection requires key");
@@ -31537,6 +31843,11 @@ fn projected_workdir_summary_from_record(
     record: &WorkdirRegistryRecord,
 ) -> Result<WorkingDirectorySummary> {
     let (repository_key, external_grant_permissions) = match &record.source {
+        WorkdirRegistrySource::WorkspaceConfig { .. } => {
+            return Err(Error::WorkspacePermissionDenied(
+                "Logical config is not a filesystem Workdir".into(),
+            ));
+        }
         WorkdirRegistrySource::Repository { repository_id, .. } => (
             Some(
                 api.store
@@ -32761,6 +33072,7 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
+    include!("server_workspace_config_tests.rs");
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;

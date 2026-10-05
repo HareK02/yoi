@@ -41,6 +41,7 @@ export function defaultWorkerLaunchForm(
   const availableWorkingDirectories =
     options?.working_directories.filter((directory) =>
       directory.status === "active" &&
+      directory.source.kind !== "workspace_config" &&
       (directory.source.kind === "external_grant" ||
         directory.cleanliness === "clean") &&
       directory.occupied_by == null

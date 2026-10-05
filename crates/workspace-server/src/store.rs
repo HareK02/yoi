@@ -28,7 +28,8 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 78;
+const LATEST_SCHEMA_VERSION: i64 = 79;
+const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
@@ -264,6 +265,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 78,
         name: WORKDIR_CONNECTION_ID_MIGRATION_NAME,
         apply: migrate_workdir_connection_id_v77_to_v78,
+    },
+    Migration {
+        version: 79,
+        name: WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME,
+        apply: migrate_workspace_config_v78_to_v79,
     },
 ];
 
@@ -900,6 +906,9 @@ pub struct WorkdirCreateOperationRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkdirRegistrySource {
+    WorkspaceConfig {
+        grant_id: String,
+    },
     Repository {
         runtime_id: String,
         repository_id: String,
@@ -913,20 +922,20 @@ impl WorkdirRegistrySource {
     pub fn runtime_id(&self) -> Option<&str> {
         match self {
             Self::Repository { runtime_id, .. } => Some(runtime_id),
-            Self::ExternalGrant { .. } => None,
+            Self::ExternalGrant { .. } | Self::WorkspaceConfig { .. } => None,
         }
     }
 
     pub fn repository_id(&self) -> Option<&str> {
         match self {
             Self::Repository { repository_id, .. } => Some(repository_id),
-            Self::ExternalGrant { .. } => None,
+            Self::ExternalGrant { .. } | Self::WorkspaceConfig { .. } => None,
         }
     }
 
     pub fn external_grant_id(&self) -> Option<&str> {
         match self {
-            Self::Repository { .. } => None,
+            Self::Repository { .. } | Self::WorkspaceConfig { .. } => None,
             Self::ExternalGrant { grant_id } => Some(grant_id),
         }
     }
@@ -1920,6 +1929,23 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         cursor: Option<&str>,
     ) -> Result<WorkdirCatalogPage>;
     fn delete_workdir_registry(&self, workspace_id: &str, workdir_id: &str) -> Result<bool>;
+
+    fn create_workspace_config_grant(
+        &self,
+        grant: &server_api::WorkspaceConfigGrantResponse,
+        actor: &str,
+    ) -> Result<()>;
+    fn get_workspace_config_grant(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<Option<server_api::WorkspaceConfigGrantResponse>>;
+    fn current_workspace_config_grant(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<server_api::WorkspaceConfigGrantResponse>>;
+    fn revoke_workspace_config_grant(&self, workspace_id: &str, grant_id: &str) -> Result<()>;
 
     fn create_external_workdir_grant(
         &self,
@@ -8849,13 +8875,13 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
 
     fn upsert_workdir_registry(&self, record: &WorkdirRegistryRecord) -> Result<()> {
         self.with_conn(|conn| {
-            conn.execute(
+            let changed = conn.execute(
                 r#"INSERT INTO workdir_registry (
                     workspace_id, workdir_id, display_name, source_kind, runtime_id, repository_id,
                     external_grant_id, creation_selector, creation_ref, creation_tree,
                     current_selector, current_ref, current_tree, observed_at_epoch_seconds,
-                    materialization_status, cleanliness, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                    materialization_status, cleanliness, created_at, updated_at, workspace_config_grant_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
                 ON CONFLICT(workspace_id, workdir_id) DO UPDATE SET
                     display_name = excluded.display_name,
                     source_kind = excluded.source_kind,
@@ -8871,12 +8897,13 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     observed_at_epoch_seconds = excluded.observed_at_epoch_seconds,
                     materialization_status = excluded.materialization_status,
                     cleanliness = excluded.cleanliness,
-                    updated_at = excluded.updated_at"#,
+                    updated_at = excluded.updated_at, workspace_config_grant_id = excluded.workspace_config_grant_id
+                    WHERE workdir_registry.source_kind != 'workspace_config' OR (excluded.source_kind = 'workspace_config' AND workdir_registry.workspace_config_grant_id = excluded.workspace_config_grant_id)"#,
                 params![
                     record.workspace_id,
                     record.workdir_id,
                     record.display_name,
-                    match &record.source { WorkdirRegistrySource::Repository { .. } => "repository", WorkdirRegistrySource::ExternalGrant { .. } => "external_grant" },
+                    match &record.source { WorkdirRegistrySource::Repository { .. } => "repository", WorkdirRegistrySource::ExternalGrant { .. } => "external_grant", WorkdirRegistrySource::WorkspaceConfig { .. } => "workspace_config" },
                     record.source.runtime_id(),
                     record.source.repository_id(),
                     record.source.external_grant_id(),
@@ -8891,8 +8918,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     record.cleanliness,
                     record.created_at,
                     record.updated_at,
+                    match &record.source { WorkdirRegistrySource::WorkspaceConfig { grant_id } => Some(grant_id.as_str()), _ => None },
                 ],
             )?;
+            if changed == 0 { return Err(Error::WorkspacePermissionDenied("Logical config source identity cannot be replaced by a Runtime observation".into())); }
             Ok(())
         })
     }
@@ -8999,6 +9028,16 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     }
 
     fn delete_workdir_registry(&self, workspace_id: &str, workdir_id: &str) -> Result<bool> {
+        if self
+            .get_workdir_registry(workspace_id, workdir_id)?
+            .is_some_and(|record| {
+                matches!(record.source, WorkdirRegistrySource::WorkspaceConfig { .. })
+            })
+        {
+            return Err(Error::WorkspacePermissionDenied(
+                "Logical config Workdir cleanup is unsupported; revoke its grant".into(),
+            ));
+        }
         self.with_conn(|conn| {
             let tx = rusqlite::Transaction::new_unchecked(
                 conn,
@@ -9027,6 +9066,41 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             tx.commit()?;
             Ok(changed > 0)
         })
+    }
+
+    fn create_workspace_config_grant(
+        &self,
+        grant: &server_api::WorkspaceConfigGrantResponse,
+        actor: &str,
+    ) -> Result<()> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let active: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM workspaces WHERE workspace_id=?1 AND owner_account_id=?2 AND state='active')", params![grant.workspace_id, actor], |row|row.get(0))?;
+            if !active { return Err(Error::WorkspacePermissionDenied("Workspace no longer accepts new grants".into())); }
+            let now = chrono::Utc::now().to_rfc3339();
+            let access = match grant.access { server_api::WorkspaceConfigAccess::ReadOnly => "read_only", server_api::WorkspaceConfigAccess::ReadWrite => "read_write" };
+            tx.execute("INSERT INTO workspace_config_grants (workspace_id,grant_id,runtime_id,worker_id,workdir_id,access,revoked,created_by,created_at) VALUES (?1,?2,?3,?4,?5,?6,0,?7,?8)", params![grant.workspace_id,grant.grant_id,grant.runtime_id,grant.worker_id,grant.working_directory_id,access,actor,now])?;
+            tx.execute("INSERT INTO workdir_registry (workspace_id,workdir_id,display_name,source_kind,workspace_config_grant_id,materialization_status,cleanliness,created_at,updated_at) VALUES (?1,?2,'Workspace configuration','workspace_config',?3,'present','clean',?4,?4)", params![grant.workspace_id,grant.working_directory_id,grant.grant_id,now])?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+    fn get_workspace_config_grant(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<Option<server_api::WorkspaceConfigGrantResponse>> {
+        self.with_conn(|conn| conn.query_row("SELECT workspace_id,grant_id,runtime_id,worker_id,workdir_id,access,revoked FROM workspace_config_grants WHERE workspace_id=?1 AND grant_id=?2", params![workspace_id,grant_id], read_workspace_config_grant).optional().map_err(Error::from))
+    }
+    fn current_workspace_config_grant(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<server_api::WorkspaceConfigGrantResponse>> {
+        self.with_conn(|conn| conn.query_row("SELECT workspace_id,grant_id,runtime_id,worker_id,workdir_id,access,revoked FROM workspace_config_grants WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND revoked=0", params![workspace_id,worker.runtime_id,worker.worker_id], read_workspace_config_grant).optional().map_err(Error::from))
+    }
+    fn revoke_workspace_config_grant(&self, workspace_id: &str, grant_id: &str) -> Result<()> {
+        self.with_conn_mut(|conn| { let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?; tx.execute("UPDATE workspace_config_grants SET revoked=1 WHERE workspace_id=?1 AND grant_id=?2", params![workspace_id,grant_id])?; tx.execute("UPDATE workdir_registry SET materialization_status='not_found', updated_at=?3 WHERE workspace_id=?1 AND workspace_config_grant_id=?2", params![workspace_id,grant_id,chrono::Utc::now().to_rfc3339()])?; tx.commit()?; Ok(()) })
     }
 
     fn create_external_workdir_grant(
@@ -11809,6 +11883,7 @@ fn read_workdir_catalog_entry(
             }
             None
         }
+        WorkdirRegistrySource::WorkspaceConfig { .. } => None,
         WorkdirRegistrySource::ExternalGrant { .. } => {
             let permissions: Option<String> = row.get(19)?;
             match permissions.as_deref() {
@@ -11861,7 +11936,7 @@ fn read_workdir_catalog_entry(
 
 fn workdir_registry_select_sql(where_clause: &str) -> String {
     format!(
-        "SELECT workspace_id, workdir_id, display_name, source_kind, runtime_id, repository_id, external_grant_id, \
+        "SELECT workspace_id, workdir_id, display_name, source_kind, runtime_id, repository_id, COALESCE(external_grant_id, workspace_config_grant_id) AS external_grant_id, \
          creation_selector, creation_ref, creation_tree, \
          current_selector, current_ref, current_tree, observed_at_epoch_seconds, \
          materialization_status, cleanliness, created_at, updated_at \
@@ -11889,6 +11964,15 @@ fn read_workdir_registry_record(
                 rusqlite::Error::InvalidColumnType(
                     5,
                     "repository_id".to_string(),
+                    rusqlite::types::Type::Null,
+                )
+            })?,
+        },
+        "workspace_config" => WorkdirRegistrySource::WorkspaceConfig {
+            grant_id: external_grant_id.clone().ok_or_else(|| {
+                rusqlite::Error::InvalidColumnType(
+                    6,
+                    "workspace_config_grant_id".into(),
                     rusqlite::types::Type::Null,
                 )
             })?,
@@ -14903,6 +14987,91 @@ fn migrate_backend_job_worker_cleanup_v76_to_v77(conn: &Connection) -> Result<()
     Ok(())
 }
 
+fn read_workspace_config_grant(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<server_api::WorkspaceConfigGrantResponse> {
+    let access: String = row.get(5)?;
+    Ok(server_api::WorkspaceConfigGrantResponse {
+        workspace_id: row.get(0)?,
+        grant_id: row.get(1)?,
+        runtime_id: row.get(2)?,
+        worker_id: row.get(3)?,
+        working_directory_id: row.get(4)?,
+        access: match access.as_str() {
+            "read_only" => server_api::WorkspaceConfigAccess::ReadOnly,
+            "read_write" => server_api::WorkspaceConfigAccess::ReadWrite,
+            _ => {
+                return Err(rusqlite::Error::InvalidColumnType(
+                    5,
+                    "access".into(),
+                    rusqlite::types::Type::Text,
+                ));
+            }
+        },
+        revoked: row.get(6)?,
+    })
+}
+
+fn migrate_workspace_config_v78_to_v79(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 78 {
+        return Err(Error::Store(
+            "Workspace config migration requires schema 78".into(),
+        ));
+    }
+    let foreign_keys =
+        conn.pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))?;
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let result = (|| {
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+        let dependents = {
+            let mut stmt = tx.prepare("SELECT sql FROM sqlite_schema WHERE tbl_name='workdir_registry' AND type IN ('index','trigger') AND sql IS NOT NULL")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let schema = include_str!("latest_schema.sql");
+        let start = schema
+            .find("CREATE TABLE \"workdir_registry\"")
+            .ok_or_else(|| Error::Store("Missing Workdir schema".into()))?;
+        let end = schema[start..]
+            .find("CREATE TABLE external_workdir_grants")
+            .ok_or_else(|| Error::Store("Missing Workdir schema end".into()))?
+            + start;
+        if column_exists(&tx, "workdir_registry", "workspace_config_grant_id")?
+            && table_exists(&tx, "workspace_config_grants")?
+        {
+            tx.execute("INSERT INTO __yoi_schema_migrations(version,name) VALUES (79,'Workspace config grants and logical Workdirs')", [])?;
+            tx.commit()?;
+            return Ok(());
+        }
+        tx.execute_batch(include_str!("workspace_config_grants.sql"))?;
+        tx.execute_batch(&schema[start..end].replace(
+            "CREATE TABLE \"workdir_registry\"",
+            "CREATE TABLE workdir_registry_v79",
+        ))?;
+        tx.execute_batch("INSERT INTO workdir_registry_v79 (workspace_id,workdir_id,display_name,source_kind,runtime_id,repository_id,external_grant_id,creation_selector,creation_ref,creation_tree,current_selector,current_ref,current_tree,observed_at_epoch_seconds,materialization_status,cleanliness,created_at,updated_at) SELECT workspace_id,workdir_id,display_name,source_kind,runtime_id,repository_id,external_grant_id,creation_selector,creation_ref,creation_tree,current_selector,current_ref,current_tree,observed_at_epoch_seconds,materialization_status,cleanliness,created_at,updated_at FROM workdir_registry; DROP TABLE workdir_registry; ALTER TABLE workdir_registry_v79 RENAME TO workdir_registry;")?;
+        for sql in dependents {
+            tx.execute_batch(&sql)?;
+        }
+        let broken: bool = {
+            let mut stmt = tx.prepare("PRAGMA foreign_key_check")?;
+            let mut rows = stmt.query([])?;
+            rows.next()?.is_some()
+        };
+        if broken {
+            return Err(Error::Store(
+                "Workspace config migration foreign-key verification failed".into(),
+            ));
+        }
+        tx.execute("INSERT INTO __yoi_schema_migrations(version,name) VALUES (79,'Workspace config grants and logical Workdirs')", [])?;
+        tx.commit()?;
+        Ok(())
+    })();
+    if foreign_keys {
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    }
+    result
+}
+
 fn migrate_workdir_connection_id_v77_to_v78(conn: &Connection) -> Result<()> {
     use rusqlite::TransactionBehavior;
     let current = current_schema_version(conn)?;
@@ -15787,6 +15956,7 @@ fn migrate_workdir_credential_candidate_snapshots_v58_to_v59(conn: &Connection) 
 
 #[cfg(test)]
 mod tests {
+    include!("store_workspace_config_tests.rs");
     use super::*;
 
     #[test]
@@ -17535,6 +17705,10 @@ mod tests {
                     version: 78,
                     name: WORKDIR_CONNECTION_ID_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 79,
+                    name: WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME.to_string()
+                },
             ]
         );
 
@@ -17623,6 +17797,7 @@ mod tests {
                             BACKEND_JOB_WORKER_CLEANUP_MIGRATION_NAME.to_string(),
                         ),
                         (78, WORKDIR_CONNECTION_ID_MIGRATION_NAME.to_string()),
+                        (79, WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME.to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -17974,7 +18149,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72,
-                73, 74, 75, 76, 77, 78
+                73, 74, 75, 76, 77, 78, 79
             ]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
@@ -17983,7 +18158,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 29);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 30);
         assert!(column_exists(&conn, "worker_workdir_links", "alias").unwrap());
         assert!(column_exists(&conn, "worker_workdir_links", "capabilities").unwrap());
         assert!(!column_exists(&conn, "worker_workdir_links", "role").unwrap());

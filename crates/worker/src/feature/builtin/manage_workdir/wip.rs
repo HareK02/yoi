@@ -77,6 +77,7 @@ struct Provider {
     permissions: Option<ToolPermissionConfig>,
     catalog: bool,
     manage: bool,
+    config_content: bool,
 }
 
 /// Register Object ownership once, then contribute independent management operations.
@@ -93,6 +94,9 @@ pub fn mount_workspace_workdir_wip(
         permissions,
         catalog,
         manage,
+        config_content: registry
+            .routes()
+            .any(|route| route == crate::feature::builtin::workspace_config::CONTENT_ROOT),
     };
     for domain in [Domain::Repository, Domain::Workdir, Domain::Attachment] {
         let namespace =
@@ -337,6 +341,20 @@ impl Provider {
                         key.as_str().unwrap_or_default()
                     ));
                 }
+                if kind == "workspace_config"
+                    && source.get("content_path").and_then(Json::as_str)
+                        == Some(crate::feature::builtin::workspace_config::CONTENT_ROOT)
+                    && matches!(
+                        source.get("access").and_then(Json::as_str),
+                        Some("read_only" | "read_write")
+                    )
+                {
+                    for field in ["access", "content_path", "purpose"] {
+                        if let Some(value) = source.get(field) {
+                            projected[field] = value.clone();
+                        }
+                    }
+                }
                 result.insert("source".into(), projected);
             }
         }
@@ -344,7 +362,29 @@ impl Provider {
             if let Some(id) = raw.get("working_directory_id").and_then(Json::as_str) {
                 result.insert("workdir_path".into(), json!(item_path(Domain::Workdir, id)));
             }
-            if let Some(alias) = raw.get("alias").and_then(Json::as_str)
+            // Content references are resolved from current Backend authority,
+            // never inferred from the alias or an OS session. An old lifetime
+            // cannot refer to a replacement connection at the same root.
+            if self.config_content
+                && raw.get("alias").and_then(Json::as_str)
+                    == Some(crate::feature::builtin::workspace_config::ATTACHMENT_ALIAS)
+                && let Ok(Some(current)) =
+                    crate::feature::builtin::workspace_config::backend::WorkspaceConfigBackend::new(
+                        self.backend.client.clone(),
+                    )
+                    .current()
+                && current.connection_id == id
+                && raw.get("working_directory_id").and_then(Json::as_str)
+                    == Some(current.working_directory_id.as_str())
+                && raw.get("alias").and_then(Json::as_str) == Some(current.alias.as_str())
+            {
+                result.insert("content_path".into(), json!(current.content_path));
+                result.insert("name".into(), json!(current.name));
+                result.insert("purpose".into(), json!(current.purpose));
+                result.insert("access".into(), json!(current.access));
+            }
+            if !result.contains_key("content_path")
+                && let Some(alias) = raw.get("alias").and_then(Json::as_str)
                 && let Ok(selected) = self.backend.session_router.resolve(Some(alias))
                 && raw.get("working_directory_id").and_then(Json::as_str)
                     == Some(selected.session.workdir().id().as_str())
@@ -1038,6 +1078,7 @@ pub(crate) mod tests {
         pub(crate) attachments: Vec<Json>,
         pub(crate) requests: Vec<WorkspaceRequest>,
         pub(crate) denied: bool,
+        config_current: Option<Json>,
         generation: usize,
     }
     impl Default for CatalogClient {
@@ -1051,6 +1092,7 @@ pub(crate) mod tests {
                     attachments: vec![],
                     requests: vec![],
                     denied: false,
+                    config_current: None,
                     generation: 0,
                 }),
             }
@@ -1088,6 +1130,9 @@ pub(crate) mod tests {
                 .map(|b| serde_json::from_str(b).unwrap())
                 .unwrap_or(Json::Null);
             let value = match (request.method, path.split('?').next().unwrap()) {
+                (WorkspaceRequestMethod::Get, "workers/self/workspace-config") => {
+                    state.config_current.clone().unwrap_or(Json::Null)
+                }
                 (WorkspaceRequestMethod::Get, "repositories") => {
                     json!({"items":state.repositories})
                 }
@@ -1236,6 +1281,72 @@ pub(crate) mod tests {
             })
         }
     }
+    #[test]
+    fn config_content_reference_requires_enabled_mount_and_exact_current_lifetime() {
+        let client = Arc::new(CatalogClient::default());
+        let current = json!({"workspace_id":"test-workspace", "alias":"workspace-config", "connection_id":"config-lifetime", "working_directory_id":"config-workdir", "access":"read_only", "name":"Workspace configuration", "purpose":"Configuration editing", "content_path":"/workspace-config", "already_attached":true});
+        client.state.lock().unwrap().config_current = Some(current);
+        let raw = json!({"alias":"workspace-config", "connection_id":"config-lifetime", "working_directory_id":"config-workdir", "capabilities":{"bits":25}, "host_path":"/SECRET"});
+        let mut p = provider(client.clone(), true, true, None);
+        assert!(
+            p.projected(Domain::Attachment, &raw)
+                .ok()
+                .unwrap()
+                .get("content_path")
+                .is_none()
+        );
+        p.config_content = true;
+        let mut physical = raw.clone();
+        physical["alias"] = json!("checkout");
+        assert!(
+            p.projected(Domain::Attachment, &physical)
+                .ok()
+                .unwrap()
+                .get("content_path")
+                .is_none()
+        );
+        assert!(
+            client.state.lock().unwrap().requests.is_empty(),
+            "physical inventories must not perform a config request per attachment"
+        );
+        let projected = p.projected(Domain::Attachment, &raw).ok().unwrap();
+        assert_eq!(projected["content_path"], "/workspace-config");
+        assert_eq!(projected["access"], "read_only");
+        assert_eq!(projected["purpose"], "Configuration editing");
+        assert!(projected.get("checkout_path").is_none());
+        assert!(!projected.to_string().contains("SECRET"));
+        let mut old = raw.clone();
+        old["connection_id"] = json!("previous-lifetime");
+        assert!(
+            p.projected(Domain::Attachment, &old)
+                .ok()
+                .unwrap()
+                .get("content_path")
+                .is_none()
+        );
+        client.state.lock().unwrap().denied = true;
+        assert!(
+            p.projected(Domain::Attachment, &raw)
+                .ok()
+                .unwrap()
+                .get("content_path")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn config_workdir_source_preserves_safe_mapping_not_private_management_data() {
+        let p = provider(Arc::new(CatalogClient::default()), true, false, None);
+        let raw = json!({"working_directory_id":"config-workdir", "source":{"kind":"workspace_config", "access":"read_write", "content_path":"/workspace-config", "purpose":"Configuration editing", "grant_id":"PRIVATE", "host_path":"/SECRET"}});
+        let projected = p.projected(Domain::Workdir, &raw).ok().unwrap();
+        assert_eq!(
+            projected["source"],
+            json!({"kind":"workspace_config", "access":"read_write", "content_path":"/workspace-config", "purpose":"Configuration editing"})
+        );
+        assert!(!projected.to_string().contains("PRIVATE"));
+        assert!(!projected.to_string().contains("SECRET"));
+    }
+
     fn provider(
         client: Arc<CatalogClient>,
         catalog: bool,
@@ -1246,6 +1357,7 @@ pub(crate) mod tests {
             backend: ManageWorkdirFeature::new(client).backend(),
             catalog,
             manage,
+            config_content: false,
             permissions,
         }
     }
@@ -1573,6 +1685,7 @@ mod lifetime_tests {
             permissions: None,
             catalog: true,
             manage: true,
+            config_content: false,
         };
         let handler = CollectionHandler {
             provider: p.clone(),
@@ -1668,6 +1781,7 @@ mod logical_capability_tests {
             backend: ManageWorkdirFeature::new(client).backend(),
             catalog: true,
             manage: true,
+            config_content: false,
             permissions: None,
         };
         let item = ItemHandler {

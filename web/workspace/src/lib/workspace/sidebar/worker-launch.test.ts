@@ -9,6 +9,18 @@ declare const Deno: {
   test(name: string, fn: () => Promise<void> | void): void;
 };
 
+Deno.test("logical config attachments are never offered as process working directories", () => {
+  const config = { working_directory_id: "config-1", display_name: "Workspace config",
+    source: { kind: "workspace_config" as const, access: "read_write" as const, content_path: "/workspace-config", purpose: "Configuration" },
+    materializer_kind: "logical_workspace_config" as const, status: "active" as const, cleanliness: "clean" };
+  const form = defaultWorkerLaunchForm({ ...options, working_directories: [config] }, emptyForm({
+    workdir_attachments: [{ alias: "config", working_directory_id: "config-1", relative_cwd: "" }],
+  }));
+  if (form.workdir_attachments.some((attachment) => attachment.working_directory_id === "config-1")) {
+    throw new Error("logical config was converted to a process cwd attachment");
+  }
+});
+
 Deno.test("defaultWorkerLaunchForm uses the Backend-published defaults and initial Workdir", () => {
   const form = defaultWorkerLaunchForm(
     options,

@@ -526,6 +526,18 @@ fn working_directory_text(worker: &BackendWorkerSummary) -> String {
         BackendWorkingDirectorySource::Repository { repository_key } => {
             (repository_key.as_str(), String::new())
         }
+        BackendWorkingDirectorySource::WorkspaceConfig { .. } => {
+            // Logical config access is not host filesystem or COMMAND authority.
+            let permissions = &attachment.effective_permissions;
+            let mut categories = Vec::new();
+            if permissions.read {
+                categories.push("READ");
+            }
+            if permissions.write {
+                categories.push("EDIT");
+            }
+            ("workspace-config", format!("・{}", categories.join("・")))
+        }
         BackendWorkingDirectorySource::ExternalGrant { .. } => {
             let permissions = &attachment.effective_permissions;
             let mut categories = Vec::new();
@@ -858,6 +870,37 @@ mod tests {
         );
         assert!(!text.contains("profile:"));
         assert!(!text.contains("active clean"));
+    }
+
+    #[test]
+    fn logical_config_attachment_labels_editability_without_command_or_host_path() {
+        for (access, write, expected) in [
+            ("read_only", false, "READ"),
+            ("read_write", true, "READ・EDIT"),
+        ] {
+            let mut worker = worker("runtime-a", "worker-b", None);
+            worker.workdir_attachments = vec![serde_json::from_value(serde_json::json!({
+                "alias": "workspace-config",
+                "effective_permissions": {"read": true, "write": write, "command": false},
+                "working_directory": {
+                    "working_directory_id": "logical-config-1",
+                    "display_name": "Workspace configuration",
+                    "source": {"kind": "workspace_config", "access": access,
+                        "content_path": "/workspace-config", "purpose": "Workspace configuration"},
+                    "materializer_kind": "logical_workspace_config",
+                    "status": "active"
+                }
+            })).unwrap()];
+            let text = working_directory_text(&worker);
+            assert_eq!(
+                text,
+                format!(
+                    "wd:workspace-config:Workspace configuration・{expected}・logical-config-1"
+                )
+            );
+            assert!(!text.contains("COMMAND"));
+            assert!(!text.contains("/workspace-config"));
+        }
     }
 
     #[test]

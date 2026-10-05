@@ -24,6 +24,7 @@ pub(crate) mod subjektiv_session;
 pub mod task;
 pub mod ticket;
 pub mod worker_observation;
+pub mod workspace_config;
 pub mod workspace_worker_discovery;
 
 pub use task::{TaskFeature, task_tools_feature};

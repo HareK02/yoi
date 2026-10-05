@@ -141,6 +141,10 @@ pub struct FeatureConfig {
         deserialize_with = "deserialize_workdir_catalog"
     )]
     pub workdir_catalog: FeatureFlagConfig,
+    /// Opt-in WIP-only logical Workspace configuration feature. This flag is
+    /// not an access grant; Backend-owned Worker grants remain authoritative.
+    #[serde(default, deserialize_with = "deserialize_workspace_config")]
+    pub workspace_config: FeatureFlagConfig,
     #[serde(default)]
     pub ticket: TicketFeatureConfig,
     #[serde(default)]
@@ -165,6 +169,13 @@ where
     })
 }
 
+fn deserialize_workspace_config<'de, D>(deserializer: D) -> Result<FeatureFlagConfig, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(config::WorkspaceConfigFeatureConfigPartial::deserialize(deserializer)?.into())
+}
+
 impl Default for FeatureConfig {
     fn default() -> Self {
         Self {
@@ -180,6 +191,7 @@ impl Default for FeatureConfig {
             objective: FeatureFlagConfig::disabled(),
             manage_workdir: FeatureFlagConfig::disabled(),
             workdir_catalog: default_workdir_catalog(),
+            workspace_config: FeatureFlagConfig::disabled(),
             ticket: TicketFeatureConfig::default(),
             merge_request: MergeRequestFeatureConfig::default(),
             orchestration: FeatureFlagConfig::disabled(),

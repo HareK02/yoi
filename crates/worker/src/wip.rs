@@ -241,6 +241,13 @@ pub struct WipDynamicMount {
 /// this resolves both files and directories and enumerates authorized children.
 #[async_trait]
 pub trait WipSubtreeProvider: Send + Sync {
+    /// Provider-specific observation bounds, capped by the Host global bounds.
+    fn max_depth(&self) -> u32 {
+        32
+    }
+    fn max_nodes(&self) -> usize {
+        1024
+    }
     async fn projection(&self, path: &str) -> Result<Option<WipProjection>, ProtocolError>;
     async fn children(&self, path: &str) -> Result<Vec<String>, ProtocolError>;
 }
@@ -972,7 +979,7 @@ fn descriptor_validator(descriptor: &InterfaceDescriptor) -> Vec<u8> {
     digest.finalize().to_vec()
 }
 
-fn contextual_reference(base: &str, path: &str) -> String {
+pub(crate) fn contextual_reference(base: &str, path: &str) -> String {
     let encoded: String = path
         .as_bytes()
         .iter()
@@ -1172,6 +1179,15 @@ impl WipHost {
         Box<dyn std::future::Future<Output = Result<ObjectObservation, ProtocolError>> + Send + 'a>,
     > {
         Box::pin(async move {
+            if let Some(mount) = self.subtree(path) {
+                if depth > mount.provider.max_depth() {
+                    return Err(protocol_error(
+                        ProtocolErrorCode::ResourceLimitExceeded,
+                        "observation exceeds provider depth limit",
+                    ));
+                }
+                *remaining = (*remaining).min(mount.provider.max_nodes());
+            }
             if *remaining == 0 {
                 return Err(protocol_error(
                     ProtocolErrorCode::ResourceLimitExceeded,
@@ -1820,6 +1836,19 @@ pub struct WipRuntime {
 }
 
 impl WipRuntime {
+    /// Build an isolated Client/Host endpoint from native application mounts.
+    /// Useful to embedders and in-process integration tests without an LLM Engine.
+    pub fn from_mounts(
+        registry: WipMountRegistry,
+        security_context: String,
+    ) -> Result<Self, String> {
+        Self::new(
+            WipHost::new(registry),
+            SecurityContext::new(security_context),
+            0,
+        )
+    }
+
     fn new(
         host: WipHost,
         security_context: SecurityContext,
@@ -1874,7 +1903,7 @@ impl WipRuntime {
         Ok(())
     }
 
-    async fn discover(
+    pub async fn discover(
         &self,
         path: String,
         depth: u32,
@@ -1899,10 +1928,11 @@ impl WipRuntime {
                 .fetch_add(1, Ordering::Relaxed);
             let response = self.dispatch_retrieval(&prepared.request).await?;
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            state
+            let completion = state
                 .client
                 .complete(prepared.id, response)
                 .map_err(client_tool_error)?;
+            check_retrieval_completion(completion)?;
         }
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let values = state
@@ -1926,7 +1956,7 @@ impl WipRuntime {
         ))
     }
 
-    async fn inspect(&self, interface: String, refresh: bool) -> Result<ToolOutput, ToolError> {
+    pub async fn inspect(&self, interface: String, refresh: bool) -> Result<ToolOutput, ToolError> {
         let prepared = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             let session = state.session.clone();
@@ -1946,10 +1976,11 @@ impl WipRuntime {
                 .fetch_add(1, Ordering::Relaxed);
             let response = self.dispatch_retrieval(&prepared.request).await?;
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            state
+            let completion = state
                 .client
                 .complete(prepared.id, response)
                 .map_err(client_tool_error)?;
+            check_retrieval_completion(completion)?;
         }
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let observed = state
@@ -1968,7 +1999,7 @@ impl WipRuntime {
         ))
     }
 
-    async fn call(
+    pub async fn call(
         &self,
         path: String,
         interface: String,
@@ -2750,6 +2781,19 @@ fn tool_output_value(output: &ToolOutput) -> Value {
         Value::Integer(i64::try_from(output.attachments.len()).unwrap_or(i64::MAX)),
     );
     Value::Record(record)
+}
+
+fn check_retrieval_completion(completion: Completion) -> Result<(), ToolError> {
+    match completion {
+        Completion::Object(_) | Completion::Interface(_) => Ok(()),
+        Completion::ProtocolFailure(error) => Err(ToolError::ExecutionFailed(error.to_string())),
+        Completion::StaleResponseRejected(_) => Err(ToolError::ExecutionFailed(
+            "WIP retrieval superseded; refresh observations".into(),
+        )),
+        Completion::Call(_) => Err(ToolError::Internal(
+            "WIP retrieval returned a call result".into(),
+        )),
+    }
 }
 
 fn render_call_completion(completion: Completion) -> Result<ToolOutput, ToolError> {
@@ -4142,9 +4186,13 @@ mod tests {
             .unwrap();
         owner.visible.store(false, Ordering::SeqCst);
         assert!(runtime.host.fetch_interface(&interface).is_err());
-        let inspected = runtime.inspect(interface.clone(), true).await.unwrap();
-        let inspected: Json = serde_json::from_str(inspected.content.as_deref().unwrap()).unwrap();
-        assert_eq!(inspected["state"], "error");
+        let error = runtime.inspect(interface.clone(), true).await.unwrap_err();
+        assert!(error.to_string().contains("InterfaceNotFound"));
+        {
+            let state = runtime.state.lock().unwrap();
+            let observed = state.client.interface(&state.session, &interface).unwrap();
+            assert!(matches!(observed.state, ObservationState::Error(_)));
+        }
         assert!(
             runtime
                 .call(
