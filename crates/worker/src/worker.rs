@@ -17,7 +17,7 @@ use agen::{
 use arc_swap::ArcSwap;
 use session_store::{
     LogEntry, PasteArtifactLimits, PromptRenderProvenance, SegmentId, SessionExtension, SessionId,
-    Store, StoreError, SystemItem, segment_log,
+    Store, StoreError, SubjektivSessionAttributionState, SystemItem, segment_log,
 };
 use session_store::{
     WorkerActiveSegmentRef, WorkerMetadata, WorkerMetadataStore, WorkerReclaimedChild,
@@ -3491,12 +3491,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             let entries = store
                 .read_all(location.session_id, location.segment_id)
                 .map_err(|error| FeatureSessionError::Capture(error.to_string()))?;
-            let has_committed_run = entries.iter().any(|entry| {
-                matches!(
-                    entry,
-                    LogEntry::RunCompleted { .. } | LogEntry::RunYielded { .. }
-                )
-            });
             let run_exit = entries
                 .iter()
                 .rev()
@@ -3523,7 +3517,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 segment_id: location.segment_id.to_string(),
                 session_revision: entries.len().try_into().unwrap_or(u64::MAX),
                 entry_count: entries.len(),
-                has_committed_run,
                 run_exit,
                 history,
                 usage_history: restored.usage_history,
@@ -6520,6 +6513,15 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     }
 }
 
+fn bounded_attribution_diagnostic(mut diagnostic: String) -> String {
+    const MAX_CHARS: usize = 1024;
+    if diagnostic.chars().count() > MAX_CHARS {
+        diagnostic = diagnostic.chars().take(MAX_CHARS).collect();
+        diagnostic.push('…');
+    }
+    diagnostic
+}
+
 fn worker_language(cfg: &manifest::EngineManifest) -> &str {
     let language = cfg.language.trim();
     if language.is_empty() {
@@ -6584,6 +6586,27 @@ where
         filesystem_authority: WorkerFilesystemAuthority,
         model_client: Option<Box<dyn LlmClient>>,
     ) -> Result<Self, WorkerError> {
+        Self::from_manifest_with_context_and_model_client_for_session(
+            manifest,
+            store,
+            loader,
+            workspace_context,
+            filesystem_authority,
+            model_client,
+            None,
+        )
+        .await
+    }
+
+    async fn from_manifest_with_context_and_model_client_for_session(
+        manifest: WorkerManifest,
+        store: St,
+        loader: PromptCatalogSource,
+        workspace_context: WorkerWorkspaceContext,
+        filesystem_authority: WorkerFilesystemAuthority,
+        model_client: Option<Box<dyn LlmClient>>,
+        existing_session_id: Option<SessionId>,
+    ) -> Result<Self, WorkerError> {
         let common = prepare_worker_common_with_context_and_model_client(
             &manifest,
             &loader,
@@ -6598,8 +6621,9 @@ where
         // `ensure_segment_head`) so the SegmentStart entry can capture
         // the rendered system prompt, not the raw template source. The
         // session_id + segment_id are allocated here so the worker-allocation
-        // registration can record them from the start.
-        let session_id = session_store::new_session_id();
+        // registration can record them from the start. Pending lifecycle
+        // recovery reuses its already persisted Session identity.
+        let session_id = existing_session_id.unwrap_or_else(session_store::new_session_id);
         let segment_id = session_store::new_segment_id();
 
         // Register this Worker in the machine-wide worker-allocation
@@ -6686,6 +6710,168 @@ where
         worker.apply_prune_from_manifest();
         worker.write_worker_metadata_pending()?;
         Ok(worker)
+    }
+
+    /// Complete the Host-owned Session-to-Subject attribution boundary before a
+    /// runtime-managed Worker is exposed or accepts input. The authoritative
+    /// attachment bit comes from the Runtime create/restore request; names,
+    /// Profiles, and current singleton ownership are never used as identity.
+    ///
+    /// `OutcomeUnknown` is persisted before network I/O. A lost response or
+    /// process interruption is therefore recovered only by a later create/restore
+    /// lifecycle, where the Backend's same-attribution idempotency is safe to use.
+    pub fn finalize_subjektiv_session_attribution(
+        &self,
+        subjektiv_attached: bool,
+    ) -> Result<(), WorkerError> {
+        let worker_name = self.manifest.worker.name.as_str();
+        let metadata = self.store.read_by_name(worker_name)?.ok_or_else(|| {
+            WorkerError::SubjektivSessionAttribution {
+                state: "metadata_missing",
+                message: "Worker metadata disappeared before Session attribution".to_string(),
+            }
+        })?;
+        let active =
+            metadata
+                .active
+                .as_ref()
+                .ok_or_else(|| WorkerError::SubjektivSessionAttribution {
+                    state: "session_missing",
+                    message: "Worker metadata has no active Session attribution target".to_string(),
+                })?;
+        let session_id = self.session_id();
+        if active.session_id != session_id {
+            return Err(WorkerError::SubjektivSessionAttribution {
+                state: "session_mismatch",
+                message: format!(
+                    "Worker metadata Session {} does not match constructed Session {session_id}",
+                    active.session_id
+                ),
+            });
+        }
+
+        if !subjektiv_attached {
+            if metadata.subjektiv_session_attribution.is_some() {
+                return Err(WorkerError::SubjektivSessionAttribution {
+                    state: "attachment_missing",
+                    message:
+                        "persisted Subjektiv Session attribution state requires an authorized attachment"
+                            .to_string(),
+                });
+            }
+            return Ok(());
+        }
+
+        if let Some(state) = metadata.subjektiv_session_attribution.as_ref() {
+            if state.session_id() != session_id {
+                return Err(WorkerError::SubjektivSessionAttribution {
+                    state: "session_mismatch",
+                    message: format!(
+                        "persisted Subjektiv attribution targets Session {}, not {session_id}",
+                        state.session_id()
+                    ),
+                });
+            }
+            if matches!(state, SubjektivSessionAttributionState::Confirmed { .. }) {
+                return Ok(());
+            }
+        }
+
+        self.persist_subjektiv_session_attribution(
+            SubjektivSessionAttributionState::OutcomeUnknown {
+                session_id,
+                diagnostic: "attribution request started; completion is not yet confirmed"
+                    .to_string(),
+            },
+        )?;
+        let response = match self.workspace_client().execute_server_operation(
+            WorkspaceServerOperation::SubjektivRecordSession(
+                server_api::SubjektivRecordSessionRequest {
+                    session_id: session_id.to_string(),
+                },
+            ),
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                let message = bounded_attribution_diagnostic(format!(
+                    "Session attribution transport outcome is unknown: {error}"
+                ));
+                self.persist_subjektiv_session_attribution(
+                    SubjektivSessionAttributionState::OutcomeUnknown {
+                        session_id,
+                        diagnostic: message.clone(),
+                    },
+                )?;
+                return Err(WorkerError::SubjektivSessionAttribution {
+                    state: "outcome_unknown",
+                    message,
+                });
+            }
+        };
+        if !response.is_success() {
+            let message = bounded_attribution_diagnostic(format!(
+                "Session attribution was rejected with HTTP {}: {}",
+                response.status, response.body
+            ));
+            self.persist_subjektiv_session_attribution(SubjektivSessionAttributionState::Failed {
+                session_id,
+                diagnostic: message.clone(),
+            })?;
+            return Err(WorkerError::SubjektivSessionAttribution {
+                state: "failed",
+                message,
+            });
+        }
+        let output: server_api::SubjektivRecordSessionResponse =
+            match serde_json::from_str(&response.body) {
+                Ok(output) => output,
+                Err(error) => {
+                    let message = bounded_attribution_diagnostic(format!(
+                        "Session attribution response outcome is unknown: {error}"
+                    ));
+                    self.persist_subjektiv_session_attribution(
+                        SubjektivSessionAttributionState::OutcomeUnknown {
+                            session_id,
+                            diagnostic: message.clone(),
+                        },
+                    )?;
+                    return Err(WorkerError::SubjektivSessionAttribution {
+                        state: "outcome_unknown",
+                        message,
+                    });
+                }
+            };
+        if output.session_id != session_id.to_string()
+            || output.subject_id.trim().is_empty()
+            || output.subject_id.chars().any(char::is_control)
+        {
+            let message =
+                "Session attribution response did not confirm the requested immutable identity"
+                    .to_string();
+            self.persist_subjektiv_session_attribution(
+                SubjektivSessionAttributionState::OutcomeUnknown {
+                    session_id,
+                    diagnostic: message.clone(),
+                },
+            )?;
+            return Err(WorkerError::SubjektivSessionAttribution {
+                state: "outcome_unknown",
+                message,
+            });
+        }
+        self.persist_subjektiv_session_attribution(SubjektivSessionAttributionState::Confirmed {
+            session_id,
+            subject_id: output.subject_id,
+        })
+    }
+
+    fn persist_subjektiv_session_attribution(
+        &self,
+        state: SubjektivSessionAttributionState,
+    ) -> Result<(), WorkerError> {
+        self.store
+            .set_subjektiv_session_attribution(&self.manifest.worker.name, state)?;
+        Ok(())
     }
 
     /// Build an in-process Internal Worker without machine-wide allocation or durable Worker metadata.
@@ -7054,13 +7240,14 @@ where
         })?;
         let manifest =
             restore_manifest_from_worker_metadata_snapshot(worker_name, Some(snapshot), fallback)?;
-        Self::from_manifest_with_context_and_model_client(
+        Self::from_manifest_with_context_and_model_client_for_session(
             manifest,
             store,
             loader,
             workspace_context,
             filesystem_authority,
             model_client,
+            Some(active.session_id),
         )
         .await
     }
@@ -8084,6 +8271,12 @@ pub enum WorkerError {
 
     #[error("feature lifecycle rejected operation: {0}")]
     FeatureLifecycle(String),
+
+    #[error("Subjektiv Session attribution lifecycle is {state}: {message}")]
+    SubjektivSessionAttribution {
+        state: &'static str,
+        message: String,
+    },
 
     #[error("Flow input rejected: {0}")]
     FlowInput(String),
@@ -9485,6 +9678,264 @@ mod build_summary_prompt_tests {
         fn clone_boxed(&self) -> Box<dyn LlmClient> {
             Box::new(self.clone())
         }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum AttributionOutcome {
+        Success,
+        Rejected,
+        TransportUnknown,
+    }
+
+    #[derive(Debug)]
+    struct AttributionLifecycleClient {
+        outcomes: Mutex<VecDeque<AttributionOutcome>>,
+        requests: Mutex<Vec<WorkspaceRequest>>,
+    }
+
+    impl AttributionLifecycleClient {
+        fn new(outcomes: impl IntoIterator<Item = AttributionOutcome>) -> Self {
+            Self {
+                outcomes: Mutex::new(outcomes.into_iter().collect()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl WorkspaceClient for AttributionLifecycleClient {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("workspace-test")
+        }
+
+        fn kind(&self) -> &str {
+            "attribution-lifecycle-test"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn execute(
+            &self,
+            request: WorkspaceRequest,
+        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            self.requests.lock().unwrap().push(request.clone());
+            match self
+                .outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(AttributionOutcome::Success)
+            {
+                AttributionOutcome::TransportUnknown => Err(WorkspaceClientError::Request(
+                    "connection closed after request send".to_string(),
+                )),
+                AttributionOutcome::Rejected => Ok(WorkspaceResponse {
+                    status: 503,
+                    body: "temporarily unavailable".to_string(),
+                }),
+                AttributionOutcome::Success => {
+                    let input: server_api::SubjektivRecordSessionRequest =
+                        serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+                    Ok(WorkspaceResponse {
+                        status: 200,
+                        body: serde_json::to_string(&server_api::SubjektivRecordSessionResponse {
+                            subject_id: "subject-test".to_string(),
+                            session_id: input.session_id,
+                        })
+                        .unwrap(),
+                    })
+                }
+            }
+        }
+    }
+
+    async fn attribution_lifecycle_worker(
+        client: Arc<AttributionLifecycleClient>,
+    ) -> (
+        Worker<
+            Box<dyn LlmClient>,
+            session_store::CombinedStore<session_store::FsStore, session_store::FsWorkerStore>,
+        >,
+        session_store::CombinedStore<session_store::FsStore, session_store::FsWorkerStore>,
+        tempfile::TempDir,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = session_store::CombinedStore::new(
+            session_store::FsStore::new(temp.path().join("sessions")).unwrap(),
+            session_store::FsWorkerStore::new(temp.path().join("workers")).unwrap(),
+        );
+        let mut manifest = minimal_manifest();
+        manifest.worker.name = format!("attribution-test-{}", uuid::Uuid::now_v7());
+        let mut worker = Worker::new(
+            manifest,
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(
+                Box::new(NoopClient) as Box<dyn LlmClient>
+            ),
+            store.clone(),
+            WorkerWorkspaceContext::with_client(
+                Some(WorkspaceId::new("workspace-test").unwrap()),
+                client,
+            ),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        worker.enable_worker_metadata_write_through().unwrap();
+        (worker, store, temp)
+    }
+
+    #[tokio::test]
+    async fn session_attribution_finalizes_once_before_runs_and_persists_subject() {
+        let client = Arc::new(AttributionLifecycleClient::new([
+            AttributionOutcome::Success,
+        ]));
+        let (worker, store, _temp) = attribution_lifecycle_worker(client.clone()).await;
+        let session_id = worker.session_id();
+
+        worker.finalize_subjektiv_session_attribution(true).unwrap();
+        worker.finalize_subjektiv_session_attribution(true).unwrap();
+
+        assert_eq!(client.requests.lock().unwrap().len(), 1);
+        let metadata = store
+            .read_by_name(&worker.manifest().worker.name)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            metadata.subjektiv_session_attribution,
+            Some(SubjektivSessionAttributionState::Confirmed {
+                session_id: stored_session_id,
+                ref subject_id,
+            }) if stored_session_id == session_id && subject_id == "subject-test"
+        ));
+    }
+
+    #[tokio::test]
+    async fn unknown_and_failed_attribution_remain_incomplete_until_lifecycle_retry() {
+        for (first, expected_state) in [
+            (AttributionOutcome::TransportUnknown, "outcome_unknown"),
+            (AttributionOutcome::Rejected, "failed"),
+        ] {
+            let client = Arc::new(AttributionLifecycleClient::new([
+                first,
+                AttributionOutcome::Success,
+            ]));
+            let (worker, store, _temp) = attribution_lifecycle_worker(client.clone()).await;
+            let error = worker
+                .finalize_subjektiv_session_attribution(true)
+                .unwrap_err();
+            assert!(error.to_string().contains(expected_state));
+            let incomplete = store
+                .read_by_name(&worker.manifest().worker.name)
+                .unwrap()
+                .unwrap()
+                .subjektiv_session_attribution
+                .unwrap();
+            assert!(matches!(
+                (expected_state, incomplete),
+                (
+                    "outcome_unknown",
+                    SubjektivSessionAttributionState::OutcomeUnknown { .. }
+                ) | ("failed", SubjektivSessionAttributionState::Failed { .. })
+            ));
+
+            worker.finalize_subjektiv_session_attribution(true).unwrap();
+            assert_eq!(client.requests.lock().unwrap().len(), 2);
+            assert!(matches!(
+                store
+                    .read_by_name(&worker.manifest().worker.name)
+                    .unwrap()
+                    .unwrap()
+                    .subjektiv_session_attribution,
+                Some(SubjektivSessionAttributionState::Confirmed { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn unattached_worker_never_attempts_session_attribution() {
+        let client = Arc::new(AttributionLifecycleClient::new([
+            AttributionOutcome::Success,
+        ]));
+        let (worker, store, _temp) = attribution_lifecycle_worker(client.clone()).await;
+
+        worker
+            .finalize_subjektiv_session_attribution(false)
+            .unwrap();
+
+        assert!(client.requests.lock().unwrap().is_empty());
+        assert!(
+            store
+                .read_by_name(&worker.manifest().worker.name)
+                .unwrap()
+                .unwrap()
+                .subjektiv_session_attribution
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_restore_reuses_persisted_session_and_recovers_unknown_attribution() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = session_store::CombinedStore::new(
+            session_store::FsStore::new(temp.path().join("sessions")).unwrap(),
+            session_store::FsWorkerStore::new(temp.path().join("workers")).unwrap(),
+        );
+        let mut manifest = minimal_manifest();
+        manifest.worker.name = format!("pending-attribution-{}", uuid::Uuid::now_v7());
+        let session_id = session_store::new_session_id();
+        let snapshot = manifest::write_persisted_worker_manifest_snapshot(&manifest).unwrap();
+        store
+            .set_active_with_workspace_id(
+                &manifest.worker.name,
+                Some(WorkerActiveSegmentRef::pending_segment(session_id)),
+                Some(snapshot),
+                Some("workspace-test".to_string()),
+            )
+            .unwrap();
+        store
+            .set_subjektiv_session_attribution(
+                &manifest.worker.name,
+                SubjektivSessionAttributionState::OutcomeUnknown {
+                    session_id,
+                    diagnostic: "response lost before restart".to_string(),
+                },
+            )
+            .unwrap();
+        let client = Arc::new(AttributionLifecycleClient::new([
+            AttributionOutcome::Success,
+        ]));
+        let worker_name = manifest.worker.name.clone();
+        let worker = Worker::restore_pending_from_worker_metadata_with_context_and_model_client(
+            &worker_name,
+            manifest,
+            store.clone(),
+            PromptCatalogSource::builtins_only(),
+            WorkerWorkspaceContext::with_client(
+                Some(WorkspaceId::new("workspace-test").unwrap()),
+                client.clone(),
+            ),
+            WorkerFilesystemAuthority::None,
+            Some(Box::new(NoopClient)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(worker.session_id(), session_id);
+        worker.finalize_subjektiv_session_attribution(true).unwrap();
+        assert_eq!(client.requests.lock().unwrap().len(), 1);
+        assert!(matches!(
+            store
+                .read_by_name(&worker.manifest().worker.name)
+                .unwrap()
+                .unwrap()
+                .subjektiv_session_attribution,
+            Some(SubjektivSessionAttributionState::Confirmed {
+                session_id: stored_session_id,
+                ..
+            }) if stored_session_id == session_id
+        ));
     }
 
     fn text_segment(text: &str) -> Segment {

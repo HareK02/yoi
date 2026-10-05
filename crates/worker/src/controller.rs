@@ -1408,7 +1408,6 @@ where
         && let Some(subjektiv_sessions) =
             crate::feature::builtin::subjektiv_session::SubjektivSessionFeature::from_resolved_config(
                 &worker.manifest().feature.subjektiv,
-                worker.committed_session_capture_handle(),
                 worker.workspace_client_handle(),
             )?
     {

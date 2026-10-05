@@ -1279,6 +1279,9 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         })?;
         let worker = prepared.worker_mut();
         validate_worker_memory_settings(worker.manifest(), &request.request)?;
+        worker
+            .finalize_subjektiv_session_attribution(request.request.subjektiv_attached)
+            .map_err(|error| format!("finalize Worker Session attribution: {error}"))?;
         let workdir_capabilities = request
             .workdir_attachments
             .keys()
@@ -1517,6 +1520,9 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             Err(err) => return Err(format!("failed to restore Worker from metadata: {err}")),
         };
         validate_worker_memory_settings(worker.manifest(), &request.request)?;
+        worker
+            .finalize_subjektiv_session_attribution(request.request.subjektiv_attached)
+            .map_err(|error| format!("finalize restored Worker Session attribution: {error}"))?;
         let flow_transition_enabled = worker.manifest().feature.flow.enabled;
         let workdir_sessions = restored_workdir_router(
             &request.workdir_attachments,
@@ -5079,6 +5085,7 @@ mod tests {
             &[
                 "WorkerBootstrap::new(",
                 ".prepare()",
+                "finalize_subjektiv_session_attribution(",
                 "worker.bind_workdir_sessions(",
                 "worker.bind_worker_observation_provider(",
                 "install_runtime_flow_transition_feature()",
@@ -5089,6 +5096,7 @@ mod tests {
             restore,
             &[
                 "Worker::restore_from_worker_metadata_with_context(",
+                "finalize_subjektiv_session_attribution(",
                 "worker.bind_workdir_sessions(",
                 "worker.bind_worker_observation_provider(",
                 "install_runtime_flow_transition_feature()",

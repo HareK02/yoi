@@ -17283,6 +17283,34 @@ fn subjektiv_session_attribution(
     .map_err(|error| Error::InvalidInput(error.to_string()).into())
 }
 
+fn require_existing_subjektiv_session_attribution(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    context: &server_api::ServerRequestContext,
+    session_id: &str,
+) -> ApiResult<crate::subjektiv::SubjectSessionAttribution> {
+    let expected = subjektiv_session_attribution(api, workspace_id, context, session_id)?;
+    let existing = open_subjektiv_store(api)?
+        .session_attribution(&expected.session_id)
+        .map_err(subjektiv_store_error)?
+        .ok_or_else(|| {
+            Error::RepositoryConflict(format!(
+                "subjektiv_session_attribution_incomplete: Session {} has not completed its Host attribution lifecycle",
+                expected.session_id
+            ))
+        })?;
+    if existing.subject_id != expected.subject_id
+        || existing.runtime_id != expected.runtime_id
+        || existing.worker_id != expected.worker_id
+    {
+        return Err(Error::WorkspacePermissionDenied(
+            "existing Session attribution does not match the authorized subject Worker".to_string(),
+        )
+        .into());
+    }
+    Ok(existing)
+}
+
 fn subjektiv_subject_response(
     api: &WorkspaceApi,
     subject: crate::subjektiv::SubjectRecord,
@@ -17550,8 +17578,12 @@ async fn scoped_stage_subjektiv_candidate(
     Json(mut request): Json<server_api::SubjektivStageCandidateRequest>,
 ) -> ApiResult<Json<server_api::SubjektivStageCandidateResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let attribution =
-        subjektiv_session_attribution(&api, &path.workspace_id, &context, &request.session_id)?;
+    let attribution = require_existing_subjektiv_session_attribution(
+        &api,
+        &path.workspace_id,
+        &context,
+        &request.session_id,
+    )?;
     let subject_id = attribution.subject_id.clone();
     let session_id = attribution.session_id.as_str();
     for source_ref in &mut request.operation.source_refs {
@@ -19066,7 +19098,7 @@ async fn scoped_subjektiv_memory_backend(
             // Re-derive the same subject and immutable Session attribution for the
             // write. The request never carries subject, Worker, Runtime, origin,
             // or arbitrary source JSON from the model.
-            let attribution = subjektiv_session_attribution(
+            let attribution = require_existing_subjektiv_session_attribution(
                 &api,
                 &path.workspace_id,
                 &context,
@@ -39595,6 +39627,20 @@ mod tests {
                 }
             )
         ));
+        let Json(recorded_session) = scoped_record_subjektiv_session(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            context.clone(),
+            Json(server_api::SubjektivRecordSessionRequest {
+                session_id: "session-1".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recorded_session.subject_id, subject.id);
+
         let operation = memory::backend::MemoryStageCandidateOperation {
             source: memory::schema::SourceRef {
                 segment_id: "segment-1".to_string(),

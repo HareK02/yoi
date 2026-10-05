@@ -644,23 +644,6 @@ impl MemoryLifecycleTask {
             return Ok(());
         }
 
-        if self.target == ExtractionTarget::Subjektiv
-            && let Err(reason) = self.record_subjektiv_session(&capture.session_id)
-        {
-            audit
-                .emit(
-                    self.workspace_client.as_ref(),
-                    self.event_tx.as_ref(),
-                    memory::audit::WorkerLifecycleStatus::Failed,
-                    reason,
-                    usage_audit,
-                    extract_audit,
-                    None,
-                )
-                .await;
-            return Ok(());
-        }
-
         context.generation_fence.ensure_current()?;
         let next_pointer = memory::ExtractPointerPayload {
             processed_through_entry: capture.entry_count - 1,
@@ -745,35 +728,6 @@ impl FeatureBackgroundTask for MemoryLifecycleTask {
 }
 
 impl MemoryLifecycleTask {
-    fn record_subjektiv_session(&self, session_id: &str) -> Result<(), String> {
-        let response = self
-            .workspace_client
-            .execute_server_operation(
-                crate::worker::WorkspaceServerOperation::SubjektivRecordSession(
-                    server_api::SubjektivRecordSessionRequest {
-                        session_id: session_id.to_string(),
-                    },
-                ),
-            )
-            .map_err(|error| format!("record subjektiv Session attribution failed: {error}"))?;
-        if !response.is_success() {
-            return Err(format!(
-                "record subjektiv Session attribution returned HTTP {}: {}",
-                response.status, response.body
-            ));
-        }
-        let output: server_api::SubjektivRecordSessionResponse =
-            serde_json::from_str(&response.body).map_err(|error| {
-                format!("decode subjektiv Session attribution response: {error}")
-            })?;
-        if output.session_id != session_id {
-            return Err(
-                "subjektiv Session attribution response changed session identity".to_string(),
-            );
-        }
-        Ok(())
-    }
-
     async fn request_consolidation(&self, subjektiv: bool) {
         let audit = WorkerAuditBase::new(
             memory::audit::AuditWorker::MemoryConsolidation,
@@ -1068,7 +1022,7 @@ fn model_audit_from_manifest(model: &manifest::ModelManifest) -> memory::audit::
 #[cfg(test)]
 mod tests {
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use agen::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
@@ -1106,7 +1060,6 @@ mod tests {
             request: crate::worker::WorkspaceRequest,
         ) -> Result<crate::worker::WorkspaceResponse, crate::worker::WorkspaceClientError> {
             let is_subjektiv_stage = request.path.ends_with("/subjektiv/staging");
-            let is_subjektiv_session = request.path.ends_with("/subjektiv/sessions");
             let is_subjektiv_consolidation = request.path.ends_with("/subjektiv/consolidation");
             let is_stage_candidate = request
                 .body
@@ -1125,16 +1078,6 @@ mod tests {
                         summary: "subject consolidation requested".into(),
                         candidate_count: 1,
                         total_bytes: 1,
-                    })
-                    .unwrap(),
-                });
-            }
-            if is_subjektiv_session {
-                return Ok(crate::worker::WorkspaceResponse {
-                    status: 200,
-                    body: serde_json::to_string(&server_api::SubjektivRecordSessionResponse {
-                        subject_id: "subject-1".to_string(),
-                        session_id: "session-1".to_string(),
                     })
                     .unwrap(),
                 });
@@ -1178,52 +1121,6 @@ mod tests {
             Err(crate::worker::WorkspaceClientError::Unavailable(
                 "recording client".to_string(),
             ))
-        }
-    }
-
-    #[derive(Debug, Default)]
-    struct BlockingSessionWorkspaceClient {
-        requests: Mutex<Vec<crate::worker::WorkspaceRequest>>,
-        session_started: AtomicBool,
-        release_session: AtomicBool,
-    }
-
-    impl WorkspaceClient for BlockingSessionWorkspaceClient {
-        fn workspace_id(&self) -> Option<&str> {
-            Some("workspace-1")
-        }
-
-        fn kind(&self) -> &str {
-            "blocking-subjektiv-session-test"
-        }
-
-        fn is_available(&self) -> bool {
-            true
-        }
-
-        fn execute(
-            &self,
-            request: crate::worker::WorkspaceRequest,
-        ) -> Result<crate::worker::WorkspaceResponse, crate::worker::WorkspaceClientError> {
-            let is_subjektiv_session = request.path.ends_with("/subjektiv/sessions");
-            self.requests.lock().unwrap().push(request);
-            if !is_subjektiv_session {
-                return Err(crate::worker::WorkspaceClientError::Unavailable(
-                    "blocking client only accepts subject-session recording".to_string(),
-                ));
-            }
-            self.session_started.store(true, Ordering::Release);
-            while !self.release_session.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
-            Ok(crate::worker::WorkspaceResponse {
-                status: 200,
-                body: serde_json::to_string(&server_api::SubjektivRecordSessionResponse {
-                    subject_id: "subject-1".to_string(),
-                    session_id: "session-1".to_string(),
-                })
-                .unwrap(),
-            })
         }
     }
 
@@ -1718,7 +1615,8 @@ permission = "write"
                 .iter()
                 .filter(|request| request.path.ends_with("/subjektiv/sessions"))
                 .count(),
-            1
+            0,
+            "Memory extraction must not own Session attribution",
         );
         assert!(requests.iter().all(|request| {
             request
@@ -1736,7 +1634,7 @@ permission = "write"
     }
 
     #[tokio::test]
-    async fn empty_subjektiv_extraction_records_session_and_commits_pointer_without_candidate() {
+    async fn empty_subjektiv_extraction_commits_pointer_without_attribution_or_candidate() {
         let client = ScriptClient::new(vec![finish_empty_events("finish-1"), completed_events()]);
         let extension_writes = Arc::new(Mutex::new(Vec::new()));
         let (event_tx, _) = broadcast::channel(32);
@@ -1765,54 +1663,10 @@ permission = "write"
                 .any(|request| request.path.ends_with("/subjektiv/staging"))
         );
         assert!(
-            requests
+            !requests
                 .iter()
                 .any(|request| request.path.ends_with("/subjektiv/sessions"))
         );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancellation_during_subject_session_recording_never_commits_pointer() {
-        let client = ScriptClient::new(vec![finish_empty_events("finish-1"), completed_events()]);
-        let extension_writes = Arc::new(Mutex::new(Vec::new()));
-        let (event_tx, mut event_rx) = broadcast::channel(32);
-        let workspace_client = Arc::new(BlockingSessionWorkspaceClient::default());
-        let mut task = test_task(
-            capture(2, 250),
-            Box::new(client),
-            Arc::clone(&extension_writes),
-            event_tx,
-            workspace_client.clone(),
-        );
-        task.target = ExtractionTarget::Subjektiv;
-        task.config.consolidation_request_enabled = false;
-        let registry = start_background_task(task);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !workspace_client.session_started.load(Ordering::Acquire) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("subject-session recording should begin");
-
-        let release_client = workspace_client.clone();
-        let release = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            release_client
-                .release_session
-                .store(true, Ordering::Release);
-        });
-        let rewrite_guard = registry.begin_session_rewrite().await.unwrap();
-        release.await.unwrap();
-        drop(rewrite_guard);
-        registry.shutdown().await.unwrap();
-
-        assert!(extension_writes.lock().unwrap().is_empty());
-        assert_eq!(workspace_client.requests.lock().unwrap().len(), 1);
-        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
-        assert!(events.iter().any(|event| {
-            matches!(event, Event::MemoryWorker(event) if event.status == "cancelled")
-        }));
     }
 
     #[tokio::test]
@@ -2116,7 +1970,6 @@ permission = "write"
             segment_id: "segment-1".to_string(),
             session_revision: history_len.try_into().unwrap(),
             entry_count: history_len,
-            has_committed_run: true,
             run_exit: CommittedRunExit::Finished,
             history: (0..history_len)
                 .map(|index| HistoryEntry {

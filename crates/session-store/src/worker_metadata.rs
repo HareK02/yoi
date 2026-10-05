@@ -112,6 +112,37 @@ pub struct WorkerPeer {
     pub worker_name: String,
 }
 
+/// Durable completion state for the Host-owned Subjektiv Session attribution
+/// lifecycle. The Host writes `OutcomeUnknown` before sending the request, so a
+/// process interruption or lost response remains explicitly recoverable by the
+/// next Worker create/restore lifecycle instead of leaking into ordinary Runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SubjektivSessionAttributionState {
+    OutcomeUnknown {
+        session_id: SessionId,
+        diagnostic: String,
+    },
+    Failed {
+        session_id: SessionId,
+        diagnostic: String,
+    },
+    Confirmed {
+        session_id: SessionId,
+        subject_id: String,
+    },
+}
+
+impl SubjektivSessionAttributionState {
+    pub fn session_id(&self) -> SessionId {
+        match self {
+            Self::OutcomeUnknown { session_id, .. }
+            | Self::Failed { session_id, .. }
+            | Self::Confirmed { session_id, .. } => *session_id,
+        }
+    }
+}
+
 /// Persistent metadata for a Worker name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerMetadata {
@@ -133,6 +164,10 @@ pub struct WorkerMetadata {
     pub peers: Vec<WorkerPeer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_manifest_snapshot: Option<serde_json::Value>,
+    /// Host-owned completion evidence for Session-to-Subject attribution. Its
+    /// absence is also the legacy representation and never grants visibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subjektiv_session_attribution: Option<SubjektivSessionAttributionState>,
 }
 
 impl WorkerMetadata {
@@ -147,6 +182,7 @@ impl WorkerMetadata {
             reclaimed_children: Vec::new(),
             peers: Vec::new(),
             resolved_manifest_snapshot: None,
+            subjektiv_session_attribution: None,
         }
     }
 
@@ -159,6 +195,18 @@ impl WorkerMetadata {
         self.workspace_id = Some(workspace_id.into());
         self
     }
+}
+
+fn replace_active_session(metadata: &mut WorkerMetadata, active: Option<WorkerActiveSegmentRef>) {
+    if let Some(session_id) = active.as_ref().map(|active| active.session_id)
+        && metadata
+            .subjektiv_session_attribution
+            .as_ref()
+            .is_some_and(|state| state.session_id() != session_id)
+    {
+        metadata.subjektiv_session_attribution = None;
+    }
+    metadata.active = active;
 }
 
 /// Sync persistence backend for Worker metadata.
@@ -236,7 +284,7 @@ pub trait WorkerMetadataStore: Send + Sync {
         workspace_root: Option<PathBuf>,
     ) -> Result<WorkerMetadata, WorkerStoreError> {
         self.update_by_name(worker_name, |metadata| {
-            metadata.active = active;
+            replace_active_session(metadata, active);
             metadata.resolved_manifest_snapshot = resolved_manifest_snapshot;
             if let Some(workspace_id) = workspace_id {
                 metadata.workspace_id = Some(workspace_id);
@@ -256,7 +304,7 @@ pub trait WorkerMetadataStore: Send + Sync {
         workspace_id: Option<String>,
     ) -> Result<WorkerMetadata, WorkerStoreError> {
         self.update_by_name(worker_name, |metadata| {
-            metadata.active = active;
+            replace_active_session(metadata, active);
             metadata.resolved_manifest_snapshot = resolved_manifest_snapshot;
             if let Some(workspace_id) = workspace_id {
                 metadata.workspace_id = Some(workspace_id);
@@ -273,11 +321,23 @@ pub trait WorkerMetadataStore: Send + Sync {
         workspace_root: Option<PathBuf>,
     ) -> Result<WorkerMetadata, WorkerStoreError> {
         self.update_by_name(worker_name, |metadata| {
-            metadata.active = active;
+            replace_active_session(metadata, active);
             metadata.resolved_manifest_snapshot = resolved_manifest_snapshot;
             if let Some(workspace_root) = workspace_root {
                 metadata.workspace_root = Some(workspace_root);
             }
+        })
+    }
+
+    /// Set the Host-owned Subjektiv Session attribution lifecycle state while
+    /// preserving the active Session pointer and every unrelated field.
+    fn set_subjektiv_session_attribution(
+        &self,
+        worker_name: &str,
+        state: SubjektivSessionAttributionState,
+    ) -> Result<WorkerMetadata, WorkerStoreError> {
+        self.update_by_name(worker_name, |metadata| {
+            metadata.subjektiv_session_attribution = Some(state);
         })
     }
 
@@ -991,6 +1051,85 @@ mod tests {
         let restored: WorkerMetadata = serde_json::from_str(&json).unwrap();
 
         assert_eq!(restored, metadata);
+    }
+
+    #[test]
+    fn subjektiv_attribution_state_roundtrips_and_active_updates_preserve_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FsWorkerStore::new(tmp.path()).unwrap();
+        let session_id = crate::new_session_id();
+        store
+            .write(&WorkerMetadata::new(
+                "subject-worker",
+                Some(WorkerActiveSegmentRef::pending_segment(session_id)),
+            ))
+            .unwrap();
+        store
+            .set_subjektiv_session_attribution(
+                "subject-worker",
+                SubjektivSessionAttributionState::OutcomeUnknown {
+                    session_id,
+                    diagnostic: "request interrupted".to_string(),
+                },
+            )
+            .unwrap();
+        store
+            .set_active(
+                "subject-worker",
+                Some(WorkerActiveSegmentRef::active_segment(
+                    session_id,
+                    crate::new_segment_id(),
+                )),
+                None,
+            )
+            .unwrap();
+
+        let restored = store.read_by_name("subject-worker").unwrap().unwrap();
+        assert!(matches!(
+            restored.subjektiv_session_attribution,
+            Some(SubjektivSessionAttributionState::OutcomeUnknown {
+                session_id: stored_session_id,
+                ref diagnostic,
+            }) if stored_session_id == session_id && diagnostic == "request interrupted"
+        ));
+    }
+
+    #[test]
+    fn new_active_session_clears_prior_session_attribution_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FsWorkerStore::new(tmp.path()).unwrap();
+        let old_session_id = crate::new_session_id();
+        let new_session_id = crate::new_session_id();
+        store
+            .write(&WorkerMetadata::new(
+                "subject-worker",
+                Some(WorkerActiveSegmentRef::pending_segment(old_session_id)),
+            ))
+            .unwrap();
+        store
+            .set_subjektiv_session_attribution(
+                "subject-worker",
+                SubjektivSessionAttributionState::Confirmed {
+                    session_id: old_session_id,
+                    subject_id: "subject-1".to_string(),
+                },
+            )
+            .unwrap();
+
+        store
+            .set_active(
+                "subject-worker",
+                Some(WorkerActiveSegmentRef::pending_segment(new_session_id)),
+                None,
+            )
+            .unwrap();
+
+        let restored = store.read_by_name("subject-worker").unwrap().unwrap();
+        assert_eq!(
+            restored.active,
+            Some(WorkerActiveSegmentRef::pending_segment(new_session_id))
+        );
+        assert!(restored.subjektiv_session_attribution.is_none());
     }
 
     #[test]

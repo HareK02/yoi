@@ -1141,6 +1141,7 @@ mod tests {
                 worker_name: "peer".into(),
             }],
             resolved_manifest_snapshot: None,
+            subjektiv_session_attribution: None,
         };
         store.write(&parent).unwrap();
         store
@@ -1156,6 +1157,7 @@ mod tests {
                 reclaimed_children: Vec::new(),
                 peers: Vec::new(),
                 resolved_manifest_snapshot: None,
+                subjektiv_session_attribution: None,
             })
             .unwrap();
         store
@@ -1171,6 +1173,7 @@ mod tests {
                 reclaimed_children: Vec::new(),
                 peers: Vec::new(),
                 resolved_manifest_snapshot: None,
+                subjektiv_session_attribution: None,
             })
             .unwrap();
         store
@@ -1183,6 +1186,7 @@ mod tests {
                 reclaimed_children: Vec::new(),
                 peers: Vec::new(),
                 resolved_manifest_snapshot: None,
+                subjektiv_session_attribution: None,
             })
             .unwrap();
         store
@@ -1198,6 +1202,7 @@ mod tests {
                 reclaimed_children: Vec::new(),
                 peers: Vec::new(),
                 resolved_manifest_snapshot: None,
+                subjektiv_session_attribution: None,
             })
             .unwrap();
         store
@@ -1212,6 +1217,7 @@ mod tests {
                     worker_name: "parent".into(),
                 }],
                 resolved_manifest_snapshot: None,
+                subjektiv_session_attribution: None,
             })
             .unwrap();
 
@@ -1420,6 +1426,7 @@ mod tests {
                     worker_name: "target".into(),
                 }],
                 resolved_manifest_snapshot: None,
+                subjektiv_session_attribution: None,
             })
             .unwrap();
         inner.write(&WorkerMetadata::new("target", None)).unwrap();
@@ -1461,6 +1468,7 @@ mod tests {
                     worker_name: "target".into(),
                 }],
                 resolved_manifest_snapshot: None,
+                subjektiv_session_attribution: None,
             })
             .unwrap();
         store
@@ -1475,6 +1483,7 @@ mod tests {
                     worker_name: "source".into(),
                 }],
                 resolved_manifest_snapshot: None,
+                subjektiv_session_attribution: None,
             })
             .unwrap();
         let runtime_dir = Arc::new(RuntimeDir::create(&runtime_base, "source").await.unwrap());
@@ -1592,6 +1601,7 @@ mod tests {
                     worker_name: "target".into(),
                 }],
                 resolved_manifest_snapshot: None,
+                subjektiv_session_attribution: None,
             })
             .unwrap();
         store
@@ -1606,6 +1616,7 @@ mod tests {
                     worker_name: "source".into(),
                 }],
                 resolved_manifest_snapshot: None,
+                subjektiv_session_attribution: None,
             })
             .unwrap();
         let runtime_dir = Arc::new(RuntimeDir::create(&runtime_base, "source").await.unwrap());
@@ -1719,6 +1730,7 @@ mod tests {
                 reclaimed_children: Vec::new(),
                 peers: Vec::new(),
                 resolved_manifest_snapshot: None,
+                subjektiv_session_attribution: None,
             })
             .unwrap();
         store.write(&WorkerMetadata::new("target", None)).unwrap();
