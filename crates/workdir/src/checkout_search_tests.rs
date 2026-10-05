@@ -368,6 +368,405 @@ async fn checkout_search_wire_dto_bounds_and_provider_capabilities() {
     assert!(ExternalWorkdirOperationResult::try_from(bad_result).is_err());
 }
 
+fn write_ignore_fixture(root: &std::path::Path, relative: &str, contents: &str) {
+    let file = root.join(relative);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(file, contents).unwrap();
+}
+
+async fn verify_ignore_search_parity(session: &dyn WorkdirSession, base: &str, expected: &[&str]) {
+    let request = GlobRequest {
+        path: path(base),
+        pattern: "**/*.txt".into(),
+        limit: 100,
+    };
+    // On a Local session this is the actual ordinary WalkBuilder-backed path,
+    // not a broker wrapper that would route both calls through checkout_search.
+    let ordinary = session.glob(request.clone()).await.unwrap();
+    assert_eq!(
+        ordinary.paths,
+        expected.iter().map(|value| path(value)).collect::<Vec<_>>(),
+        "ordinary Glob fixture semantics at {base:?}"
+    );
+    assert!(!ordinary.truncated);
+    let CheckoutSearchResult::Glob(native) = session
+        .checkout_search(CheckoutSearchRequest::new(CheckoutSearchOperation::Glob(
+            request,
+        )))
+        .await
+        .unwrap()
+    else {
+        panic!("expected native Glob result")
+    };
+    assert_eq!(native, ordinary, "native Glob parity at {base:?}");
+
+    // Content mode renders paths in sorted order, avoiding dependence on the
+    // different walkers' visitation order. All fixture content has one match.
+    let request = GrepRequest {
+        path: path(base),
+        ..grep(GrepOutputMode::Content)
+    };
+    let ordinary = session.grep(request.clone()).await.unwrap();
+    assert_eq!(
+        ordinary.paths,
+        expected.iter().map(|value| path(value)).collect::<Vec<_>>(),
+        "ordinary Grep fixture semantics at {base:?}"
+    );
+    assert_eq!(ordinary.matched_files, expected.len());
+    assert_eq!(ordinary.match_count, expected.len());
+    assert!(!ordinary.truncated);
+    let CheckoutSearchResult::Grep(native) = session
+        .checkout_search(CheckoutSearchRequest::new(CheckoutSearchOperation::Grep(
+            request,
+        )))
+        .await
+        .unwrap()
+    else {
+        panic!("expected native Grep result")
+    };
+    assert_eq!(native, ordinary, "native Grep parity at {base:?}");
+}
+
+#[tokio::test]
+async fn checkout_search_local_glob_inherits_root_and_nested_ignore_rules() {
+    // Exercise the two ignore sources independently so rule precedence cannot
+    // conceal either missing source. A .git marker activates .gitignore rules.
+    for ignore_name in [".ignore", ".gitignore"] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        write_ignore_fixture(
+            root.path(),
+            ignore_name,
+            "root-only.txt\n/root-anchored.txt\n*.drop.txt\n!keep.drop.txt\ninherited.txt\npruned/\n",
+        );
+        write_ignore_fixture(
+            root.path(),
+            &format!("nested/{ignore_name}"),
+            "/nested-anchored.txt\nnested-only.txt\n!inherited.txt\nignored-dir/\n!ignored-dir/rescue.txt\n",
+        );
+        for relative in [
+            "visible.txt",
+            "root-only.txt",
+            "root-anchored.txt",
+            "discard.drop.txt",
+            "keep.drop.txt",
+            "inherited.txt",
+            "pruned/rescue.txt",
+            "nested/visible.txt",
+            "nested/root-only.txt",
+            "nested/root-anchored.txt",
+            "nested/nested-only.txt",
+            "nested/nested-anchored.txt",
+            "nested/discard.drop.txt",
+            "nested/keep.drop.txt",
+            "nested/inherited.txt",
+            "nested/pruned/rescue.txt",
+            "nested/ignored-dir/rescue.txt",
+            "nested/deep/nested-anchored.txt",
+        ] {
+            write_ignore_fixture(root.path(), relative, "needle fixture\n");
+        }
+        let source = LocalWorkdirSession::new(
+            manifest::Scope::writable(root.path()).unwrap(),
+            root.path().to_path_buf(),
+        );
+        verify_ignore_search_parity(
+            &source,
+            "",
+            &[
+                "keep.drop.txt",
+                "nested/deep/nested-anchored.txt",
+                "nested/inherited.txt",
+                "nested/keep.drop.txt",
+                "nested/root-anchored.txt",
+                "nested/visible.txt",
+                "visible.txt",
+            ],
+        )
+        .await;
+        // Starting explicitly below the provider root must still inherit the
+        // root's rules and retain provider-relative (not base-relative) paths.
+        verify_ignore_search_parity(
+            &source,
+            "nested",
+            &[
+                "nested/deep/nested-anchored.txt",
+                "nested/inherited.txt",
+                "nested/keep.drop.txt",
+                "nested/root-anchored.txt",
+                "nested/visible.txt",
+            ],
+        )
+        .await;
+        verify_ignore_search_parity(&source, "nested/deep", &["nested/deep/nested-anchored.txt"])
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn checkout_search_local_glob_preserves_ignore_source_precedence_across_levels() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join(".git")).unwrap();
+    write_ignore_fixture(
+        root.path(),
+        ".ignore",
+        "priority.txt\n!ignore-wins.txt\nroot-ignore.txt\n",
+    );
+    write_ignore_fixture(
+        root.path(),
+        ".gitignore",
+        "ignore-wins.txt\nrevived-git.txt\n",
+    );
+    write_ignore_fixture(root.path(), "nested/.ignore", "!root-ignore.txt\n");
+    write_ignore_fixture(
+        root.path(),
+        "nested/.gitignore",
+        "!priority.txt\n!revived-git.txt\n",
+    );
+    for relative in [
+        "priority.txt",
+        "ignore-wins.txt",
+        "root-ignore.txt",
+        "revived-git.txt",
+        "nested/priority.txt",
+        "nested/ignore-wins.txt",
+        "nested/root-ignore.txt",
+        "nested/revived-git.txt",
+    ] {
+        write_ignore_fixture(root.path(), relative, "needle fixture\n");
+    }
+    let source = LocalWorkdirSession::new(
+        manifest::Scope::writable(root.path()).unwrap(),
+        root.path().to_path_buf(),
+    );
+    // .ignore outranks .gitignore even when the .gitignore is deeper. Within
+    // the same source kind, a deeper negation can override an ancestor rule.
+    verify_ignore_search_parity(
+        &source,
+        "",
+        &[
+            "ignore-wins.txt",
+            "nested/ignore-wins.txt",
+            "nested/revived-git.txt",
+            "nested/root-ignore.txt",
+        ],
+    )
+    .await;
+    verify_ignore_search_parity(
+        &source,
+        "nested",
+        &[
+            "nested/ignore-wins.txt",
+            "nested/revived-git.txt",
+            "nested/root-ignore.txt",
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn checkout_search_scoped_broker_skips_denied_ancestor_ignore_files() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join(".git")).unwrap();
+    for (relative, contents) in [
+        (".ignore", "root-ignore-visible.txt\n"),
+        (".gitignore", "root-git-visible.txt\n"),
+        ("parent/.ignore", "parent-ignore-visible.txt\n"),
+        ("parent/.gitignore", "parent-git-visible.txt\n"),
+        ("parent/nested/.ignore", "allowed-ignore.txt\n"),
+    ] {
+        write_ignore_fixture(root.path(), relative, contents);
+    }
+    for name in [
+        "root-ignore-visible.txt",
+        "root-git-visible.txt",
+        "parent-ignore-visible.txt",
+        "parent-git-visible.txt",
+        "allowed-ignore.txt",
+    ] {
+        write_ignore_fixture(
+            root.path(),
+            &format!("parent/nested/{name}"),
+            "needle fixture\n",
+        );
+    }
+    let source = Arc::new(LocalWorkdirSession::new(
+        manifest::Scope::writable(root.path()).unwrap(),
+        root.path().to_path_buf(),
+    ));
+    // Without a scope layer, ordinary Local traversal really does inherit
+    // these ancestor rules. Each denied source suppresses a different file.
+    assert!(
+        source
+            .glob(GlobRequest {
+                path: path("parent/nested"),
+                pattern: "**/*.txt".into(),
+                limit: 100,
+            })
+            .await
+            .unwrap()
+            .paths
+            .is_empty()
+    );
+    // Make accidental consumption observable even if a matcher were to drop
+    // the valid patterns: these denied sparse sources exceed the shared Grep
+    // source budget. The allowed subtree remains tiny.
+    for relative in [
+        ".ignore",
+        ".gitignore",
+        "parent/.ignore",
+        "parent/.gitignore",
+    ] {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.path().join(relative))
+            .unwrap()
+            .set_len(65 * 1024 * 1024)
+            .unwrap();
+    }
+    let broker = WorkdirToolBroker::new(source.clone());
+    let lease = broker
+        .scope(scope(vec![rule("parent/nested", true)], "parent/nested"))
+        .await
+        .unwrap();
+    // Broker .glob/.grep use the native path under a scope. Compare those
+    // public entry points with explicit checkout_search and assert rebasing.
+    verify_ignore_search_parity(
+        &*lease.tool_session(),
+        "",
+        &[
+            "parent-git-visible.txt",
+            "parent-ignore-visible.txt",
+            "root-git-visible.txt",
+            "root-ignore-visible.txt",
+        ],
+    )
+    .await;
+    // Also exercise a Local native request with an unre-based provider root:
+    // allowed descendants do not grant authority to ancestor ignore sources.
+    let mut request = CheckoutSearchRequest::new(CheckoutSearchOperation::Glob(GlobRequest {
+        path: path("parent/nested"),
+        pattern: "**/*.txt".into(),
+        limit: 100,
+    }));
+    request.scope_layers = vec![vec![rule("parent/nested", true)]];
+    let CheckoutSearchResult::Glob(result) = source.checkout_search(request).await.unwrap() else {
+        panic!("expected native Glob result")
+    };
+    assert_eq!(
+        result.paths,
+        vec![
+            path("parent/nested/parent-git-visible.txt"),
+            path("parent/nested/parent-ignore-visible.txt"),
+            path("parent/nested/root-git-visible.txt"),
+            path("parent/nested/root-ignore-visible.txt"),
+        ]
+    );
+    assert!(!result.truncated);
+    lease.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn checkout_search_native_skips_symlinked_ignore_sources_without_outside_effects() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join(".git")).unwrap();
+    std::fs::create_dir(root.path().join("nested")).unwrap();
+    // Following any of these sources would hide an otherwise visible file.
+    // The native descriptor provider must safely skip rejected ignore opens,
+    // including when the source belongs to an explicitly selected base.
+    for (relative, hidden) in [
+        (".ignore", "root-ignore-visible.txt"),
+        (".gitignore", "root-git-visible.txt"),
+        ("nested/.ignore", "nested-ignore-visible.txt"),
+        ("nested/.gitignore", "nested-git-visible.txt"),
+    ] {
+        let target = outside.path().join(relative.replace('/', "-"));
+        let contents = format!("{hidden}\n");
+        std::fs::write(&target, &contents).unwrap();
+        std::os::unix::fs::symlink(&target, root.path().join(relative)).unwrap();
+        let visible = if relative.starts_with("nested/") {
+            format!("nested/{hidden}")
+        } else {
+            hidden.to_string()
+        };
+        write_ignore_fixture(root.path(), &visible, "needle fixture\n");
+    }
+    write_ignore_fixture(outside.path(), "secret.txt", "needle outside\n");
+    let source = LocalWorkdirSession::new(
+        manifest::Scope::writable(root.path()).unwrap(),
+        root.path().to_path_buf(),
+    );
+    for (base, expected) in [
+        (
+            "",
+            vec![
+                path("nested/nested-git-visible.txt"),
+                path("nested/nested-ignore-visible.txt"),
+                path("root-git-visible.txt"),
+                path("root-ignore-visible.txt"),
+            ],
+        ),
+        (
+            "nested",
+            vec![
+                path("nested/nested-git-visible.txt"),
+                path("nested/nested-ignore-visible.txt"),
+            ],
+        ),
+    ] {
+        let CheckoutSearchResult::Glob(result) = source
+            .checkout_search(CheckoutSearchRequest::new(CheckoutSearchOperation::Glob(
+                GlobRequest {
+                    path: path(base),
+                    pattern: "**/*.txt".into(),
+                    limit: 100,
+                },
+            )))
+            .await
+            .unwrap()
+        else {
+            panic!("expected native Glob result")
+        };
+        assert_eq!(result.paths, expected);
+        assert!(!result.truncated);
+        // Grep's existing descriptor contract rejects an unauthorized ignore
+        // open, rather than ignoring its error as Glob does. Both behaviors
+        // preserve confinement; do not relax Grep merely to match Glob.
+        let error = source
+            .checkout_search(CheckoutSearchRequest::new(CheckoutSearchOperation::Grep(
+                GrepRequest {
+                    path: path(base),
+                    ..grep(GrepOutputMode::Content)
+                },
+            )))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, WorkdirError::OutOfScope(_)));
+    }
+    for (relative, hidden) in [
+        (".ignore", "root-ignore-visible.txt"),
+        (".gitignore", "root-git-visible.txt"),
+        ("nested/.ignore", "nested-ignore-visible.txt"),
+        ("nested/.gitignore", "nested-git-visible.txt"),
+    ] {
+        assert!(
+            std::fs::symlink_metadata(root.path().join(relative))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join(relative.replace('/', "-"))).unwrap(),
+            format!("{hidden}\n")
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
+        "needle outside\n"
+    );
+}
+
 #[tokio::test]
 async fn checkout_search_preserves_current_provider_scope_and_rejects_symlink_escape() {
     let root = fixture();

@@ -48,26 +48,24 @@ pub fn run_glob(
         .as_ref()
         .and_then(|t| t.logical_root())
         .unwrap_or(root);
-    let mut walker = WalkBuilder::new(walker_root);
-    walker.hidden(false).follow_links(false);
-    if traversal.is_some() {
-        // Descriptor providers must never let WalkBuilder open pathname-based
-        // ignore files, which may be symlinked outside the pinned root. Glob's
-        // explicit pattern remains the complete selection contract.
-        walker
-            .git_ignore(false)
-            .git_global(false)
-            .git_exclude(false)
-            .ignore(false)
-            .parents(false);
-    }
+    let mut descriptor_ignores = traversal
+        .as_ref()
+        .map(|_| crate::descriptor_ignore::DescriptorIgnores::new(root, logical_walk_root, access))
+        .transpose()?;
     let mut visited = 0_usize;
-    let walk = if traversal.is_some() {
+    let mut walk = if traversal.is_some() {
+        // Configuration is read via authorized provider opens, never by
+        // WalkBuilder's host-path ignore discovery.
         crate::walk::Walk::descriptor(logical_walk_root, access)
     } else {
-        crate::walk::Walk::Plain(walker.build())
+        crate::walk::Walk::Plain(
+            WalkBuilder::new(walker_root)
+                .hidden(false)
+                .follow_links(false)
+                .build(),
+        )
     };
-    for entry in walk {
+    while let Some(entry) = walk.next() {
         let entry = entry?;
         access.check_cancelled().map_err(|source| FsError::Io {
             path: PathBuf::from(request.path.as_str()),
@@ -88,6 +86,19 @@ pub fn run_glob(
             Ok(resolved) if access.is_readable_paths(&path, &resolved) => resolved,
             _ => continue,
         };
+        if let Some(ignores) = descriptor_ignores.as_mut() {
+            let is_dir = entry.kind.is_some_and(|kind| kind.is_dir());
+            if path != logical_walk_root && ignores.is_ignored(&path, is_dir) {
+                if is_dir {
+                    walk.skip_current_dir();
+                }
+                continue;
+            }
+            if is_dir {
+                ignores.load_directory(&path, access)?;
+                continue;
+            }
+        }
         let Ok(file) = access.open_read_file(&path, &resolved) else {
             continue;
         };

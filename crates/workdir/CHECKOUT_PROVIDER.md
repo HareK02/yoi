@@ -125,6 +125,30 @@ provider-owned ignore loading, glob/type selection, grep context/offset/limit,
 rendering, and source/result limits remain in their shared engines. Unreadable
 ignore files are not opened to discover out-of-scope contents.
 
+Descriptor search loads `.ignore`, `.gitignore` and an authorized directory's
+`.git/info/exclude` through the same `FsAccessPolicy` opens as other sources.
+It preserves anchored rules, negation, nearest-directory precedence within a
+source class, `.ignore` precedence over Git rules, and nested repository
+boundaries. Ignored directories are pruned before enumeration or loading their
+own rules; explicitly selected ignored search roots are still traversable.
+Only the current ancestor matchers are retained, never a second tree/store.
+Glob requires an authorized `.git` directory/file marker for Git rules. Grep
+retains the existing descriptor-provider contract of applying `.gitignore`
+without a marker and rejecting unavailable/symlinked ignore opens; Glob skips
+unavailable ignore sources like its ordinary walker. Scope-denied sources are
+skipped by both before open. Bounds/cancellation failures are never retried.
+
+Configuration discovery cannot expand provider authority. Ambient ancestors
+outside the search result/provider root, global Git configuration/ignore files,
+and linked-worktree `.git`/`commondir` administration pointers are not followed.
+A `.git` file activates repository matching without treating it as a directory
+or opening the host path it contains. In-root readable ignore rules remain
+active, including inherited rules above a nested base. Descriptor ignore text
+must be UTF-8, bounded to 1 MiB/file, 16 KiB/line and 8 MiB aggregate per search;
+limit violations fail rather than returning silently incomplete filtering.
+Grep's separate candidate-content budget remains 64 MiB. Ordinary unscoped
+path-backed Tools keep their original discovery policy.
+
 Scoped ordinary trait List/Glob/Grep use this boundary as well, returning
 session-logical coordinates. Unscoped normal Tools continue using their original
 trait/provider behavior. A provider without checkout search support returns

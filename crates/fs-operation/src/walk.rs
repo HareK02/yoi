@@ -13,6 +13,13 @@ pub(crate) enum Walk<'a> {
     Descriptor(DescriptorWalk<'a>),
 }
 impl<'a> Walk<'a> {
+    /// A rejected directory has been yielded but not enumerated yet. Keep
+    /// ignore pruning inside the same bounded descriptor walk as scope pruning.
+    pub fn skip_current_dir(&mut self) {
+        if let Self::Descriptor(walk) = self {
+            walk.pending = None;
+        }
+    }
     pub fn descriptor(root: &Path, access: &'a dyn FsAccessPolicy) -> Self {
         Self::Descriptor(DescriptorWalk {
             access,

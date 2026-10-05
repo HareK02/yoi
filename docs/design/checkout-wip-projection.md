@@ -101,7 +101,13 @@ Native operation results use a JSON record with `summary`, nullable `content` an
 Search links are constructed from **typed provider paths**, not by parsing Grep's
 rendered filenames/line delimiters. Provider scope remains authoritative for
 search output as well as links. Glob/Grep share normal provider ignore/pattern,
-context/output mode, offset and bounded result behavior. Search does not claim an
+context/output mode, offset and bounded result behavior. Descriptor-safe ignore
+loading preserves root/nested rules and prunes ignored directories, checking
+scope before opening each rule source. It cannot read global/ambient ignore
+configuration outside provider authority or chase linked-worktree administration
+pointers; source-class precedence, per-provider Git-marker/error behavior and
+text/aggregate limits are detailed in `crates/workdir/CHECKOUT_PROVIDER.md`.
+Search does not claim an
 atomic snapshot of every descendant: it fences the bound directory before/after
 search and each provider read/search retains its own consistency guarantees.
 
@@ -215,6 +221,7 @@ git diff --check
 | Traversal depth/entry/cancellation bounds; stalled observation/link publication; numbered output expansion; post-dispatch encoding loss | `fs-operation/src/traversal_tests.rs`, `checkout_race_tests.rs`, `tools/src/read.rs`, `wip.rs` |
 | Real prefixed HTTP provider → Remote session → router → native WIP; auth, read-only, lost/malformed post-commit response without retry | `worker/src/checkout_http_tests.rs` |
 | Workspace proxy/External typed pairing and unknown-outcome propagation; Backend/Runtime Workspace, grant and generation isolation | checkout additions in `manage_workdir.rs` and Backend `server.rs`, plus full existing host/provider suites |
+| Root/nested ignore parity, source precedence/negation/anchoring, directory pruning, denied/symlink rule confinement and bounded loading | `fs-operation/src/ignore_tests.rs`, `workdir/src/checkout_search_tests.rs`, native WIP ignore/link regression |
 | Ordinary Tools text/hash/edit/write/search and provider symlink policy | full Tools, fs-operation and Workdir suites |
 
 The HTTP fixture tests actual network/codec boundaries but is not a production

@@ -51,6 +51,82 @@ async fn call(
 }
 
 #[tokio::test]
+async fn checkout_wip_search_preserves_root_and_nested_ignore_rules_and_links() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
+    std::fs::create_dir(dir.path().join("nested")).unwrap();
+    for (name, content) in [
+        (".ignore", "root-denied.txt\npriority.txt\n"),
+        (".gitignore", "git-denied.txt\n"),
+        ("nested/.gitignore", "!priority.txt\nnested-denied.txt\n"),
+    ] {
+        std::fs::write(dir.path().join(name), content).unwrap();
+    }
+    for name in [
+        "visible.txt",
+        "root-denied.txt",
+        "git-denied.txt",
+        "nested/visible.txt",
+        "nested/root-denied.txt",
+        "nested/git-denied.txt",
+        "nested/priority.txt",
+        "nested/nested-denied.txt",
+    ] {
+        std::fs::write(dir.path().join(name), "needle fixture\n").unwrap();
+    }
+    let source = session(&dir, false);
+    let router = Arc::new(WorkdirSessionRouter::new());
+    router
+        .attach(WorkdirAttachmentAlias::new("main").unwrap(), source.clone())
+        .unwrap();
+    let r = runtime(router, None);
+    for base in ["", "nested"] {
+        let ordinary = source
+            .glob(workdir::GlobRequest {
+                path: workdir::WorkdirPath::new(base).unwrap(),
+                pattern: "**/*.txt".into(),
+                limit: 100,
+            })
+            .await
+            .unwrap();
+        let expected = ordinary
+            .paths
+            .iter()
+            .map(|path| format!("/checkouts/main/{}", path.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(expected.len(), if base.is_empty() { 2 } else { 1 });
+        let route = if base.is_empty() {
+            "/checkouts/main"
+        } else {
+            "/checkouts/main/nested"
+        };
+        for (operation, args) in [
+            ("glob", json!({"pattern":"**/*.txt"})),
+            (
+                "grep",
+                json!({"pattern":"needle","output_mode":"files_with_matches"}),
+            ),
+        ] {
+            let output = call(&r, route, operation, args).await.unwrap();
+            let result: Json = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+            let mut paths = result["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["path"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            // Grep retains traversal order; Glob sorts its result paths.
+            paths.sort();
+            assert_eq!(paths, expected, "{operation} at {route}");
+            for path in paths {
+                assert!(r.host.projection_live(&path).await.unwrap().is_some());
+            }
+            assert!(!output.content.unwrap().contains("denied.txt"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn checkout_wip_native_roundtrip_search_read_edit_write_create() {
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join("src/deep")).unwrap();

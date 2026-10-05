@@ -6,7 +6,10 @@
 
 mod checked;
 pub use checked::{CheckedTarget, identity_validator};
+mod descriptor_ignore;
 mod glob;
+#[cfg(test)]
+mod ignore_tests;
 mod local;
 mod operation;
 mod search;
