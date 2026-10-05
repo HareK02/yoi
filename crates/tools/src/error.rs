@@ -44,7 +44,8 @@ impl From<ToolsError> for ToolError {
                 | workdir::WorkdirError::Unavailable(_)
                 | workdir::WorkdirError::OperationFailed
                 | workdir::WorkdirError::Transport(_)
-                | workdir::WorkdirError::Conflict(_),
+                | workdir::WorkdirError::Conflict(_)
+                | workdir::WorkdirError::OutcomeUnknown(_),
             ) => ToolError::ExecutionFailed(err.to_string()),
             ToolsError::FileSystem(_)
             | ToolsError::WorkdirSession(_)
@@ -61,6 +62,22 @@ impl From<ToolsError> for ToolError {
 mod tests {
     use super::*;
     use workdir::http::{WorkdirTransportError, WorkdirTransportErrorCode};
+
+    #[test]
+    fn checkout_outcome_unknown_remains_execution_failure() {
+        let error = ToolError::from(ToolsError::WorkdirSession(
+            workdir::WorkdirError::OutcomeUnknown(
+                "mutation may have committed; do not retry automatically".into(),
+            ),
+        ));
+        match error {
+            ToolError::ExecutionFailed(message) => {
+                assert!(message.contains("mutation may have committed"));
+                assert!(message.contains("do not retry automatically"));
+            }
+            other => panic!("outcome unknown must not become invalid input: {other:?}"),
+        }
+    }
 
     #[test]
     fn local_workdir_content_conflict_is_retryable_execution_failure() {

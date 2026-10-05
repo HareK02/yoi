@@ -11,15 +11,15 @@ use crate::ToolsError;
 const RESULT_LIMIT: usize = 1000;
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct GlobParams {
+pub(crate) struct GlobParams {
     /// Worker-local alias of the Workdir attachment to use.
     #[serde(default)]
-    target_workdir: Option<String>,
+    pub target_workdir: Option<String>,
     /// Glob pattern, for example `**/*.rs` or `src/**/test_*.py`.
-    pattern: String,
+    pub pattern: String,
     /// Logical Workdir-relative directory. Defaults to the Workdir root.
     #[serde(default)]
-    path: Option<String>,
+    pub path: Option<String>,
 }
 
 struct GlobTool {
@@ -44,42 +44,57 @@ impl Tool for GlobTool {
             Some(path) => WorkdirPath::new(&path).map_err(ToolsError::from)?,
             None => WorkdirPath::root(),
         };
-        let pattern = params.pattern;
-        tracing::debug!(%pattern, %path, "Glob");
-        let result = selected
-            .session
-            .glob(GlobRequest {
-                pattern: pattern.clone(),
-                path,
-                limit: RESULT_LIMIT,
-            })
-            .await
-            .map_err(ToolsError::from)?;
-        let mut body = result
-            .paths
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !body.is_empty() {
-            body.push('\n');
-        }
-        let summary = if result.paths.is_empty() {
-            format!("No files found matching {pattern}")
-        } else if result.truncated {
-            format!(
-                "Found {}+ files matching {pattern} (truncated to {RESULT_LIMIT})",
-                result.paths.len()
-            )
-        } else {
-            format!("Found {} file(s) matching {pattern}", result.paths.len())
-        };
-        Ok(ToolOutput {
+        Ok(execute_glob(
+            crate::search_target::SearchTarget::tool(selected.session),
+            path,
+            params.pattern,
+        )
+        .await?
+        .output)
+    }
+}
+
+pub(crate) async fn execute_glob(
+    target: crate::search_target::SearchTarget,
+    path: WorkdirPath,
+    pattern: String,
+) -> Result<crate::checkout::CheckoutToolOutput, ToolError> {
+    tracing::debug!(%pattern, %path, "Glob");
+    let result = target
+        .glob(GlobRequest {
+            pattern: pattern.clone(),
+            path,
+            limit: RESULT_LIMIT,
+        })
+        .await?;
+    let mut body = result
+        .paths
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    let summary = if result.paths.is_empty() {
+        format!("No files found matching {pattern}")
+    } else if result.truncated {
+        format!(
+            "Found {}+ files matching {pattern} (truncated to {RESULT_LIMIT})",
+            result.paths.len()
+        )
+    } else {
+        format!("Found {} file(s) matching {pattern}", result.paths.len())
+    };
+    Ok(crate::checkout::CheckoutToolOutput {
+        output: ToolOutput {
             summary,
             content: (!body.is_empty()).then_some(body),
             attachments: Vec::new(),
-        })
-    }
+        },
+        paths: result.paths,
+        validator: None,
+    })
 }
 
 pub fn glob_tool(session: WorkdirSessionHandle) -> ToolDefinition {

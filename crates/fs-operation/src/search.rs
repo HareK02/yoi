@@ -79,6 +79,28 @@ fn reserve_report_bytes(report: &mut GrepReport, bytes: usize) -> bool {
 
 impl GrepReport {
     fn into_result(self, root: &Path) -> GrepResult {
+        // Build Object paths from retained provider identities, never by parsing
+        // rendered text. Offset, limit and truncation already selected this set.
+        let paths = match self.mode {
+            GrepOutputMode::FilesWithMatches => self
+                .files
+                .iter()
+                .filter_map(|path| logical_path(root, path))
+                .collect(),
+            GrepOutputMode::Count => self
+                .counts
+                .iter()
+                .filter_map(|(path, _)| logical_path(root, path))
+                .collect(),
+            GrepOutputMode::Content => self
+                .lines
+                .iter()
+                .map(|line| line.path.as_path())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .filter_map(|path| logical_path(root, path))
+                .collect(),
+        };
         let (match_count, matched_files) = match self.mode {
             GrepOutputMode::FilesWithMatches => (self.files.len(), self.files.len()),
             GrepOutputMode::Count => (
@@ -116,6 +138,7 @@ impl GrepReport {
             }
         }
         GrepResult {
+            paths,
             output,
             match_count,
             matched_files,
@@ -166,11 +189,15 @@ fn render_content_lines(root: &Path, lines: &[ContentLine], show_line_numbers: b
     output
 }
 
+fn logical_path(root: &Path, path: &Path) -> Option<crate::FsPath> {
+    crate::FsPath::new_scoped(path.strip_prefix(root).unwrap_or(path).to_str()?).ok()
+}
+
 fn logical_display(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+    logical_path(root, path)
+        .expect("only representable provider paths enter a report")
+        .as_str()
+        .to_string()
 }
 
 const DEFAULT_HEAD_LIMIT: usize = 250;
@@ -464,6 +491,9 @@ pub fn run_grep(
         retained_bytes: 0,
         truncated: false,
     };
+    if head_limit == 0 {
+        return Ok(report.into_result(root));
+    }
     let mut matching_files_seen = 0;
     let mut matches_seen = 0;
 
@@ -474,6 +504,7 @@ pub fn run_grep(
                 &mut searcher,
                 &matcher,
                 &base,
+                root,
                 mode,
                 &mut report,
                 &mut matching_files_seen,
@@ -494,6 +525,10 @@ pub fn run_grep(
         .as_ref()
         .map(|traversal| traversal.path())
         .unwrap_or(&base);
+    let logical_walk_root = traversal
+        .as_ref()
+        .and_then(|t| t.logical_root())
+        .unwrap_or(root);
     let mut walker = WalkBuilder::new(walker_root);
     if traversal.is_some() {
         walker
@@ -506,19 +541,6 @@ pub fn run_grep(
             .ignore(false)
             .parents(false)
             .follow_links(false);
-        let search_relative = base.strip_prefix(root).map_err(|_| {
-            FsError::InvalidArgument("grep base is outside its provider root".to_string())
-        })?;
-        let search_relative = search_relative.to_path_buf();
-        let filter_root = walker_root.to_path_buf();
-        walker.filter_entry(move |entry| {
-            entry
-                .path()
-                .strip_prefix(&filter_root)
-                .is_ok_and(|relative| {
-                    relative.starts_with(&search_relative) || search_relative.starts_with(relative)
-                })
-        });
     } else {
         walker
             .hidden(true)
@@ -563,7 +585,13 @@ pub fn run_grep(
             )?;
         }
     }
-    for entry in walker.build().flatten() {
+    let walk = if traversal.is_some() {
+        crate::walk::Walk::descriptor(logical_walk_root, access)
+    } else {
+        crate::walk::Walk::Plain(walker.build())
+    };
+    for entry in walk {
+        let entry = entry?;
         access
             .check_cancelled()
             .map_err(|error| FsError::io(&base, error))?;
@@ -574,18 +602,11 @@ pub fn run_grep(
                 crate::MAX_TRAVERSAL_ENTRIES
             )));
         }
-        let walked_path = entry.path();
-        let path = if traversal.is_some() {
-            let relative = walked_path.strip_prefix(walker_root).map_err(|_| {
-                FsError::InvalidArgument(
-                    "descriptor traversal returned a path outside its root".to_string(),
-                )
-            })?;
-            root.join(relative)
-        } else {
-            walked_path.to_path_buf()
-        };
-        let file_type = entry.file_type();
+        let path = entry.path;
+        if logical_path(root, &path).is_none() {
+            continue;
+        }
+        let file_type = entry.kind;
         if traversal.is_some() && file_type.as_ref().is_some_and(|kind| kind.is_dir()) {
             descriptor_ignores.load_directory(&path, &base, &mut source_bytes_remaining, access)?;
             continue;
@@ -599,10 +620,12 @@ pub fn run_grep(
                     "descriptor traversal returned a path outside its search base".to_string(),
                 )
             })?;
-            if relative
-                .components()
-                .any(|component| component.as_os_str().to_string_lossy().starts_with('.'))
-                || descriptor_ignores.is_ignored(root, &path)
+            if relative.components().any(|component| {
+                component
+                    .as_os_str()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with('.'))
+            }) || descriptor_ignores.is_ignored(root, &path)
                 || !direct_file_selected(&path, overrides.as_ref(), types.as_ref())
             {
                 continue;
@@ -618,6 +641,7 @@ pub fn run_grep(
             &mut searcher,
             &matcher,
             &path,
+            root,
             mode,
             &mut report,
             &mut matching_files_seen,
@@ -639,6 +663,7 @@ fn scan_path(
     searcher: &mut Searcher,
     matcher: &grep_regex::RegexMatcher,
     path: &Path,
+    root: &Path,
     mode: GrepOutputMode,
     report: &mut GrepReport,
     matching_files_seen: &mut usize,
@@ -648,6 +673,9 @@ fn scan_path(
     source_bytes_remaining: &mut u64,
     access: &dyn FsAccessPolicy,
 ) -> Result<bool, FsError> {
+    if logical_path(root, path).is_none() {
+        return Ok(false);
+    }
     let resolved = access
         .resolve_access_path(path)
         .map_err(|error| FsError::io(path, error))?;
@@ -678,7 +706,7 @@ fn scan_path(
                 return Ok(false);
             }
             if *matching_files_seen >= offset {
-                if !reserve_report_bytes(report, path.to_string_lossy().len().saturating_add(1)) {
+                if !reserve_report_bytes(report, path.as_os_str().len().saturating_add(1)) {
                     return Ok(true);
                 }
                 report.files.push(path.to_path_buf());
@@ -695,7 +723,7 @@ fn scan_path(
                 return Ok(false);
             }
             if *matching_files_seen >= offset {
-                if !reserve_report_bytes(report, path.to_string_lossy().len().saturating_add(32)) {
+                if !reserve_report_bytes(report, path.as_os_str().len().saturating_add(32)) {
                     return Ok(true);
                 }
                 report.counts.push((path.to_path_buf(), count));
@@ -780,7 +808,7 @@ impl ContentSink<'_> {
     fn reserve(&mut self, content_bytes: usize) -> bool {
         let retained = self
             .path
-            .to_string_lossy()
+            .as_os_str()
             .len()
             .saturating_add(content_bytes)
             .saturating_add(64);

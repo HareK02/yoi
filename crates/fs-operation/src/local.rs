@@ -162,6 +162,19 @@ fn run_read_with_limits(
         }
     }
 
+    #[cfg(unix)]
+    if crate::identity_validator(&metadata).map_err(|e| map_io(&logical, e))?
+        != crate::identity_validator(
+            &reader
+                .get_ref()
+                .metadata()
+                .map_err(|e| map_io(&logical, e))?,
+        )
+        .map_err(|e| map_io(&logical, e))?
+    {
+        return Err(FsError::Conflict(logical.as_str().to_string()));
+    }
+
     let total_lines =
         current_line.saturating_add(usize::from(last_byte.is_some_and(|byte| byte != b'\n')));
     if request.offset > total_lines && request.offset != 0 {
@@ -473,6 +486,14 @@ pub fn run_list(
     if !metadata.is_dir() {
         return Err(FsError::NotDirectory(PathBuf::from(logical.as_str())));
     }
+    if !access.can_enumerate_directory(&logical_base, &path) {
+        return Ok(ListResult {
+            entries: Vec::new(),
+            total_entries: 0,
+            total_bytes: 0,
+            truncated: false,
+        });
+    }
     let mut entries = Vec::new();
     let mut retained_path_bytes = 0_usize;
     let mut provider_truncated = false;
@@ -490,6 +511,9 @@ pub fn run_list(
             )));
         }
         let entry = entry.map_err(|error| map_io(&logical, error))?;
+        if entry.file_name().to_str().is_none() {
+            continue;
+        }
         let logical_absolute = logical_base.join(entry.file_name());
         let resolved = match access.resolve_access_path(&logical_absolute) {
             Ok(resolved) => resolved,
@@ -513,7 +537,12 @@ pub fn run_list(
         let relative = logical_absolute.strip_prefix(root).map_err(|_| {
             FsError::InvalidArgument("provider returned a path outside its root".to_string())
         })?;
-        let result_path = FsPath::new(relative.to_string_lossy())?;
+        let Some(relative) = relative.to_str() else {
+            continue;
+        };
+        let Ok(result_path) = FsPath::new(relative) else {
+            continue;
+        };
         let retained = result_path.as_str().len().saturating_add(64);
         if retained_path_bytes.saturating_add(retained) > crate::MAX_RESULT_PATH_BYTES {
             provider_truncated = true;

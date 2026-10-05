@@ -256,6 +256,25 @@ impl Tracker {
             .copied()
     }
 
+    /// Record the full provider content hash and total line count, even for a sliced Read.
+    /// Keeping both under one lock prevents pairing counts from a different observation.
+    pub fn record_workdir_observation(
+        &self,
+        path: &workdir::WorkdirPath,
+        hash: workdir::ContentHash,
+        total_lines: usize,
+    ) {
+        let key = self.key(PathBuf::from(path.as_str()));
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.line_counts.insert(key.clone(), total_lines);
+        inner.hashes.insert(key.clone(), hash);
+        inner.recency.retain(|candidate| candidate != &key);
+        inner.recency.push_front(key);
+        if inner.recency.len() > RECENCY_CAPACITY {
+            inner.recency.pop_back();
+        }
+    }
+
     pub fn record_workdir_hash(&self, path: &workdir::WorkdirPath, hash: workdir::ContentHash) {
         let key = self.key(PathBuf::from(path.as_str()));
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());

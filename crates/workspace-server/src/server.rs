@@ -1077,6 +1077,9 @@ fn external_workdir_operation_kind(operation: &WorkdirSessionOperation) -> &'sta
     match operation {
         WorkdirSessionOperation::AuthorizeScope(_) => "authorize_scope",
         WorkdirSessionOperation::ScopeRulesOverlap(_) => "scope_rules_overlap",
+        WorkdirSessionOperation::CheckoutObserve(_) => "checkout_observe",
+        WorkdirSessionOperation::CheckoutExecute(_) => "checkout_execute",
+        WorkdirSessionOperation::CheckoutSearch(_) => "checkout_search",
         WorkdirSessionOperation::Stat(_) => "stat",
         WorkdirSessionOperation::Read(_) => "read",
         WorkdirSessionOperation::ReadBytes(_) => "read_bytes",
@@ -1125,6 +1128,107 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
         {
             WorkdirSessionOperationResult::ScopeRulesOverlap { overlaps } => Ok(overlaps),
             _ => Err(Self::mismatch("scope_rules_overlap")),
+        }
+    }
+    async fn checkout_observe(
+        &self,
+        path: workdir::WorkdirPath,
+    ) -> std::result::Result<workdir::CheckoutObservation, workdir::WorkdirError> {
+        self.ensure_capability(workdir::WorkdirSessionCapability::Read)?;
+        match self
+            .operate(WorkdirSessionOperation::CheckoutObserve(path.clone()))
+            .await?
+        {
+            WorkdirSessionOperationResult::CheckoutObserve(mut value)
+                if value.path == path
+                    && !value.validator.is_empty()
+                    && value.validator.len() <= 256 =>
+            {
+                value.capabilities = value.capabilities.intersection(self.capabilities());
+                Ok(value)
+            }
+            _ => Err(Self::mismatch("checkout_observe")),
+        }
+    }
+    async fn checkout_execute(
+        &self,
+        request: workdir::CheckoutRequest,
+    ) -> std::result::Result<workdir::CheckoutResult, workdir::WorkdirError> {
+        let cap = request.operation.capability();
+        self.ensure_capability(cap)?;
+        let target = request.target.clone();
+        let mutation = cap != workdir::WorkdirSessionCapability::Read;
+        match self
+            .operate(WorkdirSessionOperation::CheckoutExecute(request))
+            .await
+        {
+            Ok(WorkdirSessionOperationResult::CheckoutExecute(mut value))
+                if value.observation.path == target
+                    && !value.observation.validator.is_empty()
+                    && value.observation.validator.len() <= 256
+                    && matches!(
+                        (&value.output, cap),
+                        (
+                            workdir::CheckoutOutput::Read(_),
+                            workdir::WorkdirSessionCapability::Read
+                        ) | (
+                            workdir::CheckoutOutput::Write(_),
+                            workdir::WorkdirSessionCapability::Write
+                        ) | (
+                            workdir::CheckoutOutput::Edit(_),
+                            workdir::WorkdirSessionCapability::Edit
+                        )
+                    ) =>
+            {
+                value.observation.capabilities = value
+                    .observation
+                    .capabilities
+                    .intersection(self.capabilities());
+                Ok(value)
+            }
+            Ok(_) if mutation => Err(workdir::WorkdirError::OutcomeUnknown(
+                "mismatched checkout mutation response".into(),
+            )),
+            Ok(_) => Err(Self::mismatch("checkout_execute")),
+            Err(workdir::WorkdirError::Unavailable(_) | workdir::WorkdirError::Transport(_))
+                if mutation =>
+            {
+                Err(workdir::WorkdirError::OutcomeUnknown(
+                    "checkout provider response lost; inspect effects before retry".into(),
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+    async fn checkout_search(
+        &self,
+        request: workdir::CheckoutSearchRequest,
+    ) -> std::result::Result<workdir::CheckoutSearchResult, workdir::WorkdirError> {
+        use workdir::{
+            CheckoutSearchOperation as Op, CheckoutSearchResult as Result,
+            WorkdirSessionCapability as Cap,
+        };
+        let cap = match &request.operation {
+            Op::List(_) => Cap::Read,
+            Op::Glob(_) => Cap::Glob,
+            Op::Grep(_) => Cap::Grep,
+        };
+        self.ensure_capability(cap)?;
+        match self
+            .operate(WorkdirSessionOperation::CheckoutSearch(request))
+            .await?
+        {
+            WorkdirSessionOperationResult::CheckoutSearch(value)
+                if matches!(
+                    (&value, cap),
+                    (Result::List(_), Cap::Read)
+                        | (Result::Glob(_), Cap::Glob)
+                        | (Result::Grep(_), Cap::Grep)
+                ) =>
+            {
+                Ok(value)
+            }
+            _ => Err(Self::mismatch("checkout_search")),
         }
     }
     async fn stat(
@@ -16917,6 +17021,9 @@ async fn scoped_execute_current_worker_workdir_operation(
         }
         operation @ (WorkdirSessionOperation::AuthorizeScope(_)
         | WorkdirSessionOperation::ScopeRulesOverlap(_)
+        | WorkdirSessionOperation::CheckoutObserve(_)
+        | WorkdirSessionOperation::CheckoutExecute(_)
+        | WorkdirSessionOperation::CheckoutSearch(_)
         | WorkdirSessionOperation::Stat(_)
         | WorkdirSessionOperation::Read(_)
         | WorkdirSessionOperation::ReadBytes(_)
@@ -16978,6 +17085,18 @@ async fn execute_workdir_session_operation(
             .scope_rules_overlap(request)
             .await
             .map(|overlaps| WorkdirSessionOperationResult::ScopeRulesOverlap { overlaps }),
+        WorkdirSessionOperation::CheckoutObserve(path) => session
+            .checkout_observe(path)
+            .await
+            .map(WorkdirSessionOperationResult::CheckoutObserve),
+        WorkdirSessionOperation::CheckoutExecute(request) => session
+            .checkout_execute(request)
+            .await
+            .map(WorkdirSessionOperationResult::CheckoutExecute),
+        WorkdirSessionOperation::CheckoutSearch(request) => session
+            .checkout_search(request)
+            .await
+            .map(WorkdirSessionOperationResult::CheckoutSearch),
         WorkdirSessionOperation::Stat(request) => session
             .stat(request)
             .await
@@ -32997,6 +33116,96 @@ mod tests {
             ))
         ));
         assert!(commands.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn checkout_external_provider_typed_boundary_and_unknown_response() {
+        let (sender, mut commands) = tokio::sync::mpsc::channel(1);
+        let connection = Arc::new(ExternalProviderConnection {
+            grant_id: "checkout-grant".into(),
+            workdir_id: "checkout-external".into(),
+            provider_instance_id: "checkout-provider".into(),
+            generation: 7,
+            expires_at: None,
+            capabilities: workdir::WorkdirSessionCapabilities::READ_WRITE,
+            admission: Arc::new(tokio::sync::Semaphore::new(16)),
+            shutdown_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sender,
+        });
+        let session = Arc::new(ExternalProviderWorkdirSession::new(connection, None));
+        let path = workdir::WorkdirPath::new("file.txt").unwrap();
+        let observe = {
+            let session = session.clone();
+            let path = path.clone();
+            tokio::spawn(async move { session.checkout_observe(path).await })
+        };
+        let Some(ExternalProviderCommand::Operation {
+            operation,
+            response,
+            ..
+        }) = commands.recv().await
+        else {
+            panic!("expected operation")
+        };
+        assert!(matches!(
+            operation,
+            WorkdirSessionOperation::CheckoutObserve(_)
+        ));
+        response
+            .send(Ok(WorkdirSessionOperationResult::CheckoutObserve(
+                workdir::CheckoutObservation {
+                    path: path.clone(),
+                    kind: workdir::EntryKind::File,
+                    size: 4,
+                    validator: vec![1],
+                    capabilities: workdir::WorkdirSessionCapabilities::READ_WRITE,
+                },
+            )))
+            .unwrap();
+        let observed = observe.await.unwrap().unwrap();
+        for lose_response in [false, true] {
+            let request = workdir::CheckoutRequest {
+                target: path.clone(),
+                validator: observed.validator.clone(),
+                operation: workdir::CheckoutOperation::Write {
+                    content: b"next".to_vec(),
+                    expected_hash: [0; 32],
+                },
+            };
+            let write = {
+                let session = session.clone();
+                tokio::spawn(async move { session.checkout_execute(request).await })
+            };
+            let Some(ExternalProviderCommand::Operation {
+                operation,
+                response,
+                ..
+            }) = commands.recv().await
+            else {
+                panic!("expected operation")
+            };
+            assert!(matches!(
+                operation,
+                WorkdirSessionOperation::CheckoutExecute(_)
+            ));
+            if lose_response {
+                drop(response);
+            } else {
+                // A valid ordinary result is still the wrong subject/operation for this checked call.
+                response
+                    .send(Ok(WorkdirSessionOperationResult::Write(
+                        workdir::WriteResult {
+                            bytes_written: 4,
+                            created: false,
+                        },
+                    )))
+                    .unwrap();
+            }
+            assert!(matches!(
+                write.await.unwrap(),
+                Err(workdir::WorkdirError::OutcomeUnknown(_))
+            ));
+        }
     }
 
     #[tokio::test]

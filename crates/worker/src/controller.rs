@@ -1597,6 +1597,20 @@ where
     let host_worker_observation_provider = worker.worker_observation_provider();
     let wip_permissions = worker.manifest().permissions.clone();
     let mut wip_mount_registry = crate::wip::WipMountRegistry::new();
+    if wip_mode && !backend_job_profile {
+        crate::checkout::mount_checkouts(
+            &mut wip_mount_registry,
+            worker.workdir_sessions(),
+            tracker.clone(),
+            wip_permissions.clone(),
+        )
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("mount checkout WIP projection: {error}"),
+            )
+        })?;
+    }
     if wip_mode && let Some(feature) = &workdir_wip_feature {
         crate::feature::builtin::manage_workdir::wip::mount_workspace_workdir_wip(
             &mut wip_mount_registry,

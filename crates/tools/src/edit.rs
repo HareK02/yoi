@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use crate::error::ToolsError;
 use crate::tracker::Tracker;
-use workdir::{EditRequest, WorkdirPath, WorkdirSessionHandle, WorkdirSessionRouter};
+use workdir::{WorkdirPath, WorkdirSessionHandle, WorkdirSessionRouter};
 
 const DESCRIPTION: &str = "Replace a substring in an existing file in the selected Workdir attachment. By default \
 `old_string` must be unique in the file; set `replace_all: true` to replace \
@@ -56,56 +56,74 @@ impl Tool for EditTool {
             .tracker
             .scoped_attachment(&selected.alias, selected.generation);
         let path = WorkdirPath::new(&params.file_path).map_err(ToolsError::from)?;
-        tracing::debug!(path = %path, replace_all = params.replace_all, "Edit");
+        Ok(execute_edit(
+            crate::file_target::FileTarget {
+                session: selected.session,
+                path,
+                validator: None,
+            },
+            tracker,
+            params,
+            ctx,
+        )
+        .await?
+        .output)
+    }
+}
 
-        if params.old_string.is_empty() {
-            return Err(ToolError::InvalidArgument(
-                "old_string must not be empty".into(),
-            ));
-        }
-        if params.old_string == params.new_string {
-            return Err(ToolError::InvalidArgument(
-                "old_string and new_string are identical".into(),
-            ));
-        }
-
-        let mutation_key = PathBuf::from(path.as_str());
-        let _mutation_permit = tracker.acquire_mutation(&mutation_key, &ctx).await;
-        let expected_hash = tracker.expected_workdir_hash(&path)?;
-        let result = selected
-            .session
-            .edit(EditRequest {
-                path: path.clone(),
-                old_string: params.old_string.clone(),
-                new_string: params.new_string.clone(),
-                replace_all: params.replace_all,
-                expected_hash,
-            })
-            .await
-            .map_err(ToolsError::from)?;
-        let replacements = result.replacements;
-        tracker.record_workdir_edit(
-            &path,
-            result.content_hash,
-            replacements,
-            params.new_string.lines().count(),
-            params.old_string.lines().count(),
-        );
-
-        let summary = format!(
-            "Edited {} ({} replacement{})",
-            path,
-            replacements,
-            if replacements == 1 { "" } else { "s" }
-        );
-        let preview = make_preview(&params.new_string, &params.new_string);
-
-        Ok(ToolOutput {
+pub(crate) async fn execute_edit(
+    target: crate::file_target::FileTarget,
+    tracker: Tracker,
+    params: EditParams,
+    ctx: agen::tool::ToolExecutionContext,
+) -> Result<crate::checkout::CheckoutToolOutput, ToolError> {
+    let path = &target.path;
+    tracing::debug!(path = %path, replace_all = params.replace_all, "Edit");
+    if params.old_string.is_empty() {
+        return Err(ToolError::InvalidArgument(
+            "old_string must not be empty".into(),
+        ));
+    }
+    if params.old_string == params.new_string {
+        return Err(ToolError::InvalidArgument(
+            "old_string and new_string are identical".into(),
+        ));
+    }
+    let mutation_key = PathBuf::from(path.as_str());
+    let _mutation_permit = tracker.acquire_mutation(&mutation_key, &ctx).await;
+    let expected_hash = tracker.expected_workdir_hash(path)?;
+    let (result, validator) = target
+        .edit(
+            params.old_string.clone(),
+            params.new_string.clone(),
+            params.replace_all,
+            expected_hash,
+        )
+        .await?;
+    let replacements = result.replacements;
+    tracker.record_workdir_edit(
+        path,
+        result.content_hash,
+        replacements,
+        params.new_string.lines().count(),
+        params.old_string.lines().count(),
+    );
+    let summary = format!(
+        "Edited {} ({} replacement{})",
+        path,
+        replacements,
+        if replacements == 1 { "" } else { "s" }
+    );
+    let preview = make_preview(&params.new_string, &params.new_string);
+    Ok(crate::checkout::CheckoutToolOutput {
+        output: ToolOutput {
             summary,
             content: Some(preview),
             attachments: Vec::new(),
-        })
-    }
+        },
+        paths: Vec::new(),
+        validator,
+    })
 }
 
 /// Build a small line-numbered snippet centered on the first occurrence of

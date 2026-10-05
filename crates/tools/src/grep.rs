@@ -22,16 +22,16 @@ enum OutputMode {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct GrepParams {
+pub(crate) struct GrepParams {
     /// Worker-local alias of the Workdir attachment to use.
     #[serde(default)]
     target_workdir: Option<String>,
     pattern: String,
     /// Workdir-relative path, or an absolute path covered by readable scope. Defaults to the Workdir root.
     #[serde(default)]
-    path: Option<String>,
+    pub path: Option<String>,
     #[serde(default)]
-    glob: Option<String>,
+    pub glob: Option<String>,
     #[serde(default, rename = "type")]
     file_type: Option<String>,
     #[serde(default)]
@@ -70,69 +70,85 @@ impl Tool for GrepTool {
             params.target_workdir.as_deref(),
             workdir::WorkdirSessionCapability::Grep,
         )?;
-        let path = match params.path {
-            Some(path) => WorkdirPath::new_scoped(&path).map_err(ToolsError::from)?,
+        let path = match params.path.as_deref() {
+            Some(path) => WorkdirPath::new_scoped(path).map_err(ToolsError::from)?,
             None => WorkdirPath::root(),
         };
-        let mode = match params.output_mode.unwrap_or_default() {
-            OutputMode::FilesWithMatches => GrepOutputMode::FilesWithMatches,
-            OutputMode::Content => GrepOutputMode::Content,
-            OutputMode::Count => GrepOutputMode::Count,
-        };
-        let (before_context, after_context) = params
-            .context
-            .map(|context| (context, context))
-            .unwrap_or((params.before.unwrap_or(0), params.after.unwrap_or(0)));
-        let head_limit = params.head_limit.unwrap_or(DEFAULT_HEAD_LIMIT);
-        let result = selected
-            .session
-            .grep(GrepRequest {
-                pattern: params.pattern,
-                path,
-                glob: params.glob,
-                file_type: params.file_type,
-                case_insensitive: params.case_insensitive,
-                before_context,
-                after_context,
-                multiline: params.multiline,
-                output_mode: mode,
-                limit: head_limit,
-                offset: params.offset.unwrap_or(0),
-            })
-            .await
-            .map_err(ToolsError::from)?;
+        Ok(execute_grep(
+            crate::search_target::SearchTarget::tool(selected.session),
+            path,
+            params,
+        )
+        .await?
+        .output)
+    }
+}
 
-        let summary = if result.match_count == 0 {
-            match mode {
-                GrepOutputMode::Content => "No matches".to_owned(),
-                _ => "No files matched".to_owned(),
+pub(crate) async fn execute_grep(
+    target: crate::search_target::SearchTarget,
+    path: WorkdirPath,
+    params: GrepParams,
+) -> Result<crate::checkout::CheckoutToolOutput, ToolError> {
+    let mode = match params.output_mode.unwrap_or_default() {
+        OutputMode::FilesWithMatches => GrepOutputMode::FilesWithMatches,
+        OutputMode::Content => GrepOutputMode::Content,
+        OutputMode::Count => GrepOutputMode::Count,
+    };
+    let (before_context, after_context) = params
+        .context
+        .map(|context| (context, context))
+        .unwrap_or((params.before.unwrap_or(0), params.after.unwrap_or(0)));
+    let head_limit = params.head_limit.unwrap_or(DEFAULT_HEAD_LIMIT);
+    let result = target
+        .grep(GrepRequest {
+            pattern: params.pattern,
+            path,
+            glob: params.glob,
+            file_type: params.file_type,
+            case_insensitive: params.case_insensitive,
+            before_context,
+            after_context,
+            multiline: params.multiline,
+            output_mode: mode,
+            limit: head_limit,
+            offset: params.offset.unwrap_or(0),
+        })
+        .await?;
+
+    let summary = if result.match_count == 0 {
+        match mode {
+            GrepOutputMode::Content => "No matches".to_owned(),
+            _ => "No files matched".to_owned(),
+        }
+    } else {
+        match mode {
+            GrepOutputMode::FilesWithMatches => {
+                format!("Found matches in {} file(s)", result.matched_files)
             }
-        } else {
-            match mode {
-                GrepOutputMode::FilesWithMatches => {
-                    format!("Found matches in {} file(s)", result.matched_files)
-                }
-                GrepOutputMode::Count => format!(
-                    "Found matches in {} file(s), {} total line(s)",
-                    result.matched_files, result.match_count
-                ),
-                GrepOutputMode::Content => format!(
-                    "{} matching line(s) in {} file(s)",
-                    result.match_count, result.matched_files
-                ),
-            }
-        };
-        let summary = if result.truncated {
-            format!("{summary} (truncated at {head_limit})")
-        } else {
-            summary
-        };
-        Ok(ToolOutput {
+            GrepOutputMode::Count => format!(
+                "Found matches in {} file(s), {} total line(s)",
+                result.matched_files, result.match_count
+            ),
+            GrepOutputMode::Content => format!(
+                "{} matching line(s) in {} file(s)",
+                result.match_count, result.matched_files
+            ),
+        }
+    };
+    let summary = if result.truncated {
+        format!("{summary} (truncated at {head_limit})")
+    } else {
+        summary
+    };
+    Ok(crate::checkout::CheckoutToolOutput {
+        output: ToolOutput {
             summary,
             content: (!result.output.is_empty()).then_some(result.output),
             attachments: Vec::new(),
-        })
-    }
+        },
+        paths: result.paths,
+        validator: None,
+    })
 }
 
 pub fn grep_tool(session: WorkdirSessionHandle) -> ToolDefinition {

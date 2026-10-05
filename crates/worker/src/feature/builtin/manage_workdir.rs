@@ -353,6 +353,102 @@ impl WorkdirSession for WorkspaceAttachedWorkdirSession {
         }
     }
 
+    async fn checkout_observe(
+        &self,
+        path: workdir::WorkdirPath,
+    ) -> Result<workdir::CheckoutObservation, WorkdirError> {
+        match self.operate(WorkdirSessionOperation::CheckoutObserve(path.clone()))? {
+            WorkdirSessionOperationResult::CheckoutObserve(mut result)
+                if result.path == path
+                    && !result.validator.is_empty()
+                    && result.validator.len() <= 256 =>
+            {
+                result.capabilities = result.capabilities.intersection(self.capabilities);
+                Ok(result)
+            }
+            _ => Err(Self::mismatch("checkout_observe")),
+        }
+    }
+
+    async fn checkout_execute(
+        &self,
+        request: workdir::CheckoutRequest,
+    ) -> Result<workdir::CheckoutResult, WorkdirError> {
+        let cap = request.operation.capability();
+        if !self.capabilities.supports(cap) {
+            return Err(WorkdirError::Unsupported(cap));
+        }
+        let target = request.target.clone();
+        let mutation = cap != workdir::WorkdirSessionCapability::Read;
+        match self.operate(WorkdirSessionOperation::CheckoutExecute(request)) {
+            Ok(WorkdirSessionOperationResult::CheckoutExecute(mut result))
+                if result.observation.path == target
+                    && !result.observation.validator.is_empty()
+                    && result.observation.validator.len() <= 256
+                    && matches!(
+                        (&result.output, cap),
+                        (
+                            workdir::CheckoutOutput::Read(_),
+                            workdir::WorkdirSessionCapability::Read
+                        ) | (
+                            workdir::CheckoutOutput::Write(_),
+                            workdir::WorkdirSessionCapability::Write
+                        ) | (
+                            workdir::CheckoutOutput::Edit(_),
+                            workdir::WorkdirSessionCapability::Edit
+                        )
+                    ) =>
+            {
+                result.observation.capabilities = result
+                    .observation
+                    .capabilities
+                    .intersection(self.capabilities);
+                Ok(result)
+            }
+            Ok(_) if mutation => Err(WorkdirError::OutcomeUnknown(
+                "mismatched checkout mutation response".into(),
+            )),
+            Ok(_) => Err(Self::mismatch("checkout_execute")),
+            Err(WorkdirError::Transport(_) | WorkdirError::Unavailable(_)) if mutation => {
+                Err(WorkdirError::OutcomeUnknown(
+                    "checkout mutation response lost; inspect effects before retry".into(),
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn checkout_search(
+        &self,
+        request: workdir::CheckoutSearchRequest,
+    ) -> Result<workdir::CheckoutSearchResult, WorkdirError> {
+        use workdir::{
+            CheckoutSearchOperation as Op, CheckoutSearchResult as SearchResult,
+            WorkdirSessionCapability as Cap,
+        };
+        let cap = match &request.operation {
+            Op::List(_) => Cap::Read,
+            Op::Glob(_) => Cap::Glob,
+            Op::Grep(_) => Cap::Grep,
+        };
+        if !self.capabilities.supports(cap) {
+            return Err(WorkdirError::Unsupported(cap));
+        }
+        match self.operate(WorkdirSessionOperation::CheckoutSearch(request))? {
+            WorkdirSessionOperationResult::CheckoutSearch(result)
+                if matches!(
+                    (&result, cap),
+                    (SearchResult::List(_), Cap::Read)
+                        | (SearchResult::Glob(_), Cap::Glob)
+                        | (SearchResult::Grep(_), Cap::Grep)
+                ) =>
+            {
+                Ok(result)
+            }
+            _ => Err(Self::mismatch("checkout_search")),
+        }
+    }
+
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {
         match self.operate(WorkdirSessionOperation::Stat(request))? {
             WorkdirSessionOperationResult::Stat(result) => Ok(result),
@@ -1412,6 +1508,56 @@ mod tests {
         assert!(body.get("expected_session_fence").is_none());
         assert!(body.get("runtime_id").is_none());
         assert!(body.get("session_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn attached_checkout_mutations_preserve_known_rejection_and_lost_outcomes() {
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![
+            response(json!({"operation":"write","result":{"bytes_written":3,"created":false}})),
+            WorkspaceResponse {
+                status: 200,
+                body: "invalid payload".into(),
+            },
+            error_response(
+                409,
+                workdir::http::WorkdirTransportErrorCode::Conflict,
+                "stale",
+            ),
+        ]));
+        let session = WorkspaceAttachedWorkdirSession::handle(client.clone(), "checkout");
+        let request = workdir::CheckoutRequest {
+            target: workdir::WorkdirPath::new("file.txt").unwrap(),
+            validator: vec![1],
+            operation: workdir::CheckoutOperation::Write {
+                content: b"new".to_vec(),
+                expected_hash: [0; 32],
+            },
+        };
+        for _ in 0..2 {
+            assert!(matches!(
+                session.checkout_execute(request.clone()).await,
+                Err(WorkdirError::OutcomeUnknown(_))
+            ));
+        }
+        assert!(matches!(
+            session.checkout_execute(request.clone()).await,
+            Err(WorkdirError::Conflict(_))
+        ));
+        // Missing response simulates the Workspace client losing the provider result.
+        assert!(matches!(
+            session.checkout_execute(request).await,
+            Err(WorkdirError::OutcomeUnknown(_))
+        ));
+        let calls = client.requests();
+        assert_eq!(calls.len(), 4);
+        for call in calls {
+            let body: serde_json::Value =
+                serde_json::from_str(call.body.as_deref().unwrap()).unwrap();
+            assert_eq!(body["target_workdir"], "checkout");
+            assert_eq!(body["operation"]["operation"], "checkout_execute");
+            assert_eq!(body["operation"]["request"]["target"], "file.txt");
+            assert!(body.get("runtime_id").is_none());
+        }
     }
 
     #[tokio::test]

@@ -5,6 +5,11 @@
 //! bound to one Worker. Tools consume sessions; they do not own Workdir
 //! materialization or cleanup.
 
+pub mod checkout;
+pub use checkout::{
+    CheckoutObservation, CheckoutOperation, CheckoutOutput, CheckoutRequest, CheckoutResult,
+    CheckoutSearchOperation, CheckoutSearchRequest, CheckoutSearchResult,
+};
 pub mod external;
 pub mod http;
 mod local;
@@ -13,6 +18,8 @@ mod router;
 mod scope;
 pub mod workspace;
 
+#[cfg(test)]
+mod checkout_search_tests;
 #[cfg(test)]
 mod external_local_tests;
 
@@ -219,6 +226,31 @@ pub trait WorkdirSession: std::fmt::Debug + Send + Sync {
         ))
     }
 
+    async fn checkout_search(
+        &self,
+        _request: CheckoutSearchRequest,
+    ) -> Result<CheckoutSearchResult, WorkdirError> {
+        Err(WorkdirError::UnsupportedOperation(
+            "scoped checkout traversal".into(),
+        ))
+    }
+
+    async fn checkout_observe(
+        &self,
+        _path: WorkdirPath,
+    ) -> Result<CheckoutObservation, WorkdirError> {
+        Err(WorkdirError::UnsupportedOperation(
+            "checkout observation".into(),
+        ))
+    }
+    async fn checkout_execute(
+        &self,
+        _request: CheckoutRequest,
+    ) -> Result<CheckoutResult, WorkdirError> {
+        Err(WorkdirError::UnsupportedOperation(
+            "checked checkout execution".into(),
+        ))
+    }
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError>;
     async fn read(&self, request: ReadRequest) -> Result<ReadResult, WorkdirError>;
     async fn read_bytes(
@@ -288,6 +320,10 @@ pub enum WorkdirError {
 
     #[error("{0}")]
     Conflict(String),
+
+    /// Effects may have happened. Do not automatically retry the operation.
+    #[error("Workdir operation outcome is unknown: {0}")]
+    OutcomeUnknown(String),
 
     #[error("unknown Workdir session command: {0}")]
     UnknownCommand(String),

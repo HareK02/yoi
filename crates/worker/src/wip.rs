@@ -42,6 +42,13 @@ use wip_protocol::{
 
 use crate::permission::permission_action_for;
 
+#[cfg(test)]
+#[path = "checkout_http_tests.rs"]
+mod checkout_http_tests;
+#[cfg(test)]
+#[path = "checkout_wip_tests.rs"]
+mod checkout_wip_tests;
+
 const WIP_ENDPOINT: &str = "https://worker.wip.invalid/v1/";
 const WIP_ROOT: &str = "/";
 const WIP_TOOLS_ROOT: &str = "/tools";
@@ -92,6 +99,8 @@ pub struct WipCallContext {
 pub struct WipOperationOutput {
     pub value: Value,
     tool_output: Option<ToolOutput>,
+    // Exact post-operation provider state; never substitute a later path stat.
+    validator: Option<Vec<u8>>,
 }
 
 impl WipOperationOutput {
@@ -99,6 +108,15 @@ impl WipOperationOutput {
         Self {
             value,
             tool_output: None,
+            validator: None,
+        }
+    }
+
+    pub fn native_with_validator(value: Value, validator: Vec<u8>) -> Self {
+        Self {
+            value,
+            tool_output: None,
+            validator: Some(validator),
         }
     }
 
@@ -106,6 +124,7 @@ impl WipOperationOutput {
         Self {
             value,
             tool_output: Some(output),
+            validator: None,
         }
     }
 }
@@ -218,6 +237,19 @@ pub struct WipDynamicMount {
     pub resolver: Arc<dyn WipDynamicItemResolver>,
 }
 
+/// Explicit arbitrary-depth request-time subtree provider. Unlike item families,
+/// this resolves both files and directories and enumerates authorized children.
+#[async_trait]
+pub trait WipSubtreeProvider: Send + Sync {
+    async fn projection(&self, path: &str) -> Result<Option<WipProjection>, ProtocolError>;
+    async fn children(&self, path: &str) -> Result<Vec<String>, ProtocolError>;
+}
+
+pub struct WipSubtreeMount {
+    pub root: String,
+    pub provider: Arc<dyn WipSubtreeProvider>,
+}
+
 pub trait WipDynamicOperationResolver: Send + Sync {
     fn handler(&self, item_reference: &str) -> Arc<dyn WipOperationHandler>;
 }
@@ -327,6 +359,7 @@ impl WipOperationHandler for OperationDispatchHandler {
 pub struct WipMountRegistry {
     mounts: BTreeMap<String, MountedProjection>,
     dynamic_mounts: Vec<WipDynamicMount>,
+    subtree_mounts: Vec<WipSubtreeMount>,
     dynamic_operation_contributions: BTreeMap<String, Vec<MountedDynamicOperationContribution>>,
     namespaces: BTreeMap<String, String>,
     replaced_compatibility_capabilities: BTreeMap<String, String>,
@@ -395,6 +428,11 @@ impl WipMountRegistry {
         projection: WipProjection,
     ) -> Result<WipMountDisposition, WipMountError> {
         validate_projection(&projection)?;
+        if projection.kind == WipProjectionKind::Compatibility
+            && self.replaces_compatibility(&projection.capability)
+        {
+            return Ok(WipMountDisposition::NativeAlreadySelected);
+        }
         if projection.kind == WipProjectionKind::Compatibility && !is_tool_route(&projection.route)
         {
             return Err(WipMountError::InvalidProjection {
@@ -423,6 +461,15 @@ impl WipMountRegistry {
                     ),
                 });
             }
+        }
+        if self.subtree_mounts.iter().any(|mount| {
+            projection.route == mount.root
+                || projection.route.starts_with(&format!("{}/", mount.root))
+        }) {
+            return Err(WipMountError::RouteCollision {
+                route: projection.route,
+                existing: "request-time subtree".into(),
+            });
         }
         if self.dynamic_mounts.iter().any(|dynamic| {
             projection
@@ -571,6 +618,16 @@ impl WipMountRegistry {
                 message: error.to_string(),
             }
         })?;
+        if self.subtree_mounts.iter().any(|m| {
+            m.root == mount.collection_route
+                || m.root.starts_with(&format!("{}/", mount.collection_route))
+                || mount.collection_route.starts_with(&format!("{}/", m.root))
+        }) {
+            return Err(WipMountError::RouteCollision {
+                route: mount.collection_route,
+                existing: "request-time subtree".into(),
+            });
+        }
         let Some(collection) = self.mounts.get(&mount.collection_route) else {
             return Err(WipMountError::InvalidProjection {
                 route: mount.collection_route,
@@ -632,6 +689,42 @@ impl WipMountRegistry {
             });
         }
         self.dynamic_mounts.push(mount);
+        Ok(())
+    }
+
+    /// Delegate an entire descendant namespace to one request-time provider.
+    /// The root Object remains registry-owned; nested/static/item collisions fail.
+    pub fn mount_subtree(&mut self, mount: WipSubtreeMount) -> Result<(), WipMountError> {
+        let Some(root) = self.mounts.get(&mount.root) else {
+            return Err(WipMountError::OperationTargetNotFound { route: mount.root });
+        };
+        if root.projection.kind != WipProjectionKind::Native {
+            return Err(WipMountError::InvalidProjection {
+                route: mount.root,
+                message: "subtree requires a native root Object".into(),
+            });
+        }
+        let overlaps = |path: &str| {
+            path == mount.root
+                || path.starts_with(&format!("{}/", mount.root))
+                || mount.root.starts_with(&format!("{path}/"))
+        };
+        if self.subtree_mounts.iter().any(|m| overlaps(&m.root))
+            || self
+                .dynamic_mounts
+                .iter()
+                .any(|m| overlaps(&m.collection_route))
+            || self
+                .mounts
+                .keys()
+                .any(|p| p != &mount.root && p.starts_with(&format!("{}/", mount.root)))
+        {
+            return Err(WipMountError::RouteCollision {
+                route: mount.root,
+                existing: "subtree/static/item provider".into(),
+            });
+        }
+        self.subtree_mounts.push(mount);
         Ok(())
     }
 
@@ -793,6 +886,10 @@ impl WipMountRegistry {
             }
         }
         for capability in capabilities {
+            self.mounts.retain(|_, mounted| {
+                mounted.projection.kind != WipProjectionKind::Compatibility
+                    || mounted.projection.capability != capability
+            });
             self.replaced_compatibility_capabilities
                 .insert(capability, owner_route.to_string());
         }
@@ -962,6 +1059,163 @@ impl WipHost {
             registry,
             generation: digest.finalize().to_vec(),
         }
+    }
+
+    fn subtree(&self, path: &str) -> Option<&WipSubtreeMount> {
+        self.registry
+            .subtree_mounts
+            .iter()
+            .find(|m| path == m.root || path.starts_with(&format!("{}/", m.root)))
+    }
+
+    async fn projection_live(&self, path: &str) -> Result<Option<WipProjection>, ProtocolError> {
+        wip_protocol::validate_path(path).map_err(|_| unpublished_path_error(path))?;
+        if let Some(mount) = self.subtree(path) {
+            let Some(projection) = mount.provider.projection(path).await? else {
+                return Ok(None);
+            };
+            validate_projection(&projection).map_err(|_| {
+                protocol_error(
+                    ProtocolErrorCode::Internal,
+                    "subtree returned an invalid Object",
+                )
+            })?;
+            let owner = &self.registry.mounts[&mount.root].projection.capability;
+            if projection.route != path
+                || projection.kind != WipProjectionKind::Native
+                || projection.capability.split(':').next() != owner.split(':').next()
+            {
+                return Err(protocol_error(
+                    ProtocolErrorCode::Internal,
+                    "subtree changed route or ownership",
+                ));
+            }
+            return Ok(Some(projection));
+        }
+        Ok(self.projection(path))
+    }
+
+    async fn descriptor_live(
+        &self,
+        reference: &str,
+    ) -> Result<Option<(InterfaceDescriptor, Option<Vec<u8>>)>, ProtocolError> {
+        if let Some((_, encoded)) = reference.rsplit_once("/@/")
+            && let Some(path) = decode_contextual_path(encoded)
+            && self.subtree(&path).is_some()
+        {
+            return Ok(self
+                .projection_live(&path)
+                .await?
+                .filter(|p| p.interface == reference)
+                .map(|p| (p.descriptor, p.interface_validator)));
+        }
+        // Never expose the static registration placeholder descriptor of a subtree.
+        if self
+            .registry
+            .subtree_mounts
+            .iter()
+            .any(|m| self.registry.mounts[&m.root].projection.interface == reference)
+        {
+            return Ok(None);
+        }
+        Ok(self.descriptor(reference))
+    }
+
+    async fn fetch_interface_live(
+        &self,
+        reference: &str,
+    ) -> Result<FetchInterfaceResponse, ProtocolError> {
+        let (descriptor, validator) = self.descriptor_live(reference).await?.ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::InterfaceNotFound,
+                "interface is not published",
+            )
+        })?;
+        Ok(FetchInterfaceResponse {
+            interface: reference.into(),
+            descriptor,
+            validator,
+        })
+    }
+
+    async fn observe_live(
+        &self,
+        path: &str,
+        depth: u32,
+    ) -> Result<ObjectObservation, ProtocolError> {
+        if depth > 32 {
+            return Err(protocol_error(
+                ProtocolErrorCode::ResourceLimitExceeded,
+                "observation depth exceeds 32",
+            ));
+        }
+        let mut remaining = 1024usize;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.observe_live_node(path, depth, &mut remaining),
+        )
+        .await
+        .map_err(|_| {
+            protocol_error(
+                ProtocolErrorCode::ResourceLimitExceeded,
+                "observation deadline exceeded",
+            )
+        })?
+    }
+
+    fn observe_live_node<'a>(
+        &'a self,
+        path: &'a str,
+        depth: u32,
+        remaining: &'a mut usize,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ObjectObservation, ProtocolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            if *remaining == 0 {
+                return Err(protocol_error(
+                    ProtocolErrorCode::ResourceLimitExceeded,
+                    "observation exceeds 1024 nodes",
+                ));
+            }
+            *remaining -= 1;
+            let object = if self.subtree(path).is_some() {
+                self.projection_live(path).await?.map(|p| p.object)
+            } else {
+                self.object_at(path)
+            }
+            .ok_or_else(|| unpublished_path_error(path))?;
+            let children = if depth == 0 {
+                None
+            } else {
+                let paths = if let Some(mount) = self.subtree(path) {
+                    mount.provider.children(path).await?
+                } else {
+                    self.children(path)
+                };
+                let mut values = Vec::new();
+                let mut seen = BTreeSet::new();
+                for child in paths {
+                    let prefix = if path == "/" {
+                        "/".to_string()
+                    } else {
+                        format!("{path}/")
+                    };
+                    let suffix = child.strip_prefix(&prefix).ok_or_else(|| {
+                        protocol_error(ProtocolErrorCode::Internal, "subtree child outside parent")
+                    })?;
+                    if suffix.is_empty() || suffix.contains('/') || !seen.insert(child.clone()) {
+                        return Err(protocol_error(
+                            ProtocolErrorCode::Internal,
+                            "invalid/duplicate subtree child",
+                        ));
+                    }
+                    values.push(self.observe_live_node(&child, depth - 1, remaining).await?);
+                }
+                Some(values)
+            };
+            Ok(ObjectObservation { object, children })
+        })
     }
 
     fn descriptor(&self, reference: &str) -> Option<(InterfaceDescriptor, Option<Vec<u8>>)> {
@@ -1168,6 +1422,7 @@ impl WipHost {
         children.into_iter().collect()
     }
 
+    #[cfg(test)]
     fn observe(&self, path: &str, depth: u32) -> Result<ObjectObservation, ProtocolError> {
         let object = self
             .object_at(path)
@@ -1184,6 +1439,7 @@ impl WipHost {
         Ok(ObjectObservation { object, children })
     }
 
+    #[cfg(test)]
     fn fetch_interface(&self, reference: &str) -> Result<FetchInterfaceResponse, ProtocolError> {
         let (descriptor, validator) = self.descriptor(reference).ok_or_else(|| {
             protocol_error(
@@ -1204,9 +1460,13 @@ impl WipHost {
         request: CallOperationRequest,
         context: WipCallContext,
     ) -> Result<WipOperationOutput, WipOperationError> {
-        let projection = self.projection(&request.target.path).ok_or_else(|| {
-            WipOperationError::Protocol(unpublished_path_error(&request.target.path))
-        })?;
+        let projection = self
+            .projection_live(&request.target.path)
+            .await
+            .map_err(WipOperationError::Protocol)?
+            .ok_or_else(|| {
+                WipOperationError::Protocol(unpublished_path_error(&request.target.path))
+            })?;
         self.call_projection(projection, request, context).await
     }
 
@@ -1716,7 +1976,12 @@ impl WipRuntime {
         arguments: Json,
         execution: ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
-        let arguments = match self.host.projection(&path) {
+        let arguments = match self
+            .host
+            .projection_live(&path)
+            .await
+            .map_err(|e| ToolError::InvalidArgument(e.message))?
+        {
             Some(projection) if projection.kind == WipProjectionKind::Compatibility => {
                 BTreeMap::from([(
                     "input".to_string(),
@@ -1847,7 +2112,11 @@ impl WipRuntime {
             Route::Observe => {
                 let request_value = decode_observe_request(request.body(), self.wire_limits)
                     .map_err(|error| ToolError::Internal(error.to_string()))?;
-                match self.host.observe(&request_value.path, request_value.depth) {
+                match self
+                    .host
+                    .observe_live(&request_value.path, request_value.depth)
+                    .await
+                {
                     Ok(value) => encode_observe_response(&request_value, &value, self.wire_limits),
                     Err(error) => encode_protocol_error_response(
                         ProtocolInteraction::Observe,
@@ -1861,7 +2130,11 @@ impl WipRuntime {
                 let request_value =
                     decode_fetch_interface_request(request.body(), self.wire_limits)
                         .map_err(|error| ToolError::Internal(error.to_string()))?;
-                match self.host.fetch_interface(&request_value.interface) {
+                match self
+                    .host
+                    .fetch_interface_live(&request_value.interface)
+                    .await
+                {
                     Ok(value) => {
                         encode_fetch_interface_response(&request_value, &value, self.wire_limits)
                     }
@@ -1895,7 +2168,9 @@ impl WipRuntime {
             .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
         let descriptor = self
             .host
-            .descriptor(&metadata.interface.reference)
+            .descriptor_live(&metadata.interface.reference)
+            .await
+            .map_err(|e| ToolError::InvalidArgument(e.message))?
             .map(|(descriptor, _)| descriptor.clone())
             .ok_or_else(|| ToolError::InvalidArgument("interface is not published".into()))?;
         let request_value = metadata
@@ -1905,7 +2180,12 @@ impl WipRuntime {
             execution,
             security_context: self.security_context.as_str().to_string(),
         };
-        let result = match self.host.projection(&request_value.target.path) {
+        let result = match self
+            .host
+            .projection_live(&request_value.target.path)
+            .await
+            .map_err(|e| ToolError::InvalidArgument(e.message))?
+        {
             Some(projection) => {
                 // Pin the exact resolved instance used for dispatch. A dynamic
                 // resolver may return a fresh stateful handler on each lookup.
@@ -1934,14 +2214,37 @@ impl WipRuntime {
                     &descriptor,
                     &CallOperationResponse {
                         result: output.value,
-                        validator: self
-                            .host
-                            .projection(&request_value.target.path)
-                            .and_then(|projection| projection.object.validator.clone()),
+                        validator: match output.validator {
+                            Some(validator) => Some(validator),
+                            None if self.host.subtree(&request_value.target.path).is_some() => None,
+                            None => self
+                                .host
+                                .projection(&request_value.target.path)
+                                .and_then(|projection| projection.object.validator.clone()),
+                        },
                     },
                     self.wire_limits,
-                )
-                .map_err(|error| ToolError::Internal(error.to_string()))?;
+                );
+                let response = match response {
+                    Ok(response) => response,
+                    Err(_) => {
+                        // Dispatch has completed: losing its result is not a pre-effect refusal.
+                        let message = "completed operation result could not be encoded; inspect effects before retry";
+                        let response = encode_protocol_error_response(
+                            ProtocolInteraction::CallOperation,
+                            &protocol_error(ProtocolErrorCode::OperationOutcomeUnknown, message),
+                            self.wire_limits,
+                        )
+                        .map_err(|error| ToolError::Internal(error.to_string()))?;
+                        return Ok((
+                            response,
+                            Some(Err(ToolError::ExecutionFailed(format!(
+                                "WIP operation outcome unknown; do not retry automatically: {message}"
+                            )))),
+                            WipAuditOutcome::OutcomeUnknown,
+                        ));
+                    }
+                };
                 Ok((
                     response,
                     output.tool_output.map(Ok),
@@ -2798,6 +3101,58 @@ mod tests {
             registry.mount(collision),
             Err(WipMountError::RouteCollision { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn completed_native_result_encoding_failure_is_unknown_and_not_retried() {
+        struct OversizedResult(Arc<AtomicUsize>);
+        #[async_trait]
+        impl WipOperationHandler for OversizedResult {
+            async fn call(
+                &self,
+                _: &str,
+                _: &BTreeMap<String, Value>,
+                _: WipCallContext,
+            ) -> Result<WipOperationOutput, WipOperationError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(WipOperationOutput::native(Value::String(
+                    "x".repeat(3 * 1024 * 1024),
+                )))
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut p = contribution_projection(Arc::new(OversizedResult(calls.clone())));
+        p.descriptor.operations[0].returns.r#type = TypeExpr::String;
+        p.interface_validator = Some(descriptor_validator(&p.descriptor));
+        let mut registry = WipMountRegistry::new();
+        registry.allocate_namespace("asset", "assets").unwrap();
+        registry.mount(p).unwrap();
+        let runtime = WipRuntime::new(
+            WipHost::new(registry),
+            SecurityContext::new("encoding-test"),
+            0,
+        )
+        .unwrap();
+        runtime
+            .discover("/assets/A-1".into(), 0, true)
+            .await
+            .unwrap();
+        runtime
+            .inspect("test.asset/item/v1".into(), true)
+            .await
+            .unwrap();
+        let error = runtime
+            .call(
+                "/assets/A-1".into(),
+                "test.asset/item/v1".into(),
+                "read".into(),
+                Json::Object(Default::default()),
+                Default::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("outcome unknown"), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     struct ContributionHandler {

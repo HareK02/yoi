@@ -344,7 +344,21 @@ impl Provider {
             if let Some(id) = raw.get("working_directory_id").and_then(Json::as_str) {
                 result.insert("workdir_path".into(), json!(item_path(Domain::Workdir, id)));
             }
-            // Content projection belongs to T-699/T-695. No unconditional FS entrance.
+            if let Some(alias) = raw.get("alias").and_then(Json::as_str)
+                && let Ok(selected) = self.backend.session_router.resolve(Some(alias))
+                && raw.get("working_directory_id").and_then(Json::as_str)
+                    == Some(selected.session.workdir().id().as_str())
+                && selected
+                    .session
+                    .capabilities()
+                    .supports(workdir::WorkdirSessionCapability::Read)
+            {
+                result.insert(
+                    "checkout_path".into(),
+                    json!(crate::checkout::checkout_root(alias)),
+                );
+                result.insert("checkout_slug".into(), json!(encode_identity(alias)));
+            }
         }
         result.insert("path".into(), json!(item_path(domain, id)));
         Ok(Json::Object(result))
@@ -735,6 +749,17 @@ impl WipOperationHandler for ItemHandler {
                     let mut result = raw;
                     result["workdir_path"] = json!(item_path(Domain::Workdir, &self.id));
                     result["attachments_path"] = json!(ATTACHMENTS);
+                    if let Some(alias) = input.get("alias").and_then(Json::as_str)
+                        && self
+                            .provider
+                            .backend
+                            .session_router
+                            .resolve(Some(alias))
+                            .is_ok()
+                    {
+                        result["checkout_path"] = json!(crate::checkout::checkout_root(alias));
+                        result["checkout_slug"] = json!(encode_identity(alias));
+                    }
                     // Backend attachment list supplies the durable lifetime identity.
                     result
                 } else {
@@ -866,7 +891,7 @@ fn page_limit(input: &Json) -> Result<usize, WipOperationError> {
 // Readable ASCII identities remain unchanged. Every other UTF-8 identity uses a
 // canonical ~hex segment; the escape marker is itself always escaped. This is
 // injective, does not exclude existing keys, and never decodes a second route.
-fn encode_identity(id: &str) -> String {
+pub(crate) fn encode_identity(id: &str) -> String {
     if !id.is_empty()
         && id
             .bytes()
@@ -883,7 +908,7 @@ fn encode_identity(id: &str) -> String {
         )
     }
 }
-fn decode_identity(segment: &str) -> Option<String> {
+pub(crate) fn decode_identity(segment: &str) -> Option<String> {
     let id = if let Some(hex) = segment.strip_prefix('~') {
         if hex.len() % 2 != 0 || hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;

@@ -1,4 +1,5 @@
 pub mod bootstrap;
+pub mod checkout;
 pub mod compact;
 pub mod controller;
 pub mod discovery;

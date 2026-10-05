@@ -149,6 +149,56 @@ fn validate_external_operation(operation: &WorkdirSessionOperation) -> Result<()
         WorkdirSessionOperation::ScopeRulesOverlap(request) => {
             is_root_relative(&request.left.target) && is_root_relative(&request.right.target)
         }
+        WorkdirSessionOperation::CheckoutSearch(request) => {
+            request.validate().is_ok()
+                && request.scope_layers.iter().map(Vec::len).sum::<usize>()
+                    <= MAX_EXTERNAL_SCOPE_RULES
+                && validate_external_operation(&match &request.operation {
+                    crate::CheckoutSearchOperation::List(r) => {
+                        WorkdirSessionOperation::List(r.clone())
+                    }
+                    crate::CheckoutSearchOperation::Glob(r) => {
+                        WorkdirSessionOperation::Glob(r.clone())
+                    }
+                    crate::CheckoutSearchOperation::Grep(r) => {
+                        WorkdirSessionOperation::Grep(r.clone())
+                    }
+                })
+                .is_ok()
+        }
+        WorkdirSessionOperation::CheckoutObserve(path) => {
+            is_root_relative(path) && crate::checkout::validate_path(path).is_ok()
+        }
+        WorkdirSessionOperation::CheckoutExecute(request) => {
+            is_root_relative(&request.target)
+                && crate::checkout::validate_path(&request.target).is_ok()
+                && !request.validator.is_empty()
+                && request.validator.len() <= 256
+                && match &request.operation {
+                    crate::CheckoutOperation::Read {
+                        limit, max_bytes, ..
+                    } => {
+                        *limit <= 1_000_000
+                            && *max_bytes <= BoundedReadLimits::EXTERNAL_DEFAULT.max_response_bytes
+                    }
+                    crate::CheckoutOperation::Write { content, .. } => {
+                        content.len() <= MAX_EXTERNAL_WRITE_BYTES
+                    }
+                    crate::CheckoutOperation::Edit {
+                        old_string,
+                        new_string,
+                        ..
+                    } => old_string
+                        .len()
+                        .checked_add(new_string.len())
+                        .is_some_and(|size| size <= MAX_EXTERNAL_WRITE_BYTES),
+                    crate::CheckoutOperation::Create { path, content } => {
+                        is_root_relative(path)
+                            && crate::checkout::create_relative_path(&request.target, path).is_ok()
+                            && content.len() <= MAX_EXTERNAL_WRITE_BYTES
+                    }
+                }
+        }
         WorkdirSessionOperation::Stat(request) => is_root_relative(&request.path),
         WorkdirSessionOperation::Read(request) => {
             is_root_relative(&request.path)
@@ -272,10 +322,59 @@ fn result_paths_fit<'a>(paths: impl IntoIterator<Item = &'a WorkdirPath>) -> boo
         .is_some_and(|retained| retained <= fs_operation::MAX_RESULT_PATH_BYTES)
 }
 
+fn valid_checkout_observation(observation: &crate::CheckoutObservation) -> bool {
+    is_root_relative(&observation.path)
+        && !observation.validator.is_empty()
+        && observation.validator.len() <= 256
+        && matches!(
+            observation.kind,
+            crate::EntryKind::File | crate::EntryKind::Directory
+        )
+        && (observation.kind == crate::EntryKind::Directory
+            || observation.size <= BoundedReadLimits::EXTERNAL_DEFAULT.max_source_bytes)
+}
+
 fn validate_external_result(result: &WorkdirSessionOperationResult) -> Result<(), String> {
     let result_is_valid = match result {
         WorkdirSessionOperationResult::AuthorizeScope
         | WorkdirSessionOperationResult::ScopeRulesOverlap { .. } => true,
+        WorkdirSessionOperationResult::CheckoutSearch(result) => {
+            validate_external_result(&match result {
+                crate::CheckoutSearchResult::List(r) => {
+                    WorkdirSessionOperationResult::List(r.clone())
+                }
+                crate::CheckoutSearchResult::Glob(r) => {
+                    WorkdirSessionOperationResult::Glob(r.clone())
+                }
+                crate::CheckoutSearchResult::Grep(r) => {
+                    WorkdirSessionOperationResult::Grep(r.clone())
+                }
+            })
+            .is_ok()
+        }
+        WorkdirSessionOperationResult::CheckoutObserve(observation) => {
+            valid_checkout_observation(observation)
+        }
+        WorkdirSessionOperationResult::CheckoutExecute(result) => {
+            valid_checkout_observation(&result.observation)
+                && match &result.output {
+                    crate::CheckoutOutput::Read(read) => {
+                        read.path == result.observation.path
+                            && validate_external_result(&WorkdirSessionOperationResult::Read(
+                                read.clone(),
+                            ))
+                            .is_ok()
+                    }
+                    crate::CheckoutOutput::Write(write) => validate_external_result(
+                        &WorkdirSessionOperationResult::Write(write.clone()),
+                    )
+                    .is_ok(),
+                    crate::CheckoutOutput::Edit(edit) => {
+                        validate_external_result(&WorkdirSessionOperationResult::Edit(edit.clone()))
+                            .is_ok()
+                    }
+                }
+        }
         WorkdirSessionOperationResult::Stat(result) => is_root_relative(&result.path),
         WorkdirSessionOperationResult::Read(result) => {
             is_root_relative(&result.path)
@@ -307,6 +406,9 @@ fn validate_external_result(result: &WorkdirSessionOperationResult) -> Result<()
             result.output.len() <= BoundedReadLimits::EXTERNAL_DEFAULT.max_response_bytes
                 && result.match_count <= MAX_EXTERNAL_RESULT_ITEMS
                 && result.matched_files <= MAX_EXTERNAL_RESULT_ITEMS
+                && result.paths.len() <= MAX_EXTERNAL_RESULT_ITEMS
+                && result.paths.iter().all(is_root_relative)
+                && result_paths_fit(&result.paths)
         }
         WorkdirSessionOperationResult::Write(result) => {
             result.bytes_written <= MAX_EXTERNAL_WRITE_BYTES
@@ -821,6 +923,7 @@ mod tests {
         assert!(ExternalWorkdirOperation::try_from(unbounded).is_err());
 
         let oversized_result = WorkdirSessionOperationResult::Grep(GrepResult {
+            paths: Vec::new(),
             output: "x".repeat(BoundedReadLimits::EXTERNAL_DEFAULT.max_response_bytes + 1),
             match_count: 1,
             matched_files: 1,

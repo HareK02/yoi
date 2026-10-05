@@ -9,20 +9,24 @@
 //! and command capability, while the Runtime process and OS user remain the
 //! trusted execution boundary.
 
+pub mod checkout;
 pub mod error;
 pub mod tracker;
 
 mod bash;
 mod edit;
+mod file_target;
 mod glob;
 mod grep;
 mod read;
 mod routing;
+mod search_target;
 mod view_image;
 mod web;
 mod write;
 
 pub use bash::bash_tool;
+pub use checkout::{CheckoutToolOutput, execute_checkout_tool};
 pub use edit::edit_tool;
 pub use error::ToolsError;
 pub use glob::glob_tool;
