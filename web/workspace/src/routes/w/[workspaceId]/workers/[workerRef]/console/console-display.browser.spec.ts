@@ -261,13 +261,28 @@ test.each(["live_protocol", "retained_snapshot"] as const)("overlapping history 
   await screen.findByText("Start of conversation");
   expect(view.container.querySelectorAll(".activity-summary")).toHaveLength(1);
   expect(screen.getAllByText("searched 1 time・ran 1 command")).toHaveLength(1);
-  await fireEvent.click(screen.getByRole("button", { name: "Normal" }));
+  const footer = screen.getByLabelText("Worker model and context");
+  const overview = screen.getByRole("switch", { name: "Overview" });
+  expect(screen.queryByRole("button", { name: "Normal" })).toBeNull();
+  const details = screen.getByRole("button", { name: "Details" });
+  expect(view.container.querySelector(".console-header")).toBeNull();
+  expect(footer.contains(overview)).toBe(true);
+  expect(overview.nextElementSibling).toBe(details);
+  expect(overview.closest("form")).toBeNull();
+  expect(view.container.querySelector(".console-composer")?.nextElementSibling).toBe(footer);
+  expect(overview.getAttribute("aria-checked")).toBe("true");
+  await fireEvent.click(overview);
+  expect(overview.getAttribute("aria-checked")).toBe("false");
+  expect(overview.textContent?.trim()).toBe("Overview");
   const transcript = screen.getByRole("article", { name: "main transcript" });
   const ids = [...transcript.querySelectorAll("[data-console-line-id]")].map((line) => line.getAttribute("data-console-line-id"));
   expect(ids).toHaveLength(3);
   expect(new Set(ids).size).toBe(ids.length);
-  await fireEvent.click(screen.getByRole("button", { name: "Overview" }));
+  await fireEvent.click(overview);
+  expect(overview.getAttribute("aria-checked")).toBe("true");
+  expect(overview.textContent?.trim()).toBe("Overview");
   expect(view.container.querySelectorAll(".activity-summary")).toHaveLength(1);
+  expect(multiplexer.sendWorkerMethod).not.toHaveBeenCalled();
 });
 
 test.each([
@@ -473,7 +488,7 @@ test("mini task summary opens and closes details without a header Tasks button",
   latestListener().onFrame(subscribedFrame(session));
   const summary = await screen.findByRole("button", { name: /1 task — pending/ });
   expect(screen.queryByRole("complementary", { name: "Worker tasks" })).toBeNull();
-  expect(view.container.querySelector(".console-header")?.textContent).not.toContain("Tasks");
+  expect(view.container.querySelector(".console-header")).toBeNull();
   await fireEvent.click(screen.getByRole("button", { name: "Details" }));
   const details = await screen.findByRole("complementary", { name: "Worker detail" });
   expect(details.textContent).not.toContain("Capabilities");

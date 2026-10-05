@@ -7,7 +7,7 @@ use protocol::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use thiserror::Error;
@@ -139,6 +139,17 @@ struct RetainedHistoryCursor {
     before_offset: u64,
     record_end_offset: Option<u64>,
     seed_entry_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    corrections: Vec<ToolCorrectionPosition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ToolCorrectionPosition {
+    entry_id: String,
+    segment_id: SegmentId,
+    start: u64,
+    end: u64,
 }
 
 #[derive(Debug)]
@@ -445,6 +456,7 @@ pub fn read_retained_session_history_page(
             limits,
             &mut scanned_bytes,
             &mut scanned_entries,
+            &mut Vec::new(),
         )?;
         Some(SessionHistoryLineageBoundary {
             lineage_id: lineage_identity(active.session_id, &lineage[1..]),
@@ -456,6 +468,10 @@ pub fn read_retained_session_history_page(
     } else {
         None
     };
+    let mut correction_positions = cursor
+        .as_ref()
+        .map(|c| c.corrections.clone())
+        .unwrap_or_default();
     let mut turns = read_history_turns_backward(
         &store,
         active.session_id,
@@ -465,11 +481,23 @@ pub fn read_retained_session_history_page(
         limits,
         &mut scanned_bytes,
         &mut scanned_entries,
+        &mut correction_positions,
     )?;
     let has_more = turns.len() > page_limit;
     if has_more {
         turns.truncate(page_limit);
     }
+    // Carry only corrections whose original results are still on older pages.
+    let returned_ids: HashSet<_> = turns
+        .iter()
+        .flat_map(|turn| {
+            turn.turn
+                .entries
+                .iter()
+                .map(|entry| entry.entry_id.as_str())
+        })
+        .collect();
+    correction_positions.retain(|position| !returned_ids.contains(position.entry_id.as_str()));
     let next_cursor = if has_more {
         let oldest = turns
             .last()
@@ -485,6 +513,7 @@ pub fn read_retained_session_history_page(
             before_offset: oldest.position.before_offset,
             record_end_offset: oldest.position.record_end_offset,
             seed_entry_index: oldest.position.seed_entry_index,
+            corrections: correction_positions,
         })?)
     } else {
         None
@@ -702,6 +731,7 @@ fn persisted_entry_units(entries: &[LogEntry]) -> usize {
             | LogEntry::AnnotatedUserInput { history, .. } => history.len(),
             LogEntry::AnnotatedAssistantItem { .. }
             | LogEntry::AnnotatedToolResult { .. }
+            | LogEntry::ToolResultCorrected { .. }
             | LogEntry::AnnotatedSystemItem { .. } => 1,
             _ => 0,
         };
@@ -814,10 +844,56 @@ fn read_history_turns_backward(
     limits: RetainedHistoryReadLimits,
     scanned_bytes: &mut u64,
     scanned_entries: &mut usize,
+    correction_positions: &mut Vec<ToolCorrectionPosition>,
 ) -> Result<Vec<PositionedHistoryTurn>, RetainedHistoryReadError> {
     let mut turns = Vec::new();
     let mut pending_entries = Vec::new();
     let mut seen_entries = HashSet::new();
+    let mut corrections = HashMap::<String, SessionSnapshotEntryData>::new();
+
+    // Carry only bounded log positions, never correction text or image bodies,
+    // across pages. Re-read and validate the referenced records from adopted
+    // lineage rather than rescanning an arbitrarily large newer suffix.
+    for position in correction_positions.iter() {
+        let segment = lineage
+            .iter()
+            .find(|s| s.segment_id == position.segment_id)
+            .ok_or(RetainedHistoryReadError::InvalidCursor)?;
+        let adopted_end = locate_adopted_segment_end(
+            store,
+            session_id,
+            segment,
+            limits,
+            scanned_bytes,
+            scanned_entries,
+        )?;
+        if position.start >= position.end || position.end > adopted_end {
+            return Err(RetainedHistoryReadError::InvalidCursor);
+        }
+        let record = store
+            .read_log_record_range_read_only_bounded(
+                session_id,
+                position.segment_id,
+                position.start,
+                position.end,
+                limits.max_scan_bytes.saturating_sub(*scanned_bytes),
+            )
+            .map_err(map_history_cursor_store_error)?;
+        *scanned_bytes = scanned_bytes
+            .checked_add(record.end_offset - record.start_offset)
+            .ok_or(RetainedHistoryReadError::ResourceLimit)?;
+        *scanned_entries = scanned_entries
+            .checked_add(persisted_entry_units(std::slice::from_ref(&record.entry)))
+            .ok_or(RetainedHistoryReadError::ResourceLimit)?;
+        if *scanned_entries > limits.max_entries {
+            return Err(RetainedHistoryReadError::ResourceLimit);
+        }
+        if !matches!(&record.entry, LogEntry::ToolResultCorrected { entry, .. } if entry.metadata.entry_id.0 == position.entry_id)
+            || !capture_tool_correction(&record.entry, &mut corrections)
+        {
+            return Err(RetainedHistoryReadError::InvalidCursor);
+        }
+    }
 
     let (start_segment_index, start_position, cursor_turn_id) = match start {
         Some((position, turn_id)) => {
@@ -878,32 +954,6 @@ fn read_history_turns_backward(
 
     for (segment_index, segment) in lineage.iter().enumerate().skip(start_segment_index) {
         let starting_here = segment_index == start_segment_index;
-        if starting_here
-            && start_position
-                .as_ref()
-                .and_then(|position| position.seed_entry_index)
-                .is_some()
-        {
-            let seed_index = start_position
-                .as_ref()
-                .and_then(|position| position.seed_entry_index)
-                .expect("checked seed cursor");
-            if collect_history_entries_backward(
-                &segment.seed_entries[..seed_index],
-                segment.segment_id,
-                0,
-                None,
-                true,
-                turn_limit,
-                &mut seen_entries,
-                &mut pending_entries,
-                &mut turns,
-            ) {
-                return Ok(turns);
-            }
-            continue;
-        }
-
         let adopted_end = locate_adopted_segment_end(
             store,
             session_id,
@@ -923,6 +973,32 @@ fn read_history_turns_backward(
         if before_offset > adopted_end {
             return Err(RetainedHistoryReadError::InvalidCursor);
         }
+        if starting_here
+            && start_position
+                .as_ref()
+                .and_then(|position| position.seed_entry_index)
+                .is_some()
+        {
+            let seed_index = start_position
+                .as_ref()
+                .and_then(|position| position.seed_entry_index)
+                .expect("checked seed cursor");
+            if collect_history_entries_backward(
+                &corrected_history_entries(&segment.seed_entries[..seed_index], &corrections),
+                segment.segment_id,
+                0,
+                None,
+                true,
+                turn_limit,
+                &mut seen_entries,
+                &mut pending_entries,
+                &mut turns,
+            ) {
+                return Ok(turns);
+            }
+            continue;
+        }
+
         let mut reader = store
             .open_retained_segment_reader(session_id, segment.segment_id, before_offset)
             .map_err(map_history_store_error)?;
@@ -949,7 +1025,25 @@ fn read_history_turns_backward(
                 }
                 continue;
             }
-            let entries = project_history_record(session_id, segment.segment_id, &record.entry);
+            if capture_tool_correction(&record.entry, &mut corrections) {
+                let LogEntry::ToolResultCorrected { entry, .. } = &record.entry else {
+                    unreachable!()
+                };
+                let position = ToolCorrectionPosition {
+                    entry_id: entry.metadata.entry_id.0.clone(),
+                    segment_id: segment.segment_id,
+                    start: record.start_offset,
+                    end: record.end_offset,
+                };
+                if !correction_positions.contains(&position) {
+                    correction_positions.push(position);
+                }
+                continue;
+            }
+            let entries = corrected_history_entries(
+                &project_history_record(session_id, segment.segment_id, &record.entry),
+                &corrections,
+            );
             if collect_history_entries_backward(
                 &entries,
                 segment.segment_id,
@@ -967,7 +1061,7 @@ fn read_history_turns_backward(
 
         if segment_index + 1 == lineage.len()
             && collect_history_entries_backward(
-                &segment.seed_entries,
+                &corrected_history_entries(&segment.seed_entries, &corrections),
                 segment.segment_id,
                 0,
                 None,
@@ -982,6 +1076,38 @@ fn read_history_turns_backward(
         }
     }
     Ok(turns)
+}
+
+fn capture_tool_correction(
+    record: &LogEntry,
+    corrections: &mut HashMap<String, SessionSnapshotEntryData>,
+) -> bool {
+    let LogEntry::ToolResultCorrected { entry, .. } = record else {
+        return false;
+    };
+    if let Some(data) = project_item(&entry.metadata.entry_id.0, &entry.item) {
+        // We read backwards: the first correction seen is the latest one.
+        corrections
+            .entry(entry.metadata.entry_id.0.clone())
+            .or_insert(data);
+    }
+    true
+}
+
+fn corrected_history_entries(
+    entries: &[SessionSnapshotEntry],
+    corrections: &HashMap<String, SessionSnapshotEntryData>,
+) -> Vec<SessionSnapshotEntry> {
+    entries
+        .iter()
+        .cloned()
+        .map(|mut entry| {
+            if let Some(data) = corrections.get(&entry.entry_id) {
+                entry.data = data.clone();
+            }
+            entry
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1052,9 +1178,13 @@ fn is_user_entry(entry: &SessionSnapshotEntry) -> bool {
 fn encode_history_cursor(
     cursor: &RetainedHistoryCursor,
 ) -> Result<String, RetainedHistoryReadError> {
-    serde_json::to_vec(cursor)
+    let encoded = serde_json::to_vec(cursor)
         .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
-        .map_err(|_| RetainedHistoryReadError::CorruptLog)
+        .map_err(|_| RetainedHistoryReadError::CorruptLog)?;
+    if encoded.len() > 4096 {
+        return Err(RetainedHistoryReadError::ResourceLimit);
+    }
+    Ok(encoded)
 }
 
 fn decode_history_cursor(cursor: &str) -> Result<RetainedHistoryCursor, RetainedHistoryReadError> {
@@ -1250,6 +1380,19 @@ pub(crate) fn project_session_snapshot_for_segment(
             | LogEntry::AnnotatedToolResult { ts, entry } => {
                 if let Some(data) = project_item(&entry.metadata.entry_id.0, &entry.item) {
                     entries.push(history_entry(entry, *ts, data));
+                }
+            }
+            LogEntry::ToolResultCorrected { ts, entry } => {
+                if let Some(data) = project_item(&entry.metadata.entry_id.0, &entry.item) {
+                    if let Some(existing) = entries
+                        .iter_mut()
+                        .find(|existing| existing.entry_id == entry.metadata.entry_id.0)
+                    {
+                        // The original result keeps its place/time in the conversation.
+                        existing.data = data;
+                    } else {
+                        entries.push(history_entry(entry, *ts, data));
+                    }
                 }
             }
             LogEntry::AnnotatedSystemItem { ts, entry, .. } => entries.push(system_entry(
@@ -1780,6 +1923,129 @@ mod tests {
             .iter()
             .map(|turn| turn.turn_id.as_str())
             .collect()
+    }
+
+    #[test]
+    fn image_correction_keeps_original_position_across_history_pages() {
+        let session_id = crate::new_session_id();
+        let segment_id = crate::new_segment_id();
+        let mut image = assistant_message(1, "image");
+        image.item = agen::Item::tool_result_item_with_disposition_and_attachments(
+            "image-call",
+            "original image",
+            None,
+            agen::ToolResultDisposition::Success,
+            vec![agen::tool::Attachment::Image(
+                agen::tool::ImageAttachment::new("image/png", vec![1_u8, 2, 3]),
+            )],
+        )
+        .into();
+        let mut corrected = image.clone();
+        corrected.item = agen::Item::tool_result_item_with_disposition_and_attachments(
+            "image-call",
+            "Resize or crop and retry ViewImage",
+            None,
+            agen::ToolResultDisposition::Error,
+            Vec::new(),
+        )
+        .into();
+        let mut log = vec![segment_start(session_id, Vec::new(), None, None)];
+        append_turn(&mut log, 1);
+        log.push(LogEntry::AnnotatedToolResult {
+            ts: 15,
+            entry: image.clone(),
+        });
+        append_turn(&mut log, 2);
+        append_turn(&mut log, 3);
+        log.push(LogEntry::ToolResultCorrected {
+            ts: 35,
+            entry: corrected,
+        });
+        let (_root, aggregate_root) = persist_history_fixture(
+            "corrected-image",
+            session_id,
+            segment_id,
+            vec![(segment_id, log.clone())],
+        );
+        let first = read_retained_session_history_page(
+            &aggregate_root,
+            "corrected-image",
+            None,
+            Some(1),
+            RetainedHistoryReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(turn_ids(&first), ["user-3"]);
+        assert!(
+            !first.turns[0]
+                .entries
+                .iter()
+                .any(|entry| entry.entry_id == image.metadata.entry_id.0)
+        );
+        let second = read_retained_session_history_page(
+            &aggregate_root,
+            "corrected-image",
+            first.next_cursor.as_deref(),
+            Some(1),
+            RetainedHistoryReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(turn_ids(&second), ["user-2"]);
+        let third = read_retained_session_history_page(
+            &aggregate_root,
+            "corrected-image",
+            second.next_cursor.as_deref(),
+            Some(1),
+            RetainedHistoryReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(turn_ids(&third), ["user-1"]);
+        let entry = third.turns[0]
+            .entries
+            .iter()
+            .find(|entry| entry.entry_id == image.metadata.entry_id.0)
+            .unwrap();
+        assert_eq!(entry.timestamp, 15);
+        assert!(
+            matches!(&entry.data, SessionSnapshotEntryData::ToolResult { is_error: true, attachments, .. } if attachments.is_empty())
+        );
+        assert_eq!(
+            *entry,
+            *project_session_snapshot(session_id, &log)
+                .entries
+                .iter()
+                .find(|entry| entry.entry_id == image.metadata.entry_id.0)
+                .unwrap()
+        );
+        let restored = crate::collect_state(&log);
+        assert_eq!(
+            restored
+                .annotated_history
+                .iter()
+                .filter(|entry| entry.metadata.entry_id == image.metadata.entry_id)
+                .count(),
+            1
+        );
+        assert!(
+            matches!(&restored.annotated_history.iter().find(|entry| entry.metadata.entry_id == image.metadata.entry_id).unwrap().item, LoggedItem::ToolResult { is_error: true, attachments, .. } if attachments.is_empty())
+        );
+
+        // Cursor pointers are only hints: the referenced record is read under
+        // current lineage authority and must actually be a correction record.
+        let mut cursor = decode_history_cursor(first.next_cursor.as_deref().unwrap()).unwrap();
+        cursor.corrections[0].segment_id = crate::new_segment_id();
+        let forged = encode_history_cursor(&cursor).unwrap();
+        assert_eq!(
+            read_retained_session_history_page(
+                &aggregate_root,
+                "corrected-image",
+                Some(&forged),
+                Some(1),
+                RetainedHistoryReadLimits::default()
+            )
+            .unwrap_err(),
+            RetainedHistoryReadError::InvalidCursor
+        );
     }
 
     #[test]

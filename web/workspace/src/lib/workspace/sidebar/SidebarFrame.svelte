@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { onDestroy, type Snippet } from 'svelte';
+  import { onDestroy, onMount, type Snippet } from 'svelte';
+  import { on } from 'svelte/events';
   import Bevel from '#lib/workspace/ui/Bevel.svelte';
   import SidebarToggleIcon from './SidebarToggleIcon.svelte';
   import './sidebar.css';
@@ -77,6 +78,19 @@
     focusInside = false;
     clearCloseTimer();
   });
+  function closeAfterNavigation(event: MouseEvent) {
+    if (!mobile || !open || event.defaultPrevented || event.button !== 0 ||
+        event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    const link = event.target instanceof Element ? event.target.closest('a[href]') : null;
+    if (!(link instanceof HTMLAnchorElement) || !frame.contains(link) ||
+        link.hasAttribute('download') || (link.target && link.target !== '_self')) return;
+    clearCloseTimer();
+    onOpenChange(false);
+  }
+
+  // Handle nested navigation links, including activation of the current page.
+  // Svelte's listener preserves ordering with delegated child click handlers.
+  onMount(() => on(frame, 'click', closeAfterNavigation));
   onDestroy(clearCloseTimer);
 </script>
 

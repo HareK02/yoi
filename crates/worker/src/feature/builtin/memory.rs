@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
 use arc_swap::ArcSwap;
@@ -157,9 +158,24 @@ impl dyn WorkspaceClient + '_ {
     }
 }
 
+const RESIDENT_SUMMARY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
 async fn execute_subjektiv_memory_operation(
     client: &dyn WorkspaceClient,
     operation: server_api::SubjektivMemoryBackendOperation,
+) -> Result<server_api::SubjektivMemoryBackendResponse, WorkspaceMemoryBackendError> {
+    execute_subjektiv_memory_operation_with(client, operation, |client, request| {
+        client.execute(request)
+    })
+}
+
+fn execute_subjektiv_memory_operation_with(
+    client: &dyn WorkspaceClient,
+    operation: server_api::SubjektivMemoryBackendOperation,
+    execute: impl FnOnce(
+        &dyn WorkspaceClient,
+        WorkspaceRequest,
+    ) -> Result<crate::worker::WorkspaceResponse, WorkspaceClientError>,
 ) -> Result<server_api::SubjektivMemoryBackendResponse, WorkspaceMemoryBackendError> {
     let workspace_id =
         client
@@ -170,11 +186,14 @@ async fn execute_subjektiv_memory_operation(
                     client.kind()
                 ),
             })?;
-    let response = client.execute(WorkspaceRequest::json(
-        WorkspaceRequestMethod::Post,
-        format!("/api/w/{workspace_id}/subjektiv/memory"),
-        serde_json::to_string(&server_api::SubjektivMemoryBackendRequest { operation })?,
-    ))?;
+    let response = execute(
+        client,
+        WorkspaceRequest::json(
+            WorkspaceRequestMethod::Post,
+            format!("/api/w/{workspace_id}/subjektiv/memory"),
+            serde_json::to_string(&server_api::SubjektivMemoryBackendRequest { operation })?,
+        ),
+    )?;
     let status = reqwest::StatusCode::from_u16(response.status)
         .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
     if !response.is_success() {
@@ -712,12 +731,13 @@ impl WorkspaceSubjektivResidentSummarySource {
     async fn fetch(
         &self,
     ) -> Result<server_api::SubjektivResidentContextOutput, WorkspaceMemoryBackendError> {
-        match execute_subjektiv_memory_operation(
+        match execute_subjektiv_memory_operation_with(
             self.client.as_ref(),
             server_api::SubjektivMemoryBackendOperation::ResidentContext(Default::default()),
-        )
-        .await?
-        {
+            |client, request| {
+                client.execute_with_timeout(request, RESIDENT_SUMMARY_REQUEST_TIMEOUT)
+            },
+        )? {
             server_api::SubjektivMemoryBackendResponse::ResidentContext(output) => Ok(output),
             other => Err(WorkspaceMemoryBackendError::InvalidResponse(format!(
                 "unexpected subject resident context response: {other:?}"
@@ -1291,6 +1311,7 @@ mod tests {
         scope_allowed: bool,
         behavior: Mutex<(u64, String)>,
         paths: Mutex<Vec<String>>,
+        timeouts: Mutex<Vec<Duration>>,
     }
 
     impl SubjectResidentClient {
@@ -1304,6 +1325,7 @@ mod tests {
                 scope_allowed: true,
                 behavior: Mutex::new((3, "Be deliberate.".to_string())),
                 paths: Mutex::new(Vec::new()),
+                timeouts: Mutex::new(Vec::new()),
             }
         }
 
@@ -1314,6 +1336,7 @@ mod tests {
                 scope_allowed: false,
                 behavior: Mutex::new((3, "must not be injected".to_string())),
                 paths: Mutex::new(Vec::new()),
+                timeouts: Mutex::new(Vec::new()),
             }
         }
     }
@@ -1366,6 +1389,15 @@ mod tests {
                 )
                 .unwrap(),
             })
+        }
+
+        fn execute_with_timeout(
+            &self,
+            request: WorkspaceRequest,
+            timeout: Duration,
+        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            self.timeouts.lock().unwrap().push(timeout);
+            self.execute(request)
         }
     }
 
@@ -1681,6 +1713,10 @@ permission = "write"
             ready_client.paths.lock().unwrap().clone(),
             vec!["/api/w/workspace/subjektiv/memory".to_string()]
         );
+        assert_eq!(
+            ready_client.timeouts.lock().unwrap().as_slice(),
+            &[RESIDENT_SUMMARY_REQUEST_TIMEOUT]
+        );
 
         let ready_empty_client = Arc::new(SubjectResidentClient::new(
             memory::backend::MemoryResidentSummaryAvailability::Ready,
@@ -1789,6 +1825,12 @@ permission = "write"
             replay_after_rewrite
                 .body
                 .contains("No user-managed behavior is set")
+        );
+        // Initial load and every live update/clear/replay probe retain the
+        // target-side bounded resident request contract.
+        assert_eq!(
+            client.timeouts.lock().unwrap().as_slice(),
+            &[RESIDENT_SUMMARY_REQUEST_TIMEOUT; 7]
         );
     }
 

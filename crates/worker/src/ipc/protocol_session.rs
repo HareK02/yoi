@@ -76,6 +76,7 @@ pub fn live_log_entry_event(entry: LogEntry) -> Option<Event> {
         }
         entry @ (LogEntry::AnnotatedAssistantItem { .. }
         | LogEntry::AnnotatedToolResult { .. }
+        | LogEntry::ToolResultCorrected { .. }
         | LogEntry::RunYielded { .. }
         | LogEntry::RunResumed { .. }
         | LogEntry::RunCancelled { .. }

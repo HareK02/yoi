@@ -62,9 +62,7 @@ async function assertSubjectCreateRejects(
     assertEquals(error.status, expectedStatus);
     if (!error.message.includes(expectedMessage)) {
       throw new Error(
-        `expected ${JSON.stringify(error.message)} to include ${
-          JSON.stringify(expectedMessage)
-        }`,
+        `expected ${JSON.stringify(error.message)} to include ${JSON.stringify(expectedMessage)}`,
       );
     }
     return;
@@ -82,6 +80,30 @@ function subject(id = "subject-1") {
     store_revision: 12,
     created_at: "2026-09-01T00:00:00Z",
     updated_at: "2026-09-02T00:00:00Z",
+  };
+}
+
+function currentWorker() {
+  return {
+    runtime_id: "runtime-1",
+    worker_id: "worker-1",
+    host_id: "host-1",
+    display_name: "Release Worker",
+    label: "Release Worker",
+    profile: "builtin:companion",
+    singleton_key: "subjektiv:subject-1",
+    tags: [],
+    workspace: {
+      visibility: "workspace",
+      identity: "workspace-1",
+      workspace_id: "workspace-1",
+    },
+    state: "idle",
+    last_seen_at: "2026-09-02T00:00:00Z",
+    pinned: false,
+    retention_state: "retained",
+    implementation: { kind: "embedded", display_hint: "Embedded" },
+    diagnostics: [],
   };
 }
 
@@ -190,11 +212,32 @@ Deno.test("Subject parsers enforce identity, exact enums, safe revisions, and bo
     () =>
       parseSubjektivSubjectListResponse({
         limit: 100,
-        items: Array.from({ length: 101 }, (_, index) =>
-          subject(`subject-${index}`)),
+        items: Array.from({ length: 101 }, (_, index) => subject(`subject-${index}`)),
         has_more: false,
       }),
     "bounded array",
+  );
+});
+
+Deno.test("Subject parser preserves live Worker connection state", () => {
+  assertEquals(
+    parseSubjektivSubjectResponse({
+      ...subject(),
+      current_worker: currentWorker(),
+    }),
+    { ...subject(), current_worker: currentWorker() },
+  );
+  assertEquals(
+    parseSubjektivSubjectResponse({ ...subject(), current_worker: null }),
+    { ...subject(), current_worker: null },
+  );
+  assertThrows(
+    () =>
+      parseSubjektivSubjectResponse({
+        ...subject(),
+        current_worker: { display_name: "Incomplete Worker" },
+      }),
+    "current worker.runtime_id",
   );
 });
 
@@ -401,8 +444,7 @@ Deno.test("Subject create client distinguishes rejected and unknown outcomes wit
     throw new TypeError("connection reset");
   }) as typeof fetch;
   await assertSubjectCreateRejects(
-    () =>
-      createSubjektivSubject(unknownFetch, "workspace-1", { role: "Reviewer" }),
+    () => createSubjektivSubject(unknownFetch, "workspace-1", { role: "Reviewer" }),
     "unknown_outcome",
     "may have been created",
   );
@@ -506,8 +548,7 @@ Deno.test("Current Memory list parser rejects unknown variants, unsafe integers,
   assertThrows(
     () =>
       parseSubjektivMemoryQueryResponse({
-        items: Array.from({ length: 101 }, (_, index) =>
-          queryItem(`memory-${index}`)),
+        items: Array.from({ length: 101 }, (_, index) => queryItem(`memory-${index}`)),
         has_more: false,
       }),
     "bounded array",

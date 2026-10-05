@@ -34,6 +34,10 @@
     return cursor ? `${path}?cursor=${encodeURIComponent(cursor)}` : path;
   }
 
+  function subjectStateLabel(state: SubjektivSubjectResponse['state']): string {
+    return state === 'active' ? 'Available' : 'Retired';
+  }
+
   async function openCreateForm(): Promise<void> {
     createExpanded = true;
     createError = null;
@@ -121,7 +125,7 @@
     </div>
     <div class="memory-header-actions">
       {#if data.subjects.data}
-        <span class="memory-count">{subjects.length}{data.subjects.data.has_more ? '+' : ''} subject{subjects.length === 1 ? '' : 's'}</span>
+        <span class="memory-count">{subjects.length} shown{data.subjects.data.has_more ? ' · more available' : ''}</span>
       {/if}
       <button
         bind:this={createButton}
@@ -209,14 +213,19 @@
         {#each subjects as subject (subject.id)}
           <a class="subject-row" href={subjectHref(subject.id)}>
             <div class="subject-copy">
-              <span class="memory-state-pill is-{subject.state}">{subject.state}</span>
+              <span class="memory-state-pill is-{subject.state}">{subjectStateLabel(subject.state)}</span>
               <h2>{subject.role}</h2>
               <code title={subject.id}>{subject.id}</code>
             </div>
             <dl class="subject-meta">
-              <div><dt>Store revision</dt><dd>{subject.store_revision}</dd></div>
-              <div><dt>Updated</dt><dd><time datetime={subject.updated_at}>{formatDate(subject.updated_at)}</time></dd></div>
-              <div><dt>Worker</dt><dd>{subject.current_worker?.display_name ?? 'None'}</dd></div>
+              <div>
+                <dt>Worker connection</dt>
+                <dd>
+                  <strong>{subject.current_worker ? 'Connected' : 'Not connected'}</strong>
+                  {#if subject.current_worker}<span>{subject.current_worker.display_name}</span>{/if}
+                </dd>
+              </div>
+              <div><dt>Last changed</dt><dd><time datetime={subject.updated_at}>{formatDate(subject.updated_at)}</time></dd></div>
             </dl>
           </a>
         {/each}
@@ -465,8 +474,8 @@
 
   .subject-meta {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: var(--space-3);
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-4);
     align-self: center;
   }
 
@@ -480,10 +489,17 @@
   }
 
   .subject-meta dd {
+    display: grid;
+    gap: var(--space-1);
     margin-top: var(--space-1);
     color: var(--text-muted);
     font-size: var(--font-size-compact);
     overflow-wrap: anywhere;
+  }
+
+  .subject-meta dd strong {
+    color: var(--text);
+    font-weight: 700;
   }
 
   .memory-state {

@@ -136,14 +136,13 @@ pub fn project(items: &mut [Item], indices: &[usize]) -> usize {
 /// Remove binary attachments after the first model request that could consume them.
 ///
 /// Attachments on tool results following the latest model output are fresh outputs for the
-/// immediate follow-up request and remain visible. Once a later assistant/reasoning/tool-call
-/// item exists, the model has already had an opportunity to inspect the attachment. Subsequent
-/// requests keep the durable tool summary and can call the originating tool again when the image
-/// is still needed. Only the request-context clone is modified.
+/// immediate follow-up request and remain visible. With early dispatch, later
+/// text/calls in the same response have not consumed its tool results: use the
+/// confirmed response boundary, not that response's last individual item.
+/// Subsequent requests keep the durable tool summary and can call the originating
+/// tool again when the image is still needed. Only the request-context clone is modified.
 pub fn project_consumed_attachments(items: &mut [Item]) -> usize {
-    let latest_model_output = items.iter().rposition(|item| {
-        item.is_assistant_message() || item.is_reasoning() || item.is_tool_call()
-    });
+    let latest_model_output = crate::image_recovery::accepted_input_end(items.iter());
     let mut count = 0;
     for (index, item) in items.iter_mut().enumerate() {
         let is_fresh = latest_model_output.is_some_and(|boundary| index > boundary);

@@ -107,6 +107,9 @@ pub enum LogEntry {
 
     /// Canonical tool output and metadata committed as one journal record.
     AnnotatedToolResult { ts: u64, entry: LoggedHistoryEntry },
+    /// Append-only correction of a provider-rejected image result. Retains the
+    /// original stable identity; replay replaces rather than appends the item.
+    ToolResultCorrected { ts: u64, entry: LoggedHistoryEntry },
 
     /// Canonical typed system event and model-visible metadata committed
     /// together.
@@ -398,6 +401,16 @@ pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
             | LogEntry::AnnotatedToolResult { entry, .. } => {
                 state.annotated_history.push(entry.clone());
                 state.history.push(Item::from(entry.item.clone()));
+            }
+            LogEntry::ToolResultCorrected { entry, .. } => {
+                if let Some(index) = state
+                    .annotated_history
+                    .iter()
+                    .position(|existing| existing.metadata.entry_id == entry.metadata.entry_id)
+                {
+                    state.annotated_history[index] = entry.clone();
+                    state.history[index] = Item::from(entry.item.clone());
+                }
             }
             LogEntry::AnnotatedSystemItem {
                 entry, extensions, ..

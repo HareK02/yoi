@@ -90,6 +90,35 @@ impl ClientError {
         }
     }
 
+    /// A provider-declared image size rejection, not a generic invalid input.
+    /// Some providers (including OpenAI) expose only `invalid_value` here, so
+    /// narrowly recognize their image-size diagnostic without hardcoded limits.
+    pub fn is_image_size_rejection(&self) -> bool {
+        let Self::Api {
+            status: Some(400 | 413 | 422),
+            code,
+            message,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        if matches!(
+            code.as_deref(),
+            Some("image_too_large" | "image_size_exceeded")
+        ) {
+            return true;
+        }
+        let message = message.to_ascii_lowercase();
+        message.contains("image")
+            && ((message.contains("patches")
+                && message.contains("exceed")
+                && message.contains("limit"))
+                || message.contains("image is too large")
+                || message.contains("image too large")
+                || (message.contains("image dimensions") && message.contains("exceed")))
+    }
+
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
             ClientError::Api { retry_after, .. } => *retry_after,

@@ -6,6 +6,23 @@ import WorkerContextStatus from "./WorkerContextStatus.svelte";
 
 afterEach(cleanup);
 
+test("the three-dot Details control invokes the existing toggle and reflects its state", async () => {
+  let toggles = 0;
+  const view = render(WorkerContextStatus, {
+    metadata: null,
+    detailsOpen: false,
+    onToggleDetails: () => { toggles++; },
+  });
+  const button = view.getByRole("button", { name: "Details" });
+  expect(button.querySelectorAll("circle")).toHaveLength(3);
+  expect(button.textContent?.trim()).toBe("");
+  expect(button.getAttribute("aria-expanded")).toBe("false");
+  button.click();
+  expect(toggles).toBe(1);
+  await view.rerender({ detailsOpen: true });
+  expect(button.getAttribute("aria-expanded")).toBe("true");
+});
+
 test("renders resolved model, reasoning, and measured context accessibly", () => {
   const view = render(WorkerContextStatus, {
     metadata: {
@@ -19,13 +36,13 @@ test("renders resolved model, reasoning, and measured context accessibly", () =>
 
   const status = view.getByLabelText("Worker model and context");
   expect(status.textContent).toContain("gpt-6-astra · high");
-  expect(status.textContent).toContain("Context 142.0k / 272.0k (52%)");
+  expect(status.textContent).toContain("142.0k / 272.0k (52%)");
 });
 
 test("renders honest unavailable state instead of a fabricated zero percent", async () => {
   const view = render(WorkerContextStatus, { metadata: null });
   expect(view.getByText("Model unavailable")).not.toBeNull();
-  expect(view.getByText("Context unavailable")).not.toBeNull();
+  expect(view.getByText("unavailable")).not.toBeNull();
   expect(view.container.textContent).not.toContain("0%");
 
   await view.rerender({
@@ -38,7 +55,7 @@ test("renders honest unavailable state instead of a fabricated zero percent", as
     },
   });
   expect(view.container.textContent).toContain("claude · 8.2k token budget");
-  expect(view.container.textContent).toContain("Context ~12.0k / 64.0k (19%)");
+  expect(view.container.textContent).toContain("~12.0k / 64.0k (19%)");
 
   await view.rerender({
     metadata: {

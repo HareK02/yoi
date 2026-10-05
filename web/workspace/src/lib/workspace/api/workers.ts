@@ -262,7 +262,16 @@ function workerStateSnapshot(
   label: string,
 ): WorkerStateSnapshot {
   const snapshot = record(value, label);
-  exact(snapshot, ["last_command_id", "state"], label);
+  exact(
+    snapshot,
+    ["last_command_id", "last_finished_submission_request_id", "state"],
+    label,
+  );
+  const lastFinishedSubmissionRequestId = optional(
+    snapshot.last_finished_submission_request_id,
+    `${label}.last_finished_submission_request_id`,
+    string,
+  );
   const state = record(snapshot.state, `${label}.state`);
   const kind = string(state.kind, `${label}.state.kind`);
   if (kind === "idle") {
@@ -272,6 +281,7 @@ function workerStateSnapshot(
         snapshot.last_command_id,
         `${label}.last_command_id`,
       ),
+      last_finished_submission_request_id: lastFinishedSubmissionRequestId,
       state: { kind: "idle" },
     };
   }
@@ -291,6 +301,7 @@ function workerStateSnapshot(
         snapshot.last_command_id,
         `${label}.last_command_id`,
       ),
+      last_finished_submission_request_id: lastFinishedSubmissionRequestId,
       state: {
         kind: "busy",
         state: busyKind === "run"

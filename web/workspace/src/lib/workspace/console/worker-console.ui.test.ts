@@ -502,7 +502,9 @@ Deno.test("workspace Memory surfaces use read-only scoped memory APIs", async ()
     subjectIndexLoad.includes('"/subjektiv/subjects"') &&
       subjectIndexLoad.includes("parseSubjektivSubjectListResponse") &&
       subjectIndexPage.includes(">Subjects</h1>") &&
-      subjectIndexPage.includes("subject.store_revision") &&
+      subjectIndexPage.includes("Worker connection") &&
+      subjectIndexPage.includes("subject.current_worker") &&
+      !subjectIndexPage.includes("subject.store_revision") &&
       subjectIndexPage.includes('data-memory-view="subjects"'),
     "Memory product entry should list explicit typed subjects",
   );
@@ -510,10 +512,13 @@ Deno.test("workspace Memory surfaces use read-only scoped memory APIs", async ()
     subjectPageLoad.includes("`${subjectPath}/surface`") &&
       subjectPageLoad.includes("`${subjectPath}/memories`") &&
       subjectPage.includes("DocumentMarkdown from") &&
-      subjectPage.includes("Resident surface") &&
+      subjectPage.includes("Resident context") &&
+      subjectPage.includes("Subject store revision") &&
       subjectPage.includes("Current Memories") &&
       subjectPage.includes("surface?.availability === 'ready'") &&
+      subjectPage.includes("surface?.availability === 'ungenerated'") &&
       subjectPage.includes("surface?.availability === 'stale'") &&
+      subjectPage.includes("surface?.availability === 'failed'") &&
       subjectPage.includes("data-surface-ready-empty") &&
       !subjectPage.includes("overflow-y"),
     "Subject page should combine strict resident-surface and current-Memory reads without a nested vertical scroller",
@@ -736,6 +741,32 @@ Deno.test("Worker Console renders Edit diffs without preformatted template gaps"
       !consoleLine.includes('<pre class="console-diff"'),
     "Edit diff rows should not be wrapped in a pre element that preserves template whitespace as blank lines",
   );
+});
+
+Deno.test("Model information stays below Composer in one compact monospace row", async () => {
+  const page = await Deno.readTextFile(new URL(
+    "./../../../routes/w/[workspaceId]/workers/[workerRef]/console/+page.svelte",
+    import.meta.url,
+  ));
+  const composer = page.indexOf('<form class="console-composer"');
+  const composerEnd = page.indexOf("</form>", composer);
+  const status = page.indexOf("<WorkerContextStatus");
+  assert(composer >= 0 && composerEnd > composer && status > composerEnd, "Model information must follow Composer");
+  assert(page.includes("metadata={selectedConsoleProjection.workerMetadata}"), "Keep selected Worker metadata");
+  assert(page.indexOf("<WorkerContextStatus", status + 1) === -1, "Render model information only once");
+  const component = await Deno.readTextFile(new URL("./WorkerContextStatus.svelte", import.meta.url));
+  for (const rule of [
+    "flex-wrap: nowrap", "white-space: nowrap", "text-overflow: ellipsis",
+    "font-family: var(--font-mono)", "font-size: var(--font-size-compact)",
+    "line-height: var(--line-height-compact)", "padding-inline: var(--space-3)",
+  ]) assert(component.includes(rule), rule);
+  assert(!component.includes("@media"), "Narrow layouts must retain the same single row");
+  const modes = page.indexOf('class="console-view-toggle"');
+  assert(modes > status && modes < page.indexOf("</WorkerContextStatus>", status), "Display toggle must be in the model information row");
+  assert(!page.includes("console-header"), "Remove the empty header and its styles");
+  assert(component.indexOf("{@render controls?.()}") < component.indexOf('class="details-button"'), "Display controls must precede Details");
+  assert(/\.worker-context-actions\s*\{[^}]*flex: 0 0 auto/.test(component), "Keep display controls from shrinking on narrow screens");
+  assert(component.includes("margin-left: auto"), "Align footer controls to the right");
 });
 
 Deno.test("Console spacing and text metrics use existing design tokens", async () => {
@@ -1551,14 +1582,10 @@ Deno.test("Composer owns TUI-style completion and replaces Compact/Rewind header
   const input = await Deno.readTextFile(
     new URL("./ComposerInput.svelte", import.meta.url),
   );
-  const header = page.slice(
-    page.indexOf('<section class="console-header'),
-    page.indexOf("{#if rewindTargets.length"),
-  );
   assert(
-    !header.includes("Compact") && !header.includes("Rewind") &&
+    !page.includes('class="console-header') &&
       !page.includes("requestRewindTargets"),
-    "Header must defer Compact/Rewind to commands",
+    "Compact/Rewind must remain commands without a dedicated header",
   );
   assert(
     input.includes('role="listbox"') && input.includes('role="option"') &&
@@ -1588,12 +1615,8 @@ Deno.test("mini task summary owns pane toggling instead of the header", async ()
   const component = await Deno.readTextFile(
     new URL("./ConsoleTasks.svelte", import.meta.url),
   );
-  const header = page.slice(
-    page.indexOf('<section class="console-header'),
-    page.indexOf("{#if rewindTargets.length"),
-  );
   assert(
-    !header.includes("taskPaneOpen = !taskPaneOpen") &&
+    !page.includes('class="console-header') &&
       page.includes("onTogglePane={() => {"),
     "Only the mini summary should own Tasks toggling",
   );

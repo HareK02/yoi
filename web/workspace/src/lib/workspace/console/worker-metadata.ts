@@ -36,11 +36,11 @@ export function formatContextSummary(
     used === null || used === undefined || limit === null ||
     limit === undefined || !Number.isSafeInteger(used) ||
     !Number.isSafeInteger(limit) || used < 0 || limit <= 0
-  ) return "Context unavailable";
+  ) return "unavailable";
   const percent = Math.round((used / limit) * 100);
-  if (!Number.isFinite(percent)) return "Context unavailable";
+  if (!Number.isFinite(percent)) return "unavailable";
   const estimate = metadata?.contextSource === "estimated" ? "~" : "";
-  return `Context ${estimate}${formatRunTokens(used)} / ${
+  return `${estimate}${formatRunTokens(used)} / ${
     formatRunTokens(limit)
   } (${percent}%)`;
 }

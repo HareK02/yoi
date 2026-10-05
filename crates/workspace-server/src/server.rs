@@ -162,11 +162,11 @@ use crate::hosts::{
     RuntimeRegistryError, RuntimeRegistryUnregisterResult, TicketWorkerRole,
     WorkerCompletionsRequest, WorkerCompletionsResult, WorkerControlOperation, WorkerCreateBinding,
     WorkerInputDisposition, WorkerInputKind, WorkerInputRequest, WorkerInputResult,
-    WorkerLifecycleRequest, WorkerLifecycleResult, WorkerSpawnAcceptanceRequirement,
-    WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult, WorkerSpawnWorkingDirectoryRequest,
-    WorkerTicketAssignmentRequest, WorkspaceRuntimeAuthorization,
-    is_disallowed_remote_runtime_address, is_loopback_runtime_origin,
-    worker_spawn_create_fingerprint, workspace_worker_summary,
+    WorkerLifecycleRequest, WorkerLifecycleResult, WorkerSpawnAcceptanceEvidence,
+    WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult,
+    WorkerSpawnWorkingDirectoryRequest, WorkerTicketAssignmentRequest,
+    WorkspaceRuntimeAuthorization, is_disallowed_remote_runtime_address,
+    is_loopback_runtime_origin, worker_spawn_create_fingerprint, workspace_worker_summary,
 };
 use crate::memory_backend::execute_memory_backend_operation_with_authority;
 use crate::memory_staging::{
@@ -27712,6 +27712,11 @@ async fn create_workspace_worker_inner(
         Ok(result) => result,
         Err(error) => return Err(error.into()),
     };
+    let result = if resolved_subjektiv_attached {
+        restore_reused_subject_worker(&api, result)?
+    } else {
+        result
+    };
     Ok(Json(record_browser_worker_spawn(
         &api,
         runtime_id,
@@ -27719,6 +27724,52 @@ async fn create_workspace_worker_inner(
         result,
         assignment.as_ref(),
     )?))
+}
+
+fn restore_reused_subject_worker(
+    api: &WorkspaceApi,
+    mut result: WorkerSpawnResult,
+) -> ApiResult<WorkerSpawnResult> {
+    if result.state != InternalWorkerOperationState::Accepted {
+        return Ok(result);
+    }
+    let Some(worker) = result.worker.as_ref() else {
+        return Ok(result);
+    };
+    if worker.state != "stopped" {
+        return Ok(result);
+    }
+
+    let worker_ref = worker.worker.clone();
+    let restored = api.restore_workspace_worker(&worker_ref)?;
+    if restored.state != server_api::WorkerRestoreState::Accepted {
+        let message = runtime_diagnostics_message(&restored.diagnostics);
+        return Err(ApiError::with_diagnostics(
+            Error::RuntimeOperationFailed {
+                runtime_id: worker_ref.runtime_id,
+                code: "subject_worker_restore_rejected".to_string(),
+                message,
+            },
+            restored.diagnostics,
+        ));
+    }
+    let worker = restored
+        .worker
+        .ok_or_else(|| Error::RuntimeOperationFailed {
+            runtime_id: worker_ref.runtime_id,
+            code: "subject_worker_restore_missing_summary".to_string(),
+            message: "Runtime restored the existing subject Worker without returning its summary"
+                .to_string(),
+        })?;
+    result.worker = Some(worker);
+    result.diagnostics.extend(restored.diagnostics);
+    result
+        .acceptance_evidence
+        .push(WorkerSpawnAcceptanceEvidence {
+            kind: "subject_worker_restored".to_string(),
+            detail: "the existing stopped subject Worker was restored".to_string(),
+        });
+    Ok(result)
 }
 
 fn record_browser_worker_spawn(
@@ -39609,7 +39660,7 @@ mod tests {
     async fn ordinary_worker_launch_validates_optional_subjektiv_connection() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
-        let api = test_api(workspace.path()).await;
+        let (api, execution) = test_api_with_recording_backend(workspace.path()).await;
         let store = open_subjektiv_store(&api).unwrap();
         let active = store
             .create_subject(crate::subjektiv::SubjectRole::new("companion").unwrap())
@@ -39704,6 +39755,31 @@ mod tests {
             first.worker.singleton_key.as_deref(),
             Some(format!("subjektiv:{}", active.id).as_str())
         );
+
+        let worker = RuntimeWorkerRef::new(&first.runtime_id, &first.worker_id);
+        let stopped = api
+            .runtime
+            .stop_worker(
+                &worker,
+                WorkerLifecycleRequest {
+                    reason: Some("test subject Worker restart".to_string()),
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
+        assert_eq!(api.runtime.worker(&worker).unwrap().state, "stopped");
+        execution.accept_restores();
+
+        let Json(restored) = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(request(Some(&active.id), "builtin:companion", None)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored.worker_id, first.worker_id);
+        assert_eq!(restored.worker.state, "idle");
     }
 
     #[tokio::test]

@@ -3,6 +3,7 @@
 mod engine;
 mod handler;
 mod history;
+mod image_recovery;
 mod message;
 
 pub(crate) mod callback;

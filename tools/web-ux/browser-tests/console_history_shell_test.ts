@@ -596,6 +596,16 @@ async function checkConsoleHistory(viewportHeight: number): Promise<void> {
         await touchPage.reload();
         await touchPage.getByRole("button", { name: "Show sidebar", exact: true }).waitFor();
         assertEquals(await touchPage.evaluate(() => localStorage.getItem("yoi.sidebar.mode.v1")), "pinned");
+        // Different-route and same-page links both dismiss the mobile overlay.
+        for (let visit = 0; visit < 2; visit++) {
+          await touchPage.getByRole("button", { name: "Show sidebar", exact: true }).tap();
+          await touchPage.getByRole("link", { name: "Workspace home", exact: true }).tap();
+          await touchPage.waitForURL(`**/w/${workspaceId}`);
+          await touchPage.getByRole("button", { name: "Show sidebar", exact: true }).waitFor();
+          assertEquals(await touchPage.locator(".app-shell__main").evaluate((element) => (element as HTMLElement).inert), false);
+          assertEquals(await touchPage.evaluate(() => localStorage.getItem("yoi.sidebar.mode.v1")), "pinned");
+        }
+        await touchPage.goto(page.url());
         // A wide touchscreen still has a temporary-open control in hover mode.
         await touchPage.setViewportSize({ width: 1024, height: 600 });
         await touchPage.getByRole("button", { name: "Unpin sidebar", exact: true }).tap();
