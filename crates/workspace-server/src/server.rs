@@ -1384,6 +1384,7 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
 #[derive(Default)]
 struct OrchestratorAttentionState {
     sending: bool,
+    restore_recheck: bool,
     accepted: Option<OrchestratorAttentionDelivery>,
     pending: Option<OrchestratorAttentionDelivery>,
 }
@@ -1395,11 +1396,24 @@ struct OrchestratorAttentionDelivery {
     content: String,
 }
 
-struct OrchestratorAttentionReservation(Arc<Mutex<OrchestratorAttentionState>>);
+struct OrchestratorAttentionReservation(Option<Arc<Mutex<OrchestratorAttentionState>>>);
+
+impl OrchestratorAttentionReservation {
+    fn complete(mut self) -> bool {
+        let state = self.0.take().expect("active attention reservation");
+        let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
+        // Release and take deferred work atomically. A Restore arriving after
+        // release can reserve its own check; one arriving before is ours to drain.
+        state.sending = false;
+        std::mem::take(&mut state.restore_recheck)
+    }
+}
 
 impl Drop for OrchestratorAttentionReservation {
     fn drop(&mut self) {
-        self.0.lock().unwrap_or_else(|p| p.into_inner()).sending = false;
+        if let Some(state) = &self.0 {
+            state.lock().unwrap_or_else(|p| p.into_inner()).sending = false;
+        }
     }
 }
 
@@ -16878,16 +16892,47 @@ fn dispatch_orchestrator_queue_attention(
     worker: &RuntimeWorkerRef,
     retry_only: bool,
 ) {
+    with_orchestrator_attention_reservation(api, worker, retry_only, |state, pending| {
+        check_orchestrator_queue_attention(api, worker, state, pending);
+    });
+}
+
+fn with_orchestrator_attention_reservation(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    mut retry_only: bool,
+    mut check: impl FnMut(
+        &Arc<Mutex<OrchestratorAttentionState>>,
+        Option<OrchestratorAttentionDelivery>,
+    ),
+) {
     let state = orchestrator_attention_state(api, worker);
-    let pending = {
-        let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
-        if state.sending || (retry_only && state.pending.is_none()) {
+    loop {
+        let pending = {
+            let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
+            if state.sending || (retry_only && state.pending.is_none()) {
+                return;
+            }
+            state.sending = true;
+            state.pending.clone()
+        };
+        let reservation = OrchestratorAttentionReservation(Some(state.clone()));
+        check(&state, pending);
+        if !reservation.complete() {
             return;
         }
-        state.sending = true;
-        state.pending.clone()
-    };
-    let _reservation = OrchestratorAttentionReservation(state.clone());
+        // Accepted Restore is an explicit recheck even when the current check
+        // was a no-op or an already-online retry. Never infer it from Idle.
+        retry_only = false;
+    }
+}
+
+fn check_orchestrator_queue_attention(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    state: &Arc<Mutex<OrchestratorAttentionState>>,
+    pending: Option<OrchestratorAttentionDelivery>,
+) {
     // Unknown outcomes keep the original immutable payload and ID, even if the
     // backlog or prompt projection changed before this retry.
     if let Some(delivery) = pending {
@@ -22322,11 +22367,15 @@ async fn scoped_start_workspace_orchestrator(
                 let mut attention = attention.lock().unwrap_or_else(|p| p.into_inner());
                 // Retire only pre-Restore success. Concurrent reservations, unknown
                 // outcomes and newly accepted deliveries must survive Restore.
-                if !attention.sending
-                    && attention.pending.is_none()
+                if attention.pending.is_none()
                     && attention.accepted.as_ref().map(|d| &d.request_id) == before_restore.as_ref()
                 {
                     attention.accepted = None;
+                }
+                // A reserved caller may already have decided not to send. Carry
+                // the explicit Restore check through its completion in that case.
+                if attention.sending {
+                    attention.restore_recheck = true;
                 }
             }
             drop(_guard);
@@ -48295,6 +48344,140 @@ mod tests {
         assert_eq!(execution.take_input_request_ids().len(), 1);
         assert!(!state.lock().unwrap().sending);
         assert!(state.lock().unwrap().accepted.is_some());
+    }
+
+    #[tokio::test]
+    async fn orchestrator_attention_restore_rechecks_reserved_noop_before_and_after_comparison() {
+        for pause_before_comparison in [true, false] {
+            let (_dir, api, execution) = attention_test_api().await;
+            let started = start_attention_test_orchestrator(&api).await;
+            let worker = RuntimeWorkerRef::new(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                started.worker.unwrap().worker_id,
+            );
+            let state = orchestrator_attention_state(&api, &worker);
+            let old_id = state
+                .lock()
+                .unwrap()
+                .accepted
+                .as_ref()
+                .unwrap()
+                .request_id
+                .clone();
+            execution.take_inputs();
+            execution.take_input_request_ids();
+            api.runtime
+                .stop_worker(
+                    &worker,
+                    WorkerLifecycleRequest {
+                        reason: None,
+                        ticket_assignment: None,
+                    },
+                )
+                .unwrap();
+            execution.accept_restores();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let api_for_caller = api.clone();
+                let worker_for_caller = worker.clone();
+                let caller = scope.spawn(move || {
+                    let mut first = true;
+                    with_orchestrator_attention_reservation(
+                        &api_for_caller,
+                        &worker_for_caller,
+                        false,
+                        |state, pending| {
+                            if first && pause_before_comparison {
+                                entered_tx.send(()).unwrap();
+                                release_rx
+                                    .recv_timeout(std::time::Duration::from_secs(5))
+                                    .unwrap();
+                            }
+                            check_orchestrator_queue_attention(
+                                &api_for_caller,
+                                &worker_for_caller,
+                                state,
+                                pending,
+                            );
+                            if first && !pause_before_comparison {
+                                // Old fingerprint matched: check returned without sending,
+                                // but the exact same production reservation still exists.
+                                assert_eq!(
+                                    state.lock().unwrap().accepted.as_ref().unwrap().request_id,
+                                    old_id
+                                );
+                                entered_tx.send(()).unwrap();
+                                release_rx
+                                    .recv_timeout(std::time::Duration::from_secs(5))
+                                    .unwrap();
+                            }
+                            first = false;
+                        },
+                    );
+                });
+                entered_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                assert!(state.lock().unwrap().sending);
+                let restored = futures::executor::block_on(start_attention_test_orchestrator(&api));
+                assert_eq!(restored.disposition, "restored");
+                let deferred = state.lock().unwrap().restore_recheck;
+                let old_retired = state.lock().unwrap().accepted.is_none();
+                let inputs_before_release = execution.take_inputs();
+                release_tx.send(()).unwrap();
+                caller.join().unwrap();
+                assert!(deferred);
+                assert!(old_retired);
+                assert!(inputs_before_release.is_empty());
+            });
+            assert_eq!(execution.take_inputs().len(), 1);
+            assert_eq!(execution.take_input_request_ids().len(), 1);
+            let state = state.lock().unwrap();
+            assert!(state.accepted.is_some());
+            assert!(!state.sending);
+            assert!(!state.restore_recheck);
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_attention_restore_keeps_pending_unknown_delivery_and_id() {
+        let (_dir, api, execution) = attention_test_api().await;
+        execution.reject_inputs("unknown acceptance response");
+        let started = start_attention_test_orchestrator(&api).await;
+        let worker = RuntimeWorkerRef::new(
+            EMBEDDED_WORKER_RUNTIME_ID,
+            started.worker.unwrap().worker_id,
+        );
+        let state = orchestrator_attention_state(&api, &worker);
+        let pending = state.lock().unwrap().pending.clone().unwrap();
+        execution.take_inputs();
+        execution.take_input_request_ids();
+        api.runtime
+            .stop_worker(
+                &worker,
+                WorkerLifecycleRequest {
+                    reason: None,
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        execution.accept_restores();
+        *execution.input_failure.lock().unwrap() = None;
+        let restored = start_attention_test_orchestrator(&api).await;
+        assert_eq!(restored.disposition, "restored");
+        let attempts = execution.take_inputs();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].1, pending.content);
+        assert_eq!(
+            execution.take_input_request_ids(),
+            vec![Some(pending.request_id.clone())]
+        );
+        assert!(state.lock().unwrap().pending.is_none());
+        assert_eq!(
+            state.lock().unwrap().accepted.as_ref().unwrap().request_id,
+            pending.request_id
+        );
     }
 
     #[tokio::test]
