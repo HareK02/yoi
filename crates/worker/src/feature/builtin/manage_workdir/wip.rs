@@ -225,8 +225,8 @@ impl Provider {
     fn inventory(&self, domain: Domain) -> Result<Vec<Json>, WipOperationError> {
         let response = self.request(match domain {
             Domain::Repository => "repositories",
-            Domain::Workdir => "working-directories",
-            Domain::Attachment => "workers/self/workdir-attachments",
+            Domain::Workdir => "workers/self/workdir-catalog?limit=1",
+            Domain::Attachment => "workers/self/workdir-attachments?limit=1",
         })?;
         response
             .get("items")
@@ -363,6 +363,29 @@ impl WipOperationHandler for CollectionHandler {
     fn object_validator(&self) -> Option<Vec<u8>> {
         let mut digest = Sha256::new();
         digest.update(self.domain.route());
+        if matches!(self.domain, Domain::Workdir | Domain::Attachment) {
+            // The complete-set revision is computed by the existing Backend
+            // registry/ledger in the same snapshot as a bounded page. Never infer
+            // collection freshness from just the first page's items.
+            let path = if matches!(self.domain, Domain::Workdir) {
+                "workers/self/workdir-catalog?limit=1"
+            } else {
+                "workers/self/workdir-attachments?limit=1"
+            };
+            match self
+                .provider
+                .request(path)
+                .ok()
+                .and_then(|p| p.get("revision").and_then(Json::as_str).map(str::to_owned))
+            {
+                Some(revision) => {
+                    digest.update([0]);
+                    digest.update(revision);
+                }
+                None => digest.update(b"inventory-revision-unavailable"),
+            }
+            return Some(digest.finalize().to_vec());
+        }
         match self.provider.inventory(self.domain) {
             Ok(items) => {
                 for raw in items {
@@ -422,36 +445,54 @@ impl WipOperationHandler for CollectionHandler {
                     .authorize(self.domain.list_permission(), &input)?;
                 let limit = page_limit(&input)?;
                 let cursor = input.get("cursor").and_then(Json::as_str);
-                if matches!(self.domain, Domain::Attachment) {
-                    let offset = cursor
-                        .map(|c| {
-                            c.strip_prefix("offset:")
-                                .and_then(|s| s.parse::<u32>().ok())
-                                .ok_or_else(|| {
-                                    failure(
-                                        ProtocolErrorCode::InvalidArguments,
-                                        "invalid attachment page cursor",
-                                    )
-                                })
-                        })
-                        .transpose()?
-                        .unwrap_or(0);
-                    let page = self.provider.request(&format!(
-                        "workers/self/workdir-attachments?limit={limit}&offset={offset}"
-                    ))?;
-                    let raws = page.get("items").and_then(Json::as_array).ok_or_else(|| {
-                        WipOperationError::OutcomeUnknown("invalid attachment page".into())
-                    })?;
+                if matches!(self.domain, Domain::Workdir | Domain::Attachment) {
+                    let attachment = matches!(self.domain, Domain::Attachment);
+                    let path = if attachment {
+                        let offset = cursor
+                            .map(|c| {
+                                c.strip_prefix("offset:")
+                                    .and_then(|s| s.parse::<u32>().ok())
+                                    .ok_or_else(|| {
+                                        failure(
+                                            ProtocolErrorCode::InvalidArguments,
+                                            "invalid attachment page cursor",
+                                        )
+                                    })
+                            })
+                            .transpose()?
+                            .unwrap_or(0);
+                        format!("workers/self/workdir-attachments?limit={limit}&offset={offset}")
+                    } else {
+                        let suffix = cursor
+                            .map(|c| format!("&cursor={}", encode_path_segment(c)))
+                            .unwrap_or_default();
+                        format!("workers/self/workdir-catalog?limit={limit}{suffix}")
+                    };
+                    let page = self.provider.request(&path)?;
+                    let raws = page
+                        .get("items")
+                        .and_then(Json::as_array)
+                        .filter(|v| v.len() <= limit)
+                        .ok_or_else(|| {
+                            WipOperationError::OutcomeUnknown(
+                                "invalid bounded inventory page".into(),
+                            )
+                        })?;
+                    if page.get("revision").and_then(Json::as_str).is_none() {
+                        return Err(WipOperationError::OutcomeUnknown(
+                            "inventory page revision missing".into(),
+                        ));
+                    }
                     let mut items = Vec::new();
                     for raw in raws {
-                        let id =
-                            raw.get("connection_id")
-                                .and_then(Json::as_str)
-                                .ok_or_else(|| {
-                                    WipOperationError::OutcomeUnknown(
-                                        "attachment identity missing".into(),
-                                    )
-                                })?;
+                        let id = raw
+                            .get(self.domain.identity_field())
+                            .and_then(Json::as_str)
+                            .ok_or_else(|| {
+                                WipOperationError::OutcomeUnknown(
+                                    "inventory identity missing".into(),
+                                )
+                            })?;
                         if self.provider.allowed(
                             self.domain.read_permission(),
                             &self.provider.read_input(self.domain, id),
@@ -459,10 +500,33 @@ impl WipOperationHandler for CollectionHandler {
                             items.push(self.provider.projected(self.domain, raw)?);
                         }
                     }
-                    let next = page
-                        .get("next_offset")
-                        .and_then(Json::as_u64)
-                        .map(|n| format!("offset:{n}"));
+                    let next = if attachment {
+                        match page.get("next_offset") {
+                            Some(Json::Null) => None,
+                            Some(v) if v.as_u64().is_some_and(|n| n <= u32::MAX as u64) => {
+                                Some(format!("offset:{}", v.as_u64().unwrap()))
+                            }
+                            _ => {
+                                return Err(WipOperationError::OutcomeUnknown(
+                                    "invalid attachment next page".into(),
+                                ));
+                            }
+                        }
+                    } else {
+                        match page.get("next_cursor") {
+                            Some(Json::Null) => None,
+                            Some(Json::String(v)) if cursor.is_none_or(|old| v.as_str() > old) => {
+                                Some(v.clone())
+                            }
+                            _ => {
+                                return Err(WipOperationError::OutcomeUnknown(
+                                    "invalid Workdir next page".into(),
+                                ));
+                            }
+                        }
+                    };
+                    // Empty describes this permission-filtered page, not the
+                    // entire catalog. A sparse page still advances the Backend cursor.
                     return native(
                         json!({"empty":items.is_empty(), "items":items, "has_more":next.is_some(), "next_cursor":next, "limit":limit}),
                     );
@@ -781,7 +845,15 @@ fn argument_json(arguments: &BTreeMap<String, Value>) -> Result<Json, WipOperati
     Ok(Json::Object(values))
 }
 fn page_limit(input: &Json) -> Result<usize, WipOperationError> {
-    let limit = input.get("limit").and_then(Json::as_u64).unwrap_or(50);
+    let limit = match input.get("limit") {
+        None | Some(Json::Null) => 50,
+        Some(value) => value.as_u64().ok_or_else(|| {
+            failure(
+                ProtocolErrorCode::InvalidArguments,
+                "limit must be an integer in 1..=100",
+            )
+        })?,
+    };
     if !(1..=100).contains(&limit) {
         return Err(failure(
             ProtocolErrorCode::InvalidArguments,
@@ -995,7 +1067,43 @@ pub(crate) mod tests {
                     json!({"items":state.repositories})
                 }
                 (WorkspaceRequestMethod::Get, "working-directories") => {
-                    json!({"items":state.workdirs})
+                    // The legacy browser/Tool endpoint is a latest-200 snapshot,
+                    // not a complete WIP catalog; regressions must not use it.
+                    json!({"items":state.workdirs.iter().rev().take(200).collect::<Vec<_>>()})
+                }
+                (WorkspaceRequestMethod::Get, "workers/self/workdir-catalog") => {
+                    let query: BTreeMap<_, _> = path
+                        .split('?')
+                        .nth(1)
+                        .unwrap_or_default()
+                        .split('&')
+                        .filter_map(|p| p.split_once('='))
+                        .collect();
+                    let limit = query
+                        .get("limit")
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(50);
+                    let cursor = query.get("cursor").copied();
+                    let mut all: Vec<_> = state.workdirs.iter().collect();
+                    all.sort_by_key(|v| v["working_directory_id"].as_str().unwrap());
+                    let revision = Sha256::digest(serde_json::to_vec(&all).unwrap())
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>();
+                    let remaining: Vec<_> = all
+                        .into_iter()
+                        .filter(|v| {
+                            cursor.is_none_or(|c| v["working_directory_id"].as_str().unwrap() > c)
+                        })
+                        .collect();
+                    let has_more = remaining.len() > limit;
+                    let items: Vec<_> = remaining.into_iter().take(limit).collect();
+                    let next = if has_more {
+                        items.last().map(|v| v["working_directory_id"].clone())
+                    } else {
+                        None
+                    };
+                    json!({"items":items, "next_cursor":next, "revision":revision})
                 }
                 (WorkspaceRequestMethod::Get, "workers/self/workdir-attachments") => {
                     let query: BTreeMap<_, _> = path
@@ -1005,8 +1113,14 @@ pub(crate) mod tests {
                         .split('&')
                         .filter_map(|p| p.split_once('='))
                         .collect();
+                    let mut all: Vec<_> = state.attachments.iter().collect();
+                    all.sort_by_key(|v| v["alias"].as_str().unwrap());
+                    let revision = Sha256::digest(serde_json::to_vec(&all).unwrap())
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>();
                     if let Some(expected) = query.get("connection_id") {
-                        json!({"items":state.attachments.iter().filter(|a| a["connection_id"] == *expected).collect::<Vec<_>>(), "next_offset":null})
+                        json!({"items":all.into_iter().filter(|a| a["connection_id"] == *expected).collect::<Vec<_>>(), "next_offset":null, "revision":revision})
                     } else {
                         let limit = query
                             .get("limit")
@@ -1016,11 +1130,10 @@ pub(crate) mod tests {
                             .get("offset")
                             .and_then(|s| s.parse::<usize>().ok())
                             .unwrap_or(0);
-                        let items: Vec<_> =
-                            state.attachments.iter().skip(offset).take(limit).collect();
-                        let next =
-                            (offset + limit < state.attachments.len()).then_some(offset + limit);
-                        json!({"items":items, "next_offset":next})
+                        let count = all.len();
+                        let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
+                        let next = (offset + limit < count).then_some(offset + limit);
+                        json!({"items":items, "next_offset":next, "revision":revision})
                     }
                 }
                 (WorkspaceRequestMethod::Get, p) if p.starts_with("repositories/") => {
@@ -1540,6 +1653,31 @@ mod logical_capability_tests {
         assert!(item.operation_available("read"));
         for operation in ["attach", "delete", "command"] {
             assert!(!item.operation_available(operation));
+        }
+    }
+}
+
+#[cfg(test)]
+mod page_contract_tests {
+    use super::*;
+    #[test]
+    fn bounded_page_limit_rejects_negative_and_noninteger_inputs() {
+        assert_eq!(page_limit(&json!({})).unwrap_or_default(), 50);
+        assert_eq!(page_limit(&json!({"limit":100})).unwrap_or_default(), 100);
+        for input in [
+            json!({"limit":-1}),
+            json!({"limit":0}),
+            json!({"limit":101}),
+            json!({"limit":"50"}),
+            json!({"limit":1.5}),
+        ] {
+            assert!(matches!(
+                page_limit(&input),
+                Err(WipOperationError::Protocol(ProtocolError {
+                    code: ProtocolErrorCode::InvalidArguments,
+                    ..
+                }))
+            ));
         }
     }
 }

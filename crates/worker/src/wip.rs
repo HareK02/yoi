@@ -4020,6 +4020,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn catalog_native_transport_pages_all_workdirs_beyond_legacy_200_cap() {
+        use crate::feature::builtin::manage_workdir::wip::tests::CatalogClient;
+        let client = Arc::new(CatalogClient::default());
+        client.state.lock().unwrap().workdirs = (0..205).map(|n| json!({
+            "working_directory_id":format!("wd-{n:03}"), "source":{"kind":"repository", "repository_key":"registered-key"}, "status":"active"
+        })).collect();
+        let runtime = catalog_transport_runtime(client.clone(), false, None);
+        let interface = observed_contextual_interface(&runtime, "/workdirs").await;
+        let mut cursor = Json::Null;
+        let mut ids = BTreeSet::new();
+        let mut pages = 0;
+        loop {
+            let page = transport_call_json(
+                &runtime,
+                "/workdirs",
+                &interface,
+                "list",
+                if cursor.is_null() {
+                    json!({"limit":100})
+                } else {
+                    json!({"limit":100, "cursor":cursor})
+                },
+            )
+            .await;
+            pages += 1;
+            let items = page["items"].as_array().unwrap();
+            assert!(items.len() <= 100);
+            for item in items {
+                assert!(ids.insert(item["working_directory_id"].as_str().unwrap().to_owned()));
+            }
+            if !page["has_more"].as_bool().unwrap() {
+                assert!(page["next_cursor"].is_null());
+                break;
+            }
+            cursor = page["next_cursor"].clone();
+            assert!(pages < 4, "cursor must progress");
+        }
+        assert_eq!(pages, 3);
+        assert_eq!(ids.len(), 205);
+        assert!(ids.contains("wd-000"));
+        let item_interface = observed_contextual_interface(&runtime, "/workdirs/wd-000").await;
+        let read = transport_call_json(
+            &runtime,
+            "/workdirs/wd-000",
+            &item_interface,
+            "read",
+            json!({}),
+        )
+        .await;
+        assert_eq!(read["working_directory_id"], "wd-000");
+        assert!(
+            client
+                .state
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .all(|r| !r.path.ends_with("/working-directories")),
+            "WIP must not use a capped legacy inventory"
+        );
+
+        let permissions = Some(ToolPermissionConfig {
+            default_action: ToolPermissionAction::Deny,
+            rules: vec![
+                manifest::ToolPermissionRule {
+                    tool: "WorkdirList".into(),
+                    pattern: "*".into(),
+                    action: ToolPermissionAction::Allow,
+                },
+                manifest::ToolPermissionRule {
+                    tool: "WorkdirRead".into(),
+                    pattern: "*wd-204*".into(),
+                    action: ToolPermissionAction::Allow,
+                },
+            ],
+        });
+        let runtime = catalog_transport_runtime(client, false, permissions);
+        let interface = observed_contextual_interface(&runtime, "/workdirs").await;
+        let first = transport_call_json(
+            &runtime,
+            "/workdirs",
+            &interface,
+            "list",
+            json!({"limit":100}),
+        )
+        .await;
+        assert_eq!(first["empty"], true);
+        assert_eq!(
+            first["has_more"], true,
+            "empty filtered page is not terminal"
+        );
+        let second = transport_call_json(
+            &runtime,
+            "/workdirs",
+            &interface,
+            "list",
+            json!({"limit":100, "cursor":first["next_cursor"]}),
+        )
+        .await;
+        assert_eq!(second["has_more"], true);
+        let last = transport_call_json(
+            &runtime,
+            "/workdirs",
+            &interface,
+            "list",
+            json!({"limit":100, "cursor":second["next_cursor"]}),
+        )
+        .await;
+        assert_eq!(last["items"][0]["working_directory_id"], "wd-204");
+        assert_eq!(last["has_more"], false);
+    }
+
+    #[tokio::test]
+    async fn catalog_native_transport_invalidates_attachment_change_beyond_first_page() {
+        use crate::feature::builtin::manage_workdir::wip::tests::CatalogClient;
+        for capability_change in [false, true] {
+            let client = Arc::new(CatalogClient::default());
+            client.state.lock().unwrap().attachments = (0..65).map(|n| json!({
+                "connection_id":format!("lifetime-{n:03}"), "alias":format!("alias-{n:03}"), "working_directory_id":"wd", "capabilities":{"bits":25}
+            })).collect();
+            let first_fifty = client.state.lock().unwrap().attachments[..50].to_vec();
+            let runtime = catalog_transport_runtime(client.clone(), true, None);
+            let interface = observed_contextual_interface(&runtime, "/workdir-attachments").await;
+            let old_validator = runtime
+                .host
+                .projection("/workdir-attachments")
+                .unwrap()
+                .object
+                .validator;
+            if capability_change {
+                client.state.lock().unwrap().attachments[64]["capabilities"] = json!({"bits":63});
+            } else {
+                client.state.lock().unwrap().attachments[64]["connection_id"] =
+                    json!("new-lifetime");
+            }
+            assert_eq!(client.state.lock().unwrap().attachments[..50], first_fifty);
+            assert_ne!(
+                runtime
+                    .host
+                    .projection("/workdir-attachments")
+                    .unwrap()
+                    .object
+                    .validator,
+                old_validator
+            );
+            let error = runtime
+                .call(
+                    "/workdir-attachments".into(),
+                    interface.clone(),
+                    "list".into(),
+                    json!({"cursor":"offset:50", "limit":100}),
+                    ToolExecutionContext::direct(),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("ValidatorMismatch"), "{error}");
+            let interface = observed_contextual_interface(&runtime, "/workdir-attachments").await;
+            let page = transport_call_json(
+                &runtime,
+                "/workdir-attachments",
+                &interface,
+                "list",
+                json!({"cursor":"offset:50"}),
+            )
+            .await;
+            assert_eq!(page["items"].as_array().unwrap().len(), 15);
+            if capability_change {
+                assert_eq!(page["items"][14]["capabilities"]["bits"], 63);
+            } else {
+                assert_eq!(page["items"][14]["connection_id"], "new-lifetime");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn catalog_native_transport_discovers_creates_attaches_reads_and_detaches() {
         use crate::feature::builtin::manage_workdir::wip::tests::CatalogClient;
         use crate::worker::WorkspaceRequestMethod;

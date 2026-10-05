@@ -951,6 +951,23 @@ pub struct WorkdirRegistryRecord {
     pub updated_at: String,
 }
 
+/// Projection inputs captured together with the catalog revision in one SQLite snapshot.
+#[derive(Debug, Clone)]
+pub struct WorkdirCatalogEntry {
+    pub record: WorkdirRegistryRecord,
+    pub repository_key: Option<String>,
+    /// None for Repository records and unsupported legacy External grants.
+    pub external_grant_permissions: Option<workdir::workspace::WorkdirPermissionSummary>,
+    pub occupied_by: Option<workdir::workspace::WorkingDirectoryOccupancy>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkdirCatalogPage {
+    pub entries: Vec<WorkdirCatalogEntry>,
+    pub next_cursor: Option<String>,
+    pub revision: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExternalWorkdirGrantRecord {
     pub grant_id: String,
@@ -1896,6 +1913,12 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         workspace_id: &str,
         limit: usize,
     ) -> Result<Vec<WorkdirRegistryRecord>>;
+    fn workdir_catalog_page(
+        &self,
+        workspace_id: &str,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Result<WorkdirCatalogPage>;
     fn delete_workdir_registry(&self, workspace_id: &str, workdir_id: &str) -> Result<bool>;
 
     fn create_external_workdir_grant(
@@ -2008,6 +2031,14 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         offset: u32,
         connection_id: Option<&str>,
     ) -> Result<Vec<WorkerWorkdirLinkRecord>>;
+    fn list_worker_workdir_links_page_with_revision(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        limit: u32,
+        offset: u32,
+        connection_id: Option<&str>,
+    ) -> Result<(Vec<WorkerWorkdirLinkRecord>, String)>;
     fn worker_workdir_link_history_exists(
         &self,
         workspace_id: &str,
@@ -8901,6 +8932,72 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn workdir_catalog_page(
+        &self,
+        workspace_id: &str,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Result<WorkdirCatalogPage> {
+        if limit == 0 || limit > 100 {
+            return Err(Error::InvalidInput(
+                "catalog page limit must be 1..=100".to_string(),
+            ));
+        }
+        if cursor.is_some_and(|id| {
+            id.trim().is_empty() || id.len() > 128 || id.chars().any(char::is_control)
+        }) {
+            return Err(Error::InvalidInput(
+                "catalog cursor must contain 1..=128 bytes without control characters".to_string(),
+            ));
+        }
+        self.with_conn(|conn| {
+            // Also fence writers using other SQLite connections, not only this mutex.
+            let tx = conn.unchecked_transaction()?;
+            let sql = workdir_catalog_select_sql();
+            let mut hasher = Sha256::new();
+            update_public_collection_digest(&mut hasher, &("workdir-catalog:v1", workspace_id))?;
+            {
+                let mut stmt = tx.prepare(&format!("{sql} WHERE wr.workspace_id = ?1 ORDER BY wr.workdir_id"))?;
+                let mut rows = stmt.query(params![workspace_id])?;
+                while let Some(row) = rows.next()? {
+                    let (entry, connection_id) = read_workdir_catalog_entry(row)?;
+                    let record = &entry.record;
+                    // Safe projection fields and timestamps only: no paths, provider identity,
+                    // credentials, Repository UUIDs, or raw internal records.
+                    update_public_collection_digest(&mut hasher, &(
+                        &record.workdir_id, &record.display_name, &entry.repository_key,
+                        record.source.external_grant_id(), &entry.external_grant_permissions,
+                        (&record.creation_selector, &record.creation_ref, &record.creation_tree),
+                        (&record.current_selector, &record.current_ref, &record.current_tree),
+                        record.observed_at_epoch_seconds,
+                        (&record.materialization_status, &record.cleanliness),
+                        (&record.created_at, &record.updated_at),
+                        &entry.occupied_by, connection_id,
+                    ))?;
+                }
+            }
+            let mut stmt = tx.prepare(&format!(
+                "{sql} WHERE wr.workspace_id = ?1 AND (?2 IS NULL OR wr.workdir_id > ?2) ORDER BY wr.workdir_id ASC LIMIT ?3"
+            ))?;
+            let mut rows = stmt.query(params![workspace_id, cursor, limit + 1])?;
+            let mut entries = Vec::new();
+            while let Some(row) = rows.next()? {
+                entries.push(read_workdir_catalog_entry(row)?.0);
+            }
+            let next_cursor = if entries.len() > limit as usize {
+                entries.truncate(limit as usize);
+                entries.last().map(|entry| entry.record.workdir_id.clone())
+            } else {
+                None
+            };
+            Ok(WorkdirCatalogPage {
+                entries,
+                next_cursor,
+                revision: hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+            })
+        })
+    }
+
     fn delete_workdir_registry(&self, workspace_id: &str, workdir_id: &str) -> Result<bool> {
         self.with_conn(|conn| {
             let tx = rusqlite::Transaction::new_unchecked(
@@ -9815,6 +9912,24 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         offset: u32,
         connection_id: Option<&str>,
     ) -> Result<Vec<WorkerWorkdirLinkRecord>> {
+        self.list_worker_workdir_links_page_with_revision(
+            workspace_id,
+            worker,
+            limit,
+            offset,
+            connection_id,
+        )
+        .map(|(links, _)| links)
+    }
+
+    fn list_worker_workdir_links_page_with_revision(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        limit: u32,
+        offset: u32,
+        connection_id: Option<&str>,
+    ) -> Result<(Vec<WorkerWorkdirLinkRecord>, String)> {
         if limit == 0 || limit > 101 {
             return Err(Error::InvalidInput(
                 "attachment page limit must be 1..=101".to_string(),
@@ -9829,7 +9944,40 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             ));
         }
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let tx = conn.unchecked_transaction()?;
+            let mut hasher = Sha256::new();
+            update_public_collection_digest(
+                &mut hasher,
+                &(
+                    "workdir-connections:v1",
+                    workspace_id,
+                    &worker.runtime_id,
+                    &worker.worker_id,
+                ),
+            )?;
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT alias, connection_id, workdir_id, capabilities FROM worker_workdir_links
+                     WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
+                       AND unlinked_at IS NULL ORDER BY alias"
+                )?;
+                let mut rows =
+                    stmt.query(params![workspace_id, worker.runtime_id, worker.worker_id])?;
+                while let Some(row) = rows.next()? {
+                    let alias: String = row.get(0)?;
+                    let id: String = row.get(1)?;
+                    let workdir: String = row.get(2)?;
+                    let capabilities =
+                        decode_workdir_link_capabilities(&row.get::<_, String>(3)?, 3).map_err(
+                            |_| Error::Store("invalid public connection capabilities".to_string()),
+                        )?;
+                    update_public_collection_digest(
+                        &mut hasher,
+                        &(alias, id, workdir, capabilities),
+                    )?;
+                }
+            }
+            let mut stmt = tx.prepare(
                 r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities,
                           linked_at, unlinked_at, connection_id
                    FROM worker_workdir_links
@@ -9849,8 +9997,15 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 ],
                 read_worker_workdir_link_record,
             )?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(Error::from)
+            let links = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok((
+                links,
+                hasher
+                    .finalize()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
+            ))
         })
     }
 
@@ -11612,6 +11767,96 @@ fn require_expected_ticket_assignment(
     Err(Error::TicketAssignmentConflict(format!(
         "Ticket {ticket_id} is no longer assigned to {expected_assignment_id}"
     )))
+}
+
+// Length-framed canonical JSON prevents ambiguous concatenations and never hashes raw ledgers.
+fn update_public_collection_digest(hasher: &mut Sha256, value: &impl Serialize) -> Result<()> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|_| Error::Store("unable to encode public collection metadata".to_string()))?;
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+    Ok(())
+}
+
+fn workdir_catalog_select_sql() -> String {
+    format!(
+        "SELECT wr.*, r.repository_key, g.permissions,
+                l.runtime_id, l.worker_id, w.display_name, l.linked_at, l.connection_id
+         FROM ({}) wr
+         LEFT JOIN repositories r ON r.workspace_id = wr.workspace_id AND r.repository_id = wr.repository_id
+         LEFT JOIN external_workdir_grants g ON g.workspace_id = wr.workspace_id AND g.grant_id = wr.external_grant_id
+         LEFT JOIN worker_workdir_links l ON l.rowid = (
+             SELECT rowid FROM worker_workdir_links
+             WHERE workspace_id = wr.workspace_id AND workdir_id = wr.workdir_id AND unlinked_at IS NULL
+             ORDER BY linked_at DESC, rowid DESC LIMIT 1
+         )
+         LEFT JOIN worker_registry w ON w.workspace_id = l.workspace_id AND w.runtime_id = l.runtime_id AND w.worker_id = l.worker_id",
+        workdir_registry_select_sql("")
+    )
+}
+
+fn read_workdir_catalog_entry(
+    row: &rusqlite::Row<'_>,
+) -> Result<(WorkdirCatalogEntry, Option<String>)> {
+    let record = read_workdir_registry_record(row)?;
+    let repository_key: Option<String> = row.get(18)?;
+    let external_grant_permissions = match &record.source {
+        WorkdirRegistrySource::Repository { .. } => {
+            if repository_key.is_none() {
+                return Err(Error::Store(
+                    "Workdir catalog Repository is unavailable".to_string(),
+                ));
+            }
+            None
+        }
+        WorkdirRegistrySource::ExternalGrant { .. } => {
+            let permissions: Option<String> = row.get(19)?;
+            match permissions.as_deref() {
+                Some("read_only") => Some(workdir::workspace::WorkdirPermissionSummary {
+                    read: true,
+                    write: false,
+                    command: false,
+                }),
+                Some("read_write") => Some(workdir::workspace::WorkdirPermissionSummary {
+                    read: true,
+                    write: true,
+                    command: false,
+                }),
+                Some("read_write_command") => Some(workdir::workspace::WorkdirPermissionSummary {
+                    read: true,
+                    write: true,
+                    command: true,
+                }),
+                Some("command_only" | "read_command") => None,
+                _ => {
+                    return Err(Error::Store(
+                        "Workdir catalog External grant permissions are unavailable".to_string(),
+                    ));
+                }
+            }
+        }
+    };
+    let runtime_id: Option<String> = row.get(20)?;
+    let occupied_by = match runtime_id {
+        Some(runtime_id) => Some(workdir::workspace::WorkingDirectoryOccupancy {
+            runtime_id,
+            worker_id: row.get(21)?,
+            display_name: row.get::<_, Option<String>>(22)?.ok_or_else(|| {
+                Error::Store("Workdir catalog occupant is unavailable".to_string())
+            })?,
+            linked_at: row.get(23)?,
+        }),
+        None => None,
+    };
+    Ok((
+        WorkdirCatalogEntry {
+            record,
+            repository_key,
+            external_grant_permissions,
+            occupied_by,
+        },
+        row.get(24)?,
+    ))
 }
 
 fn workdir_registry_select_sql(where_clause: &str) -> String {

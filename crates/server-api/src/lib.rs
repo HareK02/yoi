@@ -190,6 +190,8 @@ impl_openapi_schema!(
     WorkingDirectoryListResponse,
     WorkingDirectoryDetailResponse,
     WorkingDirectoryCreateResponse,
+    CurrentWorkerWorkdirCatalogQuery,
+    CurrentWorkerWorkdirCatalogResponse,
     CurrentWorkerWorkdirAttachRequest,
     CurrentWorkerWorkdirAttachmentResponse,
     CurrentWorkerWorkdirAttachmentItem,
@@ -2553,6 +2555,19 @@ pub trait ServerApi {
         #[path] working_directory_id: String,
         #[body] request: WorkingDirectoryRemovalRequest,
     ) -> Result<WorkingDirectoryRemovalResponse, RepositoryApiError>;
+    #[get(
+        "/api/w/{workspace_id}/workers/self/workdir-catalog",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        openapi = false,
+    )]
+    async fn current_worker_workdir_catalog(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[query] query: CurrentWorkerWorkdirCatalogQuery,
+    ) -> Result<CurrentWorkerWorkdirCatalogResponse, RepositoryApiError>;
     #[get(
         "/api/w/{workspace_id}/workers/self/workdir-attachments",
         status = 200,
@@ -6772,6 +6787,28 @@ pub struct CurrentWorkerWorkdirAttachRequest {
     pub working_directory_id: String,
 }
 
+/// Stable Workdir-ID keyset paging over the authoritative inventory, not a Runtime snapshot.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentWorkerWorkdirCatalogQuery {
+    /// Defaults to 50; valid range is 1..=100 scanned registry records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Exclusive stable Workdir ID. An empty policy-filtered page can still have a next cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentWorkerWorkdirCatalogResponse {
+    pub workspace_id: String,
+    pub items: Vec<WorkingDirectorySummary>,
+    pub next_cursor: Option<String>,
+    /// Opaque digest of the complete authoritative inventory and its occupancy.
+    pub revision: String,
+}
+
 /// Bounded, alias-ordered paging over the current Worker's active attachments.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -6801,6 +6838,8 @@ pub struct CurrentWorkerWorkdirAttachmentListResponse {
     pub workspace_id: String,
     pub items: Vec<CurrentWorkerWorkdirAttachmentItem>,
     pub next_offset: Option<u32>,
+    /// Opaque digest of this caller's complete active connection set, independent of query paging/filtering.
+    pub revision: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -12042,6 +12081,7 @@ mod tests {
         );
         let list = CurrentWorkerWorkdirAttachmentListResponse {
             workspace_id: "workspace".to_string(),
+            revision: "opaque-revision".to_string(),
             next_offset: Some(1),
             items: vec![CurrentWorkerWorkdirAttachmentItem {
                 alias: "checkout".to_string(),
@@ -12056,6 +12096,62 @@ mod tests {
             )
             .unwrap(),
             list
+        );
+    }
+
+    #[test]
+    fn current_worker_workdir_catalog_contract_is_bounded_and_revision_is_required() {
+        let query = CurrentWorkerWorkdirCatalogQuery {
+            limit: Some(100),
+            cursor: Some("stable-id".to_string()),
+        };
+        assert_eq!(
+            serde_json::from_value::<CurrentWorkerWorkdirCatalogQuery>(
+                serde_json::to_value(&query).unwrap()
+            )
+            .unwrap(),
+            query
+        );
+        assert_eq!(
+            serde_json::to_value(CurrentWorkerWorkdirCatalogQuery::default()).unwrap(),
+            serde_json::json!({})
+        );
+        assert!(
+            serde_json::from_value::<CurrentWorkerWorkdirCatalogQuery>(
+                serde_json::json!({"offset": 0})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CurrentWorkerWorkdirCatalogQuery>(
+                serde_json::json!({"limit": -1})
+            )
+            .is_err()
+        );
+        let response = CurrentWorkerWorkdirCatalogResponse {
+            workspace_id: "workspace".to_string(),
+            items: Vec::new(),
+            next_cursor: Some("scanned-legacy-row".to_string()),
+            revision: "opaque".to_string(),
+        };
+        assert_eq!(
+            serde_json::from_value::<CurrentWorkerWorkdirCatalogResponse>(
+                serde_json::to_value(&response).unwrap()
+            )
+            .unwrap(),
+            response
+        );
+        assert!(
+            serde_json::from_value::<CurrentWorkerWorkdirCatalogResponse>(
+                serde_json::json!({"workspace_id": "workspace", "items": [], "next_cursor": null})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CurrentWorkerWorkdirAttachmentListResponse>(
+                serde_json::json!({"workspace_id": "workspace", "items": [], "next_offset": null})
+            )
+            .is_err()
         );
     }
 
@@ -13024,6 +13120,7 @@ mod openapi_artifact_tests {
         // identity, or a one-use Reviewer capability. They remain generated Rust client/Axum
         // operations, but must not appear as unauthenticated operations in the public OpenAPI.
         const SIGNED_INTERNAL: &[&str] = &[
+            "current_worker_workdir_catalog",
             "current_worker_workdir_attachment_list",
             "current_worker_workdir_attach",
             "current_worker_workdir_detach",

@@ -5885,6 +5885,9 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::runtime_workdir_cleanup(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::current_worker_workdir_catalog(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::current_worker_workdir_attachment_list(service.clone()))
         .merge(server_api::server_api_axum::current_worker_workdir_attach(
             service.clone(),
@@ -10415,6 +10418,28 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn current_worker_workdir_catalog(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        query: server_api::CurrentWorkerWorkdirCatalogQuery,
+    ) -> std::result::Result<
+        server_api::CurrentWorkerWorkdirCatalogResponse,
+        server_api::RepositoryApiError,
+    > {
+        let api = self.workspace_api()?;
+        validate_workspace_scope(api, &workspace_id)
+            .map_err(ApiError::into_repository_api_error)?;
+        current_worker_identity(
+            api,
+            &workspace_id,
+            &current_worker_contract_headers(&context)?,
+        )
+        .map_err(ApiError::from)
+        .map_err(ApiError::into_repository_api_error)?;
+        list_current_worker_workdir_catalog(api, query).map_err(ApiError::into_repository_api_error)
     }
 
     async fn current_worker_workdir_attachment_list(
@@ -16486,6 +16511,45 @@ async fn scoped_attach_current_worker_workdir(
     }))
 }
 
+fn list_current_worker_workdir_catalog(
+    api: &WorkspaceApi,
+    query: server_api::CurrentWorkerWorkdirCatalogQuery,
+) -> ApiResult<server_api::CurrentWorkerWorkdirCatalogResponse> {
+    // No Runtime inventory refresh: both projection inputs and complete digest are authoritative
+    // Backend records captured by the store in one read transaction.
+    let page = api.store.workdir_catalog_page(
+        &api.config.workspace_id,
+        query.limit.unwrap_or(50),
+        query.cursor.as_deref(),
+    )?;
+    let items = page
+        .entries
+        .into_iter()
+        .filter_map(|entry| {
+            if matches!(
+                entry.record.source,
+                WorkdirRegistrySource::ExternalGrant { .. }
+            ) && entry.external_grant_permissions.is_none()
+            {
+                return None;
+            }
+            let mut summary = workdir_summary_from_record(
+                &entry.record,
+                entry.repository_key.as_deref(),
+                entry.external_grant_permissions,
+            );
+            summary.occupied_by = entry.occupied_by;
+            Some(server_api::WorkingDirectorySummary::from(summary))
+        })
+        .collect();
+    Ok(server_api::CurrentWorkerWorkdirCatalogResponse {
+        workspace_id: api.config.workspace_id.clone(),
+        items,
+        next_cursor: page.next_cursor,
+        revision: page.revision,
+    })
+}
+
 fn list_current_worker_workdir_attachments(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
@@ -16498,7 +16562,7 @@ fn list_current_worker_workdir_attachments(
             Error::InvalidInput("attachment page limit must be 1..=100".to_string()).into(),
         );
     }
-    let mut links = api.store.list_worker_workdir_links_page(
+    let (mut links, revision) = api.store.list_worker_workdir_links_page_with_revision(
         &api.config.workspace_id,
         worker,
         limit + 1,
@@ -16526,6 +16590,7 @@ fn list_current_worker_workdir_attachments(
             })
             .collect(),
         next_offset,
+        revision,
     })
 }
 
@@ -50673,6 +50738,260 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn current_worker_workdir_catalog_enumerates_complete_stable_inventory() {
+        let mut fixture = manual_coder_assignment_fixture().await;
+        let identity =
+            worker_runtime::auth::RuntimeIdentityMaterial::generate(&fixture.worker.runtime_id)
+                .unwrap();
+        configure_runtime_request_auth(&mut fixture.api, &identity, &fixture.worker.runtime_id);
+        let api = &fixture.api;
+        let template = api
+            .store
+            .list_workdir_registry(TEST_WORKSPACE_ID, 10)
+            .unwrap()
+            .remove(0);
+        let mut expected = api
+            .store
+            .list_workdir_registry(TEST_WORKSPACE_ID, 10)
+            .unwrap()
+            .into_iter()
+            .map(|record| record.workdir_id)
+            .collect::<HashSet<_>>();
+        let mut oldest = None;
+        for index in 0..233 {
+            let legacy = index < 3;
+            let mut record = WorkdirRegistryRecord {
+                workdir_id: format!("000-catalog-{index:03}"),
+                display_name: Some(format!("Catalog {index}")),
+                // Timestamp order intentionally differs from stable ID order.
+                updated_at: format!("{index:05}"),
+                ..template.clone()
+            };
+            if legacy || index % 2 == 1 {
+                let grant = ExternalWorkdirGrantRecord {
+                    grant_id: format!("catalog-grant-{index}"),
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    workdir_id: record.workdir_id.clone(),
+                    provider_instance_id: "private-provider-instance".to_string(),
+                    display_name: record.display_name.clone().unwrap(),
+                    permissions: if legacy { "command_only" } else { "read_write" }.to_string(),
+                    created_by: "test-account".to_string(),
+                    created_at: "1".to_string(),
+                    expires_at: None,
+                    generation: 1,
+                    status: "online".to_string(),
+                    updated_at: "1".to_string(),
+                };
+                record.source = WorkdirRegistrySource::ExternalGrant {
+                    grant_id: grant.grant_id.clone(),
+                };
+                api.store
+                    .create_external_workdir_grant(&grant, &record)
+                    .unwrap();
+            } else {
+                api.store.upsert_workdir_registry(&record).unwrap();
+            }
+            if !legacy {
+                expected.insert(record.workdir_id.clone());
+                if oldest.is_none() {
+                    oldest = Some(record.clone());
+                }
+            }
+        }
+        let base = format!("/api/w/{TEST_WORKSPACE_ID}/workers/self/workdir-catalog");
+        let request = |path: &str| {
+            runtime_source_request(
+                &identity,
+                Some(&fixture.worker.worker_id),
+                "GET",
+                path,
+                Vec::new(),
+            )
+        };
+        let response = build_router(api.clone())
+            .oneshot(request(&format!("{base}?limit=3")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let empty: server_api::CurrentWorkerWorkdirCatalogResponse =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(empty.items.is_empty());
+        assert_eq!(empty.next_cursor.as_deref(), Some("000-catalog-002"));
+        let mut cursor = None;
+        let mut seen = Vec::new();
+        let mut pages = 0;
+        loop {
+            let path = match &cursor {
+                Some(cursor) => format!("{base}?limit=37&cursor={cursor}"),
+                None => format!("{base}?limit=37"),
+            };
+            let response = build_router(api.clone())
+                .oneshot(request(&path))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains("private-provider-instance"));
+            let page: server_api::CurrentWorkerWorkdirCatalogResponse =
+                serde_json::from_slice(&bytes).unwrap();
+            assert!(page.items.len() <= 37);
+            assert_eq!(page.revision, empty.revision);
+            seen.extend(page.items.into_iter().map(|item| item.working_directory_id));
+            pages += 1;
+            if let Some(next) = page.next_cursor {
+                assert!(cursor.as_ref().is_none_or(|previous| previous < &next));
+                cursor = Some(next);
+            } else {
+                break;
+            }
+            assert!(pages < 20);
+        }
+        assert!(seen.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(seen.into_iter().collect::<HashSet<_>>(), expected);
+        assert!(pages > 6);
+        let oldest = oldest.unwrap();
+        // Existing direct lookup agrees for the oldest visible External Workdir.
+        let Json(detail) = scoped_working_directory_detail(
+            State(api.clone()),
+            AxumPath(ScopedWorkingDirectoryPath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                working_directory_id: oldest.workdir_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        let oldest_page = list_current_worker_workdir_catalog(
+            api,
+            server_api::CurrentWorkerWorkdirCatalogQuery {
+                limit: Some(1),
+                cursor: Some("000-catalog-002".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(oldest_page.items, vec![detail.item]);
+        assert!(
+            !api.store
+                .list_workdir_registry(TEST_WORKSPACE_ID, 200)
+                .unwrap()
+                .iter()
+                .any(|record| record.workdir_id == oldest.workdir_id)
+        );
+        for query in ["limit=0", "limit=101", "limit=-1", "cursor=", "cursor=%0A"] {
+            assert_eq!(
+                build_router(api.clone())
+                    .oneshot(request(&format!("{base}?{query}")))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let default = list_current_worker_workdir_catalog(api, Default::default()).unwrap();
+        assert_eq!(default.items.len(), 47);
+        let before = list_current_worker_workdir_catalog(
+            api,
+            server_api::CurrentWorkerWorkdirCatalogQuery {
+                limit: Some(3),
+                cursor: None,
+            },
+        )
+        .unwrap();
+        let mut last = api
+            .store
+            .get_workdir_registry(TEST_WORKSPACE_ID, "000-catalog-232")
+            .unwrap()
+            .unwrap();
+        last.display_name = Some("Updated outside the first page".to_string());
+        api.store.upsert_workdir_registry(&last).unwrap();
+        let changed = list_current_worker_workdir_catalog(
+            api,
+            server_api::CurrentWorkerWorkdirCatalogQuery {
+                limit: Some(3),
+                cursor: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(before.items, changed.items);
+        assert_ne!(before.revision, changed.revision);
+        let template_link = api
+            .store
+            .list_worker_workdir_links(TEST_WORKSPACE_ID, &fixture.worker)
+            .unwrap()
+            .remove(0);
+        let link = api
+            .store
+            .attach_worker_workdir(&WorkerWorkdirLinkRecord {
+                workdir_id: last.workdir_id.clone(),
+                alias: "catalog-occupancy".to_string(),
+                ..template_link
+            })
+            .unwrap();
+        let occupied = list_current_worker_workdir_catalog(
+            api,
+            server_api::CurrentWorkerWorkdirCatalogQuery {
+                limit: Some(3),
+                cursor: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(changed.items, occupied.items);
+        assert_ne!(changed.revision, occupied.revision);
+        api.store
+            .detach_worker_workdir_connection(
+                TEST_WORKSPACE_ID,
+                &fixture.worker,
+                &link.alias,
+                &link.connection_id,
+                "detach",
+            )
+            .unwrap();
+        assert_eq!(
+            changed.revision,
+            list_current_worker_workdir_catalog(api, Default::default())
+                .unwrap()
+                .revision
+        );
+        let restarted = SqliteWorkspaceStore::open(&api.config.database_path).unwrap();
+        assert_eq!(
+            changed.revision,
+            restarted
+                .workdir_catalog_page(TEST_WORKSPACE_ID, 100, None)
+                .unwrap()
+                .revision
+        );
+        let no_worker = runtime_source_request(&identity, None, "GET", &base, Vec::new());
+        assert_eq!(
+            build_router(api.clone())
+                .oneshot(no_worker)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let mut forged = request(&base);
+        forged
+            .headers_mut()
+            .insert("x-yoi-worker-id", "foreign-worker".parse().unwrap());
+        assert_eq!(
+            build_router(api.clone())
+                .oneshot(forged)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            build_router(api.clone())
+                .oneshot(Request::builder().uri(&base).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
     async fn current_worker_workdir_routes_require_a_live_runtime_worker_identity() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
@@ -50995,6 +51314,10 @@ mod tests {
         assert_eq!(page.items[0].working_directory_id, target.workdir_id);
         assert_eq!(page.items[0].connection_id, target.connection_id);
         assert_eq!(page.next_offset, None);
+        assert_eq!(
+            page.revision, first.revision,
+            "lookup does not narrow the collection revision"
+        );
 
         let foreign_worker_id = seed_cleanup_worker(api, 902, "normal");
         seed_cleanup_workdir(api, "foreign-lookup-workdir", "present", "clean");
@@ -51023,6 +51346,7 @@ mod tests {
                     .unwrap();
             assert!(page.items.is_empty());
             assert_eq!(page.next_offset, None);
+            assert_eq!(page.revision, first.revision);
         }
         let mut forged = request(&lookup_path);
         forged
@@ -51049,6 +51373,13 @@ mod tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
 
+        let unchanged =
+            list_current_worker_workdir_attachments(api, &fixture.worker, Default::default())
+                .unwrap();
+        assert_eq!(
+            unchanged, first,
+            "another caller's connection cannot change this revision"
+        );
         api.store
             .detach_worker_workdir_connection(
                 TEST_WORKSPACE_ID,
@@ -51060,6 +51391,139 @@ mod tests {
             .unwrap();
         let replacement = api.store.attach_worker_workdir(&target).unwrap();
         assert_ne!(replacement.connection_id, target.connection_id);
+        let reattached =
+            list_current_worker_workdir_attachments(api, &fixture.worker, Default::default())
+                .unwrap();
+        assert_eq!(reattached.items, first.items);
+        assert_eq!(reattached.next_offset, first.next_offset);
+        assert_ne!(
+            reattached.revision, first.revision,
+            "same alias and Workdir, new lifetime beyond page zero"
+        );
+        let downgraded = api
+            .store
+            .attach_worker_workdir(&WorkerWorkdirLinkRecord {
+                capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+                ..replacement.clone()
+            })
+            .unwrap();
+        assert_eq!(downgraded.connection_id, replacement.connection_id);
+        let capability_changed =
+            list_current_worker_workdir_attachments(api, &fixture.worker, Default::default())
+                .unwrap();
+        assert_eq!(capability_changed.items, reattached.items);
+        assert_ne!(capability_changed.revision, reattached.revision);
+        let restarted = SqliteWorkspaceStore::open(&api.config.database_path).unwrap();
+        let (restarted_page, restarted_revision) = restarted
+            .list_worker_workdir_links_page_with_revision(
+                TEST_WORKSPACE_ID,
+                &fixture.worker,
+                51,
+                0,
+                None,
+            )
+            .unwrap();
+        assert_eq!(restarted_page.len(), 51);
+        assert_eq!(restarted_revision, capability_changed.revision);
+        // A SQLite backup restores the same authoritative content/revision, without a sync store.
+        let source = rusqlite::Connection::open(&api.config.database_path).unwrap();
+        let mut snapshot = rusqlite::Connection::open_in_memory().unwrap();
+        rusqlite::backup::Backup::new(&source, &mut snapshot)
+            .unwrap()
+            .run_to_completion(128, std::time::Duration::from_millis(1), None)
+            .unwrap();
+        let restored = SqliteWorkspaceStore::from_connection(snapshot).unwrap();
+        assert_eq!(
+            restored
+                .list_worker_workdir_links_page_with_revision(
+                    TEST_WORKSPACE_ID,
+                    &fixture.worker,
+                    51,
+                    0,
+                    None
+                )
+                .unwrap(),
+            (restarted_page, restarted_revision)
+        );
+        // Independent SQLite connections race a last-row capability update against exact lookup.
+        // The page and complete revision must always describe the same snapshot, not two reads.
+        let mut read_write_links = api
+            .store
+            .list_worker_workdir_links(TEST_WORKSPACE_ID, &fixture.worker)
+            .unwrap();
+        read_write_links
+            .iter_mut()
+            .find(|link| link.connection_id == replacement.connection_id)
+            .unwrap()
+            .capabilities = workdir::WorkdirSessionCapabilities::READ_WRITE;
+        let read_only_links = api
+            .store
+            .list_worker_workdir_links(TEST_WORKSPACE_ID, &fixture.worker)
+            .unwrap();
+        restarted
+            .replace_worker_workdir_link_capabilities(
+                TEST_WORKSPACE_ID,
+                &fixture.worker,
+                &read_write_links,
+            )
+            .unwrap();
+        let (_, read_write_revision) = restarted
+            .list_worker_workdir_links_page_with_revision(
+                TEST_WORKSPACE_ID,
+                &fixture.worker,
+                1,
+                0,
+                Some(&replacement.connection_id),
+            )
+            .unwrap();
+        assert_ne!(read_write_revision, capability_changed.revision);
+        let reader = SqliteWorkspaceStore::open(&api.config.database_path).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        std::thread::scope(|scope| {
+            let worker = &fixture.worker;
+            let writer_barrier = barrier.clone();
+            scope.spawn(move || {
+                writer_barrier.wait();
+                for index in 0..64 {
+                    restarted
+                        .replace_worker_workdir_link_capabilities(
+                            TEST_WORKSPACE_ID,
+                            worker,
+                            if index % 2 == 0 {
+                                &read_write_links
+                            } else {
+                                &read_only_links
+                            },
+                        )
+                        .unwrap();
+                }
+            });
+            barrier.wait();
+            for _ in 0..100 {
+                let (page, revision) = reader
+                    .list_worker_workdir_links_page_with_revision(
+                        TEST_WORKSPACE_ID,
+                        worker,
+                        1,
+                        0,
+                        Some(&replacement.connection_id),
+                    )
+                    .unwrap();
+                assert_eq!(page.len(), 1);
+                if revision == read_write_revision {
+                    assert_eq!(
+                        page[0].capabilities,
+                        workdir::WorkdirSessionCapabilities::READ_WRITE
+                    );
+                } else {
+                    assert_eq!(revision, capability_changed.revision);
+                    assert_eq!(
+                        page[0].capabilities,
+                        workdir::WorkdirSessionCapabilities::READ_ONLY
+                    );
+                }
+            }
+        });
         let response = build_router(api.clone())
             .oneshot(request(&lookup_path))
             .await
