@@ -1355,6 +1355,7 @@ mod tests {
             "companion",
             "coder",
             "reviewer",
+            "backend-job",
             "memory-consolidation",
             "subjektiv-memory-consolidation",
         ] {
@@ -1366,6 +1367,15 @@ mod tests {
                     .map(|compaction| compaction.prune_enabled),
                 Some(false),
                 "{name} must keep pruning disabled for the experiment"
+            );
+            assert_eq!(
+                role.manifest
+                    .compaction
+                    .as_ref()
+                    .and_then(|compaction| compaction.model.as_ref())
+                    .and_then(|model| model.ref_.as_deref()),
+                Some("codex-oauth/gpt-6-luna"),
+                "{name} must use Luna for compaction"
             );
         }
 
@@ -1379,11 +1389,18 @@ mod tests {
             Some(ReasoningControl::Effort(ReasoningEffort::High))
         );
 
-        for name in ["coder", "reviewer"] {
+        for name in [
+            "default",
+            "standalone",
+            "intake",
+            "orchestrator",
+            "coder",
+            "reviewer",
+        ] {
             let role = resolve(name);
             assert_eq!(
                 role.manifest.model.ref_.as_deref(),
-                Some("codex-oauth/gpt-5.6-sol")
+                Some("codex-oauth/gpt-6.1-sol")
             );
             assert_eq!(
                 role.manifest.engine.reasoning,
@@ -1395,7 +1412,7 @@ mod tests {
                     .model
                     .as_ref()
                     .and_then(|model| model.ref_.as_deref()),
-                Some("codex-oauth/gpt-5.6-luna")
+                Some("codex-oauth/gpt-6-luna")
             );
             assert_eq!(
                 extraction.reasoning,
@@ -1403,16 +1420,34 @@ mod tests {
             );
         }
 
-        for name in ["memory-consolidation", "subjektiv-memory-consolidation"] {
+        for name in [
+            "backend-job",
+            "memory-consolidation",
+            "subjektiv-memory-consolidation",
+        ] {
             let consolidation = resolve(name);
             assert_eq!(
                 consolidation.manifest.model.ref_.as_deref(),
-                Some("codex-oauth/gpt-5.6-luna")
+                Some("codex-oauth/gpt-6-luna")
             );
             assert_eq!(
                 consolidation.manifest.engine.reasoning,
                 Some(ReasoningControl::Effort(ReasoningEffort::Medium))
             );
+            if name == "memory-consolidation" {
+                assert_eq!(
+                    consolidation
+                        .manifest
+                        .feature
+                        .memory
+                        .profile
+                        .extraction
+                        .model
+                        .as_ref()
+                        .and_then(|model| model.ref_.as_deref()),
+                    Some("codex-oauth/gpt-6-luna")
+                );
+            }
         }
     }
 
@@ -1562,7 +1597,7 @@ mod tests {
         ));
         assert_eq!(
             resolved.manifest.model.ref_.as_deref(),
-            Some("codex-oauth/gpt-5.6-sol")
+            Some("codex-oauth/gpt-6.1-sol")
         );
         assert!(resolved.manifest.feature.task.enabled);
         assert!(resolved.manifest.feature.web.enabled);

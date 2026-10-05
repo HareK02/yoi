@@ -2,7 +2,7 @@ import "./base.dcdl" // {
     slug = "coder";
     description = "Ticket implementation coder profile.";
     scope = "workspace_write";
-    model = { ref = "codex-oauth/gpt-5.6-sol"; };
+    model = { ref = "codex-oauth/gpt-6.1-sol"; };
     engine = {
         instruction = "role.coder";
         reasoning = "high";

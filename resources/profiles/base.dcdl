@@ -3,7 +3,7 @@ description = "Shared base configuration for Yoi Worker profiles.";
 scope = "workspace_write";
 
 model = {
-    ref = "codex-oauth/gpt-5.6-sol";
+    ref = "codex-oauth/gpt-6.1-sol";
 };
 
 session = {
@@ -31,7 +31,7 @@ feature = {
         enabled = true;
         extraction = {
             enabled = true;
-            model = { ref = "codex-oauth/gpt-5.6-luna"; };
+            model = { ref = "codex-oauth/gpt-6-luna"; };
             reasoning = "medium";
             threshold = 50000;
         };

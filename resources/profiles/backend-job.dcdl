@@ -2,7 +2,7 @@ import "./base.dcdl" // {
     slug = "backend-job";
     description = "Backend-owned bounded Job Worker profile.";
     scope = "workspace_read";
-    model = { ref = "codex-oauth/gpt-5.6-luna"; };
+    model = { ref = "codex-oauth/gpt-6-luna"; };
     engine = {
         instruction = "internal.backend_job_system";
         reasoning = "medium";

@@ -337,7 +337,7 @@ mod tests {
             .expect("evaluate built-in standalone")
             .expect("standalone exists");
         assert_eq!(value["slug"], "standalone");
-        assert_eq!(value["model"]["ref"], "codex-oauth/gpt-5.6-sol");
+        assert_eq!(value["model"]["ref"], "codex-oauth/gpt-6.1-sol");
         assert_eq!(value["scope"]["intent"], "workspace_write");
         assert_eq!(value["scope"]["symlink_policy"], "logical");
         assert_eq!(value["delegation_scope"]["intent"], "workspace_write");
