@@ -502,7 +502,9 @@ Deno.test("workspace Memory surfaces use read-only scoped memory APIs", async ()
     subjectIndexLoad.includes('"/subjektiv/subjects"') &&
       subjectIndexLoad.includes("parseSubjektivSubjectListResponse") &&
       subjectIndexPage.includes(">Subjects</h1>") &&
-      subjectIndexPage.includes("subject.store_revision") &&
+      subjectIndexPage.includes("Worker connection") &&
+      subjectIndexPage.includes("subject.current_worker") &&
+      !subjectIndexPage.includes("subject.store_revision") &&
       subjectIndexPage.includes('data-memory-view="subjects"'),
     "Memory product entry should list explicit typed subjects",
   );
@@ -510,10 +512,13 @@ Deno.test("workspace Memory surfaces use read-only scoped memory APIs", async ()
     subjectPageLoad.includes("`${subjectPath}/surface`") &&
       subjectPageLoad.includes("`${subjectPath}/memories`") &&
       subjectPage.includes("DocumentMarkdown from") &&
-      subjectPage.includes("Resident surface") &&
+      subjectPage.includes("Resident context") &&
+      subjectPage.includes("Subject store revision") &&
       subjectPage.includes("Current Memories") &&
       subjectPage.includes("surface?.availability === 'ready'") &&
+      subjectPage.includes("surface?.availability === 'ungenerated'") &&
       subjectPage.includes("surface?.availability === 'stale'") &&
+      subjectPage.includes("surface?.availability === 'failed'") &&
       subjectPage.includes("data-surface-ready-empty") &&
       !subjectPage.includes("overflow-y"),
     "Subject page should combine strict resident-surface and current-Memory reads without a nested vertical scroller",
