@@ -374,6 +374,209 @@ test("edits and clears user-managed behavior with CAS while distinguishing save 
   );
 });
 
+function subjectPageData(record = subject(), workspaceId = "workspace-1") {
+  return {
+    workspaceId,
+    subjectId: record.id,
+    subject: result(record),
+    surface: result({
+      subject_id: record.id,
+      availability: "ungenerated" as const,
+    }),
+    memories: result({ items: [], has_more: false }),
+  };
+}
+
+test.each([
+  ["subject-2", "workspace-1"],
+  ["subject-1", "workspace-2"],
+])(
+  "resets reused Subject editor for %s in %s and saves only its own behavior",
+  async (id, workspaceId) => {
+    const nextSubject = { ...subject(), id, behavior_md: "Only B behavior." };
+    const fetchMock = vi.fn(async (_path: string, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body));
+      return Response.json({
+        ...nextSubject,
+        behavior_md: request.behavior_md,
+        behavior_revision: request.expected_behavior_revision + 1,
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const view = render(SubjectPage, { data: subjectPageData() } as never);
+    await fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    await fireEvent.input(
+      screen.getByRole("textbox", { name: "Subject behavior" }),
+      {
+        target: { value: "Unsaved A draft" },
+      },
+    );
+
+    await view.rerender(
+      { data: subjectPageData(nextSubject, workspaceId) } as never,
+    );
+    expect(screen.queryByRole("textbox", { name: "Subject behavior" }))
+      .toBeNull();
+    expect(
+      screen.getByRole("article", { name: "User-managed Subject behavior" })
+        .textContent,
+    )
+      .toContain("Only B behavior.");
+    await fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    expect(
+      (screen.getByRole("textbox", {
+        name: "Subject behavior",
+      }) as HTMLTextAreaElement).value,
+    )
+      .toBe("Only B behavior.");
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Save behavior" }),
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const [path, init] = fetchMock.mock.calls[0] as unknown as [
+      string,
+      RequestInit,
+    ];
+    expect(path).toBe(
+      `/api/w/${workspaceId}/subjektiv/subjects/${id}/behavior`,
+    );
+    expect(JSON.parse(String(init.body))).toEqual({
+      expected_behavior_revision: 2,
+      behavior_md: "Only B behavior.",
+    });
+    await waitFor(() =>
+      expect(screen.getByText(/storage confirmed at revision 3/)).not.toBeNull()
+    );
+  },
+);
+
+test.each(["success", "failure"])(
+  "fences late %s from a previous Subject without clearing the new save state",
+  async (outcome) => {
+    const pending: Array<(response: Response) => void> = [];
+    const fetchMock = vi.fn(() =>
+      new Promise<Response>((resolve) => pending.push(resolve))
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const view = render(SubjectPage, { data: subjectPageData() } as never);
+    await fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Save behavior" }),
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    const nextSubject = {
+      ...subject(),
+      id: "subject-2",
+      behavior_md: "Only B behavior.",
+    };
+    await view.rerender({ data: subjectPageData(nextSubject) } as never);
+    await fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    await fireEvent.input(
+      screen.getByRole("textbox", { name: "Subject behavior" }),
+      {
+        target: { value: "Updated B behavior." },
+      },
+    );
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Save behavior" }),
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    pending[0](
+      outcome === "success"
+        ? Response.json({
+          ...subject(),
+          behavior_md: "Late A response",
+          behavior_revision: 3,
+        })
+        : Response.json({
+          error: "Forbidden",
+          message: "A denied",
+          diagnostics: [],
+        }, { status: 403 }),
+    );
+    // Drain the previous response through its success/catch/finally branches.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(
+      screen.getByRole("button", { name: "Saving…" }).hasAttribute("disabled"),
+    ).toBe(true);
+    expect(
+      (screen.getByRole("textbox", {
+        name: "Subject behavior",
+      }) as HTMLTextAreaElement).value,
+    )
+      .toBe("Updated B behavior.");
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByText(/storage confirmed/)).toBeNull();
+    pending[1](
+      Response.json({
+        ...nextSubject,
+        behavior_md: "Updated B behavior.",
+        behavior_revision: 3,
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.getByText(/storage confirmed at revision 3/)).not.toBeNull()
+    );
+    expect(
+      screen.getByRole("article", { name: "User-managed Subject behavior" })
+        .textContent,
+    )
+      .toContain("Updated B behavior.");
+  },
+);
+
+test("a refreshed loader snapshot fences old saves even after returning to the same Subject", async () => {
+  let resolveRequest!: (response: Response) => void;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(() =>
+      new Promise<Response>((resolve) => {
+        resolveRequest = resolve;
+      })
+    ),
+  );
+  const view = render(SubjectPage, { data: subjectPageData() } as never);
+  await fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+  await fireEvent.click(screen.getByRole("button", { name: "Save behavior" }));
+  await view.rerender(
+    { data: subjectPageData({ ...subject(), id: "subject-2" }) } as never,
+  );
+  const fresh = {
+    ...subject(),
+    behavior_md: "Fresh A loader",
+    behavior_revision: 4,
+  };
+  await view.rerender({ data: subjectPageData(fresh) } as never);
+  resolveRequest(
+    Response.json({
+      ...subject(),
+      behavior_md: "Stale A response",
+      behavior_revision: 3,
+    }),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(
+    screen.getByRole("article", { name: "User-managed Subject behavior" })
+      .textContent,
+  )
+    .toContain("Fresh A loader");
+  expect(screen.queryByText(/storage confirmed/)).toBeNull();
+
+  await view.rerender(
+    {
+      data: {
+        ...subjectPageData(),
+        subject: result(null, "Subject unavailable"),
+      },
+    } as never,
+  );
+  expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+  expect(
+    screen.queryByRole("article", { name: "User-managed Subject behavior" }),
+  ).toBeNull();
+});
+
 test("distinguishes ready-empty, stale, failed, unavailable, and request error surfaces", async () => {
   const base = {
     workspaceId: "workspace-1",

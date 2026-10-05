@@ -18,27 +18,57 @@
   let behaviorError = $state<string | null>(null);
   let behaviorSaveConfirmed = $state(false);
 
+  let routeGeneration = 0;
+  let subjectWorkspaceId = untrack(() => data.workspaceId);
+
+  // SvelteKit reuses this page across Subject and Workspace routes. A new
+  // loader snapshot owns a new editor and fences all previous mutations.
+  $effect(() => {
+    const workspaceId = data.workspaceId;
+    const subjectId = data.subjectId;
+    const loadedSubject = data.subject.data;
+    untrack(() => {
+      routeGeneration += 1;
+      subjectWorkspaceId = workspaceId;
+      subject = loadedSubject?.id === subjectId ? loadedSubject : null;
+      behaviorDraft = subject?.behavior_md ?? '';
+      editingBehavior = false;
+      behaviorSaving = false;
+      behaviorError = null;
+      behaviorSaveConfirmed = false;
+    });
+  });
+
   async function saveBehavior(): Promise<void> {
-    if (!subject || behaviorSaving) return;
+    if (!subject || behaviorSaving || subject.id !== data.subjectId || subjectWorkspaceId !== data.workspaceId) return;
+    const generation = routeGeneration;
+    const workspaceId = subjectWorkspaceId;
+    const subjectId = subject.id;
+    const request = {
+      expected_behavior_revision: subject.behavior_revision,
+      behavior_md: behaviorDraft,
+    };
+    const isCurrent = () => generation === routeGeneration &&
+      data.workspaceId === workspaceId && data.subjectId === subjectId;
     behaviorSaving = true;
     behaviorError = null;
     behaviorSaveConfirmed = false;
     try {
-      subject = await updateSubjektivSubjectBehavior(fetch, data.workspaceId, data.subjectId, {
-        expected_behavior_revision: subject.behavior_revision,
-        behavior_md: behaviorDraft,
-      });
-      behaviorDraft = subject.behavior_md;
+      const updated = await updateSubjektivSubjectBehavior(fetch, workspaceId, subjectId, request);
+      if (!isCurrent()) return;
+      subject = updated;
+      behaviorDraft = updated.behavior_md;
       editingBehavior = false;
       behaviorSaveConfirmed = true;
     } catch (error) {
+      if (!isCurrent()) return;
       behaviorError = error instanceof SubjektivSubjectCreateError
         ? (error.status === 401 || error.status === 403
           ? 'You do not have permission to edit this Subject.'
           : error.message)
         : 'The save outcome is unknown. Reload the Subject before retrying.';
     } finally {
-      behaviorSaving = false;
+      if (isCurrent()) behaviorSaving = false;
     }
   }
 
