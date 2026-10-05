@@ -292,6 +292,34 @@ test("renders a ready resident surface and committed Memory lifecycle states", a
     .toContain("cursor=memory-next");
 });
 
+test("candidate-only Subjects show no committed Memories, not an inferred candidate count", () => {
+  // The store regression candidate_decisions_reject_conflicts_and_roll_back_partial_writes
+  // stages a candidate without committing a Memory. Its public read projection is
+  // the same empty committed list as a new Subject; candidates are not a page input.
+  render(SubjectPage, {
+    data: {
+      workspaceId: "workspace-1",
+      subjectId: "subject-1",
+      cursor: null,
+      subject: result({ ...subject(), store_revision: 0 }),
+      surface: result({ subject_id: "subject-1", availability: "ungenerated" }),
+      memories: result({ limit: 100, items: [], has_more: false }),
+    },
+  } as never);
+
+  expect(screen.getByText("None", { exact: true })).not.toBeNull();
+  expect(screen.getByText("No committed Memories yet.")).not.toBeNull();
+  expect(screen.getByText("Not connected", { exact: true })).not.toBeNull();
+  expect(screen.getAllByText("Not generated", { exact: true })).toHaveLength(2);
+  expect(screen.queryByRole("article", { name: "Resident context" }))
+    .toBeNull();
+  expect(
+    screen.queryByText(
+      /candidate count|all Memories lost|automatically updating/i,
+    ),
+  ).toBeNull();
+});
+
 test("distinguishes ready-empty, stale, failed, unavailable, and request error surfaces", async () => {
   const base = {
     workspaceId: "workspace-1",
