@@ -23,7 +23,7 @@ function assertEquals<T>(actual: T, expected: T): void {
   }
 }
 
-Deno.test("completionTokenAt detects command and file sigils before the cursor", () => {
+Deno.test("completionTokenAt detects command, file, and Feature sigils before the cursor", () => {
   assertEquals(completionTokenAt("open @src/ma", "open @src/ma".length), {
     sigil: "@",
     kind: "file",
@@ -32,7 +32,13 @@ Deno.test("completionTokenAt detects command and file sigils before the cursor",
     prefix: "src/ma",
   });
   assertEquals(completionTokenAt(":comp", 5)?.kind, "command");
-  assertEquals(completionTokenAt("run /work", 9), null);
+  assertEquals(completionTokenAt("run /work", 9), {
+    sigil: "/",
+    kind: "feature",
+    start: 4,
+    end: 9,
+    prefix: "work",
+  });
   assertEquals(completionTokenAt("ask #plain", "ask #plain".length), null);
 });
 
@@ -91,4 +97,60 @@ Deno.test("localCommandCompletions filters colon commands", () => {
   assertEquals(localCommandCompletions("com").map((entry) => entry.value), [
     "compact",
   ]);
+});
+
+Deno.test("argument completions replace whole quoted values and preserve following arguments", () => {
+  const descriptor = { identity: "test/run", name: "run", aliases: [], display_name: "Run", description: "Test",
+    syntax: "parenthesized" as const, arguments: [{ name: "path", position: 0, required: true,
+      value_type: { kind: "worker_file" as const }, completion: { kind: "worker_file" as const } }] };
+  for (const value of ['/run("src/ma', '/run("src/ma", next=true)', '/run(path="src/ma", next=true)']) {
+    const cursor = value.indexOf("ma") + 1;
+    const token = completionTokenAt(value, cursor, [descriptor]);
+    assert(token, "argument token should exist");
+    assertEquals(token.prefix, "src/m");
+    assertEquals(applyCompletion(value, token, { value: '資料/a "b"/c' }).value,
+      value.startsWith('/run(path') ? '/run(path="資料/a \\"b\\"/c", next=true)' :
+      value.endsWith('true)') ? '/run("資料/a \\"b\\"/c", next=true)' : '/run("資料/a \\"b\\"/c"a');
+  }
+});
+
+Deno.test("incomplete or invalid quoted completion preserves mode and body after the cursor", () => {
+  const descriptor = { identity: "test/run", name: "run", aliases: [], display_name: "Run", description: "Test",
+    syntax: "parenthesized" as const, arguments: [{ name: "path", position: 0, required: true,
+      value_type: { kind: "worker_file" as const }, completion: { kind: "worker_file" as const } }] };
+  for (const value of ['/run(path="ab, mode=safe) following prose', '/run("ab, mode=safe) following prose', String.raw`/run(path="ab\q", mode=safe) following prose`]) {
+    const cursor = value.indexOf("ab") + 2;
+    const token = completionTokenAt(value, cursor, [descriptor], [{ from: 0, descriptor }]);
+    assert(token, "selected argument completion should exist");
+    assertEquals(token.end, cursor);
+    const result = applyCompletion(value, token, { value: "completed/資料" });
+    assertEquals(result.value.slice(result.cursor), value.slice(cursor));
+    assert(result.value.includes("mode=safe) following prose"), "other arguments and body must remain intact");
+  }
+});
+
+Deno.test("quoted call-looking data completes the selected outer value without erasing other arguments", () => {
+  const descriptor = { identity: "test/run", name: "run", aliases: [], display_name: "Run", description: "Test",
+    syntax: "parenthesized" as const, arguments: [{ name: "path", position: 0, required: true,
+      value_type: { kind: "worker_file" as const }, completion: { kind: "worker_file" as const } }] };
+  const value = '/run("a /run(pa", mode=safe) prose';
+  const token = completionTokenAt(value, value.lastIndexOf("pa") + 2, [descriptor], [{ from: 0, descriptor }]);
+  assert(token, "outer argument completion should exist");
+  assertEquals(token.context?.argument, "path");
+  assertEquals(token.prefix, "a /run(pa");
+  assertEquals(applyCompletion(value, token, { value: "replacement" }).value, '/run("replacement", mode=safe) prose');
+});
+
+Deno.test("argument name replacement preserves its value and directories drill inside quotes", () => {
+  const descriptor = { identity: "test/run", name: "run", aliases: [], display_name: "Run", description: "Test",
+    syntax: "parenthesized" as const, arguments: [{ name: "path", position: 0, required: true,
+      value_type: { kind: "worker_file" as const }, completion: { kind: "worker_file" as const } }] };
+  const named = '/run(path="original")';
+  const token = completionTokenAt(named, 7, [descriptor]);
+  assert(token, "named completion should exist");
+  assertEquals(applyCompletion(named, token, { value: "path=" }).value, named);
+  const directory = '/run("sr")';
+  const result = applyCompletion(directory, completionTokenAt(directory, 8, [descriptor])!, { value: "src", is_dir: true });
+  assertEquals(result.value, '/run("src/")');
+  assertEquals(completionTokenAt(result.value, result.cursor, [descriptor])?.prefix, "src/");
 });

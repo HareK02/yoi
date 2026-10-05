@@ -1,4 +1,5 @@
 pub mod identity;
+pub mod invocation;
 #[cfg(feature = "stream")]
 pub mod stream;
 pub mod subscription;
@@ -10,6 +11,14 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 pub use identity::{WorkerId, WorkerIdParseError};
+pub use invocation::{
+    FeatureInvocation, FeatureInvocationDescriptor, FeatureInvocationIdentity,
+    FeatureInvocationResult, FeatureInvocationStatus, FeatureInvocationSyntax,
+    InvocationArgumentDescriptor, InvocationArgumentType, InvocationArgumentValue,
+    InvocationClientAdapter, InvocationCompletion, InvocationValidationError, InvocationValue,
+    ParsedFeatureInvocation, parse_feature_invocation, quote_invocation_string,
+    validate_feature_invocation,
+};
 
 /// Allocate an opaque idempotency key for one client Submit request.
 pub fn new_submission_request_id() -> String {
@@ -60,6 +69,17 @@ impl Default for AuthenticatedInputSource {
     fn default() -> Self {
         Self::UntrustedWire
     }
+}
+
+// Tracked methods may carry serialized transport provenance, but wire values
+// never grant authority. Keep this field recognized under fail-closed decoding
+// while replacing it with UntrustedWire, including malformed/forged values.
+fn ignore_wire_input_source<'de, D>(deserializer: D) -> Result<AuthenticatedInputSource, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+    Ok(AuthenticatedInputSource::UntrustedWire)
 }
 
 impl AuthenticatedInputSource {
@@ -224,7 +244,12 @@ impl From<WorkerStatus> for WorkerStateSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-#[serde(tag = "method", content = "params", rename_all = "snake_case")]
+#[serde(
+    tag = "method",
+    content = "params",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum Method {
     /// Durably accept typed input for immediate activation or the session FIFO.
     /// Running or Paused Workers queue Submit for a later turn; use Notify for
@@ -244,7 +269,7 @@ pub enum Method {
     SubmitTracked {
         submission_request_id: String,
         input: Vec<Segment>,
-        #[serde(skip_deserializing, default)]
+        #[serde(default, deserialize_with = "ignore_wire_input_source")]
         source: AuthenticatedInputSource,
     },
     /// Agent-controlled input: accept only at an Idle controller boundary, never
@@ -254,7 +279,7 @@ pub enum Method {
     SubmitIfIdle {
         submission_request_id: String,
         input: Vec<Segment>,
-        #[serde(skip_deserializing, default)]
+        #[serde(default, deserialize_with = "ignore_wire_input_source")]
         source: AuthenticatedInputSource,
     },
     /// Human-readable text injected into the target Worker's LLM context as a
@@ -272,7 +297,7 @@ pub enum Method {
     NotifyTracked {
         notification_request_id: String,
         message: String,
-        #[serde(skip_deserializing, default)]
+        #[serde(default, deserialize_with = "ignore_wire_input_source")]
         source: AuthenticatedInputSource,
     },
     /// Typed lifecycle report from a child Worker to its direct parent.
@@ -336,6 +361,12 @@ pub enum Method {
     ListCompletions {
         kind: CompletionKind,
         prefix: String,
+        /// Client query generation. Echoed verbatim so identical-prefix ABA
+        /// responses cannot cross edits, target switches, or permission changes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<CompletionContext>,
     },
     /// List Workers visible to this Worker from durable Worker state and the spawned-child
     /// registry. This is not a host-wide Worker universe query.
@@ -609,6 +640,10 @@ pub enum Segment {
     /// `[Dir: <path>]` listings; the flattened user text keeps the literal
     /// `@<path>` placeholder either way.
     FileRef { path: String },
+    /// Explicitly selected, source-qualified Feature invocation. The host never
+    /// promotes free text to this variant and validates it against the installed
+    /// declaration before execution.
+    FeatureInvoke { invocation: FeatureInvocation },
     /// Source-qualified request for the host to start a Flow before committing
     /// this user input. Runtime resolves it through Workspace authority and
     /// replaces it with the entered state's instructions before Worker-side
@@ -676,6 +711,9 @@ impl Segment {
                 Segment::FileRef { path } => {
                     out.push('@');
                     out.push_str(path);
+                }
+                Segment::FeatureInvoke { invocation } => {
+                    out.push_str(&invocation.display_input());
                 }
                 Segment::Flow { selector } => {
                     out.push_str("[Flow: ");
@@ -1348,6 +1386,12 @@ pub enum Event {
     /// wired up.
     Completions {
         kind: CompletionKind,
+        #[serde(default)]
+        prefix: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<CompletionContext>,
         entries: Vec<CompletionEntry>,
     },
     /// Reply to `Method::ListRewindTargets`. Clients should only open a picker
@@ -1460,25 +1504,42 @@ pub enum AlertSource {
 
 /// Kind of completion requested by `Method::ListCompletions`.
 ///
-/// Mirrors the completion prefix sigil: `@` → `File`.
+/// `File` is the existing `@` path lane. `Feature` lists installed chat
+/// invocations. `FeatureArgument` resolves a declared argument using the
+/// source-qualified [`CompletionContext`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CompletionKind {
     File,
+    Feature,
+    FeatureArgument,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct CompletionContext {
+    pub invocation: FeatureInvocationIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument: Option<String>,
 }
 
 /// One completion candidate for a prefix query.
-///
-/// `value` is a path (file kind).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct CompletionEntry {
     pub value: String,
     #[serde(default)]
     pub is_dir: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation: Option<FeatureInvocationDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2115,6 +2176,27 @@ mod tests {
     }
 
     #[test]
+    fn notify_rejects_typed_intent_instead_of_silently_discarding_it() {
+        for method in ["notify", "notify_tracked"] {
+            for key in ["input", "segments", "invocation"] {
+                let mut params =
+                    serde_json::json!({"notification_request_id":"request", "message":"advisory"});
+                params[key] = serde_json::json!([{ "kind":"feature_invoke", "invocation": { "identity":"builtin:test/run" } }]);
+                assert!(
+                    serde_json::from_value::<Method>(
+                        serde_json::json!({"method":method,"params":params})
+                    )
+                    .is_err()
+                );
+            }
+        }
+        // Text is still text: no decoding or Host scan promotes it to an invoke.
+        assert!(
+            matches!(serde_json::from_value::<Method>(serde_json::json!({"method":"notify", "params":{"notification_request_id":"text","message":"/run()"}})).unwrap(), Method::Notify { message, .. } if message == "/run()")
+        );
+    }
+
+    #[test]
     fn segment_unknown_variant_decodes_as_unknown() {
         // A future client sends a segment kind this Worker has never heard of.
         // Forward compat requirement: deserialization must succeed and the
@@ -2352,6 +2434,8 @@ mod tests {
         let method = Method::ListCompletions {
             kind: CompletionKind::File,
             prefix: "src/".into(),
+            request_id: None,
+            context: None,
         };
         let json = serde_json::to_string(&method).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2361,7 +2445,7 @@ mod tests {
 
         let decoded: Method = serde_json::from_str(&json).unwrap();
         match decoded {
-            Method::ListCompletions { kind, prefix } => {
+            Method::ListCompletions { kind, prefix, .. } => {
                 assert_eq!(kind, CompletionKind::File);
                 assert_eq!(prefix, "src/");
             }
@@ -2370,12 +2454,51 @@ mod tests {
     }
 
     #[test]
+    fn completion_generation_round_trips_for_identical_query_correlation() {
+        let context = CompletionContext {
+            invocation: FeatureInvocationIdentity("builtin:test/run".into()),
+            argument: Some("mode".into()),
+        };
+        for request_id in ["query-1", "query-2"] {
+            let method = Method::ListCompletions {
+                kind: CompletionKind::FeatureArgument,
+                prefix: "s".into(),
+                request_id: Some(request_id.into()),
+                context: Some(context.clone()),
+            };
+            let decoded: Method =
+                serde_json::from_str(&serde_json::to_string(&method).unwrap()).unwrap();
+            assert!(
+                matches!(decoded, Method::ListCompletions { request_id: Some(id), context: Some(restored), .. } if id == request_id && restored == context)
+            );
+            let event = Event::Completions {
+                kind: CompletionKind::FeatureArgument,
+                prefix: "s".into(),
+                request_id: Some(request_id.into()),
+                context: Some(context.clone()),
+                entries: Vec::new(),
+            };
+            let decoded: Event =
+                serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+            assert!(
+                matches!(decoded, Event::Completions { request_id: Some(id), context: Some(restored), .. } if id == request_id && restored == context)
+            );
+        }
+    }
+
+    #[test]
     fn event_completions_format_and_default_is_dir() {
         let event = Event::Completions {
             kind: CompletionKind::File,
+            prefix: "src/".into(),
+            request_id: None,
+            context: None,
             entries: vec![CompletionEntry {
                 value: "src/main.rs".into(),
                 is_dir: false,
+                description: None,
+                usage: None,
+                invocation: None,
             }],
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -2389,7 +2512,7 @@ mod tests {
             r#"{"event":"completions","data":{"kind":"file","entries":[{"value":"main.rs"}]}}"#;
         let decoded: Event = serde_json::from_str(inbound).unwrap();
         match decoded {
-            Event::Completions { kind, entries } => {
+            Event::Completions { kind, entries, .. } => {
                 assert_eq!(kind, CompletionKind::File);
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].value, "main.rs");

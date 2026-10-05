@@ -3067,6 +3067,12 @@ where
         handle: &WorkerExecutionHandle,
         input: WorkerInput,
     ) -> WorkerExecutionResult {
+        if let Err(error) = crate::runtime::validate_worker_input(&input) {
+            return WorkerExecutionResult::rejected(
+                WorkerExecutionOperation::Input,
+                error.to_string(),
+            );
+        }
         let (worker, worker_state, _workspace_client) = match self.get_execution(handle) {
             Ok(execution) => execution,
             Err(mut result) => {
@@ -3367,6 +3373,7 @@ where
         handle: &WorkerExecutionHandle,
         kind: protocol::CompletionKind,
         prefix: &str,
+        context: Option<&protocol::CompletionContext>,
     ) -> Vec<protocol::CompletionEntry> {
         if handle.backend_id() != self.backend_id() {
             return Vec::new();
@@ -3377,7 +3384,9 @@ where
         workers
             .get(handle.worker_ref())
             .map(|execution| {
-                futures::executor::block_on(execution.handle.completion_entries(kind, prefix))
+                futures::executor::block_on(
+                    execution.handle.completion_entries(kind, prefix, context),
+                )
             })
             .unwrap_or_default()
     }

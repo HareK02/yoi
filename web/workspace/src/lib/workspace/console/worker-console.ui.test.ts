@@ -1017,7 +1017,7 @@ Deno.test("Worker Console paste chips preserve typed draft and target authority"
       composerInput.includes('key: "Backspace"') &&
       composerInput.includes('key: "Delete"') &&
       composerInput.includes(
-        "composerDeletionRange(selection, pastes, direction)",
+        "composerDeletionRange(selection, atoms, direction)",
       ) &&
       composerInput.includes("EditorState.readOnly.of(isDisabled)") &&
       composerInput.includes('key: "Mod-z"') &&
@@ -1572,8 +1572,8 @@ Deno.test("Composer owns TUI-style completion and replaces Compact/Rewind header
     "Completion navigation must precede input history",
   );
   assert(
-    page.includes("fileCompletions.receive(event.data.entries)") &&
-      page.includes("fileCompletions.close()"),
+    page.includes("fileCompletions.receive(event.data.entries, event.data.prefix, event.data.request_id)") &&
+      page.includes("rejectPendingCompletion(new Error(\"Worker completion connection closed.\"), `${target.workspaceId}:${target.runtimeId}:${target.workerId}`)"),
     "File completion lifecycle must be scoped to the transport",
   );
 });
@@ -1701,7 +1701,7 @@ Deno.test("Web Console uses Notify while running and exposes queued input cancel
       consolePage.includes("{#if workerRunning || workerPaused}") &&
       consolePage.includes('delivery === "queue" && request.kind !== "user"') &&
       consolePage.includes(
-        'method.method === "submit" && delivery === "submit"',
+        'event.event === "submission_accepted" && event.data.disposition === "started"',
       ),
     "busy Console must offer explicit Queue without changing paused state or queueing commands",
   );

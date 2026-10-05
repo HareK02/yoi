@@ -8233,7 +8233,7 @@ pub struct RuntimeWorkerInputRequest {
     pub kind: Option<String>,
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub segments: Option<Vec<serde_json::Value>>,
+    pub segments: Option<Vec<protocol::Segment>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -8268,9 +8268,11 @@ pub struct RuntimeWorkerLifecycleResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeWorkerCompletionsRequest {
-    pub kind: serde_json::Value,
+    pub kind: protocol::CompletionKind,
     #[serde(default)]
     pub prefix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<protocol::CompletionContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
@@ -8278,9 +8280,9 @@ pub struct RuntimeWorkerCompletionsRequest {
 pub struct RuntimeWorkerCompletionsResult {
     pub runtime_id: String,
     pub worker_id: String,
-    pub kind: serde_json::Value,
+    pub kind: protocol::CompletionKind,
     pub prefix: String,
-    pub entries: Vec<serde_json::Value>,
+    pub entries: Vec<protocol::CompletionEntry>,
     #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -12659,6 +12661,45 @@ mod tests {
             "provider_session_id": "session-private"
         });
         assert!(serde_json::from_value::<CompanionTranscriptItem>(private_item).is_err());
+    }
+
+    #[test]
+    fn structured_invocation_input_round_trips_through_typed_api() {
+        let json = serde_json::json!({"kind":"user", "content":"", "segments":[{"kind":"feature_invoke", "invocation":{
+            "invocation_id":"stable-invoke", "identity":"builtin:test/prepare", "name":"prepare",
+            "arguments":[{"name":"path", "value":{"kind":"string","value":"資料/a b"}}]
+        }}]});
+        let request: RuntimeWorkerInputRequest = serde_json::from_value(json.clone()).unwrap();
+        assert!(
+            matches!(&request.segments.as_ref().unwrap()[0], protocol::Segment::FeatureInvoke { invocation }
+            if invocation.identity.0 == "builtin:test/prepare" && invocation.invocation_id == "stable-invoke")
+        );
+        assert_eq!(serde_json::to_value(request).unwrap(), json);
+        let mut invalid = json;
+        invalid["segments"][0]["invocation"]["arguments"][0]["value"] =
+            serde_json::json!({"kind":"integer","value":2147483648_i64});
+        assert!(serde_json::from_value::<RuntimeWorkerInputRequest>(invalid).is_err());
+    }
+
+    #[test]
+    fn feature_completion_contract_is_typed_and_preserves_argument_context() {
+        let json = serde_json::json!({"kind":"feature_argument", "prefix":"資料/", "context":{"invocation":"builtin:test/prepare","argument":"path"}});
+        let request: RuntimeWorkerCompletionsRequest =
+            serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(request.kind, protocol::CompletionKind::FeatureArgument);
+        assert_eq!(serde_json::to_value(request).unwrap(), json);
+        assert!(
+            serde_json::from_value::<RuntimeWorkerCompletionsRequest>(
+                serde_json::json!({"kind":"unknown"})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<RuntimeWorkerCompletionsRequest>(
+                serde_json::json!({"kind":"feature_argument", "context":{"invocation":123}})
+            )
+            .is_err()
+        );
     }
 
     #[test]

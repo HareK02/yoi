@@ -399,8 +399,23 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
                 .lock()
                 .expect("pending_attachments poisoned"),
         );
+        // Preparations can commit before Engine receives the user prompt. The
+        // annotation queue alone does not materialize their model-visible items:
+        // return them through the normal prompt lifecycle, without recommitting.
+        // The annotator consumes their original IDs/provenance as Engine appends.
+        let mut prepared_items = self
+            .pending_committed_history
+            .lock()
+            .expect("pending committed history poisoned")
+            .iter()
+            .map(|entry| entry.item.clone())
+            .collect::<Vec<_>>();
         Ok(if extras.is_empty() {
-            PromptAction::Continue
+            if prepared_items.is_empty() {
+                PromptAction::Continue
+            } else {
+                PromptAction::ContinueWith(prepared_items)
+            }
         } else {
             // Commit the typed system items first, then hand the
             // matching `Item::system_message`s to the worker. Sync
@@ -410,7 +425,10 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
             self.attach_prompt_provenance(&mut extras);
             let items: Vec<Item> = extras.iter().map(SystemItem::to_history_item).collect();
             match self.commit_system_items(&extras) {
-                Ok(()) => PromptAction::ContinueWith(items),
+                Ok(()) => {
+                    prepared_items.extend(items);
+                    PromptAction::ContinueWith(prepared_items)
+                }
                 Err(error) => PromptAction::Cancel(format!("session persistence failed: {error}")),
             }
         })

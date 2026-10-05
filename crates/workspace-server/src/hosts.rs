@@ -735,6 +735,8 @@ pub struct WorkerCompletionsRequest {
     pub kind: protocol::CompletionKind,
     #[serde(default)]
     pub prefix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<protocol::CompletionContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3333,10 +3335,12 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 )],
             };
         };
-        match self
-            .runtime
-            .worker_completions(&worker_ref, request.kind, &request.prefix)
-        {
+        match self.runtime.worker_completions(
+            &worker_ref,
+            request.kind,
+            &request.prefix,
+            request.context.as_ref(),
+        ) {
             Ok(entries) => WorkerCompletionsResult {
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 kind: request.kind,
@@ -5415,6 +5419,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         let request = runtime_api::CompletionRequest {
             kind: request.kind,
             prefix: request.prefix,
+            context: request.context,
         };
         let failure_kind = request.kind;
         let failure_prefix = request.prefix.clone();
@@ -6709,6 +6714,45 @@ mod tests {
             let decoded: EmbeddedWorkerInput = runtime_contract_convert(wire).unwrap();
             assert_eq!(decoded, input);
         }
+    }
+
+    #[test]
+    fn feature_invocation_and_completion_context_survive_runtime_contract() {
+        let segments = vec![
+            protocol::Segment::FeatureInvoke {
+                invocation: protocol::FeatureInvocation {
+                    invocation_id: "stable-request".into(),
+                    identity: protocol::FeatureInvocationIdentity("builtin:test/prepare".into()),
+                    name: "prepare".into(),
+                    arguments: vec![protocol::InvocationArgumentValue {
+                        name: "path".into(),
+                        value: protocol::InvocationValue::String("資料/a b".into()),
+                    }],
+                },
+            },
+            protocol::Segment::text(" subsequent prose"),
+        ];
+        let input = EmbeddedWorkerInput {
+            kind: EmbeddedWorkerInputKind::User,
+            content: protocol::Segment::flatten_to_text(&segments),
+            submission_request_id: Some("submit-request".into()),
+            segments: Some(segments),
+        };
+        let wire: runtime_api::WorkerInput = runtime_contract_convert(input.clone()).unwrap();
+        let restored: EmbeddedWorkerInput = runtime_contract_convert(wire).unwrap();
+        assert_eq!(restored, input);
+        let request = WorkerCompletionsRequest {
+            kind: protocol::CompletionKind::FeatureArgument,
+            prefix: "資料/".into(),
+            context: Some(protocol::CompletionContext {
+                invocation: protocol::FeatureInvocationIdentity("builtin:test/prepare".into()),
+                argument: Some("path".into()),
+            }),
+        };
+        let wire: runtime_api::CompletionRequest =
+            runtime_contract_convert(request.clone()).unwrap();
+        let restored: WorkerCompletionsRequest = runtime_contract_convert(wire).unwrap();
+        assert_eq!(restored, request);
     }
 
     #[test]

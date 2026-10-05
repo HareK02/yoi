@@ -526,6 +526,8 @@ pub struct RuntimeHttpWorkerCompletionsRequest {
     pub kind: protocol::CompletionKind,
     #[serde(default)]
     pub prefix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<protocol::CompletionContext>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1865,10 +1867,14 @@ async fn worker_completions(
             &worker_ref,
             request.kind,
             &request.prefix,
+            request.context.as_ref(),
         ),
-        None => state
-            .runtime
-            .worker_completions(&worker_ref, request.kind, &request.prefix),
+        None => state.runtime.worker_completions(
+            &worker_ref,
+            request.kind,
+            &request.prefix,
+            request.context.as_ref(),
+        ),
     }
     .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkerCompletionsResponse {

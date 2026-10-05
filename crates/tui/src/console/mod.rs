@@ -121,56 +121,23 @@ fn copy_selection_to_terminal(app: &mut App) -> bool {
     copy_selection_to_writer(app, &mut stdout)
 }
 
-type AttachmentUploadResult = Result<UploadedFileRef, String>;
-
-fn mark_attachments_after_transport_acceptance(
-    pending: &mut Vec<UploadedFileRef>,
-    awaiting_acceptance: &mut Vec<UploadedFileRef>,
-) {
-    awaiting_acceptance.append(pending);
+struct AttachmentUploadResult {
+    id: String,
+    result: Result<UploadedFileRef, String>,
 }
-
-fn reconcile_attachment_submission(
-    pending: &mut Vec<UploadedFileRef>,
-    awaiting_acceptance: &mut Vec<UploadedFileRef>,
-    event: &Event,
-) -> bool {
-    match event {
-        Event::UserMessage { segments, .. } => {
-            let accepted_ids = segments
-                .iter()
-                .filter_map(|segment| match segment {
-                    Segment::UploadedFile { file } => Some(file.artifact_id.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            let awaited_ids = awaiting_acceptance
-                .iter()
-                .map(|file| file.artifact_id.as_str())
-                .collect::<Vec<_>>();
-            let accepts_exact_submission = !awaited_ids.is_empty() && accepted_ids == awaited_ids;
-            if accepts_exact_submission {
-                awaiting_acceptance.clear();
-            }
-            accepts_exact_submission
-        }
-        Event::Error { .. } if !awaiting_acceptance.is_empty() => {
-            pending.append(awaiting_acceptance);
-            false
-        }
-        _ => false,
-    }
+struct StagedUpload {
+    path: PathBuf,
+    task: Option<tokio::task::JoinHandle<()>>,
+    reference: Option<UploadedFileRef>,
 }
-
 struct ConsoleConnection<T> {
     client: Client<T>,
     standalone_host: Option<StandaloneHost>,
     backend_target: Option<BackendRuntimeTarget>,
-    pending_attachments: Vec<UploadedFileRef>,
-    awaiting_attachment_acceptance: Vec<UploadedFileRef>,
-    upload_tasks: Vec<tokio::task::JoinHandle<()>>,
+    staged_uploads: HashMap<String, StagedUpload>,
+    typed_submissions: HashMap<String, Method>,
+    rejected_typed_submit: Option<Method>,
     active_uploads: usize,
-    upload_ids: HashMap<PathBuf, String>,
 }
 
 async fn upload_client_path(
@@ -206,7 +173,20 @@ async fn upload_client_path(
             "attachment file type is not supported",
         )
     })?;
-    let bytes = tokio::fs::read(path).await?;
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    tokio::fs::File::open(path)
+        .await?
+        .take(10 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() > 10 * 1024 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "attachment exceeds the 10 MiB limit",
+        )
+        .into());
+    }
     target
         .upload_file_with_id(upload_id, file_name, media_type, bytes)
         .await
@@ -238,11 +218,10 @@ impl<T: Socket> ConsoleConnection<T> {
             client,
             standalone_host: Some(host),
             backend_target: None,
-            pending_attachments: Vec::new(),
-            awaiting_attachment_acceptance: Vec::new(),
-            upload_tasks: Vec::new(),
+            staged_uploads: HashMap::new(),
+            typed_submissions: HashMap::new(),
+            rejected_typed_submit: None,
             active_uploads: 0,
-            upload_ids: HashMap::new(),
         }
     }
 
@@ -251,11 +230,10 @@ impl<T: Socket> ConsoleConnection<T> {
             client,
             standalone_host: None,
             backend_target: Some(target),
-            pending_attachments: Vec::new(),
-            awaiting_attachment_acceptance: Vec::new(),
-            upload_tasks: Vec::new(),
+            staged_uploads: HashMap::new(),
+            typed_submissions: HashMap::new(),
+            rejected_typed_submit: None,
             active_uploads: 0,
-            upload_ids: HashMap::new(),
         }
     }
 
@@ -268,27 +246,30 @@ impl<T: Socket> ConsoleConnection<T> {
     }
 
     async fn send(&mut self, method: &Method) -> Result<(), Box<dyn std::error::Error>> {
-        let mut prepared = method.clone();
-        let carries_attachments =
-            matches!(prepared, Method::Submit { .. }) && !self.pending_attachments.is_empty();
-        if let Method::Submit { input, .. } = &mut prepared {
-            input.extend(
-                self.pending_attachments
-                    .iter()
-                    .cloned()
-                    .map(|file| Segment::UploadedFile { file }),
-            );
+        // A failed write may still have delivered a complete request. Track ownership
+        // before transport I/O and fence deletion until authoritative admission.
+        if let Method::Submit {
+            submission_request_id,
+            input,
+        } = method
+        {
+            if input.iter().any(|segment| {
+                matches!(
+                    segment,
+                    Segment::UploadedFile { .. } | Segment::FeatureInvoke { .. }
+                )
+            }) {
+                self.typed_submissions
+                    .insert(submission_request_id.clone(), method.clone());
+            }
         }
-        self.client.send(&prepared).await?;
-        if carries_attachments {
-            self.mark_attachments_awaiting_acceptance();
-        }
+        self.client.send(method).await?;
         Ok(())
     }
-
     fn start_upload(
         &mut self,
         path: PathBuf,
+        id: String,
         result_tx: mpsc::UnboundedSender<AttachmentUploadResult>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let target = self.backend_target.clone().ok_or_else(|| {
@@ -297,73 +278,173 @@ impl<T: Socket> ConsoleConnection<T> {
                 "client-local file upload is available only for Backend Workers",
             )
         })?;
-        self.upload_tasks.retain(|task| !task.is_finished());
-        let upload_id = self
-            .upload_ids
-            .entry(path.clone())
-            .or_insert_with(|| uuid::Uuid::now_v7().to_string())
-            .clone();
-        self.active_uploads = self.active_uploads.saturating_add(1);
-        self.upload_tasks.push(tokio::spawn(async move {
-            let result = upload_client_path(&target, &path, &upload_id)
+        if self
+            .staged_uploads
+            .get(&id)
+            .is_some_and(|upload| upload.task.is_some())
+        {
+            return Ok(());
+        }
+        self.active_uploads += 1;
+        let upload_id = id.clone();
+        let upload_path = path.clone();
+        let task = tokio::spawn(async move {
+            let result = upload_client_path(&target, &upload_path, &upload_id)
                 .await
                 .map_err(|error| error.to_string());
-            let _ = result_tx.send(result);
-        }));
+            let _ = result_tx.send(AttachmentUploadResult {
+                id: upload_id,
+                result,
+            });
+        });
+        self.staged_uploads.insert(
+            id,
+            StagedUpload {
+                path,
+                task: Some(task),
+                reference: None,
+            },
+        );
         Ok(())
     }
-
-    fn finish_upload(&mut self) {
-        self.active_uploads = self.active_uploads.saturating_sub(1);
-        self.upload_tasks.retain(|task| !task.is_finished());
-    }
-
     fn has_active_uploads(&self) -> bool {
         self.active_uploads != 0
     }
-
     fn observe_worker_event(&mut self, event: &Event) -> bool {
-        let attachments_accepted = reconcile_attachment_submission(
-            &mut self.pending_attachments,
-            &mut self.awaiting_attachment_acceptance,
-            event,
-        );
-        if attachments_accepted {
-            self.upload_ids.clear();
+        match event {
+            Event::SubmissionAccepted {
+                submission_request_id,
+                ..
+            } => {
+                if let Some(Method::Submit { input, .. }) =
+                    self.typed_submissions.remove(submission_request_id)
+                {
+                    self.release_accepted_attachments(&input);
+                    return true;
+                }
+            }
+            Event::SubmissionRejected {
+                submission_request_id,
+                ..
+            } => {
+                self.rejected_typed_submit = self.typed_submissions.remove(submission_request_id);
+            }
+            Event::UserMessage { segments, .. } => {
+                self.release_accepted_attachments(segments);
+                self.typed_submissions.retain(|_, method| !matches!(method, Method::Submit { input, .. } if input == segments));
+            }
+            _ => {}
         }
-        attachments_accepted
+        false
     }
-
-    fn mark_attachments_awaiting_acceptance(&mut self) {
-        mark_attachments_after_transport_acceptance(
-            &mut self.pending_attachments,
-            &mut self.awaiting_attachment_acceptance,
-        );
+    fn release_accepted_attachments(&mut self, segments: &[Segment]) {
+        let ids = segments
+            .iter()
+            .filter_map(|segment| match segment {
+                Segment::UploadedFile { file } => Some(file.artifact_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        self.staged_uploads.retain(|_, upload| {
+            !upload
+                .reference
+                .as_ref()
+                .is_some_and(|reference| ids.contains(&reference.artifact_id.as_str()))
+        });
     }
-
-    async fn clear_pending_attachments(&mut self) {
-        for task in self.upload_tasks.drain(..) {
+    fn attachment_is_submitting(&self, artifact_id: &str) -> bool {
+        self.typed_submissions.values().any(|method| matches!(method, Method::Submit { input, .. }
+            if input.iter().any(|segment| matches!(segment, Segment::UploadedFile { file } if file.artifact_id == artifact_id))))
+    }
+    async fn delete_draft_attachment(&mut self, reference: &UploadedFileRef) {
+        if self.attachment_is_submitting(&reference.artifact_id) {
+            return;
+        }
+        let id = self.staged_uploads.iter().find_map(|(id, upload)| {
+            upload
+                .reference
+                .as_ref()
+                .filter(|owned| owned.artifact_id == reference.artifact_id)
+                .map(|_| id.clone())
+        });
+        // History/accepted/restored files are not this connection's unsent staging.
+        if let Some(id) = id {
+            self.cancel_stage(&id).await;
+        }
+    }
+    async fn cancel_stage(&mut self, id: &str) {
+        let Some(upload) = self.staged_uploads.remove(id) else {
+            return;
+        };
+        if let Some(task) = upload.task {
+            self.active_uploads = self.active_uploads.saturating_sub(1);
             task.abort();
         }
-        self.active_uploads = 0;
-        let upload_ids = std::mem::take(&mut self.upload_ids)
-            .into_values()
-            .collect::<Vec<_>>();
-        let references = std::mem::take(&mut self.pending_attachments);
         if let Some(target) = &self.backend_target {
-            for upload_id in upload_ids {
-                let _ = target.cancel_file_upload(&upload_id).await;
-            }
-            for reference in references {
+            let _ = target.cancel_file_upload(id).await;
+            if let Some(reference) = upload.reference {
                 let _ = target.delete_uploaded_file(&reference.artifact_id).await;
             }
         }
     }
-
+    async fn finish_upload(&mut self, app: &mut App, result: AttachmentUploadResult) {
+        let Some(upload) = self.staged_uploads.get_mut(&result.id) else {
+            if let (Some(target), Ok(reference)) = (&self.backend_target, result.result) {
+                if reference.source_entry_id.is_none() {
+                    let _ = target.delete_uploaded_file(&reference.artifact_id).await;
+                }
+            }
+            return;
+        };
+        if upload.task.take().is_some() {
+            self.active_uploads = self.active_uploads.saturating_sub(1);
+        }
+        match result.result {
+            Ok(reference) => {
+                if reference.source_entry_id.is_some() {
+                    // An idempotent retry may return an already committed resource.
+                    self.staged_uploads.remove(&result.id);
+                    app.input
+                        .finish_attachment_stage(&result.id, Some(reference));
+                    return;
+                }
+                upload.reference = Some(reference.clone());
+                if !app
+                    .input
+                    .finish_attachment_stage(&result.id, Some(reference))
+                {
+                    self.cancel_stage(&result.id).await;
+                } else {
+                    app.completion = None;
+                    app.clear_actionbar_notice();
+                }
+            }
+            Err(error) => {
+                if !app.input.finish_attachment_stage(&result.id, None) {
+                    self.cancel_stage(&result.id).await;
+                } else {
+                    app.push_error(format!(
+                        "Attachment upload failed: {error}. Alt+Enter on the failed chip retries."
+                    ));
+                }
+            }
+        }
+    }
     async fn shutdown(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.pending_attachments
-            .append(&mut self.awaiting_attachment_acceptance);
-        self.clear_pending_attachments().await;
+        let ids =
+            self.staged_uploads
+                .iter()
+                .filter(|(_, upload)| {
+                    !upload.reference.as_ref().is_some_and(|reference| {
+                        self.attachment_is_submitting(&reference.artifact_id)
+                    })
+                })
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+        for id in ids {
+            self.cancel_stage(&id).await;
+        }
+        // Disconnect leaves in-flight acceptance ambiguous; never delete those resources.
         if let Some(host) = self.standalone_host.take() {
             host.shutdown().await?;
         }
@@ -478,6 +559,15 @@ async fn run_backend_console<T: Socket>(
     let mut terminal = enter_fullscreen()?;
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut app = App::new_with_persistent_input_history(worker_label, &workspace_root);
+    app.set_completion_target(
+        serde_json::to_string(&(
+            &target.base_url,
+            &target.workspace_id,
+            &target.runtime_id,
+            &target.worker_id,
+        ))
+        .expect("serializing a Backend target cannot fail"),
+    );
     app.connected = connected;
     let mut connection = ConsoleConnection::with_backend_target(client, target);
     let result = run_loop(&mut terminal, &mut app, &mut connection).await;
@@ -852,7 +942,7 @@ where
             }))
         }
         upload = upload_rx.recv() => {
-            LoopInput::Upload(upload.unwrap_or_else(|| Err("attachment upload queue stopped".into())))
+            LoopInput::Upload(upload.unwrap_or_else(|| AttachmentUploadResult { id: String::new(), result: Err("attachment upload queue stopped".into()) }))
         }
         event = pod_next, if connected => LoopInput::Worker(event),
         _ = animation_tick, if animate => LoopInput::Tick,
@@ -950,40 +1040,21 @@ async fn run_loop<T: Socket>(
             LoopInput::Terminal(term_event) => {
                 handle_terminal_event(app, client, &upload_tx, term_event?).await?;
             }
-            LoopInput::Upload(result) => {
-                client.finish_upload();
-                match result {
-                    Ok(reference) => {
-                        app.flash_actionbar_notice(
-                            format!(
-                                "[{} · {} bytes · ready] Send a message or use /clear-attachments.",
-                                reference.file_name, reference.byte_len
-                            ),
-                            ActionbarNoticeLevel::Info,
-                            ActionbarNoticeSource::Tui,
-                            Duration::from_secs(60 * 60),
-                        );
-                        if !client
-                            .pending_attachments
-                            .iter()
-                            .any(|pending| pending.artifact_id == reference.artifact_id)
-                        {
-                            client.pending_attachments.push(reference);
-                        }
-                    }
-                    Err(error) => app.push_error(format!("Attachment upload failed: {error}")),
-                }
-            }
+            LoopInput::Upload(result) => client.finish_upload(app, result).await,
             LoopInput::Worker(event) => match event? {
                 Some(ev) => {
                     if client.observe_worker_event(&ev) {
                         app.clear_actionbar_notice();
+                    }
+                    if let Some(method) = client.rejected_typed_submit.take() {
+                        app.restore_unsent_run(&method);
                     }
                     if let Some(method) = app.handle_worker_event(ev) {
                         send_console_method(app, client, &method).await?;
                     }
                 }
                 None => {
+                    app.cancel_completion();
                     app.connected = false;
                     app.mark_orphan_compacts_incomplete();
                     app.push_error("Connection lost");
@@ -998,25 +1069,48 @@ async fn run_loop<T: Socket>(
     Ok(())
 }
 
-fn attachment_command_path(method: &Method) -> Option<PathBuf> {
-    let Method::Submit { input, .. } = method else {
-        return None;
+async fn client_file_completions(prefix: &str) -> Vec<protocol::CompletionEntry> {
+    let (directory, leaf, displayed) = match prefix.rsplit_once('/') {
+        Some((directory, leaf)) => (
+            if directory.is_empty() { "/" } else { directory },
+            leaf,
+            format!("{directory}/"),
+        ),
+        None => (".", prefix, String::new()),
     };
-    let [Segment::Text { content }] = input.as_slice() else {
-        return None;
+    let Ok(mut reader) = tokio::fs::read_dir(directory).await else {
+        return Vec::new();
     };
-    let path = content.strip_prefix("/attach ")?.trim();
-    (!path.is_empty()).then(|| PathBuf::from(path))
-}
-
-fn is_clear_attachments_command(method: &Method) -> bool {
-    let Method::Submit { input, .. } = method else {
-        return false;
-    };
-    matches!(
-        input.as_slice(),
-        [Segment::Text { content }] if content.trim() == "/clear-attachments"
-    )
+    let mut entries = Vec::new();
+    // Keep directory discovery bounded and local; never send a client path to Worker.
+    let mut visited = 0;
+    while let Ok(Some(entry)) = reader.next_entry().await {
+        visited += 1;
+        if visited > 4096 {
+            break;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with(leaf) {
+            continue;
+        }
+        let is_dir = entry
+            .metadata()
+            .await
+            .is_ok_and(|metadata| metadata.is_dir());
+        if !is_dir && attachment_media_type(&entry.path()).is_none() {
+            continue;
+        }
+        entries.push(protocol::CompletionEntry {
+            value: format!("{displayed}{name}"),
+            is_dir,
+            ..Default::default()
+        });
+    }
+    entries.sort_by(|a, b| a.value.cmp(&b.value));
+    entries.truncate(100);
+    entries
 }
 
 async fn send_console_method<T: Socket>(
@@ -1024,10 +1118,29 @@ async fn send_console_method<T: Socket>(
     client: &mut ConsoleConnection<T>,
     method: &Method,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if let Method::ListCompletions {
+        kind: protocol::CompletionKind::FeatureArgument,
+        prefix,
+        context: Some(context),
+        request_id,
+    } = method
+    {
+        if app.is_client_file_completion(context) {
+            let entries = client_file_completions(prefix).await;
+            app.handle_worker_event(Event::Completions {
+                request_id: request_id.clone(),
+                kind: protocol::CompletionKind::FeatureArgument,
+                prefix: prefix.clone(),
+                context: Some(context.clone()),
+                entries,
+            });
+            return Ok(());
+        }
+    }
     if matches!(method, Method::Submit { .. }) && client.has_active_uploads() {
         app.restore_unsent_run(method);
         app.flash_actionbar_notice(
-            "Attachment upload is still in progress; wait or use /clear-attachments.",
+            "Attachment upload is still in progress; wait for its composer chip.",
             ActionbarNoticeLevel::Info,
             ActionbarNoticeSource::Tui,
             Duration::from_secs(60 * 60),
@@ -1035,16 +1148,21 @@ async fn send_console_method<T: Socket>(
         return Ok(());
     }
 
-    let sends_attachments =
-        matches!(method, Method::Submit { .. }) && !client.pending_attachments.is_empty();
+    let sends_attachments = matches!(
+        method,
+        Method::Submit { input, .. }
+            if input.iter().any(|segment| matches!(segment, Segment::UploadedFile { .. }))
+    );
     if let Err(error) = client.send(method).await {
-        if sends_attachments {
+        if sends_attachments
+            || matches!(method, Method::Submit { input, .. } if input.iter().any(|segment| matches!(segment, Segment::FeatureInvoke { .. })))
+        {
             app.restore_unsent_run(method);
             app.push_error(format!(
-                "Attachment submission failed: {error}. Pending attachments were retained; retry Send."
+                "Typed input submission failed: {error}. The composer was restored; retry Send."
             ));
             app.flash_actionbar_notice(
-                "Attachment submission failed; pending attachments are ready to retry.",
+                "Typed input submission failed; composer chips are ready to retry.",
                 ActionbarNoticeLevel::Error,
                 ActionbarNoticeSource::Tui,
                 Duration::from_secs(60 * 60),
@@ -1072,30 +1190,56 @@ async fn handle_terminal_event<T: Socket>(
 ) -> Result<(), Box<dyn std::error::Error>> {
     match event {
         TermEvent::Key(key) => {
+            if key.code == KeyCode::Enter
+                && key.modifiers == KeyModifiers::ALT
+                && key.kind == crossterm::event::KeyEventKind::Press
+            {
+                if let Some(id) = app.input.adjacent_failed_attachment() {
+                    if let Some(upload) = client.staged_uploads.get(&id) {
+                        let path = upload.path.clone();
+                        client.start_upload(path, id.clone(), upload_tx.clone())?;
+                        app.input.retry_attachment_stage(&id);
+                    }
+                    return Ok(());
+                }
+            }
             if let Some(method) = handle_key(app, key) {
-                if let Some(path) = attachment_command_path(&method) {
-                    match client.start_upload(path, upload_tx.clone()) {
-                        Ok(()) => app.flash_actionbar_notice(
-                            "Uploading attachment… Use /clear-attachments to cancel.",
+                send_console_method(app, client, &method).await?;
+            }
+            for (invocation_id, path) in app.attachment_invocations() {
+                let id = uuid::Uuid::now_v7().to_string();
+                let file_name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                match client.start_upload(path, id.clone(), upload_tx.clone()) {
+                    Ok(()) => {
+                        app.input.stage_attachment(&invocation_id, id, file_name);
+                        app.flash_actionbar_notice(
+                            "Uploading attachment; delete its chip to cancel.",
                             ActionbarNoticeLevel::Info,
                             ActionbarNoticeSource::Tui,
                             Duration::from_secs(30),
-                        ),
-                        Err(error) => {
-                            app.push_error(format!("Attachment upload failed: {error}"));
-                        }
+                        );
                     }
-                } else if is_clear_attachments_command(&method) {
-                    client.clear_pending_attachments().await;
-                    app.flash_actionbar_notice(
-                        "Removed pending attachments.",
-                        ActionbarNoticeLevel::Info,
-                        ActionbarNoticeSource::Tui,
-                        Duration::from_secs(4),
-                    );
-                } else {
-                    send_console_method(app, client, &method).await?;
+                    Err(error) => app.push_error(format!("Attachment upload failed: {error}")),
                 }
+            }
+            let visible_stages = app.input.attachment_stage_ids();
+            let orphaned = client
+                .staged_uploads
+                .iter()
+                .filter(|(id, upload)| upload.reference.is_none() && !visible_stages.contains(id))
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            for id in orphaned {
+                client.cancel_stage(&id).await;
+            }
+            for id in app.input.take_removed_attachment_stages() {
+                client.cancel_stage(&id).await;
+            }
+            for reference in app.input.take_removed_uploaded_files() {
+                client.delete_draft_attachment(&reference).await;
             }
         }
         TermEvent::Mouse(mouse) => {
@@ -1171,6 +1315,18 @@ fn apply_composer_edit_action(app: &mut App, action: ComposerEditAction) -> Opti
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
+    if key.kind == crossterm::event::KeyEventKind::Release
+        || (key.code == KeyCode::Enter && key.kind == crossterm::event::KeyEventKind::Repeat)
+    {
+        return None;
+    }
+    if key.code == KeyCode::Enter
+        && key.modifiers == KeyModifiers::ALT
+        && !app.is_command_mode()
+        && app.input.adjacent_feature_invocation().is_some()
+    {
+        return app.edit_adjacent_feature_invocation();
+    }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -1582,23 +1738,387 @@ mod tests {
     }
 
     #[test]
-    fn client_local_attachment_commands_are_typed_and_do_not_send_the_path() {
-        let attach = Method::Submit {
-            submission_request_id: protocol::new_submission_request_id(),
-            input: vec![Segment::text("/attach /tmp/report.md")],
-        };
-        assert_eq!(
-            attachment_command_path(&attach),
-            Some(PathBuf::from("/tmp/report.md"))
+    fn feature_invocation_alt_enter_reopens_chip_but_preserves_plain_newline_and_key_release_behavior()
+     {
+        use crate::invocation_tests::descriptor;
+        let invocation = protocol::parse_feature_invocation("/run(x)", 0, &descriptor(), "id")
+            .unwrap()
+            .invocation;
+        let mut app = App::new("test".into());
+        app.input
+            .replace_with_segments(&[Segment::FeatureInvoke { invocation }]);
+        assert!(matches!(
+            handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            Some(Method::ListCompletions {
+                kind: protocol::CompletionKind::Feature,
+                ..
+            })
+        ));
+        app.handle_worker_event(Event::Completions {
+            request_id: app.completion_request_id(),
+            kind: protocol::CompletionKind::Feature,
+            prefix: "run".into(),
+            context: None,
+            entries: vec![protocol::CompletionEntry {
+                value: "run".into(),
+                invocation: Some(descriptor()),
+                ..Default::default()
+            }],
+        });
+        assert_eq!(app.input.plain_text(), "/run(path=\"x\")");
+        let mut plain = App::new("test".into());
+        plain.input.insert_str("committed 日本語");
+        handle_key(&mut plain, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        assert_eq!(plain.input.plain_text(), "committed 日本語\n");
+        let before = plain.input.submit_segments();
+        handle_key(
+            &mut plain,
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+                kind: crossterm::event::KeyEventKind::Release,
+                state: crossterm::event::KeyEventState::NONE,
+            },
         );
-        assert!(!is_clear_attachments_command(&attach));
+        assert_eq!(plain.input.submit_segments(), before);
+    }
 
-        let clear = Method::Submit {
-            submission_request_id: protocol::new_submission_request_id(),
-            input: vec![Segment::text("/clear-attachments")],
+    fn attachment_test_connection() -> ConsoleConnection<FailOnceSocket> {
+        ConsoleConnection {
+            client: Client::new(FailOnceSocket {
+                fail_next_send: false,
+            }),
+            standalone_host: None,
+            backend_target: None,
+            staged_uploads: HashMap::new(),
+            typed_submissions: HashMap::new(),
+            rejected_typed_submit: None,
+            active_uploads: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn attachment_staging_completion_replaces_its_chip_not_the_current_cursor() {
+        use crate::invocation_tests::{descriptor, uploaded_file};
+        let mut app = App::new("test".into());
+        let invocation = protocol::parse_feature_invocation("/run(x)", 0, &descriptor(), "invoke")
+            .unwrap()
+            .invocation;
+        app.input.replace_with_segments(&[
+            Segment::FeatureInvoke { invocation },
+            Segment::text(" following prose"),
+        ]);
+        app.input
+            .stage_attachment("invoke", "stage".into(), "a.txt".into());
+        app.input.move_home();
+        app.input.insert_str("prefix ");
+        let mut connection = attachment_test_connection();
+        connection.staged_uploads.insert(
+            "stage".into(),
+            StagedUpload {
+                path: "a.txt".into(),
+                task: None,
+                reference: None,
+            },
+        );
+        connection
+            .finish_upload(
+                &mut app,
+                AttachmentUploadResult {
+                    id: "stage".into(),
+                    result: Ok(uploaded_file()),
+                },
+            )
+            .await;
+        assert_eq!(
+            app.input.submit_segments(),
+            vec![
+                Segment::text("prefix "),
+                Segment::UploadedFile {
+                    file: uploaded_file()
+                },
+                Segment::text(" following prose")
+            ]
+        );
+        app.input.insert_str("cursor remains ");
+        assert!(app.input.plain_text().starts_with("prefix cursor remains "));
+    }
+
+    #[tokio::test]
+    async fn attachment_removed_staging_and_failed_retry_keep_exact_resource_ownership() {
+        use crate::invocation_tests::{descriptor, uploaded_file};
+        let mut app = App::new("test".into());
+        let invocation = protocol::parse_feature_invocation("/run(x)", 0, &descriptor(), "invoke")
+            .unwrap()
+            .invocation;
+        app.input
+            .replace_with_segments(&[Segment::FeatureInvoke { invocation }]);
+        app.input
+            .stage_attachment("invoke", "stage".into(), "a.txt".into());
+        let mut connection = attachment_test_connection();
+        connection.staged_uploads.insert(
+            "stage".into(),
+            StagedUpload {
+                path: "a.txt".into(),
+                task: None,
+                reference: None,
+            },
+        );
+        connection
+            .finish_upload(
+                &mut app,
+                AttachmentUploadResult {
+                    id: "stage".into(),
+                    result: Err("temporary".into()),
+                },
+            )
+            .await;
+        assert_eq!(
+            app.input.adjacent_failed_attachment().as_deref(),
+            Some("stage")
+        );
+        assert_eq!(
+            connection.staged_uploads["stage"].path,
+            PathBuf::from("a.txt")
+        );
+        app.input.retry_attachment_stage("stage");
+        assert!(app.input.adjacent_failed_attachment().is_none());
+        app.input.delete_word_before();
+        for id in app.input.take_removed_attachment_stages() {
+            connection.cancel_stage(&id).await;
+        }
+        assert!(connection.staged_uploads.is_empty());
+        connection
+            .finish_upload(
+                &mut app,
+                AttachmentUploadResult {
+                    id: "stage".into(),
+                    result: Ok(uploaded_file()),
+                },
+            )
+            .await;
+        assert!(app.input.is_empty());
+        assert!(connection.staged_uploads.is_empty());
+    }
+
+    #[tokio::test]
+    async fn attachment_acceptance_transfers_ownership_before_queue_execution_and_history_delete() {
+        use crate::invocation_tests::uploaded_file;
+        let mut connection = attachment_test_connection();
+        let reference = uploaded_file();
+        connection.staged_uploads.insert(
+            "stage".into(),
+            StagedUpload {
+                path: "a.txt".into(),
+                task: None,
+                reference: Some(reference.clone()),
+            },
+        );
+        let method = Method::Submit {
+            submission_request_id: "request".into(),
+            input: vec![Segment::UploadedFile {
+                file: reference.clone(),
+            }],
         };
-        assert!(is_clear_attachments_command(&clear));
-        assert_eq!(attachment_command_path(&clear), None);
+        connection.send(&method).await.unwrap();
+        connection.delete_draft_attachment(&reference).await;
+        assert_eq!(
+            connection.staged_uploads.len(),
+            1,
+            "in-flight resources must be protected"
+        );
+        connection.observe_worker_event(&Event::Error {
+            code: protocol::ErrorCode::ProviderError,
+            message: "unrelated provider error".into(),
+        });
+        assert_eq!(connection.typed_submissions.len(), 1);
+        assert!(
+            !connection.observe_worker_event(&Event::SubmissionAccepted {
+                submission_request_id: "other".into(),
+                submission_id: "other-submission".into(),
+                disposition: protocol::SubmissionDisposition::Queued
+            })
+        );
+        assert!(connection.observe_worker_event(&Event::SubmissionAccepted {
+            submission_request_id: "request".into(),
+            submission_id: "submission".into(),
+            disposition: protocol::SubmissionDisposition::Queued
+        }));
+        assert!(connection.staged_uploads.is_empty());
+        connection.delete_draft_attachment(&reference).await;
+        connection.shutdown().await.unwrap();
+        assert!(
+            connection.staged_uploads.is_empty(),
+            "accepted resources never reenter unsent ownership"
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_rejection_is_request_scoped_and_restores_typed_retry() {
+        use crate::invocation_tests::uploaded_file;
+        let mut connection = attachment_test_connection();
+        let reference = uploaded_file();
+        connection.staged_uploads.insert(
+            "stage".into(),
+            StagedUpload {
+                path: "a.txt".into(),
+                task: None,
+                reference: Some(reference.clone()),
+            },
+        );
+        let first = Method::Submit {
+            submission_request_id: "first".into(),
+            input: vec![Segment::UploadedFile {
+                file: reference.clone(),
+            }],
+        };
+        let second = Method::Submit {
+            submission_request_id: "second".into(),
+            input: vec![Segment::UploadedFile {
+                file: UploadedFileRef {
+                    artifact_id: "second-artifact".into(),
+                    ..reference.clone()
+                },
+            }],
+        };
+        connection.send(&first).await.unwrap();
+        connection.send(&second).await.unwrap();
+        connection.observe_worker_event(&Event::SubmissionRejected {
+            submission_request_id: "first".into(),
+            message: "rejected".into(),
+        });
+        assert_eq!(connection.typed_submissions.len(), 1);
+        assert!(connection.typed_submissions.contains_key("second"));
+        let mut app = App::new("test".into());
+        app.restore_unsent_run(&connection.rejected_typed_submit.take().unwrap());
+        assert_eq!(
+            app.input.submit_segments(),
+            vec![Segment::UploadedFile {
+                file: reference.clone()
+            }]
+        );
+        connection.delete_draft_attachment(&reference).await;
+        assert!(connection.staged_uploads.is_empty());
+    }
+
+    #[tokio::test]
+    async fn attachment_retry_returning_committed_resource_never_acquires_delete_ownership() {
+        use crate::invocation_tests::{descriptor, uploaded_file};
+        let invocation = protocol::parse_feature_invocation("/run(x)", 0, &descriptor(), "invoke")
+            .unwrap()
+            .invocation;
+        let mut app = App::new("test".into());
+        app.input
+            .replace_with_segments(&[Segment::FeatureInvoke { invocation }]);
+        app.input
+            .stage_attachment("invoke", "stage".into(), "a.txt".into());
+        let mut connection = attachment_test_connection();
+        connection.staged_uploads.insert(
+            "stage".into(),
+            StagedUpload {
+                path: "a.txt".into(),
+                task: None,
+                reference: None,
+            },
+        );
+        let file = UploadedFileRef {
+            source_entry_id: Some("committed-entry".into()),
+            ..uploaded_file()
+        };
+        connection
+            .finish_upload(
+                &mut app,
+                AttachmentUploadResult {
+                    id: "stage".into(),
+                    result: Ok(file.clone()),
+                },
+            )
+            .await;
+        assert_eq!(
+            app.input.submit_segments(),
+            vec![Segment::UploadedFile { file: file.clone() }]
+        );
+        assert!(connection.staged_uploads.is_empty());
+        app.input.delete_before();
+        connection.delete_draft_attachment(&file).await;
+        assert!(connection.staged_uploads.is_empty());
+    }
+
+    #[tokio::test]
+    async fn attachment_local_completion_aba_echoes_nonce_and_ignores_prior_request() {
+        use crate::invocation_tests::{attachment_descriptor, select};
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("資料 a.txt"), "data").unwrap();
+        let mut app = App::new("test".into());
+        select(&mut app, attachment_descriptor(), "add-file");
+        let prefix = format!("{}/", temp.path().display());
+        app.input
+            .insert_str(protocol::quote_invocation_string(&prefix).trim_end_matches('"'));
+        let old = app.refresh_completion().unwrap();
+        app.insert_char('x');
+        app.delete_char_before();
+        let current = app.refresh_completion().unwrap();
+        let mut connection = attachment_test_connection();
+        connection.client = Client::new(FailOnceSocket {
+            fail_next_send: true,
+        });
+        send_console_method(&mut app, &mut connection, &old)
+            .await
+            .unwrap();
+        assert!(app.completion.as_ref().unwrap().entries.is_empty());
+        send_console_method(&mut app, &mut connection, &current)
+            .await
+            .unwrap();
+        assert_eq!(app.completion.as_ref().unwrap().entries.len(), 1);
+        assert!(
+            app.completion.as_ref().unwrap().entries[0]
+                .value
+                .ends_with("資料 a.txt")
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_client_file_completion_is_local_bounded_and_safe_for_unicode_paths() {
+        use crate::invocation_tests::{attachment_descriptor, select};
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("資料 a.txt"), "data").unwrap();
+        std::fs::write(temp.path().join("unsafe.exe"), "data").unwrap();
+        std::fs::create_dir(temp.path().join("nested dir")).unwrap();
+        let mut app = App::new("test".into());
+        select(&mut app, attachment_descriptor(), "add-file");
+        let prefix = format!("{}/", temp.path().display());
+        app.input
+            .insert_str(&protocol::quote_invocation_string(&prefix).trim_end_matches('"'));
+        let method = app.refresh_completion().unwrap();
+        let mut connection = attachment_test_connection();
+        // If completion is accidentally sent to Worker this deliberately failing transport fails the test.
+        connection.client = Client::new(FailOnceSocket {
+            fail_next_send: true,
+        });
+        send_console_method(&mut app, &mut connection, &method)
+            .await
+            .unwrap();
+        let entries = &app.completion.as_ref().unwrap().entries;
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.value.ends_with("資料 a.txt"))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.is_dir && entry.value.ends_with("nested dir"))
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.value.ends_with("unsafe.exe"))
+        );
+    }
+
+    #[test]
+    fn attachment_media_types_remain_restricted() {
         assert_eq!(
             attachment_media_type(Path::new("report.webp")),
             Some("image/webp")
@@ -1652,15 +2172,15 @@ mod tests {
             }),
             standalone_host: None,
             backend_target: None,
-            pending_attachments: vec![file.clone()],
-            awaiting_attachment_acceptance: Vec::new(),
-            upload_tasks: Vec::new(),
+            staged_uploads: HashMap::new(),
+            typed_submissions: HashMap::new(),
+            rejected_typed_submit: None,
             active_uploads: 0,
-            upload_ids: HashMap::new(),
         };
 
         let mut app = App::new("worker".into());
         app.input.insert_str("inspect");
+        app.input.insert_uploaded_file(file.clone());
 
         connection.active_uploads = 1;
         let blocked = app.submit_input().unwrap();
@@ -1668,36 +2188,41 @@ mod tests {
         send_console_method(&mut app, &mut connection, &blocked)
             .await
             .unwrap();
-        assert_eq!(app.input.plain_text(), "inspect");
-        assert_eq!(connection.pending_attachments, vec![file.clone()]);
-        assert!(connection.awaiting_attachment_acceptance.is_empty());
+        assert!(matches!(app.input.submit_segments().as_slice(),
+            [Segment::Text { content }, Segment::UploadedFile { file: restored }]
+            if content == "inspect" && restored == &file));
+        assert!(connection.staged_uploads.is_empty());
+        assert!(connection.typed_submissions.is_empty());
 
         connection.active_uploads = 0;
         let failed = app.submit_input().unwrap();
         send_console_method(&mut app, &mut connection, &failed)
             .await
             .unwrap();
-        assert_eq!(app.input.plain_text(), "inspect");
-        assert_eq!(connection.pending_attachments, vec![file.clone()]);
-        assert!(connection.awaiting_attachment_acceptance.is_empty());
+        assert!(matches!(app.input.submit_segments().as_slice(),
+            [Segment::Text { content }, Segment::UploadedFile { file: restored }]
+            if content == "inspect" && restored == &file));
+        assert!(connection.staged_uploads.is_empty());
+        assert_eq!(connection.typed_submissions.len(), 1);
 
         let retry = app.submit_input().unwrap();
+        assert_eq!(
+            serde_json::to_value(&retry).unwrap(),
+            serde_json::to_value(&failed).unwrap()
+        );
         send_console_method(&mut app, &mut connection, &retry)
             .await
             .unwrap();
         assert!(app.input.is_empty());
-        assert!(connection.pending_attachments.is_empty());
-        assert_eq!(
-            connection.awaiting_attachment_acceptance,
-            vec![file.clone()]
-        );
+        assert!(connection.staged_uploads.is_empty());
+        assert_eq!(connection.typed_submissions.len(), 1);
 
         connection.observe_worker_event(&Event::UserMessage {
             entry_id: None,
             segments: vec![Segment::text("inspect"), Segment::UploadedFile { file }],
         });
-        assert!(connection.pending_attachments.is_empty());
-        assert!(connection.awaiting_attachment_acceptance.is_empty());
+        assert!(connection.staged_uploads.is_empty());
+        assert!(connection.typed_submissions.is_empty());
     }
 
     #[tokio::test]
@@ -1718,15 +2243,15 @@ mod tests {
             }),
             standalone_host: None,
             backend_target: None,
-            pending_attachments: vec![file.clone()],
-            awaiting_attachment_acceptance: Vec::new(),
-            upload_tasks: Vec::new(),
+            staged_uploads: HashMap::new(),
+            typed_submissions: HashMap::new(),
+            rejected_typed_submit: None,
             active_uploads: 0,
-            upload_ids: HashMap::new(),
         };
         let mut app = App::new("worker".into());
         app.set_worker_status(WorkerStatus::Running);
         app.input.insert_str("queued inspect");
+        app.input.insert_uploaded_file(file.clone());
         let method = app
             .submit_input()
             .expect("running Submit is sent immediately");
@@ -1735,63 +2260,46 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(app.input.plain_text(), "queued inspect");
-        assert_eq!(connection.pending_attachments, vec![file]);
-        assert!(connection.awaiting_attachment_acceptance.is_empty());
+        assert!(matches!(app.input.submit_segments().as_slice(),
+            [Segment::Text { content }, Segment::UploadedFile { file: restored }]
+            if content == "queued inspect" && restored == &file));
+        assert!(connection.staged_uploads.is_empty());
+        assert_eq!(connection.typed_submissions.len(), 1);
+        assert_eq!(
+            serde_json::to_value(app.submit_input().unwrap()).unwrap(),
+            serde_json::to_value(&method).unwrap()
+        );
     }
 
     #[test]
-    fn partial_attachment_echo_does_not_acknowledge_an_atomic_submission() {
-        let first = UploadedFileRef {
-            artifact_id: "artifact-1".into(),
-            file_name: "one.txt".into(),
-            media_type: "text/plain".into(),
-            created_at_ms: 1,
-            availability: UploadedFileAvailability::Available,
-            byte_len: 1,
-            sha256: "a".repeat(64),
-            source_entry_id: None,
-        };
-        let second = UploadedFileRef {
-            artifact_id: "artifact-2".into(),
-            file_name: "two.txt".into(),
-            ..first.clone()
-        };
-        let mut pending = Vec::new();
-        let mut awaiting = vec![first.clone(), second.clone()];
-        let expected = awaiting.clone();
-
-        for segments in [
-            vec![Segment::UploadedFile {
-                file: first.clone(),
-            }],
-            vec![
-                Segment::UploadedFile {
-                    file: second.clone(),
-                },
-                Segment::UploadedFile {
-                    file: first.clone(),
-                },
-            ],
-            vec![
-                Segment::UploadedFile {
-                    file: first.clone(),
-                },
-                Segment::UploadedFile {
-                    file: first.clone(),
-                },
-            ],
-        ] {
-            assert!(!reconcile_attachment_submission(
-                &mut pending,
-                &mut awaiting,
-                &Event::UserMessage {
-                    entry_id: None,
-                    segments,
-                },
-            ));
-            assert_eq!(awaiting, expected);
-            assert!(pending.is_empty());
+    fn typed_retry_late_acceptance_clears_only_the_matching_restored_draft() {
+        for changed in [false, true] {
+            let mut app = App::new("worker".into());
+            app.input
+                .insert_uploaded_file(crate::invocation_tests::uploaded_file());
+            let method = app.submit_input().unwrap();
+            app.restore_unsent_run(&method);
+            if changed {
+                app.input.insert_str("new edit");
+            }
+            let before = app.input.submit_segments();
+            let Method::Submit {
+                submission_request_id,
+                ..
+            } = method
+            else {
+                unreachable!()
+            };
+            app.handle_worker_event(Event::SubmissionAccepted {
+                submission_request_id,
+                submission_id: "durable".into(),
+                disposition: protocol::SubmissionDisposition::Queued,
+            });
+            if changed {
+                assert_eq!(app.input.submit_segments(), before);
+            } else {
+                assert!(app.input.is_empty());
+            }
         }
     }
 
@@ -1935,7 +2443,12 @@ mod tests {
             sha256: "a".repeat(64),
             source_entry_id: None,
         };
-        upload_tx.send(Ok(file.clone())).unwrap();
+        upload_tx
+            .send(AttachmentUploadResult {
+                id: "upload-1".into(),
+                result: Ok(file.clone()),
+            })
+            .unwrap();
 
         match next_loop_input(
             &mut terminal_rx,
@@ -1947,7 +2460,13 @@ mod tests {
         )
         .await
         {
-            LoopInput::Upload(Ok(received)) => assert_eq!(received, file),
+            LoopInput::Upload(AttachmentUploadResult {
+                id,
+                result: Ok(received),
+            }) => {
+                assert_eq!(id, "upload-1");
+                assert_eq!(received, file);
+            }
             _ => panic!("expected attachment upload result"),
         }
     }
@@ -3008,6 +3527,7 @@ mod tests {
         app.completion.as_mut().unwrap().entries = vec![protocol::CompletionEntry {
             value: "src/main.rs".into(),
             is_dir: false,
+            ..protocol::CompletionEntry::default()
         }];
         app.handle_worker_event(Event::InternalWorker {
             worker: protocol::InternalWorkerRef {

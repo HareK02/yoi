@@ -366,6 +366,23 @@ fn task_status_mark(status: TaskStatus) -> (&'static str, Style) {
 /// taller than that single row); `Clear` blanks the cells first so
 /// underlying text doesn't bleed through. The popup width matches the
 /// widest visible label, capped at the input-area width.
+fn completion_entry_label(entry: &CompletionEntry) -> String {
+    if let Some(invocation) = &entry.invocation {
+        format!(
+            "/{} — {} — {}",
+            entry.value,
+            invocation.description,
+            invocation.usage()
+        )
+    } else {
+        let suffix = if entry.is_dir { "/" } else { "" };
+        match &entry.description {
+            Some(description) => format!("{}{suffix} — {description}", entry.value),
+            None => format!("{}{suffix}", entry.value),
+        }
+    }
+}
+
 fn draw_completion_popup(frame: &mut Frame, state: &CompletionState, input_area: Rect) {
     let entries = &state.entries;
     if entries.is_empty() || input_area.y == 0 {
@@ -380,16 +397,10 @@ fn draw_completion_popup(frame: &mut Frame, state: &CompletionState, input_area:
     };
     let view_end = (view_start + visible).min(entries.len());
 
-    let label_for = |entry: &CompletionEntry| {
-        let mut s = entry.value.clone();
-        if entry.is_dir {
-            s.push('/');
-        }
-        s
-    };
+    let label_for = |entry: &CompletionEntry| completion_entry_label(entry);
     let max_label = entries[view_start..view_end]
         .iter()
-        .map(|e| label_for(e).chars().count() as u16)
+        .map(|e| label_for(e).width().min(u16::MAX as usize) as u16)
         .max()
         .unwrap_or(0);
     let popup_w = max_label.saturating_add(2).min(input_area.width).max(1);
@@ -1341,6 +1352,10 @@ fn chip_span_for(seg: &Segment, fallback: Style) -> (Style, String) {
             ),
         ),
         Segment::FileRef { path } => (Style::default().fg(Color::Cyan), format!("@{path}")),
+        Segment::FeatureInvoke { invocation } => (
+            Style::default().fg(Color::Yellow),
+            invocation.display_input(),
+        ),
         Segment::Flow { selector } => (
             Style::default().fg(Color::Yellow),
             format!("[Flow: {selector}]"),
@@ -1375,6 +1390,7 @@ fn segment_display_text(seg: &Segment) -> String {
             file.availability.as_str()
         ),
         Segment::FileRef { path } => format!("@{path}"),
+        Segment::FeatureInvoke { invocation } => invocation.display_input(),
         Segment::Flow { selector } => format!("[Flow: {selector}]"),
         Segment::Unknown => "[unknown segment]".to_owned(),
     }
@@ -2184,6 +2200,28 @@ mod tests {
                 }],
             },
         });
+    }
+
+    #[test]
+    fn feature_invocation_completion_labels_include_alias_description_usage_and_argument_help() {
+        let descriptor = crate::invocation_tests::descriptor();
+        let entry = CompletionEntry {
+            value: "execute".into(),
+            invocation: Some(descriptor.clone()),
+            ..Default::default()
+        };
+        let label = completion_entry_label(&entry);
+        assert!(label.starts_with("/execute"));
+        assert!(label.contains(&descriptor.description));
+        assert!(label.contains(&descriptor.usage()));
+        assert_eq!(
+            completion_entry_label(&CompletionEntry {
+                value: "mode=".into(),
+                description: Some("execution mode".into()),
+                ..Default::default()
+            }),
+            "mode= — execution mode"
+        );
     }
 
     #[test]

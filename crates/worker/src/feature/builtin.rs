@@ -5,6 +5,7 @@
 //! an external plugin-loading surface.
 
 pub mod backend_job_result;
+pub mod chat_invocation;
 pub mod flow_transition;
 pub mod manage_workdir;
 pub mod manage_worker;

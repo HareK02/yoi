@@ -2,6 +2,8 @@
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/svelte";
 import { afterEach, expect, test, vi } from "vitest";
 import { EditorView } from "@codemirror/view";
+import type { FeatureInvocationDescriptor, Segment } from "#lib/generated/protocol.ts";
+import { undo } from "@codemirror/commands";
 import ComposerInput from "./ComposerInput.svelte";
 
 afterEach(cleanup);
@@ -147,4 +149,251 @@ test("cursor changes, Escape, scope changes and disable discard late file result
   await ui.findByRole("listbox");
   await ui.rerender({ disabled: true });
   expect(ui.queryByRole("listbox")).toBeNull();
+});
+
+test("synchronous draft and cursor ABA invalidate old Feature completion generations", async () => {
+  const requests: Array<ReturnType<typeof deferred<Array<{ value: string; invocation: FeatureInvocationDescriptor }>>>> = [];
+  const resolver = vi.fn(() => { const result = deferred<Array<{ value: string; invocation: FeatureInvocationDescriptor }>>(); requests.push(result); return result.promise; });
+  const ui = render(ComposerInput, { historyScope: "feature-aba", resolveFeatureCompletions: resolver });
+  const cm = editor(ui.container);
+  type(cm, "/ru");
+  await waitFor(() => expect(requests).toHaveLength(1));
+  cm.dispatch({ changes: { from: 2, to: 3, insert: "x" } });
+  cm.dispatch({ changes: { from: 2, to: 3, insert: "u" } });
+  requests[0].resolve([{ value: "stale", invocation: invocationDescriptor }]);
+  await waitFor(() => expect(requests).toHaveLength(2));
+  expect(ui.queryByRole("option")).toBeNull();
+  cm.dispatch({ selection: { anchor: 0 } });
+  cm.dispatch({ selection: { anchor: 3 } });
+  requests[1].resolve([{ value: "stale-cursor", invocation: invocationDescriptor }]);
+  await waitFor(() => expect(requests).toHaveLength(3));
+  expect(ui.queryByRole("option")).toBeNull();
+  requests[2].resolve([{ value: "run", invocation: invocationDescriptor }]);
+  expect((await ui.findByRole("option")).textContent).toContain("/run");
+});
+
+test("restored chip descriptor edits reject same-draft cursor ABA", async () => {
+  const request = deferred<Array<{ value: string; invocation: FeatureInvocationDescriptor }>>();
+  const resolver = vi.fn(() => request.promise);
+  const ui = render(ComposerInput, { historyScope: "edit-cursor-aba", resolveFeatureCompletions: resolver });
+  ui.component.restoreSegments([invocationSegment]);
+  const cm = editor(ui.container);
+  await fireEvent.mouseDown(ui.container.querySelector(".composer-typed-chip")!);
+  await waitFor(() => expect(resolver).toHaveBeenCalledOnce());
+  cm.dispatch({ selection: { anchor: 0 } });
+  cm.dispatch({ selection: { anchor: cm.state.doc.length } });
+  request.resolve([{ value: "run", invocation: invocationDescriptor }]);
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(ui.component.snapshot().segments).toEqual([invocationSegment]);
+});
+
+test("cancelled upload cannot become sendable via late completion or Undo", async () => {
+  const onremoveatom = vi.fn();
+  const ui = render(ComposerInput, { historyScope: "upload-cancel-late", onremoveatom });
+  const cm = editor(ui.container);
+  type(cm, "before after", 7);
+  const reservation = ui.component.reserveUpload("report.md")!;
+  ui.component.cancelUpload(reservation);
+  expect(ui.component.completeUpload(reservation, uploadedSegment)).toBe(false);
+  undo(cm);
+  expect(ui.component.snapshot().segments.some((segment) => segment.kind === "uploaded_file" || segment.kind === "unknown")).toBe(false);
+  ui.component.clear();
+  expect(onremoveatom).not.toHaveBeenCalled();
+});
+
+const invocationDescriptor: FeatureInvocationDescriptor = {
+  identity: "feature:test/run", name: "run", aliases: [], display_name: "Run",
+  description: "Declared invocation", syntax: "parenthesized",
+  arguments: [{ name: "path", position: 0, required: true,
+    value_type: { kind: "worker_file" }, completion: { kind: "worker_file" } }],
+};
+const invocationSegment: Segment = {
+  kind: "feature_invoke", invocation: { invocation_id: "invoke-1",
+    identity: invocationDescriptor.identity, name: "run",
+    arguments: [{ name: "path", value: { kind: "string", value: "a b/資料" } }] },
+};
+const uploadedSegment: Segment = { kind: "uploaded_file", file: {
+  artifact_id: "artifact-1", file_name: "report.md", media_type: "text/markdown",
+  created_at_ms: 1, availability: "available", byte_len: 4, sha256: "abcd",
+} };
+
+test("argument popup stays anchored to the edited outer call when its data contains a call-looking slash", async () => {
+  const descriptor: FeatureInvocationDescriptor = { ...invocationDescriptor, arguments: [...invocationDescriptor.arguments,
+    { name: "mode", required: false, value_type: { kind: "enum", values: ["safe"] }, completion: { kind: "static", values: ["safe"] } }] };
+  const resolveFeatureArgumentCompletions = vi.fn(async () => [{ value: "completed" }]);
+  const ui = render(ComposerInput, { historyScope: "quoted-data-argument", resolveFeatureArgumentCompletions,
+    resolveFeatureCompletions: async () => [{ value: "run", invocation: descriptor }] });
+  const segment: Segment = { kind: "feature_invoke", invocation: { ...invocationSegment.invocation, arguments: [
+    { name: "path", value: { kind: "string", value: "a /run(pa" } },
+    { name: "mode", value: { kind: "string", value: "safe" } },
+  ] } };
+  ui.component.restoreSegments([segment]);
+  await fireEvent.mouseDown(ui.container.querySelector(".composer-typed-chip")!);
+  const cm = editor(ui.container);
+  await waitFor(() => expect(cm.state.doc.toString()).toBe('/run(path="a /run(pa", mode="safe")'));
+  cm.dispatch({ selection: { anchor: cm.state.doc.toString().lastIndexOf("(pa") + 3 } });
+  await waitFor(() => expect(resolveFeatureArgumentCompletions).toHaveBeenLastCalledWith(
+    { invocation: descriptor.identity, argument: "path" }, "a /run(pa", expect.any(AbortSignal),
+  ));
+  await ui.findByRole("option");
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter" });
+  expect(cm.state.doc.toString()).toBe('/run(path="completed", mode="safe")');
+});
+
+test("mid-cursor completion of an incomplete quote preserves following arguments and prose", async () => {
+  const descriptor: FeatureInvocationDescriptor = { ...invocationDescriptor, arguments: [...invocationDescriptor.arguments,
+    { name: "mode", required: false, value_type: { kind: "enum", values: ["safe"] }, completion: { kind: "static", values: ["safe"] } }] };
+  const ui = render(ComposerInput, { historyScope: "incomplete-quote-suffix",
+    resolveFeatureCompletions: async () => [{ value: "run", invocation: descriptor }],
+    resolveFeatureArgumentCompletions: async () => [{ value: "completed" }] });
+  const cm = editor(ui.container);
+  type(cm, "/ru");
+  await ui.findByRole("option");
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter" });
+  const value = '/run(path="ab, mode=safe) following prose';
+  cm.dispatch({ changes: { from: cm.state.doc.length, insert: value.slice(5) }, selection: { anchor: value.indexOf("ab") + 2 } });
+  await ui.findByRole("option");
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter" });
+  expect(cm.state.doc.toString()).toBe('/run(path="completed", mode=safe) following prose');
+  const snapshot = ui.component.snapshot();
+  expect(snapshot.segments[0]).toMatchObject({ kind: "feature_invoke", invocation: { arguments: [
+    { name: "path", value: { kind: "string", value: "completed" } },
+    { name: "mode", value: { kind: "string", value: "safe" } },
+  ] } });
+  expect(snapshot.segments[1]).toEqual({ kind: "text", content: " following prose" });
+});
+
+test("selected malformed surrogate strings stay editable and reject Submit snapshot", async () => {
+  const ui = render(ComposerInput, { historyScope: "invalid-surrogate-submit",
+    resolveFeatureCompletions: async () => [{ value: "run", invocation: invocationDescriptor }] });
+  const cm = editor(ui.container);
+  type(cm, "/ru");
+  await ui.findByRole("option");
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter" });
+  const invalid = String.raw`"\uD800")`;
+  cm.dispatch({ changes: { from: cm.state.doc.length, insert: invalid }, selection: { anchor: 5 + invalid.length } });
+  await Promise.resolve();
+  expect(ui.container.querySelector(".composer-typed-chip")).toBeNull();
+  expect(() => ui.component.snapshot()).toThrow("unpaired Unicode surrogates");
+  const valid = String.raw`"\uD83D\uDE00")`;
+  cm.dispatch({ changes: { from: 5, to: cm.state.doc.length, insert: valid }, selection: { anchor: 5 + valid.length } });
+  const snapshot = ui.component.snapshot();
+  expect(snapshot.segments[0]).toMatchObject({ kind: "feature_invoke", invocation: { arguments: [
+    { name: "path", value: { kind: "string", value: "😀" } },
+  ] } });
+});
+
+test("selected calls chipify without promoting matching typed or pasted text", async () => {
+  const ui = render(ComposerInput, { historyScope: "invocation-select",
+    resolveFeatureCompletions: async () => [{ value: "run", invocation: invocationDescriptor }] });
+  const cm = editor(ui.container);
+  type(cm, "/ru");
+  await ui.findByRole("option");
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter" });
+  cm.dispatch({ changes: { from: cm.state.doc.length, insert: '"a b/資料")' }, selection: { anchor: '/run("a b/資料")'.length } });
+  await waitFor(() => expect(ui.container.querySelectorAll(".composer-typed-chip")).toHaveLength(1));
+  cm.dispatch({ changes: { from: cm.state.doc.length, insert: ' /run("literal")' } });
+  await Promise.resolve();
+  const snapshot = ui.component.snapshot();
+  expect(snapshot.segments.map((segment) => segment.kind)).toEqual(["feature_invoke", "text"]);
+  expect(snapshot.segments[1]).toEqual({ kind: "text", content: ' /run("literal")' });
+  expect(snapshot.segments[0].kind === "feature_invoke" && snapshot.segments[0].invocation.arguments[0].value)
+    .toEqual({ kind: "string", value: "a b/資料" });
+});
+
+test("restored invocation chips fetch declarative descriptors and stay editable inside arguments", async () => {
+  const resolveFeatureCompletions = vi.fn(async () => [{ value: "run", invocation: invocationDescriptor }]);
+  const ui = render(ComposerInput, { historyScope: "invocation-edit", resolveFeatureCompletions });
+  ui.component.restoreSegments([invocationSegment]);
+  const cm = editor(ui.container);
+  await fireEvent.mouseDown(ui.container.querySelector(".composer-typed-chip")!);
+  await waitFor(() => expect(cm.state.doc.toString()).toBe('/run(path="a b/資料")'));
+  expect(resolveFeatureCompletions).toHaveBeenCalledWith("run", expect.any(AbortSignal));
+  cm.dispatch({ changes: { from: 11, to: 12, insert: "c" }, selection: { anchor: 12 } });
+  await Promise.resolve();
+  expect(ui.container.querySelector(".composer-typed-chip")).toBeNull();
+  const snapshot = ui.component.snapshot();
+  expect(snapshot.segments[0].kind).toBe("feature_invoke");
+});
+
+test("attachment adapter uses descriptor capability rather than a hardcoded slash name", async () => {
+  const onclientadapter = vi.fn();
+  const adapter = { ...invocationDescriptor, name: "send-file", arguments: [], client_adapter: "attachment" as const };
+  const ui = render(ComposerInput, { historyScope: "invocation-adapter", onclientadapter,
+    resolveFeatureCompletions: async () => [{ value: adapter.name, invocation: adapter }] });
+  const cm = editor(ui.container);
+  type(cm, "before /send");
+  await ui.findByRole("option");
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter" });
+  expect(onclientadapter).toHaveBeenCalledWith(adapter);
+  expect(cm.state.doc.toString()).toBe("before ");
+});
+
+test("uploads preserve reserved order, deletion undo, cleanup and accepted ownership", async () => {
+  const onremoveatom = vi.fn();
+  const ui = render(ComposerInput, { historyScope: "invocation-upload", onremoveatom });
+  const cm = editor(ui.container);
+  type(cm, "before ");
+  const first = ui.component.reserveUpload("report.md")!;
+  const second = ui.component.reserveUpload("second.md")!;
+  cm.dispatch({ changes: { from: cm.state.doc.length, insert: " after" } });
+  const secondSegment = { ...uploadedSegment, file: { ...uploadedSegment.file, artifact_id: "artifact-2", file_name: "second.md" } };
+  expect(ui.component.completeUpload(second, secondSegment)).toBe(true);
+  expect(ui.component.completeUpload(first, uploadedSegment)).toBe(true);
+  expect(ui.component.snapshot().segments).toEqual([
+    { kind: "text", content: "before " }, uploadedSegment, secondSegment, { kind: "text", content: " after" },
+  ]);
+  const tokenEnd = "before ".length + 3;
+  cm.dispatch({ selection: { anchor: tokenEnd } });
+  await fireEvent.keyDown(cm.contentDOM, { key: "Backspace" });
+  expect(onremoveatom).not.toHaveBeenCalled();
+  undo(cm);
+  expect(ui.component.snapshot().segments).toContainEqual(uploadedSegment);
+  ui.component.clear(true);
+  expect(onremoveatom).not.toHaveBeenCalled();
+  expect(undo(cm)).toBe(false);
+  ui.component.insertSegment(uploadedSegment, true);
+  ui.component.restoreSegments([invocationSegment]);
+  expect(onremoveatom).toHaveBeenCalledWith(uploadedSegment);
+});
+
+test("restored opaque segments and typed clipboard labels are not lost", async () => {
+  const ui = render(ComposerInput, { historyScope: "invocation-restore" });
+  const segments: Segment[] = [invocationSegment, uploadedSegment, { kind: "file_ref", path: "a b/c" }, { kind: "flow", selector: "legacy" }];
+  ui.component.restoreSegments(segments);
+  expect(ui.component.snapshot().segments).toEqual(segments);
+  const cm = editor(ui.container);
+  cm.dispatch({ selection: { anchor: 0, head: cm.state.doc.length } });
+  const setData = vi.fn();
+  await fireEvent.copy(cm.contentDOM, { clipboardData: { setData } });
+  expect(setData).toHaveBeenCalledWith("text/plain", expect.stringContaining('/run(path="a b/資料")'));
+  expect(setData.mock.calls[0][1]).not.toContain("\uFFF8");
+});
+
+test("restored descriptor requests cannot edit a newer draft after a scope change", async () => {
+  const request = deferred<Array<{ value: string; invocation: FeatureInvocationDescriptor }>>();
+  const resolver = vi.fn(() => request.promise);
+  const ui = render(ComposerInput, { historyScope: "invocation-stale-edit", completionScope: "worker-a", resolveFeatureCompletions: resolver });
+  ui.component.restoreSegments([invocationSegment]);
+  await fireEvent.mouseDown(ui.container.querySelector(".composer-typed-chip")!);
+  await waitFor(() => expect(resolver).toHaveBeenCalledOnce());
+  await ui.rerender({ completionScope: "worker-b" });
+  ui.component.restoreSegments([{ kind: "text", content: "new draft" }]);
+  request.resolve([{ value: "run", invocation: invocationDescriptor }]);
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(ui.component.snapshot().segments).toEqual([{ kind: "text", content: "new draft" }]);
+});
+
+test("pasted invocation text remains literal after descriptor selection", async () => {
+  const ui = render(ComposerInput, { historyScope: "invocation-paste-literal", resolveFeatureCompletions: async () => [{ value: "run", invocation: invocationDescriptor }] });
+  const cm = editor(ui.container);
+  type(cm, "/ru");
+  await ui.findByRole("option");
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter" });
+  cm.dispatch({ changes: { from: cm.state.doc.length, insert: '"x")' }, selection: { anchor: '/run("x")'.length } });
+  await waitFor(() => expect(ui.container.querySelectorAll(".composer-typed-chip")).toHaveLength(1));
+  await fireEvent.paste(cm.contentDOM, { clipboardData: { getData: () => ' /run("pasted")', items: [] } });
+  expect(ui.component.snapshot().segments.map((segment) => segment.kind)).toEqual(["feature_invoke", "text"]);
 });

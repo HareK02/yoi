@@ -720,6 +720,7 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         _handle: &WorkerExecutionHandle,
         _kind: protocol::CompletionKind,
         _prefix: &str,
+        _context: Option<&protocol::CompletionContext>,
     ) -> Vec<protocol::CompletionEntry> {
         Vec::new()
     }
@@ -942,8 +943,10 @@ impl WorkerExecutionBackendRef {
         handle: &WorkerExecutionHandle,
         kind: protocol::CompletionKind,
         prefix: &str,
+        context: Option<&protocol::CompletionContext>,
     ) -> Vec<protocol::CompletionEntry> {
-        self.backend.worker_completions(handle, kind, prefix)
+        self.backend
+            .worker_completions(handle, kind, prefix, context)
     }
 
     pub(crate) fn stop_worker_operation(

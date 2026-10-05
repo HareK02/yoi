@@ -827,6 +827,45 @@ function uploadedFile(
   };
 }
 
+function invocationValue(
+  value: unknown,
+  label: string,
+): Extract<Extract<Segment, { kind: "feature_invoke" }>["invocation"]["arguments"][number], { name: string }>["value"] {
+  const item = record(value, label);
+  const kind = string(item.kind, `${label}.kind`);
+  exact(item, ["kind", "value"], label);
+  if (kind === "string") return { kind, value: string(item.value, `${label}.value`) };
+  if (kind === "integer") {
+    const parsed = number(item.value, `${label}.value`);
+    if (!Number.isSafeInteger(parsed)) throw new Error(`${label}.value must be a safe integer`);
+    if (parsed < -2147483648 || parsed > 2147483647) throw new Error(`${label}.value must be a signed 32-bit integer`);
+    return { kind, value: parsed };
+  }
+  if (kind === "boolean") return { kind, value: boolean(item.value, `${label}.value`) };
+  throw new Error(`${label}.kind is invalid`);
+}
+
+function featureInvocation(
+  value: unknown,
+  label: string,
+): Extract<Segment, { kind: "feature_invoke" }>["invocation"] {
+  const item = record(value, label);
+  exact(item, ["invocation_id", "identity", "name", "arguments"], label);
+  return {
+    invocation_id: string(item.invocation_id, `${label}.invocation_id`),
+    identity: string(item.identity, `${label}.identity`),
+    name: string(item.name, `${label}.name`),
+    arguments: array(item.arguments, `${label}.arguments`, (argument, argumentLabel) => {
+      const entry = record(argument, argumentLabel);
+      exact(entry, ["name", "value"], argumentLabel);
+      return {
+        name: string(entry.name, `${argumentLabel}.name`),
+        value: invocationValue(entry.value, `${argumentLabel}.value`),
+      };
+    }),
+  };
+}
+
 function segment(value: unknown, label: string): Segment {
   const item = record(value, label);
   const kind = string(item.kind, `${label}.kind`) as Segment["kind"];
@@ -855,6 +894,12 @@ function segment(value: unknown, label: string): Segment {
     case "file_ref":
       exact(item, ["kind", "path"], label);
       return { kind, path: string(item.path, `${label}.path`) };
+    case "feature_invoke":
+      exact(item, ["kind", "invocation"], label);
+      return {
+        kind,
+        invocation: featureInvocation(item.invocation, `${label}.invocation`),
+      };
     case "flow":
       exact(item, ["kind", "selector"], label);
       return { kind, selector: string(item.selector, `${label}.selector`) };

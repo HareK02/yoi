@@ -1197,6 +1197,8 @@ mod tests {
                 method: crate::Method::ListCompletions {
                     kind: crate::CompletionKind::File,
                     prefix: "src/".to_string(),
+                    request_id: None,
+                    context: None,
                 },
             },
         ));

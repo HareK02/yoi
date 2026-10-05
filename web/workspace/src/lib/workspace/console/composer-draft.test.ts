@@ -3,6 +3,8 @@ import {
   composerDeletionRange,
   type ComposerPaste,
   composerPasteToken,
+  composerTypedAtoms,
+  composerTypedToken,
   pasteChipLabel,
   snapshotComposerDraft,
 } from "#lib/workspace/console/composer-draft.ts";
@@ -221,6 +223,50 @@ Deno.test("Paste content beginning with a colon remains opaque user input", () =
   assert(afterWhitespace.request);
   assertEquals(afterWhitespace.request.kind, "user");
   assertEquals(afterWhitespace.request.content, "  :not-a-command\r\n");
+});
+
+Deno.test("typed invocation and attachment atoms round-trip in source order and delete atomically", () => {
+  const invocation: Segment = {
+    kind: "feature_invoke",
+    invocation: {
+      invocation_id: "invoke-1",
+      identity: "builtin:test/run",
+      name: "run",
+      arguments: [{ name: "value", value: { kind: "string", value: "資料 x" } }],
+    },
+  };
+  const attachment: Segment = {
+    kind: "uploaded_file",
+    file: {
+      artifact_id: "artifact-1",
+      file_name: "report.md",
+      media_type: "text/markdown",
+      created_at_ms: 1,
+      availability: "available",
+      byte_len: 4,
+      sha256: "abcd",
+    },
+  };
+  const first = composerTypedToken(10);
+  const second = composerTypedToken(11);
+  const document = `before ${first} between ${second} after`;
+  const registry = new Map([
+    [10, { segment: invocation, label: '/run(value="資料 x")' }],
+    [11, { segment: attachment, label: "Attached report.md", cleanup: true }],
+  ]);
+  const snapshot = snapshotComposerDraft(document, new Map(), [], registry);
+  assertEquals(snapshot.segments.map((segment) => segment.kind), [
+    "text",
+    "feature_invoke",
+    "text",
+    "uploaded_file",
+    "text",
+  ]);
+  const atoms = composerTypedAtoms(document, registry);
+  assertEquals(
+    composerDeletionRange({ from: atoms[1].to, to: atoms[1].to, head: atoms[1].to }, atoms, "backward"),
+    { from: atoms[1].from, to: atoms[1].to },
+  );
 });
 
 Deno.test("plain short-paste Text retains the existing composer request path", () => {

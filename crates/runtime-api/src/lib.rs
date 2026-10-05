@@ -567,6 +567,8 @@ pub struct CompletionRequest {
     pub kind: CompletionKind,
     #[serde(default)]
     pub prefix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<protocol::CompletionContext>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1201,6 +1203,21 @@ pub const REMAINING_RUNTIME_ROUTES: &[RemainingRuntimeRoute] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feature_argument_completion_wire_preserves_source_and_argument() {
+        let json = serde_json::json!({"kind":"feature_argument", "prefix":"資料/", "context": {"invocation":"builtin:test/prepare", "argument":"path"}});
+        let request: CompletionRequest = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(request.kind, CompletionKind::FeatureArgument);
+        assert_eq!(
+            request.context.as_ref().unwrap().argument.as_deref(),
+            Some("path")
+        );
+        assert_eq!(serde_json::to_value(request).unwrap(), json);
+        let legacy: CompletionRequest =
+            serde_json::from_value(serde_json::json!({"kind":"file"})).unwrap();
+        assert!(legacy.context.is_none());
+    }
 
     #[derive(Clone)]
     struct RoundTripService;

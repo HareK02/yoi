@@ -56,8 +56,8 @@ use crate::feature::session::{
     SessionExtensionHandle,
 };
 use crate::feature::{
-    FeatureInstructionDeclaration, FeatureInstructionId, FeatureRegistryBuilder,
-    FeatureRegistryInstallReport, dedupe_instruction_contributions,
+    FeatureInstructionDeclaration, FeatureInstructionId, FeatureInvocationRegistry,
+    FeatureRegistryBuilder, FeatureRegistryInstallReport, dedupe_instruction_contributions,
 };
 use crate::hook::{
     BeforeSessionRewriteAction, BeforeSessionRewriteContext, Hook, HookHistoryRange,
@@ -82,6 +82,101 @@ const MAX_PENDING_SUBMISSION_BYTES: u64 = 1024 * 1024;
 const MAX_PENDING_ARTIFACT_REFS: usize = 64;
 const MAX_ACTIVATION_REQUEST_ID_BYTES: usize = 128;
 const MAX_SUBMISSION_RECEIPTS: usize = 128;
+const MAX_INVOCATION_RECEIPTS: usize = 1024;
+const MAX_INVOCATION_IDENTITY_BYTES: usize = 256;
+
+/// A durable start without a matching result is intentionally not retryable.
+/// This is a conservative fence, not an exactly-once business-operation ledger.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InvocationReceipt {
+    invocation_id: String,
+    identity: protocol::FeatureInvocationIdentity,
+    payload_digest: String,
+    result: Option<protocol::FeatureInvocationResult>,
+}
+
+impl InvocationReceipt {
+    fn new(
+        invocation: &protocol::FeatureInvocation,
+        result: Option<protocol::FeatureInvocationResult>,
+    ) -> Self {
+        Self {
+            invocation_id: invocation.invocation_id.clone(),
+            identity: invocation.identity.clone(),
+            payload_digest: invocation_payload_digest(invocation),
+            result,
+        }
+    }
+
+    fn matches(&self, invocation: &protocol::FeatureInvocation) -> bool {
+        self.invocation_id == invocation.invocation_id
+            && self.identity == invocation.identity
+            && self.payload_digest == invocation_payload_digest(invocation)
+    }
+
+    fn is_valid(&self) -> bool {
+        !self.invocation_id.trim().is_empty()
+            && self.invocation_id.len() <= protocol::invocation::MAX_FEATURE_INVOCATION_ID_BYTES
+            && !self.identity.0.is_empty()
+            && self.identity.0.len() <= MAX_INVOCATION_IDENTITY_BYTES
+            && self.payload_digest.len() == 64
+            && self
+                .payload_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            && self.result.as_ref().is_none_or(|result| {
+                result.invocation_id == self.invocation_id
+                    && result.identity == self.identity
+                    && crate::feature::invocation::invocation_result_is_bounded(result)
+                    && (result.status == protocol::FeatureInvocationStatus::Succeeded
+                        || result.context.is_none())
+            })
+    }
+}
+
+fn invocation_payload_digest(invocation: &protocol::FeatureInvocation) -> String {
+    submission_payload_digest(&[Segment::FeatureInvoke {
+        invocation: invocation.clone(),
+    }])
+}
+
+fn validate_activation_invocation_ids(input: &[Segment]) -> Result<(), String> {
+    if input
+        .iter()
+        .any(|segment| matches!(segment, Segment::Unknown))
+    {
+        return Err(
+            "unknown input segment rejected; unsupported intent must not be discarded".into(),
+        );
+    }
+    const MAX_INVOCATIONS_PER_SUBMISSION: usize = 8;
+    let mut ids = std::collections::BTreeSet::new();
+    for invocation in input.iter().filter_map(|segment| match segment {
+        Segment::FeatureInvoke { invocation } => Some(invocation),
+        _ => None,
+    }) {
+        if invocation.invocation_id.trim().is_empty()
+            || invocation.invocation_id.len()
+                > protocol::invocation::MAX_FEATURE_INVOCATION_ID_BYTES
+            || invocation.identity.0.is_empty()
+            || invocation.identity.0.len() > MAX_INVOCATION_IDENTITY_BYTES
+        {
+            return Err(
+                "invocation id/identity is empty or exceeds the recovery key byte limit".into(),
+            );
+        }
+        if !ids.insert(&invocation.invocation_id) {
+            return Err("duplicate invocation id in one submission".into());
+        }
+    }
+    if ids.len() > MAX_INVOCATIONS_PER_SUBMISSION {
+        return Err(format!(
+            "at most {MAX_INVOCATIONS_PER_SUBMISSION} Feature invocations are allowed per submission"
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PendingSubmission {
@@ -142,6 +237,12 @@ pub(crate) struct PendingActivationState {
     pending_notifications: VecDeque<PendingNotification>,
     receipts: VecDeque<SubmissionReceipt>,
     notification_receipts: VecDeque<NotificationReceipt>,
+    /// Retained across queue checkpoints, compaction, rewind and restore. Do not
+    /// evict starts/results: eviction would silently permit repeated effects.
+    #[serde(default)]
+    invocation_receipts: Vec<InvocationReceipt>,
+    #[serde(default)]
+    invocation_recovery_blocked: bool,
 }
 
 fn deserialize_activating_notifications<'de, D>(
@@ -308,6 +409,7 @@ fn pending_submission_preview(input: &[Segment]) -> String {
             Segment::UploadedFile { file } => ["[Attached file: ", &file.file_name, "]"],
             Segment::PasteArtifact { .. } => ["[Large paste]", "", ""],
             Segment::FileRef { path } => ["@", path, ""],
+            Segment::FeatureInvoke { invocation } => ["[Feature: ", &invocation.name, "]"],
             Segment::Flow { selector } => ["[Flow: ", selector, "]"],
             Segment::Unknown => ["[Unknown input]", "", ""],
         };
@@ -1493,6 +1595,8 @@ pub(crate) enum PendingSubmissionError {
     RequestIdLimit,
     #[error("submission input must contain at least one typed segment")]
     EmptyInput,
+    #[error("Feature invocation rejected: {0}")]
+    InvalidInvocation(String),
     #[error("submission request id was already used with a different payload")]
     IdempotencyConflict,
     #[error("pending submission queue is full (maximum {MAX_PENDING_SUBMISSIONS})")]
@@ -1652,6 +1756,8 @@ where
         if input.is_empty() {
             return Err(PendingSubmissionError::EmptyInput);
         }
+        validate_activation_invocation_ids(&input)
+            .map_err(PendingSubmissionError::InvalidInvocation)?;
         let payload_digest = submission_payload_digest(&input);
         let _append_guard = self
             .writer
@@ -2290,6 +2396,19 @@ impl WorkerSession {
             return;
         };
         if let Ok(mut state) = serde_json::from_value::<PendingActivationState>(payload.clone()) {
+            let mut ids = std::collections::BTreeSet::new();
+            if state.invocation_receipts.len() > MAX_INVOCATION_RECEIPTS
+                || state
+                    .invocation_receipts
+                    .iter()
+                    .any(|receipt| !receipt.is_valid() || !ids.insert(&receipt.invocation_id))
+            {
+                self.pending_activations
+                    .lock()
+                    .expect("pending activation state poisoned")
+                    .invocation_recovery_blocked = true;
+                return;
+            }
             if let Some(activating) = state.activating.take() {
                 state.pending.push_front(activating);
                 state.revision = state.revision.saturating_add(1);
@@ -2304,6 +2423,13 @@ impl WorkerSession {
                 .pending_activations
                 .lock()
                 .expect("pending activation state poisoned") = state;
+        } else {
+            // A malformed checkpoint must never turn a durable start into a
+            // new executable invocation on restore.
+            self.pending_activations
+                .lock()
+                .expect("pending activation state poisoned")
+                .invocation_recovery_blocked = true;
         }
     }
 
@@ -2401,6 +2527,8 @@ pub struct Worker<C: LlmClient, St: Store> {
     hook_registry: Option<Arc<HookRegistry>>,
     /// Executable background tasks registered by successfully installed features.
     feature_background_tasks: FeatureBackgroundTaskRegistry,
+    /// Enabled chat invocation metadata and executable handlers.
+    feature_invocations: FeatureInvocationRegistry,
     /// Internal Workers install an explicit Feature composition and disable
     /// manifest-derived lifecycle Features before controller startup.
     manifest_lifecycle_features_enabled: bool,
@@ -2739,6 +2867,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             hook_builder: HookRegistryBuilder::new(),
             hook_registry: None,
             feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
+            feature_invocations: FeatureInvocationRegistry::default(),
             manifest_lifecycle_features_enabled: true,
             interceptor_installed: false,
             compact_state: None,
@@ -3144,6 +3273,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.manifest_lifecycle_features_enabled
     }
 
+    pub fn feature_invocations(&self) -> FeatureInvocationRegistry {
+        self.feature_invocations.clone()
+    }
+
     /// Install enabled feature modules into the Worker host surfaces.
     pub fn install_features(
         &mut self,
@@ -3155,6 +3288,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             return report;
         }
         self.feature_background_tasks = report.background_tasks.clone();
+        self.feature_invocations = report.chat_invocations.clone();
         for instruction in report.installed_instruction_contributions() {
             self.register_feature_instruction(instruction);
         }
@@ -4289,6 +4423,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         St: Clone + 'static,
         F: FnOnce(),
     {
+        validate_activation_invocation_ids(&input).map_err(WorkerError::FeatureInvocation)?;
         let (mut input, pending_flow_state, flow_projection) = self.prepare_flow_input(input)?;
         let projected_entry_ids = if flow_projection.is_some() {
             (0..input.len())
@@ -4366,6 +4501,27 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.user_segments.push(input.clone());
         on_input_committed();
 
+        // Explicit invocation handlers run only after the typed input is durable
+        // and before any dependent LLM request. They execute in source order;
+        // the first failure fences later invocations in the same submission.
+        let has_invocations = input
+            .iter()
+            .any(|segment| matches!(segment, Segment::FeatureInvoke { .. }));
+        match self.execute_feature_invocations(&input).await {
+            Ok(false) => {}
+            Ok(true) => {
+                self.materialize_committed_activation_history(&projected_input);
+                return Err(WorkerError::FeatureInvocation(
+                    "activation preparation failed or has an unknown outcome; dependent LLM request was not sent".into(),
+                ));
+            }
+            Err(error) => {
+                self.materialize_committed_activation_history(&projected_input);
+                return Err(error);
+            }
+        }
+        let committed_activation_input = has_invocations.then(|| projected_input.clone());
+
         // Resolve `@<path>` file refs to system messages stashed for the
         // WorkerInterceptor to attach right after the user message. Resolution
         // failures are non-fatal alerts.
@@ -4413,12 +4569,264 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.engine = Some(locked.unlock());
         self.session.note_mutation();
 
-        if self.should_rollback_empty_turn(&result, &rollback_snapshot) {
+        if let Some(input) = &committed_activation_input {
+            // A prompt hook may cancel before Engine materializes input/results.
+            // Business preparation is already durable and cannot be rolled back.
+            self.materialize_committed_activation_history(input);
+        }
+        if !has_invocations && self.should_rollback_empty_turn(&result, &rollback_snapshot) {
             self.rollback_empty_turn(rollback_snapshot)?;
             return Ok(WorkerRunResult::RolledBack);
         }
 
         self.handle_worker_result(result, history_before).await
+    }
+
+    async fn execute_feature_invocations(&self, segments: &[Segment]) -> Result<bool, WorkerError>
+    where
+        St: Clone + 'static,
+    {
+        use protocol::{FeatureInvocationResult, FeatureInvocationStatus};
+        let invocations = segments
+            .iter()
+            .filter_map(|segment| match segment {
+                Segment::FeatureInvoke { invocation } => Some(invocation),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut prior_failure = false;
+        for invocation in invocations {
+            let failed = |status, message: String| FeatureInvocationResult {
+                invocation_id: invocation.invocation_id.clone(),
+                identity: invocation.identity.clone(),
+                status,
+                message,
+                context: None,
+            };
+            let handle = self.pending_submission_handle();
+            // Use the queue's append/state lock order. Never hold a lock while
+            // awaiting business execution. A durable start without result fences
+            // both restart and same-process replay.
+            let (existing, recovery_blocked) = {
+                let state = handle
+                    .state
+                    .lock()
+                    .expect("pending activation state poisoned");
+                (
+                    state
+                        .invocation_receipts
+                        .iter()
+                        .find(|receipt| receipt.invocation_id == invocation.invocation_id)
+                        .cloned(),
+                    state.invocation_recovery_blocked,
+                )
+            };
+            let result = if recovery_blocked {
+                failed(
+                    FeatureInvocationStatus::OutcomeUnknown,
+                    "invocation recovery checkpoint is invalid; execution is fenced".into(),
+                )
+            } else if prior_failure {
+                failed(
+                    FeatureInvocationStatus::Failed,
+                    "not executed because an earlier invocation in this submission failed".into(),
+                )
+            } else if let Some(receipt) = &existing {
+                if !receipt.matches(invocation) {
+                    failed(
+                        FeatureInvocationStatus::Failed,
+                        "invocation id was already used with a different payload".into(),
+                    )
+                } else {
+                    let replay = receipt.result.clone().unwrap_or_else(|| {
+                        failed(
+                            FeatureInvocationStatus::OutcomeUnknown,
+                            "a durable invocation start has no result; do not retry automatically"
+                                .into(),
+                        )
+                    });
+                    if replay.status == FeatureInvocationStatus::Succeeded {
+                        // Recorded success is reusable context, not authority to
+                        // resurrect a capability removed from this composition.
+                        match self.feature_invocations.validate_metadata(invocation) {
+                            Ok(()) => replay,
+                            Err(error) => failed(FeatureInvocationStatus::Failed, error.message),
+                        }
+                    } else {
+                        replay
+                    }
+                }
+            } else if let Err(error) = self.feature_invocations.validate(invocation) {
+                failed(FeatureInvocationStatus::Failed, error.message)
+            } else {
+                let started = {
+                    let _append = handle
+                        .writer
+                        .state
+                        .append_lock
+                        .lock()
+                        .expect("segment append lock poisoned");
+                    let mut state = handle
+                        .state
+                        .lock()
+                        .expect("pending activation state poisoned");
+                    if state.invocation_receipts.len() >= MAX_INVOCATION_RECEIPTS {
+                        false
+                    } else {
+                        let mut started = state.clone();
+                        started
+                            .invocation_receipts
+                            .push(InvocationReceipt::new(invocation, None));
+                        handle
+                            .persist_locked(&started)
+                            .map_err(|error| WorkerError::FeatureInvocation(error.to_string()))?;
+                        *state = started;
+                        true
+                    }
+                };
+                if !started {
+                    failed(FeatureInvocationStatus::Failed,
+                        "invocation recovery receipt capacity reached; refusing untracked execution".into())
+                } else {
+                    match self.feature_invocations.invoke(invocation).await {
+                        Ok(result) => result,
+                        Err(error) => failed(
+                            if error.outcome_unknown {
+                                FeatureInvocationStatus::OutcomeUnknown
+                            } else {
+                                FeatureInvocationStatus::Failed
+                            },
+                            error.message,
+                        ),
+                    }
+                }
+            };
+            prior_failure |= result.status != FeatureInvocationStatus::Succeeded;
+            let body = match (&result.status, &result.context) {
+                (FeatureInvocationStatus::Succeeded, Some(context)) => format!(
+                    "[Feature invocation succeeded: {}]\n{}",
+                    result.identity, context
+                ),
+                (FeatureInvocationStatus::Succeeded, None) => format!(
+                    "[Feature invocation succeeded: {}] {}",
+                    result.identity, result.message
+                ),
+                (FeatureInvocationStatus::Failed, _) => format!(
+                    "[Feature invocation failed: {}] {}",
+                    result.identity, result.message
+                ),
+                (FeatureInvocationStatus::OutcomeUnknown, _) => format!(
+                    "[Feature invocation outcome unknown: {}] {} Do not retry automatically.",
+                    result.identity, result.message
+                ),
+            };
+            // Commit result and recovery checkpoint atomically with the existing
+            // AnnotatedSystemItem lifecycle. Failed appends leave the start fenced.
+            let _append = handle
+                .writer
+                .state
+                .append_lock
+                .lock()
+                .expect("segment append lock poisoned");
+            let mut state = handle
+                .state
+                .lock()
+                .expect("pending activation state poisoned");
+            let mut completed = state.clone();
+            if let Some(receipt) = completed
+                .invocation_receipts
+                .iter_mut()
+                .find(|receipt| receipt.matches(invocation) && receipt.result.is_none())
+            {
+                receipt.result = Some(result.clone());
+            } else if existing.is_none()
+                && completed.invocation_receipts.len() < MAX_INVOCATION_RECEIPTS
+            {
+                completed
+                    .invocation_receipts
+                    .push(InvocationReceipt::new(invocation, Some(result.clone())));
+            }
+            let item = SystemItem::FeatureInvocationResult { result, body };
+            let metadata = new_history_metadata(
+                WorkerHistoryProvenance::BackendInstruction { operation_id: None },
+                None,
+            );
+            let history = HistoryEntry::new(item.to_history_item(), metadata.clone());
+            handle
+                .writer
+                .append_entry_locked(LogEntry::AnnotatedSystemItem {
+                    ts: segment_log::now_millis(),
+                    entry: session_store::LoggedSystemHistoryEntry { item, metadata },
+                    extensions: vec![pending_activation_extension(&completed)],
+                })?;
+            *state = completed;
+            self.pending_committed_history
+                .lock()
+                .expect("pending committed history poisoned")
+                .push_back(history);
+        }
+        Ok(prior_failure)
+    }
+
+    fn materialize_committed_activation_history(
+        &mut self,
+        input: &[HistoryEntry<SessionHistoryMetadata>],
+    ) {
+        let pending = self
+            .pending_committed_history
+            .lock()
+            .expect("pending committed history poisoned")
+            .drain(..)
+            .collect::<Vec<_>>();
+        for entry in input.iter().cloned().chain(pending) {
+            if !self
+                .session
+                .history()
+                .entries()
+                .iter()
+                .any(|existing| existing.annotation.entry_id == entry.annotation.entry_id)
+            {
+                self.session.history_mut().push_entry(entry);
+            }
+        }
+        self.session.note_mutation();
+    }
+
+    fn ensure_invocation_preparation_complete(&self) -> Result<(), WorkerError> {
+        let state = self
+            .session
+            .pending_activations
+            .lock()
+            .expect("pending activation state poisoned");
+        if state.invocation_recovery_blocked {
+            return Err(WorkerError::FeatureInvocation(
+                "invocation recovery checkpoint is invalid".into(),
+            ));
+        }
+        if let Some(input) = self.user_segments.last() {
+            for invocation in input.iter().filter_map(|segment| match segment {
+                Segment::FeatureInvoke { invocation } => Some(invocation),
+                _ => None,
+            }) {
+                let succeeded = state.invocation_receipts.iter().any(|receipt| {
+                    receipt.matches(invocation)
+                        && receipt.result.as_ref().is_some_and(|result| {
+                            result.status == protocol::FeatureInvocationStatus::Succeeded
+                        })
+                });
+                if !succeeded
+                    || self
+                        .feature_invocations
+                        .validate_metadata(invocation)
+                        .is_err()
+                {
+                    return Err(WorkerError::FeatureInvocation(
+                        "activation preparation is failed, incomplete, or outcome unknown; submit fresh input instead of resuming".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Resolve every `Segment::FileRef` in `segments` to a `[File: <path>]`
@@ -4732,6 +5140,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     where
         St: Clone + 'static,
     {
+        self.ensure_invocation_preparation_complete()?;
         debug_assert!(
             matches!(
                 kind,
@@ -4788,6 +5197,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     where
         St: Clone + 'static,
     {
+        self.ensure_invocation_preparation_complete()?;
         self.prepare_for_run().await?;
         self.resume_prepared(source).await
     }
@@ -6703,6 +7113,7 @@ where
             hook_builder: HookRegistryBuilder::new(),
             hook_registry: None,
             feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
+            feature_invocations: FeatureInvocationRegistry::default(),
             manifest_lifecycle_features_enabled: true,
             interceptor_installed: false,
             compact_state: None,
@@ -6980,6 +7391,7 @@ where
             hook_builder: HookRegistryBuilder::new(),
             hook_registry: None,
             feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
+            feature_invocations: FeatureInvocationRegistry::default(),
             manifest_lifecycle_features_enabled: false,
             interceptor_installed: false,
             compact_state: None,
@@ -7105,6 +7517,7 @@ where
             hook_builder: HookRegistryBuilder::new(),
             hook_registry: None,
             feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
+            feature_invocations: FeatureInvocationRegistry::default(),
             manifest_lifecycle_features_enabled: true,
             interceptor_installed: false,
             compact_state: None,
@@ -7486,6 +7899,7 @@ where
             hook_builder: HookRegistryBuilder::new(),
             hook_registry: None,
             feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
+            feature_invocations: FeatureInvocationRegistry::default(),
             manifest_lifecycle_features_enabled: true,
             interceptor_installed: false,
             compact_state: None,
@@ -8219,6 +8633,9 @@ fn preview_segments(segments: &[Segment]) -> String {
                 preview.push('@');
                 preview.push_str(path);
             }
+            Segment::FeatureInvoke { invocation } => {
+                preview.push_str(&invocation.display_input());
+            }
             Segment::Flow { selector } => {
                 preview.push_str("[Flow: ");
                 preview.push_str(selector);
@@ -8334,6 +8751,9 @@ pub enum WorkerError {
         state: &'static str,
         message: String,
     },
+
+    #[error("Feature invocation rejected: {0}")]
+    FeatureInvocation(String),
 
     #[error("Flow input rejected: {0}")]
     FlowInput(String),
@@ -9635,6 +10055,7 @@ mod build_summary_prompt_tests {
     struct FailRunTerminalStore {
         inner: session_store::FsStore,
         fail_run_terminal: Arc<AtomicBool>,
+        invocation_failure: Arc<AtomicUsize>,
     }
 
     impl Store for FailRunTerminalStore {
@@ -9649,6 +10070,35 @@ mod build_summary_prompt_tests {
             {
                 return Err(StoreError::Io(std::io::Error::other(
                     "synthetic terminal append failure",
+                )));
+            }
+            let invocation_kind = match entry {
+                LogEntry::Extension {
+                    domain, payload, ..
+                } if domain == SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN
+                    && payload["invocation_receipts"]
+                        .as_array()
+                        .is_some_and(|receipts| {
+                            receipts.iter().any(|receipt| receipt["result"].is_null())
+                        }) =>
+                {
+                    1
+                }
+                LogEntry::AnnotatedSystemItem { entry, .. }
+                    if matches!(entry.item, SystemItem::FeatureInvocationResult { .. }) =>
+                {
+                    2
+                }
+                _ => 0,
+            };
+            if invocation_kind != 0
+                && self
+                    .invocation_failure
+                    .compare_exchange(invocation_kind, 0, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                return Err(StoreError::Io(std::io::Error::other(
+                    "synthetic invocation append failure",
                 )));
             }
             self.inner.append(session_id, segment_id, entry)
@@ -10342,6 +10792,7 @@ mod build_summary_prompt_tests {
         let store = FailRunTerminalStore {
             inner: session_store::FsStore::new(dir.path().join("sessions")).unwrap(),
             fail_run_terminal: Arc::new(AtomicBool::new(false)),
+            invocation_failure: Arc::new(AtomicUsize::new(0)),
         };
         let mut worker = Worker::new(
             minimal_manifest(),
@@ -13297,12 +13748,447 @@ permission = "write"
         assert!(matches!(submission, PendingActivation::Submission(_)));
     }
 
+    #[derive(Clone)]
+    struct RecoveryInvocationFeature {
+        calls: Arc<AtomicUsize>,
+        sink: SegmentLogSink,
+    }
+
+    fn recovery_invocation_descriptor() -> protocol::FeatureInvocationDescriptor {
+        protocol::FeatureInvocationDescriptor {
+            identity: protocol::FeatureInvocationIdentity("builtin:recovery-test/prepare".into()),
+            name: "prepare".into(),
+            aliases: Vec::new(),
+            display_name: "Prepare".into(),
+            description: "Test recovery".into(),
+            syntax: protocol::FeatureInvocationSyntax::Parenthesized,
+            arguments: Vec::new(),
+            client_adapter: None,
+        }
+    }
+
+    fn recovery_invocation(id: &str) -> Segment {
+        Segment::FeatureInvoke {
+            invocation: protocol::FeatureInvocation {
+                invocation_id: id.into(),
+                identity: recovery_invocation_descriptor().identity,
+                name: "prepare".into(),
+                arguments: Vec::new(),
+            },
+        }
+    }
+
+    impl crate::feature::FeatureModule for RecoveryInvocationFeature {
+        fn descriptor(&self) -> crate::feature::FeatureDescriptor {
+            crate::feature::FeatureDescriptor::builtin("recovery-test", "Recovery test")
+                .with_chat_invocation(recovery_invocation_descriptor())
+        }
+        fn install(
+            &self,
+            context: &mut crate::feature::FeatureInstallContext<'_>,
+        ) -> Result<(), crate::feature::FeatureInstallError> {
+            context
+                .chat_invocations()
+                .register(recovery_invocation_descriptor(), self.clone())
+        }
+    }
+
+    #[async_trait]
+    impl crate::feature::FeatureInvocationHandler for RecoveryInvocationFeature {
+        async fn invoke(
+            &self,
+            context: crate::feature::FeatureInvocationContext,
+            invocation: &protocol::FeatureInvocation,
+        ) -> Result<protocol::FeatureInvocationResult, crate::feature::FeatureInvocationHandlerError>
+        {
+            let entries = self.sink.subscribe_with_snapshot().0;
+            let start = entries
+                .iter()
+                .rev()
+                .find_map(|entry| match entry {
+                    LogEntry::Extension {
+                        domain, payload, ..
+                    } if domain == SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN => {
+                        serde_json::from_value::<PendingActivationState>(payload.clone()).ok()
+                    }
+                    _ => None,
+                })
+                .expect("durable start must precede handler");
+            assert!(
+                start
+                    .invocation_receipts
+                    .iter()
+                    .any(|receipt| { receipt.matches(invocation) && receipt.result.is_none() })
+            );
+            assert_eq!(context.invocation_id, invocation.invocation_id);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if invocation.invocation_id == "incomplete" {
+                futures::future::pending::<()>().await;
+            }
+            Ok(protocol::FeatureInvocationResult {
+                invocation_id: invocation.invocation_id.clone(),
+                identity: invocation.identity.clone(),
+                status: protocol::FeatureInvocationStatus::Succeeded,
+                message: "done".into(),
+                context: Some("prepared recovery context".into()),
+            })
+        }
+    }
+
+    fn install_recovery_invocation<C: LlmClient + 'static, St: Store>(
+        worker: &mut Worker<C, St>,
+        calls: Arc<AtomicUsize>,
+    ) {
+        let feature = RecoveryInvocationFeature {
+            calls,
+            sink: worker.sink(),
+        };
+        assert!(
+            !worker
+                .install_features(FeatureRegistryBuilder::new().with_module(feature))
+                .has_errors()
+        );
+    }
+
+    #[tokio::test]
+    async fn feature_invocation_restart_reuses_completed_results_and_fences_incomplete_starts() {
+        let runtime = tempfile::tempdir().unwrap();
+        let _sandbox = worker_allocation::test_util::RuntimeDirSandbox::new(runtime.path());
+        for id in ["completed", "incomplete"] {
+            let dir = tempfile::tempdir().unwrap();
+            let cwd = dir.path().join("workspace");
+            std::fs::create_dir_all(&cwd).unwrap();
+            let mut engine =
+                Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient);
+            engine.set_system_prompt("recovery test system prompt");
+            let mut manifest = minimal_manifest();
+            manifest.scope.allow[0].target = cwd.clone();
+            let mut original = Worker::new(
+                manifest,
+                engine,
+                session_store::FsStore::new(dir.path().join("sessions")).unwrap(),
+                WorkerWorkspaceContext::local_filesystem(None),
+                WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone()),
+                Scope::writable(&cwd).unwrap(),
+            )
+            .await
+            .unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            install_recovery_invocation(&mut original, calls.clone());
+            let input = vec![recovery_invocation(id)];
+            if id == "incomplete" {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(20), original.run(input.clone()))
+                        .await
+                        .is_err()
+                );
+            } else {
+                let _ = original.run(input.clone()).await;
+                let entries = original.sink().subscribe_with_snapshot().0;
+                assert!(entries.iter().any(|entry| match entry {
+                    LogEntry::AnnotatedSystemItem {
+                        entry, extensions, ..
+                    } => {
+                        matches!(entry.item, SystemItem::FeatureInvocationResult { .. })
+                            && extensions.iter().any(|extension| {
+                                extension.domain == SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN
+                                    && serde_json::from_value::<PendingActivationState>(
+                                        extension.payload.clone(),
+                                    )
+                                    .unwrap()
+                                    .invocation_receipts
+                                    .iter()
+                                    .any(|receipt| receipt.result.is_some())
+                            })
+                    }
+                    _ => false,
+                }));
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let session = original.session_id();
+            let segment = original.segment_id();
+            let store = session_store::CombinedStore::new(
+                original.store.clone(),
+                session_store::FsWorkerStore::new(dir.path().join("workers")).unwrap(),
+            );
+            let manifest = original.manifest.clone();
+            drop(original);
+            let cwd = dir.path().join("workspace");
+            let mut restored = Worker::<Box<dyn LlmClient>, _>::restore_from_manifest_with_context_and_model_client(
+                session, segment, manifest, store,
+                crate::prompt::source::PromptCatalogSource::builtins_only(),
+                WorkerWorkspaceContext::local_filesystem(None),
+                WorkerFilesystemAuthority::local(cwd.clone(), cwd),
+                Some(Box::new(NoopClient)),
+            ).await.unwrap();
+            install_recovery_invocation(&mut restored, calls.clone());
+            if id == "incomplete" {
+                assert!(restored.resume().await.is_err());
+                assert!(
+                    restored
+                        .run_for_notification(protocol::InvokeKind::Notify)
+                        .await
+                        .is_err()
+                );
+                assert!(restored.run(input).await.is_err());
+                let last = restored
+                    .session
+                    .pending_activations
+                    .lock()
+                    .unwrap()
+                    .invocation_receipts[0]
+                    .result
+                    .clone()
+                    .unwrap();
+                assert_eq!(
+                    last.status,
+                    protocol::FeatureInvocationStatus::OutcomeUnknown
+                );
+            } else {
+                let _ = restored.run(input).await;
+                assert!(restored.ensure_invocation_preparation_complete().is_ok());
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "restore/replay must not repeat business execution"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn feature_invocation_queue_receipts_prevent_activation_and_business_replay() {
+        let (_dir, mut worker) = rewind_test_worker().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        install_recovery_invocation(&mut worker, calls.clone());
+        let input = vec![recovery_invocation("queued")];
+        let handle = worker.pending_submission_handle();
+        let accepted = handle
+            .accept("request-1".into(), input.clone(), false)
+            .unwrap();
+        let repeated = handle
+            .accept("request-1".into(), input.clone(), false)
+            .unwrap();
+        assert_eq!(accepted.submission_id, repeated.submission_id);
+        assert_eq!(handle.snapshot().submissions.len(), 1);
+        let PendingActivation::Submission(pending) =
+            handle.prepare_next_activation(None).unwrap().unwrap();
+        let id = pending.submission_id.clone();
+        let extension = handle.activation_extension();
+        let finished = handle.clone();
+        let _ = worker
+            .run_with_input_extensions_and_commit_hook(
+                pending.input,
+                vec![extension],
+                pending.provenance,
+                move || finished.finish_activation(&id),
+            )
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let replay = handle
+            .accept("request-1".into(), input.clone(), false)
+            .unwrap();
+        assert!(replay.activation.is_none());
+        assert!(handle.prepare_next_activation(None).unwrap().is_none());
+        let _ = worker.run(input).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn feature_invocation_start_and_result_append_failures_fence_execution_and_replay() {
+        for failure in [1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = FailRunTerminalStore {
+                inner: session_store::FsStore::new(dir.path().join("sessions")).unwrap(),
+                fail_run_terminal: Arc::new(AtomicBool::new(false)),
+                invocation_failure: Arc::new(AtomicUsize::new(failure)),
+            };
+            let mut worker = Worker::new(
+                minimal_manifest(),
+                Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+                store,
+                WorkerWorkspaceContext::no_workspace(),
+                WorkerFilesystemAuthority::None,
+                Scope::empty(),
+            )
+            .await
+            .unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            install_recovery_invocation(&mut worker, calls.clone());
+            let input = vec![recovery_invocation("fault")];
+            assert!(worker.run(input.clone()).await.is_err());
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                if failure == 1 { 0 } else { 1 }
+            );
+            assert!(worker.resume().await.is_err());
+            if failure == 1 {
+                // No start became durable and no effect ran; an explicit fresh
+                // submission may execute after the append fault is corrected.
+                let _ = worker.run(input).await;
+            } else {
+                // Effect ran but result did not become durable. Do not invoke
+                // the handler a second time even when the Store is healthy.
+                assert!(worker.run(input).await.is_err());
+                let result = worker
+                    .session
+                    .pending_activations
+                    .lock()
+                    .unwrap()
+                    .invocation_receipts[0]
+                    .result
+                    .clone()
+                    .unwrap();
+                assert_eq!(
+                    result.status,
+                    protocol::FeatureInvocationStatus::OutcomeUnknown
+                );
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn feature_invocation_corrupt_checkpoint_fails_closed() {
+        let (_dir, mut worker) = rewind_test_worker().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        install_recovery_invocation(&mut worker, calls.clone());
+        worker.session.restore_pending_activations(&[(
+            SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN.into(),
+            serde_json::json!({"invocation_receipts": "corrupt"}),
+        )]);
+        assert!(worker.run(vec![recovery_invocation("new")]).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn feature_invocation_receipts_retain_digest_not_arguments_and_detect_payload_changes() {
+        let Segment::FeatureInvoke { mut invocation } = recovery_invocation("large") else {
+            unreachable!()
+        };
+        invocation.arguments = (0..32)
+            .map(|index| protocol::InvocationArgumentValue {
+                name: format!("arg{index}"),
+                value: protocol::InvocationValue::String("private-argument".repeat(1024)),
+            })
+            .collect();
+        let receipt = InvocationReceipt::new(&invocation, None);
+        assert!(receipt.matches(&invocation));
+        assert!(receipt.is_valid());
+        let serialized = serde_json::to_vec(&receipt).unwrap();
+        assert!(serialized.len() < 512);
+        assert!(
+            !String::from_utf8(serialized)
+                .unwrap()
+                .contains("private-argument")
+        );
+        let mut altered = invocation.clone();
+        altered.arguments[0].value = protocol::InvocationValue::String("different".into());
+        assert!(!receipt.matches(&altered));
+        altered = invocation.clone();
+        altered.name = "alias".into();
+        assert!(!receipt.matches(&altered));
+        altered = invocation.clone();
+        altered.arguments.reverse();
+        assert!(!receipt.matches(&altered));
+        let state = PendingActivationState {
+            invocation_receipts: vec![receipt; MAX_INVOCATION_RECEIPTS],
+            ..PendingActivationState::default()
+        };
+        assert!(serde_json::to_vec(&state).unwrap().len() < 512 * MAX_INVOCATION_RECEIPTS);
+    }
+
+    #[test]
+    fn feature_invocation_structurally_valid_corrupt_receipts_fail_closed_on_restore() {
+        let Segment::FeatureInvoke { invocation } = recovery_invocation("corrupt") else {
+            unreachable!()
+        };
+        let receipt = InvocationReceipt::new(&invocation, None);
+        let valid = serde_json::to_value(PendingActivationState {
+            invocation_receipts: vec![receipt],
+            ..PendingActivationState::default()
+        })
+        .unwrap();
+        let mut variants = Vec::new();
+        let mut digest = valid.clone();
+        digest["invocation_receipts"][0]["payload_digest"] = serde_json::json!("not-sha256");
+        variants.push(digest);
+        let mut duplicate = valid.clone();
+        duplicate["invocation_receipts"]
+            .as_array_mut()
+            .unwrap()
+            .push(valid["invocation_receipts"][0].clone());
+        variants.push(duplicate);
+        let mut identity = valid.clone();
+        identity["invocation_receipts"][0]["result"] =
+            serde_json::to_value(protocol::FeatureInvocationResult {
+                invocation_id: "foreign".into(),
+                identity: invocation.identity.clone(),
+                status: protocol::FeatureInvocationStatus::Succeeded,
+                message: "done".into(),
+                context: None,
+            })
+            .unwrap();
+        variants.push(identity);
+        let mut oversized = valid.clone();
+        oversized["invocation_receipts"][0]["result"] =
+            serde_json::to_value(protocol::FeatureInvocationResult {
+                invocation_id: invocation.invocation_id.clone(),
+                identity: invocation.identity.clone(),
+                status: protocol::FeatureInvocationStatus::Succeeded,
+                message: "done".into(),
+                context: Some("x".repeat(16385)),
+            })
+            .unwrap();
+        variants.push(oversized);
+        let mut old_shape = valid;
+        old_shape["invocation_receipts"][0]["invocation"] =
+            serde_json::to_value(invocation).unwrap();
+        variants.push(old_shape);
+        for payload in variants {
+            let mut session = WorkerSession::new(session_store::new_session_id(), Vec::new());
+            session.restore_pending_activations(&[(
+                SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN.into(),
+                payload,
+            )]);
+            assert!(
+                session
+                    .pending_activations
+                    .lock()
+                    .unwrap()
+                    .invocation_recovery_blocked
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn feature_invocation_unknown_segments_rejected_at_queue_admission() {
+        let (_dir, worker) = rewind_test_worker().await;
+        let handle = worker.pending_submission_handle();
+        for activate_now in [true, false] {
+            let before = handle.persisted_entries_for_test().len();
+            assert!(
+                handle
+                    .accept(
+                        "unknown".into(),
+                        vec![Segment::text("intent"), Segment::Unknown],
+                        activate_now
+                    )
+                    .is_err()
+            );
+            assert_eq!(handle.persisted_entries_for_test().len(), before);
+            assert!(handle.snapshot().submissions.is_empty());
+        }
+    }
+
     #[test]
     fn restoring_an_in_flight_activation_requeues_it_at_the_fifo_head() {
         let mut session = WorkerSession::new(session_store::new_session_id(), Vec::new());
         let state = PendingActivationState {
             revision: 4,
             next_activation_sequence: 3,
+            invocation_receipts: Vec::new(),
+            invocation_recovery_blocked: false,
             activating: Some(PendingSubmission {
                 submission_request_id: "request-1".into(),
                 source_namespace: "direct:test".into(),
