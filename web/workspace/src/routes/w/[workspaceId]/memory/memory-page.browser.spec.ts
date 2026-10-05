@@ -34,6 +34,8 @@ function subject() {
   return {
     id: "subject-1",
     role: "Release coordinator",
+    behavior_md: "Prefer explicit evidence.",
+    behavior_revision: 2,
     state: "active" as const,
     store_revision: 9,
     created_at: "2026-01-01T00:00:00Z",
@@ -96,6 +98,12 @@ test("creates one Subject with the exact role and navigates to its generated det
   }) as HTMLInputElement;
   await waitFor(() => expect(document.activeElement).toBe(roleInput));
   await fireEvent.input(roleInput, { target: { value: "  Review lead  " } });
+  const behaviorInput = screen.getByRole("textbox", {
+    name: /Behavior/,
+  }) as HTMLTextAreaElement;
+  await fireEvent.input(behaviorInput, {
+    target: { value: "Challenge unsupported assumptions." },
+  });
 
   const submit = screen.getByRole("button", { name: "Create Subject" });
   await fireEvent.click(submit);
@@ -110,6 +118,8 @@ test("creates one Subject with the exact role and navigates to its generated det
   resolveRequest(Response.json({
     id: "generated-subject-1",
     role: "  Review lead  ",
+    behavior_md: "Challenge unsupported assumptions.",
+    behavior_revision: 0,
     state: "active",
     store_revision: 0,
     created_at: "2026-01-03T00:00:00Z",
@@ -127,7 +137,9 @@ test("creates one Subject with the exact role and navigates to its generated det
   ];
   expect(path).toBe("/api/w/workspace-1/subjektiv/subjects");
   expect(init.method).toBe("POST");
-  expect(init.body).toBe('{"role":"  Review lead  "}');
+  expect(init.body).toBe(
+    '{"role":"  Review lead  ","behavior_md":"Challenge unsupported assumptions."}',
+  );
 });
 
 test("keeps creation available for an empty list and restores focus on cancel", async () => {
@@ -146,7 +158,7 @@ test("keeps creation available for an empty list and restores focus on cancel", 
   expect(screen.queryByRole("textbox", { name: "Role" })).toBeNull();
 });
 
-test("preserves invalid and rejected role drafts with accessible errors", async () => {
+test("preserves invalid and rejected Subject drafts with accessible field errors", async () => {
   const fetchMock = vi.fn(() =>
     Promise.resolve(Response.json(
       {
@@ -172,6 +184,20 @@ test("preserves invalid and rejected role drafts with accessible errors", async 
   expect(fetchMock).not.toHaveBeenCalled();
 
   await fireEvent.input(input, { target: { value: "Release reviewer" } });
+  const behaviorInput = screen.getByRole("textbox", {
+    name: /Behavior/,
+  }) as HTMLTextAreaElement;
+  await fireEvent.input(behaviorInput, { target: { value: "   " } });
+  await fireEvent.click(screen.getByRole("button", { name: "Create Subject" }));
+  expect(screen.getByRole("alert").textContent).toContain(
+    "empty or contain non-whitespace",
+  );
+  expect(behaviorInput.getAttribute("aria-invalid")).toBe("true");
+  expect(fetchMock).not.toHaveBeenCalled();
+
+  await fireEvent.input(behaviorInput, {
+    target: { value: "Challenge unsupported assumptions." },
+  });
   await fireEvent.click(screen.getByRole("button", { name: "Create Subject" }));
   await waitFor(() => {
     expect(screen.getByRole("alert").textContent).toContain(
@@ -267,6 +293,11 @@ test("renders a ready resident surface and committed Memory lifecycle states", a
     expect(screen.getByRole("heading", { name: "Resident context", level: 1 }))
       .not.toBeNull();
   });
+  expect(
+    screen.getByRole("article", { name: "User-managed Subject behavior" })
+      .textContent,
+  )
+    .toContain("Prefer explicit evidence.");
   expect(screen.getByRole("article", { name: "Resident surface" })).not
     .toBeNull();
   expect(screen.getAllByText("active", { exact: true }).length).toBeGreaterThan(
@@ -278,6 +309,69 @@ test("renders a ready resident surface and committed Memory lifecycle states", a
     .not.toBeNull();
   expect(screen.getByRole("link", { name: /Next page/ }).getAttribute("href"))
     .toContain("cursor=memory-next");
+});
+
+test("edits and clears user-managed behavior with CAS while distinguishing save from Worker application", async () => {
+  const fetchMock = vi.fn(async (_path: string, init?: RequestInit) => {
+    const request = JSON.parse(String(init?.body));
+    return Response.json({
+      ...subject(),
+      behavior_md: request.behavior_md,
+      behavior_revision: request.expected_behavior_revision + 1,
+    });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  render(SubjectPage, {
+    data: {
+      workspaceId: "workspace-1",
+      subjectId: "subject-1",
+      subject: result(subject()),
+      surface: result({
+        subject_id: "subject-1",
+        availability: "ungenerated" as const,
+      }),
+      memories: result({ items: [], has_more: false }),
+    },
+  } as never);
+
+  await fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+  const textarea = screen.getByRole("textbox", { name: "Subject behavior" });
+  await fireEvent.input(textarea, {
+    target: { value: "Ask before irreversible actions." },
+  });
+  await fireEvent.click(screen.getByRole("button", { name: "Save behavior" }));
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+  const [path, init] = fetchMock.mock.calls[0] as unknown as [
+    string,
+    RequestInit,
+  ];
+  expect(path).toBe("/api/w/workspace-1/subjektiv/subjects/subject-1/behavior");
+  expect(init.method).toBe("PATCH");
+  expect(init.body).toBe(
+    '{"expected_behavior_revision":2,"behavior_md":"Ask before irreversible actions."}',
+  );
+  await waitFor(() => {
+    expect(
+      screen.getByText(/Behavior storage confirmed at revision 3/).textContent,
+    )
+      .toContain("does not confirm application");
+  });
+  expect(
+    screen.getByRole("article", { name: "User-managed Subject behavior" })
+      .textContent,
+  )
+    .toContain("Ask before irreversible actions.");
+
+  await fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+  await fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+  await fireEvent.click(screen.getByRole("button", { name: "Save behavior" }));
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+  const secondBody =
+    (fetchMock.mock.calls[1] as unknown as [string, RequestInit])[1].body;
+  expect(secondBody).toBe('{"expected_behavior_revision":3,"behavior_md":""}');
+  await waitFor(() =>
+    expect(screen.getByText("No behavior is set.")).not.toBeNull()
+  );
 });
 
 test("distinguishes ready-empty, stale, failed, unavailable, and request error surfaces", async () => {

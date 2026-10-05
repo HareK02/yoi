@@ -14,13 +14,16 @@
   const subjects = $derived(data.subjects.data?.items ?? []);
   let createExpanded = $state(false);
   let role = $state('');
+  let behaviorMd = $state('');
   let submitting = $state(false);
   let createError = $state<string | null>(null);
   let roleInvalid = $state(false);
+  let behaviorInvalid = $state(false);
   let createOutcomeUnknown = $state(false);
   let createdSubject = $state<SubjektivSubjectResponse | null>(null);
   let createButton = $state<HTMLButtonElement>();
   let roleInput = $state<HTMLInputElement>();
+  let behaviorInput = $state<HTMLTextAreaElement>();
 
   function subjectHref(subjectId: string): string {
     return workspaceRoute(data.workspaceId, `/memory/${encodeURIComponent(subjectId)}`);
@@ -35,6 +38,7 @@
     createExpanded = true;
     createError = null;
     roleInvalid = false;
+    behaviorInvalid = false;
     createOutcomeUnknown = false;
     createdSubject = null;
     await tick();
@@ -45,8 +49,10 @@
     if (submitting) return;
     createExpanded = false;
     role = '';
+    behaviorMd = '';
     createError = null;
     roleInvalid = false;
+    behaviorInvalid = false;
     createOutcomeUnknown = false;
     createdSubject = null;
     await tick();
@@ -58,9 +64,13 @@
     submitting = true;
     createError = null;
     roleInvalid = false;
+    behaviorInvalid = false;
     createOutcomeUnknown = false;
     try {
-      const subject = await createSubjektivSubject(fetch, data.workspaceId, { role });
+      const subject = await createSubjektivSubject(fetch, data.workspaceId, {
+        role,
+        behavior_md: behaviorMd,
+      });
       createdSubject = subject;
       try {
         await goto(subjectHref(subject.id));
@@ -69,14 +79,16 @@
       }
     } catch (error) {
       if (error instanceof SubjektivSubjectCreateError) {
-        roleInvalid = error.kind === 'validation';
+        roleInvalid = error.kind === 'validation' && error.message.startsWith('Subject role');
+        behaviorInvalid = error.kind === 'validation' && error.message.startsWith('Subject behavior');
         createOutcomeUnknown = error.kind === 'unknown_outcome';
         createError = error.status === 401 || error.status === 403
           ? 'You do not have permission to create Subjects in this Workspace.'
           : error.message;
-        if (roleInvalid) {
+        if (roleInvalid || behaviorInvalid) {
           await tick();
-          roleInput?.focus();
+          if (behaviorInvalid) behaviorInput?.focus();
+          else roleInput?.focus();
         }
       } else {
         createOutcomeUnknown = true;
@@ -145,8 +157,21 @@
           disabled={submitting || createdSubject !== null}
           onkeydown={createFormKeydown}
           aria-invalid={roleInvalid ? 'true' : undefined}
-          aria-describedby={createError ? 'subject-role-help subject-create-error' : 'subject-role-help'}
+          aria-describedby={createError && roleInvalid ? 'subject-role-help subject-create-error' : 'subject-role-help'}
         />
+      </label>
+      <label class="subject-role-field">
+        <span>Behavior <small>Optional, user-managed</small></span>
+        <textarea
+          bind:this={behaviorInput}
+          bind:value={behaviorMd}
+          rows="7"
+          disabled={submitting || createdSubject !== null}
+          onkeydown={createFormKeydown}
+          aria-invalid={behaviorInvalid ? 'true' : undefined}
+          aria-describedby={createError && behaviorInvalid ? 'subject-behavior-help subject-create-error' : 'subject-behavior-help'}
+        ></textarea>
+        <small id="subject-behavior-help">Persistent guidance injected verbatim for this Subject. It remains separate from generated Memory and can be edited later.</small>
       </label>
       {#if createError}
         <div
@@ -309,18 +334,23 @@
   }
 
   .subject-create-actions {
-    grid-column: 3;
-    grid-row: 1;
+    grid-column: 2;
   }
 
   .subject-create-panel {
     display: grid;
-    grid-template-columns: minmax(14rem, 0.8fr) minmax(18rem, 1fr) auto;
-    align-items: end;
+    grid-template-columns: minmax(14rem, 0.7fr) minmax(18rem, 1.3fr);
+    align-items: start;
     gap: var(--space-4);
     padding: var(--space-4);
     background: var(--bg-raised);
     border-radius: var(--radius-soft);
+  }
+
+  .subject-create-copy {
+    grid-column: 1;
+    grid-row: 1 / span 4;
+    align-self: start;
   }
 
   .subject-create-copy h2,
@@ -344,7 +374,8 @@
     font-weight: 700;
   }
 
-  .subject-role-field input {
+  .subject-role-field input,
+  .subject-role-field textarea {
     width: 100%;
     min-width: 0;
     border: 1px solid var(--line);
@@ -354,7 +385,15 @@
     color: var(--text-strong);
   }
 
-  .subject-role-field input[aria-invalid='true'] {
+  .subject-role-field textarea {
+    min-height: 8rem;
+    resize: vertical;
+    font: inherit;
+    line-height: 1.5;
+  }
+
+  .subject-role-field input[aria-invalid='true'],
+  .subject-role-field textarea[aria-invalid='true'] {
     border-color: var(--danger);
   }
 
@@ -480,6 +519,7 @@
       align-items: stretch;
     }
 
+    .subject-create-copy,
     .subject-create-error,
     .subject-create-actions {
       grid-column: 1;

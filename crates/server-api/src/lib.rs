@@ -237,6 +237,7 @@ impl_openapi_schema!(
     MemoryConsolidateStagingRequest,
     MemoryConsolidationResponse,
     SubjektivSubjectCreateRequest,
+    SubjektivSubjectBehaviorUpdateRequest,
     SubjektivSubjectListQuery,
     SubjektivSubjectListResponse,
     SubjektivSubjectResponse,
@@ -1162,6 +1163,20 @@ pub trait ServerApi {
         &self,
         #[path] workspace_id: String,
         #[path] subject_id: String,
+    ) -> Result<SubjektivSubjectResponse, RepositoryApiError>;
+    #[patch(
+        "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/behavior",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        bearer_auth = true,
+        browser_auth = true,
+    )]
+    async fn subjektiv_subject_behavior_update(
+        &self,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+        #[body] request: SubjektivSubjectBehaviorUpdateRequest,
     ) -> Result<SubjektivSubjectResponse, RepositoryApiError>;
     #[get(
         "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/surface",
@@ -4579,9 +4594,20 @@ pub enum SubjektivSubjectState {
 #[serde(deny_unknown_fields)]
 pub struct SubjektivSubjectCreateRequest {
     pub role: String,
+    #[serde(default)]
+    pub behavior_md: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSubjectBehaviorUpdateRequest {
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub expected_behavior_revision: u64,
+    pub behavior_md: String,
 }
 
 pub const SUBJEKTIV_BROWSER_MAX_LIST_LIMIT: usize = 100;
+pub const SUBJEKTIV_MAX_BEHAVIOR_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -4609,6 +4635,9 @@ pub struct SubjektivSubjectListResponse {
 pub struct SubjektivSubjectResponse {
     pub id: String,
     pub role: String,
+    pub behavior_md: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub behavior_revision: u64,
     pub state: SubjektivSubjectState,
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub store_revision: u64,
@@ -5443,9 +5472,21 @@ pub struct SubjektivSurfaceFailureResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivResidentContextOutput {
+    /// Exact user-managed document. Empty means explicitly unset.
+    pub behavior_md: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub behavior_revision: u64,
+    /// Independently-fresh generated Memory projection.
+    pub memory_surface: memory::backend::MemoryResidentSummaryOutput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "operation", content = "input", rename_all = "snake_case")]
 pub enum SubjektivMemoryBackendOperation {
     ResidentSummary(memory::backend::MemoryResidentSummaryOperation),
+    ResidentContext(memory::backend::MemoryResidentSummaryOperation),
     Query(SubjektivMemoryQueryRequest),
     Read(SubjektivMemoryReadRequest),
     ListRevisions(SubjektivMemoryListRevisionsRequest),
@@ -5618,6 +5659,7 @@ pub struct SubjektivMemoryStageExplicitResponse {
 #[serde(tag = "result", content = "data", rename_all = "snake_case")]
 pub enum SubjektivMemoryBackendResponse {
     ResidentSummary(memory::backend::MemoryResidentSummaryOutput),
+    ResidentContext(SubjektivResidentContextOutput),
     Query(SubjektivMemoryQueryResponse),
     Read(SubjektivMemoryReadResponse),
     ListRevisions(SubjektivMemoryListRevisionsResponse),
@@ -9861,9 +9903,11 @@ pub fn memory_api_typescript() -> String {
     // `ts-rs` solely for this read-only projection.
     let subjektiv_browser_declarations = r#"export type SubjektivSubjectState = "active" | "retired";
 
-export type SubjektivSubjectCreateRequest = { role: string, };
+export type SubjektivSubjectCreateRequest = { role: string, behavior_md?: string, };
 
-export type SubjektivSubjectResponse = { id: string, role: string, state: SubjektivSubjectState, store_revision: number, created_at: string, updated_at: string, current_worker?: | import("./worker-launch-api").WorkerLaunchWorkerSummary | null, };
+export type SubjektivSubjectBehaviorUpdateRequest = { expected_behavior_revision: number, behavior_md: string, };
+
+export type SubjektivSubjectResponse = { id: string, role: string, behavior_md: string, behavior_revision: number, state: SubjektivSubjectState, store_revision: number, created_at: string, updated_at: string, current_worker?: | import("./worker-launch-api").WorkerLaunchWorkerSummary | null, };
 
 export type SubjektivSubjectListResponse = { limit: number, items: Array<SubjektivSubjectResponse>, next_cursor?: string | null, has_more: boolean, };
 
@@ -9896,8 +9940,11 @@ export type SubjektivMemoryListRevisionsResponse = { memory_id: string, current_
     let limits = format!(
         "export const MEMORY_API_LIMITS = {{\n  maxResponseBytes: {MEMORY_API_MAX_RESPONSE_BYTES},\n  maxDocumentBytes: {MEMORY_API_MAX_DOCUMENT_BYTES},\n  maxCollectionItems: {MEMORY_API_MAX_COLLECTION_ITEMS},\n  maxStringBytes: {MEMORY_API_MAX_STRING_BYTES},\n  maxIdentifierBytes: {MEMORY_API_MAX_IDENTIFIER_BYTES},\n}} as const;"
     );
+    let subjektiv_limits = format!(
+        "export const SUBJEKTIV_API_LIMITS = {{\n  maxBehaviorBytes: {SUBJEKTIV_MAX_BEHAVIOR_BYTES},\n}} as const;"
+    );
     format!(
-        "// Generated from server-api. Do not edit by hand.\n// Regenerate: cargo run -q -p server-api --features typescript --example generate_memory_api_types > web/workspace/src/lib/generated/memory-api.ts\n\n{limits}\n\n{}\n\n{subjektiv_browser_declarations}\n",
+        "// Generated from server-api. Do not edit by hand.\n// Regenerate: cargo run -q -p server-api --features typescript --example generate_memory_api_types > web/workspace/src/lib/generated/memory-api.ts\n\n{limits}\n\n{subjektiv_limits}\n\n{}\n\n{subjektiv_browser_declarations}\n",
         declarations
             .into_iter()
             .map(|declaration| format!("export {declaration}"))

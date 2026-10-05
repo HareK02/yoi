@@ -167,6 +167,15 @@ pub enum SystemItem {
         prompt_provenance: Option<PromptRenderProvenance>,
     },
 
+    /// A Host-fetched change to user-managed Subject behavior. Each changed
+    /// revision is appended rather than rewriting prior prompt/session content.
+    SubjectBehaviorRefresh {
+        body: String,
+        behavior_revision: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_provenance: Option<PromptRenderProvenance>,
+    },
+
     /// Synthetic note inserted after an interrupted turn before the next
     /// user input. `body` is the exact LLM-context text explaining that the
     /// previous turn was cut short.
@@ -192,6 +201,7 @@ impl SystemItem {
             }
             SystemItem::TaskReminder { body, .. } => body.clone(),
             SystemItem::ResidentSummaryRefresh { body, .. } => body.clone(),
+            SystemItem::SubjectBehaviorRefresh { body, .. } => body.clone(),
             SystemItem::Interrupt { body, .. } => body.clone(),
         }
     }
@@ -214,6 +224,7 @@ impl SystemItem {
             SystemItem::LegacyIgnored { .. } => "legacy_ignored",
             SystemItem::TaskReminder { .. } => "task_reminder",
             SystemItem::ResidentSummaryRefresh { .. } => "resident_summary_refresh",
+            SystemItem::SubjectBehaviorRefresh { .. } => "subject_behavior_refresh",
             SystemItem::Interrupt { .. } => "interrupt",
         }
     }
@@ -265,6 +276,25 @@ mod tests {
             interrupt,
             SystemItem::Interrupt {
                 prompt_provenance: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn subject_behavior_refresh_round_trips_with_revision_and_exact_body() {
+        let item = SystemItem::SubjectBehaviorRefresh {
+            body: "current Subject context".to_string(),
+            behavior_revision: 7,
+            prompt_provenance: None,
+        };
+        let raw = serde_json::to_string(&item).unwrap();
+        let parsed: SystemItem = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed.history_text(), "current Subject context");
+        assert!(matches!(
+            parsed,
+            SystemItem::SubjectBehaviorRefresh {
+                behavior_revision: 7,
                 ..
             }
         ));

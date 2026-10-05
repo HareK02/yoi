@@ -281,6 +281,20 @@ impl SystemItemAppendHandle {
             .expect("system-item append queue poisoned")
             .push(item);
     }
+
+    /// Queue a revisioned Subject behavior refresh. The caller receives this
+    /// narrow operation only at a pre-request boundary, and the host commits it
+    /// before exposing it to the model.
+    pub fn append_subject_behavior_refresh(&self, body: impl Into<String>, behavior_revision: u64) {
+        self.pending
+            .lock()
+            .expect("system-item append queue poisoned")
+            .push(SystemItem::SubjectBehaviorRefresh {
+                body: body.into(),
+                behavior_revision,
+                prompt_provenance: None,
+            });
+    }
 }
 
 /// Host-created narrow append authority exposed only at a restore lifecycle
