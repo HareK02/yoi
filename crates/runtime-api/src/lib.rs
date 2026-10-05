@@ -569,12 +569,18 @@ pub struct CompletionRequest {
     pub prefix: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<protocol::CompletionContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CompletionResponse {
     pub kind: CompletionKind,
     pub prefix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<protocol::CompletionContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     pub entries: Vec<CompletionEntry>,
 }
 

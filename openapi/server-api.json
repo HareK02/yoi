@@ -7807,6 +7807,12 @@
           "prefix": {
             "default": "",
             "type": "string"
+          },
+          "request_id": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -7817,6 +7823,16 @@
       "RuntimeWorkerCompletionsResult": {
         "additionalProperties": false,
         "properties": {
+          "context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CompletionContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "diagnostics": {
             "default": [],
             "items": {
@@ -7835,6 +7851,12 @@
           },
           "prefix": {
             "type": "string"
+          },
+          "request_id": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "runtime_id": {
             "type": "string"
@@ -15264,7 +15286,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:0dc47aa72f9cace6e0026fbf5d9385f51b6d79c8f6a70a04954067a35e01c887"
+    "x-yoi-source-digest": "sha256:eddff23c6405c11e8becfef09473d6833647bcaba9243abae189db7f840c1896"
   },
   "openapi": "3.1.0",
   "paths": {

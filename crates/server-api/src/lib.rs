@@ -8273,6 +8273,8 @@ pub struct RuntimeWorkerCompletionsRequest {
     pub prefix: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<protocol::CompletionContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
@@ -8282,6 +8284,10 @@ pub struct RuntimeWorkerCompletionsResult {
     pub worker_id: String,
     pub kind: protocol::CompletionKind,
     pub prefix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<protocol::CompletionContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     pub entries: Vec<protocol::CompletionEntry>,
     #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,

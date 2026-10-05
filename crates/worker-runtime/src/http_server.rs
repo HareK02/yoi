@@ -521,21 +521,8 @@ pub struct RuntimeHttpUploadedFileDeleteResponse {
     pub deleted: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeHttpWorkerCompletionsRequest {
-    pub kind: protocol::CompletionKind,
-    #[serde(default)]
-    pub prefix: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context: Option<protocol::CompletionContext>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeHttpWorkerCompletionsResponse {
-    pub kind: protocol::CompletionKind,
-    pub prefix: String,
-    pub entries: Vec<protocol::CompletionEntry>,
-}
+pub type RuntimeHttpWorkerCompletionsRequest = runtime_api::CompletionRequest;
+pub type RuntimeHttpWorkerCompletionsResponse = runtime_api::CompletionResponse;
 
 /// Worker lifecycle request body used by stop/cancel endpoints.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1880,6 +1867,8 @@ async fn worker_completions(
     Ok(Json(RuntimeHttpWorkerCompletionsResponse {
         kind: request.kind,
         prefix: request.prefix,
+        context: request.context,
+        request_id: request.request_id,
         entries,
     }))
 }
@@ -3515,6 +3504,56 @@ mod tests {
     async fn read_json<T: for<'de> Deserialize<'de>>(response: Response) -> T {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rest_feature_completions_echo_each_nonce_and_qualified_context() {
+        let runtime =
+            Runtime::with_execution_backend(RuntimeOptions::default(), Arc::new(AcceptingBackend))
+                .unwrap();
+        runtime
+            .store_config_bundle(test_bundle(ProfileSelector::Builtin(
+                "builtin:coder".into(),
+            )))
+            .unwrap();
+        let token = "completion-token";
+        let app = runtime_http_router(runtime, token.into());
+        let created = authed_json_request(
+            app.clone(),
+            Method::POST,
+            "/v1/workers",
+            token,
+            &task_request("completion"),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::OK);
+        let created: RuntimeHttpWorkerResponse = read_json(created).await;
+        let context = protocol::CompletionContext {
+            invocation: protocol::FeatureInvocationIdentity("builtin:test/prepare".into()),
+            argument: Some("path".into()),
+        };
+        for nonce in ["first", "second", "first"] {
+            let request = runtime_api::CompletionRequest {
+                kind: protocol::CompletionKind::FeatureArgument,
+                prefix: "資料/".into(),
+                context: Some(context.clone()),
+                request_id: Some(nonce.into()),
+            };
+            let response = authed_json_request(
+                app.clone(),
+                Method::POST,
+                &format!("/v1/workers/{}/completions", created.worker.worker_id),
+                token,
+                &request,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let response: runtime_api::CompletionResponse = read_json(response).await;
+            assert_eq!(response.kind, request.kind);
+            assert_eq!(response.prefix, request.prefix);
+            assert_eq!(response.context, request.context);
+            assert_eq!(response.request_id, request.request_id);
+        }
     }
 
     #[tokio::test]

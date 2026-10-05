@@ -582,6 +582,8 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         Ok(runtime_api::CompletionResponse {
             kind,
             prefix,
+            context: value.context,
+            request_id: value.request_id,
             entries,
         })
     }

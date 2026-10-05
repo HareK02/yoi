@@ -737,6 +737,8 @@ pub struct WorkerCompletionsRequest {
     pub prefix: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<protocol::CompletionContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -745,6 +747,10 @@ pub struct WorkerCompletionsResult {
     pub worker: RuntimeWorkerRef,
     pub kind: protocol::CompletionKind,
     pub prefix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<protocol::CompletionContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     pub entries: Vec<protocol::CompletionEntry>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
@@ -1329,6 +1335,8 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
             worker: RuntimeWorkerRef::new(self.runtime_id().to_string(), worker_id.to_string()),
             kind: request.kind,
             prefix: request.prefix,
+            context: request.context,
+            request_id: request.request_id,
             entries: Vec::new(),
             diagnostics: vec![diagnostic(
                 "worker_completions_unsupported",
@@ -3312,6 +3320,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 kind: request.kind,
                 prefix: request.prefix,
+                context: request.context,
+                request_id: request.request_id,
                 entries: Vec::new(),
                 diagnostics: vec![diagnostic(
                     "embedded_worker_execution_unavailable",
@@ -3327,6 +3337,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 kind: request.kind,
                 prefix: request.prefix,
+                context: request.context,
+                request_id: request.request_id,
                 entries: Vec::new(),
                 diagnostics: vec![diagnostic(
                     "embedded_worker_id_invalid",
@@ -3345,6 +3357,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 kind: request.kind,
                 prefix: request.prefix,
+                context: request.context,
+                request_id: request.request_id,
                 entries,
                 diagnostics: Vec::new(),
             },
@@ -3352,6 +3366,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 kind: request.kind,
                 prefix: request.prefix,
+                context: request.context,
+                request_id: request.request_id,
                 entries: Vec::new(),
                 diagnostics: vec![embedded_runtime_diagnostic(&error)],
             },
@@ -5420,9 +5436,12 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             kind: request.kind,
             prefix: request.prefix,
             context: request.context,
+            request_id: request.request_id,
         };
         let failure_kind = request.kind;
         let failure_prefix = request.prefix.clone();
+        let failure_context = request.context.clone();
+        let failure_request_id = request.request_id.clone();
         let worker_id_owned = worker_id.to_string();
         match self.run_runtime_api(
             self.request_timeout,
@@ -5437,6 +5456,8 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 kind: response.kind,
                 prefix: response.prefix,
+                context: response.context,
+                request_id: response.request_id,
                 entries: response.entries,
                 diagnostics: Vec::new(),
             },
@@ -5444,6 +5465,8 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 kind: failure_kind,
                 prefix: failure_prefix,
+                context: failure_context,
+                request_id: failure_request_id,
                 entries: Vec::new(),
                 diagnostics: vec![diagnostic],
             },
@@ -6748,6 +6771,7 @@ mod tests {
                 invocation: protocol::FeatureInvocationIdentity("builtin:test/prepare".into()),
                 argument: Some("path".into()),
             }),
+            request_id: Some("completion-nonce".into()),
         };
         let wire: runtime_api::CompletionRequest =
             runtime_contract_convert(request.clone()).unwrap();
