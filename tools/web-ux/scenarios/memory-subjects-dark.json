@@ -122,9 +122,33 @@
       "dataState": "Ready generated Markdown surface with long content, unsafe Markdown, wide table/code, provenance refs, and three lifecycle states.",
       "ready": {
         "kind": "selector",
-        "selector": "[data-memory-view='subject'][data-memory-state='ready'] article[aria-label='Resident surface']"
+        "selector": "[data-memory-view='subject'][data-memory-state='ready'] article[aria-label='Resident context']"
       },
-      "capturePoints": [{ "id": "initial", "label": "Ready subject" }]
+      "capturePoints": [
+        { "id": "initial", "label": "Ready subject" },
+        {
+          "id": "subject-diagnostics",
+          "label": "Subject diagnostics",
+          "interaction": [
+            { "action": "click", "selector": "details.subject-technical-details summary" }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": "details.subject-technical-details[open]"
+          }
+        },
+        {
+          "id": "surface-diagnostics",
+          "label": "Surface sources and diagnostics",
+          "interaction": [
+            { "action": "click", "selector": "details.surface-details summary" }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": "details.surface-details[open]"
+          }
+        }
+      ]
     },
     {
       "id": "detail",
@@ -149,6 +173,18 @@
         "selector": "[data-memory-view='subject'][data-memory-state='ready'] [data-surface-ready-empty]"
       },
       "capturePoints": [{ "id": "initial", "label": "Ready empty" }]
+    },
+    {
+      "id": "ungenerated",
+      "label": "Ungenerated subject context",
+      "path": "/w/memory-review/memory/ungenerated-subject",
+      "goal": "Distinguish a Subject with no generated resident context from lost committed Memory.",
+      "dataState": "Ungenerated resident context and a successful empty committed Memory list.",
+      "ready": {
+        "kind": "selector",
+        "selector": "[data-memory-view='subject'][data-memory-state='ungenerated']"
+      },
+      "capturePoints": [{ "id": "initial", "label": "Not generated" }]
     },
     {
       "id": "stale",

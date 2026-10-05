@@ -66,7 +66,13 @@ ${"detail-wide-code-".repeat(18)}
 <script>alert("not rendered")</script>`;
 
 const subjects = [
-  subject(representativeSubjectId, "Release coordination", "active", 42),
+  subject(
+    representativeSubjectId,
+    "Release coordination",
+    "active",
+    42,
+    connectedWorker("Release coordination Worker with a deliberately long display name"),
+  ),
   subject(emptySubjectId, "Empty ready subject", "active", 0),
   subject(staleSubjectId, "Stale surface subject", "active", 19),
   subject(failedSubjectId, "Failed surface subject", "active", 8),
@@ -75,7 +81,37 @@ const subjects = [
 ];
 const pagedSubject = subject(pagedSubjectId, "Subject on the next page", "active", 1);
 
-function subject(id: string, role: string, state: "active" | "retired", storeRevision: number) {
+function connectedWorker(displayName: string) {
+  return {
+    runtime_id: "embedded-worker-runtime",
+    worker_id: "release-coordination-worker",
+    host_id: "fixture-host",
+    display_name: displayName,
+    label: displayName,
+    profile: "builtin:companion",
+    singleton_key: `subjektiv:${representativeSubjectId}`,
+    tags: [],
+    workspace: {
+      visibility: "workspace",
+      identity: workspaceId,
+      workspace_id: workspaceId,
+    },
+    state: "idle",
+    last_seen_at: "2026-01-02T03:04:05Z",
+    pinned: false,
+    retention_state: "retained",
+    implementation: { kind: "embedded", display_hint: "Fixture Worker" },
+    diagnostics: [],
+  };
+}
+
+function subject(
+  id: string,
+  role: string,
+  state: "active" | "retired",
+  storeRevision: number,
+  currentWorker?: ReturnType<typeof connectedWorker>,
+) {
   return {
     id,
     role,
@@ -83,6 +119,7 @@ function subject(id: string, role: string, state: "active" | "retired", storeRev
     store_revision: storeRevision,
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-02T03:04:05Z",
+    ...(currentWorker ? { current_worker: currentWorker } : {}),
   };
 }
 
@@ -125,7 +162,7 @@ function memoriesFor(subjectId: string) {
       1,
       "working_assumption",
       "retracted",
-      "T-672 UNIQUE END MARKER",
+      "Memory list end marker for scroll validation",
     ),
   ];
 }
@@ -235,7 +272,7 @@ function memoryDetail(memoryId: string, requestedRevision: number | null) {
         evidence_id: "evidence-message-0001",
         origin: { kind: "human_input", account_id: "account-fixture" },
         evidence_kind: "message",
-        label: "T-672 product direction",
+        label: "Memory information design source",
         summary: "Bounded source reference retained with the committed revision.",
       }],
       source_refs_total: 1,

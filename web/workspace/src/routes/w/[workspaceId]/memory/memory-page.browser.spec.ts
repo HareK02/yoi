@@ -73,6 +73,9 @@ test("renders the subject index as the Memory product entry", () => {
   expect(screen.getByRole("link", { name: /Release coordinator/ })).not
     .toBeNull();
   expect(screen.getByText("subject-1")).not.toBeNull();
+  expect(screen.getByText("Not connected")).not.toBeNull();
+  expect(screen.queryByText("Store revision", { exact: true })).toBeNull();
+  expect(screen.getByText("1 shown · more available")).not.toBeNull();
   expect(screen.getByRole("link", { name: "First page" }).getAttribute("href"))
     .toBe("/w/workspace-1/memory");
   expect(screen.getByRole("link", { name: /Next page/ }).getAttribute("href"))
@@ -214,7 +217,10 @@ test("renders a ready resident surface and committed Memory lifecycle states", a
       workspaceId: "workspace-1",
       subjectId: "subject-1",
       cursor: "memory-current",
-      subject: result(subject()),
+      subject: result({
+        ...subject(),
+        current_worker: { display_name: "Release Worker" },
+      }),
       surface: result({
         subject_id: "subject-1",
         availability: "ready" as const,
@@ -267,9 +273,15 @@ test("renders a ready resident surface and committed Memory lifecycle states", a
     expect(screen.getByRole("heading", { name: "Resident context", level: 1 }))
       .not.toBeNull();
   });
-  expect(screen.getByRole("article", { name: "Resident surface" })).not
+  expect(screen.getByRole("article", { name: "Resident context" })).not
     .toBeNull();
-  expect(screen.getAllByText("active", { exact: true }).length).toBeGreaterThan(
+  expect(screen.getByText("Connected", { exact: true })).not.toBeNull();
+  expect(screen.getByText("Release Worker", { exact: true })).not.toBeNull();
+  expect(screen.getByText("3 on this page", { exact: true })).not.toBeNull();
+  expect(screen.getByText("Subject store revision", { exact: true })).not
+    .toBeNull();
+  expect(screen.getByText(/not a Memory count/)).not.toBeNull();
+  expect(screen.getAllByText("Active", { exact: true }).length).toBeGreaterThan(
     0,
   );
   expect(screen.getByText("Resolved", { exact: true })).not.toBeNull();
@@ -278,6 +290,34 @@ test("renders a ready resident surface and committed Memory lifecycle states", a
     .not.toBeNull();
   expect(screen.getByRole("link", { name: /Next page/ }).getAttribute("href"))
     .toContain("cursor=memory-next");
+});
+
+test("candidate-only Subjects show no committed Memories, not an inferred candidate count", () => {
+  // The store regression candidate_decisions_reject_conflicts_and_roll_back_partial_writes
+  // stages a candidate without committing a Memory. Its public read projection is
+  // the same empty committed list as a new Subject; candidates are not a page input.
+  render(SubjectPage, {
+    data: {
+      workspaceId: "workspace-1",
+      subjectId: "subject-1",
+      cursor: null,
+      subject: result({ ...subject(), store_revision: 0 }),
+      surface: result({ subject_id: "subject-1", availability: "ungenerated" }),
+      memories: result({ limit: 100, items: [], has_more: false }),
+    },
+  } as never);
+
+  expect(screen.getByText("None", { exact: true })).not.toBeNull();
+  expect(screen.getByText("No committed Memories yet.")).not.toBeNull();
+  expect(screen.getByText("Not connected", { exact: true })).not.toBeNull();
+  expect(screen.getAllByText("Not generated", { exact: true })).toHaveLength(2);
+  expect(screen.queryByRole("article", { name: "Resident context" }))
+    .toBeNull();
+  expect(
+    screen.queryByText(
+      /candidate count|all Memories lost|automatically updating/i,
+    ),
+  ).toBeNull();
 });
 
 test("distinguishes ready-empty, stale, failed, unavailable, and request error surfaces", async () => {
@@ -303,8 +343,25 @@ test("distinguishes ready-empty, stale, failed, unavailable, and request error s
       }),
     },
   } as never);
-  expect(screen.getByText("Resident surface is ready and empty.")).not
+  expect(screen.getByText("Resident context is current but empty.")).not
     .toBeNull();
+  expect(screen.getByText(/current empty surface exists/)).not.toBeNull();
+  expect(screen.getByText("No committed Memories yet.")).not.toBeNull();
+
+  await view.rerender(
+    {
+      data: {
+        ...base,
+        surface: result({
+          subject_id: "subject-1",
+          availability: "ungenerated" as const,
+        }),
+      },
+    } as never,
+  );
+  expect(screen.getByText("Resident context has not been generated.")).not
+    .toBeNull();
+  expect(screen.getAllByText("Not generated", { exact: true })).toHaveLength(2);
 
   await view.rerender(
     {
@@ -317,7 +374,8 @@ test("distinguishes ready-empty, stale, failed, unavailable, and request error s
       },
     } as never,
   );
-  expect(screen.getByText("Resident surface is stale.")).not.toBeNull();
+  expect(screen.getByText("Resident context needs to be refreshed.")).not
+    .toBeNull();
 
   await view.rerender(
     {
@@ -333,7 +391,7 @@ test("distinguishes ready-empty, stale, failed, unavailable, and request error s
   expect(screen.getByRole("alert").textContent).toContain("generation failed");
 
   await view.rerender({ data: { ...base, surface: result(null) } } as never);
-  expect(screen.getByText("Resident surface data is unavailable.")).not
+  expect(screen.getByText("Resident context status is unavailable.")).not
     .toBeNull();
 
   await view.rerender(
@@ -342,7 +400,7 @@ test("distinguishes ready-empty, stale, failed, unavailable, and request error s
     } as never,
   );
   expect(screen.getByRole("alert").textContent).toContain(
-    "Resident surface unavailable",
+    "Resident context status unavailable",
   );
 });
 

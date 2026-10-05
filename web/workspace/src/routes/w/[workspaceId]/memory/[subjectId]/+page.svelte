@@ -1,7 +1,10 @@
 <script lang="ts">
   import DocumentMarkdown from '#lib/workspace/markdown/DocumentMarkdown.svelte';
   import { formatDate, workspaceRoute } from '#lib/workspace/api/http.ts';
-  import type { SubjektivMemoryState } from '#lib/generated/memory-api.ts';
+  import type {
+    SubjektivMemoryState,
+    SubjektivResidentSurfaceAvailability,
+  } from '#lib/generated/memory-api.ts';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
@@ -36,6 +39,24 @@
   function kindLabel(kind: string): string {
     return kind.replaceAll('_', ' ');
   }
+
+  function surfaceLabel(availability: SubjektivResidentSurfaceAvailability): string {
+    if (availability === 'ready') return snapshot?.body_md.trim() ? 'Ready to use' : 'Ready, no context';
+    if (availability === 'ungenerated') return 'Not generated';
+    if (availability === 'stale') return 'Needs refresh';
+    return 'Generation failed';
+  }
+
+  function surfaceSummary(availability: SubjektivResidentSurfaceAvailability): string {
+    if (availability !== 'ready') return 'No current generated context is available to use.';
+    return snapshot?.body_md.trim()
+      ? 'Current generated context is available.'
+      : 'A current empty surface exists; there is no resident context to show.';
+  }
+
+  function subjectStateLabel(state: 'active' | 'retired'): string {
+    return state === 'active' ? 'Available' : 'Retired';
+  }
 </script>
 
 <svelte:head>
@@ -56,13 +77,50 @@
   </header>
 
   {#if data.subject.data}
-    <dl class="subject-facts" aria-label="Subject details">
-      <div><dt>Role</dt><dd>{data.subject.data.role}</dd></div>
-      <div><dt>State</dt><dd><span class="subject-state is-{data.subject.data.state}">{data.subject.data.state}</span></dd></div>
-      <div><dt>Store revision</dt><dd>{data.subject.data.store_revision}</dd></div>
-      <div><dt>Updated</dt><dd><time datetime={data.subject.data.updated_at}>{formatDate(data.subject.data.updated_at)}</time></dd></div>
-      <div><dt>Current worker</dt><dd>{data.subject.data.current_worker?.display_name ?? 'None'}</dd></div>
-    </dl>
+    <section class="subject-overview" aria-label="Subject status">
+      <div>
+        <span>Subject status</span>
+        <strong class="subject-state is-{data.subject.data.state}">{subjectStateLabel(data.subject.data.state)}</strong>
+        <p>{data.subject.data.state === 'active' ? 'Available for new Worker connections.' : 'No longer available for new Worker connections.'}</p>
+      </div>
+      <div>
+        <span>Worker connection</span>
+        <strong>{data.subject.data.current_worker ? 'Connected' : 'Not connected'}</strong>
+        <p>{data.subject.data.current_worker?.display_name ?? 'No Worker currently owns this Subject connection.'}</p>
+      </div>
+      <div>
+        <span>Committed Memories</span>
+        {#if data.memories.data}
+          <strong>{data.cursor ? `${memories.length} on this page` : memories.length === 0 ? 'None' : 'Available'}</strong>
+          <p>{memories.length} shown{data.memories.data.has_more ? ' · more available' : ''}</p>
+        {:else}
+          <strong>Unavailable</strong>
+          <p>The current Memory list could not be read.</p>
+        {/if}
+      </div>
+      <div>
+        <span>Resident context</span>
+        {#if surface}
+          <strong class="availability is-{surface.availability}">{surfaceLabel(surface.availability)}</strong>
+          <p>{surfaceSummary(surface.availability)}</p>
+        {:else}
+          <strong>Unavailable</strong>
+          <p>The resident context status could not be read.</p>
+        {/if}
+      </div>
+    </section>
+
+    <details class="subject-technical-details">
+      <summary>Technical details</summary>
+      <dl>
+        <div><dt>Subject ID</dt><dd><code>{data.subject.data.id}</code></dd></div>
+        <div>
+          <dt>Subject store revision</dt>
+          <dd>{data.subject.data.store_revision}<small>Internal change number for committed Memories; not a Memory count or content-quality score.</small></dd>
+        </div>
+        <div><dt>Last changed</dt><dd><time datetime={data.subject.data.updated_at}>{formatDate(data.subject.data.updated_at)}</time></dd></div>
+      </dl>
+    </details>
   {:else if data.subject.error}
     <div class="memory-state is-error" role="alert">
       <strong>Subject details unavailable.</strong>
@@ -75,38 +133,40 @@
   <section class="surface-section" aria-labelledby="resident-surface-heading">
     <header class="section-heading">
       <div>
-        <p class="memory-eyebrow">Resident context</p>
-        <h2 id="resident-surface-heading">Resident surface</h2>
+        <p class="memory-eyebrow">Generated from committed Memory</p>
+        <h2 id="resident-surface-heading">Resident context</h2>
       </div>
       {#if surface}
-        <span class="availability is-{surface.availability}">{surface.availability}</span>
+        <span class="availability is-{surface.availability}">{surfaceLabel(surface.availability)}</span>
       {/if}
     </header>
 
     {#if surface?.availability === 'ready' && snapshot}
       <div class="surface-meta">
-        <span>Built from store revision {snapshot.built_from_store_revision}</span>
+        <span>Generated <time datetime={snapshot.created_at}>{formatDate(snapshot.created_at)}</time></span>
         <span aria-hidden="true">·</span>
-        <time datetime={snapshot.created_at}>{formatDate(snapshot.created_at)}</time>
-        <span aria-hidden="true">·</span>
-        <span>{snapshot.memory_refs.length} Memory ref{snapshot.memory_refs.length === 1 ? '' : 's'}</span>
+        <span>{snapshot.memory_refs.length} referenced Memory {snapshot.memory_refs.length === 1 ? 'record' : 'records'}</span>
       </div>
       {#if snapshot.body_md.trim().length === 0}
         <div class="memory-state" role="status" data-surface-ready-empty>
-          <strong>Resident surface is ready and empty.</strong>
-          <p>This subject currently has no resident context to display.</p>
+          <strong>Resident context is current but empty.</strong>
+          <p>A generated surface exists, but it contains no context to show. Committed Memories, if any, remain listed below.</p>
         </div>
       {:else}
-        <article class="surface-document" aria-label="Resident surface">
+        <article class="surface-document" aria-label="Resident context">
           <DocumentMarkdown text={snapshot.body_md} />
         </article>
       {/if}
       <details class="surface-details">
-        <summary>Surface provenance</summary>
+        <summary>Surface sources and diagnostics</summary>
         <dl>
-          <div><dt>Snapshot id</dt><dd><code>{snapshot.snapshot_id}</code></dd></div>
+          <div><dt>Snapshot ID</dt><dd><code>{snapshot.snapshot_id}</code></dd></div>
           <div>
-            <dt>Memory refs</dt>
+            <dt>Generated from Subject revision</dt>
+            <dd>{snapshot.built_from_store_revision}<small>The Subject change number used for this surface, distinct from each Memory’s revision.</small></dd>
+          </div>
+          <div>
+            <dt>Referenced Memory revisions</dt>
             <dd>
               {#if snapshot.memory_refs.length === 0}
                 None
@@ -123,26 +183,26 @@
       </details>
     {:else if surface?.availability === 'ungenerated'}
       <div class="memory-state" role="status">
-        <strong>Resident surface has not been generated.</strong>
-        <p>Committed Memories remain available below.</p>
+        <strong>Resident context has not been generated.</strong>
+        <p>Committed Memories, if any, remain available below.</p>
       </div>
     {:else if surface?.availability === 'stale'}
       <div class="memory-state is-warning" role="status">
-        <strong>Resident surface is stale.</strong>
-        <p>The latest committed Memories are not represented by a publishable snapshot.</p>
+        <strong>Resident context needs to be refreshed.</strong>
+        <p>The latest committed Memories are not represented by a current surface, so no generated context is shown.</p>
       </div>
     {:else if surface?.availability === 'failed'}
       <div class="memory-state is-error" role="alert">
-        <strong>Resident surface generation failed.</strong>
-        <p>No failed or partial snapshot is displayed.</p>
+        <strong>Resident context generation failed.</strong>
+        <p>No failed or partial surface is shown. Committed Memories remain available below.</p>
       </div>
     {:else if data.surface.error}
       <div class="memory-state is-error" role="alert">
-        <strong>Resident surface unavailable.</strong>
+        <strong>Resident context status unavailable.</strong>
         <p>{data.surface.error}</p>
       </div>
     {:else}
-      <div class="memory-state" role="status"><p>Resident surface data is unavailable.</p></div>
+      <div class="memory-state" role="status"><p>Resident context status is unavailable.</p></div>
     {/if}
   </section>
 
@@ -152,14 +212,14 @@
         <p class="memory-eyebrow">Committed records</p>
         <h2 id="current-memories-heading">Current Memories</h2>
       </div>
-      {#if data.memories.data}<span class="memory-count">{memories.length}{data.memories.data.has_more ? '+' : ''}</span>{/if}
+      {#if data.memories.data}<span class="memory-count">{memories.length} shown{data.memories.data.has_more ? ' · more available' : ''}</span>{/if}
     </header>
 
     {#if data.memories.data}
       {#if memories.length === 0}
         <div class="memory-state" role="status" data-memories-empty>
-          <strong>No committed Memories.</strong>
-          <p>This subject has no current Memory revisions.</p>
+          <strong>{data.cursor ? 'No committed Memories on this page.' : 'No committed Memories yet.'}</strong>
+          <p>{data.cursor ? 'Return to the first page to review earlier records.' : 'This Subject has no current Memory records.'}</p>
           {#if data.cursor}<p><a href={memoryPageHref()}>Return to the first page</a></p>{/if}
         </div>
       {:else}
@@ -175,9 +235,9 @@
                 <p>{memory.excerpt || 'No excerpt.'}</p>
               </div>
               <dl>
-                <div><dt>Memory id</dt><dd><code title={memory.id}>{memory.id}</code></dd></div>
-                <div><dt>Revision</dt><dd>{memory.revision}</dd></div>
-                <div><dt>Updated</dt><dd><time datetime={memory.updated_at}>{formatDate(memory.updated_at)}</time></dd></div>
+                <div><dt>Memory ID</dt><dd><code title={memory.id}>{memory.id}</code></dd></div>
+                <div><dt>Memory revision</dt><dd>{memory.revision}</dd></div>
+                <div><dt>Last changed</dt><dd><time datetime={memory.updated_at}>{formatDate(memory.updated_at)}</time></dd></div>
               </dl>
             </a>
           {/each}
@@ -270,23 +330,77 @@
     font-size: var(--font-size-compact);
   }
 
-  .subject-facts {
-    grid-template-columns: repeat(5, minmax(0, 1fr));
-    gap: var(--space-3);
+  .subject-overview {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: var(--space-4);
+    padding: var(--space-4);
+    background: var(--bg-raised);
+    border-radius: var(--radius-soft);
   }
 
-  .subject-facts > div {
-    display: block;
+  .subject-overview > div {
+    display: grid;
+    align-content: start;
+    gap: var(--space-1);
+    min-width: 0;
   }
 
-  .subject-facts dt {
-    white-space: normal;
+  .subject-overview span,
+  .subject-overview p,
+  .subject-technical-details summary,
+  .subject-technical-details small,
+  .surface-details small {
+    color: var(--text-muted);
+    font-size: var(--font-size-compact);
   }
 
-  .subject-facts dd {
-    margin-top: var(--space-1);
-    color: var(--text);
+  .subject-overview strong {
+    color: var(--text-strong);
     overflow-wrap: anywhere;
+  }
+
+  .subject-overview p {
+    margin: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .subject-technical-details {
+    padding-bottom: var(--space-3);
+    border-bottom: 1px solid var(--line);
+  }
+
+  .subject-technical-details summary {
+    width: fit-content;
+    cursor: pointer;
+    font-weight: 700;
+  }
+
+  .subject-technical-details dl,
+  .surface-details dl {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: var(--space-4);
+    margin-top: var(--space-3);
+  }
+
+  .subject-technical-details dl > div,
+  .surface-details dl > div {
+    display: block;
+    min-width: 0;
+  }
+
+  .subject-technical-details dd,
+  .surface-details dd {
+    margin-top: var(--space-1);
+    overflow-wrap: anywhere;
+  }
+
+  .subject-technical-details small,
+  .surface-details small {
+    display: block;
+    margin-top: var(--space-1);
+    line-height: 1.4;
   }
 
   .subject-state,
@@ -455,7 +569,7 @@
   }
 
   @media (max-width: 900px) {
-    .subject-facts {
+    .subject-overview {
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
@@ -472,8 +586,14 @@
       gap: var(--space-2);
     }
 
-    .subject-facts {
+    .subject-overview,
+    .subject-technical-details dl,
+    .surface-details dl {
       grid-template-columns: minmax(0, 1fr);
+    }
+
+    .subject-overview {
+      padding: var(--space-3);
     }
 
     .memory-row {
