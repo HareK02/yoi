@@ -278,7 +278,7 @@ async fn target_alias_routes_each_tool_and_isolates_read_before_edit() {
 
     let bash = call(
         &reg.get("Bash"),
-        json!({ "target_workdir": "right", "command": "pwd" }),
+        json!({ "target_workdir": "right", "command": "pwd", "cwd": "." }),
     )
     .await;
     assert_eq!(
@@ -1005,7 +1005,7 @@ async fn bash_inherits_workdir_cwd() {
     // `pwd` should canonicalize to the workspace root we set up.
     let (dir, _spill, reg) = setup();
     let bash = reg.get("Bash");
-    let out = call(&bash, json!({ "command": "pwd" })).await;
+    let out = call(&bash, json!({ "command": "pwd", "cwd": "." })).await;
     let body = out.content.unwrap();
     let actual = std::fs::canonicalize(body.trim()).unwrap();
     let expected = std::fs::canonicalize(dir.path()).unwrap();
@@ -1016,7 +1016,11 @@ async fn bash_inherits_workdir_cwd() {
 async fn bash_provider_output_exposes_readable_retained_path() {
     let (_dir, spill, reg) = setup();
     let bash = reg.get("Bash");
-    let out = call(&bash, json!({ "command": "printf 'x%.0s' {1..20480}" })).await;
+    let out = call(
+        &bash,
+        json!({ "command": "printf 'x%.0s' {1..20480}", "cwd": "." }),
+    )
+    .await;
     let body = out.content.unwrap();
     assert!(body.contains("bounded WorkdirSession command output"));
     assert!(body.contains("full output saved to"));
@@ -1038,7 +1042,7 @@ async fn bash_cancellation_returns_bounded_progress_as_terminal_output() {
         "printf 'before\\n'; printf 'err-before\\n' >&2; sleep 1; touch {}; printf 'after\\n'",
         marker.display()
     );
-    let input = serde_json::to_string(&json!({ "command": command })).unwrap();
+    let input = serde_json::to_string(&json!({ "command": command, "cwd": "." })).unwrap();
     let context = ToolExecutionContext::new("call-heavy", "attempt-heavy", 0);
     let bash = reg.get("Bash");
     let executing = bash.clone();
@@ -1084,7 +1088,7 @@ async fn bash_force_close_cleanup_stops_command_and_keeps_session_reusable() {
     let (dir, _spill, reg) = setup();
     let marker = dir.path().join("must-not-survive-force-close");
     let command = format!("sleep 1; touch {}", marker.display());
-    let input = serde_json::to_string(&json!({ "command": command })).unwrap();
+    let input = serde_json::to_string(&json!({ "command": command, "cwd": "." })).unwrap();
     let bash = reg.get("Bash");
     let context = ToolExecutionContext::new("call-force", "attempt-force", 0);
     let (handle, terminal) = ToolExecutionHandle::start(bash.clone(), input, context);
@@ -1103,7 +1107,10 @@ async fn bash_force_close_cleanup_stops_command_and_keeps_session_reusable() {
     );
 
     let output = bash
-        .execute(r#"{"command":"printf 'reused'"}"#, Default::default())
+        .execute(
+            r#"{"command":"printf 'reused'","cwd":"."}"#,
+            Default::default(),
+        )
         .await
         .expect("workdir session remains reusable after cleanup");
     assert_eq!(output.content.as_deref(), Some("reused"));
