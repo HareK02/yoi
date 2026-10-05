@@ -10,29 +10,21 @@ use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use server_api::{
-    SUBJEKTIV_SESSION_MAX_TOOL_CONTENT_BYTES, SubjektivRecordSessionRequest,
-    SubjektivRecordSessionResponse, SubjektivSessionBackendOperation,
+    SUBJEKTIV_SESSION_MAX_TOOL_CONTENT_BYTES, SubjektivSessionBackendOperation,
     SubjektivSessionBackendRequest, SubjektivSessionBackendResponse, SubjektivSessionBackendResult,
     SubjektivSessionDiagnosticCode, SubjektivSessionErrorResponse, SubjektivSessionListRequest,
     SubjektivSessionReadRequest, SubjektivSessionSearchRequest,
 };
 
-use crate::feature::session::CommittedSessionCaptureHandle;
 use crate::feature::{
-    FeatureDescriptor, FeatureHookPoint, FeatureInstallContext, FeatureInstallError, FeatureModule,
-    HookDeclaration, ToolContribution, ToolDeclaration,
-};
-use crate::hook::{
-    Hook, HookError, HookErrorCategory, HookExecutionPolicy, HookFailurePolicy,
-    HookPreRequestAction, PreLlmRequest, PreRequestContext, RunCommitted, RunCommittedContext,
+    FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureModule, ToolContribution,
+    ToolDeclaration,
 };
 use crate::worker::{WorkspaceClient, WorkspaceServerOperation};
 
 const LIST_TOOL: &str = "SubjektivSessionList";
 const SEARCH_TOOL: &str = "SubjektivSessionSearch";
 const READ_TOOL: &str = "SubjektivSessionRead";
-const COMMIT_HOOK: &str = "record-subjektiv-session-after-commit";
-const RETRY_HOOK: &str = "retry-subjektiv-session-attribution";
 
 const LIST_DESCRIPTION: &str = "List committed retained or archived Sessions attributed by the Host to the connected subject. Filter by exact session_id or storage and continue with the returned opaque cursor; subject, Runtime, Worker, archive, and filesystem authority are never model inputs.";
 const SEARCH_DESCRIPTION: &str = "Search committed public entries across Host-authorized Sessions attributed to the connected subject, or list one Session's public entries when session_id is supplied and query is omitted. Search is case-insensitive literal matching; system prompts, hidden reasoning, traces, and attachment bodies are never exposed.";
@@ -46,13 +38,11 @@ pub(crate) struct SubjektivSessionFeature {
 #[derive(Clone)]
 struct SubjektivSessionState {
     client: Arc<dyn WorkspaceClient>,
-    capture: CommittedSessionCaptureHandle,
 }
 
 impl SubjektivSessionFeature {
     pub(crate) fn from_resolved_config(
         config: &manifest::ResolvedSubjektivFeatureConfig,
-        capture: CommittedSessionCaptureHandle,
         client: Arc<dyn WorkspaceClient>,
     ) -> std::io::Result<Option<Self>> {
         if !config.execution_enabled() {
@@ -68,7 +58,7 @@ impl SubjektivSessionFeature {
             ));
         }
         Ok(Some(Self {
-            state: SubjektivSessionState { client, capture },
+            state: SubjektivSessionState { client },
         }))
     }
 }
@@ -82,14 +72,6 @@ impl FeatureModule for SubjektivSessionFeature {
             .with_tool(ToolDeclaration::new(LIST_TOOL, LIST_DESCRIPTION))
             .with_tool(ToolDeclaration::new(SEARCH_TOOL, SEARCH_DESCRIPTION))
             .with_tool(ToolDeclaration::new(READ_TOOL, READ_DESCRIPTION))
-            .with_hook(HookDeclaration::new(
-                COMMIT_HOOK,
-                FeatureHookPoint::RunCommitted,
-            ))
-            .with_hook(HookDeclaration::new(
-                RETRY_HOOK,
-                FeatureHookPoint::PreLlmRequest,
-            ))
     }
 
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
@@ -103,19 +85,7 @@ impl FeatureModule for SubjektivSessionFeature {
                 tool_definition(name, description, self.state.clone(), operation),
             ))?;
         }
-        context.hooks().add_run_committed(
-            COMMIT_HOOK,
-            HookExecutionPolicy::new(HookFailurePolicy::AttentionRequired, 30_000),
-            RecordCommittedSessionHook {
-                state: self.state.clone(),
-            },
-        )?;
-        context.hooks().add_pre_request(
-            RETRY_HOOK,
-            RetryCommittedSessionHook {
-                state: self.state.clone(),
-            },
-        )
+        Ok(())
     }
 }
 
@@ -204,88 +174,6 @@ impl SubjektivSessionState {
             response.status
         )))
     }
-
-    fn record_current_committed_session(&self) -> Result<(), HookError> {
-        let capture = self
-            .capture
-            .capture()
-            .map_err(|error| HookError::new(HookErrorCategory::Dependency, error.to_string()))?;
-        if !capture.has_committed_run {
-            return Err(HookError::new(
-                HookErrorCategory::Dependency,
-                "committed Session capture is not available yet",
-            ));
-        }
-        self.record_session(&capture.session_id)
-    }
-
-    fn retry_current_committed_session(&self) -> Result<(), HookError> {
-        let capture = self
-            .capture
-            .capture()
-            .map_err(|error| HookError::new(HookErrorCategory::Dependency, error.to_string()))?;
-        if !capture.has_committed_run {
-            return Ok(());
-        }
-        self.record_session(&capture.session_id)
-    }
-
-    fn record_session(&self, session_id: &str) -> Result<(), HookError> {
-        let response = self
-            .client
-            .execute_server_operation(WorkspaceServerOperation::SubjektivRecordSession(
-                SubjektivRecordSessionRequest {
-                    session_id: session_id.to_string(),
-                },
-            ))
-            .map_err(|error| HookError::new(HookErrorCategory::Dependency, error.to_string()))?;
-        if !response.is_success() {
-            return Err(HookError::new(
-                HookErrorCategory::Dependency,
-                format!(
-                    "record subjektiv Session attribution returned HTTP {}",
-                    response.status
-                ),
-            ));
-        }
-        let output: SubjektivRecordSessionResponse =
-            serde_json::from_str(&response.body).map_err(|error| {
-                HookError::new(
-                    HookErrorCategory::Dependency,
-                    format!("decode subjektiv Session attribution response: {error}"),
-                )
-            })?;
-        if output.session_id != session_id {
-            return Err(HookError::new(
-                HookErrorCategory::Dependency,
-                "subjektiv Session attribution response changed session identity",
-            ));
-        }
-        Ok(())
-    }
-}
-
-struct RecordCommittedSessionHook {
-    state: SubjektivSessionState,
-}
-
-#[async_trait]
-impl Hook<RunCommitted> for RecordCommittedSessionHook {
-    async fn call(&self, _input: &RunCommittedContext) -> Result<(), HookError> {
-        self.state.record_current_committed_session()
-    }
-}
-
-struct RetryCommittedSessionHook {
-    state: SubjektivSessionState,
-}
-
-#[async_trait]
-impl Hook<PreLlmRequest> for RetryCommittedSessionHook {
-    async fn call(&self, _input: &PreRequestContext) -> Result<HookPreRequestAction, HookError> {
-        self.state.retry_current_committed_session()?;
-        Ok(HookPreRequestAction::Continue)
-    }
 }
 
 fn parse<T: serde::de::DeserializeOwned>(input: &str, tool: &str) -> Result<T, ToolError> {
@@ -348,12 +236,8 @@ fn response_summary(response: &SubjektivSessionBackendResponse) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::feature::session::{CommittedRunExit, CommittedSessionCapture};
-    use crate::hook::{HookHistoryRange, HookInvocationContext, PreRequestInfo, RunCommittedExit};
     use crate::worker::{
         WorkspaceClientError, WorkspaceRequest, WorkspaceRequestMethod, WorkspaceResponse,
     };
@@ -398,81 +282,6 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Default)]
-    struct AttributionClient {
-        requests: Mutex<Vec<WorkspaceRequest>>,
-        recorded: Mutex<HashSet<String>>,
-        insertions: AtomicUsize,
-        failures: AtomicUsize,
-    }
-
-    impl WorkspaceClient for AttributionClient {
-        fn workspace_id(&self) -> Option<&str> {
-            Some("workspace-test")
-        }
-
-        fn kind(&self) -> &str {
-            "subjektiv-attribution-test"
-        }
-
-        fn is_available(&self) -> bool {
-            true
-        }
-
-        fn execute(
-            &self,
-            request: WorkspaceRequest,
-        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
-            self.requests.lock().unwrap().push(request.clone());
-            if self
-                .failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok()
-            {
-                return Ok(WorkspaceResponse {
-                    status: 503,
-                    body: "temporarily unavailable".into(),
-                });
-            }
-            let input: SubjektivRecordSessionRequest =
-                serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
-            if self
-                .recorded
-                .lock()
-                .unwrap()
-                .insert(input.session_id.clone())
-            {
-                self.insertions.fetch_add(1, Ordering::SeqCst);
-            }
-            Ok(WorkspaceResponse {
-                status: 200,
-                body: serde_json::to_string(&SubjektivRecordSessionResponse {
-                    subject_id: "subject-1".into(),
-                    session_id: input.session_id,
-                })
-                .unwrap(),
-            })
-        }
-    }
-
-    fn capture(has_committed_run: bool) -> CommittedSessionCaptureHandle {
-        CommittedSessionCaptureHandle::new(move || {
-            Ok(CommittedSessionCapture {
-                session_id: "session-1".into(),
-                segment_id: "segment-1".into(),
-                session_revision: usize::from(has_committed_run) as u64,
-                entry_count: usize::from(has_committed_run),
-                has_committed_run,
-                run_exit: CommittedRunExit::Finished,
-                history: Vec::new(),
-                usage_history: Vec::new(),
-                extensions: Vec::new(),
-            })
-        })
-    }
-
     fn list_response() -> SubjektivSessionBackendResponse {
         SubjektivSessionBackendResponse::Ok {
             result: SubjektivSessionBackendResult::List(server_api::SubjektivSessionListResponse {
@@ -483,45 +292,14 @@ mod tests {
         }
     }
 
-    fn state(client: Arc<dyn WorkspaceClient>, has_committed_run: bool) -> SubjektivSessionState {
-        SubjektivSessionState {
-            client,
-            capture: capture(has_committed_run),
-        }
+    fn state(client: Arc<dyn WorkspaceClient>) -> SubjektivSessionState {
+        SubjektivSessionState { client }
     }
 
     fn feature(client: Arc<dyn WorkspaceClient>) -> SubjektivSessionFeature {
         SubjektivSessionFeature {
-            state: state(client, true),
+            state: state(client),
         }
-    }
-
-    fn run_committed_context() -> RunCommittedContext {
-        RunCommittedContext {
-            invocation: HookInvocationContext {
-                workspace_id: Some("workspace-test".into()),
-                worker_id: "worker-1".into(),
-                session_id: "session-1".into(),
-                session_revision: 1,
-                run_id: Some("run-1".into()),
-                turn_index: Some(0),
-                call_id: None,
-            },
-            exit: RunCommittedExit::Finished,
-            committed_history: HookHistoryRange::default(),
-        }
-    }
-
-    fn pre_request_context() -> PreRequestContext {
-        PreRequestContext::new(
-            PreRequestInfo {
-                item_count: 0,
-                estimated_tokens: None,
-                turn_index: 0,
-                tool_calls_this_turn: 0,
-            },
-            None,
-        )
     }
 
     #[test]
@@ -540,17 +318,7 @@ mod tests {
                 (READ_TOOL, READ_DESCRIPTION),
             ]
         );
-        assert_eq!(
-            descriptor
-                .hooks
-                .iter()
-                .map(|hook| (hook.name.as_str(), hook.point.clone()))
-                .collect::<Vec<_>>(),
-            vec![
-                (COMMIT_HOOK, FeatureHookPoint::RunCommitted),
-                (RETRY_HOOK, FeatureHookPoint::PreLlmRequest),
-            ]
-        );
+        assert!(descriptor.hooks.is_empty());
 
         for (name, description, operation, expected_schema) in [
             (
@@ -595,7 +363,6 @@ mod tests {
         let config = manifest::ResolvedSubjektivFeatureConfig::default();
         let result = SubjektivSessionFeature::from_resolved_config(
             &config,
-            capture(false),
             Arc::new(SessionToolClient::new(list_response())),
         )
         .unwrap();
@@ -620,7 +387,7 @@ mod tests {
             ),
         ] {
             let error = SubjektivSessionTool {
-                state: state(client.clone(), true),
+                state: state(client.clone()),
                 operation,
             }
             .execute(input, ToolExecutionContext::new("call", "batch", 0))
@@ -635,7 +402,7 @@ mod tests {
     async fn tool_routes_one_host_bound_operation_to_session_history() {
         let client = Arc::new(SessionToolClient::new(list_response()));
         let tool = SubjektivSessionTool {
-            state: state(client.clone(), true),
+            state: state(client.clone()),
             operation: SessionOperation::List,
         };
         let output = tool
@@ -682,7 +449,7 @@ mod tests {
             },
         };
         let error_tool = SubjektivSessionTool {
-            state: state(Arc::new(SessionToolClient::new(typed_error.clone())), true),
+            state: state(Arc::new(SessionToolClient::new(typed_error.clone()))),
             operation: SessionOperation::Search,
         };
         let output = error_tool
@@ -768,88 +535,5 @@ mod tests {
                 )
             } if content == escaped_content && cursor == "next-page"
         ));
-    }
-
-    #[tokio::test]
-    async fn candidate_free_commit_records_session_and_pre_request_waits_for_committed_capture() {
-        let client = Arc::new(AttributionClient::default());
-        let commit_hook = RecordCommittedSessionHook {
-            state: state(client.clone(), true),
-        };
-        commit_hook.call(&run_committed_context()).await.unwrap();
-        let requests = client.requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].path, "/api/w/workspace-test/subjektiv/sessions");
-        assert!(!requests[0].path.contains("staging"));
-        drop(requests);
-
-        let before_commit = Arc::new(AttributionClient::default());
-        let premature_commit_hook = RecordCommittedSessionHook {
-            state: state(before_commit.clone(), false),
-        };
-        assert!(
-            premature_commit_hook
-                .call(&run_committed_context())
-                .await
-                .is_err()
-        );
-        let retry_hook = RetryCommittedSessionHook {
-            state: state(before_commit.clone(), false),
-        };
-        assert_eq!(
-            retry_hook.call(&pre_request_context()).await.unwrap(),
-            HookPreRequestAction::Continue
-        );
-        assert!(before_commit.requests.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn transient_attribution_failure_is_a_hook_failure_then_retries_exactly() {
-        let client = Arc::new(AttributionClient::default());
-        client.failures.store(1, Ordering::SeqCst);
-        let state = state(client.clone(), true);
-        let commit_hook = RecordCommittedSessionHook {
-            state: state.clone(),
-        };
-        let retry_hook = RetryCommittedSessionHook { state };
-
-        let error = commit_hook
-            .call(&run_committed_context())
-            .await
-            .unwrap_err();
-        assert_eq!(error.category, HookErrorCategory::Dependency);
-        assert_eq!(
-            retry_hook.call(&pre_request_context()).await.unwrap(),
-            HookPreRequestAction::Continue
-        );
-
-        let requests = client.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].body, requests[1].body);
-        assert_eq!(client.insertions.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn repeated_commit_and_pre_request_use_exact_request_and_backend_dedupes() {
-        let client = Arc::new(AttributionClient::default());
-        let state = state(client.clone(), true);
-        let commit_hook = RecordCommittedSessionHook {
-            state: state.clone(),
-        };
-        let retry_hook = RetryCommittedSessionHook { state };
-
-        commit_hook.call(&run_committed_context()).await.unwrap();
-        commit_hook.call(&run_committed_context()).await.unwrap();
-        retry_hook.call(&pre_request_context()).await.unwrap();
-
-        let requests = client.requests.lock().unwrap();
-        assert_eq!(requests.len(), 3);
-        assert!(
-            requests
-                .iter()
-                .all(|request| request.body == requests[0].body)
-        );
-        assert_eq!(client.recorded.lock().unwrap().len(), 1);
-        assert_eq!(client.insertions.load(Ordering::SeqCst), 1);
     }
 }

@@ -4782,6 +4782,11 @@ pub struct SubjektivStageCandidateResponse {
 #[serde(deny_unknown_fields)]
 pub struct SubjektivRecordSessionRequest {
     pub session_id: String,
+    /// Creation is allowed only while finalizing a newly generated Session or
+    /// recovering that exact lifecycle's durable incomplete state. Restoring a
+    /// legacy Session uses verification-only mode so current ownership cannot
+    /// invent historical attribution.
+    pub create_if_missing: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]

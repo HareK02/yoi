@@ -1221,9 +1221,9 @@ impl SubjektivStore {
         })
     }
 
-    /// Atomically records immutable host attribution for the committed Session
-    /// and stages its extracted candidate. Exact retries return the first stored
-    /// records, including their original host timestamps.
+    /// Atomically verifies immutable Host attribution already completed at the
+    /// Session lifecycle boundary and stages its extracted candidate. Candidate
+    /// staging never creates or repairs Session attribution.
     pub fn stage_candidate_with_attribution(
         &self,
         mut record: SubjectStagingRecord,
@@ -1243,14 +1243,38 @@ impl SubjektivStore {
         validate_staging_record(self.workspace_id(), &record)?;
         validate_staging_admission(&record)?;
         let candidate_raw = serde_json::to_string(&record)?;
-        let attribution_raw = serde_json::to_string(&attribution)?;
 
         self.database.try_transaction(|transaction| {
             require_active_subject(transaction, &record.subject_id)?;
-            let attribution = write_session_attribution(transaction, attribution, attribution_raw)?;
+            let existing_raw = transaction
+                .query_row(
+                    "SELECT record_json FROM subject_session_attributions WHERE session_id = ?1",
+                    [&attribution.session_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    SubjektivError::InvalidRecord(format!(
+                        "Session {} has not completed Host attribution",
+                        attribution.session_id
+                    ))
+                })?;
+            let existing = parse_session_attribution(&existing_raw)?;
+            if existing.subject_id != attribution.subject_id {
+                return Err(SubjektivError::SessionSubjectConflict {
+                    session_id: attribution.session_id,
+                    existing_subject_id: existing.subject_id,
+                    requested_subject_id: attribution.subject_id,
+                });
+            }
+            if !equivalent_session_attribution(&existing, &attribution) {
+                return Err(SubjektivError::SessionAttributionConflict(
+                    attribution.session_id,
+                ));
+            }
             let candidate =
                 write_staging_candidate(transaction, self.workspace_id(), record, candidate_raw)?;
-            Ok((candidate, attribution))
+            Ok((candidate, existing))
         })
     }
 
@@ -3657,6 +3681,7 @@ mod tests {
             "2026-09-28T09:00:00.000Z",
         );
 
+        store.record_session_attribution(session.clone()).unwrap();
         let (first_candidate, stored_session) = store
             .stage_candidate_with_attribution(
                 candidate(&subject.id, "candidate-1", "workspace-a"),
@@ -3871,16 +3896,20 @@ mod tests {
         };
 
         let (_manager, _workspace, store) = open_store(&root, "workspace-a");
+        let lifecycle_attribution = attribution(
+            &subject_id,
+            "runtime-1",
+            "worker-1",
+            "session-1",
+            "2026-09-28T10:00:00.000Z",
+        );
+        store
+            .record_session_attribution(lifecycle_attribution.clone())
+            .unwrap();
         let (staged, stored_attribution) = store
             .stage_candidate_with_attribution(
                 candidate(&subject_id, "candidate-after-migration", "workspace-a"),
-                attribution(
-                    &subject_id,
-                    "runtime-1",
-                    "worker-1",
-                    "session-1",
-                    "2026-09-28T10:00:00.000Z",
-                ),
+                lifecycle_attribution,
             )
             .unwrap();
 
@@ -3977,7 +4006,7 @@ mod tests {
     }
 
     #[test]
-    fn attributed_staging_is_atomic_and_retry_idempotent() {
+    fn attributed_staging_requires_lifecycle_record_and_retry_is_idempotent() {
         let temp = tempfile::tempdir().unwrap();
         let (_manager, _workspace, store) = open_store(&temp.path().join("storage"), "workspace-a");
         let subject = store.create_subject(role()).unwrap();
@@ -3988,6 +4017,24 @@ mod tests {
             "session-1",
             "2026-09-28T10:00:00.000Z",
         );
+        assert!(matches!(
+            store.stage_candidate_with_attribution(
+                candidate(&subject.id, "candidate-unattributed", "workspace-a"),
+                first_attribution.clone(),
+            ),
+            Err(SubjektivError::InvalidRecord(message))
+                if message.contains("has not completed Host attribution")
+        ));
+        assert!(store.session_attribution("session-1").unwrap().is_none());
+        assert!(
+            store
+                .staging_candidate(&subject.id, "candidate-unattributed")
+                .unwrap()
+                .is_none()
+        );
+        store
+            .record_session_attribution(first_attribution.clone())
+            .unwrap();
         let (first_candidate, first_attribution) = store
             .stage_candidate_with_attribution(
                 candidate(&subject.id, "candidate-1", "workspace-a"),
@@ -4013,22 +4060,24 @@ mod tests {
         let mut conflicting_candidate = candidate(&subject.id, "candidate-1", "workspace-a");
         conflicting_candidate.claim = "different content".into();
         conflicting_candidate.source_refs[0].session_id = Some("session-2".into());
-        let result = store.stage_candidate_with_attribution(
-            conflicting_candidate,
-            attribution(
-                &subject.id,
-                "runtime-1",
-                "worker-1",
-                "session-2",
-                "2026-09-28T12:00:00.000Z",
-            ),
+        let conflicting_attribution = attribution(
+            &subject.id,
+            "runtime-1",
+            "worker-1",
+            "session-2",
+            "2026-09-28T12:00:00.000Z",
         );
+        store
+            .record_session_attribution(conflicting_attribution.clone())
+            .unwrap();
+        let result =
+            store.stage_candidate_with_attribution(conflicting_candidate, conflicting_attribution);
         assert!(matches!(
             result,
             Err(SubjektivError::CandidateConflict(candidate_id))
                 if candidate_id == "candidate-1"
         ));
-        assert!(store.session_attribution("session-2").unwrap().is_none());
+        assert!(store.session_attribution("session-2").unwrap().is_some());
     }
 
     #[test]
@@ -4119,6 +4168,26 @@ mod tests {
         let (_manager, _workspace, store) = open_store(&temp.path().join("storage"), "workspace-a");
         let subject = store.create_subject(role()).unwrap();
         let other_subject = store.create_subject(role()).unwrap();
+        for lifecycle_attribution in [
+            attribution(
+                &subject.id,
+                "runtime-1",
+                "worker-1",
+                "session-1",
+                "2026-09-28T10:00:00.000Z",
+            ),
+            attribution(
+                &subject.id,
+                "runtime-2",
+                "worker-2",
+                "session-2",
+                "2026-09-28T11:00:00.000Z",
+            ),
+        ] {
+            store
+                .record_session_attribution(lifecycle_attribution)
+                .unwrap();
+        }
 
         store
             .stage_candidate_with_attribution(
@@ -4716,17 +4785,18 @@ mod tests {
                 "This attribution must roll back with the stale proposal",
             ))
             .unwrap();
+        let stale_attribution = attribution(
+            &subject.id,
+            "runtime-proposal",
+            "worker-proposal",
+            "session-proposal-stale",
+            "2026-09-28T12:00:00.000Z",
+        );
+        store
+            .record_session_attribution(stale_attribution.clone())
+            .unwrap();
         assert!(matches!(
-            store.stage_candidate_with_attribution(
-                attributed_stale,
-                attribution(
-                    &subject.id,
-                    "runtime-proposal",
-                    "worker-proposal",
-                    "session-proposal-stale",
-                    "2026-09-28T12:00:00.000Z",
-                ),
-            ),
+            store.stage_candidate_with_attribution(attributed_stale, stale_attribution,),
             Err(SubjektivError::RevisionConflict {
                 expected: 1,
                 actual: 2,
@@ -4737,7 +4807,7 @@ mod tests {
             store
                 .session_attribution("session-proposal-stale")
                 .unwrap()
-                .is_none()
+                .is_some()
         );
         let reopen = candidate(&subject.id, "candidate-reopen", "workspace-a")
             .with_revision_proposal(proposal(
