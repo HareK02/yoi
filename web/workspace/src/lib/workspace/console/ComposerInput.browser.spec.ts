@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, waitFor } from "@testing-library/svelte";
 import { afterEach, expect, test, vi } from "vitest";
 import { EditorView } from "@codemirror/view";
 import type { FeatureInvocationDescriptor, Segment } from "#lib/generated/protocol.ts";
-import { undo } from "@codemirror/commands";
+import { redo, undo } from "@codemirror/commands";
 import ComposerInput from "./ComposerInput.svelte";
 
 afterEach(cleanup);
@@ -186,6 +186,52 @@ test("restored chip descriptor edits reject same-draft cursor ABA", async () => 
   await Promise.resolve();
   await Promise.resolve();
   expect(ui.component.snapshot().segments).toEqual([invocationSegment]);
+});
+
+test.each(["Backspace", "Delete", "range", "cut", "replace"])("pending upload %s cancels its reservation before late completion and Undo", async (operation) => {
+  const oncancelupload = vi.fn();
+  const ui = render(ComposerInput, { historyScope: `upload-delete-${operation}`, oncancelupload });
+  const cm = editor(ui.container);
+  type(cm, "before after", 7);
+  const reservation = ui.component.reserveUpload("report.md")!;
+  const from = 7, to = cm.state.selection.main.head;
+  if (operation === "Backspace" || operation === "Delete") {
+    cm.dispatch({ selection: { anchor: operation === "Backspace" ? to : from } });
+    await fireEvent.keyDown(cm.contentDOM, { key: operation });
+  } else if (operation === "replace") {
+    cm.dispatch({ changes: { from, to, insert: "replacement" }, userEvent: "input" });
+  } else {
+    // happy-dom emits selectionchange synchronously while CodeMirror updates a
+    // focused DOM range. Exercise the transaction/cut handler unfocused here;
+    // the Chromium suite covers focused keyboard range deletion.
+    cm.contentDOM.blur();
+    cm.dispatch({ selection: { anchor: from, head: to } });
+    if (operation === "cut") await fireEvent.cut(cm.contentDOM, { clipboardData: { setData: vi.fn() } });
+    else await fireEvent.keyDown(cm.contentDOM, { key: "Backspace" });
+  }
+  expect(oncancelupload).toHaveBeenCalledExactlyOnceWith(reservation);
+  expect(ui.component.completeUpload(reservation, uploadedSegment)).toBe(false);
+  expect(ui.component.snapshot().segments.some((segment) => segment.kind === "unknown" || segment.kind === "uploaded_file")).toBe(false);
+  undo(cm);
+  expect(ui.component.completeUpload(reservation, uploadedSegment)).toBe(false);
+  expect(ui.component.snapshot().segments.some((segment) => segment.kind === "unknown" || segment.kind === "uploaded_file")).toBe(false);
+  redo(cm);
+  ui.component.clear();
+  expect(oncancelupload).toHaveBeenCalledOnce();
+});
+
+test.each(["clear", "restore", "unmount"])("pending upload %s boundary cancels once without acquiring late staged resources", (boundary) => {
+  const oncancelupload = vi.fn();
+  const onremoveatom = vi.fn();
+  const ui = render(ComposerInput, { historyScope: `upload-boundary-${boundary}`, oncancelupload, onremoveatom });
+  const reservation = ui.component.reserveUpload("report.md")!;
+  const complete = ui.component.completeUpload;
+  if (boundary === "clear") ui.component.clear();
+  else if (boundary === "restore") ui.component.restoreSegments([invocationSegment]);
+  else ui.unmount();
+  expect(oncancelupload).toHaveBeenCalledExactlyOnceWith(reservation);
+  expect(complete(reservation, uploadedSegment)).toBe(false);
+  expect(onremoveatom).not.toHaveBeenCalled();
 });
 
 test("cancelled upload cannot become sendable via late completion or Undo", async () => {

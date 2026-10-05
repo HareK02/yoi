@@ -59,7 +59,7 @@ Completion requests carry a kind, fresh `request_id`, and source-qualified argum
 - TUI may select a path visible to the TUI process, stage an upload, and replace the invocation intent with an `UploadedFile` chip.
 - Web opens the existing browser picker; it does not enumerate the browser host filesystem.
 - The local path is never sent to or resolved by the Worker.
-- Uploading is cancellable draft staging, not invocation execution. Removing an unsent uploaded-file chip cancels or deletes staged state, and a late upload completion must not recreate a removed chip.
+- Uploading is cancellable draft staging, not invocation execution. Removing an in-progress upload chip by Backspace/Delete, range replacement, or draft abandonment cancels its reservation and adapter upload; the removed upload must no longer block a text-only Submit. Late callbacks and Undo cannot restore that cancelled reservation as sendable input. A completed unsent uploaded-file chip may retain its staged resource while editor Undo can restore it, releasing abandoned resources at the draft boundary; a late completion must never turn a deleted pending reservation into such an Undo-owned resource.
 - Authoritative `SubmissionAccepted` (not socket-send success) transfers uploaded references to the durable input lifecycle. Draft removal cannot delete an in-flight reference whose admission may already have succeeded, or an accepted attachment. Rejection restores the exact typed intent for retry; retry retains request/invocation IDs. Upload completion alone is not submission acceptance.
 - TUI standalone currently has no client-local upload staging transport. It reports the unsupported adapter and preserves the draft; it does not reinterpret a local path as a Worker host path.
 

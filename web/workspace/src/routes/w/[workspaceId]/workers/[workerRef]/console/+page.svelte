@@ -1091,6 +1091,17 @@
         );
     }
 
+    function cancelComposerUpload(reservation: number): void {
+        const attachment = attachments.find((candidate) =>
+            uploadReservations.get(candidate.id) === reservation);
+        if (!attachment) return;
+        // The editor already cancelled/tombstoned its reservation. Do not call
+        // cancelUpload here: this may run inside a CodeMirror update listener.
+        uploadReservations.delete(attachment.id);
+        attachments = attachments.filter((candidate) => candidate.id !== attachment.id);
+        attachment.request?.abort();
+    }
+
     function completeAttachmentUpload(
         attachment: ComposerAttachment,
         reference: NonNullable<ComposerAttachment["reference"]>,
@@ -2177,6 +2188,7 @@
                 resolveFeatureArgumentCompletions={(context, prefix, signal) =>
                     featureArgumentCompletionLane(context).request(prefix, signal)}
                 onremoveatom={(segment) => void releaseComposerAtom(segment)}
+                oncancelupload={cancelComposerUpload}
                 onclientadapter={(descriptor) => {
                     if (descriptor.client_adapter === "attachment") fileInput?.click();
                 }}

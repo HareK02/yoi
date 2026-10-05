@@ -80,6 +80,7 @@
       signal: AbortSignal,
     ) => Promise<ComposerCompletionEntry[]>;
     onremoveatom?: (segment: Segment) => void;
+    oncancelupload?: (reservation: number) => void;
     onclientadapter?: (descriptor: FeatureInvocationDescriptor) => void;
   }
 
@@ -98,6 +99,7 @@
     resolveFeatureCompletions,
     resolveFeatureArgumentCompletions,
     onremoveatom,
+    oncancelupload,
     onclientadapter,
   }: Props = $props();
 
@@ -105,6 +107,7 @@
   let view: EditorView | null = null;
   let editorExtensions: Extension[] = [];
   const stagedTypedAtoms = new Map<number, Segment>();
+  const pendingUploads = new Set<number>();
   let composerHistory = new ComposerHistory();
   let restoringHistory = false;
   let nextPasteId = 1;
@@ -411,9 +414,19 @@
     create: () => new Map(),
     update(registry, transaction) {
       const additions = transaction.effects.filter((effect) => effect.is(registerTypedAtom));
-      if (!additions.length) return registry;
+      if (!additions.length && !transaction.docChanged) return registry;
       const next = new Map(registry);
       for (const addition of additions) next.set(addition.value.key, addition.value.atom);
+      if (transaction.docChanged) {
+        const live = new Set(composerTypedAtoms(transaction.newDoc.toString(), next).map((atom) => atom.key));
+        for (const atom of composerTypedAtoms(transaction.startState.doc.toString(), registry)) {
+          if (atom.uploadReservation && !live.has(atom.key)) {
+            // Cancellation is part of the editor transaction, not a later callback.
+            // Undo restores text only; it cannot regain this upload reservation.
+            next.set(atom.key, { segment: { kind: "text", content: "" }, label: "Removed upload" });
+          }
+        }
+      }
       return next;
     },
   });
@@ -457,7 +470,14 @@
     EditorView.decorations.of((currentView) => typedDecorations(currentView.state)),
     EditorView.atomicRanges.of((currentView) => typedDecorations(currentView.state)),
   ];
-  // Deleted uploads remain staged while Undo can still restore their atoms.
+  function releasePendingUploads(): void {
+    const cancelled = [...pendingUploads];
+    pendingUploads.clear();
+    for (const key of cancelled) oncancelupload?.(key);
+  }
+
+  // Completed uploads remain staged while Undo can still restore their atoms.
+  // Pending reservations are cancelled immediately, not retained as Undo leases.
   // Release abandoned resources at a draft boundary; accepted live atoms belong to the host.
   function releaseStagedAtoms(accepted = false): void {
     const live = accepted && view ? new Set(composerTypedAtoms(
@@ -481,7 +501,7 @@
 
   function insertTypedSegment(
     segment: Segment,
-    options: { from?: number; to?: number; cleanup?: boolean; label?: string } = {},
+    options: { from?: number; to?: number; cleanup?: boolean; label?: string; uploadReservation?: boolean } = {},
   ): number | null {
     if (!view || view.state.readOnly) return null;
     const selection = view.state.selection.main;
@@ -489,13 +509,14 @@
     const to = options.to ?? selection.to;
     const key = nextTypedKey++;
     if (options.cleanup) stagedTypedAtoms.set(key, segment);
+    if (options.uploadReservation) pendingUploads.add(key);
     const token = composerTypedToken(key);
     view.dispatch({
       changes: { from, to, insert: token },
       selection: EditorSelection.cursor(from + token.length),
       effects: registerTypedAtom.of({
         key,
-        atom: { segment, label: options.label ?? typedAtomLabel(segment), cleanup: options.cleanup },
+        atom: { segment, label: options.label ?? typedAtomLabel(segment), cleanup: options.cleanup, uploadReservation: options.uploadReservation },
       }),
       annotations: isolateHistory.of("full"),
       userEvent: "input.complete",
@@ -784,6 +805,14 @@
             spellcheck: "true",
           }),
           EditorView.updateListener.of((update) => {
+            // StateField tombstones deleted reservations before notifying the
+            // adapter. The callback must not dispatch a nested editor update.
+            for (const key of pendingUploads) {
+              if (!update.state.field(typedRegistry).get(key)?.uploadReservation) {
+                pendingUploads.delete(key);
+                oncancelupload?.(key);
+              }
+            }
             if (update.docChanged || update.selectionSet) {
               editorGeneration++;
               // Invalidate synchronously: an A→B→A edit/cursor cycle in one
@@ -881,6 +910,7 @@
 
     return () => {
       closeCompletion();
+      releasePendingUploads();
       releaseStagedAtoms();
       editVersion++;
       view?.destroy();
@@ -940,11 +970,14 @@
   }
 
   export function reserveUpload(fileName: string): number | null {
-    return insertTypedSegment({ kind: "unknown" }, { label: `Uploading ${fileName}` });
+    return insertTypedSegment({ kind: "unknown" }, { label: `Uploading ${fileName}`, uploadReservation: true });
   }
 
   export function completeUpload(key: number, segment: Segment): boolean {
-    if (!view || view.state.field(typedRegistry).get(key)?.segment.kind !== "unknown") return false;
+    if (!view || !pendingUploads.has(key) ||
+        !view.state.field(typedRegistry).get(key)?.uploadReservation ||
+        !composerTypedAtoms(view.state.doc.toString(), view.state.field(typedRegistry)).some((atom) => atom.key === key)) return false;
+    pendingUploads.delete(key);
     stagedTypedAtoms.set(key, segment);
     view.dispatch({ effects: registerTypedAtom.of({
       key, atom: { segment, label: typedAtomLabel(segment), cleanup: true },
@@ -968,6 +1001,7 @@
 
   export function clear(acceptedTypedResources = false, retainStagedResources = false): void {
     if (!view) return;
+    releasePendingUploads();
     if (!retainStagedResources) releaseStagedAtoms(acceptedTypedResources);
     editVersion++;
     closeCompletion();

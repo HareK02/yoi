@@ -306,7 +306,7 @@ Deno.test("production attachment upload failure and in-flight cancellation never
     );
   }, true));
 
-Deno.test("production upload retry retains upload ID and late completion cannot resurrect deleted reservation", () =>
+Deno.test("production upload retry retains upload ID and deleted pending upload cancels without blocking Submit", () =>
   fixture(async (page, base, errors, caseOutput) => {
     await control(base, { upload: "fail" });
     await attach(page, "retry.md");
@@ -335,41 +335,35 @@ Deno.test("production upload retry retains upload ID and late completion cannot 
     const held = await eventually(base, (value) => value.held_uploads.length === 1);
     const lateId = held.held_uploads[0];
     await page.locator(".composer-typed-chip").filter({ hasText: "Uploading late.md" }).waitFor();
-    // Delete only the reservation, without aborting its real pending upload.
+    // Keyboard deletion cancels staging; a separate Remove action is not needed.
     await page.locator(".cm-content").focus();
     await page.keyboard.press("Control+End");
     await page.keyboard.press("Backspace");
     assertEquals(await page.locator(".composer-typed-chip").count(), 0);
     await page.screenshot({ path: join(caseOutput, "late-upload-deleted.png") });
-    const response = page.waitForResponse((response) =>
-      response.request().method() === "PUT" && response.url().endsWith(lateId)
-    );
-    await control(base, { release_uploads: true });
-    assertEquals((await response).status(), 200);
-    const late = await eventually(
-      base,
-      (value) => value.uploads.includes(lateId) && value.held_uploads.length === 0,
-    );
-    assertEquals(
-      await page.locator(".composer-typed-chip").count(),
-      0,
-      "late success cannot resurrect deleted atom",
-    );
-    assertEquals(
-      late.methods.filter((method) => method.method === "submit").length,
-      1,
-      "upload/retry/late completion never submits",
-    );
-    // Deleted resources remain undo-owned until the next accepted draft boundary.
-    await page.screenshot({ path: join(caseOutput, "late-upload-completed.png") });
-    await draft(page, "finish late deletion");
+    // Submit immediately, without waiting for upload completion or cancellation HTTP.
+    await page.keyboard.type("finish late deletion");
     await page.keyboard.press("Control+Enter");
-    const completed = await eventually(base, (value) => value.deletes.includes(lateId));
-    assertEquals(completed.methods.filter((method) => method.method === "submit").length, 2);
+    const completed = await eventually(
+      base,
+      (value) =>
+        value.deletes.includes(lateId) && value.held_uploads.length === 0 &&
+        value.methods.filter((method) => method.method === "submit").length === 2,
+    );
+    assertEquals(await page.locator(".composer-attachments").count(), 0);
     assertEquals(
       completed.methods.filter((method) => method.method === "submit").at(-1)?.params?.input,
       [{ kind: "text", content: "finish late deletion" }],
     );
+    // A delayed fixture release after cancellation cannot revive a resource or intent.
+    // Component tests separately inject a late completion callback against the tombstone.
+    await page.waitForFunction(() => document.querySelector(".cm-content")?.textContent === "");
+    await control(base, { release_uploads: true });
+    const late = await state(base);
+    assert(!late.uploads.includes(lateId));
+    assertEquals(late.methods.filter((method) => method.method === "submit").length, 2);
+    assertEquals(await page.locator(".composer-typed-chip").count(), 0);
+    await page.screenshot({ path: join(caseOutput, "late-upload-completed.png") });
     assert(errors.every((error) => /503/.test(error)), JSON.stringify(errors));
     await Deno.writeTextFile(
       join(caseOutput, "retry-late-result.json"),
@@ -378,6 +372,57 @@ Deno.test("production upload retry retains upload ID and late completion cannot 
         null,
         2,
       ),
+    );
+  }, true));
+
+Deno.test("production pending-upload Delete, range, cut and replacement cancel staging and allow immediate text Submit", () =>
+  fixture(async (page, base, errors, caseOutput) => {
+    await control(base, { upload: "hold" });
+    const results = [];
+    for (const [index, operation] of ["Delete", "range", "cut", "replace"].entries()) {
+      await attach(page, `keyboard-${operation}.md`);
+      const held = await eventually(base, (value) => value.held_uploads.length === 1);
+      const uploadId = held.held_uploads[0];
+      await page.locator(".composer-typed-chip").filter({
+        hasText: `Uploading keyboard-${operation}.md`,
+      }).waitFor();
+      await page.screenshot({ path: join(caseOutput, `keyboard-${operation}-pending.png`) });
+      await page.locator(".cm-content").focus();
+      if (operation === "Delete") {
+        await page.keyboard.press("Control+Home");
+        await page.keyboard.press("Delete");
+      } else {
+        await page.keyboard.press("Control+a");
+        if (operation === "range") await page.keyboard.press("Backspace");
+        else if (operation === "cut") await page.keyboard.press("Control+x");
+        else await page.keyboard.type("replacement ");
+      }
+      assertEquals(await page.locator(".composer-typed-chip").count(), 0);
+      await page.screenshot({ path: join(caseOutput, `keyboard-${operation}-deleted.png`) });
+      const text = `${operation === "replace" ? "replacement " : ""}text after ${operation}`;
+      await page.keyboard.type(`text after ${operation}`);
+      await page.keyboard.press("Control+Enter");
+      const accepted = await eventually(
+        base,
+        (value) =>
+          value.deletes.includes(uploadId) && value.held_uploads.length === 0 &&
+          value.methods.filter((method) => method.method === "submit").length === index + 1,
+      );
+      assertEquals(
+        accepted.methods.filter((method) => method.method === "submit").at(-1)?.params?.input,
+        [{ kind: "text", content: text }],
+      );
+      assertEquals(await page.locator(".composer-attachments").count(), 0);
+      await page.waitForFunction(() => document.querySelector(".cm-content")?.textContent === "");
+      await control(base, { release_uploads: true });
+      assert(!(await state(base)).uploads.includes(uploadId));
+      await page.screenshot({ path: join(caseOutput, `keyboard-${operation}-accepted.png`) });
+      results.push({ operation, held, accepted });
+    }
+    assertEquals(errors, []);
+    await Deno.writeTextFile(
+      join(caseOutput, "keyboard-cancellation-result.json"),
+      JSON.stringify({ status: "pass", results, errors }, null, 2),
     );
   }, true));
 

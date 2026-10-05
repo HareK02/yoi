@@ -32,6 +32,8 @@ export interface ComposerTypedSegment {
   label: string;
   /** Whether deleting this unsent atom must release client-staged state. */
   cleanup?: boolean;
+  /** Client-only reservation whose removal cancels an in-progress upload. */
+  uploadReservation?: boolean;
 }
 
 export interface ComposerTypedAtom extends ComposerTypedSegment {
