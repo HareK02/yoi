@@ -64,6 +64,20 @@ pub struct WorkerHandle {
 }
 
 impl WorkerHandle {
+    /// Transport closure belongs to this Controller endpoint, not a WorkerRef.
+    pub fn protocol_is_closed(&self) -> bool {
+        self.method_tx.is_closed()
+    }
+
+    pub async fn protocol_closed(&self) {
+        self.method_tx.closed().await;
+    }
+
+    /// Compare actual endpoints when an execution-bound transport is dispatched.
+    pub fn same_controller(&self, other: &Self) -> bool {
+        self.method_tx.same_channel(&other.method_tx)
+    }
+
     pub async fn send(&self, method: Method) -> Result<(), mpsc::error::SendError<Method>> {
         // Reject known-busy sends before channel dispatch, including maintenance
         // that cannot receive methods until it finishes. The controller checks
@@ -873,9 +887,6 @@ impl WorkerController {
             None,
         )
         .await?;
-        let command_observer = fs_for_view
-            .as_ref()
-            .and_then(|session| wire_workdir_command_events(session, &in_flight));
 
         // Intake role Workers self-terminate only after a successful
         // TicketIntakeReady turn has fully settled back to Idle. The request
@@ -929,8 +940,8 @@ impl WorkerController {
                 protocol::ContextTokenSource::Measured,
             );
         });
-        if let Some(fs_for_view) = fs_for_view {
-            shared_state.set_fs_view(crate::fs_view::WorkerFsView::new(fs_for_view));
+        if let Some(fs_for_view) = fs_for_view.as_ref() {
+            shared_state.set_fs_view(crate::fs_view::WorkerFsView::new(fs_for_view.clone()));
         }
         runtime_dir.write_manifest(&manifest_toml).await?;
         runtime_dir.write_status(&shared_state).await?;
@@ -952,8 +963,23 @@ impl WorkerController {
             pending_activations,
         };
 
+        // Do not start an observer before fallible head/recovery/runtime-file
+        // initialization. The only remaining fallible step is socket startup,
+        // whose error path must abort AND join this task before returning.
+        let command_observer = fs_for_view
+            .as_ref()
+            .and_then(|session| wire_workdir_command_events(session, &in_flight));
         let socket_server = match transport {
-            WorkerControllerTransport::UnixSocket => Some(SocketServer::start(&handle).await?),
+            WorkerControllerTransport::UnixSocket => match SocketServer::start(&handle).await {
+                Ok(server) => Some(server),
+                Err(error) => {
+                    if let Some(observer) = command_observer {
+                        observer.abort();
+                        let _ = observer.await;
+                    }
+                    return Err(error);
+                }
+            },
             WorkerControllerTransport::InProcess => None,
         };
 
@@ -3892,6 +3918,21 @@ mod tests {
         assert!(feature_install < materialize_gate);
         assert!(materialize_gate < materialize);
         assert!(materialize < exposure);
+        let observer = startup.find("let command_observer = fs_for_view").unwrap();
+        let recover = startup.find(".recover_unfinished_compaction()").unwrap();
+        let files = startup
+            .find("runtime_dir.write_status(&shared_state).await?")
+            .unwrap();
+        let loop_start = startup.find("tokio::spawn(controller_loop(").unwrap();
+        assert!(recover < observer && files < observer && observer < loop_start);
+        let socket_startup = &startup[observer..loop_start];
+        let abort = socket_startup.find("observer.abort()").unwrap();
+        let join = socket_startup.find("observer.await").unwrap();
+        let failure = socket_startup.find("return Err(error)").unwrap();
+        assert!(
+            abort < join && join < failure,
+            "startup cannot detach its observer on error"
+        );
         assert!(
             startup[materialize_gate..materialize]
                 .contains("needs_initial_session_head_materialization")
