@@ -3390,6 +3390,13 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .prepare_session_rewrite(SessionRewriteKind::Rewind)
             .await
             .map_err(|error| RewindError::Invalid(error.to_string()))?;
+        // Serialize the replacement with queue admission/checkpoint appends so
+        // a concurrently accepted operation cannot lose its recovery evidence.
+        let segment_state = self.segment_state.clone();
+        let append_guard = segment_state
+            .append_lock
+            .lock()
+            .expect("segment append lock poisoned");
         let loc = self.segment_state.location();
         if target.segment_id != loc.segment_id {
             return Err(RewindError::Invalid(
@@ -3423,10 +3430,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             tool_side_effect_warning,
         };
 
-        self.store
-            .truncate(loc.session_id, loc.segment_id, truncate_entries)?;
-        self.segment_state.set_entries_written(truncate_entries);
-        self.sink.truncate_silent(truncate_entries);
+        // Recovery evidence survives a rewind independently of visible history.
+        // Persist the prefix and checkpoint in one replacement: truncating first
+        // would erase receipts if the checkpoint append failed or we crashed.
+        let mut replacement = retained.clone();
         let pending_state = self
             .session
             .pending_activations
@@ -3439,6 +3446,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             || !pending_state.activating_notifications.is_empty()
             || !pending_state.receipts.is_empty()
             || !pending_state.notification_receipts.is_empty()
+            || !pending_state.invocation_receipts.is_empty()
+            || pending_state.invocation_recovery_blocked
         {
             let checkpoint = LogEntry::Extension {
                 ts: segment_log::now_millis(),
@@ -3449,8 +3458,13 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     ))
                 })?,
             };
-            self.commit_entry(checkpoint)?;
+            replacement.push(checkpoint);
         }
+        self.store
+            .create_segment(loc.session_id, loc.segment_id, &replacement)?;
+        self.segment_state.set_entries_written(replacement.len());
+        self.sink.replace_silent(replacement);
+        drop(append_guard);
 
         let history_entries = restore_history_entries(loc.session_id, loc.segment_id, &retained)
             .map_err(|error| RewindError::Invalid(error.into()))?;
@@ -4647,8 +4661,9 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     });
                     if replay.status == FeatureInvocationStatus::Succeeded {
                         // Recorded success is reusable context, not authority to
-                        // resurrect a capability removed from this composition.
-                        match self.feature_invocations.validate_metadata(invocation) {
+                        // resurrect a removed capability or revoked argument
+                        // permission. Revalidate without repeating the effect.
+                        match self.feature_invocations.validate(invocation) {
                             Ok(()) => replay,
                             Err(error) => failed(FeatureInvocationStatus::Failed, error.message),
                         }
@@ -4814,12 +4829,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                             result.status == protocol::FeatureInvocationStatus::Succeeded
                         })
                 });
-                if !succeeded
-                    || self
-                        .feature_invocations
-                        .validate_metadata(invocation)
-                        .is_err()
-                {
+                if !succeeded || self.feature_invocations.validate(invocation).is_err() {
                     return Err(WorkerError::FeatureInvocation(
                         "activation preparation is failed, incomplete, or outcome unknown; submit fresh input instead of resuming".into(),
                     ));
@@ -10133,7 +10143,28 @@ mod build_summary_prompt_tests {
             segment_id: SegmentId,
             entries: &[LogEntry],
         ) -> Result<(), StoreError> {
-            self.inner.create_segment(session_id, segment_id, entries)
+            if self
+                .invocation_failure
+                .compare_exchange(3, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Err(StoreError::Io(std::io::Error::other(
+                    "synthetic replacement failure before atomic commit",
+                )));
+            }
+            self.inner.create_segment(session_id, segment_id, entries)?;
+            if self
+                .invocation_failure
+                .compare_exchange(4, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                // Model interruption after the atomic commit, before Worker
+                // updates its mirror/counters. Restart sees the complete new log.
+                return Err(StoreError::Io(std::io::Error::other(
+                    "synthetic interruption after atomic replacement",
+                )));
+            }
+            Ok(())
         }
 
         fn exists(&self, session_id: SessionId, segment_id: SegmentId) -> Result<bool, StoreError> {
@@ -10411,6 +10442,13 @@ mod build_summary_prompt_tests {
     #[tokio::test]
     async fn pending_restore_reuses_persisted_session_and_recovers_unknown_attribution() {
         let temp = tempfile::tempdir().unwrap();
+        // Startup reads the process runtime-dir environment. Share the existing
+        // sandbox lock with allocation tests so their temporary directories cannot
+        // disappear between this test's path lookup and lock-file creation.
+        let runtime_dir = temp.path().join("runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let _runtime_sandbox =
+            crate::runtime::worker_allocation::test_util::RuntimeDirSandbox::new(&runtime_dir);
         let store = session_store::CombinedStore::new(
             session_store::FsStore::new(temp.path().join("sessions")).unwrap(),
             session_store::FsWorkerStore::new(temp.path().join("workers")).unwrap(),
@@ -13953,6 +13991,217 @@ permission = "write"
                 1,
                 "restore/replay must not repeat business execution"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn feature_invocation_rewind_atomic_replacement_preserves_recovery_on_disk_restart() {
+        let runtime = tempfile::tempdir().unwrap();
+        let _sandbox = worker_allocation::test_util::RuntimeDirSandbox::new(runtime.path());
+        for queued in [false, true] {
+            for scenario in ["completed", "incomplete", "result-fault", "corrupt"] {
+                for replacement_fault in [0, 1, 3, 4] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let cwd = dir.path().join("workspace");
+                    std::fs::create_dir_all(&cwd).unwrap();
+                    let store = FailRunTerminalStore {
+                        inner: session_store::FsStore::new(dir.path().join("sessions")).unwrap(),
+                        fail_run_terminal: Arc::new(AtomicBool::new(false)),
+                        invocation_failure: Arc::new(AtomicUsize::new(0)),
+                    };
+                    let mut engine =
+                        Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient);
+                    engine.set_system_prompt("recovery rewind test system prompt");
+                    let mut manifest = minimal_manifest();
+                    manifest.scope.allow[0].target = cwd.clone();
+                    let mut original = Worker::new(
+                        manifest,
+                        engine,
+                        store.clone(),
+                        WorkerWorkspaceContext::local_filesystem(None),
+                        WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone()),
+                        Scope::writable(&cwd).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    install_recovery_invocation(&mut original, calls.clone());
+                    let input = vec![recovery_invocation(scenario)];
+                    if scenario == "corrupt" {
+                        let _ = original.run(vec![Segment::text("rewind target")]).await;
+                        let payload = serde_json::json!({"invocation_receipts": "corrupt"});
+                        original
+                            .commit_entry(LogEntry::Extension {
+                                ts: segment_log::now_millis(),
+                                domain: SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN.into(),
+                                payload: payload.clone(),
+                            })
+                            .unwrap();
+                        original.session.restore_pending_activations(&[(
+                            SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN.into(),
+                            payload,
+                        )]);
+                    } else {
+                        if scenario == "result-fault" {
+                            store.invocation_failure.store(2, Ordering::SeqCst);
+                        }
+                        let (run_input, extensions, provenance, activation) = if queued {
+                            // Exercise the durable admission/activation path used
+                            // by Controller, in addition to direct Worker.run.
+                            let handle = original.pending_submission_handle();
+                            let accepted = handle
+                                .accept("request-1".into(), input.clone(), true)
+                                .unwrap();
+                            let pending = accepted.activation.unwrap();
+                            let id = pending.submission_id.clone();
+                            (
+                                pending.input,
+                                vec![handle.activation_extension()],
+                                pending.provenance,
+                                Some((handle, id)),
+                            )
+                        } else {
+                            (
+                                input.clone(),
+                                Vec::new(),
+                                WorkerHistoryProvenance::LegacyUnknown,
+                                None,
+                            )
+                        };
+                        let run = original.run_with_input_extensions_and_commit_hook(
+                            run_input,
+                            extensions,
+                            provenance,
+                            move || {
+                                if let Some((handle, id)) = activation {
+                                    handle.finish_activation(&id);
+                                }
+                            },
+                        );
+                        if scenario == "incomplete" {
+                            assert!(
+                                tokio::time::timeout(Duration::from_millis(20), run)
+                                    .await
+                                    .is_err()
+                            );
+                        } else {
+                            let _ = run.await;
+                        }
+                        assert_eq!(calls.load(Ordering::SeqCst), 1);
+                    }
+                    let pending = original.session.pending_activations.lock().unwrap().clone();
+                    if !queued {
+                        assert!(pending.pending.is_empty());
+                        assert!(pending.activating.is_none());
+                        assert!(pending.receipts.is_empty());
+                        assert!(pending.notification_receipts.is_empty());
+                        assert!(pending.pending_notifications.is_empty());
+                        assert!(pending.activating_notifications.is_empty());
+                    }
+                    let (head, targets) = original.list_rewind_targets().unwrap();
+                    let target = targets.last().unwrap();
+                    let old = store
+                        .read_all(original.session_id(), original.segment_id())
+                        .unwrap();
+                    let old_mirror = original.sink.subscribe_with_snapshot().0;
+                    let old_count = original.segment_state.entries_written();
+                    store
+                        .invocation_failure
+                        .store(replacement_fault, Ordering::SeqCst);
+                    let applied = original.rewind_to(target.id.clone(), head).await;
+                    let disk = store
+                        .read_all(original.session_id(), original.segment_id())
+                        .unwrap();
+                    if replacement_fault == 3 {
+                        assert!(applied.is_err());
+                        assert_eq!(
+                            serde_json::to_value(&disk).unwrap(),
+                            serde_json::to_value(&old).unwrap()
+                        );
+                        assert_eq!(
+                            serde_json::to_value(original.sink.subscribe_with_snapshot().0)
+                                .unwrap(),
+                            serde_json::to_value(old_mirror).unwrap()
+                        );
+                        assert_eq!(original.segment_state.entries_written(), old_count);
+                    } else {
+                        if replacement_fault <= 1 {
+                            // An injected checkpoint-append fault is no longer
+                            // relevant: rewind must never append after truncation.
+                            assert_eq!(
+                                store.invocation_failure.load(Ordering::SeqCst),
+                                replacement_fault
+                            );
+                            let applied = applied.unwrap();
+                            assert_eq!(
+                                applied.summary.truncated_to_entries,
+                                target.truncate_entries
+                            );
+                            assert_eq!(
+                                applied.summary.discarded_entries,
+                                head - target.truncate_entries
+                            );
+                            assert_eq!(applied.entries.len(), target.truncate_entries);
+                            assert_eq!(original.segment_state.entries_written(), disk.len());
+                            assert_eq!(
+                                serde_json::to_value(original.sink.subscribe_with_snapshot().0)
+                                    .unwrap(),
+                                serde_json::to_value(&disk).unwrap()
+                            );
+                        } else {
+                            assert!(applied.is_err());
+                        }
+                        assert_eq!(disk.len(), target.truncate_entries + 1);
+                        assert_eq!(
+                            serde_json::to_value(&disk[..target.truncate_entries]).unwrap(),
+                            serde_json::to_value(&old[..target.truncate_entries]).unwrap()
+                        );
+                        let LogEntry::Extension {
+                            domain, payload, ..
+                        } = disk.last().unwrap()
+                        else {
+                            panic!("complete replacement must include recovery checkpoint")
+                        };
+                        assert_eq!(domain, SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN);
+                        assert_eq!(*payload, serde_json::to_value(&pending).unwrap());
+                    }
+                    let session = original.session_id();
+                    let segment = original.segment_id();
+                    let manifest = original.manifest.clone();
+                    drop(original);
+                    // Reopen from the path: no retained in-memory queue/Store state.
+                    let reopened = session_store::CombinedStore::new(
+                        session_store::FsStore::new(dir.path().join("sessions")).unwrap(),
+                        session_store::FsWorkerStore::new(dir.path().join("workers")).unwrap(),
+                    );
+                    let mut restored = Worker::<Box<dyn LlmClient>, _>::restore_from_manifest_with_context_and_model_client(
+                        session, segment, manifest, reopened,
+                        crate::prompt::source::PromptCatalogSource::builtins_only(),
+                        WorkerWorkspaceContext::local_filesystem(None),
+                        WorkerFilesystemAuthority::local(cwd.clone(), cwd),
+                        Some(Box::new(NoopClient)),
+                    ).await.unwrap();
+                    install_recovery_invocation(&mut restored, calls.clone());
+                    let replay = restored.run(input).await;
+                    if scenario == "completed" {
+                        assert!(restored.ensure_invocation_preparation_complete().is_ok());
+                    } else {
+                        assert!(replay.is_err());
+                        assert!(restored.resume().await.is_err());
+                        assert!(
+                            restored
+                                .run_for_notification(protocol::InvokeKind::Notify)
+                                .await
+                                .is_err()
+                        );
+                    }
+                    assert_eq!(
+                        calls.load(Ordering::SeqCst),
+                        usize::from(scenario != "corrupt"),
+                        "queued={queued} scenario={scenario} replacement_fault={replacement_fault}"
+                    );
+                }
+            }
         }
     }
 

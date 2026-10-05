@@ -26,6 +26,7 @@ struct Trace {
     calls: Arc<Mutex<Vec<String>>>,
     requests: Arc<Mutex<Vec<Request>>>,
     available: Arc<AtomicBool>,
+    argument_allowed: Arc<AtomicBool>,
 }
 
 impl Default for Trace {
@@ -34,6 +35,7 @@ impl Default for Trace {
             calls: Arc::default(),
             requests: Arc::default(),
             available: Arc::new(AtomicBool::new(true)),
+            argument_allowed: Arc::new(AtomicBool::new(true)),
         }
     }
 }
@@ -104,7 +106,10 @@ impl FeatureInvocationHandler for FakeFeature {
         &self,
         invocation: &FeatureInvocation,
     ) -> Result<(), FeatureInvocationHandlerError> {
-        if invocation.arguments[0].value == InvocationValue::String("denied".into()) {
+        if invocation.arguments[0].value == InvocationValue::String("denied".into())
+            || (invocation.arguments[0].value == InvocationValue::String("first".into())
+                && !self.0.argument_allowed.load(Ordering::SeqCst))
+        {
             return Err(FeatureInvocationHandlerError::failed(
                 "host permission denied",
             ));
@@ -347,6 +352,33 @@ async fn feature_replay_reuses_result_and_rejects_id_payload_changes() {
         results(&worker).last().unwrap().status,
         FeatureInvocationStatus::Failed
     );
+}
+
+#[tokio::test]
+async fn feature_argument_permission_revocation_fences_success_replay_and_resume() {
+    let trace = Trace::default();
+    let (_dir, mut worker) = fixture(trace.clone()).await;
+    worker.run(vec![invoke("same", "first")]).await.unwrap();
+    trace.argument_allowed.store(false, Ordering::SeqCst);
+    // The feature remains available: only this argument's authority was revoked.
+    assert_eq!(worker.feature_invocations().descriptors().len(), 1);
+    assert!(worker.resume().await.is_err());
+    assert!(
+        worker
+            .run_for_notification(protocol::InvokeKind::Notify)
+            .await
+            .is_err()
+    );
+    assert!(worker.run(vec![invoke("same", "first")]).await.is_err());
+    let replay = results(&worker).pop().unwrap();
+    assert_eq!(replay.status, FeatureInvocationStatus::Failed);
+    assert!(replay.context.is_none());
+    assert!(replay.message.contains("host permission denied"));
+    assert_eq!(*trace.calls.lock().unwrap(), ["first", "llm"]);
+    // Reauthorization allows context reuse, never another business execution.
+    trace.argument_allowed.store(true, Ordering::SeqCst);
+    worker.run(vec![invoke("same", "first")]).await.unwrap();
+    assert_eq!(*trace.calls.lock().unwrap(), ["first", "llm", "llm"]);
 }
 
 #[tokio::test]

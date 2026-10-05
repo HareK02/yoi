@@ -110,7 +110,14 @@ pub trait Store: Send + Sync {
     /// segment ID without its session ID (e.g. legacy `--session <UUID>`).
     fn lookup_session_of(&self, segment_id: SegmentId) -> Result<Option<SessionId>, StoreError>;
 
-    /// Create a new segment within `session_id`, with initial entries.
+    /// Create or atomically replace a segment within `session_id` with all entries.
+    ///
+    /// Readers and crash recovery must observe either the previous complete log
+    /// or the complete replacement, never a truncated prefix or partial record.
+    /// Failure before replacement leaves the old log intact; an error after the
+    /// atomic commit (for example a durability sync failure) may leave the complete
+    /// replacement. Filesystem implementations must sync replacement bytes before
+    /// rename and the containing directory afterward before reporting success.
     fn create_segment(
         &self,
         session_id: SessionId,

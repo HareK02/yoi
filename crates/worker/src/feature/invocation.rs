@@ -94,7 +94,8 @@ pub trait FeatureInvocationHandler: Send + Sync {
 
     /// Side-effect-free semantic and authority validation. Installed handlers
     /// retain Workspace/credential/permission authority; request arguments never
-    /// supply it. The Worker calls this before persisting an execution start.
+    /// supply it. The Worker calls this before persisting an execution start
+    /// and before reusing successful preparation context on replay or resume.
     fn validate(
         &self,
         _invocation: &FeatureInvocation,

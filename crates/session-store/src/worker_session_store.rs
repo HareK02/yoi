@@ -1166,7 +1166,7 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreEr
     atomic_write_bytes(path, &bytes)
 }
 
-fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+pub(crate) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     let parent = path
         .parent()
         .ok_or_else(|| std::io::Error::other("Worker Session path has no parent"))?;

@@ -116,6 +116,100 @@ fn create_segment_writes_all_entries() {
 }
 
 #[test]
+fn create_segment_replacement_keeps_open_old_log_and_commits_complete_new_log() {
+    use std::io::Read;
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsStore::new(dir.path()).unwrap();
+    let sid = new_session_id();
+    let segid = new_segment_id();
+    let old = vec![
+        nil_session_start(1, sid),
+        LogEntry::TurnEnd {
+            ts: 2,
+            turn_count: 1,
+        },
+    ];
+    store.create_segment(sid, segid, &old).unwrap();
+    let path = dir
+        .path()
+        .join(sid.to_string())
+        .join(format!("{segid}.jsonl"));
+    let old_bytes = std::fs::read(&path).unwrap();
+    let mut old_reader = std::fs::File::open(&path).unwrap();
+    let new = vec![
+        nil_session_start(1, sid),
+        LogEntry::Extension {
+            ts: 3,
+            domain: "recovery-checkpoint".into(),
+            payload: serde_json::json!({"receipt": "retained"}),
+        },
+    ];
+    store.create_segment(sid, segid, &new).unwrap();
+    let mut retained_inode = Vec::new();
+    old_reader.read_to_end(&mut retained_inode).unwrap();
+    // An in-place fs::write would truncate the inode held by this reader.
+    assert_eq!(retained_inode, old_bytes);
+    let reopened = FsStore::new(dir.path()).unwrap();
+    assert_eq!(
+        serde_json::to_value(reopened.read_all(sid, segid).unwrap()).unwrap(),
+        serde_json::to_value(&new).unwrap()
+    );
+    assert_eq!(reopened.read_entry_count(sid, segid).unwrap(), new.len());
+    assert_eq!(
+        std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+        1,
+        "successful replacement must not leave temporary files"
+    );
+}
+
+#[test]
+fn create_segment_atomic_replacement_readers_only_observe_complete_old_or_new() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsStore::new(dir.path()).unwrap();
+    let sid = new_session_id();
+    let segid = new_segment_id();
+    let old = vec![
+        nil_session_start(1, sid),
+        LogEntry::Extension {
+            ts: 2,
+            domain: "old-evidence".into(),
+            payload: serde_json::json!({"result": "old"}),
+        },
+    ];
+    let new = vec![
+        nil_session_start(1, sid),
+        LogEntry::Extension {
+            ts: 3,
+            domain: "new-checkpoint".into(),
+            payload: serde_json::json!({"result": "new"}),
+        },
+    ];
+    store.create_segment(sid, segid, &old).unwrap();
+    let old_json = serde_json::to_value(&old).unwrap();
+    let new_json = serde_json::to_value(&new).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let reader_store = store.clone();
+    let reader_barrier = barrier.clone();
+    let reader = std::thread::spawn(move || {
+        reader_barrier.wait();
+        for _ in 0..1000 {
+            let observed =
+                serde_json::to_value(reader_store.read_all(sid, segid).unwrap()).unwrap();
+            assert!(
+                observed == old_json || observed == new_json,
+                "replacement must never expose a partial log: {observed}"
+            );
+        }
+    });
+    barrier.wait();
+    for _ in 0..50 {
+        store.create_segment(sid, segid, &new).unwrap();
+        store.create_segment(sid, segid, &old).unwrap();
+    }
+    reader.join().unwrap();
+}
+
+#[test]
 fn list_sessions_and_segments() {
     let dir = tempfile::tempdir().unwrap();
     let store = FsStore::new(dir.path()).unwrap();
