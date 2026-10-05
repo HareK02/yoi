@@ -1,6 +1,12 @@
 // @vitest-environment happy-dom
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/svelte";
 import { afterEach, expect, test, vi } from "vitest";
 
 const { gotoMock } = vi.hoisted(() => ({
@@ -181,7 +187,9 @@ test("preserves invalid and rejected role drafts with accessible errors", async 
 });
 
 test("warns about an unknown create outcome without replaying the POST", async () => {
-  const fetchMock = vi.fn(() => Promise.reject(new TypeError("connection reset")));
+  const fetchMock = vi.fn(() =>
+    Promise.reject(new TypeError("connection reset"))
+  );
   vi.stubGlobal("fetch", fetchMock);
   render(SubjectIndexPage, { data: subjectIndexData() } as never);
 
@@ -218,7 +226,8 @@ test("renders a ready resident surface and committed Memory lifecycle states", a
         availability: "ready" as const,
         snapshot: {
           snapshot_id: "snapshot-1",
-          body_md: "# Resident context\n\nUse the **current** committed record.",
+          body_md:
+            "# Resident context\n\nUse the **current** committed record.",
           memory_refs: [{ memory_id: "memory-1", revision: 3 }],
           built_from_store_revision: 9,
           created_at: "2026-01-02T03:04:05Z",
@@ -308,6 +317,7 @@ test("distinguishes ready-empty, stale, failed, unavailable, and request error s
   } as never);
   expect(screen.getByText("Resident context is current but empty.")).not
     .toBeNull();
+  expect(screen.getByText(/current empty surface exists/)).not.toBeNull();
   expect(screen.getByText("No committed Memories yet.")).not.toBeNull();
 
   await view.rerender(

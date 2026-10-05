@@ -47,6 +47,13 @@
     return 'Generation failed';
   }
 
+  function surfaceSummary(availability: SubjektivResidentSurfaceAvailability): string {
+    if (availability !== 'ready') return 'No current generated context is available to use.';
+    return snapshot?.body_md.trim()
+      ? 'Current generated context is available.'
+      : 'A current empty surface exists; there is no resident context to show.';
+  }
+
   function subjectStateLabel(state: 'active' | 'retired'): string {
     return state === 'active' ? 'Available' : 'Retired';
   }
@@ -95,7 +102,7 @@
         <span>Resident context</span>
         {#if surface}
           <strong class="availability is-{surface.availability}">{surfaceLabel(surface.availability)}</strong>
-          <p>{surface.availability === 'ready' ? 'Current generated context is available.' : 'No current generated context is available to use.'}</p>
+          <p>{surfaceSummary(surface.availability)}</p>
         {:else}
           <strong>Unavailable</strong>
           <p>The resident context status could not be read.</p>
