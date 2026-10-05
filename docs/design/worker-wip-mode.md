@@ -75,7 +75,18 @@ The built-in native route migration is:
 | `/features/objective/objectives[/<reference>]` | `/objectives[/<reference>]` |
 | `/features/merge-request/merge-requests[/<reference>]` | `/merge-requests[/<reference>]` |
 
-`/repositories` and `/workdirs` are reserved for a later provider using the same registration contract; this layer does not implement those domains. `/checkouts` content projection is likewise outside this contract.
+`/repositories` and `/workdirs` can be allocated by a later provider using the same registration contract; this layer does not implement or pre-allocate those domains. `/checkouts` content projection is likewise outside this contract.
+
+### Registering a subsequent provider
+
+1. Allocate `allocate_namespace("repository", "repositories")`. The returned `WipNamespaceRoute::root()` is `/repositories`; the owner is independent of any Feature registration name.
+2. Mount a native collection `WipProjection` at that root with capability `repository:collection`, matching Object name and one declared interface. Static Objects underneath the root use the same capability owner prefix. A mounted collection retains its own identity, interfaces, and validator even when it has static children.
+3. For dynamic items, register one `WipDynamicMount` on the collection with capability `repository:item`. A foreign capability owner is rejected. Its `WipDynamicItemResolver` owns reference acceptance, Object identity, and current Object validator. It returns only a bounded direct child; it must not reinterpret a reference as another namespace or grant permission from existence.
+4. The reference provider supplies its read operations and handlers independently of management Feature enablement. An Object-only provider may use an empty operation descriptor. Enabled management Features register `WipOperationContribution` for static Objects or `WipDynamicOperationContribution` for a dynamic family; they do not allocate the namespace again or replace its resolver.
+5. Contributions use the existing interface reference and identical format, documentation, and type declarations, supplying only their new operations. Interface references are global: extending a descriptor that is also mounted elsewhere must not create different descriptors/validators under the same reference (registration fails). Use separate references for collection and item contracts. Failed contributions leave the registry unchanged.
+6. Handlers are responsible for checking current target capability and current subject authorization before dispatch. Registration/discovery is metadata, not a grant. A resolver/handler must retain the original permission identity and domain audit/failure contracts. Revocation after discovery must fail before provider dispatch. Compatibility mounts are restricted to `/tools/<tool-name>` and cannot bypass namespace ownership or republish legacy routes.
+
+Tests `management_enablement_is_independent_of_read_and_operation_permissions` and `contributed_interface_invalidates_observations_and_restore_requires_discovery` cover all eight enablement/read/manage combinations, direct-call rejection, effective descriptor changes, fresh runtime isolation under the same Worker identity, reset, and post-observation revocation.
 
 ## Authority and execution
 
