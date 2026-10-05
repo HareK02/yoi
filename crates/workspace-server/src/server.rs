@@ -2579,6 +2579,23 @@ fn repository_api_rejection(path: &str, status: StatusCode, message: &str) -> Re
     status.into_response()
 }
 
+/// Authored configuration editors are user-facing authority, not a generic
+/// Runtime workspace.request capability. Worker configuration access is only
+/// through the grant- and connection-bound WIP adapter. Keep runtime projections
+/// (Prompt/Skill/config bundles) on their existing, separate consumer contracts.
+fn is_workspace_config_editor_path(path: &str) -> bool {
+    let Some((_, resource)) = path
+        .strip_prefix("/api/w/")
+        .and_then(|scoped| scoped.split_once('/'))
+    else {
+        return false;
+    };
+    resource == "config/source-tree"
+        || resource.starts_with("config/source-tree/")
+        || resource == "settings/profiles"
+        || resource.starts_with("settings/profiles/")
+}
+
 async fn authorize_scoped_workspace_request(
     api: &WorkspaceServerApi,
     workspace_id: &str,
@@ -2639,6 +2656,13 @@ async fn authorize_scoped_workspace_request(
                 "invalid runtime request proof",
             )
         })?;
+        if is_workspace_config_editor_path(&request_path) {
+            return Err(repository_api_rejection(
+                &request_path,
+                StatusCode::FORBIDDEN,
+                "Runtime configuration editor access denied",
+            ));
+        }
         request.extensions_mut().insert(source);
         if !matches!(
             *request.method(),
@@ -2771,6 +2795,13 @@ async fn authorize_workspace_api_request(
                 "invalid runtime request proof",
             );
         };
+        if is_workspace_config_editor_path(&request_path) {
+            return repository_api_rejection(
+                &request_path,
+                StatusCode::FORBIDDEN,
+                "Runtime configuration editor access denied",
+            );
+        }
         request.extensions_mut().insert(source);
         if !matches!(
             *request.method(),

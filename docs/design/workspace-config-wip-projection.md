@@ -89,6 +89,22 @@ ID. Worker requests carry authenticated source identity, never these IDs as a
 substitute for authorization. A grant from another Workspace or another Worker
 cannot be adopted by knowing a route or possessing a previous Interface.
 
+Explicit grants do not replace the UI editor's user authentication. Authored
+source-tree read/entry/history/commit routes and the UI Profile settings catalog
+reject Runtime/Worker source proofs in both single-Workspace and server-scoped
+middleware, including workers with a read-write grant. `workspace.request` is
+not a configuration-editor capability: granted Workers use the WIP adapter,
+never the UI editor as an alternate access path. User/session/API-token editing
+continues to share the canonical validation and CAS boundary with WIP saves.
+
+The audit found no separate Profile/Prompt/Runtime/Skill source-save endpoint;
+authored writes converge on source-tree commit. Existing runtime consumption of
+Prompt projections, Skill catalog/activation and resolved config bundles remains
+a separate read-only/activation contract needed for Worker startup and normal
+operation. Those evaluated projections are not authored source-tree bodies,
+revision history or a second editor. Do not fence all `/config` routes as one
+capability: that would break the existing Prompt reader's runtime contract.
+
 The existing connection ledger remains authoritative. Each granted Worker has
 an independently identified logical registry target over the **same** authored
 configuration tree. This preserves the ordinary Workdir exclusive-owner

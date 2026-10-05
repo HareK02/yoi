@@ -128,6 +128,99 @@ mod workspace_config_integration {
     }
 
     #[tokio::test]
+    async fn workspace_config_signed_editor_routes_cannot_bypass_wip_authority() {
+        let mut fixture = manual_coder_assignment_fixture().await;
+        let identity = RuntimeIdentityMaterial::generate(&fixture.worker.runtime_id).unwrap();
+        configure_runtime_request_auth(&mut fixture.api, &identity, &fixture.worker.runtime_id);
+        let api = &fixture.api;
+        let initial = api.config_store.load_workspace_config(TEST_WORKSPACE_ID).unwrap().unwrap();
+        let tree = format!("/api/w/{TEST_WORKSPACE_ID}/config/source-tree");
+        let change = server_api::ConfigCommitRequest {
+            base_revision: initial.snapshot.revision,
+            base_digest: initial.snapshot.digest.clone(),
+            changes: vec![create("notes/editor-only.txt", "must not persist from Worker")],
+            entrypoints: vec!["main.dcdl".into()],
+        };
+        let routes = [
+            ("GET", tree.clone()),
+            ("GET", format!("{tree}/entries/main.dcdl")),
+            ("GET", format!("{tree}/revisions/{}", initial.snapshot.revision)),
+            ("POST", format!("{tree}/commit")),
+            ("GET", format!("/api/w/{TEST_WORKSPACE_ID}/settings/profiles")),
+        ];
+        for state in ["ungranted", "read_only", "revoked", "detached", "read_write"] {
+            match state {
+                "read_only" => {
+                    grant(api, &fixture.worker, Access::ReadOnly).await;
+                    attach(api, &fixture.worker).await;
+                }
+                "revoked" => {
+                    let current = api.store.current_workspace_config_grant(TEST_WORKSPACE_ID, &fixture.worker).unwrap().unwrap();
+                    workspace_config::revoke_grant(api, &test_owner_actor(), TEST_WORKSPACE_ID,
+                        &current.grant_id).await.unwrap();
+                }
+                "detached" => {
+                    grant(api, &fixture.worker, Access::ReadWrite).await;
+                    let attached = attach(api, &fixture.worker).await;
+                    detach_current_worker_workdir(api, &fixture.worker, "workspace-config",
+                        Some(&attached.connection_id)).await.unwrap();
+                }
+                "read_write" => { attach(api, &fixture.worker).await; }
+                _ => {}
+            }
+            for (method, path) in &routes {
+                let body = if *method == "POST" { serde_json::to_vec(&change).unwrap() } else { vec![] };
+                for scoped in [false, true] {
+                    let app = if scoped {
+                        workspace_server_router(WorkspaceServerApi::new(api.config.clone(), api.store.clone()))
+                    } else {
+                        build_router(api.clone())
+                    };
+                    let response = app.oneshot(runtime_source_request(&identity,
+                        Some(&fixture.worker.worker_id), method, path, body.clone())).await.unwrap();
+                    assert_eq!(response.status(), StatusCode::FORBIDDEN,
+                        "{state}: {method} {path}, scoped={scoped}");
+                    let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+                    assert!(!String::from_utf8_lossy(&bytes).contains("must not persist"));
+                }
+            }
+            let after = api.config_store.load_workspace_config(TEST_WORKSPACE_ID).unwrap().unwrap();
+            assert_eq!(after.snapshot, initial.snapshot, "{state}: editor rejection must have no effect");
+        }
+        // A Runtime-only proof is not a user editor identity either.
+        assert_eq!(signed_call(api, &identity, None, "GET", &tree, Value::Null).await.0,
+            StatusCode::FORBIDDEN);
+        let attached = attach(api, &fixture.worker).await;
+        let observed = observe(api, &fixture.worker, &attached.connection_id, &["main.dcdl"], 0).await;
+        let node = observed.nodes.iter().find(|n| n.path == "main.dcdl").unwrap();
+        assert!(workspace_config::read(api, &fixture.worker, Read {
+            connection_id: attached.connection_id,
+            path: "main.dcdl".into(), validator: node.validator.clone(),
+        }).await.is_ok(), "the granted WIP path remains available");
+
+        // Real API-token authentication still permits the normal UI editor.
+        let token = seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
+        for (method, path) in &routes {
+            if *method == "GET" {
+                request_json_authenticated(build_router(api.clone()), method, path, None,
+                    &token, StatusCode::OK).await;
+            }
+        }
+        request_json_authenticated(build_router(api.clone()), "POST", &format!("{tree}/commit"),
+            Some(serde_json::to_value(change).unwrap()), &token, StatusCode::CREATED).await;
+        let saved = api.config_store.load_workspace_config(TEST_WORKSPACE_ID).unwrap().unwrap();
+        assert_eq!(saved.snapshot.revision, initial.snapshot.revision + 1);
+        assert!(saved.snapshot.entries.keys().any(|p| p.as_str() == "notes/editor-only.txt"));
+        // Prompt and Skill runtime consumption are separate read-only projections,
+        // not authored-tree editor APIs; bootstrap must remain usable.
+        assert_eq!(signed_call(api, &identity, Some(&fixture.worker.worker_id), "GET",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/config/projections/prompts"), Value::Null).await.0,
+            StatusCode::OK);
+        assert_eq!(signed_call(api, &identity, Some(&fixture.worker.worker_id), "GET",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/skills"), Value::Null).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn workspace_config_entrypoint_support_is_exact_and_canonical_mutations_stay_guarded() {
         let fixture = manual_coder_assignment_fixture().await;
         let api = &fixture.api;
