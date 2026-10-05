@@ -6513,6 +6513,38 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubjektivSessionAttributionLifecycle {
+    NewSession,
+    RestoredSession,
+}
+
+fn incomplete_subjektiv_attribution_state(
+    session_id: SessionId,
+    create_if_missing: bool,
+    diagnostic: String,
+) -> SubjektivSessionAttributionState {
+    if create_if_missing {
+        SubjektivSessionAttributionState::OutcomeUnknown {
+            session_id,
+            diagnostic,
+        }
+    } else {
+        SubjektivSessionAttributionState::LegacyUnknown {
+            session_id,
+            diagnostic,
+        }
+    }
+}
+
+fn incomplete_subjektiv_attribution_label(create_if_missing: bool) -> &'static str {
+    if create_if_missing {
+        "outcome_unknown"
+    } else {
+        "legacy_unknown"
+    }
+}
+
 fn bounded_attribution_diagnostic(mut diagnostic: String) -> String {
     const MAX_CHARS: usize = 1024;
     if diagnostic.chars().count() > MAX_CHARS {
@@ -6714,15 +6746,18 @@ where
 
     /// Complete the Host-owned Session-to-Subject attribution boundary before a
     /// runtime-managed Worker is exposed or accepts input. The authoritative
-    /// attachment bit comes from the Runtime create/restore request; names,
-    /// Profiles, and current singleton ownership are never used as identity.
+    /// attachment bit and lifecycle kind come from the Runtime create/restore
+    /// request; names, Profiles, and current singleton ownership are never used
+    /// as historical identity.
     ///
-    /// `OutcomeUnknown` is persisted before network I/O. A lost response or
-    /// process interruption is therefore recovered only by a later create/restore
-    /// lifecycle, where the Backend's same-attribution idempotency is safe to use.
+    /// New Sessions persist `OutcomeUnknown` before create-if-missing network I/O.
+    /// A restore retries creation only for that durable state (or `Failed`). An
+    /// unmarked legacy restore is verification-only and persists `LegacyUnknown`,
+    /// so current ownership can never invent historical attribution.
     pub fn finalize_subjektiv_session_attribution(
         &self,
         subjektiv_attached: bool,
+        lifecycle: SubjektivSessionAttributionLifecycle,
     ) -> Result<(), WorkerError> {
         let worker_name = self.manifest.worker.name.as_str();
         let metadata = self.store.read_by_name(worker_name)?.ok_or_else(|| {
@@ -6762,32 +6797,41 @@ where
             return Ok(());
         }
 
-        if let Some(state) = metadata.subjektiv_session_attribution.as_ref() {
-            if state.session_id() != session_id {
-                return Err(WorkerError::SubjektivSessionAttribution {
-                    state: "session_mismatch",
-                    message: format!(
-                        "persisted Subjektiv attribution targets Session {}, not {session_id}",
-                        state.session_id()
-                    ),
-                });
+        let create_if_missing = match metadata.subjektiv_session_attribution.as_ref() {
+            Some(state) => {
+                if state.session_id() != session_id {
+                    return Err(WorkerError::SubjektivSessionAttribution {
+                        state: "session_mismatch",
+                        message: format!(
+                            "persisted Subjektiv attribution targets Session {}, not {session_id}",
+                            state.session_id()
+                        ),
+                    });
+                }
+                match state {
+                    SubjektivSessionAttributionState::Confirmed { .. } => return Ok(()),
+                    SubjektivSessionAttributionState::OutcomeUnknown { .. }
+                    | SubjektivSessionAttributionState::Failed { .. } => true,
+                    SubjektivSessionAttributionState::LegacyUnknown { .. } => false,
+                }
             }
-            if matches!(state, SubjektivSessionAttributionState::Confirmed { .. }) {
-                return Ok(());
-            }
-        }
-
-        self.persist_subjektiv_session_attribution(
-            SubjektivSessionAttributionState::OutcomeUnknown {
-                session_id,
-                diagnostic: "attribution request started; completion is not yet confirmed"
-                    .to_string(),
-            },
-        )?;
+            None => matches!(lifecycle, SubjektivSessionAttributionLifecycle::NewSession),
+        };
+        let initial_diagnostic = if create_if_missing {
+            "attribution creation started; completion is not yet confirmed"
+        } else {
+            "legacy Session has no local attribution evidence; immutable Backend verification started"
+        };
+        self.persist_subjektiv_session_attribution(incomplete_subjektiv_attribution_state(
+            session_id,
+            create_if_missing,
+            initial_diagnostic.to_string(),
+        ))?;
         let response = match self.workspace_client().execute_server_operation(
             WorkspaceServerOperation::SubjektivRecordSession(
                 server_api::SubjektivRecordSessionRequest {
                     session_id: session_id.to_string(),
+                    create_if_missing,
                 },
             ),
         ) {
@@ -6797,13 +6841,14 @@ where
                     "Session attribution transport outcome is unknown: {error}"
                 ));
                 self.persist_subjektiv_session_attribution(
-                    SubjektivSessionAttributionState::OutcomeUnknown {
+                    incomplete_subjektiv_attribution_state(
                         session_id,
-                        diagnostic: message.clone(),
-                    },
+                        create_if_missing,
+                        message.clone(),
+                    ),
                 )?;
                 return Err(WorkerError::SubjektivSessionAttribution {
-                    state: "outcome_unknown",
+                    state: incomplete_subjektiv_attribution_label(create_if_missing),
                     message,
                 });
             }
@@ -6813,12 +6858,24 @@ where
                 "Session attribution was rejected with HTTP {}: {}",
                 response.status, response.body
             ));
-            self.persist_subjektiv_session_attribution(SubjektivSessionAttributionState::Failed {
-                session_id,
-                diagnostic: message.clone(),
-            })?;
+            let state = if create_if_missing {
+                SubjektivSessionAttributionState::Failed {
+                    session_id,
+                    diagnostic: message.clone(),
+                }
+            } else {
+                SubjektivSessionAttributionState::LegacyUnknown {
+                    session_id,
+                    diagnostic: message.clone(),
+                }
+            };
+            self.persist_subjektiv_session_attribution(state)?;
             return Err(WorkerError::SubjektivSessionAttribution {
-                state: "failed",
+                state: if create_if_missing {
+                    "failed"
+                } else {
+                    "legacy_unknown"
+                },
                 message,
             });
         }
@@ -6830,13 +6887,14 @@ where
                         "Session attribution response outcome is unknown: {error}"
                     ));
                     self.persist_subjektiv_session_attribution(
-                        SubjektivSessionAttributionState::OutcomeUnknown {
+                        incomplete_subjektiv_attribution_state(
                             session_id,
-                            diagnostic: message.clone(),
-                        },
+                            create_if_missing,
+                            message.clone(),
+                        ),
                     )?;
                     return Err(WorkerError::SubjektivSessionAttribution {
-                        state: "outcome_unknown",
+                        state: incomplete_subjektiv_attribution_label(create_if_missing),
                         message,
                     });
                 }
@@ -6848,14 +6906,13 @@ where
             let message =
                 "Session attribution response did not confirm the requested immutable identity"
                     .to_string();
-            self.persist_subjektiv_session_attribution(
-                SubjektivSessionAttributionState::OutcomeUnknown {
-                    session_id,
-                    diagnostic: message.clone(),
-                },
-            )?;
+            self.persist_subjektiv_session_attribution(incomplete_subjektiv_attribution_state(
+                session_id,
+                create_if_missing,
+                message.clone(),
+            ))?;
             return Err(WorkerError::SubjektivSessionAttribution {
-                state: "outcome_unknown",
+                state: incomplete_subjektiv_attribution_label(create_if_missing),
                 message,
             });
         }
@@ -9794,10 +9851,25 @@ mod build_summary_prompt_tests {
         let (worker, store, _temp) = attribution_lifecycle_worker(client.clone()).await;
         let session_id = worker.session_id();
 
-        worker.finalize_subjektiv_session_attribution(true).unwrap();
-        worker.finalize_subjektiv_session_attribution(true).unwrap();
+        worker
+            .finalize_subjektiv_session_attribution(
+                true,
+                SubjektivSessionAttributionLifecycle::NewSession,
+            )
+            .unwrap();
+        worker
+            .finalize_subjektiv_session_attribution(
+                true,
+                SubjektivSessionAttributionLifecycle::RestoredSession,
+            )
+            .unwrap();
 
-        assert_eq!(client.requests.lock().unwrap().len(), 1);
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let request: server_api::SubjektivRecordSessionRequest =
+            serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
+        assert!(request.create_if_missing);
+        drop(requests);
         let metadata = store
             .read_by_name(&worker.manifest().worker.name)
             .unwrap()
@@ -9823,7 +9895,10 @@ mod build_summary_prompt_tests {
             ]));
             let (worker, store, _temp) = attribution_lifecycle_worker(client.clone()).await;
             let error = worker
-                .finalize_subjektiv_session_attribution(true)
+                .finalize_subjektiv_session_attribution(
+                    true,
+                    SubjektivSessionAttributionLifecycle::NewSession,
+                )
                 .unwrap_err();
             assert!(error.to_string().contains(expected_state));
             let incomplete = store
@@ -9840,7 +9915,12 @@ mod build_summary_prompt_tests {
                 ) | ("failed", SubjektivSessionAttributionState::Failed { .. })
             ));
 
-            worker.finalize_subjektiv_session_attribution(true).unwrap();
+            worker
+                .finalize_subjektiv_session_attribution(
+                    true,
+                    SubjektivSessionAttributionLifecycle::RestoredSession,
+                )
+                .unwrap();
             assert_eq!(client.requests.lock().unwrap().len(), 2);
             assert!(matches!(
                 store
@@ -9861,7 +9941,10 @@ mod build_summary_prompt_tests {
         let (worker, store, _temp) = attribution_lifecycle_worker(client.clone()).await;
 
         worker
-            .finalize_subjektiv_session_attribution(false)
+            .finalize_subjektiv_session_attribution(
+                false,
+                SubjektivSessionAttributionLifecycle::NewSession,
+            )
             .unwrap();
 
         assert!(client.requests.lock().unwrap().is_empty());
@@ -9923,8 +10006,18 @@ mod build_summary_prompt_tests {
         .unwrap();
 
         assert_eq!(worker.session_id(), session_id);
-        worker.finalize_subjektiv_session_attribution(true).unwrap();
-        assert_eq!(client.requests.lock().unwrap().len(), 1);
+        worker
+            .finalize_subjektiv_session_attribution(
+                true,
+                SubjektivSessionAttributionLifecycle::RestoredSession,
+            )
+            .unwrap();
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let request: server_api::SubjektivRecordSessionRequest =
+            serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
+        assert!(request.create_if_missing);
+        drop(requests);
         assert!(matches!(
             store
                 .read_by_name(&worker.manifest().worker.name)
@@ -9935,6 +10028,96 @@ mod build_summary_prompt_tests {
                 session_id: stored_session_id,
                 ..
             }) if stored_session_id == session_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn materialized_legacy_session_without_backend_attribution_stays_ambiguous() {
+        let client = Arc::new(AttributionLifecycleClient::new([
+            AttributionOutcome::Rejected,
+        ]));
+        let (worker, store, _temp) = attribution_lifecycle_worker(client.clone()).await;
+        let session_id = worker.session_id();
+        store
+            .set_active(
+                &worker.manifest().worker.name,
+                Some(WorkerActiveSegmentRef::active_segment(
+                    session_id,
+                    worker.segment_state.location().segment_id,
+                )),
+                None,
+            )
+            .unwrap();
+
+        let error = worker
+            .finalize_subjektiv_session_attribution(
+                true,
+                SubjektivSessionAttributionLifecycle::RestoredSession,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("legacy_unknown"));
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let request: server_api::SubjektivRecordSessionRequest =
+            serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(request.session_id, session_id.to_string());
+        assert!(!request.create_if_missing);
+        drop(requests);
+        assert!(matches!(
+            store
+                .read_by_name(&worker.manifest().worker.name)
+                .unwrap()
+                .unwrap()
+                .subjektiv_session_attribution,
+            Some(SubjektivSessionAttributionState::LegacyUnknown {
+                session_id: stored_session_id,
+                ..
+            }) if stored_session_id == session_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn materialized_legacy_session_adopts_only_matching_backend_attribution() {
+        let client = Arc::new(AttributionLifecycleClient::new([
+            AttributionOutcome::Success,
+        ]));
+        let (worker, store, _temp) = attribution_lifecycle_worker(client.clone()).await;
+        let session_id = worker.session_id();
+        store
+            .set_active(
+                &worker.manifest().worker.name,
+                Some(WorkerActiveSegmentRef::active_segment(
+                    session_id,
+                    worker.segment_state.location().segment_id,
+                )),
+                None,
+            )
+            .unwrap();
+
+        worker
+            .finalize_subjektiv_session_attribution(
+                true,
+                SubjektivSessionAttributionLifecycle::RestoredSession,
+            )
+            .unwrap();
+
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let request: server_api::SubjektivRecordSessionRequest =
+            serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
+        assert!(!request.create_if_missing);
+        drop(requests);
+        assert!(matches!(
+            store
+                .read_by_name(&worker.manifest().worker.name)
+                .unwrap()
+                .unwrap()
+                .subjektiv_session_attribution,
+            Some(SubjektivSessionAttributionState::Confirmed {
+                session_id: stored_session_id,
+                ref subject_id,
+            }) if stored_session_id == session_id && subject_id == "subject-test"
         ));
     }
 

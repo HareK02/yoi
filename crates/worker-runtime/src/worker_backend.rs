@@ -129,10 +129,11 @@ use worker::feature::builtin::{
 #[cfg(feature = "ws-server")]
 use worker::ipc::protocol_session::{live_log_entry_event, subscribe_worker_protocol_session};
 use worker::{
-    PreparedWorker, PromptCatalogSource, SegmentLogSink, Worker, WorkerBootstrap,
-    WorkerBootstrapError, WorkerBootstrapLayout, WorkerControllerTransport, WorkerError,
-    WorkerFilesystemAuthority, WorkerHandle, WorkerSharedState, WorkerWorkspaceContext,
-    WorkspaceClient, WorkspaceId, bash_output_dir_for_worker_id,
+    PreparedWorker, PromptCatalogSource, SegmentLogSink, SubjektivSessionAttributionLifecycle,
+    Worker, WorkerBootstrap, WorkerBootstrapError, WorkerBootstrapLayout,
+    WorkerControllerTransport, WorkerError, WorkerFilesystemAuthority, WorkerHandle,
+    WorkerSharedState, WorkerWorkspaceContext, WorkspaceClient, WorkspaceId,
+    bash_output_dir_for_worker_id,
 };
 
 const DEFAULT_BACKEND_ID: &str = "worker-crate";
@@ -1280,7 +1281,10 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         let worker = prepared.worker_mut();
         validate_worker_memory_settings(worker.manifest(), &request.request)?;
         worker
-            .finalize_subjektiv_session_attribution(request.request.subjektiv_attached)
+            .finalize_subjektiv_session_attribution(
+                request.request.subjektiv_attached,
+                SubjektivSessionAttributionLifecycle::NewSession,
+            )
             .map_err(|error| format!("finalize Worker Session attribution: {error}"))?;
         let workdir_capabilities = request
             .workdir_attachments
@@ -1521,7 +1525,10 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         };
         validate_worker_memory_settings(worker.manifest(), &request.request)?;
         worker
-            .finalize_subjektiv_session_attribution(request.request.subjektiv_attached)
+            .finalize_subjektiv_session_attribution(
+                request.request.subjektiv_attached,
+                SubjektivSessionAttributionLifecycle::RestoredSession,
+            )
             .map_err(|error| format!("finalize restored Worker Session attribution: {error}"))?;
         let flow_transition_enabled = worker.manifest().feature.flow.enabled;
         let workdir_sessions = restored_workdir_router(

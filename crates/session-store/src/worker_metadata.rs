@@ -119,7 +119,16 @@ pub struct WorkerPeer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SubjektivSessionAttributionState {
+    /// A lifecycle-created Session sent a create-if-missing request but the
+    /// Host could not determine whether the Backend committed it.
     OutcomeUnknown {
+        session_id: SessionId,
+        diagnostic: String,
+    },
+    /// A legacy restored Session has no local lifecycle evidence. Recovery may
+    /// verify an immutable Backend record but must never create one from current
+    /// ownership.
+    LegacyUnknown {
         session_id: SessionId,
         diagnostic: String,
     },
@@ -137,6 +146,7 @@ impl SubjektivSessionAttributionState {
     pub fn session_id(&self) -> SessionId {
         match self {
             Self::OutcomeUnknown { session_id, .. }
+            | Self::LegacyUnknown { session_id, .. }
             | Self::Failed { session_id, .. }
             | Self::Confirmed { session_id, .. } => *session_id,
         }

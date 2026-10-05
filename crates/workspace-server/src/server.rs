@@ -17638,11 +17638,20 @@ async fn scoped_record_subjektiv_session(
     Json(request): Json<server_api::SubjektivRecordSessionRequest>,
 ) -> ApiResult<Json<server_api::SubjektivRecordSessionResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let attribution =
-        subjektiv_session_attribution(&api, &path.workspace_id, &context, &request.session_id)?;
-    let attribution = open_subjektiv_store(&api)?
-        .record_session_attribution(attribution)
-        .map_err(|error| Error::InvalidInput(error.to_string()))?;
+    let attribution = if request.create_if_missing {
+        let attribution =
+            subjektiv_session_attribution(&api, &path.workspace_id, &context, &request.session_id)?;
+        open_subjektiv_store(&api)?
+            .record_session_attribution(attribution)
+            .map_err(|error| Error::InvalidInput(error.to_string()))?
+    } else {
+        require_existing_subjektiv_session_attribution(
+            &api,
+            &path.workspace_id,
+            &context,
+            &request.session_id,
+        )?
+    };
     Ok(Json(server_api::SubjektivRecordSessionResponse {
         subject_id: attribution.subject_id,
         session_id: attribution.session_id,
@@ -39627,6 +39636,28 @@ mod tests {
                 }
             )
         ));
+        let missing_legacy = scoped_record_subjektiv_session(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            context.clone(),
+            Json(server_api::SubjektivRecordSessionRequest {
+                session_id: "session-1".to_string(),
+                create_if_missing: false,
+            }),
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(missing_legacy.status(), StatusCode::CONFLICT);
+        assert!(
+            open_subjektiv_store(&api)
+                .unwrap()
+                .session_attribution("session-1")
+                .unwrap()
+                .is_none()
+        );
         let Json(recorded_session) = scoped_record_subjektiv_session(
             State(api.clone()),
             AxumPath(ScopedWorkspacePath {
@@ -39635,11 +39666,26 @@ mod tests {
             context.clone(),
             Json(server_api::SubjektivRecordSessionRequest {
                 session_id: "session-1".to_string(),
+                create_if_missing: true,
             }),
         )
         .await
         .unwrap();
         assert_eq!(recorded_session.subject_id, subject.id);
+        let Json(verified_legacy) = scoped_record_subjektiv_session(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            context.clone(),
+            Json(server_api::SubjektivRecordSessionRequest {
+                session_id: "session-1".to_string(),
+                create_if_missing: false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(verified_legacy, recorded_session);
 
         let operation = memory::backend::MemoryStageCandidateOperation {
             source: memory::schema::SourceRef {
