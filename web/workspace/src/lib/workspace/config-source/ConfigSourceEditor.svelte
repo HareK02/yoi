@@ -21,6 +21,8 @@
   let newPath = $state("module.dcdl");
   let diagnostics = $state<ConfigDiagnostic[]>([]);
   let status = $state("Loading source tree…");
+  let loadState = $state<"loading" | "error" | "ready">("loading");
+  let mounted = false;
   let busy = $state(false);
   let workingChanges = $state<ConfigTreeChange[]>([]);
   let baseRevision = $state(0);
@@ -42,9 +44,12 @@
   const dirty = $derived(workingChanges.length > 0 || (selected ? source !== selected.content : source.length > 0));
 
   onMount(() => {
-    toolchain = new ConfigSourceToolchain();
+    mounted = true;
     void reload();
-    return () => toolchain?.close();
+    return () => {
+      mounted = false;
+      toolchain?.close();
+    };
   });
 
   $effect(() => {
@@ -70,9 +75,20 @@
   });
 
   async function reload() {
+    loadState = "loading";
+    status = "Loading source tree…";
     analysisReady = false;
+    analysisGeneration += 1;
     try {
-      treeState = await fetchConfigTree(workspaceId);
+      const remote = await fetchConfigTree(workspaceId);
+      if (!mounted) return;
+      toolchain?.close();
+      toolchain = null;
+      toolchain = new ConfigSourceToolchain();
+      await toolchain.setSnapshot(remote.snapshot, remote.contract.schema_bundle);
+      if (!mounted) return;
+      // Publish the new baseline only after both fetch and toolchain setup succeed.
+      treeState = remote;
       if (!selectedPath || !treeState.snapshot.entries[selectedPath]) {
         selectedPath = Object.keys(treeState.snapshot.entries).toSorted()[0] ?? "";
       }
@@ -80,15 +96,19 @@
       baseSnapshot = $state.snapshot(treeState.snapshot);
       baseRevision = treeState.snapshot.revision;
       baseDigest = treeState.snapshot.digest;
-      await toolchain?.setSnapshot(treeState.snapshot, treeState.contract.schema_bundle);
       analysisReady = true;
       workingChanges = [];
       renamePath = selectedPath;
       diagnostics = [];
       conflict = false;
       status = `Revision ${treeState.snapshot.revision} · ${treeState.snapshot.digest.slice(0, 20)}…`;
+      loadState = "ready";
     } catch (error) {
+      if (!mounted) return;
+      toolchain?.close();
+      toolchain = null;
       status = String(error);
+      loadState = "error";
     }
   }
 
@@ -213,8 +233,6 @@
   }
 
   async function discardAndReload() {
-    workingChanges = [];
-    source = "";
     await reload();
   }
 
@@ -287,7 +305,18 @@
   }
 </script>
 
-<section class="config-source-shell" aria-label="Workspace configuration source tree">
+<section class="config-source-shell" aria-label="Workspace configuration source tree" aria-busy={loadState === "loading"}>
+  {#if loadState === "loading"}
+    <div class="config-source-load" role="status">Loading source tree…</div>
+  {:else if loadState === "error"}
+    <div class="config-source-load">
+      <div role="alert">
+        <strong>Unable to load workspace configuration</strong>
+        <p>{status}</p>
+      </div>
+      <button type="button" onclick={reload}>Reload source tree</button>
+    </div>
+  {:else}
   <aside class="config-source-tree">
     <div class="config-source-tree__header">
       <strong>Source tree</strong>
@@ -354,4 +383,12 @@
       </ol>
     {/if}
   </div>
+  {/if}
 </section>
+
+<style>
+  .config-source-load {
+    grid-column: 1 / -1;
+    padding: 1rem;
+  }
+</style>

@@ -12,6 +12,7 @@ import {
   parseSubjektivSubjectListResponse,
   parseSubjektivSubjectResponse,
   SubjektivSubjectCreateError,
+  updateSubjektivSubjectBehavior,
   validateSubjektivSubjectCreateRequest,
 } from "../src/lib/workspace/memory/api.ts";
 
@@ -61,9 +62,7 @@ async function assertSubjectCreateRejects(
     assertEquals(error.status, expectedStatus);
     if (!error.message.includes(expectedMessage)) {
       throw new Error(
-        `expected ${JSON.stringify(error.message)} to include ${
-          JSON.stringify(expectedMessage)
-        }`,
+        `expected ${JSON.stringify(error.message)} to include ${JSON.stringify(expectedMessage)}`,
       );
     }
     return;
@@ -75,10 +74,36 @@ function subject(id = "subject-1") {
   return {
     id,
     role: "Release coordinator",
+    behavior_md: "Prefer explicit evidence.",
+    behavior_revision: 2,
     state: "active",
     store_revision: 12,
     created_at: "2026-09-01T00:00:00Z",
     updated_at: "2026-09-02T00:00:00Z",
+  };
+}
+
+function currentWorker() {
+  return {
+    runtime_id: "runtime-1",
+    worker_id: "worker-1",
+    host_id: "host-1",
+    display_name: "Release Worker",
+    label: "Release Worker",
+    profile: "builtin:companion",
+    singleton_key: "subjektiv:subject-1",
+    tags: [],
+    workspace: {
+      visibility: "workspace",
+      identity: "workspace-1",
+      workspace_id: "workspace-1",
+    },
+    state: "idle",
+    last_seen_at: "2026-09-02T00:00:00Z",
+    pinned: false,
+    retention_state: "retained",
+    implementation: { kind: "embedded", display_hint: "Embedded" },
+    diagnostics: [],
   };
 }
 
@@ -187,11 +212,32 @@ Deno.test("Subject parsers enforce identity, exact enums, safe revisions, and bo
     () =>
       parseSubjektivSubjectListResponse({
         limit: 100,
-        items: Array.from({ length: 101 }, (_, index) =>
-          subject(`subject-${index}`)),
+        items: Array.from({ length: 101 }, (_, index) => subject(`subject-${index}`)),
         has_more: false,
       }),
     "bounded array",
+  );
+});
+
+Deno.test("Subject parser preserves live Worker connection state", () => {
+  assertEquals(
+    parseSubjektivSubjectResponse({
+      ...subject(),
+      current_worker: currentWorker(),
+    }),
+    { ...subject(), current_worker: currentWorker() },
+  );
+  assertEquals(
+    parseSubjektivSubjectResponse({ ...subject(), current_worker: null }),
+    { ...subject(), current_worker: null },
+  );
+  assertThrows(
+    () =>
+      parseSubjektivSubjectResponse({
+        ...subject(),
+        current_worker: { display_name: "Incomplete Worker" },
+      }),
+    "current worker.runtime_id",
   );
 });
 
@@ -228,7 +274,7 @@ Deno.test("Subject list parser preserves the exact bounded response", () => {
 Deno.test("Subject create request mirrors Backend role validation without rewriting input", () => {
   assertEquals(
     validateSubjektivSubjectCreateRequest({ role: "  Release coordinator  " }),
-    { role: "  Release coordinator  " },
+    { role: "  Release coordinator  ", behavior_md: "" },
   );
   assertThrows(
     () => validateSubjektivSubjectCreateRequest({ role: "   " }),
@@ -242,6 +288,70 @@ Deno.test("Subject create request mirrors Backend role validation without rewrit
     () => validateSubjektivSubjectCreateRequest({ role: "界".repeat(86) }),
     "at most 256 bytes",
   );
+  assertThrows(
+    () =>
+      validateSubjektivSubjectCreateRequest({
+        role: "Reviewer",
+        behavior_md: " ".repeat(3),
+      }),
+    "empty or contain non-whitespace",
+  );
+  assertThrows(
+    () =>
+      validateSubjektivSubjectCreateRequest({
+        role: "Reviewer",
+        behavior_md: "x".repeat(16 * 1024 + 1),
+      }),
+    "at most 16384 bytes",
+  );
+});
+
+Deno.test("Subject behavior update uses CAS and preserves exact text", async () => {
+  const requests: Array<{ path: string; init?: RequestInit }> = [];
+  const fetchFn = (async (path: string | URL | Request, init?: RequestInit) => {
+    requests.push({ path: String(path), init });
+    return Response.json({
+      ...subject("subject/one"),
+      behavior_md: "Line one.\nLine two.",
+      behavior_revision: 3,
+    });
+  }) as typeof fetch;
+
+  const updated = await updateSubjektivSubjectBehavior(
+    fetchFn,
+    "workspace one",
+    "subject/one",
+    { expected_behavior_revision: 2, behavior_md: "Line one.\nLine two." },
+  );
+  assertEquals(updated.behavior_revision, 3);
+  assertEquals(updated.behavior_md, "Line one.\nLine two.");
+  assertEquals(
+    requests[0].path,
+    "/api/w/workspace%20one/subjektiv/subjects/subject%2Fone/behavior",
+  );
+  assertEquals(requests[0].init?.method, "PATCH");
+  assertEquals(
+    requests[0].init?.body,
+    '{"expected_behavior_revision":2,"behavior_md":"Line one.\\nLine two."}',
+  );
+});
+
+Deno.test("Subject behavior update reports conflicts without claiming Worker application", async () => {
+  const conflictFetch =
+    (async () =>
+      Response.json({ message: "revision conflict" }, {
+        status: 409,
+      })) as typeof fetch;
+  await assertSubjectCreateRejects(
+    () =>
+      updateSubjektivSubjectBehavior(conflictFetch, "workspace", "subject", {
+        expected_behavior_revision: 1,
+        behavior_md: "new",
+      }),
+    "rejected",
+    "changed elsewhere",
+    409,
+  );
 });
 
 Deno.test("Subject create client sends the exact typed body once and parses the created Subject", async () => {
@@ -251,20 +361,26 @@ Deno.test("Subject create client sends the exact typed body once and parses the 
     return Response.json({
       ...subject("subject-created"),
       role: "  Release coordinator  ",
+      behavior_md: "Stay concise.",
     }, { status: 201 });
   }) as typeof fetch;
 
   const created = await createSubjektivSubject(fetchFn, "workspace one", {
     role: "  Release coordinator  ",
+    behavior_md: "Stay concise.",
   });
   assertEquals(created, {
     ...subject("subject-created"),
     role: "  Release coordinator  ",
+    behavior_md: "Stay concise.",
   });
   assertEquals(requests.length, 1);
   assertEquals(requests[0].path, "/api/w/workspace%20one/subjektiv/subjects");
   assertEquals(requests[0].init?.method, "POST");
-  assertEquals(requests[0].init?.body, '{"role":"  Release coordinator  "}');
+  assertEquals(
+    requests[0].init?.body,
+    '{"role":"  Release coordinator  ","behavior_md":"Stay concise."}',
+  );
 });
 
 Deno.test("Subject create client distinguishes rejected and unknown outcomes without retrying", async () => {
@@ -328,8 +444,7 @@ Deno.test("Subject create client distinguishes rejected and unknown outcomes wit
     throw new TypeError("connection reset");
   }) as typeof fetch;
   await assertSubjectCreateRejects(
-    () =>
-      createSubjektivSubject(unknownFetch, "workspace-1", { role: "Reviewer" }),
+    () => createSubjektivSubject(unknownFetch, "workspace-1", { role: "Reviewer" }),
     "unknown_outcome",
     "may have been created",
   );
@@ -433,8 +548,7 @@ Deno.test("Current Memory list parser rejects unknown variants, unsafe integers,
   assertThrows(
     () =>
       parseSubjektivMemoryQueryResponse({
-        items: Array.from({ length: 101 }, (_, index) =>
-          queryItem(`memory-${index}`)),
+        items: Array.from({ length: 101 }, (_, index) => queryItem(`memory-${index}`)),
         has_more: false,
       }),
     "bounded array",

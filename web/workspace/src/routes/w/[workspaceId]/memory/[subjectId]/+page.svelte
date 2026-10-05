@@ -1,10 +1,90 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import DocumentMarkdown from '#lib/workspace/markdown/DocumentMarkdown.svelte';
   import { formatDate, workspaceRoute } from '#lib/workspace/api/http.ts';
-  import type { SubjektivMemoryState } from '#lib/generated/memory-api.ts';
+  import {
+    SubjektivSubjectCreateError,
+    updateSubjektivSubjectBehavior,
+  } from '#lib/workspace/memory/api.ts';
+  import type { SubjektivMemoryState, SubjektivResidentSurfaceAvailability } from '#lib/generated/memory-api.ts';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
+
+  let subject = $state(untrack(() => data.subject.data));
+  let editingBehavior = $state(false);
+  let behaviorDraft = $state(untrack(() => subject?.behavior_md ?? ''));
+  let behaviorSaving = $state(false);
+  let behaviorError = $state<string | null>(null);
+  let behaviorSaveConfirmed = $state(false);
+
+  let routeGeneration = 0;
+  let subjectWorkspaceId = untrack(() => data.workspaceId);
+
+  // SvelteKit reuses this page across Subject and Workspace routes. A new
+  // loader snapshot owns a new editor and fences all previous mutations.
+  $effect(() => {
+    const workspaceId = data.workspaceId;
+    const subjectId = data.subjectId;
+    const loadedSubject = data.subject.data;
+    untrack(() => {
+      routeGeneration += 1;
+      subjectWorkspaceId = workspaceId;
+      subject = loadedSubject?.id === subjectId ? loadedSubject : null;
+      behaviorDraft = subject?.behavior_md ?? '';
+      editingBehavior = false;
+      behaviorSaving = false;
+      behaviorError = null;
+      behaviorSaveConfirmed = false;
+    });
+  });
+
+  async function saveBehavior(): Promise<void> {
+    if (!subject || behaviorSaving || subject.id !== data.subjectId || subjectWorkspaceId !== data.workspaceId) return;
+    const generation = routeGeneration;
+    const workspaceId = subjectWorkspaceId;
+    const subjectId = subject.id;
+    const request = {
+      expected_behavior_revision: subject.behavior_revision,
+      behavior_md: behaviorDraft,
+    };
+    const isCurrent = () => generation === routeGeneration &&
+      data.workspaceId === workspaceId && data.subjectId === subjectId;
+    behaviorSaving = true;
+    behaviorError = null;
+    behaviorSaveConfirmed = false;
+    try {
+      const updated = await updateSubjektivSubjectBehavior(fetch, workspaceId, subjectId, request);
+      if (!isCurrent()) return;
+      subject = updated;
+      behaviorDraft = updated.behavior_md;
+      editingBehavior = false;
+      behaviorSaveConfirmed = true;
+    } catch (error) {
+      if (!isCurrent()) return;
+      behaviorError = error instanceof SubjektivSubjectCreateError
+        ? (error.status === 401 || error.status === 403
+          ? 'You do not have permission to edit this Subject.'
+          : error.message)
+        : 'The save outcome is unknown. Reload the Subject before retrying.';
+    } finally {
+      if (isCurrent()) behaviorSaving = false;
+    }
+  }
+
+  function beginBehaviorEdit(): void {
+    if (!subject) return;
+    behaviorDraft = subject.behavior_md;
+    behaviorError = null;
+    behaviorSaveConfirmed = false;
+    editingBehavior = true;
+  }
+
+  function cancelBehaviorEdit(): void {
+    behaviorDraft = subject?.behavior_md ?? '';
+    behaviorError = null;
+    editingBehavior = false;
+  }
 
   const surface = $derived(data.surface.data);
   const snapshot = $derived(surface?.snapshot ?? null);
@@ -36,10 +116,28 @@
   function kindLabel(kind: string): string {
     return kind.replaceAll('_', ' ');
   }
+
+  function surfaceLabel(availability: SubjektivResidentSurfaceAvailability): string {
+    if (availability === 'ready') return snapshot?.body_md.trim() ? 'Ready to use' : 'Ready, no context';
+    if (availability === 'ungenerated') return 'Not generated';
+    if (availability === 'stale') return 'Needs refresh';
+    return 'Generation failed';
+  }
+
+  function surfaceSummary(availability: SubjektivResidentSurfaceAvailability): string {
+    if (availability !== 'ready') return 'No current generated context is available to use.';
+    return snapshot?.body_md.trim()
+      ? 'Current generated context is available.'
+      : 'A current empty surface exists; there is no generated Memory context to show.';
+  }
+
+  function subjectStateLabel(state: 'active' | 'retired'): string {
+    return state === 'active' ? 'Available' : 'Retired';
+  }
 </script>
 
 <svelte:head>
-  <title>{data.subject.data?.role ?? data.subjectId} · Memory · Yoi Workspace</title>
+  <title>{subject?.role ?? data.subjectId} · Memory · Yoi Workspace</title>
   <meta name="description" content="Subject resident surface and current committed Memories" />
 </svelte:head>
 
@@ -49,20 +147,57 @@
   <header class="memory-page-header">
     <div>
       <p class="memory-eyebrow">Memory subject</p>
-      <h1 id="subject-heading">{data.subject.data?.role ?? data.subjectId}</h1>
+      <h1 id="subject-heading">{subject?.role ?? data.subjectId}</h1>
       <code class="subject-id" title={data.subjectId}>{data.subjectId}</code>
     </div>
-    <span class="read-only-label">Read-only</span>
+    <span class="read-only-label">Behavior editable</span>
   </header>
 
-  {#if data.subject.data}
-    <dl class="subject-facts" aria-label="Subject details">
-      <div><dt>Role</dt><dd>{data.subject.data.role}</dd></div>
-      <div><dt>State</dt><dd><span class="subject-state is-{data.subject.data.state}">{data.subject.data.state}</span></dd></div>
-      <div><dt>Store revision</dt><dd>{data.subject.data.store_revision}</dd></div>
-      <div><dt>Updated</dt><dd><time datetime={data.subject.data.updated_at}>{formatDate(data.subject.data.updated_at)}</time></dd></div>
-      <div><dt>Current worker</dt><dd>{data.subject.data.current_worker?.display_name ?? 'None'}</dd></div>
-    </dl>
+  {#if subject}
+    <section class="subject-overview" aria-label="Subject status">
+      <div>
+        <span>Subject status</span>
+        <strong class="subject-state is-{subject.state}">{subjectStateLabel(subject.state)}</strong>
+        <p>{subject.state === 'active' ? 'Available for new Worker connections.' : 'No longer available for new Worker connections.'}</p>
+      </div>
+      <div>
+        <span>Worker connection</span>
+        <strong>{subject.current_worker ? 'Connected' : 'Not connected'}</strong>
+        <p>{subject.current_worker?.display_name ?? 'No Worker currently owns this Subject connection.'}</p>
+      </div>
+      <div>
+        <span>Committed Memories</span>
+        {#if data.memories.data}
+          <strong>{data.cursor ? `${memories.length} on this page` : memories.length === 0 ? 'None' : 'Available'}</strong>
+          <p>{memories.length} shown{data.memories.data.has_more ? ' · more available' : ''}</p>
+        {:else}
+          <strong>Unavailable</strong>
+          <p>The current Memory list could not be read.</p>
+        {/if}
+      </div>
+      <div>
+        <span>Generated Memory context</span>
+        {#if surface}
+          <strong class="availability is-{surface.availability}">{surfaceLabel(surface.availability)}</strong>
+          <p>{surfaceSummary(surface.availability)}</p>
+        {:else}
+          <strong>Unavailable</strong>
+          <p>The resident context status could not be read.</p>
+        {/if}
+      </div>
+    </section>
+
+    <details class="subject-technical-details">
+      <summary>Technical details</summary>
+      <dl>
+        <div><dt>Subject ID</dt><dd><code>{subject.id}</code></dd></div>
+        <div>
+          <dt>Subject store revision</dt>
+          <dd>{subject.store_revision}<small>Internal change number for committed Memories; not a Memory count or content-quality score.</small></dd>
+        </div>
+        <div><dt>Last changed</dt><dd><time datetime={subject.updated_at}>{formatDate(subject.updated_at)}</time></dd></div>
+      </dl>
+    </details>
   {:else if data.subject.error}
     <div class="memory-state is-error" role="alert">
       <strong>Subject details unavailable.</strong>
@@ -72,41 +207,77 @@
     <div class="memory-state" role="status"><p>Subject details are unavailable.</p></div>
   {/if}
 
+  {#if subject}
+    <section class="behavior-section" aria-labelledby="subject-behavior-heading">
+      <header class="section-heading">
+        <div>
+          <p class="memory-eyebrow">User-managed context</p>
+          <h2 id="subject-behavior-heading">Behavior</h2>
+        </div>
+        {#if !editingBehavior}
+          <button type="button" class="behavior-edit" onclick={beginBehaviorEdit}>Edit</button>
+        {/if}
+      </header>
+      <p class="behavior-help">The Host injects this text verbatim for connected Workers, separately from generated Memory. Saving confirms storage only. Connected Workers check for the latest revision before later model requests; this page does not report that application.</p>
+      {#if editingBehavior}
+        <form class="behavior-form" aria-busy={behaviorSaving} onsubmit={(event) => { event.preventDefault(); void saveBehavior(); }}>
+          <label>
+            <span class="sr-only">Subject behavior</span>
+            <textarea bind:value={behaviorDraft} rows="9" disabled={behaviorSaving} aria-invalid={behaviorError ? 'true' : undefined} aria-describedby={behaviorError ? 'subject-behavior-edit-error' : undefined}></textarea>
+          </label>
+          {#if behaviorError}<p id="subject-behavior-edit-error" class="behavior-error" role="alert">{behaviorError}</p>{/if}
+          <div class="behavior-actions">
+            <button type="submit" disabled={behaviorSaving}>{behaviorSaving ? 'Saving…' : 'Save behavior'}</button>
+            <button type="button" disabled={behaviorSaving} onclick={cancelBehaviorEdit}>Cancel</button>
+            <button type="button" disabled={behaviorSaving || behaviorDraft.length === 0} onclick={() => { behaviorDraft = ''; }}>Clear</button>
+          </div>
+        </form>
+      {:else if subject.behavior_md.length > 0}
+        <article class="behavior-document" aria-label="User-managed Subject behavior"><pre>{subject.behavior_md}</pre></article>
+      {:else}
+        <div class="memory-state" role="status"><strong>No behavior is set.</strong><p>Connected Workers receive an explicit empty behavior document.</p></div>
+      {/if}
+      {#if behaviorSaveConfirmed}<p class="behavior-saved" role="status">Behavior storage confirmed at revision {subject.behavior_revision}. This page does not confirm application by a connected Worker.</p>{/if}
+    </section>
+  {/if}
+
   <section class="surface-section" aria-labelledby="resident-surface-heading">
     <header class="section-heading">
       <div>
-        <p class="memory-eyebrow">Resident context</p>
-        <h2 id="resident-surface-heading">Resident surface</h2>
+        <p class="memory-eyebrow">Generated from committed Memory</p>
+        <h2 id="resident-surface-heading">Resident context</h2>
       </div>
       {#if surface}
-        <span class="availability is-{surface.availability}">{surface.availability}</span>
+        <span class="availability is-{surface.availability}">{surfaceLabel(surface.availability)}</span>
       {/if}
     </header>
 
     {#if surface?.availability === 'ready' && snapshot}
       <div class="surface-meta">
-        <span>Built from store revision {snapshot.built_from_store_revision}</span>
+        <span>Generated <time datetime={snapshot.created_at}>{formatDate(snapshot.created_at)}</time></span>
         <span aria-hidden="true">·</span>
-        <time datetime={snapshot.created_at}>{formatDate(snapshot.created_at)}</time>
-        <span aria-hidden="true">·</span>
-        <span>{snapshot.memory_refs.length} Memory ref{snapshot.memory_refs.length === 1 ? '' : 's'}</span>
+        <span>{snapshot.memory_refs.length} referenced Memory {snapshot.memory_refs.length === 1 ? 'record' : 'records'}</span>
       </div>
       {#if snapshot.body_md.trim().length === 0}
         <div class="memory-state" role="status" data-surface-ready-empty>
-          <strong>Resident surface is ready and empty.</strong>
-          <p>This subject currently has no resident context to display.</p>
+          <strong>Resident context is current but empty.</strong>
+          <p>A generated surface exists, but it contains no context to show. Committed Memories, if any, remain listed below.</p>
         </div>
       {:else}
-        <article class="surface-document" aria-label="Resident surface">
+        <article class="surface-document" aria-label="Resident context">
           <DocumentMarkdown text={snapshot.body_md} />
         </article>
       {/if}
       <details class="surface-details">
-        <summary>Surface provenance</summary>
+        <summary>Surface sources and diagnostics</summary>
         <dl>
-          <div><dt>Snapshot id</dt><dd><code>{snapshot.snapshot_id}</code></dd></div>
+          <div><dt>Snapshot ID</dt><dd><code>{snapshot.snapshot_id}</code></dd></div>
           <div>
-            <dt>Memory refs</dt>
+            <dt>Generated from Subject revision</dt>
+            <dd>{snapshot.built_from_store_revision}<small>The Subject change number used for this surface, distinct from each Memory’s revision.</small></dd>
+          </div>
+          <div>
+            <dt>Referenced Memory revisions</dt>
             <dd>
               {#if snapshot.memory_refs.length === 0}
                 None
@@ -123,26 +294,26 @@
       </details>
     {:else if surface?.availability === 'ungenerated'}
       <div class="memory-state" role="status">
-        <strong>Resident surface has not been generated.</strong>
-        <p>Committed Memories remain available below.</p>
+        <strong>Resident context has not been generated.</strong>
+        <p>Committed Memories, if any, remain available below.</p>
       </div>
     {:else if surface?.availability === 'stale'}
       <div class="memory-state is-warning" role="status">
-        <strong>Resident surface is stale.</strong>
-        <p>The latest committed Memories are not represented by a publishable snapshot.</p>
+        <strong>Resident context needs to be refreshed.</strong>
+        <p>The latest committed Memories are not represented by a current surface, so no generated context is shown.</p>
       </div>
     {:else if surface?.availability === 'failed'}
       <div class="memory-state is-error" role="alert">
-        <strong>Resident surface generation failed.</strong>
-        <p>No failed or partial snapshot is displayed.</p>
+        <strong>Resident context generation failed.</strong>
+        <p>No failed or partial surface is shown. Committed Memories remain available below.</p>
       </div>
     {:else if data.surface.error}
       <div class="memory-state is-error" role="alert">
-        <strong>Resident surface unavailable.</strong>
+        <strong>Resident context status unavailable.</strong>
         <p>{data.surface.error}</p>
       </div>
     {:else}
-      <div class="memory-state" role="status"><p>Resident surface data is unavailable.</p></div>
+      <div class="memory-state" role="status"><p>Resident context status is unavailable.</p></div>
     {/if}
   </section>
 
@@ -152,14 +323,14 @@
         <p class="memory-eyebrow">Committed records</p>
         <h2 id="current-memories-heading">Current Memories</h2>
       </div>
-      {#if data.memories.data}<span class="memory-count">{memories.length}{data.memories.data.has_more ? '+' : ''}</span>{/if}
+      {#if data.memories.data}<span class="memory-count">{memories.length} shown{data.memories.data.has_more ? ' · more available' : ''}</span>{/if}
     </header>
 
     {#if data.memories.data}
       {#if memories.length === 0}
         <div class="memory-state" role="status" data-memories-empty>
-          <strong>No committed Memories.</strong>
-          <p>This subject has no current Memory revisions.</p>
+          <strong>{data.cursor ? 'No committed Memories on this page.' : 'No committed Memories yet.'}</strong>
+          <p>{data.cursor ? 'Return to the first page to review earlier records.' : 'This Subject has no current Memory records.'}</p>
           {#if data.cursor}<p><a href={memoryPageHref()}>Return to the first page</a></p>{/if}
         </div>
       {:else}
@@ -175,9 +346,9 @@
                 <p>{memory.excerpt || 'No excerpt.'}</p>
               </div>
               <dl>
-                <div><dt>Memory id</dt><dd><code title={memory.id}>{memory.id}</code></dd></div>
-                <div><dt>Revision</dt><dd>{memory.revision}</dd></div>
-                <div><dt>Updated</dt><dd><time datetime={memory.updated_at}>{formatDate(memory.updated_at)}</time></dd></div>
+                <div><dt>Memory ID</dt><dd><code title={memory.id}>{memory.id}</code></dd></div>
+                <div><dt>Memory revision</dt><dd>{memory.revision}</dd></div>
+                <div><dt>Last changed</dt><dd><time datetime={memory.updated_at}>{formatDate(memory.updated_at)}</time></dd></div>
               </dl>
             </a>
           {/each}
@@ -270,23 +441,77 @@
     font-size: var(--font-size-compact);
   }
 
-  .subject-facts {
-    grid-template-columns: repeat(5, minmax(0, 1fr));
-    gap: var(--space-3);
+  .subject-overview {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: var(--space-4);
+    padding: var(--space-4);
+    background: var(--bg-raised);
+    border-radius: var(--radius-soft);
   }
 
-  .subject-facts > div {
-    display: block;
+  .subject-overview > div {
+    display: grid;
+    align-content: start;
+    gap: var(--space-1);
+    min-width: 0;
   }
 
-  .subject-facts dt {
-    white-space: normal;
+  .subject-overview span,
+  .subject-overview p,
+  .subject-technical-details summary,
+  .subject-technical-details small,
+  .surface-details small {
+    color: var(--text-muted);
+    font-size: var(--font-size-compact);
   }
 
-  .subject-facts dd {
-    margin-top: var(--space-1);
-    color: var(--text);
+  .subject-overview strong {
+    color: var(--text-strong);
     overflow-wrap: anywhere;
+  }
+
+  .subject-overview p {
+    margin: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .subject-technical-details {
+    padding-bottom: var(--space-3);
+    border-bottom: 1px solid var(--line);
+  }
+
+  .subject-technical-details summary {
+    width: fit-content;
+    cursor: pointer;
+    font-weight: 700;
+  }
+
+  .subject-technical-details dl,
+  .surface-details dl {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: var(--space-4);
+    margin-top: var(--space-3);
+  }
+
+  .subject-technical-details dl > div,
+  .surface-details dl > div {
+    display: block;
+    min-width: 0;
+  }
+
+  .subject-technical-details dd,
+  .surface-details dd {
+    margin-top: var(--space-1);
+    overflow-wrap: anywhere;
+  }
+
+  .subject-technical-details small,
+  .surface-details small {
+    display: block;
+    margin-top: var(--space-1);
+    line-height: 1.4;
   }
 
   .subject-state,
@@ -320,12 +545,85 @@
     color: var(--danger);
   }
 
+  .behavior-section,
   .surface-section,
   .memories-section {
     display: grid;
     gap: var(--space-4);
     min-width: 0;
     padding-top: var(--space-3);
+  }
+
+  .behavior-help,
+  .behavior-saved,
+  .behavior-error {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: var(--font-size-compact);
+  }
+
+  .behavior-error { color: var(--danger); }
+  .behavior-saved { color: var(--success); }
+
+  .behavior-form,
+  .behavior-form label {
+    display: grid;
+    gap: var(--space-3);
+  }
+
+  .behavior-form textarea {
+    width: 100%;
+    min-height: 10rem;
+    padding: var(--space-3);
+    color: var(--text);
+    background: var(--surface-raised);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-sm);
+    font: inherit;
+    line-height: 1.5;
+    resize: vertical;
+  }
+
+  .behavior-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+
+  .behavior-edit,
+  .behavior-actions button {
+    padding: var(--space-2) var(--space-3);
+    color: var(--text);
+    background: var(--surface-raised);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+  }
+
+  .behavior-actions button:disabled { cursor: not-allowed; opacity: 0.55; }
+
+  .behavior-document pre {
+    margin: 0;
+    padding: var(--space-4);
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+    background: var(--surface-raised);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    font: inherit;
+    line-height: 1.6;
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   }
 
   .surface-meta,
@@ -455,7 +753,7 @@
   }
 
   @media (max-width: 900px) {
-    .subject-facts {
+    .subject-overview {
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
@@ -472,8 +770,14 @@
       gap: var(--space-2);
     }
 
-    .subject-facts {
+    .subject-overview,
+    .subject-technical-details dl,
+    .surface-details dl {
       grid-template-columns: minmax(0, 1fr);
+    }
+
+    .subject-overview {
+      padding: var(--space-3);
     }
 
     .memory-row {

@@ -63,6 +63,11 @@
     return value.replaceAll('_', ' ');
   }
 
+  function titleLabel(value: string): string {
+    const normalized = label(value);
+    return normalized[0].toUpperCase() + normalized.slice(1);
+  }
+
   function rangeLabel(range: [number, number] | null | undefined): string {
     return range ? `${range[0]}–${range[1]}` : 'None';
   }
@@ -98,8 +103,8 @@
     <header class="memory-page-header">
       <div>
         <div class="pill-row">
-          <span class="memory-pill is-{memory.state}">{memory.state}</span>
-          <span class="memory-kind">{label(memory.kind)}</span>
+          <span class="memory-pill is-{memory.state}">{titleLabel(memory.state)}</span>
+          <span class="memory-kind">{titleLabel(memory.kind)}</span>
           {#if memory.revision !== memory.current_revision}<span class="historical-pill">Historical revision</span>{/if}
         </div>
         <h1 id="memory-detail-heading">{memory.claim}</h1>
@@ -109,11 +114,11 @@
     </header>
 
     <dl class="memory-facts" aria-label="Memory details">
-      <div><dt>Revision</dt><dd>{memory.revision} of {memory.current_revision}</dd></div>
-      <div><dt>State</dt><dd>{memory.state}</dd></div>
-      <div><dt>Kind</dt><dd>{label(memory.kind)}</dd></div>
+      <div><dt>Memory revision</dt><dd>{memory.revision} of {memory.current_revision}</dd></div>
+      <div><dt>Status</dt><dd>{titleLabel(memory.state)}</dd></div>
+      <div><dt>Type</dt><dd>{titleLabel(memory.kind)}</dd></div>
       <div><dt>Created</dt><dd><time datetime={memory.created_at}>{formatDate(memory.created_at)}</time></dd></div>
-      <div><dt>Updated</dt><dd><time datetime={memory.updated_at}>{formatDate(memory.updated_at)}</time></dd></div>
+      <div><dt>Last changed</dt><dd><time datetime={memory.updated_at}>{formatDate(memory.updated_at)}</time></dd></div>
     </dl>
 
     <section class="detail-section memory-body-section" aria-labelledby="memory-body-heading">
@@ -140,7 +145,7 @@
     <section class="detail-section provenance-section" aria-labelledby="provenance-heading">
       <header class="section-heading">
         <div><p class="memory-eyebrow">Audit context</p><h2 id="provenance-heading">Candidate provenance</h2></div>
-        <span>{memory.source_candidates.length} candidate{memory.source_candidates.length === 1 ? '' : 's'}</span>
+        <span>{memory.source_candidates.length} shown</span>
       </header>
 
       {#if memory.source_candidates.length === 0}
@@ -226,7 +231,11 @@
     </section>
 
     <section class="detail-section revision-section" aria-labelledby="revision-heading">
-      <header class="section-heading"><div><p class="memory-eyebrow">Immutable record</p><h2 id="revision-heading">Revision history</h2></div>{#if data.revisions.data}<span>{revisions.length}{data.revisions.data.has_more ? '+' : ''}</span>{/if}</header>
+      <header class="section-heading">
+        <div><p class="memory-eyebrow">Immutable record</p><h2 id="revision-heading">Revision history</h2></div>
+        {#if data.revisions.data}<span>{revisions.length} shown{data.revisions.data.has_more ? ' · more available' : ''}</span>{/if}
+      </header>
+      <p class="section-intro">These are versions of this Memory record, separate from the Subject’s internal update number.</p>
       {#if data.revisions.data}
         {#if revisions.length === 0}
           <div>
@@ -238,7 +247,7 @@
             {#each revisions as revision (revision.revision)}
               <li class:current={revision.revision === memory.revision}>
                 <a href={revisionHref(revision.revision)} aria-current={revision.revision === memory.revision ? 'page' : undefined}>
-                  <div><strong>Revision {revision.revision}</strong><span class="memory-pill is-{revision.state}">{revision.state}</span><span class="memory-kind">{label(revision.kind)}</span></div>
+                  <div><strong>Memory revision {revision.revision}</strong><span class="memory-pill is-{revision.state}">{titleLabel(revision.state)}</span><span class="memory-kind">{titleLabel(revision.kind)}</span></div>
                   <p>{revision.claim}</p>
                   <small>{revision.change_reason} · <time datetime={revision.updated_at}>{formatDate(revision.updated_at)}</time></small>
                 </a>
@@ -386,6 +395,7 @@
   }
 
   .memory-facts {
+    display: grid;
     grid-template-columns: repeat(5, minmax(0, 1fr));
     gap: var(--space-3);
   }
@@ -414,6 +424,7 @@
   .why-useful,
   .staleness,
   .change-reason,
+  .section-intro,
   .empty-copy,
   .bounded-note {
     margin: 0;

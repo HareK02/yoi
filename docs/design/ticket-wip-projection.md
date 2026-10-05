@@ -4,12 +4,14 @@
 
 When a Worker explicitly runs in `wip` mode and its Ticket Feature is enabled, the Worker Host projects the enabled Ticket surface as native Worldspace objects. The projection is an adapter over the existing scoped Workspace Ticket API and typed Ticket tools. It does not add a Ticket store, resolver, audit path, state machine, readiness rule, queue path, or relation implementation.
 
-The Host allocates `/features/ticket` and the Feature mounts:
+The Host assigns the Ticket provider the root `tickets` namespace through `WipMountRegistry` and mounts:
 
 ```text
-/features/ticket/tickets
-/features/ticket/tickets/<ticket-reference>
+/tickets
+/tickets/<ticket-reference>
 ```
+
+There is no Feature Object or `/features/ticket` compatibility alias. A legacy path supplied as current input fails with rediscovery guidance; saved history containing that text is left unchanged.
 
 `<ticket-reference>` is either a canonical `T-<digits>` key or an existing canonical internal alphanumeric ID. Only a direct child is accepted. Nested suffixes, Objective keys, unrelated prefixes, and hidden routes do not resolve.
 

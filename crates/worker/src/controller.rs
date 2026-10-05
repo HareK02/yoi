@@ -489,11 +489,29 @@ fn stage_pending_notifications<St: Store + Clone>(
     count
 }
 
+/// The durable input append is the activation boundary. Clear live state in
+/// the same poll, before invocation preparation can checkpoint it again; the
+/// oneshot only publishes the already-completed transition to the Controller.
+pub(crate) fn input_committed_hook<St: Store + Clone>(
+    pending: crate::worker::PendingSubmissionHandle<St>,
+    submission_id: String,
+    sender: oneshot::Sender<()>,
+) -> impl FnOnce() {
+    move || {
+        pending.finish_activation(&submission_id);
+        let _ = sender.send(());
+    }
+}
+
 fn notification_coalesce_remaining<St: Store + Clone>(
     pending_submissions: &crate::worker::PendingSubmissionHandle<St>,
     notify_buffer: &NotifyBuffer,
     delay: Duration,
+    can_schedule_run: bool,
 ) -> Option<Duration> {
+    if !can_schedule_run {
+        return None;
+    }
     let Some(accepted_at_ms) = pending_submissions.oldest_pending_notification_accepted_at_ms()
     else {
         return notify_buffer
@@ -1434,6 +1452,7 @@ where
         crate::feature::builtin::memory::ordinary_subjektiv_resident_summary_source(
             worker.manifest(),
             worker.workspace_client_handle(),
+            worker.prompts(),
         )?
     {
         let workspace_id = worker
@@ -1563,7 +1582,13 @@ where
             ),
         );
     }
-    if feature_config.manage_workdir.enabled {
+    let wip_mode = worker.manifest().worker.mode == manifest::WorkerMode::Wip;
+    let mut workdir_wip_feature = None;
+    if feature_config.manage_workdir.enabled
+        || (wip_mode
+            && feature_config.workdir_catalog.enabled
+            && worker.workspace_client_handle().is_available())
+    {
         // Workdir lifecycle is Workspace control-plane authority. The Worker
         // receives only the injected WorkspaceClient and never Runtime URLs,
         // repository paths, materializer handles, or cleanup sessions.
@@ -1579,7 +1604,7 @@ where
         }
         let shutdown_registry = spawned_registry.clone();
         let reopen_registry = spawned_registry.clone();
-        feature_registry.add_module(
+        let module =
             crate::feature::builtin::manage_workdir::ManageWorkdirFeature::with_child_lifecycle(
                 workspace_client,
                 worker.workdir_sessions(),
@@ -1588,8 +1613,11 @@ where
                     Box::pin(async move { child_registry.shutdown_internal().await })
                 }),
                 Arc::new(move || reopen_registry.reopen_internal()),
-            ),
-        );
+            );
+        if feature_config.manage_workdir.enabled {
+            feature_registry.add_module(module.clone());
+        }
+        workdir_wip_feature = Some(module);
     }
     if feature_config.workspace_worker_discovery.enabled {
         let workspace_client = worker.workspace_client_handle();
@@ -1644,20 +1672,34 @@ where
     }
 
     let host_worker_observation_provider = worker.worker_observation_provider();
-    let wip_mode = worker.manifest().worker.mode == manifest::WorkerMode::Wip;
     let wip_permissions = worker.manifest().permissions.clone();
     let mut wip_mount_registry = crate::wip::WipMountRegistry::new();
+    if wip_mode && let Some(feature) = &workdir_wip_feature {
+        crate::feature::builtin::manage_workdir::wip::mount_workspace_workdir_wip(
+            &mut wip_mount_registry,
+            feature,
+            feature_config.workdir_catalog.enabled,
+            feature_config.manage_workdir.enabled,
+            wip_permissions.clone(),
+        )
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("mount Workdir WIP projection: {error}"),
+            )
+        })?;
+    }
     {
         let workspace_client = worker.workspace_client_handle();
         let engine = worker.engine_mut();
 
         if feature_config.merge_request.any() && wip_mode {
-            let feature_route = wip_mount_registry
-                .allocate_feature_route("merge-request")
+            let namespace_route = wip_mount_registry
+                .allocate_namespace("merge-request", "merge-requests")
                 .map_err(|error| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        format!("allocate Merge Request WIP route: {error}"),
+                        format!("allocate Merge Request WIP namespace: {error}"),
                     )
                 })?;
             crate::feature::builtin::merge_request::mount_workspace_http_merge_request_wip(
@@ -1665,7 +1707,7 @@ where
                 workspace_client.clone(),
                 feature_config.merge_request,
                 wip_permissions.clone(),
-                &feature_route,
+                &namespace_route,
             )
             .map_err(|error| {
                 std::io::Error::new(
@@ -1682,12 +1724,12 @@ where
                 intake: feature_config.ticket.intake,
                 workflow: feature_config.ticket.workflow,
             };
-            let feature_route = wip_mount_registry
-                .allocate_feature_route("ticket")
+            let namespace_route = wip_mount_registry
+                .allocate_namespace("ticket", "tickets")
                 .map_err(|error| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        format!("allocate Ticket WIP route: {error}"),
+                        format!("allocate Ticket WIP namespace: {error}"),
                     )
                 })?;
             crate::feature::builtin::ticket::mount_workspace_http_ticket_wip(
@@ -1695,7 +1737,7 @@ where
                 workspace_client.clone(),
                 ticket_access,
                 wip_permissions.clone(),
-                &feature_route,
+                &namespace_route,
             )
             .map_err(|error| {
                 std::io::Error::new(
@@ -1716,19 +1758,19 @@ where
                     engine.register_tool(definition);
                 }
                 if wip_mode {
-                    let feature_route = wip_mount_registry
-                        .allocate_feature_route("objective")
+                    let namespace_route = wip_mount_registry
+                        .allocate_namespace("objective", "objectives")
                         .map_err(|error| {
                             std::io::Error::new(
                                 std::io::ErrorKind::InvalidInput,
-                                format!("allocate Objective WIP route: {error}"),
+                                format!("allocate Objective WIP namespace: {error}"),
                             )
                         })?;
                     crate::feature::builtin::objective::mount_workspace_http_objective_wip(
                         &mut wip_mount_registry,
                         workspace_client.clone(),
                         wip_permissions.clone(),
-                        &feature_route,
+                        &namespace_route,
                     )
                     .map_err(|error| {
                         std::io::Error::new(
@@ -2140,9 +2182,11 @@ async fn controller_loop<C, St>(
                             submission.input,
                             vec![extension],
                             submission.provenance,
-                            move || {
-                                let _ = input_commit_tx.send(());
-                            },
+                            input_committed_hook(
+                                pending_submissions.clone(),
+                                committed_submission.submission_id.clone(),
+                                input_commit_tx,
+                            ),
                         ),
                         &mut method_rx,
                         &working_event_tx,
@@ -2199,10 +2243,6 @@ async fn controller_loop<C, St>(
                     .await
                 }
             };
-            if notify_buffer.is_empty() {
-                pending_submissions.finish_notification_batch();
-            }
-
             if !shutdown && may_drain_pending && new_status == WorkerStatus::Idle {
                 match prepare_pending_run(&pending_submissions, &notify_buffer, None, false) {
                     Ok(Some(next)) => {
@@ -2251,12 +2291,16 @@ async fn controller_loop<C, St>(
             continue;
         }
 
+        // An expired Notify deadline must not repeatedly schedule a run that
+        // cannot cross the invocation fence. Keep the accepted notification for
+        // a fresh input/recovery boundary instead of retrying business effects.
         let notification_delay = (shared_state.catalog_status() == WorkerStatus::Idle)
             .then(|| {
                 notification_coalesce_remaining(
                     &pending_submissions,
                     &notify_buffer,
                     notification_coalesce_delay,
+                    worker.can_schedule_notification_run(),
                 )
             })
             .flatten();
@@ -3928,6 +3972,40 @@ mod tests {
             Some(PendingRun::RunForNotification { .. })
         ));
         assert!(notify_buffer.has_notification_pending());
+    }
+
+    #[test]
+    fn invocation_fence_suspends_expired_notification_deadline_without_dropping_input() {
+        let temp = TempDir::new().unwrap();
+        let pending = crate::worker::PendingSubmissionHandle::for_test(temp.path());
+        let buffer = NotifyBuffer::new();
+        pending
+            .accept_notification("held".into(), "held".into())
+            .unwrap();
+        let before = pending.persisted_entries_for_test().len();
+        assert_eq!(
+            notification_coalesce_remaining(&pending, &buffer, Duration::ZERO, true),
+            Some(Duration::ZERO)
+        );
+        for _ in 0..4 {
+            assert_eq!(
+                notification_coalesce_remaining(&pending, &buffer, Duration::ZERO, false),
+                None
+            );
+        }
+        assert_eq!(pending.persisted_entries_for_test().len(), before);
+        assert_eq!(pending.snapshot().notification_count, 1);
+        // A busy-time staged notification is equally retained behind the fence.
+        stage_pending_notifications(&pending, &buffer);
+        assert_eq!(
+            notification_coalesce_remaining(&pending, &buffer, Duration::ZERO, false),
+            None
+        );
+        assert!(buffer.has_notification_pending());
+        assert_eq!(
+            notification_coalesce_remaining(&pending, &buffer, Duration::ZERO, true),
+            Some(Duration::ZERO)
+        );
     }
 
     #[test]

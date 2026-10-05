@@ -33,6 +33,7 @@ import {
   parseWorkerLaunchOptionsResponse,
   parseWorkerSummary,
 } from "./workers.ts";
+import { loadJson } from "./http.ts";
 
 const worker = {
   runtime_id: "runtime-a",
@@ -109,6 +110,92 @@ Deno.test("Worker summary parser enforces observation freshness", () => {
   });
   assertEquals(observedStopped.availability, "observed");
   assertEquals(observedStopped.state, "stopped");
+});
+
+const workerStates = [
+  { kind: "idle" },
+  { kind: "busy", state: { kind: "run", state: "running" } },
+  { kind: "busy", state: { kind: "run", state: "pausing" } },
+  { kind: "busy", state: { kind: "run", state: "paused" } },
+  { kind: "busy", state: { kind: "run", state: "cancelling" } },
+  { kind: "busy", state: { kind: "maintenance", state: "compacting" } },
+] as const;
+
+Deno.test("Worker summary parser preserves the optional submission completion fence in every state", () => {
+  for (const state of workerStates) {
+    for (const completion of [
+      {},
+      { last_finished_submission_request_id: null },
+      { last_finished_submission_request_id: "completed-submit" },
+    ]) {
+      const snapshot = { last_command_id: 7, ...completion, state };
+      const parsed = parseWorkerSummary({
+        ...worker,
+        resource_key: "W-1",
+        availability: "observed",
+        worker_state: snapshot,
+      });
+      assertEquals(parsed.worker_state, snapshot);
+    }
+  }
+});
+
+Deno.test("Worker summary parser validates submission completion fences without accepting unknown fields", () => {
+  for (const state of workerStates) {
+    for (const invalid of [0, false, {}, [], "x".repeat(65_537)]) {
+      assertThrows(
+        () => parseWorkerSummary({
+          ...worker,
+          resource_key: "W-1",
+          availability: "observed",
+          worker_state: {
+            last_command_id: 7,
+            last_finished_submission_request_id: invalid,
+            state,
+          },
+        }),
+        Error,
+        "worker_state.last_finished_submission_request_id",
+      );
+    }
+    assertThrows(
+      () => parseWorkerSummary({
+        ...worker,
+        resource_key: "W-1",
+        availability: "observed",
+        worker_state: {
+          last_command_id: 7,
+          last_finished_submission_request_id: "completed-submit",
+          state,
+          unexpected: true,
+        },
+      }),
+      Error,
+      "unknown field unexpected",
+    );
+  }
+});
+
+Deno.test("Console Worker API loading accepts a completed submission snapshot", async () => {
+  const snapshot = {
+    last_command_id: 0,
+    last_finished_submission_request_id: "completed-submit",
+    state: { kind: "idle" },
+  };
+  const result = await loadJson(
+    () => Promise.resolve(Response.json({
+      ...worker,
+      resource_key: "W-1",
+      availability: "observed",
+      worker_state: snapshot,
+    })),
+    "/api/w/workspace-a/workers/W-1",
+    undefined,
+    parseWorkerSummary,
+    { diagnosticLabel: "Worker API", maxResponseBytes: 8 * 1024 * 1024 },
+  );
+  assertEquals(result.error, null);
+  assertEquals(result.data?.worker_state, snapshot);
 });
 
 Deno.test("Worker summary parser preserves attachment-effective External permissions", () => {

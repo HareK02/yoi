@@ -51,8 +51,9 @@ pub struct WorkerManifestConfig {
     /// is disabled; `Some` requires `default_action` during final resolve.
     #[serde(default)]
     pub permissions: Option<PermissionConfigPartial>,
-    /// Explicit built-in feature/tool-surface enablement. Absent flags resolve
-    /// disabled after cascade merge.
+    /// Built-in feature/tool-surface enablement. Absent tool flags resolve
+    /// disabled after cascade merge; the read-only WIP workdir catalog defaults
+    /// enabled without granting authority.
     #[serde(default)]
     pub feature: FeatureConfigPartial,
     /// Explicit Model Context Protocol provider declarations. Config parsing
@@ -95,6 +96,8 @@ pub struct FeatureConfigPartial {
     #[serde(default)]
     pub manage_workdir: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
+    pub workdir_catalog: Option<FeatureFlagConfigPartial>,
+    #[serde(default)]
     pub ticket: Option<TicketFeatureConfigPartial>,
     #[serde(default)]
     pub merge_request: Option<MergeRequestFeatureConfigPartial>,
@@ -134,6 +137,11 @@ impl FeatureConfigPartial {
             manage_workdir: merge_option(
                 self.manage_workdir,
                 other.manage_workdir,
+                FeatureFlagConfigPartial::merge,
+            ),
+            workdir_catalog: merge_option(
+                self.workdir_catalog,
+                other.workdir_catalog,
                 FeatureFlagConfigPartial::merge,
             ),
             ticket: merge_option(self.ticket, other.ticket, TicketFeatureConfigPartial::merge),
@@ -388,6 +396,12 @@ impl From<FeatureConfigPartial> for FeatureConfig {
                 .manage_workdir
                 .map(FeatureFlagConfig::from)
                 .unwrap_or_default(),
+            workdir_catalog: FeatureFlagConfig {
+                enabled: value
+                    .workdir_catalog
+                    .and_then(|flag| flag.enabled)
+                    .unwrap_or(defaults::WORKDIR_CATALOG_ENABLED),
+            },
             ticket: value
                 .ticket
                 .map(TicketFeatureConfig::from)
@@ -579,6 +593,7 @@ impl From<FeatureConfig> for FeatureConfigPartial {
             workspace_worker_discovery: Some(value.workspace_worker_discovery.into()),
             objective: Some(value.objective.into()),
             manage_workdir: Some(value.manage_workdir.into()),
+            workdir_catalog: Some(value.workdir_catalog.into()),
             ticket: Some(value.ticket.into()),
             merge_request: Some(value.merge_request.into()),
             orchestration: Some(value.orchestration.into()),
@@ -766,7 +781,8 @@ impl WorkerManifestConfig {
 
     /// Base config populated with the in-code per-field defaults listed in
     /// [`crate::defaults`]. This is not a selectable Profile and does not
-    /// enable a launch capability surface. Profile and one-file Manifest
+    /// enable launch authority or normal Tools. The read-only WIP workdir
+    /// catalog defaults enabled independently. Profile and one-file Manifest
     /// resolvers start from this layer so every per-field default lives at
     /// exactly one call site (the `defaults` module).
     ///
@@ -2232,7 +2248,7 @@ worker_max_turns = 7
     }
 
     #[test]
-    fn feature_flags_default_disabled_in_resolved_manifest() {
+    fn tool_feature_flags_default_disabled_except_read_only_workdir_catalog() {
         let manifest: WorkerManifest = minimal_valid().try_into().unwrap();
         assert!(!manifest.feature.task.enabled);
         assert!(!manifest.feature.memory.profile.enabled);
@@ -2240,8 +2256,104 @@ worker_max_turns = 7
         assert!(!manifest.feature.sub_worker.enabled);
         assert!(!manifest.feature.objective.enabled);
         assert!(!manifest.feature.manage_workdir.enabled);
+        assert!(manifest.feature.workdir_catalog.enabled);
         assert!(!manifest.feature.ticket.enabled);
         assert!(!manifest.feature.merge_request.any());
+    }
+
+    #[test]
+    fn workdir_catalog_defaults_agree_for_partial_and_resolved_configs() {
+        assert!(FeatureConfig::default().workdir_catalog.enabled);
+        assert!(FeatureConfigPartial::default().workdir_catalog.is_none());
+        for source in ["", "[feature]\n", "[feature.workdir_catalog]\n"] {
+            let partial = WorkerManifestConfig::from_toml(source).unwrap();
+            let feature = FeatureConfig::from(partial.feature);
+            assert!(feature.workdir_catalog.enabled, "{source}");
+            let value: toml::Value = toml::from_str(source).unwrap();
+            let resolved: FeatureConfig = serde_json::from_value(
+                serde_json::to_value(
+                    value
+                        .get("feature")
+                        .cloned()
+                        .unwrap_or_else(|| toml::Value::Table(Default::default())),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(feature, resolved);
+        }
+        for source in ["{}", r#"{"workdir_catalog": {}}"#] {
+            let feature: FeatureConfig = serde_json::from_str(source).unwrap();
+            assert!(feature.workdir_catalog.enabled);
+            assert!(!feature.manage_workdir.enabled);
+        }
+    }
+
+    #[test]
+    fn workdir_catalog_is_independent_and_merges_partial_layers() {
+        for catalog in [false, true] {
+            for manage in [false, true] {
+                let source = format!(
+                    "[feature.workdir_catalog]\nenabled = {catalog}\n\
+                     [feature.manage_workdir]\nenabled = {manage}\n"
+                );
+                let lower = WorkerManifestConfig::from_toml(&source).unwrap();
+                let empty = WorkerManifestConfig::from_toml("[feature.workdir_catalog]").unwrap();
+                let cfg = minimal_valid().merge(lower.clone()).merge(empty);
+                let manifest: WorkerManifest = cfg.try_into().unwrap();
+                assert_eq!(manifest.feature.workdir_catalog.enabled, catalog);
+                assert_eq!(manifest.feature.manage_workdir.enabled, manage);
+
+                let override_source =
+                    format!("[feature.workdir_catalog]\nenabled = {}\n", !catalog);
+                let upper = WorkerManifestConfig::from_toml(&override_source).unwrap();
+                let manifest: WorkerManifest = minimal_valid()
+                    .merge(lower)
+                    .merge(upper)
+                    .try_into()
+                    .unwrap();
+                assert_eq!(manifest.feature.workdir_catalog.enabled, !catalog);
+                assert_eq!(manifest.feature.manage_workdir.enabled, manage);
+            }
+        }
+    }
+
+    #[test]
+    fn workdir_catalog_roundtrips_config_and_persisted_snapshots() {
+        for enabled in [false, true] {
+            let mut cfg = minimal_valid();
+            cfg.feature.workdir_catalog = Some(FeatureFlagConfigPartial {
+                enabled: Some(enabled),
+            });
+            let manifest: WorkerManifest = cfg.try_into().unwrap();
+            let partial = FeatureConfigPartial::from(manifest.feature.clone());
+            assert_eq!(
+                partial.workdir_catalog.as_ref().unwrap().enabled,
+                Some(enabled)
+            );
+            let serialized = toml::to_string(&partial).unwrap();
+            let partial: FeatureConfigPartial = toml::from_str(&serialized).unwrap();
+            assert_eq!(FeatureConfig::from(partial), manifest.feature);
+            let serialized = serde_json::to_value(&manifest.feature).unwrap();
+            assert_eq!(serialized["workdir_catalog"]["enabled"], enabled);
+            let feature: FeatureConfig = serde_json::from_value(serialized).unwrap();
+            assert_eq!(feature, manifest.feature);
+
+            let snapshot = crate::write_persisted_worker_manifest_snapshot(&manifest).unwrap();
+            let restored =
+                crate::read_persisted_worker_manifest_snapshot(snapshot.clone()).unwrap();
+            assert_eq!(restored.feature.workdir_catalog.enabled, enabled);
+            assert!(!restored.feature.manage_workdir.enabled);
+
+            let mut legacy = snapshot;
+            legacy["manifest"]["feature"]
+                .as_object_mut()
+                .unwrap()
+                .remove("workdir_catalog");
+            let restored = crate::read_persisted_worker_manifest_snapshot(legacy).unwrap();
+            assert!(restored.feature.workdir_catalog.enabled);
+            assert!(!restored.feature.manage_workdir.enabled);
+        }
     }
 
     #[test]

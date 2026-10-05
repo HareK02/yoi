@@ -3769,6 +3769,29 @@ Deno.test("committed tool identities reconcile one live call block", () => {
   );
 });
 
+Deno.test("image rejection correction updates the existing tool result without duplicate rows", () => {
+  const result: SessionSnapshotEntry = {
+    kind: "tool_result", entry_id: "result-image", timestamp: 2,
+    provenance: "tool_output", call_id: "image", summary: "Attached image", is_error: false,
+    attachments: [{ attachment_id: "image-body", media_type: "image/png", byte_len: 100 }],
+  };
+  const lines = projectConsole([
+    { eventId: "call", event: { event: "session_entry_committed", data: { entry: {
+      kind: "tool_call", entry_id: "call-image", timestamp: 1, provenance: "model_output",
+      call_id: "image", name: "ViewImage", arguments: "{}",
+    } } } },
+    { eventId: "original", event: { event: "session_entry_committed", data: { entry: result } } },
+    { eventId: "correction", event: { event: "session_entry_committed", data: { entry: {
+      ...result, timestamp: 3, summary: "Resize or crop and retry ViewImage", is_error: true, attachments: [],
+    } } } },
+  ]).lines;
+  assertEquals(lines.length, 1);
+  assertEquals(lines[0].entryId, "result-image");
+  assertEquals(lines[0].toolCall?.state, "error");
+  assertEquals(lines[0].attachments ?? [], []);
+  assert(lines[0].body.includes("Resize or crop"), "show the model recovery instruction");
+});
+
 function readHistory(ids: string[], summary: string): ConsoleLine[] {
   const entries = ids.flatMap((id): SessionSnapshotEntry[] => [{
     kind: "tool_call", entry_id: `call-entry-${id}`, timestamp: 1,

@@ -45,7 +45,7 @@ Deno.test("worker metadata formats effort, budget, estimate, and unknown safely"
       contextTokens: 142_000,
       contextSource: "estimated",
     }),
-    "Context ~142.0k / 272.0k (52%)",
+    "~142.0k / 272.0k (52%)",
   );
   assertEquals(formatModelSummary(null), "Model unavailable");
   assertEquals(
@@ -64,7 +64,7 @@ Deno.test("worker metadata formats effort, budget, estimate, and unknown safely"
     formatReasoning({ kind: "budget_tokens", budget_tokens: -2 }),
     "reasoning unavailable",
   );
-  assertEquals(formatContextSummary(null), "Context unavailable");
+  assertEquals(formatContextSummary(null), "unavailable");
   assertEquals(
     formatContextSummary({
       model: null,
@@ -73,7 +73,7 @@ Deno.test("worker metadata formats effort, budget, estimate, and unknown safely"
       contextTokens: 0,
       contextSource: null,
     }),
-    "Context unavailable",
+    "unavailable",
   );
 });
 

@@ -35,7 +35,9 @@ It is not a dumping ground for external research, old plans, API inventories, or
 27. [`development/subjektiv-product-cutover.md`](development/subjektiv-product-cutover.md) — legacy Workspace Memoryからsubjektivへのoperator cutover、explicit reset、backup／rollback runbook。
 28. [`design/worker-wip-mode.md`](design/worker-wip-mode.md) — explicit-opt-in Worker WIP mode, Worldspace projection, authority, cache, and retry contracts.
 29. [`design/objective-wip-projection.md`](design/objective-wip-projection.md) — Host-assigned Objective collection/item routes, operation mapping, Backend authority, bounds, and compatibility suppression.
-30. [`design/feature-chat-invocations.md`](design/feature-chat-invocations.md) — declarative `/` invocation identity, grammar, completion, typed draft, attachment staging, execution, and authority boundaries.
+30. [`design/ticket-wip-projection.md`](design/ticket-wip-projection.md) — Host-assigned Ticket collection/item routes, role-specific operations, route identity, and typed Backend preservation.
+31. [`design/merge-request-wip-projection.md`](design/merge-request-wip-projection.md) — Host-assigned Merge Request routes and preserved review/integration authority gates.
+32. [`design/feature-chat-invocations.md`](design/feature-chat-invocations.md) — declarative `/` invocation identity, grammar, completion, typed draft, attachment staging, execution, and authority boundaries.
 
 ## What belongs here
 

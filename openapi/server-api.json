@@ -9807,9 +9807,32 @@
         ],
         "type": "object"
       },
+      "SubjektivSubjectBehaviorUpdateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "behavior_md": {
+            "type": "string"
+          },
+          "expected_behavior_revision": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_behavior_revision",
+          "behavior_md"
+        ],
+        "type": "object"
+      },
       "SubjektivSubjectCreateRequest": {
         "additionalProperties": false,
         "properties": {
+          "behavior_md": {
+            "default": "",
+            "type": "string"
+          },
           "role": {
             "type": "string"
           }
@@ -9875,6 +9898,15 @@
       "SubjektivSubjectResponse": {
         "additionalProperties": false,
         "properties": {
+          "behavior_md": {
+            "type": "string"
+          },
+          "behavior_revision": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
           "created_at": {
             "type": "string"
           },
@@ -9911,6 +9943,8 @@
         "required": [
           "id",
           "role",
+          "behavior_md",
+          "behavior_revision",
           "state",
           "store_revision",
           "created_at",
@@ -15286,7 +15320,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:eddff23c6405c11e8becfef09473d6833647bcaba9243abae189db7f840c1896"
+    "x-yoi-source-digest": "sha256:47064776569f7f208533f24d56ac80c0db6055d508ab29fb0a780c2c66387081"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -29593,6 +29627,123 @@
             "description": "Error response"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/behavior": {
+      "patch": {
+        "operationId": "subjektiv_subject_behavior_update",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "subject_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubjektivSubjectBehaviorUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubjektivSubjectResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
             "content": {
               "application/json": {
                 "schema": {

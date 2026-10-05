@@ -71,16 +71,103 @@ Deno.test("config source API commits directly through the workspace scope", asyn
     entrypoints: [],
   }, fetcher);
 
-  assertEquals(calls.map((call) => call.url), [
+  assertEquals<unknown>(calls.map((call) => call.url), [
     "/api/w/w%2Fone/config/source-tree",
     "/api/w/w%2Fone/config/source-tree/revisions/7",
     "/api/w/w%2Fone/config/source-tree/entries/profiles%2Fmain.dcdl",
     "/api/w/w%2Fone/config/source-tree/commit",
   ]);
-  assertEquals(calls[3].init?.method, "POST");
+  assertEquals<unknown>(calls[3].init?.method, "POST");
   assert(
     String(calls[3].init?.body).includes('"base_digest":"sha256:base"'),
   );
+});
+
+function withSchema(source: unknown, contributionSource: unknown = "builtin") {
+  return {
+    ...tree,
+    contract: {
+      ...tree.contract,
+      schema_bundle: {
+        ...tree.contract.schema_bundle,
+        source,
+        contributions: [{
+          provider_id: "builtin",
+          namespace: "workspace",
+          version: "1",
+          source: contributionSource,
+          source_digest: "sha256:contribution",
+        }],
+      },
+    },
+  };
+}
+
+for (const field of ["bundle", "contribution"] as const) {
+  Deno.test(`config source API accepts ${field} schema bodies larger than metadata`, async () => {
+    const source = "schema body\n".repeat(6000);
+    const body = field === "bundle"
+      ? withSchema(source)
+      : withSchema("builtin", source);
+    const fetcher = (() => Promise.resolve(response(body))) as typeof fetch;
+    assertEquals<unknown>(await fetchConfigTree("w", fetcher), body);
+    assertEquals<unknown>(
+      await commitConfigTree("w", {
+        base_revision: 7,
+        base_digest: snapshot.digest,
+        changes: [],
+        entrypoints: ["main.dcdl"],
+      }, fetcher),
+      body,
+    );
+  });
+
+  Deno.test(`config source API bounds ${field} schema bodies in UTF-8 bytes and checks types`, () => {
+    const body = (source: unknown) =>
+      field === "bundle" ? withSchema(source) : withSchema("builtin", source);
+    const limit = 8 * 1024 * 1024;
+    const atLimit = "é".repeat(limit / 2);
+    assertEquals<unknown>(
+      parseWorkspaceConfigTreeResponse(body(atLimit)),
+      body(atLimit),
+    );
+    for (const invalid of [atLimit + "x", null, 42, {}]) {
+      assertThrows(
+        () => parseWorkspaceConfigTreeResponse(body(invalid)),
+        ConfigSourceApiError,
+      );
+    }
+  });
+}
+
+Deno.test("config source API retains metadata and total response limits", async () => {
+  const invalid = withSchema("builtin");
+  invalid.contract.schema_bundle.contributions[0].provider_id = "x".repeat(
+    4097,
+  );
+  assertThrows(
+    () => parseWorkspaceConfigTreeResponse(invalid),
+    ConfigSourceApiError,
+  );
+  for (
+    const headers of [
+      new Headers(),
+      new Headers({ "content-length": String(8 * 1024 * 1024 + 1) }),
+    ]
+  ) {
+    const fetcher = (() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify(withSchema("x".repeat(8 * 1024 * 1024))),
+          { headers },
+        ),
+      )) as typeof fetch;
+    await assertRejects(
+      () => fetchConfigTree("w", fetcher),
+      ConfigSourceApiError,
+      "too large",
+    );
+  }
 });
 
 Deno.test("config source API rejects unknown response fields", async () => {

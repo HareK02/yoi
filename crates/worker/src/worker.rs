@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "image_recovery_tests.rs"]
+mod image_recovery_tests;
+
 use std::collections::{HashMap, VecDeque};
 #[cfg(test)]
 use std::path::Path;
@@ -835,6 +839,17 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
     fn is_available(&self) -> bool;
     fn execute(&self, request: WorkspaceRequest)
     -> Result<WorkspaceResponse, WorkspaceClientError>;
+
+    /// Executes one bounded Workspace request when the caller is on a
+    /// latency-sensitive lifecycle boundary. Implementations without transport
+    /// timeout support retain their existing execution semantics.
+    fn execute_with_timeout(
+        &self,
+        request: WorkspaceRequest,
+        _timeout: Duration,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        self.execute(request)
+    }
 
     fn execute_server_operation(
         &self,
@@ -1986,7 +2001,7 @@ where
 
     pub(crate) fn prepare_notification_batch(
         &self,
-    ) -> Vec<(PendingNotification, SessionExtension)> {
+    ) -> Vec<(PendingNotification, NotificationCommitIdentity)> {
         let mut state = self
             .state
             .lock()
@@ -2003,18 +2018,11 @@ where
         notifications
             .into_iter()
             .map(|notification| {
-                let index = state
-                    .activating_notifications
-                    .iter()
-                    .position(|active| {
-                        active.notification_request_id == notification.notification_request_id
-                            && active.source_namespace == notification.source_namespace
-                    })
-                    .expect("newly staged notification must be active");
-                let mut committed = state.clone();
-                committed.activating_notifications.drain(..=index);
-                committed.revision = committed.revision.saturating_add(1);
-                (notification, pending_activation_extension(&committed))
+                let identity = NotificationCommitIdentity {
+                    request_id: notification.notification_request_id.clone(),
+                    source_namespace: notification.source_namespace.clone(),
+                };
+                (notification, identity)
             })
             .collect()
     }
@@ -2114,17 +2122,6 @@ where
                 receipt.disposition = protocol::SubmissionDisposition::Started;
             }
             state.activating = None;
-            state.revision = state.revision.saturating_add(1);
-        }
-    }
-
-    pub(crate) fn finish_notification_batch(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .expect("pending activation state poisoned");
-        if !state.activating_notifications.is_empty() {
-            state.activating_notifications.clear();
             state.revision = state.revision.saturating_add(1);
         }
     }
@@ -2246,6 +2243,93 @@ impl PendingSubmissionHandle<session_store::FsStore> {
             .store
             .read_all(location.session_id, location.segment_id)
             .expect("read test pending entries")
+    }
+}
+
+/// Identity of one staged notification, never a frozen full-state checkpoint.
+#[derive(Debug, Clone)]
+pub struct NotificationCommitIdentity {
+    pub(crate) request_id: String,
+    pub(crate) source_namespace: String,
+}
+
+pub(crate) trait DurableNotificationCommitter: Send + Sync {
+    fn commit_notification(
+        &self,
+        identity: &NotificationCommitIdentity,
+        item: SystemItem,
+        provenance: Option<WorkerHistoryProvenance>,
+    ) -> Result<Option<HistoryEntry<SessionHistoryMetadata>>, StoreError>;
+}
+
+impl<St: Store + Clone> DurableNotificationCommitter for PendingSubmissionHandle<St> {
+    fn commit_notification(
+        &self,
+        identity: &NotificationCommitIdentity,
+        item: SystemItem,
+        provenance: Option<WorkerHistoryProvenance>,
+    ) -> Result<Option<HistoryEntry<SessionHistoryMetadata>>, StoreError> {
+        let _append = self
+            .writer
+            .state
+            .append_lock
+            .lock()
+            .expect("segment append lock poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("pending activation state poisoned");
+        let matches = |notification: &PendingNotification| {
+            notification.notification_request_id == identity.request_id
+                && notification.source_namespace == identity.source_namespace
+        };
+        let Some(index) = state.activating_notifications.iter().position(matches) else {
+            // A partial drain may already have committed this notification. Its
+            // original history entry remains authoritative; never append it twice.
+            if !state.pending_notifications.iter().any(matches)
+                && state.notification_receipts.iter().any(|receipt| {
+                    receipt.notification_request_id == identity.request_id
+                        && receipt.source_namespace == identity.source_namespace
+                })
+            {
+                return Ok(None);
+            }
+            return Err(StoreError::Io(std::io::Error::other(
+                "notification is not staged at the commit boundary",
+            )));
+        };
+        if index != 0 {
+            return Err(StoreError::Io(std::io::Error::other(
+                "notification commit would violate FIFO order",
+            )));
+        }
+        let notification = &state.activating_notifications[index];
+        if !matches!(&item, SystemItem::Notification { message, .. } if message == &notification.message)
+            || provenance.as_ref() != Some(&notification.provenance)
+        {
+            return Err(StoreError::Io(std::io::Error::other(
+                "notification does not match accepted input authority",
+            )));
+        }
+        let mut committed = state.clone();
+        committed.activating_notifications.pop_front();
+        committed.revision = committed.revision.saturating_add(1);
+        let metadata = new_history_metadata(
+            provenance.unwrap_or(WorkerHistoryProvenance::LegacyUnknown),
+            None,
+        );
+        let history_item = item.to_history_item();
+        self.writer
+            .append_entry_locked(LogEntry::AnnotatedSystemItem {
+                ts: segment_log::now_millis(),
+                entry: session_store::LoggedSystemHistoryEntry {
+                    item,
+                    metadata: metadata.clone(),
+                },
+                extensions: vec![pending_activation_extension(&committed)],
+            })?;
+        *state = committed;
+        Ok(Some(HistoryEntry::new(history_item, metadata)))
     }
 }
 
@@ -2472,9 +2556,30 @@ pub(crate) enum SystemPromptContribution {
     Unavailable,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResidentContextRefresh {
+    pub body: String,
+    pub revision: u64,
+}
+
 #[async_trait::async_trait]
 pub(crate) trait SystemPromptContributionSource: Send + Sync {
     async fn load(&self) -> SystemPromptContribution;
+
+    /// Returns a durable model-visible refresh only when user-managed resident
+    /// context changed since the last successful load.
+    async fn load_changed_resident_context(
+        &self,
+    ) -> Result<Option<ResidentContextRefresh>, String> {
+        Ok(None)
+    }
+
+    /// Acknowledges that the revision's typed refresh was durably committed.
+    fn confirm_resident_context_revision(&self, _revision: u64) {}
+
+    /// Invalidates the in-memory representation fence before history may be
+    /// compacted or rewound.
+    fn invalidate_resident_context_representation(&self) {}
 }
 
 #[derive(Debug, Clone)]
@@ -2674,6 +2779,7 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// paths skip SystemItem disk commits but still see the rendered
     /// `Item::system_message` in worker history.
     log_writer: Option<Arc<dyn SystemItemCommitter>>,
+    notification_committer: Option<Arc<dyn DurableNotificationCommitter>>,
 }
 
 impl<C: LlmClient, St: Store> Drop for Worker<C, St> {
@@ -2753,10 +2859,14 @@ impl<C: LlmClient + 'static, St: Store + Clone + 'static> Worker<C, St> {
     /// Idempotent: subsequent calls overwrite the previous handle.
     pub fn attach_log_writer(&mut self, writer: Arc<dyn SystemItemCommitter>) {
         self.log_writer = Some(writer);
+        self.notification_committer = Some(Arc::new(self.pending_submission_handle()));
     }
 
     pub fn attach_in_flight_events(&mut self, in_flight: InFlightEvents) {
         self.in_flight = Some(in_flight);
+        if self.notification_committer.is_some() {
+            self.notification_committer = Some(Arc::new(self.pending_submission_handle()));
+        }
     }
 
     pub fn clear_in_flight_events(&self) {
@@ -2902,6 +3012,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             sink: SegmentLogSink::new(),
             history_persistence_wired: false,
             log_writer: None,
+            notification_committer: None,
         };
         worker.apply_permissions_from_manifest();
         worker.apply_prune_from_manifest();
@@ -3971,8 +4082,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 self.log_writer.clone(),
                 self.pending_committed_history.clone(),
             )
+            .with_notification_committer(self.notification_committer.clone())
             .with_usage_tracker(self.usage_tracker.clone())
             .with_metrics_tracker(self.metrics_tracker.clone())
+            .with_resident_context_source(self.feature_resident_summary_source.clone())
             .with_prompt_workspace_id(
                 self.workspace_context
                     .workspace_id()
@@ -4187,6 +4300,24 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         St: Clone + 'static,
     {
         self.materialize_durable_session_head().await?;
+        let writer = self.log_writer_handle();
+        let activity = self.ai_activity_counter.clone();
+        self.engine_mut()
+            .set_image_rejection_handler(move |original, replacement| {
+                writer
+                    .append_entry(LogEntry::ToolResultCorrected {
+                        ts: segment_log::now_millis(),
+                        entry: session_store::LoggedHistoryEntry {
+                            item: replacement.clone().into(),
+                            metadata: original.annotation.clone(),
+                        },
+                    })
+                    .map_err(|error| error.to_string())?;
+                // A later Cancel must not roll back this committed correction while
+                // leaving the in-memory result changed (the original may predate Run).
+                activity.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
         self.ensure_interceptor_installed();
         if self.should_pre_run_compact() {
             self.try_pre_run_compact().await?;
@@ -4524,13 +4655,13 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         match self.execute_feature_invocations(&input).await {
             Ok(false) => {}
             Ok(true) => {
-                self.materialize_committed_activation_history(&projected_input);
+                self.materialize_committed_history(&projected_input);
                 return Err(WorkerError::FeatureInvocation(
                     "activation preparation failed or has an unknown outcome; dependent LLM request was not sent".into(),
                 ));
             }
             Err(error) => {
-                self.materialize_committed_activation_history(&projected_input);
+                self.materialize_committed_history(&projected_input);
                 return Err(error);
             }
         }
@@ -4586,7 +4717,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         if let Some(input) = &committed_activation_input {
             // A prompt hook may cancel before Engine materializes input/results.
             // Business preparation is already durable and cannot be rolled back.
-            self.materialize_committed_activation_history(input);
+            self.materialize_committed_history(input);
         }
         if !has_invocations && self.should_rollback_empty_turn(&result, &rollback_snapshot) {
             self.rollback_empty_turn(rollback_snapshot)?;
@@ -4783,10 +4914,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         Ok(prior_failure)
     }
 
-    fn materialize_committed_activation_history(
-        &mut self,
-        input: &[HistoryEntry<SessionHistoryMetadata>],
-    ) {
+    fn materialize_committed_history(&mut self, input: &[HistoryEntry<SessionHistoryMetadata>]) {
         let pending = self
             .pending_committed_history
             .lock()
@@ -4805,6 +4933,12 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             }
         }
         self.session.note_mutation();
+    }
+
+    pub(crate) fn can_schedule_notification_run(&self) -> bool {
+        !self.has_failed_segment_activation()
+            && !self.has_pending_compaction_cleanup()
+            && self.ensure_invocation_preparation_complete().is_ok()
     }
 
     fn ensure_invocation_preparation_complete(&self) -> Result<(), WorkerError> {
@@ -5407,6 +5541,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     where
         St: Clone + 'static,
     {
+        // A producer may durably append a prefix before a later append fails.
+        // Preserve that exact annotated prefix even when Engine never got to
+        // materialize it; retries must neither lose nor reappend it.
+        self.materialize_committed_history(&[]);
         let run_id = uuid::Uuid::now_v7().to_string();
         let hook_exit = hook_run_exit(&result);
         if let Some(hooks) = self.hook_registry.clone() {
@@ -7158,6 +7296,7 @@ where
             sink: SegmentLogSink::new(),
             history_persistence_wired: false,
             log_writer: None,
+            notification_committer: None,
         };
         worker.apply_permissions_from_manifest();
         worker.apply_prune_from_manifest();
@@ -7436,6 +7575,7 @@ where
             sink: SegmentLogSink::new(),
             history_persistence_wired: false,
             log_writer: None,
+            notification_committer: None,
         };
         worker.apply_permissions_from_manifest();
         worker.apply_prune_from_manifest();
@@ -7562,6 +7702,7 @@ where
             sink: SegmentLogSink::new(),
             history_persistence_wired: false,
             log_writer: None,
+            notification_committer: None,
         };
         worker.apply_permissions_from_manifest();
         worker.apply_prune_from_manifest();
@@ -7949,6 +8090,7 @@ where
             sink: SegmentLogSink::with_initial(mirror_entries),
             history_persistence_wired: false,
             log_writer: None,
+            notification_committer: None,
         };
         worker
             .session
@@ -9598,6 +9740,7 @@ mod build_summary_prompt_tests {
         availability: memory::backend::MemoryResidentSummaryAvailability,
         content: Option<String>,
         load_count: Arc<AtomicUsize>,
+        behavior_revision: Option<Arc<AtomicUsize>>,
     }
 
     impl WorkspaceClient for RestoreSubjectResidentClient {
@@ -9621,16 +9764,23 @@ mod build_summary_prompt_tests {
                 serde_json::from_str(request.body.as_deref().unwrap_or_default()).unwrap();
             assert!(matches!(
                 request.operation,
-                server_api::SubjektivMemoryBackendOperation::ResidentSummary(_)
+                server_api::SubjektivMemoryBackendOperation::ResidentContext(_)
             ));
             self.load_count.fetch_add(1, Ordering::SeqCst);
             Ok(WorkspaceResponse {
                 status: 200,
                 body: serde_json::to_string(
-                    &server_api::SubjektivMemoryBackendResponse::ResidentSummary(
-                        memory::backend::MemoryResidentSummaryOutput {
-                            availability: self.availability,
-                            content: self.content.clone(),
+                    &server_api::SubjektivMemoryBackendResponse::ResidentContext(
+                        server_api::SubjektivResidentContextOutput {
+                            behavior_md: "restore behavior".to_string(),
+                            behavior_revision: self
+                                .behavior_revision
+                                .as_ref()
+                                .map_or(1, |revision| revision.load(Ordering::SeqCst) as u64),
+                            memory_surface: memory::backend::MemoryResidentSummaryOutput {
+                                availability: self.availability,
+                                content: self.content.clone(),
+                            },
                         },
                     ),
                 )
@@ -9649,9 +9799,12 @@ mod build_summary_prompt_tests {
             availability,
             content: content.map(str::to_string),
             load_count: Arc::clone(&load_count),
+            behavior_revision: None,
         });
         let source = crate::feature::builtin::memory::ordinary_subjektiv_resident_summary_source(
-            manifest, client,
+            manifest,
+            client,
+            Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap())),
         )
         .unwrap()
         .unwrap();
@@ -10098,6 +10251,9 @@ mod build_summary_prompt_tests {
                     if matches!(entry.item, SystemItem::FeatureInvocationResult { .. }) =>
                 {
                     2
+                }
+                LogEntry::AnnotatedSystemItem { entry, .. } if matches!(&entry.item, SystemItem::Notification { message, .. } if message == "second") => {
+                    5
                 }
                 _ => 0,
             };
@@ -12675,9 +12831,10 @@ permission = "write"
             .unwrap()
             .to_string();
         assert!(
-            empty_boundary.contains("current ready resident memory surface is intentionally empty")
+            empty_boundary
+                .contains("current generated Memory surface is ready and intentionally empty")
         );
-        assert!(!empty_boundary.contains("No current ready resident memory surface"));
+        assert!(!empty_boundary.contains("No generated Memory surface exists yet"));
         drop(empty_restore);
 
         for availability in [
@@ -12729,7 +12886,22 @@ permission = "write"
                 .as_text()
                 .unwrap()
                 .to_string();
-            assert!(tombstone.contains("No current ready resident memory surface"));
+            let unavailable_message = match availability {
+                memory::backend::MemoryResidentSummaryAvailability::Ungenerated => {
+                    "No generated Memory surface exists yet"
+                }
+                memory::backend::MemoryResidentSummaryAvailability::Stale => {
+                    "generated Memory surface is stale"
+                }
+                memory::backend::MemoryResidentSummaryAvailability::Failed => {
+                    "Generation of the Memory surface failed"
+                }
+                memory::backend::MemoryResidentSummaryAvailability::Unavailable => {
+                    "Host could not fetch the Subject resident context"
+                }
+                memory::backend::MemoryResidentSummaryAvailability::Ready => unreachable!(),
+            };
+            assert!(tombstone.contains(unavailable_message));
             assert!(!tombstone.contains("latest subject surface"));
             assert!(!tombstone.contains("LEGACY_MEMORY_SENTINEL_MUST_NOT_REFRESH"));
             let entries = store.read_all(session_id, segment_id).unwrap();
@@ -13747,6 +13919,84 @@ permission = "write"
     }
 
     #[test]
+    fn notification_lost_acceptance_retry_after_restore_commits_once_not_by_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let handle = PendingSubmissionHandle::for_test(temp.path());
+        let source = "backend:orchestrator-attention";
+        let accept = |handle: &PendingSubmissionHandle<session_store::FsStore>, id: &str| {
+            handle
+                .accept_notification_from_source(
+                    id.into(),
+                    "Queued Tickets require attention".into(),
+                    source.into(),
+                    WorkerHistoryProvenance::BackendInstruction { operation_id: None },
+                )
+                .unwrap()
+        };
+        // The sender lost this acceptance response; the receipt is already durable.
+        assert!(accept(&handle, "attention-1"));
+        let restored_state: PendingActivationState = handle
+            .persisted_entries_for_test()
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                LogEntry::Extension {
+                    domain, payload, ..
+                } if domain == SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN => {
+                    Some(serde_json::from_value(payload.clone()).unwrap())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(restored_state.notification_receipts.len(), 1);
+        let handle = PendingSubmissionHandle {
+            state: Arc::new(Mutex::new(restored_state)),
+            writer: handle.writer.clone(),
+        };
+        assert!(!accept(&handle, "attention-1"));
+        let commit_batch = |handle: &PendingSubmissionHandle<session_store::FsStore>| {
+            let batch = handle.prepare_notification_batch();
+            let count = batch.len();
+            for (notification, identity) in batch {
+                handle
+                    .commit_notification(
+                        &identity,
+                        SystemItem::Notification {
+                            body: notification.message.clone(),
+                            message: notification.message,
+                            prompt_provenance: None,
+                        },
+                        Some(notification.provenance),
+                    )
+                    .unwrap();
+            }
+            count
+        };
+        assert_eq!(commit_batch(&handle), 1);
+        assert!(!accept(&handle, "attention-1"));
+        assert_eq!(commit_batch(&handle), 0);
+        let notification_count = |handle: &PendingSubmissionHandle<session_store::FsStore>| {
+            handle
+                .persisted_entries_for_test()
+                .iter()
+                .filter(|entry| {
+                    matches!(entry,
+                        LogEntry::AnnotatedSystemItem { entry, .. }
+                            if matches!(entry.item, SystemItem::Notification { .. })
+                    )
+                })
+                .count()
+        };
+        assert_eq!(notification_count(&handle), 1);
+        assert_eq!(handle.state.lock().unwrap().notification_receipts.len(), 1);
+        // Same body with a new logical ID is legitimate, not content-deduped.
+        assert!(accept(&handle, "attention-2"));
+        assert_eq!(commit_batch(&handle), 1);
+        assert_eq!(notification_count(&handle), 2);
+        assert_eq!(handle.state.lock().unwrap().notification_receipts.len(), 2);
+    }
+
+    #[test]
     fn notification_batch_preserves_fifo_order_and_notification_dedupes() {
         let temp = tempfile::tempdir().unwrap();
         let handle = PendingSubmissionHandle::for_test(temp.path());
@@ -13777,13 +14027,393 @@ permission = "write"
         assert_eq!(notifications.len(), 2);
         assert_eq!(notifications[0].0.message, "notice");
         assert_eq!(notifications[1].0.message, "second notice");
-        let committed_state: PendingActivationState =
-            serde_json::from_value(notifications[1].1.payload.clone()).unwrap();
+        for (notification, identity) in notifications {
+            handle
+                .commit_notification(
+                    &identity,
+                    SystemItem::Notification {
+                        body: notification.message.clone(),
+                        message: notification.message,
+                        prompt_provenance: None,
+                    },
+                    Some(notification.provenance),
+                )
+                .unwrap();
+        }
+        let committed_state = handle.state.lock().unwrap().clone();
         assert!(committed_state.pending_notifications.is_empty());
         assert!(committed_state.activating_notifications.is_empty());
-        handle.finish_notification_batch();
         let submission = handle.prepare_next_activation(None).unwrap().unwrap();
         assert!(matches!(submission, PendingActivation::Submission(_)));
+    }
+
+    #[test]
+    fn notification_commit_preserves_later_admission_and_completed_activation() {
+        let temp = tempfile::tempdir().unwrap();
+        let handle = PendingSubmissionHandle::for_test(temp.path());
+        handle
+            .accept_notification("first".into(), "first".into())
+            .unwrap();
+        let batch = handle.prepare_notification_batch();
+        // These transitions occur after staging but before the model boundary.
+        handle
+            .accept("submit-1".into(), vec![Segment::text("input")], false)
+            .unwrap();
+        let Some(PendingActivation::Submission(submission)) =
+            handle.prepare_next_activation(None).unwrap()
+        else {
+            panic!("expected submission")
+        };
+        handle.finish_activation(&submission.submission_id);
+        handle
+            .accept_notification("later".into(), "later".into())
+            .unwrap();
+        handle
+            .accept("submit-2".into(), vec![Segment::text("queued")], false)
+            .unwrap();
+        let (notification, identity) = &batch[0];
+        handle
+            .commit_notification(
+                identity,
+                SystemItem::Notification {
+                    body: notification.message.clone(),
+                    message: notification.message.clone(),
+                    prompt_provenance: None,
+                },
+                Some(notification.provenance.clone()),
+            )
+            .unwrap()
+            .unwrap();
+        let entries = handle.persisted_entries_for_test();
+        let LogEntry::AnnotatedSystemItem { extensions, .. } = entries.last().unwrap() else {
+            panic!("expected notification")
+        };
+        let checkpoint: PendingActivationState =
+            serde_json::from_value(extensions[0].payload.clone()).unwrap();
+        assert!(
+            checkpoint.activating.is_none(),
+            "must not revive completed submission"
+        );
+        assert!(checkpoint.activating_notifications.is_empty());
+        assert_eq!(checkpoint.pending_notifications.len(), 1);
+        assert_eq!(checkpoint.notification_receipts.len(), 2);
+        assert_eq!(checkpoint.pending.len(), 1);
+        assert_eq!(checkpoint.receipts.len(), 2);
+        assert_eq!(checkpoint.revision, handle.state.lock().unwrap().revision);
+        let restored = PendingSubmissionHandle {
+            state: Arc::new(Mutex::new(checkpoint)),
+            writer: handle.writer.clone(),
+        };
+        assert!(
+            !restored
+                .accept_notification("later".into(), "later".into())
+                .unwrap()
+        );
+        assert!(
+            restored
+                .accept("submit-2".into(), vec![Segment::text("queued")], false)
+                .unwrap()
+                .activation
+                .is_none()
+        );
+        // Stage a newer batch before a delayed completion/retry of the old one.
+        let later = restored.prepare_notification_batch();
+        assert_eq!(later.len(), 1);
+        assert!(
+            restored
+                .commit_notification(
+                    identity,
+                    SystemItem::Notification {
+                        body: notification.message.clone(),
+                        message: notification.message.clone(),
+                        prompt_provenance: None,
+                    },
+                    Some(notification.provenance.clone())
+                )
+                .unwrap()
+                .is_none(),
+            "retry must not duplicate durable notification"
+        );
+        assert_eq!(
+            restored
+                .state
+                .lock()
+                .unwrap()
+                .activating_notifications
+                .len(),
+            1,
+            "an old batch completion must not clear a concurrently staged notification"
+        );
+        assert_eq!(restored.persisted_entries_for_test().len(), entries.len());
+    }
+
+    #[tokio::test]
+    async fn notification_partial_drain_retries_only_uncommitted_entries() {
+        use agen::interceptor::{Interceptor, PendingHistoryAppendsContext};
+        let temp = tempfile::tempdir().unwrap();
+        let original = PendingSubmissionHandle::for_test(temp.path());
+        let store = FailRunTerminalStore {
+            inner: original.writer.store.clone(),
+            fail_run_terminal: Arc::new(AtomicBool::new(false)),
+            invocation_failure: Arc::new(AtomicUsize::new(5)),
+        };
+        let handle = PendingSubmissionHandle {
+            state: original.state.clone(),
+            writer: LogWriterHandle {
+                store: store.clone(),
+                state: original.writer.state.clone(),
+                sink: original.writer.sink.clone(),
+                in_flight: None,
+            },
+        };
+        let buffer = NotifyBuffer::new();
+        for message in ["first", "second"] {
+            handle
+                .accept_notification(message.into(), message.into())
+                .unwrap();
+        }
+        for (notification, identity) in handle.prepare_notification_batch() {
+            buffer.push_durable_notify(notification.message, notification.provenance, identity);
+        }
+        let history = Arc::new(Mutex::new(VecDeque::new()));
+        let interceptor = WorkerInterceptor::new_with_history_queue(
+            Arc::new(HookRegistryBuilder::new().build()),
+            None,
+            None,
+            buffer.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap())),
+            Some(Arc::new(handle.writer.clone())),
+            history.clone(),
+        )
+        .with_notification_committer(Some(Arc::new(handle.clone())));
+        assert!(
+            interceptor
+                .pending_history_appends(PendingHistoryAppendsContext {
+                    invocation: Default::default(),
+                    history: &[]
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            handle.state.lock().unwrap().activating_notifications.len(),
+            1
+        );
+        assert_eq!(history.lock().unwrap().len(), 1);
+        // New acceptance between failure and retry must survive both commits.
+        handle
+            .accept_notification("later".into(), "later".into())
+            .unwrap();
+        let appends = interceptor
+            .pending_history_appends(PendingHistoryAppendsContext {
+                invocation: Default::default(),
+                history: &[],
+            })
+            .await
+            .unwrap();
+        assert_eq!(appends.len(), 1);
+        assert_eq!(history.lock().unwrap().len(), 2);
+        let entries = original.persisted_entries_for_test();
+        assert_eq!(entries.iter().filter(|entry| matches!(entry, LogEntry::AnnotatedSystemItem { entry, .. } if matches!(entry.item, SystemItem::Notification { .. }))).count(), 2);
+        let LogEntry::AnnotatedSystemItem { extensions, .. } = entries.last().unwrap() else {
+            panic!("expected notification")
+        };
+        let checkpoint: PendingActivationState =
+            serde_json::from_value(extensions[0].payload.clone()).unwrap();
+        assert_eq!(checkpoint.notification_receipts.len(), 3);
+        assert_eq!(checkpoint.pending_notifications.len(), 1);
+        assert!(checkpoint.activating_notifications.is_empty());
+        assert!(buffer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn notification_partial_drain_preserves_live_and_restored_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = FailRunTerminalStore {
+            inner: session_store::FsStore::new(temp.path()).unwrap(),
+            fail_run_terminal: Arc::new(AtomicBool::new(false)),
+            invocation_failure: Arc::new(AtomicUsize::new(5)),
+        };
+        let client = PauseResumeClient {
+            calls: Arc::new(AtomicUsize::new(1)),
+        };
+        let mut worker = Worker::new(
+            minimal_manifest(),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(client.clone()),
+            store.clone(),
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        worker.attach_log_writer(Arc::new(worker.log_writer_handle()));
+        let pending = worker.pending_submission_handle();
+        for message in ["first", "second"] {
+            pending
+                .accept_notification(message.into(), message.into())
+                .unwrap();
+        }
+        for (notification, identity) in pending.prepare_notification_batch() {
+            worker.pending_notifies.push_durable_notify(
+                notification.message,
+                notification.provenance,
+                identity,
+            );
+        }
+        let result = worker
+            .run_for_notification(protocol::InvokeKind::Notify)
+            .await;
+        assert!(
+            matches!(result, Ok(WorkerRunResult::Interrupted { .. }) | Err(_)),
+            "{result:?}"
+        );
+        assert_eq!(
+            client.calls.load(Ordering::SeqCst),
+            1,
+            "failed drain must not call the provider"
+        );
+        let history = worker
+            .session
+            .history()
+            .entries()
+            .iter()
+            .find(|entry| {
+                entry
+                    .item
+                    .as_text()
+                    .is_some_and(|text| text.contains("first"))
+            })
+            .unwrap()
+            .clone();
+        worker
+            .run_for_notification(protocol::InvokeKind::Notify)
+            .await
+            .unwrap();
+        assert_eq!(client.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            worker
+                .session
+                .history()
+                .entries()
+                .iter()
+                .filter(|entry| entry.annotation.entry_id == history.annotation.entry_id)
+                .count(),
+            1
+        );
+        let entries = store
+            .read_all(worker.session_id(), worker.segment_id())
+            .unwrap();
+        let restored =
+            restore_history_entries(worker.session_id(), worker.segment_id(), &entries).unwrap();
+        assert_eq!(
+            restored
+                .iter()
+                .filter(|entry| entry.annotation.entry_id == history.annotation.entry_id)
+                .count(),
+            1
+        );
+        assert_eq!(entries.iter().filter(|entry| matches!(entry, LogEntry::AnnotatedSystemItem { entry, .. } if matches!(entry.item, SystemItem::Notification { .. }))).count(), 2);
+        assert!(
+            pending
+                .state
+                .lock()
+                .unwrap()
+                .activating_notifications
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn invocation_fence_suspends_automatic_notification_until_fresh_input() {
+        for scenario in ["failed", "unknown", "incomplete"] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = FailRunTerminalStore {
+                inner: session_store::FsStore::new(temp.path()).unwrap(),
+                fail_run_terminal: Arc::new(AtomicBool::new(false)),
+                invocation_failure: Arc::new(AtomicUsize::new(if scenario == "unknown" {
+                    2
+                } else {
+                    0
+                })),
+            };
+            let client = PauseResumeClient {
+                calls: Arc::new(AtomicUsize::new(1)),
+            };
+            let mut worker = Worker::new(
+                minimal_manifest(),
+                Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(client.clone()),
+                store,
+                WorkerWorkspaceContext::no_workspace(),
+                WorkerFilesystemAuthority::None,
+                Scope::empty(),
+            )
+            .await
+            .unwrap();
+            worker.attach_log_writer(Arc::new(worker.log_writer_handle()));
+            let effects = Arc::new(AtomicUsize::new(0));
+            install_recovery_invocation(&mut worker, effects.clone());
+            let pending = worker.pending_submission_handle();
+            pending
+                .accept_notification("held-notify".into(), "held notification".into())
+                .unwrap();
+            for (notification, identity) in pending.prepare_notification_batch() {
+                worker.pending_notifies.push_durable_notify(
+                    notification.message,
+                    notification.provenance,
+                    identity,
+                );
+            }
+            let mut input = recovery_invocation(scenario);
+            if scenario == "failed" {
+                let Segment::FeatureInvoke { invocation } = &mut input else {
+                    unreachable!()
+                };
+                invocation.name = "invalid-name".into();
+            }
+            if scenario == "incomplete" {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(20), worker.run(vec![input]))
+                        .await
+                        .is_err()
+                );
+            } else {
+                assert!(worker.run(vec![input]).await.is_err());
+            }
+            let before = worker.sink().subscribe_with_snapshot().0;
+            for _ in 0..4 {
+                assert!(!worker.can_schedule_notification_run(), "{scenario}");
+                assert!(
+                    worker
+                        .run_for_notification(protocol::InvokeKind::Notify)
+                        .await
+                        .is_err()
+                );
+            }
+            assert_eq!(
+                worker.sink().subscribe_with_snapshot().0.len(),
+                before.len()
+            );
+            assert_eq!(client.calls.load(Ordering::SeqCst), 1);
+            assert!(!worker.pending_notifies.is_empty());
+            assert_eq!(
+                effects.load(Ordering::SeqCst),
+                usize::from(scenario != "failed")
+            );
+            worker
+                .run(vec![Segment::text("explicit fresh input")])
+                .await
+                .unwrap();
+            assert!(worker.can_schedule_notification_run());
+            assert!(worker.pending_notifies.is_empty());
+            assert_eq!(client.calls.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                effects.load(Ordering::SeqCst),
+                usize::from(scenario != "failed"),
+                "no unknown effect retry"
+            );
+        }
     }
 
     #[derive(Clone)]
@@ -13886,6 +14516,300 @@ permission = "write"
                 .install_features(FeatureRegistryBuilder::new().with_module(feature))
                 .has_errors()
         );
+    }
+
+    #[derive(Clone)]
+    struct ResidentInvocationClient {
+        sink: Arc<Mutex<Option<SegmentLogSink>>>,
+        requests: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LlmClient for ResidentInvocationClient {
+        async fn stream(
+            &self,
+            request: agen::llm_client::Request,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<
+                                agen::llm_client::event::Event,
+                                agen::llm_client::ClientError,
+                            >,
+                        > + Send,
+                >,
+            >,
+            agen::llm_client::ClientError,
+        > {
+            let entries = self
+                .sink
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .subscribe_with_snapshot()
+                .0;
+            let preparation = entries
+                .iter()
+                .position(|entry| {
+                    matches!(entry,
+                        LogEntry::AnnotatedSystemItem { entry, .. }
+                            if matches!(entry.item, SystemItem::FeatureInvocationResult { .. })
+                    )
+                })
+                .expect("invocation result must be durable before the model request");
+            let behavior = entries
+                .iter()
+                .position(|entry| {
+                    matches!(entry,
+                        LogEntry::AnnotatedSystemItem { entry, .. }
+                            if matches!(entry.item, SystemItem::SubjectBehaviorRefresh { .. })
+                    )
+                })
+                .expect("Subject behavior refresh must be durable before the model request");
+            assert!(preparation < behavior);
+            let request = format!("{request:?}");
+            assert!(request.contains("prepared recovery context"));
+            assert!(request.contains("restore behavior"));
+            assert!(request.contains("literal /prepare()"));
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures::stream::iter([Ok(
+                agen::llm_client::event::Event::Status(agen::llm_client::event::StatusEvent {
+                    status: agen::llm_client::event::ResponseStatus::Completed,
+                }),
+            )])))
+        }
+
+        fn clone_boxed(&self) -> Box<dyn LlmClient> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn feature_invocation_and_subject_refresh_remain_append_only_across_restore_replay() {
+        let runtime = tempfile::tempdir().unwrap();
+        let _sandbox = worker_allocation::test_util::RuntimeDirSandbox::new(runtime.path());
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut manifest = minimal_manifest();
+        manifest.scope.allow[0].target = cwd.clone();
+        manifest.feature.subjektiv.profile.enabled = true;
+        manifest
+            .feature
+            .subjektiv
+            .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+                workspace_id: "workspace-test".into(),
+                settings_revision: 1,
+                language: "English".into(),
+            })
+            .unwrap();
+        let client = ResidentInvocationClient {
+            sink: Arc::default(),
+            requests: Arc::default(),
+        };
+        let mut engine =
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(client.clone());
+        engine.set_system_prompt("fixed initial system prompt");
+        let store = session_store::CombinedStore::new(
+            session_store::FsStore::new(dir.path().join("sessions")).unwrap(),
+            session_store::FsWorkerStore::new(dir.path().join("workers")).unwrap(),
+        );
+        let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
+        let mut original = Worker::new(
+            manifest.clone(),
+            engine,
+            store.clone(),
+            WorkerWorkspaceContext::no_workspace(),
+            authority.clone(),
+            Scope::writable(&cwd).unwrap(),
+        )
+        .await
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let behavior_revision = Arc::new(AtomicUsize::new(1));
+        let resident_source = || {
+            crate::feature::builtin::memory::ordinary_subjektiv_resident_summary_source(
+                &manifest,
+                Arc::new(RestoreSubjectResidentClient {
+                    availability: memory::backend::MemoryResidentSummaryAvailability::Ready,
+                    content: Some("literal /prepare()".into()),
+                    load_count: Arc::default(),
+                    behavior_revision: Some(behavior_revision.clone()),
+                }),
+                Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap())),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        original.attach_log_writer(Arc::new(original.log_writer_handle()));
+        let source = resident_source();
+        let report = original.install_features(
+            FeatureRegistryBuilder::new()
+                .with_module(RecoveryInvocationFeature {
+                    calls: calls.clone(),
+                    sink: original.sink(),
+                })
+                .with_module(
+                    crate::feature::builtin::memory::SubjektivResidentRestoreRefreshFeature::new(
+                        source.clone(),
+                        original.prompts(),
+                        "workspace-test",
+                    ),
+                ),
+        );
+        assert!(!report.has_errors(), "{report:?}");
+        original.install_system_prompt_contribution(Some(source), None);
+        original.set_system_prompt_template(
+            SystemPromptTemplate::parse(
+                "default",
+                crate::prompt::source::PromptCatalogSource::builtins_only(),
+            )
+            .unwrap(),
+        );
+        original.materialize_durable_session_head().await.unwrap();
+        behavior_revision.store(2, Ordering::SeqCst);
+        *client.sink.lock().unwrap() = Some(original.sink());
+        let pending = original.pending_submission_handle();
+        pending
+            .accept_notification(
+                "composed-notify".into(),
+                "resident context notification".into(),
+            )
+            .unwrap();
+        for (notification, extension) in pending.prepare_notification_batch() {
+            original.pending_notifies.push_durable_notify(
+                notification.message,
+                notification.provenance,
+                extension,
+            );
+        }
+        let input = vec![recovery_invocation("composed")];
+        pending
+            .accept("composed-submit".into(), input.clone(), false)
+            .unwrap();
+        let Some(PendingActivation::Submission(submission)) =
+            pending.prepare_next_activation(None).unwrap()
+        else {
+            panic!("expected submission")
+        };
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        let result = original
+            .run_with_input_extensions_and_commit_hook(
+                submission.input,
+                vec![pending.activation_extension()],
+                submission.provenance,
+                crate::controller::input_committed_hook(
+                    pending.clone(),
+                    submission.submission_id,
+                    sender,
+                ),
+            )
+            .await
+            .unwrap();
+        // No Controller receiver was polled while the invocation/refresh ran.
+        assert!(receiver.try_recv().is_ok());
+        assert!(pending.state.lock().unwrap().activating.is_none());
+        assert_eq!(
+            client.requests.load(Ordering::SeqCst),
+            1,
+            "{result:?}; history={:?}",
+            original.history()
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "resident text must not invoke a handler"
+        );
+        let history_before = original.history().to_vec();
+        let session_id = original.session_id();
+        let segment_id = original.segment_id();
+        drop(original);
+
+        let mut restored =
+            Worker::<Box<dyn LlmClient>, _>::restore_from_manifest_with_context_and_model_client(
+                session_id,
+                segment_id,
+                manifest.clone(),
+                store,
+                crate::prompt::source::PromptCatalogSource::builtins_only(),
+                WorkerWorkspaceContext::no_workspace(),
+                authority,
+                Some(Box::new(client.clone())),
+            )
+            .await
+            .unwrap();
+        restored.attach_log_writer(Arc::new(restored.log_writer_handle()));
+        assert!(
+            restored
+                .pending_submission_handle()
+                .prepare_next_activation(None)
+                .unwrap()
+                .is_none(),
+            "notification/invocation checkpoints must not resurrect committed input after restore"
+        );
+        assert_eq!(
+            restored
+                .session
+                .pending_activations
+                .lock()
+                .unwrap()
+                .invocation_receipts
+                .len(),
+            1
+        );
+        assert_eq!(
+            restored
+                .session
+                .pending_activations
+                .lock()
+                .unwrap()
+                .notification_receipts
+                .len(),
+            1
+        );
+        let source = resident_source();
+        let report = restored.install_features(
+            FeatureRegistryBuilder::new()
+                .with_module(RecoveryInvocationFeature {
+                    calls: calls.clone(),
+                    sink: restored.sink(),
+                })
+                .with_module(
+                    crate::feature::builtin::memory::SubjektivResidentRestoreRefreshFeature::new(
+                        source.clone(),
+                        restored.prompts(),
+                        "workspace-test",
+                    ),
+                ),
+        );
+        assert!(!report.has_errors(), "{report:?}");
+        restored.install_system_prompt_contribution(Some(source), None);
+        *client.sink.lock().unwrap() = Some(restored.sink());
+        restored.run(input).await.unwrap();
+        assert_eq!(client.requests.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "restore/replay must not repeat the business effect"
+        );
+        assert_eq!(&restored.history()[..history_before.len()], history_before);
+        let entries = restored.sink().subscribe_with_snapshot().0;
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| matches!(entry,
+                    LogEntry::AnnotatedSystemItem { entry, .. }
+                        if matches!(entry.item, SystemItem::FeatureInvocationResult { .. })
+                ))
+                .count(),
+            2 // Explicit replay displays the cached result; it does not repeat the effect.
+        );
+        assert!(entries.iter().any(|entry| matches!(entry,
+            LogEntry::AnnotatedSystemItem { entry, .. }
+                if matches!(entry.item, SystemItem::ResidentSummaryRefresh { .. })
+        )));
     }
 
     #[tokio::test]

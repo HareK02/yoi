@@ -21,9 +21,9 @@ use wip_protocol::{
 
 use crate::permission::permission_action_for;
 use crate::wip::{
-    WipCallContext, WipDynamicItem, WipDynamicItemResolver, WipDynamicMount, WipFeatureRoute,
-    WipMountError, WipMountRegistry, WipOperationError, WipOperationHandler, WipOperationOutput,
-    WipProjection, WipProjectionKind, json_to_wip, wip_to_json,
+    WipCallContext, WipDynamicItem, WipDynamicItemResolver, WipDynamicMount, WipMountError,
+    WipMountRegistry, WipNamespaceRoute, WipOperationError, WipOperationHandler,
+    WipOperationOutput, WipProjection, WipProjectionKind, json_to_wip, wip_to_json,
 };
 use crate::worker::{WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod};
 
@@ -551,9 +551,9 @@ pub fn mount_workspace_http_objective_wip(
     registry: &mut WipMountRegistry,
     client: Arc<dyn WorkspaceClient>,
     permissions: Option<ToolPermissionConfig>,
-    feature_route: &WipFeatureRoute,
+    namespace_route: &WipNamespaceRoute,
 ) -> Result<(), WipMountError> {
-    let collection_route = feature_route.child("objectives")?;
+    let collection_route = namespace_route.root().to_string();
     let backend = WorkspaceHttpObjectiveBackend::new(client);
     let revisions = Arc::new(Mutex::new(ObjectiveRevisionState::default()));
     let collection_descriptor = objective_collection_descriptor();
@@ -1775,7 +1775,9 @@ mod tests {
         }));
 
         let mut registry = WipMountRegistry::new();
-        let feature_route = registry.allocate_feature_route("objective").unwrap();
+        let namespace_route = registry
+            .allocate_namespace("objective", "objectives")
+            .unwrap();
         mount_workspace_http_objective_wip(
             &mut registry,
             Arc::new(crate::worker::TestWorkspaceHttpClient::new(
@@ -1783,18 +1785,16 @@ mod tests {
                 "http://backend",
             )),
             None,
-            &feature_route,
+            &namespace_route,
         )
         .unwrap();
-        assert_eq!(
-            registry.routes().collect::<Vec<_>>(),
-            ["/features/objective/objectives"]
+        assert_eq!(registry.routes().collect::<Vec<_>>(), ["/objectives"]);
+        assert_eq!(namespace_route.root(), "/objectives");
+        assert!(
+            registry
+                .allocate_namespace("objective", "../tickets")
+                .is_err()
         );
-        assert_eq!(
-            feature_route.child("objectives").unwrap(),
-            "/features/objective/objectives"
-        );
-        assert!(feature_route.child("../tickets").is_err());
     }
 
     #[test]
@@ -1805,7 +1805,7 @@ mod tests {
                 crate::worker::TestWorkspaceHttpClient::new("workspace", "http://backend"),
             )),
             permissions: None,
-            collection_route: "/features/objective/objectives".into(),
+            collection_route: "/objectives".into(),
             revisions: Arc::clone(&revisions),
         };
         let initial = resolver.resolve("O-3").unwrap();
@@ -1971,7 +1971,7 @@ mod tests {
         let collection = ObjectiveCollectionWipHandler {
             backend,
             permissions: None,
-            collection_route: "/features/objective/objectives".into(),
+            collection_route: "/objectives".into(),
             revisions: Arc::new(Mutex::new(ObjectiveRevisionState::default())),
         };
         let result = collection
@@ -2013,7 +2013,7 @@ mod tests {
         let collection = ObjectiveCollectionWipHandler {
             backend: backend.clone(),
             permissions: None,
-            collection_route: "/features/objective/objectives".into(),
+            collection_route: "/objectives".into(),
             revisions: Arc::clone(&revisions),
         };
         let context = || WipCallContext {
@@ -2170,7 +2170,7 @@ mod tests {
                 crate::worker::TestWorkspaceHttpClient::new("workspace", base_url),
             )),
             permissions: None,
-            collection_route: "/features/objective/objectives".into(),
+            collection_route: "/objectives".into(),
             revisions: Arc::new(Mutex::new(ObjectiveRevisionState::default())),
         };
         let output = match handler
@@ -2191,10 +2191,7 @@ mod tests {
         let output = crate::wip::wip_to_json(&output.value).unwrap();
         assert_eq!(output["next_cursor"], "next-page");
         assert_eq!(output["has_more"], true);
-        assert_eq!(
-            output["objectives"][0]["path"],
-            "/features/objective/objectives/O-3"
-        );
+        assert_eq!(output["objectives"][0]["path"], "/objectives/O-3");
         assert_eq!(output["objectives"][0]["linked_tickets"][0], "T-7");
         assert!(!output.to_string().contains("00001OBJECTIVE"));
         assert!(!output.to_string().contains("00001TICKET"));
@@ -2243,7 +2240,7 @@ mod tests {
         let resolver = ObjectiveItemResolver {
             backend: backend.clone(),
             permissions: None,
-            collection_route: "/features/objective/objectives".into(),
+            collection_route: "/objectives".into(),
             revisions: Arc::clone(&revisions),
         };
         let before = resolver.resolve("O-3").unwrap().object.validator;

@@ -190,8 +190,14 @@ impl_openapi_schema!(
     WorkingDirectoryListResponse,
     WorkingDirectoryDetailResponse,
     WorkingDirectoryCreateResponse,
+    CurrentWorkerWorkdirCatalogQuery,
+    CurrentWorkerWorkdirCatalogResponse,
     CurrentWorkerWorkdirAttachRequest,
     CurrentWorkerWorkdirAttachmentResponse,
+    CurrentWorkerWorkdirAttachmentItem,
+    CurrentWorkerWorkdirAttachmentListQuery,
+    CurrentWorkerWorkdirAttachmentListResponse,
+    CurrentWorkerWorkdirDetachQuery,
     CurrentWorkerWorkdirOperationRequest,
     CurrentWorkerWorkdirOperationResponse,
     ExternalWorkdirGrantCreateRequest,
@@ -237,6 +243,7 @@ impl_openapi_schema!(
     MemoryConsolidateStagingRequest,
     MemoryConsolidationResponse,
     SubjektivSubjectCreateRequest,
+    SubjektivSubjectBehaviorUpdateRequest,
     SubjektivSubjectListQuery,
     SubjektivSubjectListResponse,
     SubjektivSubjectResponse,
@@ -1162,6 +1169,20 @@ pub trait ServerApi {
         &self,
         #[path] workspace_id: String,
         #[path] subject_id: String,
+    ) -> Result<SubjektivSubjectResponse, RepositoryApiError>;
+    #[patch(
+        "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/behavior",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        bearer_auth = true,
+        browser_auth = true,
+    )]
+    async fn subjektiv_subject_behavior_update(
+        &self,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+        #[body] request: SubjektivSubjectBehaviorUpdateRequest,
     ) -> Result<SubjektivSubjectResponse, RepositoryApiError>;
     #[get(
         "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/surface",
@@ -2549,6 +2570,32 @@ pub trait ServerApi {
         #[path] working_directory_id: String,
         #[body] request: WorkingDirectoryRemovalRequest,
     ) -> Result<WorkingDirectoryRemovalResponse, RepositoryApiError>;
+    #[get(
+        "/api/w/{workspace_id}/workers/self/workdir-catalog",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        openapi = false,
+    )]
+    async fn current_worker_workdir_catalog(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[query] query: CurrentWorkerWorkdirCatalogQuery,
+    ) -> Result<CurrentWorkerWorkdirCatalogResponse, RepositoryApiError>;
+    #[get(
+        "/api/w/{workspace_id}/workers/self/workdir-attachments",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        openapi = false,
+    )]
+    async fn current_worker_workdir_attachment_list(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[query] query: CurrentWorkerWorkdirAttachmentListQuery,
+    ) -> Result<CurrentWorkerWorkdirAttachmentListResponse, RepositoryApiError>;
     #[post(
         "/api/w/{workspace_id}/workers/self/workdir-attachments",
         status = 200,
@@ -2574,6 +2621,7 @@ pub trait ServerApi {
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] alias: String,
+        #[query] query: CurrentWorkerWorkdirDetachQuery,
     ) -> Result<CurrentWorkerWorkdirAttachmentResponse, RepositoryApiError>;
     #[post(
         "/api/w/{workspace_id}/workers/self/workdir-session/operations",
@@ -4579,9 +4627,20 @@ pub enum SubjektivSubjectState {
 #[serde(deny_unknown_fields)]
 pub struct SubjektivSubjectCreateRequest {
     pub role: String,
+    #[serde(default)]
+    pub behavior_md: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSubjectBehaviorUpdateRequest {
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub expected_behavior_revision: u64,
+    pub behavior_md: String,
 }
 
 pub const SUBJEKTIV_BROWSER_MAX_LIST_LIMIT: usize = 100;
+pub const SUBJEKTIV_MAX_BEHAVIOR_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -4609,6 +4668,9 @@ pub struct SubjektivSubjectListResponse {
 pub struct SubjektivSubjectResponse {
     pub id: String,
     pub role: String,
+    pub behavior_md: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub behavior_revision: u64,
     pub state: SubjektivSubjectState,
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub store_revision: u64,
@@ -5443,9 +5505,21 @@ pub struct SubjektivSurfaceFailureResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivResidentContextOutput {
+    /// Exact user-managed document. Empty means explicitly unset.
+    pub behavior_md: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub behavior_revision: u64,
+    /// Independently-fresh generated Memory projection.
+    pub memory_surface: memory::backend::MemoryResidentSummaryOutput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "operation", content = "input", rename_all = "snake_case")]
 pub enum SubjektivMemoryBackendOperation {
     ResidentSummary(memory::backend::MemoryResidentSummaryOperation),
+    ResidentContext(memory::backend::MemoryResidentSummaryOperation),
     Query(SubjektivMemoryQueryRequest),
     Read(SubjektivMemoryReadRequest),
     ListRevisions(SubjektivMemoryListRevisionsRequest),
@@ -5618,6 +5692,7 @@ pub struct SubjektivMemoryStageExplicitResponse {
 #[serde(tag = "result", content = "data", rename_all = "snake_case")]
 pub enum SubjektivMemoryBackendResponse {
     ResidentSummary(memory::backend::MemoryResidentSummaryOutput),
+    ResidentContext(SubjektivResidentContextOutput),
     Query(SubjektivMemoryQueryResponse),
     Read(SubjektivMemoryReadResponse),
     ListRevisions(SubjektivMemoryListRevisionsResponse),
@@ -6752,6 +6827,69 @@ pub struct HostWorkerListResponse {
 pub struct CurrentWorkerWorkdirAttachRequest {
     pub alias: String,
     pub working_directory_id: String,
+}
+
+/// Stable Workdir-ID keyset paging over the authoritative inventory, not a Runtime snapshot.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentWorkerWorkdirCatalogQuery {
+    /// Defaults to 50; valid range is 1..=100 scanned registry records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Exclusive stable Workdir ID. An empty policy-filtered page can still have a next cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentWorkerWorkdirCatalogResponse {
+    pub workspace_id: String,
+    pub items: Vec<WorkingDirectorySummary>,
+    pub next_cursor: Option<String>,
+    /// Opaque digest of the complete authoritative inventory and its occupancy.
+    pub revision: String,
+}
+
+/// Bounded, alias-ordered paging over the current Worker's active attachments.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentWorkerWorkdirAttachmentListQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
+    /// Exact caller-scoped connection lookup, applied before paging; 1..=128 bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentWorkerWorkdirAttachmentItem {
+    pub alias: String,
+    pub working_directory_id: String,
+    pub capabilities: workdir::WorkdirSessionCapabilities,
+    /// Opaque durable identity of this attachment lifetime, not a Workdir ID.
+    pub connection_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentWorkerWorkdirAttachmentListResponse {
+    pub workspace_id: String,
+    pub items: Vec<CurrentWorkerWorkdirAttachmentItem>,
+    pub next_offset: Option<u32>,
+    /// Opaque digest of this caller's complete active connection set, independent of query paging/filtering.
+    pub revision: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentWorkerWorkdirDetachQuery {
+    /// When omitted, retain the normal Tool's unconditional detach contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_connection_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -9869,9 +10007,11 @@ pub fn memory_api_typescript() -> String {
     // `ts-rs` solely for this read-only projection.
     let subjektiv_browser_declarations = r#"export type SubjektivSubjectState = "active" | "retired";
 
-export type SubjektivSubjectCreateRequest = { role: string, };
+export type SubjektivSubjectCreateRequest = { role: string, behavior_md?: string, };
 
-export type SubjektivSubjectResponse = { id: string, role: string, state: SubjektivSubjectState, store_revision: number, created_at: string, updated_at: string, current_worker?: | import("./worker-launch-api").WorkerLaunchWorkerSummary | null, };
+export type SubjektivSubjectBehaviorUpdateRequest = { expected_behavior_revision: number, behavior_md: string, };
+
+export type SubjektivSubjectResponse = { id: string, role: string, behavior_md: string, behavior_revision: number, state: SubjektivSubjectState, store_revision: number, created_at: string, updated_at: string, current_worker?: | import("./worker-launch-api").WorkerLaunchWorkerSummary | null, };
 
 export type SubjektivSubjectListResponse = { limit: number, items: Array<SubjektivSubjectResponse>, next_cursor?: string | null, has_more: boolean, };
 
@@ -9904,8 +10044,11 @@ export type SubjektivMemoryListRevisionsResponse = { memory_id: string, current_
     let limits = format!(
         "export const MEMORY_API_LIMITS = {{\n  maxResponseBytes: {MEMORY_API_MAX_RESPONSE_BYTES},\n  maxDocumentBytes: {MEMORY_API_MAX_DOCUMENT_BYTES},\n  maxCollectionItems: {MEMORY_API_MAX_COLLECTION_ITEMS},\n  maxStringBytes: {MEMORY_API_MAX_STRING_BYTES},\n  maxIdentifierBytes: {MEMORY_API_MAX_IDENTIFIER_BYTES},\n}} as const;"
     );
+    let subjektiv_limits = format!(
+        "export const SUBJEKTIV_API_LIMITS = {{\n  maxBehaviorBytes: {SUBJEKTIV_MAX_BEHAVIOR_BYTES},\n}} as const;"
+    );
     format!(
-        "// Generated from server-api. Do not edit by hand.\n// Regenerate: cargo run -q -p server-api --features typescript --example generate_memory_api_types > web/workspace/src/lib/generated/memory-api.ts\n\n{limits}\n\n{}\n\n{subjektiv_browser_declarations}\n",
+        "// Generated from server-api. Do not edit by hand.\n// Regenerate: cargo run -q -p server-api --features typescript --example generate_memory_api_types > web/workspace/src/lib/generated/memory-api.ts\n\n{limits}\n\n{subjektiv_limits}\n\n{}\n\n{subjektiv_browser_declarations}\n",
         declarations
             .into_iter()
             .map(|declaration| format!("export {declaration}"))
@@ -11939,6 +12082,135 @@ mod tests {
     }
 
     #[test]
+    fn current_worker_attachment_contract_keeps_normal_tool_response_closed() {
+        let lookup = CurrentWorkerWorkdirAttachmentListQuery {
+            limit: Some(1),
+            offset: None,
+            connection_id: Some("opaque-connection".to_string()),
+        };
+        let value = serde_json::json!({"limit": 1, "connection_id": "opaque-connection"});
+        assert_eq!(serde_json::to_value(&lookup).unwrap(), value);
+        assert_eq!(
+            serde_json::from_value::<CurrentWorkerWorkdirAttachmentListQuery>(value).unwrap(),
+            lookup
+        );
+        assert_eq!(
+            serde_json::to_value(CurrentWorkerWorkdirAttachmentListQuery::default()).unwrap(),
+            serde_json::json!({})
+        );
+        assert!(
+            serde_json::from_value::<CurrentWorkerWorkdirAttachmentListQuery>(
+                serde_json::json!({"connection_id": 123})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CurrentWorkerWorkdirAttachmentListQuery>(
+                serde_json::json!({"expected_connection_id": "wrong-field"})
+            )
+            .is_err()
+        );
+        let query: CurrentWorkerWorkdirDetachQuery =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(query.expected_connection_id, None);
+        assert_eq!(serde_json::to_value(query).unwrap(), serde_json::json!({}));
+        assert!(
+            serde_json::from_value::<CurrentWorkerWorkdirDetachQuery>(
+                serde_json::json!({"connection_id":"wrong-field"})
+            )
+            .is_err()
+        );
+        let response = CurrentWorkerWorkdirAttachmentResponse {
+            workspace_id: "workspace".to_string(),
+            alias: "checkout".to_string(),
+            working_directory_id: "workdir".to_string(),
+            capabilities: workdir::WorkdirSessionCapabilities::EMPTY,
+            attached: false,
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 5);
+        assert!(value.get("connection_id").is_none());
+        assert_eq!(
+            serde_json::from_value::<CurrentWorkerWorkdirAttachmentResponse>(value).unwrap(),
+            response
+        );
+        let list = CurrentWorkerWorkdirAttachmentListResponse {
+            workspace_id: "workspace".to_string(),
+            revision: "opaque-revision".to_string(),
+            next_offset: Some(1),
+            items: vec![CurrentWorkerWorkdirAttachmentItem {
+                alias: "checkout".to_string(),
+                working_directory_id: "workdir".to_string(),
+                capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+                connection_id: "opaque".to_string(),
+            }],
+        };
+        assert_eq!(
+            serde_json::from_value::<CurrentWorkerWorkdirAttachmentListResponse>(
+                serde_json::to_value(&list).unwrap()
+            )
+            .unwrap(),
+            list
+        );
+    }
+
+    #[test]
+    fn current_worker_workdir_catalog_contract_is_bounded_and_revision_is_required() {
+        let query = CurrentWorkerWorkdirCatalogQuery {
+            limit: Some(100),
+            cursor: Some("stable-id".to_string()),
+        };
+        assert_eq!(
+            serde_json::from_value::<CurrentWorkerWorkdirCatalogQuery>(
+                serde_json::to_value(&query).unwrap()
+            )
+            .unwrap(),
+            query
+        );
+        assert_eq!(
+            serde_json::to_value(CurrentWorkerWorkdirCatalogQuery::default()).unwrap(),
+            serde_json::json!({})
+        );
+        assert!(
+            serde_json::from_value::<CurrentWorkerWorkdirCatalogQuery>(
+                serde_json::json!({"offset": 0})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CurrentWorkerWorkdirCatalogQuery>(
+                serde_json::json!({"limit": -1})
+            )
+            .is_err()
+        );
+        let response = CurrentWorkerWorkdirCatalogResponse {
+            workspace_id: "workspace".to_string(),
+            items: Vec::new(),
+            next_cursor: Some("scanned-legacy-row".to_string()),
+            revision: "opaque".to_string(),
+        };
+        assert_eq!(
+            serde_json::from_value::<CurrentWorkerWorkdirCatalogResponse>(
+                serde_json::to_value(&response).unwrap()
+            )
+            .unwrap(),
+            response
+        );
+        assert!(
+            serde_json::from_value::<CurrentWorkerWorkdirCatalogResponse>(
+                serde_json::json!({"workspace_id": "workspace", "items": [], "next_cursor": null})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CurrentWorkerWorkdirAttachmentListResponse>(
+                serde_json::json!({"workspace_id": "workspace", "items": [], "next_offset": null})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn workspace_and_repository_response_shapes_round_trip() {
         let workspace = serde_json::json!({
             "workspace_id": "workspace-test",
@@ -12942,6 +13214,8 @@ mod openapi_artifact_tests {
         // identity, or a one-use Reviewer capability. They remain generated Rust client/Axum
         // operations, but must not appear as unauthenticated operations in the public OpenAPI.
         const SIGNED_INTERNAL: &[&str] = &[
+            "current_worker_workdir_catalog",
+            "current_worker_workdir_attachment_list",
             "current_worker_workdir_attach",
             "current_worker_workdir_detach",
             "current_worker_workdir_operation",

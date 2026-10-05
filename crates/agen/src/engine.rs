@@ -626,6 +626,10 @@ pub struct Engine<C: LlmClient, S: EngineState = Mutable, A: Send + Sync = ()> {
     /// engine history. An error rejects the item and aborts the turn, allowing
     /// upper layers to make durable storage the commit gate.
     history_append_cbs: Vec<Box<dyn Fn(&Item) -> Result<(), String> + Send + Sync>>,
+    /// Durable host commit gate for image-result corrections. Runs before the
+    /// correction becomes live or a replacement request can be sent.
+    image_rejection_handler:
+        Option<Box<dyn Fn(&HistoryEntry<A>, &Item) -> Result<(), String> + Send + Sync>>,
     /// Request configuration (max_tokens, temperature, etc.)
     request_config: RequestConfig,
     /// Cancel notification channel (for interrupting execution)
@@ -969,6 +973,16 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         callback: impl Fn(&Item) -> Result<(), String> + Send + Sync + 'static,
     ) {
         self.history_append_cbs.push(Box::new(callback));
+    }
+
+    /// Set the host's durable commit gate for correcting a rejected ViewImage
+    /// result. The original annotation/identity must be preserved. A failed
+    /// commit leaves both history and the outgoing request untouched.
+    pub fn set_image_rejection_handler(
+        &mut self,
+        handler: impl Fn(&HistoryEntry<A>, &Item) -> Result<(), String> + Send + Sync + 'static,
+    ) {
+        self.image_rejection_handler = Some(Box::new(handler));
     }
 
     fn emit_history_append(&self, item: &Item) -> Result<(), EngineError> {
@@ -3205,7 +3219,34 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
             "Sending request to LLM"
         );
 
-        let stream = self.open_stream_with_retry(request, turn, llm_call).await?;
+        let mut request = request;
+        let stream = loop {
+            match self
+                .open_stream_with_retry(request.clone(), turn, llm_call)
+                .await
+            {
+                Ok(stream) => break stream,
+                Err(EngineError::Client(error)) if error.is_image_size_rejection() => {
+                    let Some((history_index, request_index)) =
+                        crate::image_recovery::largest_candidate(history, &request)
+                    else {
+                        return Err(EngineError::Client(error));
+                    };
+                    let entry = &history.entries()[history_index];
+                    let replacement = crate::image_recovery::rejected_result(&entry.item);
+                    if let Some(commit) = &self.image_rejection_handler {
+                        commit(entry, &replacement).map_err(EngineError::HistoryAppend)?;
+                    }
+                    history.entries_mut()[history_index].item = replacement.clone();
+                    // Rebuild the provider request from the corrected projection,
+                    // retaining prior prune/interceptor decisions. No tool runs
+                    // or assistant output have occurred for this failed request.
+                    request.items[request_index] = replacement;
+                    self.emit_warning(crate::image_recovery::REJECTION_MESSAGE);
+                }
+                Err(error) => return Err(error),
+            }
+        };
         self.tool_call_collector.begin_response();
         let mut stream = ResponseStreamPump::start(stream);
         let mut early_tools: Option<EarlyToolExecutionBatch> = None;
@@ -3567,6 +3608,7 @@ impl<C: LlmClient, A: Send + Sync> Engine<C, Mutable, A> {
             warning_cbs: Vec::new(),
             tool_result_cbs: Vec::new(),
             history_append_cbs: Vec::new(),
+            image_rejection_handler: None,
             request_config: RequestConfig::default(),
             cancel_tx,
             cancel_rx,
@@ -3856,6 +3898,7 @@ impl<C: LlmClient, A: Send + Sync> Engine<C, Mutable, A> {
             warning_cbs: self.warning_cbs,
             tool_result_cbs: self.tool_result_cbs,
             history_append_cbs: self.history_append_cbs,
+            image_rejection_handler: self.image_rejection_handler,
             request_config: self.request_config,
 
             cancel_tx: self.cancel_tx,
@@ -4040,6 +4083,7 @@ impl<C: LlmClient, A: Send + Sync> Engine<C, Locked, A> {
             warning_cbs: self.warning_cbs,
             tool_result_cbs: self.tool_result_cbs,
             history_append_cbs: self.history_append_cbs,
+            image_rejection_handler: self.image_rejection_handler,
             request_config: self.request_config,
 
             cancel_tx: self.cancel_tx,

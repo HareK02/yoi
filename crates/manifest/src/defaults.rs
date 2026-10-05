@@ -6,6 +6,10 @@
 //! `pub const`. Both paths read from this module, so changing a
 //! default requires editing exactly one line.
 
+/// Read-only Repository/Workdir/attachment reference discovery in WIP mode.
+/// This enables a reference provider, not normal Tools or any authority grant.
+pub const WORKDIR_CATALOG_ENABLED: bool = true;
+
 /// Byte-size cap applied to any tool's `content` output when no
 /// per-tool override is set. See [`crate::ToolOutputLimits`].
 pub const TOOL_OUTPUT_MAX_BYTES: usize = 64 * 1024;

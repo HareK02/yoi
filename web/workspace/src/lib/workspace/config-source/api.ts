@@ -11,6 +11,9 @@ import type {
 } from "./types.ts";
 
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+// Schema bodies are documents, not short metadata. Keep them within the
+// response budget; readJson also bounds the combined bundle and contributions.
+const MAX_SCHEMA_SOURCE_BYTES = MAX_RESPONSE_BYTES;
 const MAX_ERROR_BYTES = 4 * 1024;
 const MAX_ENTRY_COUNT = 256;
 const MAX_ENTRY_BYTES = 256 * 1024;
@@ -193,7 +196,7 @@ function parseContribution(value: unknown): ConfigSchemaContribution {
     provider_id: boundedString(item.provider_id),
     namespace: boundedString(item.namespace),
     version: boundedString(item.version),
-    source: boundedString(item.source),
+    source: boundedString(item.source, MAX_SCHEMA_SOURCE_BYTES),
     ...(projection === undefined ? {} : { projection_validator: projection }),
     source_digest: boundedString(item.source_digest, MAX_DIGEST_BYTES),
   };
@@ -203,7 +206,7 @@ function parseSchemaBundle(value: unknown): WorkspaceConfigSchemaBundle {
   const item = record(value, ["contributions", "source", "fingerprint"]);
   return {
     contributions: boundedArray(item.contributions).map(parseContribution),
-    source: boundedString(item.source),
+    source: boundedString(item.source, MAX_SCHEMA_SOURCE_BYTES),
     fingerprint: boundedString(item.fingerprint, MAX_DIGEST_BYTES),
   };
 }

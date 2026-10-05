@@ -121,6 +121,7 @@ impl SegmentLogSink {
                 | LogEntry::AnnotatedUserInput { .. }
                 | LogEntry::AnnotatedAssistantItem { .. }
                 | LogEntry::AnnotatedToolResult { .. }
+                | LogEntry::ToolResultCorrected { .. }
                 | LogEntry::AnnotatedSystemItem { .. }
                 | LogEntry::Invoke { .. }
                 | LogEntry::RunYielded { .. }

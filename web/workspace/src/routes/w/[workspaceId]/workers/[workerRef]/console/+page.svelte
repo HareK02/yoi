@@ -1859,45 +1859,6 @@
 </svelte:head>
 
 <div class="console-shell worker-console-shell">
-    <section class="console-header card" aria-label="Worker controls">
-        <WorkerContextStatus metadata={selectedConsoleProjection.workerMetadata} />
-        <div class="console-header-actions">
-            <div
-                class="console-view-modes"
-                role="group"
-                aria-label="Console display mode"
-            >
-                <button
-                    type="button"
-                    class:active={consoleViewMode === "overview"}
-                    aria-pressed={consoleViewMode === "overview"}
-                    onclick={() => (consoleViewMode = "overview")}
-                >
-                    Overview
-                </button>
-                <button
-                    type="button"
-                    class:active={consoleViewMode === "normal"}
-                    aria-pressed={consoleViewMode === "normal"}
-                    onclick={() => (consoleViewMode = "normal")}
-                >
-                    Normal
-                </button>
-            </div>
-            <button
-                type="button"
-                class="secondary-button"
-                aria-expanded={workerDetailsOpen}
-                onclick={() => {
-                    workerDetailsOpen = !workerDetailsOpen;
-                    if (workerDetailsOpen) taskPaneOpen = false;
-                }}
-            >
-                Details
-            </button>
-        </div>
-    </section>
-
     {#if rewindTargets.length > 0}
         <section class="card rewind-targets" aria-label="Rewind targets">
             <h3>Rewind targets</h3>
@@ -2324,6 +2285,28 @@
             </div>
         </div>
     </form>
+    <WorkerContextStatus
+        metadata={selectedConsoleProjection.workerMetadata}
+        detailsOpen={workerDetailsOpen}
+        onToggleDetails={() => {
+            workerDetailsOpen = !workerDetailsOpen;
+            if (workerDetailsOpen) taskPaneOpen = false;
+        }}
+    >
+        {#snippet controls()}
+            <button
+                type="button"
+                class="console-view-toggle"
+                role="switch"
+                aria-checked={consoleViewMode === "overview"}
+                title="On: Overview · Off: Normal"
+                onclick={() => (consoleViewMode = consoleViewMode === "overview" ? "normal" : "overview")}
+            >
+                <span class="console-view-toggle-track" aria-hidden="true"></span>
+                <span>Overview</span>
+            </button>
+        {/snippet}
+    </WorkerContextStatus>
 </div>
 
 <style>
@@ -2349,14 +2332,6 @@
         overscroll-behavior: contain;
     }
 
-    .console-header {
-        display: flex;
-        min-width: 0;
-        align-items: center;
-        justify-content: space-between;
-        gap: var(--space-4);
-    }
-
     .console-card {
         display: grid;
         align-content: start;
@@ -2364,46 +2339,59 @@
         min-height: 100%;
     }
 
-    .console-header-actions {
-        display: flex;
+    .console-view-toggle {
+        display: inline-flex;
         flex: 0 0 auto;
         align-items: center;
-        justify-content: flex-end;
-        flex-wrap: wrap;
-        gap: var(--space-2);
-    }
-
-    .console-view-modes {
-        display: inline-flex;
-        overflow: hidden;
-        border: 1px solid var(--line);
-        border-radius: 0.55rem;
-        background: var(--bg-raised);
-    }
-
-    .console-view-modes button {
+        gap: var(--space-1);
+        min-height: var(--space-5);
+        padding: 0;
         border: 0;
+        border-radius: var(--space-1);
         background: transparent;
         color: var(--text-muted);
-        padding: var(--space-1) var(--space-2);
-        font: inherit;
+        font-family: var(--font-sans);
         font-size: var(--font-size-compact);
         line-height: var(--line-height-compact);
-        font-weight: 700;
+        font-weight: 400;
         cursor: pointer;
     }
 
-    .console-view-modes button + button {
-        border-left: 1px solid var(--line);
-    }
-
-    .console-view-modes button:hover {
+    .console-view-toggle:hover {
         color: var(--text-strong);
     }
 
-    .console-view-modes button.active {
-        background: var(--accent);
-        color: var(--bg);
+    .console-view-toggle:focus-visible {
+        outline: 1px solid var(--text-strong);
+        outline-offset: -1px;
+    }
+
+    .console-view-toggle-track {
+        position: relative;
+        flex: 0 0 auto;
+        width: 24px;
+        height: 14px;
+        border-radius: 999px;
+        background: var(--line-strong);
+    }
+
+    .console-view-toggle-track::before {
+        content: "";
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: var(--bg);
+    }
+
+    .console-view-toggle[aria-checked="true"] .console-view-toggle-track {
+        background: var(--accent-muted);
+    }
+
+    .console-view-toggle[aria-checked="true"] .console-view-toggle-track::before {
+        transform: translateX(10px);
     }
 
     .rewind-targets {
@@ -2906,15 +2894,6 @@
         .console-history.with-task-pane {
             grid-template-columns: minmax(0, 1fr);
             grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
-        }
-
-        .console-header {
-            align-items: stretch;
-            flex-direction: column;
-        }
-
-        .console-header-actions {
-            align-self: flex-end;
         }
     }
 </style>
