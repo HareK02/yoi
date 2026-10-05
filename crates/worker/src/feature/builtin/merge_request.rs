@@ -5,9 +5,9 @@ use crate::feature::{
 };
 use crate::permission::permission_action_for;
 use crate::wip::{
-    WipCallContext, WipDynamicItem, WipDynamicItemResolver, WipDynamicMount, WipFeatureRoute,
-    WipMountError, WipMountRegistry, WipOperationError, WipOperationHandler, WipOperationOutput,
-    WipProjection, WipProjectionKind, json_to_wip, wip_to_json,
+    WipCallContext, WipDynamicItem, WipDynamicItemResolver, WipDynamicMount, WipMountError,
+    WipMountRegistry, WipNamespaceRoute, WipOperationError, WipOperationHandler,
+    WipOperationOutput, WipProjection, WipProjectionKind, json_to_wip, wip_to_json,
 };
 use crate::worker::{WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod};
 use agen::tool::{Tool, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
@@ -529,7 +529,7 @@ fn native_merge_request_tools(
             let (meta, tool) = definition(client.clone(), kind)();
             jsonschema::validator_for(&meta.input_schema).map_err(|error| {
                 WipMountError::InvalidProjection {
-                    route: "/features/merge-request/merge-requests".into(),
+                    route: "/merge-requests".into(),
                     message: format!("Merge Request tool schema cannot be retained: {error}"),
                 }
             })?;
@@ -562,9 +562,9 @@ pub fn mount_workspace_http_merge_request_wip(
     client: Arc<dyn WorkspaceClient>,
     config: MergeRequestFeatureConfig,
     permissions: Option<ToolPermissionConfig>,
-    feature_route: &WipFeatureRoute,
+    namespace_route: &WipNamespaceRoute,
 ) -> Result<(), WipMountError> {
-    let collection_route = feature_route.child("merge-requests")?;
+    let collection_route = namespace_route.root().to_string();
     let tools = native_merge_request_tools(client, config)?;
     let claimed_tools = tools
         .iter()
@@ -1049,7 +1049,7 @@ fn merge_request_operation_declaration(
         .get("properties")
         .and_then(Value::as_object)
         .ok_or_else(|| WipMountError::InvalidProjection {
-            route: "/features/merge-request/merge-requests".into(),
+            route: "/merge-requests".into(),
             message: format!(
                 "Merge Request tool `{}` schema has no properties",
                 tool.name
@@ -1474,7 +1474,9 @@ mod tests {
     #[test]
     fn native_mount_uses_host_route_and_accepts_only_one_canonical_item_segment() {
         let mut registry = WipMountRegistry::new();
-        let feature_route = registry.allocate_feature_route("merge-request").unwrap();
+        let namespace_route = registry
+            .allocate_namespace("merge-request", "merge-requests")
+            .unwrap();
         mount_workspace_http_merge_request_wip(
             &mut registry,
             Arc::new(TestWorkspaceHttpClient::new("workspace", "http://unused")),
@@ -1484,17 +1486,14 @@ mod tests {
                 ..Default::default()
             },
             None,
-            &feature_route,
+            &namespace_route,
         )
         .unwrap();
-        assert_eq!(
-            registry.routes().collect::<Vec<_>>(),
-            ["/features/merge-request/merge-requests"]
-        );
+        assert_eq!(registry.routes().collect::<Vec<_>>(), ["/merge-requests"]);
         let resolver = MergeRequestItemResolver {
             tools: HashMap::new(),
             permissions: None,
-            collection_route: "/features/merge-request/merge-requests".into(),
+            collection_route: "/merge-requests".into(),
             revisions: Arc::new(Mutex::new(MergeRequestRevisionState::default())),
         };
         assert!(
@@ -1645,7 +1644,7 @@ mod tests {
         let resolver = MergeRequestItemResolver {
             tools: HashMap::new(),
             permissions: None,
-            collection_route: "/features/merge-request/merge-requests".into(),
+            collection_route: "/merge-requests".into(),
             revisions: Arc::clone(&revisions),
         };
         let first = resolver.resolve("MR-1").unwrap().object.validator;

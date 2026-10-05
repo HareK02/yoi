@@ -1593,12 +1593,12 @@ where
         let engine = worker.engine_mut();
 
         if feature_config.merge_request.any() && wip_mode {
-            let feature_route = wip_mount_registry
-                .allocate_feature_route("merge-request")
+            let namespace_route = wip_mount_registry
+                .allocate_namespace("merge-request", "merge-requests")
                 .map_err(|error| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        format!("allocate Merge Request WIP route: {error}"),
+                        format!("allocate Merge Request WIP namespace: {error}"),
                     )
                 })?;
             crate::feature::builtin::merge_request::mount_workspace_http_merge_request_wip(
@@ -1606,7 +1606,7 @@ where
                 workspace_client.clone(),
                 feature_config.merge_request,
                 wip_permissions.clone(),
-                &feature_route,
+                &namespace_route,
             )
             .map_err(|error| {
                 std::io::Error::new(
@@ -1623,12 +1623,12 @@ where
                 intake: feature_config.ticket.intake,
                 workflow: feature_config.ticket.workflow,
             };
-            let feature_route = wip_mount_registry
-                .allocate_feature_route("ticket")
+            let namespace_route = wip_mount_registry
+                .allocate_namespace("ticket", "tickets")
                 .map_err(|error| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        format!("allocate Ticket WIP route: {error}"),
+                        format!("allocate Ticket WIP namespace: {error}"),
                     )
                 })?;
             crate::feature::builtin::ticket::mount_workspace_http_ticket_wip(
@@ -1636,7 +1636,7 @@ where
                 workspace_client.clone(),
                 ticket_access,
                 wip_permissions.clone(),
-                &feature_route,
+                &namespace_route,
             )
             .map_err(|error| {
                 std::io::Error::new(
@@ -1657,19 +1657,19 @@ where
                     engine.register_tool(definition);
                 }
                 if wip_mode {
-                    let feature_route = wip_mount_registry
-                        .allocate_feature_route("objective")
+                    let namespace_route = wip_mount_registry
+                        .allocate_namespace("objective", "objectives")
                         .map_err(|error| {
                             std::io::Error::new(
                                 std::io::ErrorKind::InvalidInput,
-                                format!("allocate Objective WIP route: {error}"),
+                                format!("allocate Objective WIP namespace: {error}"),
                             )
                         })?;
                     crate::feature::builtin::objective::mount_workspace_http_objective_wip(
                         &mut wip_mount_registry,
                         workspace_client.clone(),
                         wip_permissions.clone(),
-                        &feature_route,
+                        &namespace_route,
                     )
                     .map_err(|error| {
                         std::io::Error::new(

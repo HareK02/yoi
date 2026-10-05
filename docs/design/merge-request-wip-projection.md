@@ -4,12 +4,14 @@
 
 When a Worker explicitly runs in `wip` mode and its Merge Request Feature has at least one enabled operation, the Worker Host projects that exact operation set as native Worldspace objects. The projection is an adapter over the existing scoped Workspace Merge Request tools and Backend routes. It does not create a second Merge Request store, provider integration path, review grant, approval rule, or completion authority.
 
-The Host allocates `/features/merge-request` and the Feature mounts:
+The Host assigns the Merge Request provider the root `merge-requests` namespace through `WipMountRegistry` and mounts:
 
 ```text
-/features/merge-request/merge-requests
-/features/merge-request/merge-requests/<merge-request-id>
+/merge-requests
+/merge-requests/<merge-request-id>
 ```
+
+There is no Feature Object or `/features/merge-request` compatibility alias. Legacy paths remain historical display data only and fail as current input with rediscovery guidance.
 
 An item identity is a single canonical path segment. Nested paths and percent-encoded target substitution do not resolve. Item operations remove `merge_request_id` from their descriptor and reconstruct it only from the selected object route. Discovery does not mint authority: every call still uses the Worker's scoped `WorkspaceClient`, the enabled Feature flags, ordinary Tool permission rules, and the Backend's Workspace, repository, assignment, provider-ref, review, and integration checks.
 

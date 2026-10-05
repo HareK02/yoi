@@ -52,21 +52,36 @@ The interface descriptor uses WIP `Json` for compatibility input and includes th
 
 ## Native projection extension and collisions
 
-`worker::wip::WipMountRegistry` is the Host-owned mount allocator. A Feature can independently construct a `WipProjection` with an async `WipOperationHandler`, then pass its aggregate registry through `install_wip_mode_with_mounts` before compatibility finalization. A Feature first requests a Host-owned `/features/<feature>` namespace with `allocate_feature_route`; checked direct-child joins prevent a Feature from claiming an ambient global route.
+`worker::wip::WipMountRegistry` is the Host-owned namespace, Object, and operation registry. A provider requests a root namespace with `allocate_namespace(owner, namespace)`; the owner is retained as Host metadata and is not inserted into the public path. It then mounts the collection Object directly at `/<namespace>` and may install a bounded direct-child resolver. Features do not appear as intermediate Objects.
 
-- Routes must be canonical absolute WIP paths.
+Object resolution and operations are separate contracts. One mounted `WipProjection` owns a static Object route and its initial operations. Another Feature may add operations with `contribute_operations` without replacing that Object. Dynamic families likewise keep one `WipDynamicItemResolver`, while `contribute_dynamic_operations` supplies disjoint handlers for every resolved item without a second resolver. The Host merges only contributions with the same interface format, documentation, and type declarations; duplicate operation names, inconsistent interfaces/validators, missing targets, duplicate namespace owners, and unrelated route claims fail deterministically at registration. The merged interface validator changes with the effective operation set, so stale Known Space cannot authorize a newly contributed operation.
+
+- Routes must be canonical absolute WIP paths, and allocated namespaces are one lowercase root segment.
 - Object names must match the final route segment.
-- A projected object exposes exactly its declared interface.
-- Unrelated duplicate routes and conflicting interface descriptors or validators fail startup.
+- Object existence and resolution have one owner; operation contributors cannot remount or substitute the Object.
+- Multiple Features may contribute disjoint operations to the same Object interface.
+- Unrelated duplicate routes, duplicate operation names, and conflicting interface shapes fail startup.
 - A bounded dynamic mount may resolve exactly one item segment below an already mounted native collection; deeper paths never fall through to the resolver.
 - A native projection replaces a compatibility projection either by the original same-route semantic capability or by an explicit registry capability claim owned by a mounted native route.
 - Conflicting native claims fail startup. When native is selected, the claimed compatibility tool is hidden rather than exposed through a second entry. Normal Tool mode is unaffected because it does not install the WIP registry.
 
-`WipInspect` renders the complete descriptor, including descriptor-local named declarations and recursive record, list, enum, and union shapes with required flags and declaration documentation. The unit samples `mount_collision_and_native_replacement_are_explicit` and `native_projection_preserves_descriptor_and_decodes_typed_arguments_end_to_end` demonstrate independent native registration, deterministic replacement, collision rejection, complete descriptor inspection, and a descriptor-typed native invocation.
+`WipInspect` renders the complete effective descriptor, including contributed operations, descriptor-local named declarations, and recursive record, list, enum, and union shapes with required flags and declaration documentation. The tests `host_namespace_object_resolution_and_operation_contributions_are_independent`, `operation_contributions_reject_interface_and_target_conflicts`, and `native_projection_preserves_descriptor_and_decodes_typed_arguments_end_to_end` demonstrate root allocation, unique resolution, contribution merging, collision rejection, current call-time authorization, complete descriptor inspection, and descriptor-typed invocation.
+
+The built-in native route migration is:
+
+| Historical route | Canonical route |
+| --- | --- |
+| `/features/ticket/tickets[/<reference>]` | `/tickets[/<reference>]` |
+| `/features/objective/objectives[/<reference>]` | `/objectives[/<reference>]` |
+| `/features/merge-request/merge-requests[/<reference>]` | `/merge-requests[/<reference>]` |
+
+`/repositories` and `/workdirs` are reserved for a later provider using the same registration contract; this layer does not implement those domains. `/checkouts` content projection is likewise outside this contract.
 
 ## Authority and execution
 
-Discovery is not authority. The Worldspace contains only the tools already registered from enabled Features and the Worker's current execution context. Calling a compatibility operation:
+Discovery is not authority. Object publication, operation implementation, target capability, and subject permission are independent checks. An Object may remain discoverable through an enabled read provider when a management Feature contributes no operations; conversely, publishing an operation never bypasses the target's current capability or the subject's current permission. Every handler re-evaluates permission at call time, so revocation after discovery is rejected before provider dispatch. Feature enablement selects implementations and does not itself grant read or mutation authority.
+
+The Worldspace contains only the operations registered from enabled Features and the Worker's current execution context. Calling a compatibility operation:
 
 1. resolves the exact mounted route;
 2. verifies object and interface membership and validators;
@@ -84,6 +99,8 @@ Pre/post Engine history still records one bounded `WipCall` result, while the co
 The stateful `wip-client::Client` is owned by one Worker WIP runtime. Sessions are keyed by the canonical endpoint and an opaque security-context identity derived by the Host from Workspace, Worker, and session identity. Authentication credentials are not included in that identity and are never emitted to descriptors, tool output, or history.
 
 Known Space and interface observations are therefore not shared across Workers, endpoints, or security contexts. A restored Worker creates a new runtime/client and must explore again. `WipDiscover(reset = true)` drops all observations before reconnect/authority-change exploration; `refresh = true` explicitly supersedes one cached observation. A normal compaction keeps the live runtime but the three gateway schemas are supplied again on every LLM request, including the instruction to begin discovery at `/`; the compacted transcript is not treated as cache authority.
+
+Saved Session/history entries remain append-only evidence and are never rewritten or replayed as calls. In particular, historical `/features/<feature>/...` text stays displayable but is not a current route alias. Passing such a legacy path to discovery or call returns `NotFound` with guidance to rediscover from `/`; the Host does not translate it, resolve it under another namespace, or expose old and new routes in parallel.
 
 ## Errors, cancellation, and retries
 

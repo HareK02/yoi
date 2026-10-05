@@ -68,6 +68,14 @@ pub enum WipMountError {
     RouteCollision { route: String, existing: String },
     #[error("WIP interface `{interface}` has conflicting descriptors")]
     InterfaceCollision { interface: String },
+    #[error("WIP operation `{operation}` on `{route}` is already contributed by `{existing}`")]
+    OperationCollision {
+        route: String,
+        operation: String,
+        existing: String,
+    },
+    #[error("WIP operation contribution target `{route}` is not a mounted Object")]
+    OperationTargetNotFound { route: String },
     #[error("invalid WIP projection for `{route}`: {message}")]
     InvalidProjection { route: String, message: String },
 }
@@ -139,9 +147,21 @@ pub struct WipProjection {
     pub handler: Arc<dyn WipOperationHandler>,
 }
 
-/// One dynamically resolved direct-child object beneath a Feature-owned
-/// collection route. The Host retains route allocation and descriptor authority;
-/// the Feature only binds a validated child segment to an object and handler.
+/// An additional Feature's operations for an Object whose existence and route
+/// are already owned by the Host registry. Contributions may extend the mounted
+/// interface, but cannot replace Object resolution or another operation.
+#[derive(Clone)]
+pub struct WipOperationContribution {
+    pub route: String,
+    pub contributor: String,
+    pub interface: String,
+    pub descriptor: InterfaceDescriptor,
+    pub handler: Arc<dyn WipOperationHandler>,
+}
+
+/// One dynamically resolved direct-child object beneath a Host-owned collection
+/// route. Object resolution stays unique; operation contribution is independent
+/// for statically mounted Objects and can be extended without remounting them.
 pub struct WipDynamicItem {
     pub object: Object,
     pub handler: Arc<dyn WipOperationHandler>,
@@ -160,43 +180,89 @@ pub struct WipDynamicMount {
     pub resolver: Arc<dyn WipDynamicItemResolver>,
 }
 
+pub trait WipDynamicOperationResolver: Send + Sync {
+    fn handler(&self, item_reference: &str) -> Arc<dyn WipOperationHandler>;
+}
+
+pub struct WipDynamicOperationContribution {
+    pub collection_route: String,
+    pub contributor: String,
+    pub interface: String,
+    pub descriptor: InterfaceDescriptor,
+    pub resolver: Arc<dyn WipDynamicOperationResolver>,
+}
+
+struct MountedDynamicOperationContribution {
+    contributor: String,
+    operations: Vec<String>,
+    resolver: Arc<dyn WipDynamicOperationResolver>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WipFeatureRoute {
+pub struct WipNamespaceRoute {
     root: String,
 }
 
-impl WipFeatureRoute {
+impl WipNamespaceRoute {
     pub fn root(&self) -> &str {
         &self.root
-    }
-
-    pub fn child(&self, segment: &str) -> Result<String, WipMountError> {
-        if segment.is_empty()
-            || segment == "."
-            || segment == ".."
-            || segment.contains('/')
-            || !segment
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        {
-            return Err(WipMountError::InvalidRoute {
-                route: format!("{}/{}", self.root, segment),
-                message: "Feature child must be one canonical path segment".into(),
-            });
-        }
-        Ok(format!("{}/{}", self.root, segment))
     }
 }
 
 struct MountedProjection {
     projection: WipProjection,
+    operation_handlers: BTreeMap<String, (String, Arc<dyn WipOperationHandler>)>,
+}
+
+impl MountedProjection {
+    fn resolved(&self) -> WipProjection {
+        let mut projection = self.projection.clone();
+        projection.handler = Arc::new(OperationDispatchHandler {
+            handlers: self
+                .operation_handlers
+                .iter()
+                .map(|(operation, (_, handler))| (operation.clone(), Arc::clone(handler)))
+                .collect(),
+        });
+        projection
+    }
+}
+
+struct OperationDispatchHandler {
+    handlers: BTreeMap<String, Arc<dyn WipOperationHandler>>,
+}
+
+#[async_trait]
+impl WipOperationHandler for OperationDispatchHandler {
+    async fn call(
+        &self,
+        operation: &str,
+        arguments: &BTreeMap<String, Value>,
+        context: WipCallContext,
+    ) -> Result<WipOperationOutput, WipOperationError> {
+        let handler = self.handlers.get(operation).ok_or_else(|| {
+            WipOperationError::Protocol(protocol_error(
+                ProtocolErrorCode::OperationNotFound,
+                "operation is not published by the selected interface",
+            ))
+        })?;
+        handler.call(operation, arguments, context).await
+    }
+
+    async fn cancel(&self, context: &ToolExecutionContext) -> Result<(), ToolError> {
+        for handler in self.handlers.values() {
+            handler.cancel(context).await?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default)]
 pub struct WipMountRegistry {
     mounts: BTreeMap<String, MountedProjection>,
     dynamic_mounts: Vec<WipDynamicMount>,
-    feature_routes: BTreeSet<String>,
+    dynamic_operation_contributions: BTreeMap<String, Vec<MountedDynamicOperationContribution>>,
+    namespaces: BTreeMap<String, String>,
     replaced_compatibility_capabilities: BTreeMap<String, String>,
 }
 
@@ -205,30 +271,57 @@ impl WipMountRegistry {
         Self::default()
     }
 
-    /// Allocate the Host namespace owned by one enabled Feature. Features join
-    /// checked relative segments to this route instead of selecting global paths.
-    pub fn allocate_feature_route(
+    /// Allocate one Host-owned root namespace to its unique Object provider.
+    /// The provider identity is registry metadata, never a public path segment.
+    pub fn allocate_namespace(
         &mut self,
-        feature: &str,
-    ) -> Result<WipFeatureRoute, WipMountError> {
-        if feature.is_empty()
-            || !feature
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        {
+        owner: &str,
+        namespace: &str,
+    ) -> Result<WipNamespaceRoute, WipMountError> {
+        let valid_segment = |value: &str| {
+            !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        };
+        if !valid_segment(owner) {
             return Err(WipMountError::InvalidRoute {
-                route: format!("/features/{feature}"),
-                message: "Feature name must use lowercase ASCII letters, digits, or '-'".into(),
+                route: format!("/{namespace}"),
+                message: "namespace owner must use lowercase ASCII letters, digits, or '-'".into(),
             });
         }
-        let root = format!("/features/{feature}");
-        if !self.feature_routes.insert(root.clone()) {
+        if !valid_segment(namespace) {
+            return Err(WipMountError::InvalidRoute {
+                route: format!("/{namespace}"),
+                message: "root namespace must be one lowercase ASCII path segment".into(),
+            });
+        }
+        if matches!(namespace, "features" | "tools") {
+            return Err(WipMountError::InvalidRoute {
+                route: format!("/{namespace}"),
+                message: "the Host reserves this root namespace".into(),
+            });
+        }
+        let root = format!("/{namespace}");
+        if let Some(existing) = self.namespaces.get(&root) {
             return Err(WipMountError::RouteCollision {
                 route: root,
-                existing: format!("feature:{feature}"),
+                existing: format!("namespace owner `{existing}`"),
             });
         }
-        Ok(WipFeatureRoute { root })
+        if self.mounts.contains_key(&root)
+            || self
+                .mounts
+                .keys()
+                .any(|route| route.starts_with(&format!("{root}/")))
+        {
+            return Err(WipMountError::RouteCollision {
+                route: root,
+                existing: "already mounted route".into(),
+            });
+        }
+        self.namespaces.insert(root.clone(), owner.to_string());
+        Ok(WipNamespaceRoute { root })
     }
 
     pub fn mount(
@@ -236,6 +329,30 @@ impl WipMountRegistry {
         projection: WipProjection,
     ) -> Result<WipMountDisposition, WipMountError> {
         validate_projection(&projection)?;
+        if projection.kind == WipProjectionKind::Native
+            && !projection.route.starts_with(&format!("{WIP_TOOLS_ROOT}/"))
+        {
+            let namespace_root = projection
+                .route
+                .strip_prefix('/')
+                .and_then(|path| path.split('/').next())
+                .map(|segment| format!("/{segment}"))
+                .unwrap_or_default();
+            let Some(owner) = self.namespaces.get(&namespace_root) else {
+                return Err(WipMountError::InvalidProjection {
+                    route: projection.route,
+                    message: "native Object route requires an allocated Host namespace".into(),
+                });
+            };
+            if projection.capability.split(':').next() != Some(owner.as_str()) {
+                return Err(WipMountError::InvalidProjection {
+                    route: projection.route,
+                    message: format!(
+                        "native Object capability does not belong to namespace owner `{owner}`"
+                    ),
+                });
+            }
+        }
         if self.dynamic_mounts.iter().any(|dynamic| {
             projection
                 .route
@@ -256,8 +373,15 @@ impl WipMountRegistry {
             match (existing.projection.kind, projection.kind) {
                 (WipProjectionKind::Compatibility, WipProjectionKind::Native) => {
                     self.ensure_interface_available(&projection, Some(&existing.projection.route))?;
-                    self.mounts
-                        .insert(projection.route.clone(), MountedProjection { projection });
+                    let operation_handlers =
+                        operation_handlers(&projection, &projection.capability);
+                    self.mounts.insert(
+                        projection.route.clone(),
+                        MountedProjection {
+                            projection,
+                            operation_handlers,
+                        },
+                    );
                     return Ok(WipMountDisposition::ReplacedCompatibility);
                 }
                 (WipProjectionKind::Native, WipProjectionKind::Compatibility) => {
@@ -273,8 +397,97 @@ impl WipMountRegistry {
         }
         self.ensure_interface_available(&projection, None)?;
         let route = projection.route.clone();
-        self.mounts.insert(route, MountedProjection { projection });
+        let operation_handlers = operation_handlers(&projection, &projection.capability);
+        self.mounts.insert(
+            route,
+            MountedProjection {
+                projection,
+                operation_handlers,
+            },
+        );
         Ok(WipMountDisposition::Mounted)
+    }
+
+    /// Add operations from another Feature without changing Object ownership or
+    /// resolution. Interface shape and operation names are global protocol
+    /// contracts, so incompatible declarations fail at registration time.
+    pub fn contribute_operations(
+        &mut self,
+        contribution: WipOperationContribution,
+    ) -> Result<(), WipMountError> {
+        contribution
+            .descriptor
+            .validate()
+            .map_err(|error| WipMountError::InvalidProjection {
+                route: contribution.route.clone(),
+                message: error.to_string(),
+            })?;
+        let Some(mounted) = self.mounts.get(&contribution.route) else {
+            return Err(WipMountError::OperationTargetNotFound {
+                route: contribution.route,
+            });
+        };
+        if mounted.projection.interface != contribution.interface {
+            return Err(WipMountError::InterfaceCollision {
+                interface: contribution.interface,
+            });
+        }
+        if !same_interface_shape(&mounted.projection.descriptor, &contribution.descriptor) {
+            return Err(WipMountError::InterfaceCollision {
+                interface: contribution.interface,
+            });
+        }
+        for operation in &contribution.descriptor.operations {
+            if let Some((existing, _)) = mounted.operation_handlers.get(&operation.name) {
+                return Err(WipMountError::OperationCollision {
+                    route: contribution.route,
+                    operation: operation.name.clone(),
+                    existing: existing.clone(),
+                });
+            }
+        }
+
+        let mut merged = mounted.projection.descriptor.clone();
+        merged
+            .operations
+            .extend(contribution.descriptor.operations.iter().cloned());
+        merged
+            .operations
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        merged
+            .validate()
+            .map_err(|error| WipMountError::InvalidProjection {
+                route: contribution.route.clone(),
+                message: error.to_string(),
+            })?;
+        if self.interface_conflicts(
+            &contribution.interface,
+            &merged,
+            Some(&descriptor_validator(&merged)),
+            Some(&contribution.route),
+        ) {
+            return Err(WipMountError::InterfaceCollision {
+                interface: contribution.interface,
+            });
+        }
+
+        let mounted = self
+            .mounts
+            .get_mut(&contribution.route)
+            .expect("operation contribution target was checked");
+        for operation in contribution.descriptor.operations {
+            mounted.operation_handlers.insert(
+                operation.name,
+                (
+                    contribution.contributor.clone(),
+                    Arc::clone(&contribution.handler),
+                ),
+            );
+        }
+        mounted.projection.descriptor = merged;
+        mounted.projection.interface_validator =
+            Some(descriptor_validator(&mounted.projection.descriptor));
+        Ok(())
     }
 
     /// Mount a one-segment item family below an already mounted collection.
@@ -342,6 +555,128 @@ impl WipMountRegistry {
         }
         self.dynamic_mounts.push(mount);
         Ok(())
+    }
+
+    /// Add operations to every item resolved by one existing dynamic Object
+    /// family. The family keeps exactly one Object resolver; each Feature only
+    /// supplies handlers for its own disjoint operation names.
+    pub fn contribute_dynamic_operations(
+        &mut self,
+        contribution: WipDynamicOperationContribution,
+    ) -> Result<(), WipMountError> {
+        contribution
+            .descriptor
+            .validate()
+            .map_err(|error| WipMountError::InvalidProjection {
+                route: contribution.collection_route.clone(),
+                message: error.to_string(),
+            })?;
+        let Some(index) = self
+            .dynamic_mounts
+            .iter()
+            .position(|mount| mount.collection_route == contribution.collection_route)
+        else {
+            return Err(WipMountError::OperationTargetNotFound {
+                route: contribution.collection_route,
+            });
+        };
+        let mounted = &self.dynamic_mounts[index];
+        if mounted.interface != contribution.interface
+            || !same_interface_shape(&mounted.descriptor, &contribution.descriptor)
+        {
+            return Err(WipMountError::InterfaceCollision {
+                interface: contribution.interface,
+            });
+        }
+        for operation in &contribution.descriptor.operations {
+            if mounted
+                .descriptor
+                .operations
+                .iter()
+                .any(|existing| existing.name == operation.name)
+            {
+                let existing = self
+                    .dynamic_operation_contributions
+                    .get(&contribution.collection_route)
+                    .and_then(|contributions| {
+                        contributions.iter().find(|existing| {
+                            existing
+                                .operations
+                                .iter()
+                                .any(|name| name == &operation.name)
+                        })
+                    })
+                    .map(|existing| existing.contributor.clone())
+                    .unwrap_or_else(|| mounted.capability.clone());
+                return Err(WipMountError::OperationCollision {
+                    route: contribution.collection_route,
+                    operation: operation.name.clone(),
+                    existing,
+                });
+            }
+        }
+        let mut merged = mounted.descriptor.clone();
+        merged
+            .operations
+            .extend(contribution.descriptor.operations.iter().cloned());
+        merged
+            .operations
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        merged
+            .validate()
+            .map_err(|error| WipMountError::InvalidProjection {
+                route: contribution.collection_route.clone(),
+                message: error.to_string(),
+            })?;
+        let validator = descriptor_validator(&merged);
+        let conflicts_static = self.registry_interface_conflicts_static(
+            &contribution.interface,
+            &merged,
+            Some(&validator),
+        );
+        let conflicts_dynamic = self.dynamic_mounts.iter().any(|other| {
+            other.collection_route != contribution.collection_route
+                && other.interface == contribution.interface
+                && (other.descriptor != merged
+                    || other.interface_validator.as_deref() != Some(validator.as_slice()))
+        });
+        if conflicts_static || conflicts_dynamic {
+            return Err(WipMountError::InterfaceCollision {
+                interface: contribution.interface,
+            });
+        }
+
+        let operations = contribution
+            .descriptor
+            .operations
+            .into_iter()
+            .map(|operation| operation.name)
+            .collect();
+        let mounted = &mut self.dynamic_mounts[index];
+        mounted.descriptor = merged;
+        mounted.interface_validator = Some(validator);
+        self.dynamic_operation_contributions
+            .entry(contribution.collection_route)
+            .or_default()
+            .push(MountedDynamicOperationContribution {
+                contributor: contribution.contributor,
+                operations,
+                resolver: contribution.resolver,
+            });
+        Ok(())
+    }
+
+    fn registry_interface_conflicts_static(
+        &self,
+        interface: &str,
+        descriptor: &InterfaceDescriptor,
+        validator: Option<&[u8]>,
+    ) -> bool {
+        self.mounts.values().any(|mounted| {
+            mounted.projection.interface == interface
+                && (mounted.projection.descriptor != *descriptor
+                    || mounted.projection.interface_validator.as_deref() != validator)
+        })
     }
 
     /// Declare ordinary tool capabilities fully represented by native mounts.
@@ -433,6 +768,35 @@ impl WipMountRegistry {
     }
 }
 
+fn operation_handlers(
+    projection: &WipProjection,
+    contributor: &str,
+) -> BTreeMap<String, (String, Arc<dyn WipOperationHandler>)> {
+    projection
+        .descriptor
+        .operations
+        .iter()
+        .map(|operation| {
+            (
+                operation.name.clone(),
+                (contributor.to_string(), Arc::clone(&projection.handler)),
+            )
+        })
+        .collect()
+}
+
+fn same_interface_shape(left: &InterfaceDescriptor, right: &InterfaceDescriptor) -> bool {
+    left.format == right.format
+        && left.documentation == right.documentation
+        && left.types == right.types
+}
+
+fn descriptor_validator(descriptor: &InterfaceDescriptor) -> Vec<u8> {
+    let mut digest = Sha256::new();
+    digest.update(format!("{descriptor:?}").as_bytes());
+    digest.finalize().to_vec()
+}
+
 fn validate_projection(projection: &WipProjection) -> Result<(), WipMountError> {
     wip_protocol::validate_path(&projection.route).map_err(|error| {
         WipMountError::InvalidRoute {
@@ -508,7 +872,7 @@ impl WipHost {
 
     fn projection(&self, path: &str) -> Option<WipProjection> {
         if let Some(mounted) = self.registry.mounts.get(path) {
-            return Some(mounted.projection.clone());
+            return Some(mounted.resolved());
         }
         self.registry.dynamic_mounts.iter().find_map(|mounted| {
             let item_reference = path.strip_prefix(&format!("{}/", mounted.collection_route))?;
@@ -516,6 +880,28 @@ impl WipHost {
                 return None;
             }
             let item = mounted.resolver.resolve(item_reference)?;
+            let contributions = self
+                .registry
+                .dynamic_operation_contributions
+                .get(&mounted.collection_route);
+            let contributed_names = contributions
+                .into_iter()
+                .flatten()
+                .flat_map(|contribution| contribution.operations.iter())
+                .collect::<BTreeSet<_>>();
+            let mut handlers = mounted
+                .descriptor
+                .operations
+                .iter()
+                .filter(|operation| !contributed_names.contains(&operation.name))
+                .map(|operation| (operation.name.clone(), Arc::clone(&item.handler)))
+                .collect::<BTreeMap<_, _>>();
+            for contribution in contributions.into_iter().flatten() {
+                let handler = contribution.resolver.handler(item_reference);
+                for operation in &contribution.operations {
+                    handlers.insert(operation.clone(), Arc::clone(&handler));
+                }
+            }
             let projection = WipProjection {
                 route: path.to_string(),
                 capability: mounted.capability.clone(),
@@ -524,7 +910,7 @@ impl WipHost {
                 interface: mounted.interface.clone(),
                 descriptor: mounted.descriptor.clone(),
                 interface_validator: mounted.interface_validator.clone(),
-                handler: item.handler,
+                handler: Arc::new(OperationDispatchHandler { handlers }),
             };
             validate_projection(&projection).ok()?;
             Some(projection)
@@ -590,9 +976,9 @@ impl WipHost {
     }
 
     fn observe(&self, path: &str, depth: u32) -> Result<ObjectObservation, ProtocolError> {
-        let object = self.object_at(path).ok_or_else(|| {
-            protocol_error(ProtocolErrorCode::NotFound, "target path is not published")
-        })?;
+        let object = self
+            .object_at(path)
+            .ok_or_else(|| unpublished_path_error(path))?;
         let children = if depth == 0 {
             None
         } else {
@@ -625,10 +1011,7 @@ impl WipHost {
         context: WipCallContext,
     ) -> Result<WipOperationOutput, WipOperationError> {
         let projection = self.projection(&request.target.path).ok_or_else(|| {
-            WipOperationError::Protocol(protocol_error(
-                ProtocolErrorCode::NotFound,
-                "target path is not published",
-            ))
+            WipOperationError::Protocol(unpublished_path_error(&request.target.path))
         })?;
         let expected_object_validator = projection.object.validator.as_deref();
         match (
@@ -705,6 +1088,15 @@ impl WipHost {
         })?;
         projection.handler.cancel(context).await
     }
+}
+
+fn unpublished_path_error(path: &str) -> ProtocolError {
+    let message = if path == "/features" || path.starts_with("/features/") {
+        "legacy /features/... routes are no longer published; rediscover from `/` and use the root namespace"
+    } else {
+        "target path is not published"
+    };
+    protocol_error(ProtocolErrorCode::NotFound, message)
 }
 
 fn protocol_error(code: ProtocolErrorCode, message: impl Into<String>) -> ProtocolError {
@@ -1139,9 +1531,8 @@ impl WipRuntime {
             )
             .map_err(ToolError::InvalidArgument)?,
             None => {
-                return Err(ToolError::InvalidArgument(format!(
-                    "WIP target `{path}` is not published"
-                )));
+                let error = unpublished_path_error(&path);
+                return Err(ToolError::InvalidArgument(error.message));
             }
         };
         let prepared = {
@@ -1956,7 +2347,7 @@ mod tests {
     use agen::llm_client::{ClientError, Request as LlmRequest, ResponseStream};
     use futures::stream;
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use wip_protocol::{EnumCase, FieldDeclaration, TypeDeclaration, UnionCase};
 
     struct EchoTool {
@@ -2184,6 +2575,259 @@ mod tests {
         ));
     }
 
+    struct ContributionHandler {
+        calls: Arc<AtomicUsize>,
+        allowed: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl WipOperationHandler for ContributionHandler {
+        async fn call(
+            &self,
+            _operation: &str,
+            _arguments: &BTreeMap<String, Value>,
+            _context: WipCallContext,
+        ) -> Result<WipOperationOutput, WipOperationError> {
+            if !self.allowed.load(Ordering::SeqCst) {
+                return Err(WipOperationError::Protocol(protocol_error(
+                    ProtocolErrorCode::PermissionDenied,
+                    "current subject is not authorized",
+                )));
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(WipOperationOutput::native(Value::Unit))
+        }
+    }
+
+    fn contributed_operation(name: &str) -> OperationDeclaration {
+        OperationDeclaration {
+            name: name.into(),
+            documentation: documentation(name),
+            parameters: Vec::new(),
+            returns: ReturnDeclaration {
+                documentation: None,
+                r#type: TypeExpr::Unit,
+            },
+        }
+    }
+
+    fn contribution_projection(handler: Arc<dyn WipOperationHandler>) -> WipProjection {
+        let descriptor = InterfaceDescriptor {
+            format: INTERFACE_FORMAT_V1.into(),
+            documentation: documentation("shared object interface"),
+            types: Vec::new(),
+            operations: vec![contributed_operation("read")],
+        };
+        WipProjection {
+            route: "/assets/A-1".into(),
+            capability: "asset:object".into(),
+            kind: WipProjectionKind::Native,
+            object: Object {
+                name: "A-1".into(),
+                description: Some("host-resolved asset".into()),
+                interfaces: vec!["test.asset/item/v1".into()],
+                r#ref: Some("asset:A-1".into()),
+                validator: Some(vec![1]),
+            },
+            interface: "test.asset/item/v1".into(),
+            interface_validator: Some(descriptor_validator(&descriptor)),
+            descriptor,
+            handler,
+        }
+    }
+
+    #[tokio::test]
+    async fn host_namespace_object_resolution_and_operation_contributions_are_independent() {
+        let read_calls = Arc::new(AtomicUsize::new(0));
+        let manage_calls = Arc::new(AtomicUsize::new(0));
+        let read_allowed = Arc::new(AtomicBool::new(true));
+        let manage_allowed = Arc::new(AtomicBool::new(false));
+        let mut registry = WipMountRegistry::new();
+        assert!(matches!(
+            registry.allocate_namespace("host", "features"),
+            Err(WipMountError::InvalidRoute { .. })
+        ));
+        assert!(matches!(
+            registry.allocate_namespace("host", "tools"),
+            Err(WipMountError::InvalidRoute { .. })
+        ));
+        let namespace = registry.allocate_namespace("asset", "assets").unwrap();
+        assert_eq!(namespace.root(), "/assets");
+        assert!(matches!(
+            registry.allocate_namespace("other", "assets"),
+            Err(WipMountError::RouteCollision { .. })
+        ));
+        registry
+            .mount(contribution_projection(Arc::new(ContributionHandler {
+                calls: Arc::clone(&read_calls),
+                allowed: Arc::clone(&read_allowed),
+            })))
+            .unwrap();
+
+        let host_without_management = WipHost::new(registry);
+        let resolved = host_without_management.projection("/assets/A-1").unwrap();
+        assert_eq!(resolved.object.r#ref.as_deref(), Some("asset:A-1"));
+        assert_eq!(
+            resolved
+                .descriptor
+                .operations
+                .iter()
+                .map(|operation| operation.name.as_str())
+                .collect::<Vec<_>>(),
+            ["read"]
+        );
+
+        let mut registry = host_without_management.registry;
+        let contribution_descriptor = InterfaceDescriptor {
+            format: INTERFACE_FORMAT_V1.into(),
+            documentation: documentation("shared object interface"),
+            types: Vec::new(),
+            operations: vec![contributed_operation("manage")],
+        };
+        registry
+            .contribute_operations(WipOperationContribution {
+                route: "/assets/A-1".into(),
+                contributor: "asset-management".into(),
+                interface: "test.asset/item/v1".into(),
+                descriptor: contribution_descriptor.clone(),
+                handler: Arc::new(ContributionHandler {
+                    calls: Arc::clone(&manage_calls),
+                    allowed: Arc::clone(&manage_allowed),
+                }),
+            })
+            .unwrap();
+        assert!(matches!(
+            registry.contribute_operations(WipOperationContribution {
+                route: "/assets/A-1".into(),
+                contributor: "duplicate-management".into(),
+                interface: "test.asset/item/v1".into(),
+                descriptor: contribution_descriptor,
+                handler: Arc::new(ContributionHandler {
+                    calls: Arc::clone(&manage_calls),
+                    allowed: Arc::clone(&manage_allowed),
+                }),
+            }),
+            Err(WipMountError::OperationCollision { .. })
+        ));
+        let host = WipHost::new(registry);
+        let projection = host.projection("/assets/A-1").unwrap();
+        assert_eq!(
+            projection
+                .descriptor
+                .operations
+                .iter()
+                .map(|operation| operation.name.as_str())
+                .collect::<Vec<_>>(),
+            ["manage", "read"]
+        );
+
+        let request = |operation: &str| CallOperationRequest {
+            target: wip_protocol::Target {
+                path: "/assets/A-1".into(),
+                validator: projection.object.validator.clone(),
+            },
+            interface: wip_protocol::InterfaceTarget {
+                reference: projection.interface.clone(),
+                validator: projection.interface_validator.clone(),
+            },
+            operation: operation.into(),
+            arguments: BTreeMap::new(),
+        };
+        let context = || WipCallContext {
+            execution: ToolExecutionContext::direct(),
+            security_context: "worker-a".into(),
+        };
+        assert!(matches!(
+            host.call(request("manage"), context()).await,
+            Err(WipOperationError::Protocol(ProtocolError {
+                code: ProtocolErrorCode::PermissionDenied,
+                ..
+            }))
+        ));
+        manage_allowed.store(true, Ordering::SeqCst);
+        host.call(request("manage"), context())
+            .await
+            .unwrap_or_else(|_| panic!("authorized management contribution should run"));
+        manage_allowed.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            host.call(request("manage"), context()).await,
+            Err(WipOperationError::Protocol(ProtocolError {
+                code: ProtocolErrorCode::PermissionDenied,
+                ..
+            }))
+        ));
+        host.call(request("read"), context())
+            .await
+            .unwrap_or_else(|_| panic!("independent read contribution should run"));
+        assert_eq!(manage_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(read_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn operation_contributions_reject_interface_and_target_conflicts() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let allowed = Arc::new(AtomicBool::new(true));
+        let handler: Arc<dyn WipOperationHandler> =
+            Arc::new(ContributionHandler { calls, allowed });
+        let mut registry = WipMountRegistry::new();
+        let projection = contribution_projection(Arc::clone(&handler));
+        assert!(matches!(
+            registry.mount(projection.clone()),
+            Err(WipMountError::InvalidProjection { .. })
+        ));
+        registry.allocate_namespace("asset", "assets").unwrap();
+        registry.mount(projection).unwrap();
+        let mut inconsistent = InterfaceDescriptor {
+            format: INTERFACE_FORMAT_V1.into(),
+            documentation: documentation("different interface contract"),
+            types: Vec::new(),
+            operations: vec![contributed_operation("manage")],
+        };
+        assert!(matches!(
+            registry.contribute_operations(WipOperationContribution {
+                route: "/assets/A-1".into(),
+                contributor: "management".into(),
+                interface: "test.asset/item/v1".into(),
+                descriptor: inconsistent.clone(),
+                handler: Arc::clone(&handler),
+            }),
+            Err(WipMountError::InterfaceCollision { .. })
+        ));
+        inconsistent.documentation = documentation("shared object interface");
+        assert!(matches!(
+            registry.contribute_operations(WipOperationContribution {
+                route: "/assets/A-2".into(),
+                contributor: "management".into(),
+                interface: "test.asset/item/v1".into(),
+                descriptor: inconsistent,
+                handler,
+            }),
+            Err(WipMountError::OperationTargetNotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_feature_routes_fail_with_rediscovery_guidance() {
+        let host = WipHost::new(WipMountRegistry::new());
+        let error = host.observe("/features/ticket/tickets/T-1", 0).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::NotFound);
+        assert!(error.message.contains("rediscover from `/`"));
+        assert!(error.message.contains("no longer published"));
+
+        let runtime = WipRuntime::new(host, SecurityContext::new("worker-a"), 0).unwrap();
+        let error = runtime
+            .call(
+                "/features/ticket/tickets/T-1".into(),
+                "yoi.ticket/item/v1".into(),
+                "read".into(),
+                json!({}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("rediscover from `/`"));
+    }
+
     struct NativeTyped;
 
     #[async_trait]
@@ -2338,6 +2982,7 @@ mod tests {
     #[tokio::test]
     async fn native_projection_preserves_descriptor_and_decodes_typed_arguments_end_to_end() {
         let mut registry = WipMountRegistry::new();
+        registry.allocate_namespace("native", "native").unwrap();
         registry.mount(native_typed_projection()).unwrap();
         let runtime =
             WipRuntime::new(WipHost::new(registry), SecurityContext::new("worker-a"), 0).unwrap();
@@ -2600,10 +3245,26 @@ mod tests {
         }
     }
 
+    struct DynamicContributionResolver {
+        calls: Arc<AtomicUsize>,
+        allowed: Arc<AtomicBool>,
+    }
+
+    impl WipDynamicOperationResolver for DynamicContributionResolver {
+        fn handler(&self, _item_reference: &str) -> Arc<dyn WipOperationHandler> {
+            Arc::new(ContributionHandler {
+                calls: Arc::clone(&self.calls),
+                allowed: Arc::clone(&self.allowed),
+            })
+        }
+    }
+
     fn dynamic_registry(revision: Arc<AtomicUsize>, calls: Arc<AtomicUsize>) -> WipMountRegistry {
         let mut registry = WipMountRegistry::new();
-        let feature = registry.allocate_feature_route("objective").unwrap();
-        let collection_route = feature.child("objectives").unwrap();
+        let namespace = registry
+            .allocate_namespace("objective", "objectives")
+            .unwrap();
+        let collection_route = namespace.root().to_string();
         let mut collection = compatibility_projection(
             meta("Dynamic"),
             Arc::new(EchoTool {
@@ -2616,8 +3277,8 @@ mod tests {
         collection.capability = "objective:collection".into();
         collection.kind = WipProjectionKind::Native;
         collection.object.name = "objectives".into();
-        collection.object.interfaces = vec!["test.dynamic/v1".into()];
-        collection.interface = "test.dynamic/v1".into();
+        collection.object.interfaces = vec!["test.dynamic.collection/v1".into()];
+        collection.interface = "test.dynamic.collection/v1".into();
         collection.handler = Arc::new(DynamicHandler {
             calls: Arc::clone(&calls),
         });
@@ -2642,17 +3303,9 @@ mod tests {
         let revision = Arc::new(AtomicUsize::new(1));
         let calls = Arc::new(AtomicUsize::new(0));
         let host = WipHost::new(dynamic_registry(Arc::clone(&revision), Arc::clone(&calls)));
-        let initial = host
-            .projection("/features/objective/objectives/O-3")
-            .unwrap();
-        assert!(
-            host.projection("/features/objective/objectives/O-3/other")
-                .is_none()
-        );
-        assert!(
-            host.projection("/features/objective/objectives/T-3")
-                .is_none()
-        );
+        let initial = host.projection("/objectives/O-3").unwrap();
+        assert!(host.projection("/objectives/O-3/other").is_none());
+        assert!(host.projection("/objectives/T-3").is_none());
         assert!(host.projection("/hidden/objectives/O-3").is_none());
 
         revision.store(2, Ordering::SeqCst);
@@ -2660,7 +3313,7 @@ mod tests {
             .call(
                 CallOperationRequest {
                     target: wip_protocol::Target {
-                        path: "/features/objective/objectives/O-3".into(),
+                        path: "/objectives/O-3".into(),
                         validator: initial.object.validator,
                     },
                     interface: wip_protocol::InterfaceTarget {
@@ -2689,6 +3342,65 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    async fn dynamic_object_resolver_accepts_disjoint_feature_operations() {
+        let revision = Arc::new(AtomicUsize::new(1));
+        let base_calls = Arc::new(AtomicUsize::new(0));
+        let contribution_calls = Arc::new(AtomicUsize::new(0));
+        let allowed = Arc::new(AtomicBool::new(true));
+        let mut registry = dynamic_registry(revision, base_calls);
+        let mounted = registry
+            .dynamic_mounts
+            .first()
+            .expect("dynamic object family is mounted");
+        let mut descriptor = mounted.descriptor.clone();
+        descriptor.operations = vec![contributed_operation("manage")];
+        registry
+            .contribute_dynamic_operations(WipDynamicOperationContribution {
+                collection_route: "/objectives".into(),
+                contributor: "objective-management".into(),
+                interface: "test.dynamic/v1".into(),
+                descriptor,
+                resolver: Arc::new(DynamicContributionResolver {
+                    calls: Arc::clone(&contribution_calls),
+                    allowed,
+                }),
+            })
+            .unwrap();
+        let host = WipHost::new(registry);
+        let projection = host.projection("/objectives/O-7").unwrap();
+        assert_eq!(
+            projection
+                .descriptor
+                .operations
+                .iter()
+                .map(|operation| operation.name.as_str())
+                .collect::<Vec<_>>(),
+            ["call", "manage"]
+        );
+        host.call(
+            CallOperationRequest {
+                target: wip_protocol::Target {
+                    path: "/objectives/O-7".into(),
+                    validator: projection.object.validator,
+                },
+                interface: wip_protocol::InterfaceTarget {
+                    reference: projection.interface,
+                    validator: projection.interface_validator,
+                },
+                operation: "manage".into(),
+                arguments: BTreeMap::new(),
+            },
+            WipCallContext {
+                execution: ToolExecutionContext::direct(),
+                security_context: "worker-a".into(),
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("dynamic contributed operation should run"));
+        assert_eq!(contribution_calls.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn native_capability_claim_hides_only_claimed_compatibility_route() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -2699,18 +3411,13 @@ mod tests {
         let revision = Arc::new(AtomicUsize::new(1));
         let mut registry = dynamic_registry(revision, calls);
         registry
-            .replace_compatibility_tools("/features/objective/objectives", ["Echo"])
+            .replace_compatibility_tools("/objectives", ["Echo"])
             .unwrap();
         let runtime =
             install_wip_mode_with_mounts(&mut engine, None, "worker-a".into(), registry).unwrap();
         assert!(runtime.host.projection("/tools/Echo").is_none());
         assert!(runtime.host.projection("/tools/Other").is_some());
-        assert!(
-            runtime
-                .host
-                .projection("/features/objective/objectives")
-                .is_some()
-        );
+        assert!(runtime.host.projection("/objectives").is_some());
     }
 
     #[tokio::test]
@@ -2752,7 +3459,9 @@ mod tests {
             authoring_engine.register_tool(definition);
         }
         let mut authoring_registry = WipMountRegistry::new();
-        let route = authoring_registry.allocate_feature_route("ticket").unwrap();
+        let route = authoring_registry
+            .allocate_namespace("ticket", "tickets")
+            .unwrap();
         crate::feature::builtin::ticket::mount_workspace_http_ticket_wip(
             &mut authoring_registry,
             authoring_client.clone(),
@@ -2771,14 +3480,15 @@ mod tests {
 
         let discovered = authoring.discover("/".into(), 3, false).await.unwrap();
         let discovered = discovered.content.unwrap();
-        assert!(discovered.contains("/features/ticket/tickets"));
+        assert!(discovered.contains("/tickets"));
+        assert!(!discovered.contains("/features"));
         assert!(!discovered.contains("/tools/QueryTicket"));
         assert!(!discovered.contains("/tools/TicketCreate"));
         authoring
             .inspect("yoi.ticket/collection/v1".into(), false)
             .await
             .unwrap();
-        let collection = "/features/ticket/tickets";
+        let collection = "/tickets";
         authoring
             .call(
                 collection.into(),
@@ -2799,13 +3509,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            created
-                .content
-                .unwrap()
-                .contains("/features/ticket/tickets/T-9")
-        );
-        let item = "/features/ticket/tickets/T-9";
+        assert!(created.content.unwrap().contains("/tickets/T-9"));
+        let item = "/tickets/T-9";
         authoring.discover(item.into(), 0, false).await.unwrap();
         authoring
             .inspect("yoi.ticket/item/v1".into(), false)
@@ -2862,7 +3567,9 @@ mod tests {
             workflow_engine.register_tool(definition);
         }
         let mut workflow_registry = WipMountRegistry::new();
-        let route = workflow_registry.allocate_feature_route("ticket").unwrap();
+        let route = workflow_registry
+            .allocate_namespace("ticket", "tickets")
+            .unwrap();
         crate::feature::builtin::ticket::mount_workspace_http_ticket_wip(
             &mut workflow_registry,
             workflow_client.clone(),
@@ -2963,7 +3670,7 @@ mod tests {
         }
         let mut coder_registry = WipMountRegistry::new();
         let route = coder_registry
-            .allocate_feature_route("merge-request")
+            .allocate_namespace("merge-request", "merge-requests")
             .unwrap();
         crate::feature::builtin::merge_request::mount_workspace_http_merge_request_wip(
             &mut coder_registry,
@@ -2982,14 +3689,14 @@ mod tests {
         .unwrap();
         let discovered = coder.discover("/".into(), 3, false).await.unwrap();
         let discovered = discovered.content.unwrap();
-        assert!(discovered.contains("/features/merge-request/merge-requests"));
+        assert!(discovered.contains("/merge-requests"));
         assert!(!discovered.contains("/tools/OpenMergeRequest"));
         assert!(!discovered.contains("/tools/ShowMergeRequest"));
         coder
             .inspect("yoi.merge-request/collection/v1".into(), false)
             .await
             .unwrap();
-        let collection = "/features/merge-request/merge-requests";
+        let collection = "/merge-requests";
         let opened = coder
             .call(
                 collection.into(),
@@ -3085,7 +3792,7 @@ mod tests {
         }
         let mut reviewer_registry = WipMountRegistry::new();
         let route = reviewer_registry
-            .allocate_feature_route("merge-request")
+            .allocate_namespace("merge-request", "merge-requests")
             .unwrap();
         crate::feature::builtin::merge_request::mount_workspace_http_merge_request_wip(
             &mut reviewer_registry,
@@ -3174,7 +3881,7 @@ mod tests {
         }
         let mut orchestrator_registry = WipMountRegistry::new();
         let route = orchestrator_registry
-            .allocate_feature_route("merge-request")
+            .allocate_namespace("merge-request", "merge-requests")
             .unwrap();
         crate::feature::builtin::merge_request::mount_workspace_http_merge_request_wip(
             &mut orchestrator_registry,
@@ -3348,12 +4055,14 @@ mod tests {
             }],
         });
         let mut registry = WipMountRegistry::new();
-        let feature_route = registry.allocate_feature_route("objective").unwrap();
+        let namespace_route = registry
+            .allocate_namespace("objective", "objectives")
+            .unwrap();
         crate::feature::builtin::objective::mount_workspace_http_objective_wip(
             &mut registry,
             client.clone(),
             permissions.clone(),
-            &feature_route,
+            &namespace_route,
         )
         .unwrap();
         let runtime =
@@ -3362,13 +4071,13 @@ mod tests {
 
         let discovered = runtime.discover("/".into(), 3, false).await.unwrap();
         let discovered = discovered.content.unwrap();
-        assert!(discovered.contains("/features/objective/objectives"));
+        assert!(discovered.contains("/objectives"));
         assert!(!discovered.contains("/tools/QueryObjective"));
         runtime
             .inspect("yoi.objective/collection/v1".into(), false)
             .await
             .unwrap();
-        let collection_path = "/features/objective/objectives";
+        let collection_path = "/objectives";
         runtime
             .call(
                 collection_path.into(),
@@ -3401,14 +4110,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            created
-                .content
-                .unwrap()
-                .contains("/features/objective/objectives/O-3")
-        );
+        assert!(created.content.unwrap().contains("/objectives/O-3"));
 
-        let item_path = "/features/objective/objectives/O-3";
+        let item_path = "/objectives/O-3";
         runtime.discover(item_path.into(), 0, false).await.unwrap();
         runtime
             .inspect("yoi.objective/item/v1".into(), false)

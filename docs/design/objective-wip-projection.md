@@ -4,12 +4,14 @@
 
 When a Worker explicitly runs in `wip` mode and the Objective Feature is enabled, the Worker Host projects Objectives as native Worldspace objects. The projection is an adapter over the existing scoped Workspace API. It does not introduce another Objective store, state machine, reference resolver, or audit path.
 
-The Host allocates `/features/objective` to the Feature through `WipMountRegistry`. The Objective Feature then mounts:
+The Host assigns the Objective provider the root `objectives` namespace through `WipMountRegistry` and mounts:
 
 ```text
-/features/objective/objectives
-/features/objective/objectives/<objective-reference>
+/objectives
+/objectives/<objective-reference>
 ```
+
+There is no Feature Object or `/features/objective` compatibility alias. Legacy paths are retained only as historical text and fail as current inputs with rediscovery guidance.
 
 `<objective-reference>` is either a canonical `O-<digits>` key or an existing canonical internal alphanumeric ID. Only one direct child segment is accepted. Nested suffixes, Ticket keys, and unrelated or hidden prefixes do not resolve as Objective objects.
 
