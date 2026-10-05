@@ -28,7 +28,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 77;
+const LATEST_SCHEMA_VERSION: i64 = 78;
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
@@ -77,6 +77,7 @@ const ARCHIVE_OBSERVE_GRANTS_MIGRATION_NAME: &str =
     "preserve explicit observe grants for committed Worker Session archives";
 const BACKEND_JOB_WORKER_CLEANUP_MIGRATION_NAME: &str =
     "durable terminal Backend Job Worker cleanup";
+const WORKDIR_CONNECTION_ID_MIGRATION_NAME: &str = "durable Workdir attachment connection identity";
 const TICKET_SCHEMA_VERSION_WITH_TARGETS: i64 = 7;
 const TICKET_SCHEMA_BASELINE_NAME: &str = "ticket schema baseline";
 const WORKER_REGISTRY_PROJECTION_SCHEMA: &str = r#"
@@ -258,6 +259,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 77,
         name: BACKEND_JOB_WORKER_CLEANUP_MIGRATION_NAME,
         apply: migrate_backend_job_worker_cleanup_v76_to_v77,
+    },
+    Migration {
+        version: 78,
+        name: WORKDIR_CONNECTION_ID_MIGRATION_NAME,
+        apply: migrate_workdir_connection_id_v77_to_v78,
     },
 ];
 
@@ -963,6 +969,8 @@ pub struct ExternalWorkdirGrantRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerWorkdirLinkRecord {
+    /// Assigned by the ledger on attach; preserved only by explicit compensation.
+    pub connection_id: String,
     pub workspace_id: String,
     pub worker: RuntimeWorkerRef,
     pub workdir_id: String,
@@ -1983,6 +1991,23 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         expected_workdir_id: Option<&str>,
         unlinked_at: &str,
     ) -> Result<Option<WorkerWorkdirLinkRecord>>;
+    fn detach_worker_workdir_connection(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        alias: &str,
+        expected_connection_id: &str,
+        unlinked_at: &str,
+    ) -> Result<WorkerWorkdirLinkRecord>;
+    fn restore_worker_workdir_connection(&self, record: &WorkerWorkdirLinkRecord) -> Result<()>;
+    fn list_worker_workdir_links_page(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        limit: u32,
+        offset: u32,
+        connection_id: Option<&str>,
+    ) -> Result<Vec<WorkerWorkdirLinkRecord>>;
     fn worker_workdir_link_history_exists(
         &self,
         workspace_id: &str,
@@ -9349,6 +9374,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 "reserved attachment finalization requires an active attachment".to_string(),
             ));
         }
+        let mut record = record.clone();
+        record.connection_id = uuid::Uuid::now_v7().to_string();
         self.with_conn(|conn| {
             let tx = rusqlite::Transaction::new_unchecked(
                 conn,
@@ -9370,11 +9397,12 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             }
             tx.execute(
                 r#"INSERT INTO worker_workdir_links (
-                    workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
+                    workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)
                 ON CONFLICT(workspace_id, runtime_id, worker_id, workdir_id, alias) DO UPDATE SET
                     capabilities = excluded.capabilities,
                     linked_at = excluded.linked_at,
+                    connection_id = excluded.connection_id,
                     unlinked_at = NULL"#,
                 params![
                     record.workspace_id,
@@ -9384,6 +9412,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     record.alias,
                     encode_workdir_link_capabilities(record.capabilities)?,
                     record.linked_at,
+                    record.connection_id,
                 ],
             )
             .map_err(|error| {
@@ -9421,6 +9450,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 "a new attachment cannot already be unlinked".to_string(),
             ));
         }
+        let mut record = record.clone();
+        record.connection_id = uuid::Uuid::now_v7().to_string();
         self.with_conn(|conn| {
             let tx = rusqlite::Transaction::new_unchecked(
                 conn,
@@ -9456,7 +9487,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             }
             let active_for_alias = tx
                 .query_row(
-                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
+                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
                        FROM worker_workdir_links
                        WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
                          AND alias = ?4 AND unlinked_at IS NULL"#,
@@ -9499,7 +9530,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             }
             let active_for_workdir = tx
                 .query_row(
-                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
+                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
                        FROM worker_workdir_links
                        WHERE workspace_id = ?1 AND workdir_id = ?2 AND unlinked_at IS NULL"#,
                     params![record.workspace_id, record.workdir_id],
@@ -9514,11 +9545,12 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             }
             let write = tx.execute(
                 r#"INSERT INTO worker_workdir_links (
-                    workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
+                    workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)
                 ON CONFLICT(workspace_id, runtime_id, worker_id, workdir_id, alias) DO UPDATE SET
                     capabilities = excluded.capabilities,
                     linked_at = excluded.linked_at,
+                    connection_id = excluded.connection_id,
                     unlinked_at = NULL"#,
                 params![
                     record.workspace_id,
@@ -9528,6 +9560,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     record.alias,
                     encode_workdir_link_capabilities(record.capabilities)?,
                     record.linked_at,
+                    record.connection_id,
                 ],
             );
             if let Err(error) = write {
@@ -9556,7 +9589,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 rusqlite::TransactionBehavior::Immediate,
             )?;
             let mut stmt = tx.prepare(
-                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
+                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
                    FROM worker_workdir_links
                    WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
                      AND unlinked_at IS NULL"#,
@@ -9571,7 +9604,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
 
             let mut persisted_identity = persisted
                 .iter()
-                .map(|link| (link.alias.as_str(), link.workdir_id.as_str()))
+                .map(|link| (link.alias.as_str(), link.workdir_id.as_str(), link.connection_id.as_str()))
                 .collect::<Vec<_>>();
             persisted_identity.sort_unstable();
             let mut requested_identity = active_links
@@ -9592,7 +9625,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                             link.alias
                         ))
                     })?;
-                    Ok((link.alias.as_str(), link.workdir_id.as_str()))
+                    Ok((link.alias.as_str(), link.workdir_id.as_str(), link.connection_id.as_str()))
                 })
                 .collect::<Result<Vec<_>>>()?;
             requested_identity.sort_unstable();
@@ -9644,7 +9677,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )?;
             let active = tx
                 .query_row(
-                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
+                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
                        FROM worker_workdir_links
                        WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
                          AND (?4 IS NULL OR workdir_id = ?4) AND unlinked_at IS NULL"#,
@@ -9683,6 +9716,144 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn detach_worker_workdir_connection(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        alias: &str,
+        expected_connection_id: &str,
+        unlinked_at: &str,
+    ) -> Result<WorkerWorkdirLinkRecord> {
+        self.with_conn(|conn| {
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let active = tx
+                .query_row(
+                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities,
+                          linked_at, unlinked_at, connection_id
+                   FROM worker_workdir_links
+                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
+                     AND alias = ?4 AND connection_id = ?5 AND unlinked_at IS NULL"#,
+                    params![
+                        workspace_id,
+                        worker.runtime_id,
+                        worker.worker_id,
+                        alias,
+                        expected_connection_id
+                    ],
+                    read_worker_workdir_link_record,
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    Error::WorkdirAttachmentConflict(format!(
+                        "Workdir attachment `{alias}` connection changed during detach"
+                    ))
+                })?;
+            let changed = tx.execute(
+                r#"UPDATE worker_workdir_links SET unlinked_at = ?6
+                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
+                     AND alias = ?4 AND connection_id = ?5 AND unlinked_at IS NULL"#,
+                params![
+                    workspace_id,
+                    worker.runtime_id,
+                    worker.worker_id,
+                    alias,
+                    expected_connection_id,
+                    unlinked_at
+                ],
+            )?;
+            if changed != 1 {
+                return Err(Error::WorkdirAttachmentConflict(format!(
+                    "Workdir attachment `{alias}` connection changed during detach"
+                )));
+            }
+            tx.commit()?;
+            Ok(WorkerWorkdirLinkRecord {
+                unlinked_at: Some(unlinked_at.to_string()),
+                ..active
+            })
+        })
+    }
+
+    fn restore_worker_workdir_connection(&self, record: &WorkerWorkdirLinkRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            // Compensation reactivates only the same lifetime, never an intervening attach.
+            let changed = conn.execute(
+                r#"UPDATE worker_workdir_links SET unlinked_at = NULL
+                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
+                     AND workdir_id = ?4 AND alias = ?5 AND connection_id = ?6
+                     AND unlinked_at IS NOT NULL
+                     AND NOT EXISTS (
+                         SELECT 1 FROM worker_workdir_attachment_reservations
+                         WHERE workspace_id = ?1 AND workdir_id = ?4
+                     )"#,
+                params![record.workspace_id, record.worker.runtime_id, record.worker.worker_id,
+                        record.workdir_id, record.alias, record.connection_id],
+            ).map_err(|error| {
+                if matches!(error, rusqlite::Error::SqliteFailure(ref code, _) if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE) {
+                    Error::WorkdirAttachmentConflict("Workdir acquired another active attachment during compensation".to_string())
+                } else {
+                    error.into()
+                }
+            })?;
+            if changed != 1 {
+                return Err(Error::WorkdirAttachmentConflict(
+                    "Workdir attachment connection changed during compensation".to_string(),
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    fn list_worker_workdir_links_page(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        limit: u32,
+        offset: u32,
+        connection_id: Option<&str>,
+    ) -> Result<Vec<WorkerWorkdirLinkRecord>> {
+        if limit == 0 || limit > 101 {
+            return Err(Error::InvalidInput(
+                "attachment page limit must be 1..=101".to_string(),
+            ));
+        }
+        if connection_id.is_some_and(|id| {
+            id.trim().is_empty() || id.len() > 128 || id.chars().any(char::is_control)
+        }) {
+            return Err(Error::InvalidInput(
+                "attachment connection_id must contain 1..=128 bytes without control characters"
+                    .to_string(),
+            ));
+        }
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities,
+                          linked_at, unlinked_at, connection_id
+                   FROM worker_workdir_links
+                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
+                     AND unlinked_at IS NULL
+                     AND (?6 IS NULL OR connection_id = ?6)
+                   ORDER BY alias LIMIT ?4 OFFSET ?5"#,
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    workspace_id,
+                    worker.runtime_id,
+                    worker.worker_id,
+                    limit,
+                    offset,
+                    connection_id
+                ],
+                read_worker_workdir_link_record,
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
+        })
+    }
+
     fn worker_workdir_link_history_exists(
         &self,
         workspace_id: &str,
@@ -9708,7 +9879,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<Vec<WorkerWorkdirLinkRecord>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
+                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
                    FROM worker_workdir_links
                    WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3 AND unlinked_at IS NULL
                    ORDER BY linked_at DESC"#,
@@ -9729,7 +9900,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<Vec<WorkerWorkdirLinkRecord>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
+                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
                    FROM worker_workdir_links
                    WHERE workspace_id = ?1 AND workdir_id = ?2 AND unlinked_at IS NULL
                    ORDER BY linked_at DESC"#,
@@ -9750,7 +9921,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<Option<WorkerWorkdirLinkRecord>> {
         self.with_conn(|conn| {
             conn.query_row(
-                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
+                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
                    FROM worker_workdir_links
                    WHERE workspace_id = ?1 AND workdir_id = ?2
                    ORDER BY linked_at DESC, rowid DESC
@@ -10497,6 +10668,7 @@ fn read_worker_workdir_link_record(
         capabilities,
         linked_at: row.get(6)?,
         unlinked_at: row.get(7)?,
+        connection_id: row.get(8)?,
     })
 }
 
@@ -14486,6 +14658,27 @@ fn migrate_backend_job_worker_cleanup_v76_to_v77(conn: &Connection) -> Result<()
     Ok(())
 }
 
+fn migrate_workdir_connection_id_v77_to_v78(conn: &Connection) -> Result<()> {
+    use rusqlite::TransactionBehavior;
+    let current = current_schema_version(conn)?;
+    if current != 77 {
+        return Err(Error::Store(format!(
+            "expected schema version 77 before {WORKDIR_CONNECTION_ID_MIGRATION_NAME} migration, found {current}"
+        )));
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    tx.execute_batch(
+        "ALTER TABLE worker_workdir_links ADD COLUMN connection_id TEXT NOT NULL DEFAULT '';
+         UPDATE worker_workdir_links SET connection_id = lower(hex(randomblob(16)));",
+    )?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+        params![78_i64, WORKDIR_CONNECTION_ID_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("DROP TABLE IF EXISTS typed_ticket_targets;")?;
     conn.execute_batch(include_str!("latest_schema.sql"))?;
@@ -14546,6 +14739,7 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX typed_ticket_targets_workspace_repository
             ON typed_ticket_targets(workspace_id, repository_key, ticket_id);
+        ALTER TABLE worker_workdir_links ADD COLUMN connection_id TEXT NOT NULL DEFAULT '';
         ALTER TABLE worker_workdir_links
             ADD COLUMN capabilities TEXT NOT NULL
             CHECK (capabilities IN (
@@ -15608,6 +15802,46 @@ mod tests {
              VALUES (6, 'ticket schema baseline', CURRENT_TIMESTAMP);",
         )?;
         Ok(())
+    }
+
+    #[test]
+    fn workdir_connection_migration_backfills_distinct_durable_lifetimes() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE __yoi_schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             INSERT INTO __yoi_schema_migrations VALUES (77, 'workspace schema baseline');
+             CREATE TABLE worker_workdir_links (alias TEXT, linked_at TEXT, unlinked_at TEXT);
+             INSERT INTO worker_workdir_links VALUES ('checkout', 'same-time', NULL), ('docs', 'same-time', 'removed');",
+        ).unwrap();
+        migrate_workdir_connection_id_v77_to_v78(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 78);
+        let rows = || {
+            let mut stmt = conn.prepare("SELECT alias, linked_at, unlinked_at, connection_id FROM worker_workdir_links ORDER BY alias").unwrap();
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        let migrated = rows();
+        assert_eq!(migrated[0].0, "checkout");
+        assert_eq!(migrated[0].1, "same-time");
+        assert_eq!(migrated[0].2, None);
+        assert_eq!(migrated[1].2.as_deref(), Some("removed"));
+        assert!(!migrated[0].3.is_empty());
+        assert_ne!(migrated[0].3, migrated[1].3);
+        assert!(migrate_workdir_connection_id_v77_to_v78(&conn).is_err());
+        assert_eq!(
+            rows(),
+            migrated,
+            "a retry cannot replace an already durable connection ID"
+        );
     }
 
     #[test]
@@ -17052,6 +17286,10 @@ mod tests {
                     version: 77,
                     name: BACKEND_JOB_WORKER_CLEANUP_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 78,
+                    name: WORKDIR_CONNECTION_ID_MIGRATION_NAME.to_string(),
+                },
             ]
         );
 
@@ -17139,6 +17377,7 @@ mod tests {
                             77,
                             BACKEND_JOB_WORKER_CLEANUP_MIGRATION_NAME.to_string(),
                         ),
+                        (78, WORKDIR_CONNECTION_ID_MIGRATION_NAME.to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -17490,7 +17729,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72,
-                73, 74, 75, 76, 77
+                73, 74, 75, 76, 77, 78
             ]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
@@ -17499,7 +17738,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 28);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 29);
         assert!(column_exists(&conn, "worker_workdir_links", "alias").unwrap());
         assert!(column_exists(&conn, "worker_workdir_links", "capabilities").unwrap());
         assert!(!column_exists(&conn, "worker_workdir_links", "role").unwrap());
@@ -20855,6 +21094,7 @@ INSERT INTO worker_registry (
         store.upsert_workdir_registry(&unmanaged_workdir).unwrap();
 
         let link = WorkerWorkdirLinkRecord {
+            connection_id: String::new(),
             workspace_id: "local-dev".to_string(),
             worker: worker.worker.clone(),
             workdir_id: workdir.workdir_id.clone(),
@@ -20883,12 +21123,10 @@ INSERT INTO worker_registry (
             store.attach_worker_workdir(&link),
             Err(Error::WorkdirAttachmentConflict(_))
         ));
-        assert_eq!(
-            store
-                .finalize_reserved_worker_workdir_attachment(&link, "spawn-1")
-                .unwrap(),
-            link
-        );
+        let link = store
+            .finalize_reserved_worker_workdir_attachment(&link, "spawn-1")
+            .unwrap();
+        assert!(!link.connection_id.is_empty());
         assert_eq!(store.attach_worker_workdir(&link).unwrap(), link);
         let downgraded_link = WorkerWorkdirLinkRecord {
             capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
@@ -20958,10 +21196,7 @@ INSERT INTO worker_registry (
             store.attach_worker_workdir(&invalid_capabilities),
             Err(Error::InvalidInput(_))
         ));
-        assert_eq!(
-            store.attach_worker_workdir(&second_attachment).unwrap(),
-            second_attachment
-        );
+        let second_attachment = store.attach_worker_workdir(&second_attachment).unwrap();
         assert_eq!(
             store
                 .list_worker_workdir_links("local-dev", &worker.worker)
@@ -20991,6 +21226,157 @@ INSERT INTO worker_registry (
             store.detach_worker_workdir("local-dev", &worker.worker, Some("wrong-workdir"), "6",),
             Err(Error::WorkdirAttachmentConflict(_))
         ));
+        let old_connection = downgraded_link.connection_id.clone();
+        let removed = store
+            .detach_worker_workdir_connection(
+                "local-dev",
+                &worker.worker,
+                "checkout",
+                &old_connection,
+                "5",
+            )
+            .unwrap();
+        store.restore_worker_workdir_connection(&removed).unwrap();
+        assert_eq!(
+            store
+                .list_worker_workdir_links_page("local-dev", &worker.worker, 1, 0, None)
+                .unwrap()[0],
+            downgraded_link
+        );
+        store
+            .detach_worker_workdir_connection(
+                "local-dev",
+                &worker.worker,
+                "checkout",
+                &old_connection,
+                "5",
+            )
+            .unwrap();
+        // Reusing the exact record, including alias, Workdir ID and timestamp, starts a fresh lifetime.
+        let replacement = store.attach_worker_workdir(&downgraded_link).unwrap();
+        assert_ne!(replacement.connection_id, old_connection);
+        assert!(matches!(
+            store.detach_worker_workdir_connection(
+                "local-dev",
+                &worker.worker,
+                "checkout",
+                &old_connection,
+                "6",
+            ),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
+        assert!(matches!(
+            store.restore_worker_workdir_connection(&removed),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
+        assert!(matches!(
+            store.replace_worker_workdir_link_capabilities(
+                "local-dev",
+                &worker.worker,
+                &[downgraded_link.clone(), second_attachment.clone()],
+            ),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
+        assert_eq!(store.attach_worker_workdir(&link).unwrap(), replacement);
+        assert_eq!(
+            store
+                .list_worker_workdir_links_page("local-dev", &worker.worker, 1, 0, None)
+                .unwrap(),
+            vec![replacement.clone()]
+        );
+        assert_eq!(
+            store
+                .list_worker_workdir_links_page("local-dev", &worker.worker, 1, 1, None)
+                .unwrap(),
+            vec![second_attachment.clone()]
+        );
+        assert!(
+            store
+                .list_worker_workdir_links_page("local-dev", &worker.worker, 1, 2, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_worker_workdir_links_page("foreign", &worker.worker, 1, 0, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_worker_workdir_links_page(
+                    "local-dev",
+                    &RuntimeWorkerRef::new("foreign", worker.worker.worker_id.clone()),
+                    1,
+                    0,
+                    None
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .list_worker_workdir_links_page(
+                    "local-dev",
+                    &worker.worker,
+                    1,
+                    0,
+                    Some(&second_attachment.connection_id)
+                )
+                .unwrap(),
+            vec![second_attachment.clone()],
+            "connection filtering must precede paging"
+        );
+        for (workspace_id, identity, connection_id) in [
+            (
+                "foreign",
+                worker.worker.clone(),
+                second_attachment.connection_id.as_str(),
+            ),
+            (
+                "local-dev",
+                second_worker.worker.clone(),
+                second_attachment.connection_id.as_str(),
+            ),
+            (
+                "local-dev",
+                RuntimeWorkerRef::new("foreign", worker.worker.worker_id.clone()),
+                second_attachment.connection_id.as_str(),
+            ),
+            ("local-dev", worker.worker.clone(), old_connection.as_str()),
+            ("local-dev", worker.worker.clone(), "nonexistent"),
+        ] {
+            assert!(
+                store
+                    .list_worker_workdir_links_page(
+                        workspace_id,
+                        &identity,
+                        1,
+                        0,
+                        Some(connection_id)
+                    )
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        drop(store);
+        let store = SqliteWorkspaceStore::open(&db).unwrap();
+        assert_eq!(
+            store
+                .list_worker_workdir_links_page("local-dev", &worker.worker, 1, 0, None)
+                .unwrap(),
+            vec![replacement]
+        );
+        assert!(matches!(
+            store.detach_worker_workdir_connection(
+                "local-dev",
+                &worker.worker,
+                "checkout",
+                &old_connection,
+                "6",
+            ),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
         let detached = store
             .detach_worker_workdir("local-dev", &worker.worker, Some(&workdir.workdir_id), "6")
             .unwrap()
@@ -21001,10 +21387,7 @@ INSERT INTO worker_registry (
                 .worker_workdir_link_history_exists("local-dev", &worker.worker)
                 .unwrap()
         );
-        assert_eq!(
-            store.attach_worker_workdir(&workdir_conflict).unwrap(),
-            workdir_conflict
-        );
+        let workdir_conflict = store.attach_worker_workdir(&workdir_conflict).unwrap();
 
         drop(store);
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();

@@ -4739,6 +4739,7 @@ impl WorkspaceApi {
 
         for (alias, workdir_id, reservation_id, capabilities) in &reserved_attachments {
             let attachment = WorkerWorkdirLinkRecord {
+                connection_id: String::new(),
                 workspace_id: self.config.workspace_id.clone(),
                 worker: worker_ref.clone(),
                 workdir_id: workdir_id.clone(),
@@ -5555,6 +5556,49 @@ fn contract_request_headers(
     Ok(headers)
 }
 
+/// Self APIs derive identity from authenticated middleware, never caller-supplied hints.
+fn current_worker_contract_headers(
+    context: &server_api::ServerRequestContext,
+) -> std::result::Result<HeaderMap, server_api::RepositoryApiError> {
+    let source = context.runtime_source.as_ref().ok_or_else(|| {
+        ApiError::from(Error::WorkspacePermissionDenied(
+            "self Workdir requests require a verified Runtime Worker source".to_string(),
+        ))
+        .into_repository_api_error()
+    })?;
+    let worker_id = source.worker_id.as_deref().ok_or_else(|| {
+        ApiError::from(Error::WorkspacePermissionDenied(
+            "self Workdir requests require a Runtime-bound Worker identity".to_string(),
+        ))
+        .into_repository_api_error()
+    })?;
+    let mut headers = contract_request_headers(context)?;
+    for (name, expected) in [
+        ("x-yoi-runtime-id", source.runtime_id.as_str()),
+        ("x-yoi-worker-id", worker_id),
+    ] {
+        if headers
+            .get(name)
+            .is_some_and(|value| value.as_bytes() != expected.as_bytes())
+        {
+            return Err(ApiError::from(Error::WorkspacePermissionDenied(
+                "self Workdir request identity does not match its verified source".to_string(),
+            ))
+            .into_repository_api_error());
+        }
+        headers.insert(
+            name,
+            HeaderValue::from_str(expected).map_err(|_| {
+                ApiError::from(Error::WorkerSourceIdentity(
+                    "invalid verified Worker identity".to_string(),
+                ))
+                .into_repository_api_error()
+            })?,
+        );
+    }
+    Ok(headers)
+}
+
 async fn attach_server_origin_context(mut request: Request, next: Next) -> Response {
     let actor = request.extensions().get::<RequestActor>().cloned();
     let origin = request_origin(request.headers());
@@ -5841,6 +5885,7 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::runtime_workdir_cleanup(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::current_worker_workdir_attachment_list(service.clone()))
         .merge(server_api::server_api_axum::current_worker_workdir_attach(
             service.clone(),
         ))
@@ -10372,6 +10417,31 @@ impl server_api::ServerApi for ServerApiContractService {
         .map_err(ApiError::into_repository_api_error)
     }
 
+    async fn current_worker_workdir_attachment_list(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        query: server_api::CurrentWorkerWorkdirAttachmentListQuery,
+    ) -> std::result::Result<
+        server_api::CurrentWorkerWorkdirAttachmentListResponse,
+        server_api::RepositoryApiError,
+    > {
+        let api = self.workspace_api()?;
+        validate_workspace_scope(api, &workspace_id)
+            .map_err(ApiError::into_repository_api_error)?;
+        let worker = current_worker_identity(
+            api,
+            &workspace_id,
+            &current_worker_contract_headers(&context)?,
+        )
+        .map_err(ApiError::from)
+        .map_err(ApiError::into_repository_api_error)?;
+        let session_lock = current_worker_session_lock(api, &worker);
+        let _session_guard = session_lock.lock().await;
+        list_current_worker_workdir_attachments(api, &worker, query)
+            .map_err(ApiError::into_repository_api_error)
+    }
+
     async fn current_worker_workdir_attach(
         &self,
         context: server_api::ServerRequestContext,
@@ -10384,7 +10454,7 @@ impl server_api::ServerApi for ServerApiContractService {
         let Json(response) = scoped_attach_current_worker_workdir(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedWorkspacePath { workspace_id }),
-            contract_request_headers(&context)?,
+            current_worker_contract_headers(&context)?,
             Json(AttachCurrentWorkerWorkdirRequest {
                 alias: request.alias,
                 working_directory_id: request.working_directory_id,
@@ -10400,6 +10470,7 @@ impl server_api::ServerApi for ServerApiContractService {
         context: server_api::ServerRequestContext,
         workspace_id: String,
         alias: String,
+        query: server_api::CurrentWorkerWorkdirDetachQuery,
     ) -> std::result::Result<
         server_api::CurrentWorkerWorkdirAttachmentResponse,
         server_api::RepositoryApiError,
@@ -10407,7 +10478,8 @@ impl server_api::ServerApi for ServerApiContractService {
         let Json(response) = scoped_detach_current_worker_workdir(
             State(self.workspace_api()?.clone()),
             AxumPath((workspace_id, alias)),
-            contract_request_headers(&context)?,
+            current_worker_contract_headers(&context)?,
+            query,
         )
         .await
         .map_err(ApiError::into_repository_api_error)?;
@@ -10430,7 +10502,7 @@ impl server_api::ServerApi for ServerApiContractService {
                     .clone(),
             ),
             AxumPath(ScopedWorkspacePath { workspace_id }),
-            contract_request_headers(&context)
+            current_worker_contract_headers(&context)
                 .map_err(server_api::WorkdirOperationApiError::api)?,
             Json(WorkspaceWorkdirSessionOperationRequest {
                 target_workdir: request.target_workdir,
@@ -16354,6 +16426,7 @@ async fn scoped_attach_current_worker_workdir(
     }
     close_current_worker_attachment_session_locked(&api, &worker).await?;
     let link = api.store.attach_worker_workdir(&WorkerWorkdirLinkRecord {
+        connection_id: String::new(),
         workspace_id: api.config.workspace_id.clone(),
         worker: worker.clone(),
         workdir_id: workdir_id.to_string(),
@@ -16413,56 +16486,121 @@ async fn scoped_attach_current_worker_workdir(
     }))
 }
 
+fn list_current_worker_workdir_attachments(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    query: server_api::CurrentWorkerWorkdirAttachmentListQuery,
+) -> ApiResult<server_api::CurrentWorkerWorkdirAttachmentListResponse> {
+    let limit = query.limit.unwrap_or(50);
+    let offset = query.offset.unwrap_or(0);
+    if limit == 0 || limit > 100 {
+        return Err(
+            Error::InvalidInput("attachment page limit must be 1..=100".to_string()).into(),
+        );
+    }
+    let mut links = api.store.list_worker_workdir_links_page(
+        &api.config.workspace_id,
+        worker,
+        limit + 1,
+        offset,
+        query.connection_id.as_deref(),
+    )?;
+    let next_offset =
+        if links.len() > limit as usize {
+            Some(offset.checked_add(limit).ok_or_else(|| {
+                Error::InvalidInput("attachment page offset overflow".to_string())
+            })?)
+        } else {
+            None
+        };
+    links.truncate(limit as usize);
+    Ok(server_api::CurrentWorkerWorkdirAttachmentListResponse {
+        workspace_id: api.config.workspace_id.clone(),
+        items: links
+            .into_iter()
+            .map(|link| server_api::CurrentWorkerWorkdirAttachmentItem {
+                alias: link.alias,
+                working_directory_id: link.workdir_id,
+                capabilities: link.capabilities,
+                connection_id: link.connection_id,
+            })
+            .collect(),
+        next_offset,
+    })
+}
+
 async fn scoped_detach_current_worker_workdir(
     State(api): State<WorkspaceApi>,
     AxumPath((workspace_id, alias)): AxumPath<(String, String)>,
     headers: HeaderMap,
+    query: server_api::CurrentWorkerWorkdirDetachQuery,
 ) -> ApiResult<Json<server_api::CurrentWorkerWorkdirAttachmentResponse>> {
     validate_workspace_scope(&api, &workspace_id)?;
     let alias = workdir::WorkdirAttachmentAlias::new(alias)
         .map_err(|error| Error::InvalidInput(error.to_string()))?;
     let worker = current_worker_identity(&api, &workspace_id, &headers)?;
-    let session_lock = current_worker_session_lock(&api, &worker);
+    detach_current_worker_workdir(
+        &api,
+        &worker,
+        alias.as_str(),
+        query.expected_connection_id.as_deref(),
+    )
+    .await
+    .map(Json)
+}
+
+async fn detach_current_worker_workdir(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    alias: &str,
+    expected_connection_id: Option<&str>,
+) -> ApiResult<server_api::CurrentWorkerWorkdirAttachmentResponse> {
+    let session_lock = current_worker_session_lock(api, worker);
     let _session_guard = session_lock.lock().await;
     let link = api
         .store
-        .list_worker_workdir_links(&api.config.workspace_id, &worker)?
+        .list_worker_workdir_links(&api.config.workspace_id, worker)?
         .into_iter()
-        .find(|link| link.unlinked_at.is_none() && link.alias == alias.as_str())
+        .find(|link| link.unlinked_at.is_none() && link.alias == alias)
         .ok_or_else(|| {
             Error::WorkdirAttachmentConflict(format!(
                 "Worker {}:{} has no Workdir attachment `{alias}`",
                 worker.runtime_id, worker.worker_id
             ))
         })?;
-    close_current_worker_attachment_session_locked(&api, &worker).await?;
-    close_current_worker_command_sessions_for_alias_locked(&api, &worker, alias.as_str()).await?;
-    api.store.detach_worker_workdir(
+    if expected_connection_id.is_some_and(|expected| expected != link.connection_id) {
+        return Err(Error::WorkdirAttachmentConflict(format!(
+            "Workdir attachment `{alias}` connection changed during detach"
+        ))
+        .into());
+    }
+    close_current_worker_attachment_session_locked(api, worker).await?;
+    close_current_worker_command_sessions_for_alias_locked(api, worker, alias).await?;
+    // Even unconditional HTTP requests condition the mutation on the lifetime just read
+    // under the session lock, so a concurrent ledger replacement cannot be removed.
+    api.store.detach_worker_workdir_connection(
         &api.config.workspace_id,
-        &worker,
-        Some(&link.workdir_id),
+        worker,
+        alias,
+        &link.connection_id,
         &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
     )?;
-    if let Err(error) = sync_runtime_worker_workdir_attachments(&api, &worker) {
-        let mut restored = link.clone();
-        restored.unlinked_at = None;
-        api.store.attach_worker_workdir(&restored)?;
+    if let Err(error) = sync_runtime_worker_workdir_attachments(api, worker) {
+        api.store.restore_worker_workdir_connection(&link)?;
         return Err(error);
     }
     let remaining = api
         .store
-        .list_worker_workdir_links(&api.config.workspace_id, &worker)?
+        .list_worker_workdir_links(&api.config.workspace_id, worker)?
         .into_iter()
         .filter(|link| link.unlinked_at.is_none())
         .collect::<Vec<_>>();
     if remaining.len() == 1
         && let Err(error) =
-            open_current_worker_workdir_session_locked(&api, &worker, &remaining[0]).await
+            open_current_worker_workdir_session_locked(api, worker, &remaining[0]).await
     {
-        let mut restored = link.clone();
-        restored.unlinked_at = None;
-        api.store.attach_worker_workdir(&restored)?;
-        let _ = sync_runtime_worker_workdir_attachments(&api, &worker);
+        api.store.restore_worker_workdir_connection(&link)?;
+        let _ = sync_runtime_worker_workdir_attachments(api, worker);
         return Err(error.into());
     }
     if let Err(error) = api
@@ -16470,20 +16608,18 @@ async fn scoped_detach_current_worker_workdir(
         .refresh(&worker)
         .map_err(ApiError::from)
     {
-        let mut restored = link.clone();
-        restored.unlinked_at = None;
-        api.store.attach_worker_workdir(&restored)?;
-        sync_runtime_worker_workdir_attachments(&api, &worker)?;
-        refresh_current_worker_session_locked(&api, &worker).await?;
+        api.store.restore_worker_workdir_connection(&link)?;
+        sync_runtime_worker_workdir_attachments(api, worker)?;
+        refresh_current_worker_session_locked(api, worker).await?;
         return Err(error);
     }
-    Ok(Json(server_api::CurrentWorkerWorkdirAttachmentResponse {
+    Ok(server_api::CurrentWorkerWorkdirAttachmentResponse {
         workspace_id: api.config.workspace_id.clone(),
         alias: alias.to_string(),
         working_directory_id: link.workdir_id,
         capabilities: workdir::WorkdirSessionCapabilities::EMPTY,
         attached: false,
-    }))
+    })
 }
 
 fn validated_current_worker_attachment(
@@ -31079,6 +31215,7 @@ fn link_worker_to_workdir(
 ) -> ApiResult<()> {
     let timestamp = now_registry_timestamp();
     let record = WorkerWorkdirLinkRecord {
+        connection_id: String::new(),
         workspace_id: api.config.workspace_id.clone(),
         worker: worker_record.worker.clone(),
         workdir_id: workdir_id.to_string(),
@@ -33218,6 +33355,7 @@ mod tests {
             .unwrap();
         schedule_external_workdir_expiry(&api, &grant).unwrap();
         let link = WorkerWorkdirLinkRecord {
+            connection_id: String::new(),
             workspace_id: TEST_WORKSPACE_ID.to_string(),
             worker: worker.clone(),
             workdir_id: grant.workdir_id.clone(),
@@ -34186,6 +34324,7 @@ mod tests {
             })
             .unwrap();
         let repository_link = WorkerWorkdirLinkRecord {
+            connection_id: String::new(),
             workspace_id: TEST_WORKSPACE_ID.to_string(),
             worker: worker.clone(),
             workdir_id: "analysis-repository".to_string(),
@@ -34195,6 +34334,7 @@ mod tests {
             unlinked_at: None,
         };
         let external_link = WorkerWorkdirLinkRecord {
+            connection_id: String::new(),
             workspace_id: TEST_WORKSPACE_ID.to_string(),
             worker: worker.clone(),
             workdir_id: grant.working_directory_id.clone(),
@@ -35524,7 +35664,7 @@ mod tests {
                     updated_at: "2026-01-01T00:00:00Z".to_owned(),
                     revoked_at: None,
                 },
-                false,
+                true,
             )
             .unwrap();
     }
@@ -35939,6 +36079,7 @@ mod tests {
         };
         api.store.upsert_workdir_registry(&workdir).unwrap();
         let link = WorkerWorkdirLinkRecord {
+            connection_id: String::new(),
             workspace_id: TEST_WORKSPACE_ID.to_string(),
             worker: worker.worker.clone(),
             workdir_id: workdir.workdir_id.clone(),
@@ -36043,6 +36184,7 @@ mod tests {
             .create_external_workdir_grant(&grant, &workdir)
             .unwrap();
         let link = WorkerWorkdirLinkRecord {
+            connection_id: String::new(),
             workspace_id: TEST_WORKSPACE_ID.to_string(),
             worker: worker.worker.clone(),
             workdir_id: workdir.workdir_id.clone(),
@@ -36943,6 +37085,7 @@ mod tests {
             .unwrap();
         api.store
             .attach_worker_workdir(&WorkerWorkdirLinkRecord {
+                connection_id: String::new(),
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 worker: worker.clone(),
                 workdir_id: workdir_id.to_string(),
@@ -41307,6 +41450,7 @@ mod tests {
             .unwrap();
         api.store
             .attach_worker_workdir(&WorkerWorkdirLinkRecord {
+                connection_id: String::new(),
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 worker: RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, "7"),
                 workdir_id: "managed".to_string(),
@@ -46566,6 +46710,7 @@ mod tests {
                 .unwrap();
             api.store
                 .attach_worker_workdir(&WorkerWorkdirLinkRecord {
+                    connection_id: String::new(),
                     workspace_id: TEST_WORKSPACE_ID.to_string(),
                     worker: worker.clone(),
                     workdir_id: workdir_id.clone(),
@@ -50104,6 +50249,7 @@ mod tests {
         let runtime_worker_id = runtime_worker_id.parse::<u64>().unwrap();
         api.store
             .attach_worker_workdir(&WorkerWorkdirLinkRecord {
+                connection_id: String::new(),
                 workspace_id: api.config.workspace_id.clone(),
                 worker: RuntimeWorkerRef::new("runtime-test", runtime_worker_id.to_string()),
                 workdir_id: workdir_id.to_string(),
@@ -50546,7 +50692,426 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn current_worker_attachment_list_and_stale_detach_use_signed_identity() {
+        let mut fixture = manual_coder_assignment_fixture().await;
+        let identity =
+            worker_runtime::auth::RuntimeIdentityMaterial::generate(&fixture.worker.runtime_id)
+                .unwrap();
+        configure_runtime_request_auth(&mut fixture.api, &identity, &fixture.worker.runtime_id);
+        let api = &fixture.api;
+        let base = format!("/api/w/{TEST_WORKSPACE_ID}/workers/self/workdir-attachments");
+        let request = |method: &str, path: &str| {
+            runtime_source_request(
+                &identity,
+                Some(&fixture.worker.worker_id),
+                method,
+                path,
+                Vec::new(),
+            )
+        };
+        let response = build_router(api.clone())
+            .oneshot(request("GET", &format!("{base}?limit=1")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let page: server_api::CurrentWorkerWorkdirAttachmentListResponse =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(page.workspace_id, TEST_WORKSPACE_ID);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].alias, "checkout");
+        assert_eq!(page.next_offset, Some(1));
+        let old = api
+            .store
+            .list_worker_workdir_links(TEST_WORKSPACE_ID, &fixture.worker)
+            .unwrap()
+            .into_iter()
+            .find(|link| link.alias == "checkout")
+            .unwrap();
+        assert_eq!(page.items[0].connection_id, old.connection_id);
+        let response = build_router(api.clone())
+            .oneshot(request("GET", &format!("{base}?limit=1&offset=1")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let page: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(page["items"][0]["alias"], "docs");
+        assert!(page["next_offset"].is_null());
+        assert_eq!(
+            page["items"][0].as_object().unwrap().len(),
+            4,
+            "no paths, credentials or materializer data"
+        );
+        for query in ["limit=0", "limit=101", "offset=-1"] {
+            let response = build_router(api.clone())
+                .oneshot(request("GET", &format!("{base}?{query}")))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let mut forged = request("GET", &base);
+        forged
+            .headers_mut()
+            .insert("x-yoi-worker-id", "foreign-worker".parse().unwrap());
+        assert_eq!(
+            build_router(api.clone())
+                .oneshot(forged)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let no_worker = runtime_source_request(&identity, None, "GET", &base, Vec::new());
+        assert_eq!(
+            build_router(api.clone())
+                .oneshot(no_worker)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        api.store
+            .detach_worker_workdir_connection(
+                TEST_WORKSPACE_ID,
+                &fixture.worker,
+                "checkout",
+                &old.connection_id,
+                "first-detach",
+            )
+            .unwrap();
+        let replacement = api.store.attach_worker_workdir(&old).unwrap();
+        assert_ne!(replacement.connection_id, old.connection_id);
+        // Leave one attachment so successful detach does not need a fixture provider session.
+        api.store
+            .detach_worker_workdir(
+                TEST_WORKSPACE_ID,
+                &fixture.worker,
+                Some(&fixture.docs_workdir_id),
+                "remove-docs",
+            )
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let session: WorkdirSessionHandle = Arc::new(workdir::LocalWorkdirSession::new(
+            manifest::Scope::writable(root.path()).unwrap(),
+            root.path().to_path_buf(),
+        ));
+        let provider_handle = session
+            .start_command(workdir::CommandRequest {
+                command: "sleep 30".to_string(),
+                timeout_secs: 60,
+                output_limit: 4096,
+                cwd: workdir::WorkdirPath::root(),
+                spill_dir: None,
+                tool_call_id: None,
+            })
+            .await
+            .unwrap();
+        let external = api.workdir_sessions.lock().unwrap().register_command(
+            fixture.worker.clone(),
+            "checkout".to_string(),
+            session.clone(),
+            provider_handle.clone(),
+        );
+        let stale_path = format!(
+            "{base}/checkout?expected_connection_id={}",
+            old.connection_id
+        );
+        let response = build_router(api.clone())
+            .oneshot(request("DELETE", &stale_path))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            api.workdir_sessions
+                .lock()
+                .unwrap()
+                .command(&fixture.worker, "checkout", &external)
+                .is_some()
+        );
+        assert_eq!(
+            session
+                .command_status(provider_handle.clone())
+                .await
+                .unwrap(),
+            workdir::CommandStatus::Running
+        );
+        assert_eq!(
+            api.store
+                .list_worker_workdir_links(TEST_WORKSPACE_ID, &fixture.worker)
+                .unwrap(),
+            vec![replacement.clone()]
+        );
+
+        // The same lock excludes command/SubWorker session activity before checking identity.
+        let lock = current_worker_session_lock(api, &fixture.worker);
+        let guard = lock.lock().await;
+        let mut detach = Box::pin(detach_current_worker_workdir(
+            api,
+            &fixture.worker,
+            "checkout",
+            Some(&old.connection_id),
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut detach)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            session
+                .command_status(provider_handle.clone())
+                .await
+                .unwrap(),
+            workdir::CommandStatus::Running
+        );
+        drop(guard);
+        assert!(matches!(
+            detach.await.unwrap_err().error,
+            Error::WorkdirAttachmentConflict(_)
+        ));
+
+        let current_path = format!(
+            "{base}/checkout?expected_connection_id={}",
+            replacement.connection_id
+        );
+        let response = build_router(api.clone())
+            .oneshot(request("DELETE", &current_path))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: server_api::CurrentWorkerWorkdirAttachmentResponse =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(!response.attached);
+        assert!(
+            session.command_status(provider_handle).await.is_err(),
+            "matching detach cancels and closes command authority"
+        );
+        assert!(
+            api.workdir_sessions
+                .lock()
+                .unwrap()
+                .command(&fixture.worker, "checkout", &external)
+                .is_none()
+        );
+        assert!(
+            api.store
+                .list_worker_workdir_links(TEST_WORKSPACE_ID, &fixture.worker)
+                .unwrap()
+                .is_empty()
+        );
+        let new_lifetime = api.store.attach_worker_workdir(&old).unwrap();
+        assert_ne!(new_lifetime.connection_id, replacement.connection_id);
+        let response = build_router(api.clone())
+            .oneshot(request("DELETE", &format!("{base}/checkout")))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "normal Tool's query-free detach stays unconditional"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_worker_attachment_connection_lookup_precedes_paging_and_is_scoped() {
+        let mut fixture = manual_coder_assignment_fixture().await;
+        let identity =
+            worker_runtime::auth::RuntimeIdentityMaterial::generate(&fixture.worker.runtime_id)
+                .unwrap();
+        configure_runtime_request_auth(&mut fixture.api, &identity, &fixture.worker.runtime_id);
+        let api = &fixture.api;
+        let template = api
+            .store
+            .list_worker_workdir_links(TEST_WORKSPACE_ID, &fixture.worker)
+            .unwrap()
+            .remove(0);
+        let workdir = api
+            .store
+            .get_workdir_registry(TEST_WORKSPACE_ID, &template.workdir_id)
+            .unwrap()
+            .unwrap();
+        let mut target = None;
+        for index in 0..50 {
+            let workdir = WorkdirRegistryRecord {
+                workdir_id: format!("lookup-workdir-{index:03}"),
+                ..workdir.clone()
+            };
+            api.store.upsert_workdir_registry(&workdir).unwrap();
+            target = Some(
+                api.store
+                    .attach_worker_workdir(&WorkerWorkdirLinkRecord {
+                        workdir_id: workdir.workdir_id,
+                        alias: format!("zz-lookup-{index:03}"),
+                        ..template.clone()
+                    })
+                    .unwrap(),
+            );
+        }
+        let target = target.unwrap();
+        let base = format!("/api/w/{TEST_WORKSPACE_ID}/workers/self/workdir-attachments");
+        let request = |path: &str| {
+            runtime_source_request(
+                &identity,
+                Some(&fixture.worker.worker_id),
+                "GET",
+                path,
+                Vec::new(),
+            )
+        };
+        let response = build_router(api.clone())
+            .oneshot(request(&base))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let first: server_api::CurrentWorkerWorkdirAttachmentListResponse =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(first.items.len(), 50);
+        assert_eq!(first.next_offset, Some(50));
+        assert!(
+            !first
+                .items
+                .iter()
+                .any(|item| item.connection_id == target.connection_id)
+        );
+        let lookup_path = format!("{base}?limit=1&connection_id={}", target.connection_id);
+        let response = build_router(api.clone())
+            .oneshot(request(&lookup_path))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let page: server_api::CurrentWorkerWorkdirAttachmentListResponse =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].alias, target.alias);
+        assert_eq!(page.items[0].working_directory_id, target.workdir_id);
+        assert_eq!(page.items[0].connection_id, target.connection_id);
+        assert_eq!(page.next_offset, None);
+
+        let foreign_worker_id = seed_cleanup_worker(api, 902, "normal");
+        seed_cleanup_workdir(api, "foreign-lookup-workdir", "present", "clean");
+        seed_cleanup_link(api, &foreign_worker_id, "foreign-lookup-workdir");
+        let foreign = api
+            .store
+            .list_worker_workdir_links(
+                TEST_WORKSPACE_ID,
+                &RuntimeWorkerRef::new("runtime-test", &foreign_worker_id),
+            )
+            .unwrap()
+            .remove(0);
+        for query in [
+            format!("limit=1&connection_id={}&offset=1", target.connection_id),
+            format!("limit=1&connection_id={}", foreign.connection_id),
+            "limit=1&connection_id=nonexistent".to_string(),
+            format!("limit=1&connection_id={}", "x".repeat(128)),
+        ] {
+            let response = build_router(api.clone())
+                .oneshot(request(&format!("{base}?{query}")))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let page: server_api::CurrentWorkerWorkdirAttachmentListResponse =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert!(page.items.is_empty());
+            assert_eq!(page.next_offset, None);
+        }
+        let mut forged = request(&lookup_path);
+        forged
+            .headers_mut()
+            .insert("x-yoi-worker-id", foreign_worker_id.parse().unwrap());
+        assert_eq!(
+            build_router(api.clone())
+                .oneshot(forged)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        for invalid in [
+            String::new(),
+            "%20".to_string(),
+            "%0A".to_string(),
+            "x".repeat(129),
+        ] {
+            let response = build_router(api.clone())
+                .oneshot(request(&format!("{base}?limit=1&connection_id={invalid}")))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        api.store
+            .detach_worker_workdir_connection(
+                TEST_WORKSPACE_ID,
+                &fixture.worker,
+                &target.alias,
+                &target.connection_id,
+                "lookup-detach",
+            )
+            .unwrap();
+        let replacement = api.store.attach_worker_workdir(&target).unwrap();
+        assert_ne!(replacement.connection_id, target.connection_id);
+        let response = build_router(api.clone())
+            .oneshot(request(&lookup_path))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let stale: server_api::CurrentWorkerWorkdirAttachmentListResponse =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(stale.items.is_empty());
+        assert_eq!(stale.next_offset, None);
+        let response = build_router(api.clone())
+            .oneshot(request(&format!(
+                "{base}?limit=1&connection_id={}",
+                replacement.connection_id,
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let current: server_api::CurrentWorkerWorkdirAttachmentListResponse =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(current.items.len(), 1);
+        assert_eq!(current.items[0].connection_id, replacement.connection_id);
+        assert_eq!(current.next_offset, None);
+    }
+
+    #[tokio::test]
+    async fn current_worker_attachment_failed_detach_preserves_connection_identity() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let worker_id = seed_cleanup_worker(&api, 901, "normal");
+        seed_cleanup_workdir(&api, "compensation-workdir", "present", "clean");
+        seed_cleanup_link(&api, &worker_id, "compensation-workdir");
+        let worker = RuntimeWorkerRef::new("runtime-test", worker_id);
+        let link = api
+            .store
+            .list_worker_workdir_links(TEST_WORKSPACE_ID, &worker)
+            .unwrap()
+            .remove(0);
+        // No live Runtime provider: runtime synchronization rejects the detach after mutation.
+        assert!(
+            detach_current_worker_workdir(&api, &worker, "attachment", Some(&link.connection_id))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            api.store
+                .list_worker_workdir_links(TEST_WORKSPACE_ID, &worker)
+                .unwrap(),
+            vec![link]
+        );
     }
 
     #[tokio::test]
@@ -54773,6 +55338,7 @@ mod tests {
             .unwrap();
         api.store
             .attach_worker_workdir(&WorkerWorkdirLinkRecord {
+                connection_id: String::new(),
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 worker: RuntimeWorkerRef::new("embedded-worker-runtime", &worker_id),
                 workdir_id: workdir_id.to_string(),
@@ -55168,6 +55734,7 @@ mod tests {
             .unwrap();
         api.store
             .attach_worker_workdir(&WorkerWorkdirLinkRecord {
+                connection_id: String::new(),
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 worker: RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, &worker_id),
                 workdir_id: workdir_id.to_string(),
