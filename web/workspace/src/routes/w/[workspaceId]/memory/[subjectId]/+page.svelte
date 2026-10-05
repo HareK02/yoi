@@ -1,13 +1,90 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import DocumentMarkdown from '#lib/workspace/markdown/DocumentMarkdown.svelte';
   import { formatDate, workspaceRoute } from '#lib/workspace/api/http.ts';
-  import type {
-    SubjektivMemoryState,
-    SubjektivResidentSurfaceAvailability,
-  } from '#lib/generated/memory-api.ts';
+  import {
+    SubjektivSubjectCreateError,
+    updateSubjektivSubjectBehavior,
+  } from '#lib/workspace/memory/api.ts';
+  import type { SubjektivMemoryState, SubjektivResidentSurfaceAvailability } from '#lib/generated/memory-api.ts';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
+
+  let subject = $state(untrack(() => data.subject.data));
+  let editingBehavior = $state(false);
+  let behaviorDraft = $state(untrack(() => subject?.behavior_md ?? ''));
+  let behaviorSaving = $state(false);
+  let behaviorError = $state<string | null>(null);
+  let behaviorSaveConfirmed = $state(false);
+
+  let routeGeneration = 0;
+  let subjectWorkspaceId = untrack(() => data.workspaceId);
+
+  // SvelteKit reuses this page across Subject and Workspace routes. A new
+  // loader snapshot owns a new editor and fences all previous mutations.
+  $effect(() => {
+    const workspaceId = data.workspaceId;
+    const subjectId = data.subjectId;
+    const loadedSubject = data.subject.data;
+    untrack(() => {
+      routeGeneration += 1;
+      subjectWorkspaceId = workspaceId;
+      subject = loadedSubject?.id === subjectId ? loadedSubject : null;
+      behaviorDraft = subject?.behavior_md ?? '';
+      editingBehavior = false;
+      behaviorSaving = false;
+      behaviorError = null;
+      behaviorSaveConfirmed = false;
+    });
+  });
+
+  async function saveBehavior(): Promise<void> {
+    if (!subject || behaviorSaving || subject.id !== data.subjectId || subjectWorkspaceId !== data.workspaceId) return;
+    const generation = routeGeneration;
+    const workspaceId = subjectWorkspaceId;
+    const subjectId = subject.id;
+    const request = {
+      expected_behavior_revision: subject.behavior_revision,
+      behavior_md: behaviorDraft,
+    };
+    const isCurrent = () => generation === routeGeneration &&
+      data.workspaceId === workspaceId && data.subjectId === subjectId;
+    behaviorSaving = true;
+    behaviorError = null;
+    behaviorSaveConfirmed = false;
+    try {
+      const updated = await updateSubjektivSubjectBehavior(fetch, workspaceId, subjectId, request);
+      if (!isCurrent()) return;
+      subject = updated;
+      behaviorDraft = updated.behavior_md;
+      editingBehavior = false;
+      behaviorSaveConfirmed = true;
+    } catch (error) {
+      if (!isCurrent()) return;
+      behaviorError = error instanceof SubjektivSubjectCreateError
+        ? (error.status === 401 || error.status === 403
+          ? 'You do not have permission to edit this Subject.'
+          : error.message)
+        : 'The save outcome is unknown. Reload the Subject before retrying.';
+    } finally {
+      if (isCurrent()) behaviorSaving = false;
+    }
+  }
+
+  function beginBehaviorEdit(): void {
+    if (!subject) return;
+    behaviorDraft = subject.behavior_md;
+    behaviorError = null;
+    behaviorSaveConfirmed = false;
+    editingBehavior = true;
+  }
+
+  function cancelBehaviorEdit(): void {
+    behaviorDraft = subject?.behavior_md ?? '';
+    behaviorError = null;
+    editingBehavior = false;
+  }
 
   const surface = $derived(data.surface.data);
   const snapshot = $derived(surface?.snapshot ?? null);
@@ -51,7 +128,7 @@
     if (availability !== 'ready') return 'No current generated context is available to use.';
     return snapshot?.body_md.trim()
       ? 'Current generated context is available.'
-      : 'A current empty surface exists; there is no resident context to show.';
+      : 'A current empty surface exists; there is no generated Memory context to show.';
   }
 
   function subjectStateLabel(state: 'active' | 'retired'): string {
@@ -60,7 +137,7 @@
 </script>
 
 <svelte:head>
-  <title>{data.subject.data?.role ?? data.subjectId} · Memory · Yoi Workspace</title>
+  <title>{subject?.role ?? data.subjectId} · Memory · Yoi Workspace</title>
   <meta name="description" content="Subject resident surface and current committed Memories" />
 </svelte:head>
 
@@ -70,23 +147,23 @@
   <header class="memory-page-header">
     <div>
       <p class="memory-eyebrow">Memory subject</p>
-      <h1 id="subject-heading">{data.subject.data?.role ?? data.subjectId}</h1>
+      <h1 id="subject-heading">{subject?.role ?? data.subjectId}</h1>
       <code class="subject-id" title={data.subjectId}>{data.subjectId}</code>
     </div>
-    <span class="read-only-label">Read-only</span>
+    <span class="read-only-label">Behavior editable</span>
   </header>
 
-  {#if data.subject.data}
+  {#if subject}
     <section class="subject-overview" aria-label="Subject status">
       <div>
         <span>Subject status</span>
-        <strong class="subject-state is-{data.subject.data.state}">{subjectStateLabel(data.subject.data.state)}</strong>
-        <p>{data.subject.data.state === 'active' ? 'Available for new Worker connections.' : 'No longer available for new Worker connections.'}</p>
+        <strong class="subject-state is-{subject.state}">{subjectStateLabel(subject.state)}</strong>
+        <p>{subject.state === 'active' ? 'Available for new Worker connections.' : 'No longer available for new Worker connections.'}</p>
       </div>
       <div>
         <span>Worker connection</span>
-        <strong>{data.subject.data.current_worker ? 'Connected' : 'Not connected'}</strong>
-        <p>{data.subject.data.current_worker?.display_name ?? 'No Worker currently owns this Subject connection.'}</p>
+        <strong>{subject.current_worker ? 'Connected' : 'Not connected'}</strong>
+        <p>{subject.current_worker?.display_name ?? 'No Worker currently owns this Subject connection.'}</p>
       </div>
       <div>
         <span>Committed Memories</span>
@@ -99,7 +176,7 @@
         {/if}
       </div>
       <div>
-        <span>Resident context</span>
+        <span>Generated Memory context</span>
         {#if surface}
           <strong class="availability is-{surface.availability}">{surfaceLabel(surface.availability)}</strong>
           <p>{surfaceSummary(surface.availability)}</p>
@@ -113,12 +190,12 @@
     <details class="subject-technical-details">
       <summary>Technical details</summary>
       <dl>
-        <div><dt>Subject ID</dt><dd><code>{data.subject.data.id}</code></dd></div>
+        <div><dt>Subject ID</dt><dd><code>{subject.id}</code></dd></div>
         <div>
           <dt>Subject store revision</dt>
-          <dd>{data.subject.data.store_revision}<small>Internal change number for committed Memories; not a Memory count or content-quality score.</small></dd>
+          <dd>{subject.store_revision}<small>Internal change number for committed Memories; not a Memory count or content-quality score.</small></dd>
         </div>
-        <div><dt>Last changed</dt><dd><time datetime={data.subject.data.updated_at}>{formatDate(data.subject.data.updated_at)}</time></dd></div>
+        <div><dt>Last changed</dt><dd><time datetime={subject.updated_at}>{formatDate(subject.updated_at)}</time></dd></div>
       </dl>
     </details>
   {:else if data.subject.error}
@@ -128,6 +205,40 @@
     </div>
   {:else}
     <div class="memory-state" role="status"><p>Subject details are unavailable.</p></div>
+  {/if}
+
+  {#if subject}
+    <section class="behavior-section" aria-labelledby="subject-behavior-heading">
+      <header class="section-heading">
+        <div>
+          <p class="memory-eyebrow">User-managed context</p>
+          <h2 id="subject-behavior-heading">Behavior</h2>
+        </div>
+        {#if !editingBehavior}
+          <button type="button" class="behavior-edit" onclick={beginBehaviorEdit}>Edit</button>
+        {/if}
+      </header>
+      <p class="behavior-help">The Host injects this text verbatim for connected Workers, separately from generated Memory. Saving confirms storage only. Connected Workers check for the latest revision before later model requests; this page does not report that application.</p>
+      {#if editingBehavior}
+        <form class="behavior-form" aria-busy={behaviorSaving} onsubmit={(event) => { event.preventDefault(); void saveBehavior(); }}>
+          <label>
+            <span class="sr-only">Subject behavior</span>
+            <textarea bind:value={behaviorDraft} rows="9" disabled={behaviorSaving} aria-invalid={behaviorError ? 'true' : undefined} aria-describedby={behaviorError ? 'subject-behavior-edit-error' : undefined}></textarea>
+          </label>
+          {#if behaviorError}<p id="subject-behavior-edit-error" class="behavior-error" role="alert">{behaviorError}</p>{/if}
+          <div class="behavior-actions">
+            <button type="submit" disabled={behaviorSaving}>{behaviorSaving ? 'Saving…' : 'Save behavior'}</button>
+            <button type="button" disabled={behaviorSaving} onclick={cancelBehaviorEdit}>Cancel</button>
+            <button type="button" disabled={behaviorSaving || behaviorDraft.length === 0} onclick={() => { behaviorDraft = ''; }}>Clear</button>
+          </div>
+        </form>
+      {:else if subject.behavior_md.length > 0}
+        <article class="behavior-document" aria-label="User-managed Subject behavior"><pre>{subject.behavior_md}</pre></article>
+      {:else}
+        <div class="memory-state" role="status"><strong>No behavior is set.</strong><p>Connected Workers receive an explicit empty behavior document.</p></div>
+      {/if}
+      {#if behaviorSaveConfirmed}<p class="behavior-saved" role="status">Behavior storage confirmed at revision {subject.behavior_revision}. This page does not confirm application by a connected Worker.</p>{/if}
+    </section>
   {/if}
 
   <section class="surface-section" aria-labelledby="resident-surface-heading">
@@ -434,12 +545,85 @@
     color: var(--danger);
   }
 
+  .behavior-section,
   .surface-section,
   .memories-section {
     display: grid;
     gap: var(--space-4);
     min-width: 0;
     padding-top: var(--space-3);
+  }
+
+  .behavior-help,
+  .behavior-saved,
+  .behavior-error {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: var(--font-size-compact);
+  }
+
+  .behavior-error { color: var(--danger); }
+  .behavior-saved { color: var(--success); }
+
+  .behavior-form,
+  .behavior-form label {
+    display: grid;
+    gap: var(--space-3);
+  }
+
+  .behavior-form textarea {
+    width: 100%;
+    min-height: 10rem;
+    padding: var(--space-3);
+    color: var(--text);
+    background: var(--surface-raised);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-sm);
+    font: inherit;
+    line-height: 1.5;
+    resize: vertical;
+  }
+
+  .behavior-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+
+  .behavior-edit,
+  .behavior-actions button {
+    padding: var(--space-2) var(--space-3);
+    color: var(--text);
+    background: var(--surface-raised);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+  }
+
+  .behavior-actions button:disabled { cursor: not-allowed; opacity: 0.55; }
+
+  .behavior-document pre {
+    margin: 0;
+    padding: var(--space-4);
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+    background: var(--surface-raised);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    font: inherit;
+    line-height: 1.6;
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   }
 
   .surface-meta,

@@ -38,7 +38,7 @@ use crate::hook::{
 use crate::ipc::notify_buffer::{NotifyBuffer, build_system_item_with_provenance};
 use crate::prompt::catalog::PromptCatalog;
 use crate::session_history::SessionHistoryMetadata;
-use crate::worker::SystemItemCommitter;
+use crate::worker::{SystemItemCommitter, SystemPromptContributionSource};
 use agen::HistoryEntry;
 use agen::token_counter::total_tokens;
 
@@ -109,6 +109,7 @@ pub(crate) struct WorkerInterceptor {
     /// worker. `None` in tests / `Worker::new` paths where no writer is
     /// attached.
     log_writer: Option<Arc<dyn SystemItemCommitter>>,
+    resident_context_source: Option<Arc<dyn SystemPromptContributionSource>>,
     pending_committed_history: Arc<Mutex<VecDeque<HistoryEntry<SessionHistoryMetadata>>>>,
     /// Next turn index assigned by `on_prompt_submit`.
     next_turn_index: AtomicUsize,
@@ -163,6 +164,7 @@ impl WorkerInterceptor {
             prompts,
             prompt_workspace_id: None,
             log_writer,
+            resident_context_source: None,
             pending_committed_history,
             next_turn_index: AtomicUsize::new(0),
             tool_calls_this_turn: AtomicUsize::new(0),
@@ -179,9 +181,29 @@ impl WorkerInterceptor {
         self
     }
 
+    pub(crate) fn with_resident_context_source(
+        mut self,
+        source: Option<Arc<dyn SystemPromptContributionSource>>,
+    ) -> Self {
+        self.resident_context_source = source;
+        self
+    }
+
     pub(crate) fn with_prompt_workspace_id(mut self, workspace_id: Option<String>) -> Self {
         self.prompt_workspace_id = workspace_id;
         self
+    }
+
+    fn confirm_resident_context_item(&self, item: &SystemItem) {
+        let Some(source) = self.resident_context_source.as_ref() else {
+            return;
+        };
+        if let SystemItem::SubjectBehaviorRefresh {
+            behavior_revision, ..
+        } = item
+        {
+            source.confirm_resident_context_revision(*behavior_revision);
+        }
     }
 
     /// Commit each `SystemItem` as its own `LogEntry::AnnotatedSystemItem`
@@ -211,6 +233,7 @@ impl WorkerInterceptor {
                 .lock()
                 .expect("pending committed history poisoned")
                 .push_back(entry);
+            self.confirm_resident_context_item(item);
         }
         Ok(())
     }
@@ -349,6 +372,11 @@ impl WorkerInterceptor {
                     prompt_provenance, ..
                 } if prompt_provenance.is_none() => {
                     *prompt_provenance = Some(provenance("internal.task_reminder"));
+                }
+                SystemItem::SubjectBehaviorRefresh {
+                    prompt_provenance, ..
+                } if prompt_provenance.is_none() => {
+                    *prompt_provenance = Some(provenance("internal.subjektiv_resident_context"));
                 }
                 SystemItem::Interrupt {
                     prompt_provenance, ..
@@ -763,6 +791,7 @@ mod tests {
         HookTurnEndAction, OnTurnEnd, PostToolCall, PreLlmRequest, PreToolCall,
     };
     use crate::session_history::{WorkerHistoryProvenance, history_entry};
+    use crate::worker::SystemPromptContribution;
 
     fn test_prompts() -> Arc<ArcSwap<PromptCatalog>> {
         Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap()))
@@ -856,6 +885,53 @@ mod tests {
                 system_items.append_task_reminder("hook reminder");
             }
             Ok(HookPreRequestAction::Continue)
+        }
+    }
+
+    struct AppendingSubjectBehaviorHook;
+
+    #[async_trait]
+    impl Hook<PreLlmRequest> for AppendingSubjectBehaviorHook {
+        async fn call(
+            &self,
+            input: &PreRequestContext,
+        ) -> Result<HookPreRequestAction, crate::hook::HookError> {
+            input
+                .system_items()
+                .expect("test interceptor has durable append authority")
+                .append_subject_behavior_refresh("current Subject context", 7);
+            Ok(HookPreRequestAction::Continue)
+        }
+    }
+
+    struct ConfirmRecordingResidentSource {
+        confirmed: Arc<Mutex<Vec<u64>>>,
+    }
+
+    #[async_trait]
+    impl SystemPromptContributionSource for ConfirmRecordingResidentSource {
+        async fn load(&self) -> SystemPromptContribution {
+            SystemPromptContribution::Unavailable
+        }
+
+        fn confirm_resident_context_revision(&self, revision: u64) {
+            self.confirmed.lock().unwrap().push(revision);
+        }
+    }
+
+    struct FailingSystemItemCommitter;
+
+    impl SystemItemCommitter for FailingSystemItemCommitter {
+        fn commit_log_entry(
+            &self,
+            entry: session_store::LogEntry,
+        ) -> Result<(), session_store::StoreError> {
+            if matches!(entry, session_store::LogEntry::AnnotatedSystemItem { .. }) {
+                return Err(session_store::StoreError::Io(std::io::Error::other(
+                    "synthetic system-item failure",
+                )));
+            }
+            Ok(())
         }
     }
 
@@ -1344,6 +1420,88 @@ mod tests {
             SystemItem::TaskReminder { body, .. } => assert!(body.contains("hook reminder")),
             other => panic!("unexpected committed system item: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn subject_behavior_revision_is_confirmed_only_after_durable_commit() {
+        let mut builder = HookRegistryBuilder::new();
+        builder.add_pre_llm_request(AppendingSubjectBehaviorHook);
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let confirmed = Arc::new(Mutex::new(Vec::new()));
+        let source: Arc<dyn SystemPromptContributionSource> =
+            Arc::new(ConfirmRecordingResidentSource {
+                confirmed: Arc::clone(&confirmed),
+            });
+        let interceptor = WorkerInterceptor::new(
+            Arc::new(builder.build()),
+            None,
+            None,
+            NotifyBuffer::new(),
+            Arc::new(Mutex::new(Vec::new())),
+            test_prompts(),
+            Some(Arc::new(RecordingSystemItemCommitter {
+                committed: Arc::clone(&committed),
+            })),
+        )
+        .with_resident_context_source(Some(source));
+
+        let mut ctx = Vec::new();
+        let action = interceptor
+            .pre_llm_request(PreLlmRequestContext {
+                invocation: Default::default(),
+                items: &mut ctx,
+                history: &[],
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(action, PreRequestAction::ContinueWith(_)));
+        assert_eq!(*confirmed.lock().unwrap(), [7]);
+        assert!(matches!(
+            committed.lock().unwrap().as_slice(),
+            [SystemItem::SubjectBehaviorRefresh {
+                behavior_revision: 7,
+                prompt_provenance: Some(_),
+                ..
+            }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_subject_behavior_persistence_does_not_confirm_revision() {
+        let mut builder = HookRegistryBuilder::new();
+        builder.add_pre_llm_request(AppendingSubjectBehaviorHook);
+        let confirmed = Arc::new(Mutex::new(Vec::new()));
+        let source: Arc<dyn SystemPromptContributionSource> =
+            Arc::new(ConfirmRecordingResidentSource {
+                confirmed: Arc::clone(&confirmed),
+            });
+        let interceptor = WorkerInterceptor::new(
+            Arc::new(builder.build()),
+            None,
+            None,
+            NotifyBuffer::new(),
+            Arc::new(Mutex::new(Vec::new())),
+            test_prompts(),
+            Some(Arc::new(FailingSystemItemCommitter)),
+        )
+        .with_resident_context_source(Some(source));
+
+        let mut ctx = Vec::new();
+        let action = interceptor
+            .pre_llm_request(PreLlmRequestContext {
+                invocation: Default::default(),
+                items: &mut ctx,
+                history: &[],
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            action,
+            PreRequestAction::Cancel(reason) if reason.contains("session persistence failed")
+        ));
+        assert!(confirmed.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

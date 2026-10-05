@@ -111,6 +111,7 @@ async function openSubjectPage(
 
     await hideSidebar.click();
     await showSidebar.waitFor();
+    await page.waitForTimeout(250);
     assertEquals(await showSidebar.getAttribute("aria-expanded"), "false");
     assertEquals(
       await page.locator("main").evaluate((main) => (main as unknown as { inert: boolean }).inert),
@@ -217,6 +218,13 @@ Deno.test("production subject Memory and Worker launch shells preserve exact sco
         });
         page.on("pageerror", (error) => errors.push(String(error)));
         await openSubjectPage(page, baseUrl, scenario.mobile);
+        assertEquals(
+          await page.getByRole("article", { name: "User-managed Subject behavior" }).count(),
+          1,
+        );
+        await page.screenshot({
+          path: join(createInteractionArtifacts, `subject-${scenario.label}.png`),
+        });
 
         const initial = await mainScrollState(page);
         assert(initial.scrollHeight > initial.clientHeight);
@@ -434,7 +442,9 @@ Deno.test("production subject Memory and Worker launch shells preserve exact sco
       const createPage = await createContext.newPage();
       const mutationPaths: string[] = [];
       createPage.on("request", (request) => {
-        if (request.method() === "POST") mutationPaths.push(new URL(request.url()).pathname);
+        if (["POST", "PATCH"].includes(request.method())) {
+          mutationPaths.push(new URL(request.url()).pathname);
+        }
       });
       await createPage.goto(`${baseUrl}/w/${workspaceId}/memory?cursor=${subjectPageCursor}`);
       await createPage.getByText("Subject on the next page").waitFor();
@@ -453,9 +463,21 @@ Deno.test("production subject Memory and Worker launch shells preserve exact sco
       await createPage.getByRole("button", { name: "Cancel" }).click();
       await createPage.getByRole("button", { name: "New Subject" }).click();
       await createPage.getByRole("textbox", { name: "Role" }).fill("  Release steward  ");
+      await createPage.getByRole("textbox", { name: /Behavior/ }).fill(
+        "Challenge unsupported assumptions before release.",
+      );
       await createPage.getByRole("button", { name: "Create Subject" }).click();
       await createPage.waitForURL("**/memory/created-subject-0001");
       await createPage.getByRole("heading", { name: "Release steward", level: 1 }).waitFor();
+      assertEquals(
+        await createPage.getByRole("article", { name: "User-managed Subject behavior" }).count(),
+        1,
+      );
+      assert(
+        (await createPage.getByRole("article", {
+          name: "User-managed Subject behavior",
+        }).textContent())?.includes("Challenge unsupported assumptions before release."),
+      );
       assertEquals(
         await createPage.locator("code.subject-id", { hasText: "created-subject-0001" }).count(),
         1,
@@ -466,15 +488,40 @@ Deno.test("production subject Memory and Worker launch shells preserve exact sco
       assert((await currentWorker.textContent())?.includes("Not connected"));
       await createPage.getByText("Resident context has not been generated.").waitFor();
       await createPage.getByText("No committed Memories yet.").waitFor();
+      await createPage.getByRole("button", { name: "Edit" }).click();
+      const behaviorEditor = createPage.getByRole("textbox", { name: "Subject behavior" });
+      await behaviorEditor.fill(
+        "Challenge unsupported assumptions before release.\nName the evidence and any remaining uncertainty.",
+      );
+      await createPage.screenshot({
+        path: join(createInteractionArtifacts, "behavior-edit-desktop-light.png"),
+      });
+      await createPage.getByRole("button", { name: "Save behavior" }).click();
+      await createPage.getByText(/Behavior storage confirmed at revision 1/).waitFor();
+      assert(
+        (await createPage.getByRole("status").filter({
+          hasText: "This page does not confirm application",
+        }).textContent())?.includes("does not confirm application"),
+      );
+      await createPage.screenshot({
+        path: join(createInteractionArtifacts, "behavior-saved-desktop-light.png"),
+      });
       assertEquals(mutationPaths, [
         `/api/w/${workspaceId}/subjektiv/subjects`,
         `/api/w/${workspaceId}/subjektiv/subjects`,
+        `/api/w/${workspaceId}/subjektiv/subjects/created-subject-0001/behavior`,
       ]);
       const createEvidence = await (await fetch(`${baseUrl}/fixture/subject-create-requests`))
         .json();
       assertEquals(createEvidence, {
         count: 2,
-        requests: [{ role: "Permission denied" }, { role: "  Release steward  " }],
+        requests: [
+          { role: "Permission denied", behavior_md: "" },
+          {
+            role: "  Release steward  ",
+            behavior_md: "Challenge unsupported assumptions before release.",
+          },
+        ],
       });
       await assertNoPageWideOverflow(createPage);
       await createContext.close();

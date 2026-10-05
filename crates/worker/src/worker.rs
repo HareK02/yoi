@@ -2361,9 +2361,30 @@ pub(crate) enum SystemPromptContribution {
     Unavailable,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResidentContextRefresh {
+    pub body: String,
+    pub revision: u64,
+}
+
 #[async_trait::async_trait]
 pub(crate) trait SystemPromptContributionSource: Send + Sync {
     async fn load(&self) -> SystemPromptContribution;
+
+    /// Returns a durable model-visible refresh only when user-managed resident
+    /// context changed since the last successful load.
+    async fn load_changed_resident_context(
+        &self,
+    ) -> Result<Option<ResidentContextRefresh>, String> {
+        Ok(None)
+    }
+
+    /// Acknowledges that the revision's typed refresh was durably committed.
+    fn confirm_resident_context_revision(&self, _revision: u64) {}
+
+    /// Invalidates the in-memory representation fence before history may be
+    /// compacted or rewound.
+    fn invalidate_resident_context_representation(&self) {}
 }
 
 #[derive(Debug, Clone)]
@@ -3840,6 +3861,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             )
             .with_usage_tracker(self.usage_tracker.clone())
             .with_metrics_tracker(self.metrics_tracker.clone())
+            .with_resident_context_source(self.feature_resident_summary_source.clone())
             .with_prompt_workspace_id(
                 self.workspace_context
                     .workspace_id()
@@ -9224,16 +9246,20 @@ mod build_summary_prompt_tests {
                 serde_json::from_str(request.body.as_deref().unwrap_or_default()).unwrap();
             assert!(matches!(
                 request.operation,
-                server_api::SubjektivMemoryBackendOperation::ResidentSummary(_)
+                server_api::SubjektivMemoryBackendOperation::ResidentContext(_)
             ));
             self.load_count.fetch_add(1, Ordering::SeqCst);
             Ok(WorkspaceResponse {
                 status: 200,
                 body: serde_json::to_string(
-                    &server_api::SubjektivMemoryBackendResponse::ResidentSummary(
-                        memory::backend::MemoryResidentSummaryOutput {
-                            availability: self.availability,
-                            content: self.content.clone(),
+                    &server_api::SubjektivMemoryBackendResponse::ResidentContext(
+                        server_api::SubjektivResidentContextOutput {
+                            behavior_md: "restore behavior".to_string(),
+                            behavior_revision: 1,
+                            memory_surface: memory::backend::MemoryResidentSummaryOutput {
+                                availability: self.availability,
+                                content: self.content.clone(),
+                            },
                         },
                     ),
                 )
@@ -9254,7 +9280,9 @@ mod build_summary_prompt_tests {
             load_count: Arc::clone(&load_count),
         });
         let source = crate::feature::builtin::memory::ordinary_subjektiv_resident_summary_source(
-            manifest, client,
+            manifest,
+            client,
+            Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap())),
         )
         .unwrap()
         .unwrap();
@@ -12219,9 +12247,10 @@ permission = "write"
             .unwrap()
             .to_string();
         assert!(
-            empty_boundary.contains("current ready resident memory surface is intentionally empty")
+            empty_boundary
+                .contains("current generated Memory surface is ready and intentionally empty")
         );
-        assert!(!empty_boundary.contains("No current ready resident memory surface"));
+        assert!(!empty_boundary.contains("No generated Memory surface exists yet"));
         drop(empty_restore);
 
         for availability in [
@@ -12273,7 +12302,22 @@ permission = "write"
                 .as_text()
                 .unwrap()
                 .to_string();
-            assert!(tombstone.contains("No current ready resident memory surface"));
+            let unavailable_message = match availability {
+                memory::backend::MemoryResidentSummaryAvailability::Ungenerated => {
+                    "No generated Memory surface exists yet"
+                }
+                memory::backend::MemoryResidentSummaryAvailability::Stale => {
+                    "generated Memory surface is stale"
+                }
+                memory::backend::MemoryResidentSummaryAvailability::Failed => {
+                    "Generation of the Memory surface failed"
+                }
+                memory::backend::MemoryResidentSummaryAvailability::Unavailable => {
+                    "Host could not fetch the Subject resident context"
+                }
+                memory::backend::MemoryResidentSummaryAvailability::Ready => unreachable!(),
+            };
+            assert!(tombstone.contains(unavailable_message));
             assert!(!tombstone.contains("latest subject surface"));
             assert!(!tombstone.contains("LEGACY_MEMORY_SENTINEL_MUST_NOT_REFRESH"));
             let entries = store.read_all(session_id, segment_id).unwrap();
@@ -13288,6 +13332,86 @@ permission = "write"
         let state = handle.state.lock().unwrap();
         assert_eq!(state.pending_notifications[0].provenance, account_a);
         assert_eq!(state.pending_notifications[1].provenance, account_b);
+    }
+
+    #[test]
+    fn notification_lost_acceptance_retry_after_restore_commits_once_not_by_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let handle = PendingSubmissionHandle::for_test(temp.path());
+        let source = "backend:orchestrator-attention";
+        let accept = |handle: &PendingSubmissionHandle<session_store::FsStore>, id: &str| {
+            handle
+                .accept_notification_from_source(
+                    id.into(),
+                    "Queued Tickets require attention".into(),
+                    source.into(),
+                    WorkerHistoryProvenance::BackendInstruction { operation_id: None },
+                )
+                .unwrap()
+        };
+        // The sender lost this acceptance response; the receipt is already durable.
+        assert!(accept(&handle, "attention-1"));
+        let restored_state: PendingActivationState = handle
+            .persisted_entries_for_test()
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                LogEntry::Extension {
+                    domain, payload, ..
+                } if domain == SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN => {
+                    Some(serde_json::from_value(payload.clone()).unwrap())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(restored_state.notification_receipts.len(), 1);
+        let handle = PendingSubmissionHandle {
+            state: Arc::new(Mutex::new(restored_state)),
+            writer: handle.writer.clone(),
+        };
+        assert!(!accept(&handle, "attention-1"));
+        let commit_batch = |handle: &PendingSubmissionHandle<session_store::FsStore>| {
+            let batch = handle.prepare_notification_batch();
+            let count = batch.len();
+            for (notification, extension) in batch {
+                handle
+                    .writer
+                    .commit_system_item_with_extensions(
+                        SystemItem::Notification {
+                            body: notification.message.clone(),
+                            message: notification.message,
+                            prompt_provenance: None,
+                        },
+                        vec![extension],
+                        Some(notification.provenance),
+                    )
+                    .unwrap();
+            }
+            handle.finish_notification_batch();
+            count
+        };
+        assert_eq!(commit_batch(&handle), 1);
+        assert!(!accept(&handle, "attention-1"));
+        assert_eq!(commit_batch(&handle), 0);
+        let notification_count = |handle: &PendingSubmissionHandle<session_store::FsStore>| {
+            handle
+                .persisted_entries_for_test()
+                .iter()
+                .filter(|entry| {
+                    matches!(entry,
+                        LogEntry::AnnotatedSystemItem { entry, .. }
+                            if matches!(entry.item, SystemItem::Notification { .. })
+                    )
+                })
+                .count()
+        };
+        assert_eq!(notification_count(&handle), 1);
+        assert_eq!(handle.state.lock().unwrap().notification_receipts.len(), 1);
+        // Same body with a new logical ID is legitimate, not content-deduped.
+        assert!(accept(&handle, "attention-2"));
+        assert_eq!(commit_batch(&handle), 1);
+        assert_eq!(notification_count(&handle), 2);
+        assert_eq!(handle.state.lock().unwrap().notification_receipts.len(), 2);
     }
 
     #[test]
