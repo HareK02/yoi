@@ -17,6 +17,7 @@ import type {
 import type { Worker } from "#lib/workspace/sidebar/types.ts";
 import { EditorView } from "@codemirror/view";
 import * as alerts from "#lib/workspace/alerts/store.ts";
+import * as consoleModel from "#lib/workspace/console/model.ts";
 import ConsolePage from "./+page.svelte";
 
 // happy-dom does not implement Web Animations. Motion itself is covered in Chromium.
@@ -228,6 +229,116 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+});
+
+function subworkerFrame() {
+  const child = { session_id: "child-session", name: "reviewer", kind: "sub_worker" as const };
+  const session = sessionWithUserMessage("child question");
+  const reply = {
+    kind: "message" as const, entry_id: "child-reply", timestamp: 2,
+    provenance: "model_output" as const, role: "assistant" as const,
+    content: [{ kind: "text" as const, text: "child answer" }],
+  };
+  session.entries.push(reply, { ...reply, entry_id: "child-reply-2" });
+  const snapshot = snapshotEvent(sessionWithUserMessage("parent question")) as Extract<ProtocolEvent, { event: "snapshot" }>;
+  snapshot.data.internal_workers = [{
+    worker: child, revision: 5, session, status: "idle",
+    in_flight: { blocks: [] }, internal_workers: [],
+  }];
+  const frame = subscribedFrame();
+  frame.message.payload.snapshot.data.events = [snapshot, ...[6, 7].map((revision): ProtocolEvent => ({
+    event: "internal_worker", data: {
+      worker: child, revision, event: { event: "session_entry_committed", data: { entry: reply } },
+    },
+  }))];
+  return frame;
+}
+
+function mockLiveSessionFetch() {
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => Response.json(
+    String(input).includes("/session/history") ? emptyHistoryPage() : { availability: "live_protocol" },
+  )));
+}
+
+test("switching to a SubWorker after snapshot/commit overlap renders each entry once in both modes", async () => {
+  mockLiveSessionFetch();
+  vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(2000);
+  vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(300);
+  const view = render(ConsolePage, { data: pageData() });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
+  latestListener().onFrame(subworkerFrame());
+  await screen.findByText("parent question");
+  const mainScroll = view.container.querySelector(".console-scroll") as HTMLElement;
+  mainScroll.scrollTop = 250;
+  await fireEvent.scroll(mainScroll);
+  const selector = await screen.findByRole("group", { name: "Worker transcript view" });
+  await fireEvent.click(within(selector).getByRole("button", { name: "reviewer" }));
+  const transcript = await screen.findByRole("article", { name: "reviewer transcript" });
+  const assertEntries = () => {
+    const ids = [...transcript.querySelectorAll("[data-console-line-id]")].map((line) => line.getAttribute("data-console-line-id"));
+    expect(ids).toHaveLength(3);
+    expect(new Set(ids).size).toBe(3);
+    expect(within(transcript).getAllByText("child answer")).toHaveLength(2);
+    expect(within(transcript).queryByText("parent question")).toBeNull();
+    expect(screen.queryByText("Unable to display conversation")).toBeNull();
+  };
+  assertEntries();
+  await fireEvent.click(screen.getByRole("switch", { name: "Overview" }));
+  assertEntries();
+  const childScroll = view.container.querySelector(".console-scroll") as HTMLElement;
+  childScroll.scrollTop = 140;
+  await fireEvent.scroll(childScroll);
+  await fireEvent.click(within(selector).getByRole("button", { name: "main" }));
+  expect(await screen.findByText("parent question")).toBeTruthy();
+  expect(screen.queryByText("child answer")).toBeNull();
+  await waitFor(() => expect(view.container.querySelector(".console-scroll")?.scrollTop).toBe(250));
+  await fireEvent.click(within(selector).getByRole("button", { name: "reviewer" }));
+  await waitFor(() => expect(view.container.querySelector(".console-scroll")?.scrollTop).toBe(140));
+  expect(multiplexer.close).not.toHaveBeenCalled();
+});
+
+test.each(["switch", "retry"] as const)("a transcript rendering failure stays local and allows %s recovery", async (recovery) => {
+  mockLiveSessionFetch();
+  const project = consoleModel.projectConsoleLines;
+  const projection = vi.spyOn(consoleModel, "projectConsoleLines").mockImplementation((lines, mode) => {
+    const result = project(lines, mode);
+    // Deliberately inject a renderer defect after projection to exercise the
+    // actual Svelte each_key_duplicate boundary, independently of deduplication.
+    const childReply = result.find((line) => line.entryId === "child-reply");
+    return childReply ? [...result, childReply] : result;
+  });
+  const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+  const view = render(ConsolePage, { data: pageData() });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
+  latestListener().onFrame(subworkerFrame());
+  await screen.findByText("parent question");
+  const composer = EditorView.findFromDOM(view.container.querySelector(".cm-editor") as HTMLElement)!;
+  composer.dispatch({ changes: { from: 0, insert: "keep my draft" } });
+  const selector = screen.getByRole("group", { name: "Worker transcript view" });
+  await fireEvent.click(within(selector).getByRole("button", { name: "reviewer" }));
+  const failure = await screen.findByRole("alert");
+  expect(within(failure).getByText("Unable to display conversation")).toBeTruthy();
+  expect(errorLog).toHaveBeenCalledWith("Console transcript rendering failed", expect.any(Error));
+  expect(screen.queryByText("The selected Workspace cannot be opened")).toBeNull();
+  expect(EditorView.findFromDOM(view.container.querySelector(".cm-editor") as HTMLElement)).toBe(composer);
+  expect(composer.state.doc.toString()).toBe("keep my draft");
+  expect(multiplexer.close).not.toHaveBeenCalled();
+  expect(multiplexer.sendWorkerMethod).not.toHaveBeenCalled();
+  if (recovery === "switch") {
+    await fireEvent.click(within(selector).getByRole("button", { name: "main" }));
+    expect(await screen.findByText("parent question")).toBeTruthy();
+  } else {
+    projection.mockRestore();
+    const recoveredProjection = vi.spyOn(consoleModel, "projectConsoleLines");
+    // Wait for the queued snapshot to reach projection before retrying the renderer.
+    latestListener().onFrame(subworkerFrame());
+    await waitFor(() => expect(recoveredProjection).toHaveBeenCalled());
+    await fireEvent.click(within(failure).getByRole("button", { name: "Retry display" }));
+    expect(await screen.findAllByText("child answer")).toHaveLength(2);
+  }
+  expect(screen.queryByText("Unable to display conversation")).toBeNull();
+  expect(composer.state.doc.toString()).toBe("keep my draft");
+  expect(multiplexer.subscribe).toHaveBeenCalledOnce();
 });
 
 test.each(["live_protocol", "retained_snapshot"] as const)("overlapping history and %s render tool activity once in both modes", async (availability) => {

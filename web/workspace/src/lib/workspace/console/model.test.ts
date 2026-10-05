@@ -3645,6 +3645,81 @@ Deno.test("new invoke resets stats before the next RunEnd", () => {
   assertEquals(projection.lines.at(-1)?.body, "0s ・0 reqs ↑0/↓0");
 });
 
+Deno.test("snapshot and replayed commits preserve one row per entry without consuming the next live reply", () => {
+  const entry: SessionSnapshotEntry = {
+    kind: "message", entry_id: "assistant-durable", timestamp: 1,
+    provenance: "model_output", role: "assistant",
+    content: [{ kind: "text", text: "same answer" }],
+  };
+  const snapshot = snapshotEvent("/repo") as SnapshotEvent;
+  snapshot.data.session.entries = [entry];
+  const events: ConsoleEventInput[] = [
+    { eventId: "snapshot", event: snapshot },
+    { eventId: "next-reply", event: { event: "text_done", data: { text: "next reply" } } },
+    { eventId: "replayed-commit", event: { event: "session_entry_committed", data: { entry } } },
+    { eventId: "replayed-again", event: { event: "session_entry_committed", data: { entry } } },
+  ];
+  const projector = createConsoleProjector();
+  for (const event of events) projector.append([event]);
+  const lines = projector.snapshot().lines;
+  assertEquals(lines.map((line) => line.body), ["same answer", "next reply"]);
+  assertEquals(lines.map((line) => line.entryId), ["assistant-durable", undefined]);
+  assertEquals(new Set(lines.map((line) => line.id)).size, lines.length);
+  assertEquals(projectConsole(events).lines, lines);
+});
+
+Deno.test("snapshot entry replay is idempotent by identity, not text, including direct SubWorkers", () => {
+  const user: SessionSnapshotEntry = {
+    kind: "user_input", entry_id: "user-durable", timestamp: 1,
+    provenance: "human_input", segments: [{ kind: "text", content: "question" }],
+  };
+  const assistant: SessionSnapshotEntry = {
+    kind: "message", entry_id: "assistant-durable", timestamp: 2,
+    provenance: "model_output", role: "assistant",
+    content: [{ kind: "text", text: "same answer" }],
+  };
+  const system: SessionSnapshotEntry = {
+    kind: "system_item", entry_id: "system-durable", timestamp: 3,
+    provenance: "backend_instruction", item_kind: "notice", content: "notice",
+    data: { kind: "notice", body: "notice" },
+  };
+  const entries = [user, assistant, system, user, assistant, system,
+    { ...assistant, entry_id: "another-assistant" }];
+  const expectedIds = ["user-durable", "assistant-durable", "system-durable", "another-assistant"];
+  assertEquals(projectSessionHistoryEntries(entries, null).map((line) => line.entryId), expectedIds);
+
+  const child = { session_id: "child-session", name: "reviewer", kind: "sub_worker" as const };
+  const snapshot = snapshotEvent("/repo") as SnapshotEvent;
+  snapshot.data.internal_workers = [{
+    worker: child, revision: 5,
+    session: { ...snapshot.data.session, entries }, status: "idle",
+    in_flight: { blocks: [] }, internal_workers: [],
+  }];
+  const events: ConsoleEventInput[] = [{ eventId: "parent-snapshot", event: snapshot }];
+  for (const [index, entry] of [user, assistant, system].entries()) {
+    events.push({ eventId: `parent-${index}`, event: {
+      event: "internal_worker", data: {
+        worker: child, revision: 6 + index,
+        event: { event: "session_entry_committed", data: { entry } },
+      },
+    } });
+  }
+  events.push({ eventId: "replayed-user", event: {
+    event: "internal_worker", data: { worker: child, revision: 9, event: {
+      event: "user_message", data: { entry_id: user.entry_id, segments: user.segments },
+    } },
+  } });
+  const projection = projectConsole(events);
+  assertEquals(projection.lines, []);
+  const lines = resolveConsoleWorkerView(projection, child.session_id).console.lines;
+  assertEquals(lines.map((line) => line.entryId), expectedIds);
+  for (const mode of ["normal", "overview"] as const) {
+    const visible = projectConsoleLines(lines, mode);
+    assertEquals(new Set(visible.map((line) => line.id)).size, visible.length);
+    assertEquals(visible.filter((line) => line.body === "same answer").length, 2);
+  }
+});
+
 Deno.test("committed assistant identity reconciles the live block without text matching", () => {
   const lines = projectConsole([
     {

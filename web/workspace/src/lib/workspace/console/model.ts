@@ -1048,6 +1048,7 @@ export function applyProtocolEvent(
 
   switch (event.event) {
     case "user_message":
+      if (event.data.entry_id && next.lines.some((line) => line.entryId === event.data.entry_id)) break;
       next.lines.push({
         ...line(
           envelope.eventId,
@@ -1059,6 +1060,9 @@ export function applyProtocolEvent(
       });
       break;
     case "session_entry_committed": {
+      // A snapshot may already include this commit. Check before reconciling so
+      // replay cannot consume a later, unrelated live assistant block.
+      if (isRepeatedSessionEntry(next, event.data.entry)) break;
       const replacementIndex = reconcileCommittedSessionEntry(
         next,
         event.data.entry,
@@ -2332,12 +2336,25 @@ function reconcileCommittedSessionEntry(
   }
 }
 
+function isRepeatedSessionEntry(
+  projection: ConsoleProjection,
+  entry: Record<string, unknown>,
+): boolean {
+  // Tool entries update an existing call row, and a result may be corrected
+  // under the same entry_id (for example, provider image rejection).
+  const kind = stringField(entry, "kind");
+  if (kind === "tool_call" || kind === "tool_result") return false;
+  const entryId = stringField(entry, "entry_id");
+  return entryId !== undefined &&
+    projection.lines.some((line) => line.entryId === entryId);
+}
+
 function applySessionEntry(
   projection: ConsoleProjection,
   fallbackEventId: string,
   value: unknown,
 ): void {
-  if (!isRecord(value)) return;
+  if (!isRecord(value) || isRepeatedSessionEntry(projection, value)) return;
   const eventId = stringField(value, "entry_id") ?? fallbackEventId;
   const lineCountBefore = projection.lines.length;
   switch (stringField(value, "kind")) {

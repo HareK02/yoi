@@ -167,7 +167,7 @@
     let selectedWorkerViewSessionId = $state<string | null>(null);
     let workerViewSelectionGeneration = 0;
     let consoleViewMode = $state<ConsoleViewMode>("overview");
-    let consoleBodyElement: HTMLElement | null = null;
+    let consoleBodyElement = $state<HTMLElement | null>(null);
     let turnNavigationElement = $state<HTMLElement | null>(null);
     let composerInputElement = $state<
         (SvelteComponent & ComposerInputHandle) | null
@@ -1685,6 +1685,8 @@
         </section>
     {/if}
 
+    {#key selectedHistoryKey}
+    <svelte:boundary onerror={(error) => console.error("Console transcript rendering failed", error)}>
     <div class:with-task-pane={taskPaneOpen} class="console-history">
         <section class="console-body">
         <div
@@ -1768,6 +1770,15 @@
             <ConsoleTasks {tasks} mode="pane" paneId="console-task-pane" />
         {/if}
     </div>
+    {#snippet failed(_error, reset)}
+        <section class="card" role="alert">
+            <h2>Unable to display conversation</h2>
+            <p>This transcript could not be rendered. Try again or select another Worker view.</p>
+            <button type="button" class="secondary-button" onclick={reset}>Retry display</button>
+        </section>
+    {/snippet}
+    </svelte:boundary>
+    {/key}
 
     {#if workerDetailsOpen}
         <aside class="console-side-panel" aria-label="Worker detail">
