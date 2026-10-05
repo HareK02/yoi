@@ -2430,9 +2430,10 @@ impl Runtime {
         worker_ref: &WorkerRef,
         kind: protocol::CompletionKind,
         prefix: &str,
+        context: Option<&protocol::CompletionContext>,
     ) -> Result<Vec<protocol::CompletionEntry>, RuntimeError> {
         self.ensure_worker_in_workspace(scope, worker_ref)?;
-        self.worker_completions(worker_ref, kind, prefix)
+        self.worker_completions(worker_ref, kind, prefix, context)
     }
 
     /// Return live completion entries for the Worker composer.
@@ -2441,6 +2442,7 @@ impl Runtime {
         worker_ref: &WorkerRef,
         kind: protocol::CompletionKind,
         prefix: &str,
+        context: Option<&protocol::CompletionContext>,
     ) -> Result<Vec<protocol::CompletionEntry>, RuntimeError> {
         let (backend, handle) = {
             let state = self.lock()?;
@@ -2457,7 +2459,7 @@ impl Runtime {
         let Some((backend, handle)) = backend.zip(handle) else {
             return Ok(Vec::new());
         };
-        Ok(backend.worker_completions(&handle, kind, prefix))
+        Ok(backend.worker_completions(&handle, kind, prefix, context))
     }
 
     /// Accept a protocol method through a workspace-scoped Runtime authorization context.
@@ -2482,9 +2484,21 @@ impl Runtime {
         worker_ref: &WorkerRef,
         method: Method,
     ) -> Result<Vec<Event>, RuntimeError> {
-        if let Method::ListCompletions { kind, prefix } = method {
-            let entries = self.worker_completions(worker_ref, kind, &prefix)?;
-            return Ok(vec![Event::Completions { kind, entries }]);
+        if let Method::ListCompletions {
+            kind,
+            prefix,
+            request_id,
+            context,
+        } = method
+        {
+            let entries = self.worker_completions(worker_ref, kind, &prefix, context.as_ref())?;
+            return Ok(vec![Event::Completions {
+                kind,
+                prefix,
+                request_id,
+                context,
+                entries,
+            }]);
         }
         if matches!(&method, Method::Shutdown { .. }) {
             self.stop_worker(worker_ref, Some("worker protocol shutdown".to_string()))?;
@@ -5490,7 +5504,29 @@ fn validate_create_workspace_scope(
     Ok(())
 }
 
-fn validate_worker_input(input: &WorkerInput) -> Result<(), RuntimeError> {
+pub(crate) fn validate_worker_input(input: &WorkerInput) -> Result<(), RuntimeError> {
+    if input.segments.as_ref().is_some_and(|segments| {
+        segments
+            .iter()
+            .any(|segment| matches!(segment, protocol::Segment::Unknown))
+    }) {
+        return Err(RuntimeError::InvalidRequest(
+            "unsupported typed input must not be discarded; use a compatible client and host"
+                .into(),
+        ));
+    }
+    if !matches!(
+        input.kind,
+        WorkerInputKind::User | WorkerInputKind::UserIfIdle
+    ) && input.segments.as_ref().is_some_and(|segments| {
+        segments
+            .iter()
+            .any(|segment| !matches!(segment, protocol::Segment::Text { .. }))
+    }) {
+        return Err(RuntimeError::InvalidRequest(
+            "Notify and control inputs cannot carry typed submission intent; use Submit".into(),
+        ));
+    }
     let has_segments = input
         .segments
         .as_ref()
@@ -6500,6 +6536,13 @@ mod tests {
         workspace_config_results: Mutex<Vec<WorkspaceConfigFetchResult>>,
         contexts: Mutex<BTreeMap<WorkerId, WorkerExecutionContext>>,
         dispatched_inputs: Mutex<Vec<WorkerInput>>,
+        completion_queries: Mutex<
+            Vec<(
+                protocol::CompletionKind,
+                String,
+                Option<protocol::CompletionContext>,
+            )>,
+        >,
         repository_accesses: Mutex<Vec<WorkingDirectoryRepositoryAccessRequest>>,
         repository_access_available: AtomicBool,
         working_directory_requests: Mutex<Vec<WorkingDirectoryRequest>>,
@@ -6677,6 +6720,23 @@ mod tests {
             }
         }
 
+        fn worker_completions(
+            &self,
+            _handle: &WorkerExecutionHandle,
+            kind: protocol::CompletionKind,
+            prefix: &str,
+            context: Option<&protocol::CompletionContext>,
+        ) -> Vec<protocol::CompletionEntry> {
+            self.completion_queries
+                .lock()
+                .unwrap()
+                .push((kind, prefix.into(), context.cloned()));
+            vec![protocol::CompletionEntry {
+                value: "資料/a b".into(),
+                ..Default::default()
+            }]
+        }
+
         fn dispatch_input(
             &self,
             _handle: &WorkerExecutionHandle,
@@ -6814,6 +6874,107 @@ mod tests {
             .build()
             .unwrap()
             .block_on(subscription.recv())
+    }
+
+    #[test]
+    fn unknown_typed_intent_is_rejected_before_backend_dispatch() {
+        let (runtime, backend) = runtime_and_backend();
+        let worker = runtime
+            .create_worker(task_request("unsupported input"))
+            .unwrap();
+        let mut input = WorkerInput::user("normal prose");
+        input.segments = Some(vec![
+            protocol::Segment::text("normal prose"),
+            protocol::Segment::Unknown,
+        ]);
+        assert!(matches!(
+            runtime.send_input(&worker.worker_ref, input),
+            Err(RuntimeError::InvalidRequest(_))
+        ));
+        assert!(backend.dispatched_inputs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn notify_rejects_typed_feature_intent_before_backend_dispatch() {
+        let (runtime, backend) = runtime_and_backend();
+        let worker = runtime.create_worker(task_request("notification")).unwrap();
+        let invoke = protocol::Segment::FeatureInvoke {
+            invocation: protocol::FeatureInvocation {
+                invocation_id: "not-executed".into(),
+                identity: protocol::FeatureInvocationIdentity("builtin:test/run".into()),
+                name: "run".into(),
+                arguments: Vec::new(),
+            },
+        };
+        let mut input = WorkerInput::user("/run()");
+        input.kind = WorkerInputKind::Notify;
+        input.segments = Some(vec![invoke]);
+        assert!(matches!(
+            runtime.send_input(&worker.worker_ref, input),
+            Err(RuntimeError::InvalidRequest(_))
+        ));
+        assert!(backend.dispatched_inputs.lock().unwrap().is_empty());
+        let mut text = WorkerInput::user("/run() advisory text");
+        text.kind = WorkerInputKind::Notify;
+        assert!(
+            runtime
+                .send_input(&worker.worker_ref, text)
+                .unwrap()
+                .notification
+                .is_some()
+        );
+        assert_eq!(backend.dispatched_inputs.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn feature_argument_completions_preserve_context_and_workspace_authority() {
+        let (runtime, backend) = runtime_and_backend();
+        let owner = scope("workspace-a", "server-a");
+        let worker = runtime
+            .create_worker_scoped(&owner, scoped_task_request("completion", "workspace-a"))
+            .unwrap();
+        let context = protocol::CompletionContext {
+            invocation: protocol::FeatureInvocationIdentity("builtin:test/prepare".into()),
+            argument: Some("path".into()),
+        };
+        let events = runtime
+            .send_protocol_method_scoped(
+                &owner,
+                &worker.worker_ref,
+                Method::ListCompletions {
+                    kind: protocol::CompletionKind::FeatureArgument,
+                    prefix: "資料/".into(),
+                    request_id: Some("query-current".into()),
+                    context: Some(context.clone()),
+                },
+            )
+            .unwrap();
+        assert!(
+            matches!(&events[0], Event::Completions { kind: protocol::CompletionKind::FeatureArgument, prefix, request_id: Some(request_id), context: Some(restored), entries }
+            if request_id == "query-current" && prefix == "資料/" && restored == &context && entries[0].value == "資料/a b")
+        );
+        assert_eq!(
+            *backend.completion_queries.lock().unwrap(),
+            vec![(
+                protocol::CompletionKind::FeatureArgument,
+                "資料/".into(),
+                Some(context.clone())
+            )]
+        );
+        let outsider = scope("workspace-b", "server-b");
+        assert!(
+            runtime
+                .worker_completions_scoped(
+                    &outsider,
+                    &worker.worker_ref,
+                    protocol::CompletionKind::FeatureArgument,
+                    "",
+                    Some(&context)
+                )
+                .is_err()
+        );
+        assert_eq!(backend.completion_queries.lock().unwrap().len(), 1);
+        assert!(backend.dispatched_inputs.lock().unwrap().is_empty());
     }
 
     #[test]

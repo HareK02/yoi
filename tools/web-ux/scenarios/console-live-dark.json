@@ -1,0 +1,318 @@
+{
+  "schemaVersion": 1,
+  "id": "console-live-dark",
+  "title": "Production Console Feature invocation draft lifecycle",
+  "baseUrl": "http://127.0.0.1:15286",
+  "colorScheme": "dark",
+  "reducedMotion": "reduce",
+  "personas": [
+    {
+      "id": "fixture",
+      "label": "Live synthetic Worker",
+      "auth": {
+        "kind": "anonymous"
+      }
+    }
+  ],
+  "viewports": [
+    {
+      "label": "desktop",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "label": "narrow",
+      "width": 768,
+      "height": 900
+    },
+    {
+      "label": "mobile",
+      "width": 390,
+      "height": 844
+    }
+  ],
+  "routes": [
+    {
+      "id": "console",
+      "label": "Live Console",
+      "path": "/w/console-live-review/workers/W-901-console-live-fixture/console",
+      "goal": "Discover Feature metadata, complete typed arguments and inspect a draft chip without submitting or staging files.",
+      "dataState": "Live synthetic idle Worker; review enum/integer/boolean/worker-file arguments plus generic attachment adapter. No real account, file, or invocation execution.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".cm-content[contenteditable=true]"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Idle live Console"
+        },
+        {
+          "id": "slash-plain",
+          "label": "Literal unselected slash text",
+          "interaction": [
+            {
+              "action": "click",
+              "selector": ".cm-content"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "Control+a"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "Backspace"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "/"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "r"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "e"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "v"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "i"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "e"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "w"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "("
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "b"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "r"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "i"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "e"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "f"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": ")"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "Escape"
+            }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": ".cm-content[contenteditable=true]"
+          }
+        },
+        {
+          "id": "feature-menu",
+          "label": "Feature names",
+          "interaction": [
+            {
+              "action": "click",
+              "selector": ".cm-content"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "Control+a"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "Backspace"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "/"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "Control+Space"
+            },
+            {
+              "action": "wait",
+              "ready": {
+                "kind": "selector",
+                "selector": "[role=option]"
+              }
+            }
+          ]
+        },
+        {
+          "id": "argument-menu",
+          "label": "Argument values",
+          "interaction": [
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "Control+a"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "Backspace"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "/"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "r"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "e"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "v"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "Control+Space"
+            },
+            {
+              "action": "wait",
+              "ready": {
+                "kind": "selector",
+                "selector": "[role=option]"
+              }
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "Tab"
+            },
+            {
+              "action": "wait",
+              "ready": {
+                "kind": "selector",
+                "selector": "[role=option]"
+              }
+            }
+          ]
+        },
+        {
+          "id": "typed-chip",
+          "label": "Selected typed invocation",
+          "interaction": [
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "Escape"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "Control+End"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "b"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "r"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "i"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "e"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": "f"
+            },
+            {
+              "action": "press",
+              "selector": ".cm-content",
+              "key": ")"
+            }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": ".composer-typed-chip"
+          }
+        }
+      ]
+    }
+  ],
+  "processes": [
+    {
+      "id": "console-live-fixture",
+      "command": "deno",
+      "cwd": "..",
+      "args": [
+        "run",
+        "--allow-net",
+        "--allow-read",
+        "--allow-env=WEB_UX_BUILD_ROOT",
+        "browser-tests/console_live_fixture_server.ts",
+        "15286"
+      ],
+      "env": {
+        "WEB_UX_BUILD_ROOT": "${WEB_UX_BUILD_ROOT}"
+      },
+      "readyUrl": "http://127.0.0.1:15286/health"
+    }
+  ]
+}

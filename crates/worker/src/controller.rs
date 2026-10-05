@@ -184,6 +184,7 @@ impl WorkerHandle {
         &self,
         kind: protocol::CompletionKind,
         prefix: &str,
+        context: Option<&protocol::CompletionContext>,
     ) -> Vec<protocol::CompletionEntry> {
         match kind {
             protocol::CompletionKind::File => {
@@ -196,8 +197,61 @@ impl WorkerHandle {
                     .map(|candidate| protocol::CompletionEntry {
                         value: candidate.path,
                         is_dir: candidate.is_dir,
+                        description: None,
+                        usage: None,
+                        invocation: None,
                     })
                     .collect()
+            }
+            protocol::CompletionKind::Feature => self
+                .shared_state
+                .feature_invocations()
+                .feature_completions(prefix),
+            protocol::CompletionKind::FeatureArgument => {
+                let Some(context) = context else {
+                    return Vec::new();
+                };
+                let registry = self.shared_state.feature_invocations();
+                let Some(argument) = context.argument.as_deref() else {
+                    return registry.argument_name_completions(&context.invocation, prefix);
+                };
+                let worker_file = registry
+                    .descriptor(&context.invocation)
+                    .and_then(|descriptor| {
+                        descriptor
+                            .arguments
+                            .iter()
+                            .find(|candidate| candidate.name == argument)
+                    })
+                    .is_some_and(|descriptor| {
+                        matches!(
+                            descriptor.completion,
+                            protocol::InvocationCompletion::WorkerFile
+                        )
+                    });
+                if worker_file {
+                    let Some(view) = self.shared_state.fs_view() else {
+                        return Vec::new();
+                    };
+                    let candidates = view.list_file_completions(prefix).await;
+                    if registry.descriptor(&context.invocation).is_none() {
+                        return Vec::new();
+                    }
+                    return crate::feature::invocation::bounded_completion_entries(
+                        candidates
+                            .into_iter()
+                            .map(|candidate| protocol::CompletionEntry {
+                                value: candidate.path,
+                                is_dir: candidate.is_dir,
+                                description: None,
+                                usage: None,
+                                invocation: None,
+                            }),
+                    );
+                }
+                registry
+                    .argument_completions(&context.invocation, argument, prefix)
+                    .await
             }
         }
     }
@@ -435,11 +489,29 @@ fn stage_pending_notifications<St: Store + Clone>(
     count
 }
 
+/// The durable input append is the activation boundary. Clear live state in
+/// the same poll, before invocation preparation can checkpoint it again; the
+/// oneshot only publishes the already-completed transition to the Controller.
+pub(crate) fn input_committed_hook<St: Store + Clone>(
+    pending: crate::worker::PendingSubmissionHandle<St>,
+    submission_id: String,
+    sender: oneshot::Sender<()>,
+) -> impl FnOnce() {
+    move || {
+        pending.finish_activation(&submission_id);
+        let _ = sender.send(());
+    }
+}
+
 fn notification_coalesce_remaining<St: Store + Clone>(
     pending_submissions: &crate::worker::PendingSubmissionHandle<St>,
     notify_buffer: &NotifyBuffer,
     delay: Duration,
+    can_schedule_run: bool,
 ) -> Option<Duration> {
+    if !can_schedule_run {
+        return None;
+    }
     let Some(accepted_at_ms) = pending_submissions.oldest_pending_notification_accepted_at_ms()
     else {
         return notify_buffer
@@ -846,6 +918,7 @@ impl WorkerController {
             manifest_toml.clone(),
             greeting,
         ));
+        shared_state.set_feature_invocations(worker.feature_invocations());
         let usage_state = shared_state.clone();
         let usage_events = working_event_tx.clone();
         worker.engine_mut().on_usage(move |event| {
@@ -1327,6 +1400,10 @@ where
     let worker_enabled = feature_config.worker.enabled;
     let sub_worker_enabled = feature_config.sub_worker.enabled;
     let mut feature_registry = FeatureRegistryBuilder::new();
+    if !backend_job_profile {
+        feature_registry
+            .add_module(crate::feature::builtin::chat_invocation::AttachmentInvocationFeature);
+    }
     if backend_job_profile {
         let workspace_client = worker.workspace_client_handle();
         if !workspace_client.is_available() || workspace_client.workspace_id().is_none() {
@@ -2119,9 +2196,11 @@ async fn controller_loop<C, St>(
                             submission.input,
                             vec![extension],
                             submission.provenance,
-                            move || {
-                                let _ = input_commit_tx.send(());
-                            },
+                            input_committed_hook(
+                                pending_submissions.clone(),
+                                committed_submission.submission_id.clone(),
+                                input_commit_tx,
+                            ),
                         ),
                         &mut method_rx,
                         &working_event_tx,
@@ -2178,10 +2257,6 @@ async fn controller_loop<C, St>(
                     .await
                 }
             };
-            if notify_buffer.is_empty() {
-                pending_submissions.finish_notification_batch();
-            }
-
             if !shutdown && may_drain_pending && new_status == WorkerStatus::Idle {
                 match prepare_pending_run(&pending_submissions, &notify_buffer, None, false) {
                     Ok(Some(next)) => {
@@ -2230,12 +2305,16 @@ async fn controller_loop<C, St>(
             continue;
         }
 
+        // An expired Notify deadline must not repeatedly schedule a run that
+        // cannot cross the invocation fence. Keep the accepted notification for
+        // a fresh input/recovery boundary instead of retrying business effects.
         let notification_delay = (shared_state.catalog_status() == WorkerStatus::Idle)
             .then(|| {
                 notification_coalesce_remaining(
                     &pending_submissions,
                     &notify_buffer,
                     notification_coalesce_delay,
+                    worker.can_schedule_notification_run(),
                 )
             })
             .flatten();
@@ -3907,6 +3986,40 @@ mod tests {
             Some(PendingRun::RunForNotification { .. })
         ));
         assert!(notify_buffer.has_notification_pending());
+    }
+
+    #[test]
+    fn invocation_fence_suspends_expired_notification_deadline_without_dropping_input() {
+        let temp = TempDir::new().unwrap();
+        let pending = crate::worker::PendingSubmissionHandle::for_test(temp.path());
+        let buffer = NotifyBuffer::new();
+        pending
+            .accept_notification("held".into(), "held".into())
+            .unwrap();
+        let before = pending.persisted_entries_for_test().len();
+        assert_eq!(
+            notification_coalesce_remaining(&pending, &buffer, Duration::ZERO, true),
+            Some(Duration::ZERO)
+        );
+        for _ in 0..4 {
+            assert_eq!(
+                notification_coalesce_remaining(&pending, &buffer, Duration::ZERO, false),
+                None
+            );
+        }
+        assert_eq!(pending.persisted_entries_for_test().len(), before);
+        assert_eq!(pending.snapshot().notification_count, 1);
+        // A busy-time staged notification is equally retained behind the fence.
+        stage_pending_notifications(&pending, &buffer);
+        assert_eq!(
+            notification_coalesce_remaining(&pending, &buffer, Duration::ZERO, false),
+            None
+        );
+        assert!(buffer.has_notification_pending());
+        assert_eq!(
+            notification_coalesce_remaining(&pending, &buffer, Duration::ZERO, true),
+            Some(Duration::ZERO)
+        );
     }
 
     #[test]

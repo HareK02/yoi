@@ -606,6 +606,70 @@ fn rewound_fork_preserves_uploaded_file_segments_in_snapshot() {
     )));
 }
 
+#[test]
+fn feature_invocations_survive_replay_snapshot_and_rewind_without_reparsing() {
+    let (_dir, store) = make_store();
+    let config = RequestConfig::default();
+    let (sid, segid) = session_store::create_segment(
+        &store,
+        SegmentStartState {
+            system_prompt: Some("System prompt"),
+            config: &config,
+            history: Vec::new(),
+            user_segments: Vec::new(),
+        },
+    )
+    .unwrap();
+    let segments = vec![
+        Segment::Text {
+            content: "before ".into(),
+        },
+        Segment::FeatureInvoke {
+            invocation: protocol::FeatureInvocation {
+                invocation_id: "stable-request-1".into(),
+                identity: protocol::FeatureInvocationIdentity("builtin:test/prepare".into()),
+                name: "prepare".into(),
+                arguments: vec![protocol::InvocationArgumentValue {
+                    name: "path".into(),
+                    value: protocol::InvocationValue::String("資料/a b".into()),
+                }],
+            },
+        },
+        Segment::Text {
+            content: " after /prepare(unselected)".into(),
+        },
+    ];
+    session_store::save_user_input(
+        &store,
+        sid,
+        segid,
+        segments.clone(),
+        annotated(&[Item::user_message(Segment::flatten_to_text(&segments))]),
+    )
+    .unwrap();
+    session_store::save_turn_end(&store, sid, segid, 1).unwrap();
+    let entries = store.read_all(sid, segid).unwrap();
+    assert_eq!(
+        collect_state(&entries).user_segments,
+        vec![segments.clone()]
+    );
+    let fork_id = session_store::fork_at(&store, sid, segid, 1).unwrap();
+    let fork_entries = store.read_all(sid, fork_id).unwrap();
+    assert_eq!(
+        collect_state(&fork_entries).user_segments,
+        vec![segments.clone()]
+    );
+    let snapshot = session_store::public_snapshot::project_session_snapshot(sid, &fork_entries);
+    assert!(snapshot.entries.iter().any(|entry| matches!(
+        &entry.data, SessionSnapshotEntryData::UserInput { segments: restored } if restored == &segments
+    )));
+    // Original history remains append-only and retains the same exact typed intent.
+    assert_eq!(
+        serde_json::to_value(store.read_all(sid, segid).unwrap()).unwrap(),
+        serde_json::to_value(entries).unwrap()
+    );
+}
+
 #[tokio::test]
 async fn session_config_changed_logged() {
     let (_dir, store) = make_store();

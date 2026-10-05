@@ -123,6 +123,14 @@ pub enum SystemItem {
         prompt_provenance: Option<PromptRenderProvenance>,
     },
 
+    /// Result of an explicitly selected chat Feature invocation. The typed
+    /// result is retained for clients; `body` is the exact bounded context made
+    /// visible to the Worker model.
+    FeatureInvocationResult {
+        result: protocol::FeatureInvocationResult,
+        body: String,
+    },
+
     /// `@<path>` file reference resolution. `body` is the rendered
     /// LLM-context text (`[File: <path>]\n…` for regular files,
     /// `[Dir: <path>]\n…` for directory listings, possibly with a
@@ -193,6 +201,7 @@ impl SystemItem {
         match self {
             SystemItem::Notification { body, .. } => body.clone(),
             SystemItem::WorkerEvent { body, .. } => body.clone(),
+            SystemItem::FeatureInvocationResult { body, .. } => body.clone(),
             SystemItem::FileAttachment { body, .. } => body.clone(),
             SystemItem::SkillActivation { body, .. } => body.clone(),
             SystemItem::LegacyKnowledgeIgnored { .. } => String::new(),
@@ -218,6 +227,7 @@ impl SystemItem {
         match self {
             SystemItem::Notification { .. } => "notification",
             SystemItem::WorkerEvent { .. } => "worker_event",
+            SystemItem::FeatureInvocationResult { .. } => "feature_invocation_result",
             SystemItem::FileAttachment { .. } => "file_attachment",
             SystemItem::SkillActivation { .. } => "skill_activation",
             SystemItem::LegacyKnowledgeIgnored { .. } => "legacy_knowledge_ignored",
@@ -391,6 +401,29 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn invocation_result_retains_typed_outcome_and_exact_context() {
+        let result = protocol::FeatureInvocationResult {
+            invocation_id: "stable-invoke".into(),
+            identity: protocol::FeatureInvocationIdentity("builtin:test/prepare".into()),
+            status: protocol::FeatureInvocationStatus::OutcomeUnknown,
+            message: "operation may have committed".into(),
+            context: None,
+        };
+        let body = "Outcome unknown; do not retry automatically";
+        let item = SystemItem::FeatureInvocationResult {
+            result: result.clone(),
+            body: body.into(),
+        };
+        let restored: SystemItem =
+            serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap();
+        assert_eq!(restored.history_text(), body);
+        assert_eq!(restored.kind_label(), "feature_invocation_result");
+        assert!(
+            matches!(restored, SystemItem::FeatureInvocationResult { result: saved, .. } if saved == result)
+        );
     }
 
     #[test]

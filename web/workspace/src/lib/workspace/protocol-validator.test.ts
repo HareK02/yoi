@@ -323,3 +323,28 @@ Deno.test('stateful selector validation fences a routed event before projection'
     'mismatched Worker event crossed its subscription selector',
   );
 });
+
+Deno.test('generated subscription schema accepts invocation descriptors, context and typed user segments', () => {
+  const descriptor = { identity: 'test/run', name: 'run', aliases: ['execute'], display_name: 'Run', description: 'Test',
+    syntax: 'parenthesized', client_adapter: null, arguments: [{ name: 'count', position: 0, required: true,
+      value_type: { kind: 'integer' }, completion: { kind: 'static', values: ['1', '2'] } }] };
+  const frame = (events: unknown[]) => subscribedFrame({
+    selector: { topic: 'worker_protocol', worker_id: 'worker-1' },
+    snapshot: { topic: 'worker_protocol', data: { worker_id: 'worker-1', events } },
+  });
+  const completion = { event: 'completions', data: { kind: 'feature_argument', prefix: '1',
+    context: { invocation: 'test/run', argument: 'count' },
+    entries: [{ value: '1', is_dir: false, invocation: descriptor }] } };
+  const segment = { kind: 'feature_invoke', invocation: { invocation_id: 'invoke-1', identity: 'test/run', name: 'run',
+    arguments: [{ name: 'count', value: { kind: 'integer', value: 1 } }] } };
+  const valid = decode(frame([completion, { event: 'user_message', data: { segments: [segment] } }]));
+  assert(valid.ok, `invocation schema mismatch: ${JSON.stringify(valid)}`);
+  const invalid = decode(frame([{ event: 'user_message', data: { segments: [{ ...segment, invocation: {
+    ...segment.invocation, arguments: [{ name: 'count', value: { kind: 'integer', value: 9007199254740992 } }],
+  } }] } }]));
+  assert(!invalid.ok, 'generated invocation schema must reject unsafe wire integers');
+  const newer = decode(frame([{ ...completion, data: { ...completion.data, entries: [
+    { value: '1', is_dir: false, invocation: { ...descriptor, client_adapter: 'newer_adapter' } },
+  ] } }]));
+  assert(!newer.ok, 'unknown adapter capabilities must fail closed');
+});

@@ -11,11 +11,15 @@ import {
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type {
   Event as ProtocolEvent,
+  FeatureInvocationDescriptor,
+  Method,
   SessionConversationTurn,
   SessionSnapshot,
 } from "#lib/generated/protocol.ts";
 import type { Worker } from "#lib/workspace/sidebar/types.ts";
 import { EditorView } from "@codemirror/view";
+import * as attachmentsApi from "#lib/workspace/console/composer-attachments.ts";
+import { undo } from "@codemirror/commands";
 import * as alerts from "#lib/workspace/alerts/store.ts";
 import ConsolePage from "./+page.svelte";
 
@@ -212,10 +216,275 @@ function latestListener() {
   return listener;
 }
 
+function protocolEvent(event: ProtocolEvent) {
+  latestListener().onFrame({ frame: "event", message: { event: "event", data: { payload: {
+    event: "worker_protocol", data: { worker_id: "worker-a", event },
+  } } } });
+}
+
 async function settleMicrotasks() {
   await Promise.resolve();
   await Promise.resolve();
 }
+
+const runDescriptor: FeatureInvocationDescriptor = {
+  identity: "feature:test/run", name: "run", aliases: [], display_name: "Run", description: "Run",
+  syntax: "parenthesized", arguments: [{ name: "path", position: 0, required: true,
+    value_type: { kind: "worker_file" }, completion: { kind: "worker_file" } }],
+};
+
+async function liveComposer() {
+  const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => Response.json({ availability: "live_protocol" }));
+  vi.stubGlobal("fetch", fetchMock);
+  const view = render(ConsolePage, { data: pageData() });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
+  latestListener().onFrame(subscribedFrame());
+  await screen.findByText("No conversation to display");
+  const cm = EditorView.findFromDOM(view.container.querySelector(".cm-editor") as HTMLElement)!;
+  const form = view.container.querySelector(".console-composer") as HTMLFormElement;
+  return { view, cm, form, fetchMock };
+}
+
+function completionRequest(): Extract<Method, { method: "list_completions" }> {
+  const method = multiplexer.sendWorkerMethod.mock.calls.at(-1)![0] as Method;
+  if (method.method !== "list_completions") throw new Error("Expected completion request");
+  return method;
+}
+function completionReply(method: Extract<Method, { method: "list_completions" }>, value: string, invocation?: FeatureInvocationDescriptor) {
+  protocolEvent({ event: "completions", data: { ...method.params, entries: [{ value, invocation, is_dir: false }] } });
+}
+async function selectRun(cm: EditorView) {
+  cm.focus();
+  cm.dispatch({ changes: { from: 0, to: cm.state.doc.length, insert: "/ru" }, selection: { anchor: 3 } });
+  await waitFor(() => expect(completionRequest().params.prefix).toBe("ru"));
+  completionReply(completionRequest(), "run", runDescriptor);
+  await screen.findByRole("option");
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter" });
+  cm.dispatch({ changes: { from: cm.state.doc.length, insert: '"a b/資料")' }, selection: { anchor: '/run("a b/資料")'.length } });
+  await waitFor(() => expect(cm.dom.querySelector(".composer-typed-chip")).not.toBeNull());
+}
+
+test("Console teardown cancels pending observation frames before they can read history", async () => {
+  const { view, fetchMock } = await liveComposer();
+  const schedule = vi.spyOn(window, "requestAnimationFrame");
+  const cancel = vi.spyOn(window, "cancelAnimationFrame");
+  const warn = vi.spyOn(console, "warn");
+  protocolEvent({ event: "user_message", data: { segments: [{ kind: "text", content: "pending at teardown" }] } });
+  const handle = schedule.mock.results.at(-1)!.value as number;
+  const requestsBeforeUnmount = fetchMock.mock.calls.length;
+  await view.unmount();
+  expect(cancel).toHaveBeenCalledWith(handle);
+  // Let the real happy-dom frame queue run; do not mock away the lifecycle bug.
+  await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+  expect(fetchMock).toHaveBeenCalledTimes(requestsBeforeUnmount);
+  expect(warn).not.toHaveBeenCalled();
+});
+
+test("Feature and argument completion correlate same-prefix ABA, context and other clients", async () => {
+  const { cm } = await liveComposer();
+  cm.focus();
+  cm.dispatch({ changes: { from: 0, insert: "/ru" }, selection: { anchor: 3 } });
+  await waitFor(() => expect(multiplexer.sendWorkerMethod).toHaveBeenCalled());
+  const old = completionRequest();
+  cm.dispatch({ changes: { from: 2, to: 3, insert: "x" } });
+  await waitFor(() => expect(completionRequest().params.prefix).toBe("rx"));
+  cm.dispatch({ changes: { from: 2, to: 3, insert: "u" } });
+  await waitFor(() => expect(completionRequest().params.prefix).toBe("ru"));
+  const current = completionRequest();
+  expect(current.params.request_id).not.toBe(old.params.request_id);
+  completionReply(old, "old", runDescriptor);
+  completionReply({ ...current, params: { ...current.params, request_id: "another-client" } }, "foreign", runDescriptor);
+  completionReply({ ...current, params: { ...current.params, request_id: undefined } }, "legacy", runDescriptor);
+  await settleMicrotasks();
+  expect(screen.queryByRole("option")).toBeNull();
+  completionReply(current, "run", runDescriptor);
+  await screen.findByRole("option");
+  await fireEvent.keyDown(cm.contentDOM, { key: "Enter" });
+  cm.dispatch({ changes: { from: cm.state.doc.length, insert: '"a' }, selection: { anchor: 7 } });
+  await waitFor(() => expect(completionRequest().params.context?.argument).toBe("path"));
+  const argOld = completionRequest();
+  cm.dispatch({ changes: { from: 6, to: 7, insert: "b" } });
+  await waitFor(() => expect(completionRequest().params.prefix).toBe("b"));
+  cm.dispatch({ changes: { from: 6, to: 7, insert: "a" } });
+  await waitFor(() => expect(completionRequest().params.prefix).toBe("a"));
+  const argCurrent = completionRequest();
+  completionReply(argOld, "stale-path");
+  completionReply({ ...argCurrent, params: { ...argCurrent.params, context: { invocation: "other-feature", argument: "path" } } }, "wrong-context");
+  await settleMicrotasks();
+  expect(screen.queryByRole("option")).toBeNull();
+  completionReply(argCurrent, "a b/資料");
+  expect((await screen.findByRole("option")).textContent).toContain("a b/資料");
+});
+
+test("Submit rejection keeps exact typed draft, request/invocation IDs, and only acceptance clears", async () => {
+  const alert = vi.spyOn(alerts, "pushWorkspaceAlert");
+  const { cm, form } = await liveComposer();
+  await selectRun(cm);
+  await fireEvent.submit(form);
+  const first = multiplexer.sendWorkerMethod.mock.calls.at(-1)![0] as Extract<Method, { method: "submit" }>;
+  expect(first.method).toBe("submit");
+  expect(first.params.input[0]).toMatchObject({ kind: "feature_invoke", invocation: { identity: runDescriptor.identity, arguments: [{ name: "path", value: { kind: "string", value: "a b/資料" } }] } });
+  const doc = cm.state.doc.toString();
+  await waitFor(() => expect(cm.state.readOnly).toBe(true));
+  await fireEvent.keyDown(cm.contentDOM, { key: "Backspace" });
+  await fireEvent.keyDown(cm.contentDOM, { key: "z", ctrlKey: true });
+  expect(cm.state.doc.toString()).toBe(doc);
+  protocolEvent({ event: "submission_rejected", data: { submission_request_id: "other-client", message: "foreign" } });
+  await settleMicrotasks();
+  expect(cm.state.readOnly).toBe(true);
+  protocolEvent({ event: "submission_rejected", data: { submission_request_id: first.params.submission_request_id, message: "Feature validation failed" } });
+  await waitFor(() => expect(cm.state.readOnly).toBe(false));
+  expect(alert).toHaveBeenCalledWith("error", "Feature validation failed", expect.any(Object));
+  expect(cm.state.doc.toString()).toBe(doc);
+  await fireEvent.submit(form);
+  expect(multiplexer.sendWorkerMethod).toHaveBeenLastCalledWith(first);
+  protocolEvent({ event: "submission_accepted", data: { submission_request_id: first.params.submission_request_id, submission_id: "s", disposition: "started" } });
+  await waitFor(() => expect(cm.state.doc.toString()).toBe(""));
+  expect(undo(cm)).toBe(false);
+});
+
+test("failed upload retry preserves middle insertion, Undo, unknown admission and accepted ownership", async () => {
+  const uploads: attachmentsApi.AttachmentUploadCallbacks[] = [];
+  vi.spyOn(attachmentsApi, "uploadAttachment").mockImplementation((_path, _file, _id, callbacks) => {
+    uploads.push(callbacks);
+    return { abort: vi.fn() };
+  });
+  const { cm, form, view, fetchMock } = await liveComposer();
+  cm.dispatch({ changes: { from: 0, insert: "before  after" }, selection: { anchor: 7 } });
+  await fireEvent.change(view.container.querySelector('input[type="file"]')!, { target: { files: [new File(["data"], "report.md", { type: "text/markdown" })] } });
+  uploads[0].failed("upload failed");
+  await fireEvent.click(await screen.findByRole("button", { name: "Retry" }));
+  const reference = { artifact_id: "staged-artifact", file_name: "report.md", media_type: "text/markdown", created_at_ms: 1, availability: "available" as const, byte_len: 4, sha256: "abcd" };
+  uploads[1].complete(reference);
+  await waitFor(() => expect(view.container.textContent).toContain("Attached report.md"));
+  cm.dispatch({ selection: { anchor: 10 } });
+  await fireEvent.keyDown(cm.contentDOM, { key: "Backspace" });
+  expect(view.container.textContent).not.toContain("Attached report.md");
+  undo(cm);
+  await waitFor(() => expect(view.container.textContent).toContain("Attached report.md"));
+  await fireEvent.submit(form);
+  const first = multiplexer.sendWorkerMethod.mock.calls.at(-1)![0] as Extract<Method, { method: "submit" }>;
+  expect(first.params.input).toEqual([{ kind: "text", content: "before " }, { kind: "uploaded_file", file: reference }, { kind: "text", content: " after" }]);
+  latestListener().onStatus?.("closed", { kind: "transport", message: "ack lost" });
+  expect(fetchMock.mock.calls.some(([_path, init]) => init?.method === "DELETE")).toBe(false);
+  latestListener().onStatus?.("connecting");
+  latestListener().onFrame(subscribedFrame());
+  await fireEvent.click(await screen.findByRole("button", { name: "Retry admission" }));
+  expect(multiplexer.sendWorkerMethod).toHaveBeenLastCalledWith(first);
+  protocolEvent({ event: "submission_accepted", data: { submission_request_id: first.params.submission_request_id, submission_id: "accepted", disposition: "queued" } });
+  await waitFor(() => expect(cm.state.doc.toString()).toBe(""));
+  view.unmount();
+  expect(fetchMock.mock.calls.some(([_path, init]) => init?.method === "DELETE")).toBe(false);
+});
+
+test("late acceptance after rejection does not clear newer draft edits", async () => {
+  const { cm, form } = await liveComposer();
+  cm.dispatch({ changes: { from: 0, insert: "original" }, selection: { anchor: 8 } });
+  await fireEvent.submit(form);
+  const first = multiplexer.sendWorkerMethod.mock.calls.at(-1)![0] as Extract<Method, { method: "submit" }>;
+  protocolEvent({ event: "submission_rejected", data: { submission_request_id: first.params.submission_request_id, message: "try later" } });
+  await waitFor(() => expect(cm.state.readOnly).toBe(false));
+  cm.dispatch({ changes: { from: 0, to: cm.state.doc.length, insert: "newer draft" }, selection: { anchor: 11 } });
+  protocolEvent({ event: "submission_accepted", data: { submission_request_id: first.params.submission_request_id, submission_id: "old", disposition: "queued" } });
+  await settleMicrotasks();
+  expect(cm.state.doc.toString()).toBe("newer draft");
+});
+
+test("unmounting unknown upload admission does not delete possibly accepted artifacts", async () => {
+  let complete!: attachmentsApi.AttachmentUploadCallbacks["complete"];
+  vi.spyOn(attachmentsApi, "uploadAttachment").mockImplementation((_path, _file, _id, callbacks) => {
+    complete = callbacks.complete;
+    return { abort: vi.fn() };
+  });
+  const { view, form, fetchMock } = await liveComposer();
+  await fireEvent.change(view.container.querySelector('input[type="file"]')!, { target: { files: [new File(["data"], "unknown.md", { type: "text/markdown" })] } });
+  complete({ artifact_id: "unknown-artifact", file_name: "unknown.md", media_type: "text/markdown", created_at_ms: 1, availability: "available", byte_len: 4, sha256: "abcd" });
+  await waitFor(() => expect(view.container.textContent).toContain("Attached unknown.md"));
+  await fireEvent.submit(form);
+  latestListener().onStatus?.("closed", { kind: "transport", message: "ack lost" });
+  view.unmount();
+  await settleMicrotasks();
+  expect(fetchMock.mock.calls.some(([_path, init]) => init?.method === "DELETE")).toBe(false);
+});
+
+test("cached unsent typed draft survives target round-trip and remains sendable", async () => {
+  const alert = vi.spyOn(alerts, "pushWorkspaceAlert");
+  const { cm, form, view } = await liveComposer();
+  await selectRun(cm);
+  await view.rerender({ data: pageData("worker-b", "runtime-b") });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledTimes(2));
+  latestListener().onFrame(subscribedFrame());
+  await waitFor(() => expect(cm.state.doc.toString()).toBe(""));
+  await view.rerender({ data: pageData() });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledTimes(3));
+  latestListener().onFrame(subscribedFrame());
+  await waitFor(() => expect(cm.dom.querySelector(".composer-typed-chip")).not.toBeNull());
+  await fireEvent.submit(form);
+  expect(alert).not.toHaveBeenCalledWith("error", expect.any(String), expect.any(Object));
+  expect(multiplexer.sendWorkerMethod).toHaveBeenLastCalledWith({ method: "submit", params: { submission_request_id: expect.any(String), input: [expect.objectContaining({ kind: "feature_invoke" })] } });
+});
+
+test("unknown Submit survives target ABA and cannot be deleted into a new admission", async () => {
+  const { cm, form, view } = await liveComposer();
+  await selectRun(cm);
+  await fireEvent.submit(form);
+  const first = multiplexer.sendWorkerMethod.mock.calls.at(-1)![0] as Extract<Method, { method: "submit" }>;
+  await waitFor(() => expect(cm.state.readOnly).toBe(true));
+  await view.rerender({ data: pageData("worker-b", "runtime-b") });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledTimes(2));
+  latestListener().onFrame(subscribedFrame());
+  await waitFor(() => expect(cm.state.doc.toString()).toBe(""));
+  await view.rerender({ data: pageData() });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledTimes(3));
+  latestListener().onFrame(subscribedFrame());
+  await waitFor(() => expect(cm.dom.querySelector(".composer-typed-chip")).not.toBeNull());
+  expect(cm.state.readOnly).toBe(true);
+  const doc = cm.state.doc.toString();
+  await fireEvent.keyDown(cm.contentDOM, { key: "Backspace" });
+  expect(cm.state.doc.toString()).toBe(doc);
+  await fireEvent.click(screen.getByRole("button", { name: "Retry admission" }));
+  expect(multiplexer.sendWorkerMethod).toHaveBeenLastCalledWith(first);
+  view.unmount();
+});
+
+test("cancelled attachment ignores late completion and deletes only abandoned staging", async () => {
+  let callbacks!: attachmentsApi.AttachmentUploadCallbacks;
+  const abort = vi.fn();
+  vi.spyOn(attachmentsApi, "uploadAttachment").mockImplementation((_path, _file, _id, value) => {
+    callbacks = value;
+    return { abort };
+  });
+  const { cm, view, fetchMock } = await liveComposer();
+  cm.dispatch({ changes: { from: 0, insert: "keep this" }, selection: { anchor: 4 } });
+  await fireEvent.change(view.container.querySelector('input[type="file"]')!, { target: { files: [new File(["data"], "late.md", { type: "text/markdown" })] } });
+  await fireEvent.click(screen.getByRole("button", { name: "Remove late.md" }));
+  expect(abort).toHaveBeenCalledOnce();
+  callbacks.complete({ artifact_id: "late-artifact", file_name: "late.md", media_type: "text/markdown", created_at_ms: 1, availability: "available", byte_len: 4, sha256: "abcd" });
+  await settleMicrotasks();
+  expect(view.container.textContent).not.toContain("Attached late.md");
+  expect(cm.state.doc.toString()).toBe("keep this");
+  expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/attachments/late-artifact"), { method: "DELETE" });
+  undo(cm);
+  expect(cm.dom.textContent).not.toContain("Uploading late.md");
+});
+
+test.each(["notification_rejected", "notification_accepted"] as const)("Notify keeps text until authoritative %s", async (outcome) => {
+  const { cm } = await liveComposer();
+  protocolEvent({ event: "worker_state", data: { snapshot: { last_command_id: 0, state: { kind: "busy", state: { kind: "run", state: "running" } } } } });
+  cm.dispatch({ changes: { from: 0, insert: "通知" }, selection: { anchor: 2 } });
+  await fireEvent.click(await screen.findByRole("button", { name: "Notify Worker" }));
+  const first = multiplexer.sendWorkerMethod.mock.calls.at(-1)![0] as Extract<Method, { method: "notify" }>;
+  expect(cm.state.doc.toString()).toBe("通知");
+  protocolEvent(outcome === "notification_accepted"
+    ? { event: outcome, data: { notification_request_id: first.params.notification_request_id } }
+    : { event: outcome, data: { notification_request_id: first.params.notification_request_id, message: "not running" } });
+  await waitFor(() => expect(cm.state.readOnly).toBe(false));
+  expect(cm.state.doc.toString()).toBe(outcome === "notification_accepted" ? "" : "通知");
+  if (outcome === "notification_rejected") {
+    await fireEvent.click(screen.getByRole("button", { name: "Notify Worker" }));
+    expect(multiplexer.sendWorkerMethod).toHaveBeenLastCalledWith(first);
+  }
+});
 
 beforeEach(() => {
   multiplexer.listeners.length = 0;
@@ -308,6 +577,11 @@ test.each([
   expect(form.querySelector('[role="alert"]')).toBeNull();
   expect(form.textContent).not.toContain(message);
 
+  if (transportFailure) {
+    const method = multiplexer.sendWorkerMethod.mock.calls[0][0];
+    protocolEvent({ event: "submission_rejected", data: { submission_request_id: method.params.submission_request_id, message } });
+    await waitFor(() => expect(cm.state.readOnly).toBe(false));
+  }
   cm.dispatch({ changes: { from: 0, to: cm.state.doc.length, insert: ":peer teammate" } });
   await fireEvent.submit(form);
   await waitFor(() => expect(multiplexer.sendWorkerMethod).toHaveBeenLastCalledWith({
@@ -445,7 +719,7 @@ test.each(["idle", "running", "paused"] as const)("Composer completion executes 
   expect(multiplexer.sendWorkerMethod.mock.calls.every(([method]) => method.method !== "submit" && method.method !== "cancel")).toBe(true);
 });
 
-test("file completions consume stale responses before the latest prefix and close with the connection", async () => {
+test("file completion nonces reject stale replies without blocking newer requests", async () => {
   vi.stubGlobal("fetch", vi.fn(async () => Response.json({ availability: "live_protocol" })));
   const view = render(ConsolePage, { data: pageData() });
   await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
@@ -454,23 +728,20 @@ test("file completions consume stale responses before the latest prefix and clos
   const cm = EditorView.findFromDOM(view.container.querySelector(".cm-editor") as HTMLElement)!;
   cm.focus();
   cm.dispatch({ changes: { from: 0, insert: "@old" }, selection: { anchor: 4 } });
-  await waitFor(() => expect(multiplexer.sendWorkerMethod).toHaveBeenCalledWith({ method: "list_completions", params: { kind: "file", prefix: "old" } }));
+  await waitFor(() => expect(multiplexer.sendWorkerMethod).toHaveBeenCalledWith({ method: "list_completions", params: { kind: "file", prefix: "old", request_id: expect.any(String) } }));
+  const old = multiplexer.sendWorkerMethod.mock.calls.at(-1)![0].params.request_id;
   cm.dispatch({ changes: { from: 1, to: 4, insert: "new" }, selection: { anchor: 4 } });
+  await waitFor(() => expect(multiplexer.sendWorkerMethod).toHaveBeenCalledWith({ method: "list_completions", params: { kind: "file", prefix: "new", request_id: expect.any(String) } }));
+  const current = multiplexer.sendWorkerMethod.mock.calls.at(-1)![0].params.request_id;
+  const receive = (value: string, prefix: string, request_id?: string) => protocolEvent({ event: "completions", data: { kind: "file", prefix, request_id, entries: [{ value, is_dir: false }] } });
+  receive("old-result", "old", old);
   await settleMicrotasks();
-  expect(multiplexer.sendWorkerMethod).toHaveBeenCalledOnce();
-  const receive = (value: string) => latestListener().onFrame({
-    frame: "event", message: { event: "event", data: { payload: {
-      event: "worker_protocol", data: { event: { event: "completions", data: { kind: "file", entries: [{ value, is_dir: false }] } } },
-    } } },
-  });
-  receive("old-result");
-  await waitFor(() => expect(multiplexer.sendWorkerMethod).toHaveBeenCalledWith({ method: "list_completions", params: { kind: "file", prefix: "new" } }));
   expect(screen.queryByRole("option")).toBeNull();
-  receive("new-result");
+  receive("new-result", "new", current);
   expect((await screen.findByRole("option")).textContent).toContain("@new-result");
   latestListener().onStatus?.("closed", { kind: "transport", message: "connection lost" });
   await waitFor(() => expect(screen.queryByRole("listbox")).toBeNull());
-  receive("late-result");
+  receive("late-result", "new", current);
   await settleMicrotasks();
   expect(screen.queryByRole("listbox")).toBeNull();
 });

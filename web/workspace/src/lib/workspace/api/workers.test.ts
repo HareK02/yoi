@@ -382,3 +382,20 @@ Deno.test("Worker create request parser requires the complete shared request", (
     "kind is invalid",
   );
 });
+
+Deno.test("Worker launch request preserves typed Feature invocations and rejects unsafe values", () => {
+  const invocation = { invocation_id: "invoke-1", identity: "test/run", name: "run", arguments: [
+    { name: "path", value: { kind: "string", value: "資料/a b" } },
+    { name: "count", value: { kind: "integer", value: 1 } },
+    { name: "enabled", value: { kind: "boolean", value: true } },
+  ] };
+  const request = { runtime_id: "runtime-a", display_name: "Worker A", profile: "builtin:coder", ticket_assignment: null,
+    initial_submit: [{ kind: "feature_invoke", invocation }], workdir_attachments: [], feature_connections: {}, control_operation_id: null };
+  assertEquals(parseCreateWorkspaceWorkerRequest(request).initial_submit, request.initial_submit);
+  assertThrows(() => parseCreateWorkspaceWorkerRequest({ ...request, initial_submit: [{ kind: "feature_invoke", invocation: {
+    ...invocation, arguments: [{ name: "count", value: { kind: "integer", value: 9007199254740992 } }],
+  } }] }), Error, "safe integer");
+  assertThrows(() => parseCreateWorkspaceWorkerRequest({ ...request, initial_submit: [{ kind: "feature_invoke", invocation: {
+    ...invocation, extra: true,
+  } }] }), Error, "unknown field extra");
+});

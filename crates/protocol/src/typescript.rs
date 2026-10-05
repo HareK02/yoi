@@ -6,20 +6,23 @@ use ts_rs::{Config, TS};
 use crate::{
     Alert, AlertLevel, AlertSource, CommandEvent, CommandSnapshot, CommandStatus, CommandStream,
     CommandStreamSlice, CompactionLifecycle, CompactionLifecycleState, CompactionPhase,
-    CompactionTrigger, CompletionEntry, CompletionKind, ContextTokenSource, ContextUsage,
-    ErrorCode, Event, Greeting, InFlightBlock, InFlightCompaction, InFlightSnapshot,
+    CompactionTrigger, CompletionContext, CompletionEntry, CompletionKind, ContextTokenSource,
+    ContextUsage, ErrorCode, Event, FeatureInvocation, FeatureInvocationDescriptor,
+    FeatureInvocationIdentity, FeatureInvocationResult, FeatureInvocationStatus,
+    FeatureInvocationSyntax, Greeting, InFlightBlock, InFlightCompaction, InFlightSnapshot,
     InFlightToolCallState, InternalWorkerKind, InternalWorkerRef, InternalWorkerSnapshot,
-    InvokeKind, MemoryWorkerEvent, Method, PasteArtifactAvailability, PasteArtifactMediaType,
-    PasteArtifactRef, PendingSubmissionSummary, PendingSubmissionsSnapshot, Permission,
-    ReasoningConfig, RewindSummary, RewindTarget, RewindTargetId, RunFailureKind, RunResult,
-    RunResumeSource, RunYieldReason, ScopeRule, Segment, SessionContentPart,
-    SessionConversationTurn, SessionEntryProvenance, SessionHistoryLineageBoundary,
-    SessionHistoryPage, SessionMessageRole, SessionSnapshot, SessionSnapshotEntry,
-    SessionSnapshotEntryData, SessionToolAttachment, SubmissionDisposition, SymlinkPolicy,
-    ToolResultDisposition, TurnResult, UploadedFileAvailability, UploadedFileRef, WorkerBusyState,
-    WorkerCommandAcknowledgement, WorkerCommandDisposition, WorkerCommandEnvelope,
-    WorkerCommandKind, WorkerEvent, WorkerMaintenanceState, WorkerRunState, WorkerState,
-    WorkerStateSnapshot, WorkerStatus,
+    InvocationArgumentDescriptor, InvocationArgumentType, InvocationArgumentValue,
+    InvocationClientAdapter, InvocationCompletion, InvocationValue, InvokeKind, MemoryWorkerEvent,
+    Method, PasteArtifactAvailability, PasteArtifactMediaType, PasteArtifactRef,
+    PendingSubmissionSummary, PendingSubmissionsSnapshot, Permission, ReasoningConfig,
+    RewindSummary, RewindTarget, RewindTargetId, RunFailureKind, RunResult, RunResumeSource,
+    RunYieldReason, ScopeRule, Segment, SessionContentPart, SessionConversationTurn,
+    SessionEntryProvenance, SessionHistoryLineageBoundary, SessionHistoryPage, SessionMessageRole,
+    SessionSnapshot, SessionSnapshotEntry, SessionSnapshotEntryData, SessionToolAttachment,
+    SubmissionDisposition, SymlinkPolicy, ToolResultDisposition, TurnResult,
+    UploadedFileAvailability, UploadedFileRef, WorkerBusyState, WorkerCommandAcknowledgement,
+    WorkerCommandDisposition, WorkerCommandEnvelope, WorkerCommandKind, WorkerEvent,
+    WorkerMaintenanceState, WorkerRunState, WorkerState, WorkerStateSnapshot, WorkerStatus,
     subscription::{
         EventSubscriptionSelector, MAX_CORRELATION_ID_BYTES, MAX_REJECTION_MESSAGE_BYTES,
         MAX_RESOURCE_ID_BYTES, MAX_SUBSCRIPTION_COLLECTION_ITEMS,
@@ -64,6 +67,19 @@ pub fn generated_protocol_types() -> String {
     push_decl::<AlertLevel>(&cfg, &mut output);
     push_decl::<AlertSource>(&cfg, &mut output);
     push_decl::<CompletionKind>(&cfg, &mut output);
+    push_decl::<CompletionContext>(&cfg, &mut output);
+    push_decl::<FeatureInvocationIdentity>(&cfg, &mut output);
+    push_decl::<FeatureInvocationSyntax>(&cfg, &mut output);
+    push_decl::<InvocationArgumentType>(&cfg, &mut output);
+    push_decl::<InvocationCompletion>(&cfg, &mut output);
+    push_decl::<InvocationArgumentDescriptor>(&cfg, &mut output);
+    push_decl::<InvocationClientAdapter>(&cfg, &mut output);
+    push_decl::<FeatureInvocationDescriptor>(&cfg, &mut output);
+    push_decl::<InvocationValue>(&cfg, &mut output);
+    push_decl::<InvocationArgumentValue>(&cfg, &mut output);
+    push_decl::<FeatureInvocation>(&cfg, &mut output);
+    push_decl::<FeatureInvocationStatus>(&cfg, &mut output);
+    push_decl::<FeatureInvocationResult>(&cfg, &mut output);
     push_decl::<WorkerStatus>(&cfg, &mut output);
     push_decl::<WorkerCommandEnvelope>(&cfg, &mut output);
     push_decl::<WorkerCommandKind>(&cfg, &mut output);

@@ -6508,23 +6508,11 @@ fn worker_input_request_from_api(
             )));
         }
     };
-    let segments = request
-        .segments
-        .map(|segments| {
-            segments
-                .into_iter()
-                .map(|segment| {
-                    serde_json::from_value::<Segment>(segment)
-                        .map_err(|error| invalid_contract_value("Worker input segment", error))
-                })
-                .collect::<Result<Vec<_>>>()
-        })
-        .transpose()?;
     Ok(WorkerInputRequest {
         kind,
         content: request.content,
         submission_request_id: None,
-        segments,
+        segments: request.segments,
     })
 }
 
@@ -6543,9 +6531,10 @@ fn worker_completions_request_from_api(
     request: server_api::RuntimeWorkerCompletionsRequest,
 ) -> Result<WorkerCompletionsRequest> {
     Ok(WorkerCompletionsRequest {
-        kind: serde_json::from_value(request.kind)
-            .map_err(|error| invalid_contract_value("Worker completion kind", error))?,
+        kind: request.kind,
         prefix: request.prefix,
+        context: request.context,
+        request_id: request.request_id,
     })
 }
 
@@ -6641,17 +6630,11 @@ fn worker_completions_result_to_api(
     Ok(server_api::RuntimeWorkerCompletionsResult {
         runtime_id: result.worker.runtime_id,
         worker_id: result.worker.worker_id,
-        kind: serde_json::to_value(result.kind)
-            .map_err(|error| invalid_contract_value("Worker completion kind", error))?,
+        kind: result.kind,
         prefix: result.prefix,
-        entries: result
-            .entries
-            .into_iter()
-            .map(|entry| {
-                serde_json::to_value(entry)
-                    .map_err(|error| invalid_contract_value("Worker completion entry", error))
-            })
-            .collect::<Result<Vec<_>>>()?,
+        context: result.context,
+        request_id: result.request_id,
+        entries: result.entries,
         diagnostics: result.diagnostics.into_iter().map(Into::into).collect(),
     })
 }
@@ -36264,6 +36247,33 @@ mod tests {
     }
 
     #[test]
+    fn feature_completion_api_conversions_preserve_nonce_and_context_for_aba_requests() {
+        for nonce in ["first", "second", "first"] {
+            let json = serde_json::json!({"kind":"feature_argument", "prefix":"資料/", "request_id":nonce,
+                "context":{"invocation":"builtin:test/prepare", "argument":"path"}});
+            let wire: server_api::RuntimeWorkerCompletionsRequest =
+                serde_json::from_value(json.clone()).unwrap();
+            let request = worker_completions_request_from_api(wire).unwrap();
+            assert_eq!(serde_json::to_value(&request).unwrap(), json);
+            let result = worker_completions_result_to_api(WorkerCompletionsResult {
+                worker: RuntimeWorkerRef::new("runtime", "worker"),
+                kind: request.kind,
+                prefix: request.prefix,
+                context: request.context,
+                request_id: request.request_id,
+                entries: Vec::new(),
+                diagnostics: Vec::new(),
+            })
+            .unwrap();
+            assert_eq!(result.request_id.as_deref(), Some(nonce));
+            assert_eq!(
+                serde_json::to_value(result.context).unwrap(),
+                json["context"]
+            );
+        }
+    }
+
+    #[test]
     fn flow_or_generic_worker_state_change_is_not_ticket_completion_authority() {
         let change = || {
             TicketStateChange::new(
@@ -57327,6 +57337,8 @@ mod tests {
                 serde_json::to_string(&protocol::Method::ListCompletions {
                     kind: protocol::CompletionKind::File,
                     prefix: String::new(),
+                    request_id: None,
+                    context: None,
                 })
                 .unwrap()
                 .into(),
@@ -57807,6 +57819,8 @@ mod tests {
                     method: protocol::Method::ListCompletions {
                         kind: protocol::CompletionKind::File,
                         prefix: String::new(),
+                        request_id: None,
+                        context: None,
                     },
                 },
             ),

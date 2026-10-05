@@ -1,6 +1,7 @@
 import type { ComposerCompletionEntry } from "./composer-completion.ts";
 
 type Request = {
+  id: string;
   prefix: string;
   signal: AbortSignal;
   resolve: (entries: ComposerCompletionEntry[]) => void;
@@ -8,18 +9,18 @@ type Request = {
   abort: () => void;
 };
 
-/** The wire reply has no request id/prefix. Never overlap requests on a lane,
- * including cancelled requests: their reply must be consumed before the next.
- * A timeout poisons the lane until reconnect, rather than misrouting a late reply.
+/** A lane is scoped to a transport target and completion kind/context. Each
+ * request also has a unique wire nonce: cancelled requests never need draining,
+ * and legacy replies or another client's same-prefix broadcasts cannot match.
+ * The editor's abort signal fences the draft, cursor and completion generation.
  */
 export class FileCompletions {
   private active: Request | null = null;
-  private queued: Request | null = null;
   private timer: ReturnType<typeof setTimeout> | undefined;
   private failure: Error | null = null;
 
   constructor(
-    private send: (prefix: string) => void,
+    private send: (prefix: string, requestId: string) => void,
     private timeoutMs = 30_000,
   ) {}
 
@@ -33,42 +34,48 @@ export class FileCompletions {
   ): Promise<ComposerCompletionEntry[]> {
     if (signal.aborted) return Promise.resolve([]);
     if (this.failure) return Promise.reject(this.failure);
+    this.finish([]);
     return new Promise((resolve, reject) => {
       const request: Request = {
+        id: crypto.randomUUID(),
         prefix,
         signal,
         resolve,
         reject,
         abort: () => {
-          resolve([]);
-          if (this.queued === request) this.queued = null;
+          if (this.active === request) this.finish([]);
         },
       };
+      this.active = request;
       signal.addEventListener("abort", request.abort, { once: true });
-      if (this.queued) this.finish(this.queued, []);
-      this.queued = request;
-      this.pump();
+      this.timer = setTimeout(() => {
+        if (this.active === request) {
+          this.reject(new Error("Worker completion request timed out; retry."));
+        }
+      }, this.timeoutMs);
+      try {
+        this.send(prefix, request.id);
+      } catch (error) {
+        this.reject(error instanceof Error ? error : new Error(String(error)));
+      }
     });
   }
 
-  receive(entries: ComposerCompletionEntry[]): void {
-    if (!this.active) return;
-    clearTimeout(this.timer);
-    const request = this.active;
-    this.active = null;
-    this.finish(request, entries);
-    this.pump();
+  receive(
+    entries: ComposerCompletionEntry[],
+    prefix: string,
+    requestId?: string | null,
+  ): void {
+    if (
+      !this.active || this.active.id !== requestId ||
+      this.active.prefix !== prefix
+    ) return;
+    this.finish(entries);
   }
 
   close(error = new Error("Worker completion connection closed.")): void {
     this.failure = error;
-    clearTimeout(this.timer);
-    for (const request of [this.active, this.queued]) {
-      if (!request) continue;
-      request.signal.removeEventListener("abort", request.abort);
-      request.reject(error);
-    }
-    this.active = this.queued = null;
+    this.reject(error);
   }
 
   reset(): void {
@@ -76,31 +83,20 @@ export class FileCompletions {
     this.failure = null;
   }
 
-  private finish(request: Request, entries: ComposerCompletionEntry[]): void {
-    request.signal.removeEventListener("abort", request.abort);
-    request.resolve(request.signal.aborted ? [] : entries);
+  private take(): Request | null {
+    clearTimeout(this.timer);
+    const request = this.active;
+    this.active = null;
+    request?.signal.removeEventListener("abort", request.abort);
+    return request;
   }
 
-  private pump(): void {
-    if (this.active || !this.queued || this.failure) return;
-    const request = this.queued;
-    this.queued = null;
-    if (request.signal.aborted) {
-      this.finish(request, []);
-      return;
-    }
-    this.active = request;
-    this.timer = setTimeout(
-      () =>
-        this.close(
-          new Error("Worker completion request timed out; reconnect to retry."),
-        ),
-      this.timeoutMs,
-    );
-    try {
-      this.send(request.prefix);
-    } catch (error) {
-      this.close(error instanceof Error ? error : new Error(String(error)));
-    }
+  private finish(entries: ComposerCompletionEntry[]): void {
+    const request = this.take();
+    request?.resolve(request.signal.aborted ? [] : entries);
+  }
+
+  private reject(error: Error): void {
+    this.take()?.reject(error);
   }
 }

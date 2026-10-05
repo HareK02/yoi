@@ -383,8 +383,11 @@ impl Store for FsStore {
             content.push_str(&serde_json::to_string(entry)?);
             content.push('\n');
         }
-        fs::write(&path, content.as_bytes())?;
-        Ok(())
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| std::io::Error::other("session store append lock was poisoned"))?;
+        crate::worker_session_store::atomic_write_bytes(&path, content.as_bytes())
     }
 
     fn exists(&self, session_id: SessionId, segment_id: SegmentId) -> Result<bool, StoreError> {

@@ -20,6 +20,7 @@ use agen::Engine;
 use agen::llm_client::client::LlmClient;
 use agen::state::Mutable;
 use agen::tool::ToolDefinition;
+use protocol::FeatureInvocationDescriptor;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -623,6 +624,9 @@ pub struct FeatureDescriptor {
     pub provides_services: Vec<ServiceDeclaration>,
     pub requires_services: Vec<ServiceRequirement>,
     pub protocol_providers: Vec<ProtocolProviderDeclaration>,
+    /// Declarative, user-selected chat invocations contributed by this Feature.
+    /// Metadata is public; handlers are registered separately during install.
+    pub chat_invocations: Vec<FeatureInvocationDescriptor>,
 }
 
 impl FeatureDescriptor {
@@ -640,6 +644,7 @@ impl FeatureDescriptor {
             provides_services: Vec::new(),
             requires_services: Vec::new(),
             protocol_providers: Vec::new(),
+            chat_invocations: Vec::new(),
         }
     }
 
@@ -680,6 +685,11 @@ impl FeatureDescriptor {
 
     pub fn with_protocol_provider(mut self, provider: ProtocolProviderDeclaration) -> Self {
         self.protocol_providers.push(provider);
+        self
+    }
+
+    pub fn with_chat_invocation(mut self, invocation: FeatureInvocationDescriptor) -> Self {
+        self.chat_invocations.push(invocation);
         self
     }
 }
@@ -739,6 +749,7 @@ pub enum FeatureContributionKind {
     BackgroundTask,
     Service,
     ProtocolProvider,
+    ChatInvocation,
     Notification,
     Alert,
     Diagnostic,
@@ -765,6 +776,7 @@ pub struct FeatureInstallReport {
     pub provided_services: Vec<ServiceDeclaration>,
     pub resolved_service_requirements: Vec<ServiceRequirement>,
     pub protocol_providers: Vec<ProtocolProviderLifecycleDiagnostic>,
+    pub installed_chat_invocations: Vec<FeatureInvocationDescriptor>,
     pub skipped: Vec<SkippedContribution>,
     pub diagnostics: Vec<FeatureDiagnostic>,
 }
@@ -782,6 +794,7 @@ impl FeatureInstallReport {
             provided_services: Vec::new(),
             resolved_service_requirements: Vec::new(),
             protocol_providers: Vec::new(),
+            installed_chat_invocations: Vec::new(),
             skipped: Vec::new(),
             diagnostics: Vec::new(),
         }
@@ -794,6 +807,7 @@ impl FeatureInstallReport {
         self.installed_instructions.clear();
         self.declared_background_tasks.clear();
         self.provided_services.clear();
+        self.installed_chat_invocations.clear();
     }
 
     fn mark_skipped(
@@ -819,6 +833,7 @@ struct FeatureContributionDeclarations {
     provided_services: HashSet<(ServiceId, String)>,
     required_services: HashSet<ServiceId>,
     protocol_providers: HashSet<ProviderId>,
+    chat_invocations: Vec<FeatureInvocationDescriptor>,
 }
 
 impl FeatureContributionDeclarations {
@@ -859,6 +874,7 @@ impl FeatureContributionDeclarations {
                 .iter()
                 .map(|provider| provider.id.clone())
                 .collect(),
+            chat_invocations: descriptor.chat_invocations.clone(),
         }
     }
 
@@ -1527,6 +1543,7 @@ pub struct FeatureInstallContext<'a> {
     hook_builder: &'a mut HookRegistryBuilder,
     background_task_builder: &'a mut FeatureBackgroundTaskRegistryBuilder,
     service_registry: &'a mut FeatureServiceRegistry,
+    invocation_registry: &'a mut FeatureInvocationRegistry,
     report: &'a mut FeatureInstallReport,
 }
 
@@ -1591,6 +1608,15 @@ impl FeatureInstallContext<'_> {
         }
     }
 
+    pub fn chat_invocations(&mut self) -> InvocationContributionRegistrar<'_> {
+        InvocationContributionRegistrar {
+            feature_id: self.feature_id,
+            declarations: &self.declarations.chat_invocations,
+            registry: self.invocation_registry,
+            installed: &mut self.report.installed_chat_invocations,
+        }
+    }
+
     pub fn diagnostics(&mut self) -> FeatureDiagnosticSink<'_> {
         FeatureDiagnosticSink {
             report: self.report,
@@ -1604,6 +1630,7 @@ pub struct FeatureRegistryInstallReport {
     pub reports: Vec<FeatureInstallReport>,
     pub services: FeatureServiceRegistry,
     pub background_tasks: FeatureBackgroundTaskRegistry,
+    pub chat_invocations: FeatureInvocationRegistry,
     pub plan_error: Option<FeaturePlanError>,
 }
 
@@ -2026,11 +2053,13 @@ impl FeatureRegistryBuilder {
                     reports,
                     services: FeatureServiceRegistry::default(),
                     background_tasks: FeatureBackgroundTaskRegistry::default(),
+                    chat_invocations: FeatureInvocationRegistry::default(),
                     plan_error: Some(error),
                 };
             }
         };
         let mut service_registry = FeatureServiceRegistry::default();
+        let mut invocation_registry = FeatureInvocationRegistry::default();
         let mut background_task_builder = FeatureBackgroundTaskRegistryBuilder::default();
         let mut reports = Vec::with_capacity(plan.ordered_indices.len());
         let install_hook_checkpoint = hook_builder.checkpoint();
@@ -2055,6 +2084,7 @@ impl FeatureRegistryBuilder {
             let hook_checkpoint = hook_builder.checkpoint();
             let background_checkpoint = background_task_builder.checkpoint();
             let service_checkpoint = service_registry.clone();
+            let invocation_checkpoint = invocation_registry.clone();
             let tool_checkpoint = pending_tools.len();
             let installed_tool_checkpoint = installed_tool_names.clone();
 
@@ -2102,6 +2132,7 @@ impl FeatureRegistryBuilder {
                     hook_builder,
                     background_task_builder: &mut background_task_builder,
                     service_registry: &mut service_registry,
+                    invocation_registry: &mut invocation_registry,
                     report: &mut report,
                 };
                 module.install(&mut context)
@@ -2113,6 +2144,7 @@ impl FeatureRegistryBuilder {
                     hook_builder.rollback_to(hook_checkpoint);
                     background_task_builder.rollback_to(&background_checkpoint);
                     service_registry = service_checkpoint.clone();
+                    invocation_registry = invocation_checkpoint.clone();
                     pending_tools.truncate(tool_checkpoint);
                     installed_tool_names = installed_tool_checkpoint.clone();
                     report.clear_installed_contributions();
@@ -2138,6 +2170,14 @@ impl FeatureRegistryBuilder {
                         )));
                     }
                 }
+                for invocation in &descriptor.chat_invocations {
+                    if !report.installed_chat_invocations.contains(invocation) {
+                        report.diagnostics.push(FeatureDiagnostic::error(format!(
+                            "feature `{}` declared chat invocation `{}` but did not register an executable handler",
+                            descriptor.id, invocation.identity
+                        )));
+                    }
+                }
                 if report
                     .diagnostics
                     .iter()
@@ -2146,6 +2186,7 @@ impl FeatureRegistryBuilder {
                     hook_builder.rollback_to(hook_checkpoint);
                     background_task_builder.rollback_to(&background_checkpoint);
                     service_registry = service_checkpoint.clone();
+                    invocation_registry = invocation_checkpoint.clone();
                     pending_tools.truncate(tool_checkpoint);
                     installed_tool_names = installed_tool_checkpoint.clone();
                     report.clear_installed_contributions();
@@ -2176,6 +2217,7 @@ impl FeatureRegistryBuilder {
                 reports,
                 services: FeatureServiceRegistry::default(),
                 background_tasks: FeatureBackgroundTaskRegistry::default(),
+                chat_invocations: FeatureInvocationRegistry::default(),
                 plan_error: None,
             }
         } else {
@@ -2183,6 +2225,7 @@ impl FeatureRegistryBuilder {
                 reports,
                 services: service_registry,
                 background_tasks: background_task_builder.build(),
+                chat_invocations: invocation_registry,
                 plan_error: None,
             }
         }
@@ -2225,11 +2268,24 @@ pub enum FeatureInstallError {
         first_feature: String,
         duplicate_feature: String,
     },
+    #[error("duplicate invocation identity `{identity}`")]
+    DuplicateInvocationIdentity { identity: String },
+    #[error("duplicate invocation name `{name}` from `{duplicate}`; first registered by `{first}`")]
+    DuplicateInvocationName {
+        name: String,
+        first: String,
+        duplicate: String,
+    },
     #[error("feature install failed: {0}")]
     Install(String),
 }
 
 pub mod background;
+pub mod invocation;
+pub use invocation::{
+    FeatureInvocationCompletionProvider, FeatureInvocationContext, FeatureInvocationHandler,
+    FeatureInvocationHandlerError, FeatureInvocationRegistry, InvocationContributionRegistrar,
+};
 pub mod builtin;
 pub mod mcp;
 pub(crate) mod session;

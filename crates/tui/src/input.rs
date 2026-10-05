@@ -116,11 +116,30 @@ impl FlowRefAtom {
 }
 
 #[derive(Debug, Clone)]
+pub struct FeatureInvokeAtom {
+    pub invocation: protocol::FeatureInvocation,
+}
+
+impl FeatureInvokeAtom {
+    pub fn label(&self) -> String {
+        self.invocation.display_input()
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum Atom {
     Char(char),
+    Unknown,
+    AttachmentStage {
+        id: String,
+        file_name: String,
+        failed: bool,
+    },
     Paste(PasteRef),
     PasteArtifact(protocol::PasteArtifactRef),
+    UploadedFile(protocol::UploadedFileRef),
     FileRef(FileRefAtom),
+    FeatureInvoke(FeatureInvokeAtom),
     FlowRef(FlowRefAtom),
 }
 
@@ -130,6 +149,23 @@ impl Atom {
     fn chip(&self) -> Option<(Style, String)> {
         match self {
             Atom::Char(_) => None,
+            Atom::Unknown => Some((
+                Style::default().fg(Color::Red),
+                "[unknown input segment]".into(),
+            )),
+            Atom::AttachmentStage {
+                file_name, failed, ..
+            } => Some((
+                Style::default().fg(Color::Cyan),
+                format!(
+                    "[Attached {file_name} | {}]",
+                    if *failed {
+                        "failed; Alt+Enter retries"
+                    } else {
+                        "uploading"
+                    }
+                ),
+            )),
             Atom::Paste(p) => Some((Style::default().fg(Color::Magenta), p.label())),
             Atom::PasteArtifact(artifact) => Some((
                 Style::default().fg(Color::Magenta),
@@ -143,7 +179,17 @@ impl Atom {
                     artifact.created_at_ms
                 ),
             )),
+            Atom::UploadedFile(file) => Some((
+                Style::default().fg(Color::Cyan),
+                format!(
+                    "[Attached {} | {} bytes, ready]",
+                    file.file_name, file.byte_len
+                ),
+            )),
             Atom::FileRef(r) => Some((Style::default().fg(Color::Cyan), r.label())),
+            Atom::FeatureInvoke(invocation) => {
+                Some((Style::default().fg(Color::Yellow), invocation.label()))
+            }
             Atom::FlowRef(r) => Some((Style::default().fg(Color::Yellow), r.label())),
         }
     }
@@ -173,9 +219,14 @@ enum WordKind {
 fn atom_class(atom: &Atom) -> AtomClass {
     match atom {
         Atom::Char(c) => char_class(*c),
-        Atom::Paste(_) | Atom::PasteArtifact(_) | Atom::FileRef(_) | Atom::FlowRef(_) => {
-            AtomClass::Chip
-        }
+        Atom::Unknown
+        | Atom::AttachmentStage { .. }
+        | Atom::Paste(_)
+        | Atom::PasteArtifact(_)
+        | Atom::UploadedFile(_)
+        | Atom::FileRef(_)
+        | Atom::FeatureInvoke(_)
+        | Atom::FlowRef(_) => AtomClass::Chip,
     }
 }
 
@@ -195,12 +246,53 @@ fn char_class(c: char) -> AtomClass {
     }
 }
 
+fn first_unquoted_char(value: &str, target: char) -> Option<usize> {
+    unquoted_char_indices(value).find_map(|(index, ch)| (ch == target).then_some(index))
+}
+
+fn last_unquoted_char(value: &str, target: char) -> Option<usize> {
+    unquoted_char_indices(value)
+        .filter_map(|(index, ch)| (ch == target).then_some(index))
+        .last()
+}
+
+fn unquoted_char_indices(value: &str) -> impl Iterator<Item = (usize, char)> + '_ {
+    let mut quoted = false;
+    let mut escaped = false;
+    value.char_indices().filter(move |(_, ch)| {
+        if !escaped && *ch == '"' {
+            quoted = !quoted;
+            escaped = false;
+            return false;
+        }
+        let visible = !quoted;
+        escaped = quoted && !escaped && *ch == '\\';
+        if *ch != '\\' {
+            escaped = false;
+        }
+        visible
+    })
+}
+
+#[derive(Clone)]
+struct SelectedInvocation {
+    start: usize,
+    descriptor: protocol::FeatureInvocationDescriptor,
+    invocation_id: String,
+}
+
 pub struct InputBuffer {
+    /// Monotonic semantic edit/cursor revision, including ABA changes.
+    revision: u64,
     atoms: Vec<Atom>,
+    selected_invocations: Vec<SelectedInvocation>,
+    removed_attachment_stages: Vec<String>,
     /// Insertion point in `0..=atoms.len()`.
     cursor: usize,
     /// Top wrapped row of the visible composer viewport.
     scroll_offset: usize,
+    /// Uploaded draft chips removed by explicit editing and awaiting client-side cleanup.
+    removed_uploaded_files: Vec<protocol::UploadedFileRef>,
     /// Monotonic counter reused across the TUI process lifetime.
     next_paste_id: u32,
 }
@@ -208,20 +300,34 @@ pub struct InputBuffer {
 impl Default for InputBuffer {
     fn default() -> Self {
         Self {
+            revision: 0,
             atoms: Vec::new(),
+            selected_invocations: Vec::new(),
+            removed_attachment_stages: Vec::new(),
             cursor: 0,
             scroll_offset: 0,
+            removed_uploaded_files: Vec::new(),
             next_paste_id: 1,
         }
     }
 }
 
 impl InputBuffer {
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn bump_revision(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
 
     pub fn clear(&mut self) {
+        self.bump_revision();
+        self.selected_invocations.clear();
         self.atoms.clear();
         self.cursor = 0;
         self.scroll_offset = 0;
@@ -243,6 +349,8 @@ impl InputBuffer {
     /// by [`submit_segments`](Self::submit_segments), preserving typed chips
     /// and placing the cursor at the end of the restored input.
     pub fn replace_with_segments(&mut self, segments: &[protocol::Segment]) {
+        self.bump_revision();
+        self.selected_invocations.clear();
         self.atoms.clear();
         for segment in segments {
             match segment {
@@ -267,15 +375,16 @@ impl InputBuffer {
                     self.atoms.push(Atom::PasteArtifact(artifact.clone()));
                 }
                 protocol::Segment::UploadedFile { file } => {
-                    self.atoms.extend(
-                        format!("[Attached file: {}]", file.file_name)
-                            .chars()
-                            .map(Atom::Char),
-                    );
+                    self.atoms.push(Atom::UploadedFile(file.clone()));
                 }
                 protocol::Segment::FileRef { path } => {
                     self.atoms
                         .push(Atom::FileRef(FileRefAtom { path: path.clone() }));
+                }
+                protocol::Segment::FeatureInvoke { invocation } => {
+                    self.atoms.push(Atom::FeatureInvoke(FeatureInvokeAtom {
+                        invocation: invocation.clone(),
+                    }));
                 }
                 protocol::Segment::Flow { selector } => {
                     self.atoms.push(Atom::FlowRef(FlowRefAtom {
@@ -283,8 +392,7 @@ impl InputBuffer {
                     }));
                 }
                 protocol::Segment::Unknown => {
-                    self.atoms
-                        .extend("[unknown input segment]".chars().map(Atom::Char));
+                    self.atoms.push(Atom::Unknown);
                 }
             }
         }
@@ -292,6 +400,8 @@ impl InputBuffer {
     }
 
     pub fn insert_char(&mut self, c: char) {
+        self.bump_revision();
+        self.adjust_selection(self.cursor, self.cursor, 1);
         self.atoms.insert(self.cursor, Atom::Char(c));
         self.cursor += 1;
     }
@@ -307,6 +417,10 @@ impl InputBuffer {
         for atom in &self.atoms {
             match atom {
                 Atom::Char(c) => text.push(*c),
+                Atom::Unknown => text.push_str("[unknown input segment]"),
+                Atom::AttachmentStage { file_name, .. } => {
+                    text.push_str(&format!("[Staging {file_name}]"))
+                }
                 Atom::Paste(paste) => text.push_str(&paste.content),
                 Atom::PasteArtifact(artifact) => {
                     text.push_str(&protocol::Segment::flatten_to_text(&[
@@ -315,7 +429,11 @@ impl InputBuffer {
                         },
                     ]))
                 }
+                Atom::UploadedFile(file) => {
+                    text.push_str(&format!("[Attached file: {}]", file.file_name));
+                }
                 Atom::FileRef(file) => text.push_str(&file.path),
+                Atom::FeatureInvoke(invocation) => text.push_str(&invocation.label()),
                 Atom::FlowRef(flow) => text.push_str(&flow.selector),
             }
         }
@@ -327,6 +445,7 @@ impl InputBuffer {
     }
 
     pub fn insert_paste(&mut self, content: String) {
+        self.bump_revision();
         let measurement = measure_paste(&content);
         if measurement.presentation() == PastePresentation::Text {
             self.insert_str(&content);
@@ -335,6 +454,7 @@ impl InputBuffer {
 
         let id = self.next_paste_id;
         self.next_paste_id = self.next_paste_id.wrapping_add(1);
+        self.adjust_selection(self.cursor, self.cursor, 1);
         self.atoms.insert(
             self.cursor,
             Atom::Paste(PasteRef {
@@ -347,14 +467,236 @@ impl InputBuffer {
         self.cursor += 1;
     }
 
+    #[cfg(test)]
+    pub fn insert_uploaded_file(&mut self, file: protocol::UploadedFileRef) {
+        self.bump_revision();
+        self.adjust_selection(self.cursor, self.cursor, 1);
+        self.atoms.insert(self.cursor, Atom::UploadedFile(file));
+        self.cursor += 1;
+    }
+
+    // Selections belong to an exact occurrence, never to all text matching a name.
+    fn adjust_selection(&mut self, start: usize, end: usize, inserted: usize) {
+        self.selected_invocations.retain_mut(|selection| {
+            if start < end && (start..end).contains(&selection.start) {
+                return false;
+            }
+            if selection.start >= end {
+                selection.start = selection.start - (end - start) + inserted;
+            }
+            true
+        });
+    }
+
+    pub fn select_feature_invocation(
+        &mut self,
+        start: usize,
+        descriptor: protocol::FeatureInvocationDescriptor,
+    ) {
+        self.bump_revision();
+        self.selected_invocations
+            .retain(|selection| selection.start != start);
+        self.selected_invocations.push(SelectedInvocation {
+            start,
+            descriptor,
+            invocation_id: protocol::new_submission_request_id(),
+        });
+    }
+
+    pub fn has_selected_feature_invocations(&self) -> bool {
+        !self.selected_invocations.is_empty()
+    }
+
+    pub fn retry_attachment_stage(&mut self, id: &str) {
+        self.bump_revision();
+        for atom in &mut self.atoms {
+            if let Atom::AttachmentStage {
+                id: stage_id,
+                failed,
+                ..
+            } = atom
+            {
+                if stage_id == id {
+                    *failed = false;
+                }
+            }
+        }
+    }
+
+    pub fn finalize_feature_invocations(&mut self) -> Result<(), String> {
+        // Validate first so invalid arguments cannot partially chip a draft.
+        let mut parsed = Vec::new();
+        for selection in &self.selected_invocations {
+            let text = self.atoms[selection.start..]
+                .iter()
+                .take_while(|atom| matches!(atom, Atom::Char(_)))
+                .filter_map(|atom| {
+                    if let Atom::Char(ch) = atom {
+                        Some(*ch)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<String>();
+            let invocation = protocol::parse_feature_invocation(
+                &text,
+                0,
+                &selection.descriptor,
+                selection.invocation_id.clone(),
+            )
+            .map_err(|error| error.to_string())?;
+            parsed.push((
+                selection.start,
+                text[..invocation.end].chars().count(),
+                invocation.invocation,
+            ));
+        }
+        parsed.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+        for (start, count, invocation) in parsed {
+            self.replace_atoms(
+                start,
+                start + count,
+                vec![Atom::FeatureInvoke(FeatureInvokeAtom { invocation })],
+            );
+        }
+        Ok(())
+    }
+
+    fn replace_atoms(&mut self, start: usize, end: usize, atoms: Vec<Atom>) {
+        self.bump_revision();
+        let inserted = atoms.len();
+        self.adjust_selection(start, end, inserted);
+        let removed = self.atoms.splice(start..end, atoms).collect::<Vec<_>>();
+        for atom in removed {
+            self.record_removed_atom(atom);
+        }
+        if self.cursor >= end {
+            self.cursor = self.cursor - (end - start) + inserted;
+        } else if self.cursor > start {
+            self.cursor = start + inserted;
+        }
+    }
+
+    pub fn adjacent_feature_invocation(&self) -> Option<protocol::FeatureInvocation> {
+        [self.cursor.checked_sub(1), Some(self.cursor)]
+            .into_iter()
+            .flatten()
+            .find_map(|index| match self.atoms.get(index) {
+                Some(Atom::FeatureInvoke(atom)) => Some(atom.invocation.clone()),
+                _ => None,
+            })
+    }
+
+    pub fn edit_feature_invocation(
+        &mut self,
+        id: &str,
+        descriptor: protocol::FeatureInvocationDescriptor,
+    ) -> bool {
+        let Some((index, invocation)) =
+            self.atoms
+                .iter()
+                .enumerate()
+                .find_map(|(index, atom)| match atom {
+                    Atom::FeatureInvoke(atom) if atom.invocation.invocation_id == id => {
+                        Some((index, atom.invocation.clone()))
+                    }
+                    _ => None,
+                })
+        else {
+            return false;
+        };
+        if invocation.identity != descriptor.identity {
+            return false;
+        }
+        let text = invocation.display_input();
+        self.replace_atoms(index, index + 1, text.chars().map(Atom::Char).collect());
+        self.cursor = index + text.chars().count() - 1;
+        self.selected_invocations.push(SelectedInvocation {
+            start: index,
+            descriptor,
+            invocation_id: invocation.invocation_id,
+        });
+        true
+    }
+
+    pub fn stage_attachment(&mut self, invocation_id: &str, id: String, file_name: String) -> bool {
+        let Some(index) = self.atoms.iter().position(|atom| matches!(atom, Atom::FeatureInvoke(atom) if atom.invocation.invocation_id == invocation_id)) else { return false; };
+        self.replace_atoms(
+            index,
+            index + 1,
+            vec![Atom::AttachmentStage {
+                id,
+                file_name,
+                failed: false,
+            }],
+        );
+        true
+    }
+
+    pub fn has_attachment_stages(&self) -> bool {
+        self.atoms
+            .iter()
+            .any(|atom| matches!(atom, Atom::AttachmentStage { .. }))
+    }
+
+    pub fn attachment_stage_ids(&self) -> Vec<String> {
+        self.atoms
+            .iter()
+            .filter_map(|atom| {
+                if let Atom::AttachmentStage { id, .. } = atom {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn adjacent_failed_attachment(&self) -> Option<String> {
+        [self.cursor.checked_sub(1), Some(self.cursor)]
+            .into_iter()
+            .flatten()
+            .find_map(|index| match self.atoms.get(index) {
+                Some(Atom::AttachmentStage {
+                    id, failed: true, ..
+                }) => Some(id.clone()),
+                _ => None,
+            })
+    }
+
+    pub fn finish_attachment_stage(
+        &mut self,
+        id: &str,
+        file: Option<protocol::UploadedFileRef>,
+    ) -> bool {
+        self.bump_revision();
+        let Some(index) = self.atoms.iter().position(
+            |atom| matches!(atom, Atom::AttachmentStage { id: stage_id, .. } if stage_id == id),
+        ) else {
+            return false;
+        };
+        if let Some(file) = file {
+            self.atoms[index] = Atom::UploadedFile(file);
+        } else if let Atom::AttachmentStage { failed, .. } = &mut self.atoms[index] {
+            *failed = true;
+        }
+        true
+    }
+
+    pub fn take_removed_attachment_stages(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.removed_attachment_stages)
+    }
+
     /// Replace `atoms[start..self.cursor]` (the in-flight `@<typed>` /
     /// active `@<typed>` file token) with the corresponding chip atom
     /// and place the cursor right after the chip. Used by the completion
     /// confirm path.
     pub fn replace_with_file_ref(&mut self, start: usize, path: String) {
-        self.atoms.drain(start..self.cursor);
-        self.atoms
-            .insert(start, Atom::FileRef(FileRefAtom { path }));
+        self.replace_atoms(
+            start,
+            self.cursor,
+            vec![Atom::FileRef(FileRefAtom { path })],
+        );
         self.cursor = start + 1;
     }
 
@@ -363,14 +705,177 @@ impl InputBuffer {
     /// completion path: the popup-selected entry is inserted as raw
     /// text (not a chip) so the user can keep typing — e.g. drill into
     /// a directory whose value ends with `/`.
-    pub fn replace_with_text_at(&mut self, start: usize, text: &str) {
-        self.atoms.drain(start..self.cursor);
-        let mut idx = start;
-        for c in text.chars() {
-            self.atoms.insert(idx, Atom::Char(c));
-            idx += 1;
+    pub fn char_at(&self, index: usize) -> Option<char> {
+        match self.atoms.get(index) {
+            Some(Atom::Char(ch)) => Some(*ch),
+            _ => None,
         }
-        self.cursor = idx;
+    }
+
+    pub fn replace_with_text_at(&mut self, start: usize, text: &str) {
+        self.replace_atoms(start, self.cursor, text.chars().map(Atom::Char).collect());
+        self.cursor = start + text.chars().count();
+    }
+
+    pub fn can_complete_argument_name(&self, prefix_start: usize) -> bool {
+        let mut before = prefix_start;
+        while self.char_at(before).is_some_and(char::is_whitespace) {
+            let Some(previous) = before.checked_sub(1) else {
+                return false;
+            };
+            before = previous;
+        }
+        matches!(self.char_at(before), Some('(' | ','))
+    }
+
+    pub fn replace_feature_name_completion(&mut self, start: usize, text: &str) {
+        let mut end = self.cursor;
+        while self
+            .char_at(end)
+            .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        {
+            end += 1;
+        }
+        if self.char_at(end) == Some('(') {
+            end += 1;
+        }
+        self.replace_atoms(start, end, text.chars().map(Atom::Char).collect());
+        self.cursor = start + text.chars().count();
+    }
+
+    pub fn replace_argument_completion(&mut self, start: usize, text: &str) {
+        // Replace the whole value including an existing closing quote when editing its middle.
+        let mut end = self.cursor;
+        let quoted = self.char_at(start) == Some('"');
+        let mut escaped = false;
+        while let Some(ch) = self.char_at(end) {
+            if !quoted && (ch == ',' || ch == ')' || ch.is_whitespace()) {
+                break;
+            }
+            end += 1;
+            if quoted && !escaped && ch == '"' {
+                break;
+            }
+            escaped = ch == '\\' && !escaped;
+            if ch != '\\' {
+                escaped = false;
+            }
+        }
+        if quoted && self.char_at(end.saturating_sub(1)) != Some('"') {
+            end = self.cursor;
+        }
+        self.replace_atoms(start, end, text.chars().map(Atom::Char).collect());
+        self.cursor = start + text.chars().count();
+    }
+
+    pub fn pending_feature_argument_completion(
+        &self,
+        descriptors: &[protocol::FeatureInvocationDescriptor],
+    ) -> Option<(
+        protocol::CompletionKind,
+        usize,
+        String,
+        protocol::CompletionContext,
+    )> {
+        if self.cursor == 0 {
+            return None;
+        }
+        let selection = self
+            .selected_invocations
+            .iter()
+            .filter(|selected| selected.start < self.cursor)
+            .max_by_key(|selected| selected.start)?;
+        let run_start = selection.start;
+        let descriptor = &selection.descriptor;
+        if !descriptors
+            .iter()
+            .any(|candidate| candidate.identity == descriptor.identity)
+        {
+            return None;
+        }
+        let invocation = self.atoms[run_start..self.cursor]
+            .iter()
+            .map(|atom| match atom {
+                Atom::Char(ch) => Some(*ch),
+                _ => None,
+            })
+            .collect::<Option<String>>()?;
+        let open = invocation.find('(')?;
+        let arguments = &invocation[open + 1..];
+        if first_unquoted_char(arguments, ')').is_some() {
+            return None;
+        }
+        let current_start = last_unquoted_char(arguments, ',').map_or(0, |index| index + 1);
+        let current = &arguments[current_start..];
+        let leading = current.len() - current.trim_start().len();
+        let current = &current[leading..];
+        let (argument, prefix_offset, mut prefix) =
+            if let Some(equal) = first_unquoted_char(current, '=') {
+                let name = current[..equal].trim();
+                let mut value = &current[equal + 1..];
+                let mut offset = equal + 1;
+                let value_leading = value.len() - value.trim_start().len();
+                value = value.trim_start();
+                offset += value_leading;
+                if let Some(unquoted) = value.strip_prefix('"') {
+                    value = unquoted;
+                    offset += 1;
+                }
+                (Some(name.to_string()), offset, value.to_string())
+            } else {
+                let mut previous_start = 0;
+                let mut position = 0;
+                for comma in unquoted_char_indices(&arguments[..current_start])
+                    .filter_map(|(index, ch)| (ch == ',').then_some(index))
+                {
+                    if first_unquoted_char(&arguments[previous_start..comma], '=').is_none() {
+                        position += 1;
+                    }
+                    previous_start = comma + 1;
+                }
+                let positional = descriptor
+                    .arguments
+                    .iter()
+                    .find(|argument| argument.position == Some(position));
+                if (current.is_empty() && positional.is_none())
+                    || (current.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                    }) && positional.is_none())
+                {
+                    (None, 0, current.to_string())
+                } else {
+                    let mut value = current;
+                    let mut offset = 0;
+                    if let Some(unquoted) = value.strip_prefix('"') {
+                        value = unquoted;
+                        offset = 1;
+                    }
+                    (
+                        positional.map(|argument| argument.name.clone()),
+                        offset,
+                        value.to_string(),
+                    )
+                }
+            };
+        if prefix_offset > 0 && current[..prefix_offset].ends_with('"') {
+            if serde_json::from_str::<String>(&format!("\"{}", prefix)).is_ok() {
+                return None;
+            }
+            prefix = serde_json::from_str::<String>(&format!("\"{}\"", prefix)).ok()?;
+        }
+        let prefix_start = run_start
+            + invocation[..open + 1].chars().count()
+            + arguments[..current_start + leading].chars().count()
+            + current[..prefix_offset].chars().count();
+        Some((
+            protocol::CompletionKind::FeatureArgument,
+            prefix_start.saturating_sub(1),
+            prefix,
+            protocol::CompletionContext {
+                invocation: descriptor.identity.clone(),
+                argument,
+            },
+        ))
     }
 
     /// If the cursor is currently inside a `@<typed>` /
@@ -398,7 +903,9 @@ impl InputBuffer {
                     }
                     let kind = match c {
                         '@' => Some(protocol::CompletionKind::File),
-
+                        '/' if !typed.contains(['(', ')', '=', ',']) => {
+                            Some(protocol::CompletionKind::Feature)
+                        }
                         _ => None,
                     };
                     if let Some(k) = kind {
@@ -422,17 +929,29 @@ impl InputBuffer {
         None
     }
 
+    pub fn take_removed_uploaded_files(&mut self) -> Vec<protocol::UploadedFileRef> {
+        std::mem::take(&mut self.removed_uploaded_files)
+    }
+
+    fn record_removed_atom(&mut self, atom: Atom) {
+        match atom {
+            Atom::UploadedFile(file) => self.removed_uploaded_files.push(file),
+            Atom::AttachmentStage { id, .. } => self.removed_attachment_stages.push(id),
+            _ => {}
+        }
+    }
+
     pub fn delete_before(&mut self) {
         if self.cursor == 0 {
             return;
         }
         self.cursor -= 1;
-        self.atoms.remove(self.cursor);
+        self.replace_atoms(self.cursor, self.cursor + 1, Vec::new());
     }
 
     pub fn delete_after(&mut self) {
         if self.cursor < self.atoms.len() {
-            self.atoms.remove(self.cursor);
+            self.replace_atoms(self.cursor, self.cursor + 1, Vec::new());
         }
     }
 
@@ -442,14 +961,16 @@ impl InputBuffer {
         let end = self.cursor;
         self.move_word_left();
         let start = self.cursor;
-        self.atoms.drain(start..end);
+        self.replace_atoms(start, end, Vec::new());
     }
 
     pub fn move_left(&mut self) {
+        self.bump_revision();
         self.cursor = self.cursor.saturating_sub(1);
     }
 
     pub fn move_right(&mut self) {
+        self.bump_revision();
         self.cursor = (self.cursor + 1).min(self.atoms.len());
     }
 
@@ -457,6 +978,7 @@ impl InputBuffer {
     /// atoms sharing the same [`AtomClass`] — so `Word(Hiragana)` next to
     /// `Word(Han)` are separate blocks, and a `Paste` atom is its own block.
     pub fn move_word_left(&mut self) {
+        self.bump_revision();
         while self.cursor > 0 && atom_class(&self.atoms[self.cursor - 1]) == AtomClass::Sep {
             self.cursor -= 1;
         }
@@ -471,6 +993,7 @@ impl InputBuffer {
 
     /// Move forward by one word. Mirror of [`move_word_left`].
     pub fn move_word_right(&mut self) {
+        self.bump_revision();
         while self.cursor < self.atoms.len()
             && atom_class(&self.atoms[self.cursor]) == AtomClass::Sep
         {
@@ -486,6 +1009,7 @@ impl InputBuffer {
     }
 
     pub fn move_start(&mut self) {
+        self.bump_revision();
         self.cursor = 0;
     }
 
@@ -534,11 +1058,13 @@ impl InputBuffer {
     }
 
     pub fn move_home(&mut self) {
+        self.bump_revision();
         let (ranges, line, _) = self.logical_line_and_col();
         self.cursor = ranges[line].0;
     }
 
     pub fn move_end(&mut self) {
+        self.bump_revision();
         let (ranges, line, _) = self.logical_line_and_col();
         self.cursor = ranges[line].1;
     }
@@ -546,6 +1072,7 @@ impl InputBuffer {
     /// Move one logical line up, preserving column (atom count from
     /// current line start). No-op if already on the first line.
     pub fn move_up(&mut self) {
+        self.bump_revision();
         let (ranges, line, col) = self.logical_line_and_col();
         if line == 0 {
             return;
@@ -556,6 +1083,7 @@ impl InputBuffer {
 
     /// Move one logical line down, preserving column.
     pub fn move_down(&mut self) {
+        self.bump_revision();
         let (ranges, line, col) = self.logical_line_and_col();
         let Some(&(start, end)) = ranges.get(line + 1) else {
             return;
@@ -580,6 +1108,12 @@ impl InputBuffer {
         for a in &self.atoms {
             match a {
                 Atom::Char(c) => buf.push(*c),
+                Atom::Unknown => {
+                    flush_text(&mut buf, &mut out);
+                    out.push(protocol::Segment::Unknown);
+                }
+                // Staging is client-owned and never a submit payload.
+                Atom::AttachmentStage { .. } => {}
                 Atom::Paste(p) => {
                     flush_text(&mut buf, &mut out);
                     out.push(protocol::Segment::Paste {
@@ -595,10 +1129,20 @@ impl InputBuffer {
                         artifact: artifact.clone(),
                     });
                 }
+                Atom::UploadedFile(file) => {
+                    flush_text(&mut buf, &mut out);
+                    out.push(protocol::Segment::UploadedFile { file: file.clone() });
+                }
                 Atom::FileRef(r) => {
                     flush_text(&mut buf, &mut out);
                     out.push(protocol::Segment::FileRef {
                         path: r.path.clone(),
+                    });
+                }
+                Atom::FeatureInvoke(invocation) => {
+                    flush_text(&mut buf, &mut out);
+                    out.push(protocol::Segment::FeatureInvoke {
+                        invocation: invocation.invocation.clone(),
                     });
                 }
                 Atom::FlowRef(r) => {
@@ -1531,9 +2075,14 @@ mod word_motion_tests {
         for a in &buf.atoms {
             match a {
                 Atom::Char(c) => out.push(*c),
-                Atom::Paste(_) | Atom::PasteArtifact(_) | Atom::FileRef(_) | Atom::FlowRef(_) => {
-                    out.push_str("<P>")
-                }
+                Atom::Unknown
+                | Atom::AttachmentStage { .. }
+                | Atom::Paste(_)
+                | Atom::PasteArtifact(_)
+                | Atom::UploadedFile(_)
+                | Atom::FileRef(_)
+                | Atom::FeatureInvoke(_)
+                | Atom::FlowRef(_) => out.push_str("<P>"),
             }
         }
         out
@@ -1619,5 +2168,83 @@ mod word_motion_tests {
         assert_eq!(cursor(&buf), 5); // after "走"
         buf.move_word_right();
         assert_eq!(cursor(&buf), 7); // after "った"
+    }
+}
+
+#[cfg(test)]
+mod feature_invocation_input_tests {
+    use super::*;
+    use protocol::{
+        FeatureInvocationDescriptor, FeatureInvocationIdentity, FeatureInvocationSyntax,
+        InvocationArgumentDescriptor, InvocationArgumentType, InvocationCompletion, Segment,
+        UploadedFileAvailability, UploadedFileRef,
+    };
+
+    fn descriptor() -> FeatureInvocationDescriptor {
+        FeatureInvocationDescriptor {
+            identity: FeatureInvocationIdentity("builtin:test/run".into()),
+            name: "run".into(),
+            aliases: Vec::new(),
+            display_name: "Run".into(),
+            description: "test".into(),
+            syntax: FeatureInvocationSyntax::Parenthesized,
+            arguments: vec![InvocationArgumentDescriptor {
+                name: "path".into(),
+                position: Some(0),
+                required: true,
+                value_type: InvocationArgumentType::String,
+                completion: InvocationCompletion::None,
+                description: None,
+            }],
+            client_adapter: None,
+        }
+    }
+
+    #[test]
+    fn selected_invocations_become_typed_atoms_and_preserve_following_prose() {
+        let mut input = InputBuffer::new();
+        input.insert_str("before /run(\"資料/a b\") after /run(\"x/y\") done");
+        input.select_feature_invocation(7, descriptor());
+        input.select_feature_invocation(
+            "before /run(\"資料/a b\") after ".chars().count(),
+            descriptor(),
+        );
+        input.finalize_feature_invocations().unwrap();
+        let segments = input.submit_segments();
+        assert_eq!(
+            segments
+                .iter()
+                .filter(|segment| matches!(segment, Segment::FeatureInvoke { .. }))
+                .count(),
+            2
+        );
+        assert!(matches!(segments.last(), Some(Segment::Text { content }) if content == " done"));
+
+        let mut unselected = InputBuffer::new();
+        unselected.insert_str("/run(\"x\")");
+        unselected.finalize_feature_invocations().unwrap();
+        assert!(matches!(
+            unselected.submit_segments().as_slice(),
+            [Segment::Text { content }] if content == "/run(\"x\")"
+        ));
+    }
+
+    #[test]
+    fn deleting_an_uploaded_file_chip_reports_exact_staged_resource() {
+        let file = UploadedFileRef {
+            artifact_id: "artifact-1".into(),
+            file_name: "report.md".into(),
+            media_type: "text/markdown".into(),
+            created_at_ms: 1,
+            availability: UploadedFileAvailability::Available,
+            byte_len: 4,
+            sha256: "a".repeat(64),
+            source_entry_id: None,
+        };
+        let mut input = InputBuffer::new();
+        input.insert_uploaded_file(file.clone());
+        input.delete_before();
+        assert_eq!(input.take_removed_uploaded_files(), vec![file]);
+        assert!(input.take_removed_uploaded_files().is_empty());
     }
 }

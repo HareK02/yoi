@@ -29,7 +29,7 @@ type ComposerHistoryStorage = Pick<Storage, "getItem" | "setItem">;
 
 function cloneEntry(entry: ComposerHistoryEntry): ComposerHistoryEntry {
   return {
-    segments: entry.segments.map((segment) => ({ ...segment })) as Segment[],
+    segments: JSON.parse(JSON.stringify(entry.segments)) as Segment[],
     preserveExactText: entry.preserveExactText,
   };
 }
@@ -45,6 +45,18 @@ function isSegment(value: unknown): value is Segment {
       typeof segment.lines === "number";
   }
   if (segment.kind === "file_ref") return typeof segment.path === "string";
+  if (segment.kind === "feature_invoke") {
+    const invocation = segment.invocation as Record<string, unknown> | undefined;
+    return Boolean(invocation && typeof invocation.invocation_id === "string" &&
+      typeof invocation.identity === "string" && typeof invocation.name === "string" &&
+      Array.isArray(invocation.arguments) && invocation.arguments.every((argument) => {
+        if (!argument || typeof argument !== "object" || typeof argument.name !== "string") return false;
+        const value = argument.value;
+        return value && ((value.kind === "string" && typeof value.value === "string") ||
+          (value.kind === "integer" && Number.isSafeInteger(value.value) && value.value >= -2147483648 && value.value <= 2147483647) ||
+          (value.kind === "boolean" && typeof value.value === "boolean"));
+      }));
+  }
   return false;
 }
 

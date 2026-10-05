@@ -1,3 +1,4 @@
+import { invocationInput } from "./composer-invocation.ts";
 import type { Segment } from "#lib/generated/protocol.ts";
 
 export type WorkerConsoleInputKind =
@@ -88,9 +89,10 @@ export function buildComposerSegmentsRequest(
   sourceSegments: readonly Segment[],
   options: ComposerSegmentsRequestOptions = {},
 ): ComposerCommandResult {
-  const hasRichSegment = sourceSegments.some((segment) =>
-    segment.kind === "paste" || segment.kind === "uploaded_file"
-  );
+  if (sourceSegments.some((segment) => segment.kind === "unknown")) {
+    return { ok: false, message: "Finish or remove incomplete structured input before sending." };
+  }
+  const hasRichSegment = sourceSegments.some((segment) => segment.kind !== "text");
   if (!hasRichSegment) {
     const content = sourceSegments.map(segmentContent).join("");
     if (!options.preserveExactText || content.trimStart().startsWith(":")) {
@@ -154,8 +156,10 @@ function segmentContent(segment: Segment): string {
       return `@${segment.path}`;
     case "flow":
       return segment.selector;
+    case "feature_invoke":
+      return invocationInput(segment.invocation);
     case "paste_artifact":
-      return "";
+      return "[Restored paste]";
     case "uploaded_file":
       return `[Attached file: ${segment.file.file_name}]`;
     default:

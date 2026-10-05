@@ -1,18 +1,25 @@
 import { COMMANDS } from "./composer-command.ts";
+import type {
+  CompletionContext,
+  FeatureInvocationDescriptor,
+} from "#lib/generated/protocol.ts";
+import { activeInvocationArgument, type SelectedInvocationOccurrence } from "./composer-invocation.ts";
 
-export type ComposerCompletionKind = "command" | "file";
+export type ComposerCompletionKind = "command" | "file" | "feature" | "feature_argument";
 export type ComposerCompletionToken = {
-  sigil: ":" | "@";
+  sigil: ":" | "@" | "/" | "";
   kind: ComposerCompletionKind;
   start: number;
   end: number;
   prefix: string;
+  context?: CompletionContext;
 };
 export type ComposerCompletionEntry = {
   value: string;
   is_dir?: boolean;
-  description?: string;
-  usage?: string;
+  description?: string | null;
+  usage?: string | null;
+  invocation?: FeatureInvocationDescriptor | null;
 };
 export type CompletionApplyResult = { value: string; cursor: number };
 const ALIASES: Record<string, string> = { "?": "help", rollback: "rewind" };
@@ -28,9 +35,40 @@ export const COLON_COMMAND_COMPLETIONS: ComposerCompletionEntry[] = Object
 export function completionTokenAt(
   value: string,
   cursor: number,
+  descriptors: readonly FeatureInvocationDescriptor[] = [],
+  selectedOccurrences?: readonly SelectedInvocationOccurrence[],
 ): ComposerCompletionToken | null {
   const boundedCursor = Math.max(0, Math.min(cursor, value.length));
+  const activeArgument = activeInvocationArgument(value, boundedCursor, descriptors, selectedOccurrences);
+  if (activeArgument) {
+    return {
+      sigil: "",
+      kind: "feature_argument",
+      start: activeArgument.start,
+      end: activeArgument.end,
+      prefix: activeArgument.prefix,
+      context: {
+        invocation: activeArgument.descriptor.identity,
+        argument: activeArgument.argument?.name,
+      },
+    };
+  }
+
   const before = value.slice(0, boundedCursor);
+  const feature = /(^|\s)\/([a-z0-9_-]*)$/.exec(before);
+  if (feature) {
+    const prefix = feature[2] ?? "";
+    const start = before.length - prefix.length - 1;
+    const tail = /^[a-z0-9_-]*/.exec(value.slice(boundedCursor))?.[0] ?? "";
+    return {
+      sigil: "/",
+      kind: "feature",
+      start,
+      end: boundedCursor + tail.length,
+      prefix,
+    };
+  }
+
   const match = /(^|\s)([:@])([^\s\uFFF9\uFFFB]*)$/.exec(before);
   if (!match) return null;
   const sigil = match[2] as ":" | "@";
@@ -78,19 +116,46 @@ export function applyCompletion(
   entry: ComposerCompletionEntry,
   action: "tab" | "accept" = "accept",
 ): CompletionApplyResult {
+  if (token.kind === "feature") {
+    const replacement = `/${entry.value}(`;
+    return replaceCompletionRange(value, token, replacement);
+  }
+  if (token.kind === "feature_argument") {
+    const argumentName = !token.context?.argument && entry.value.endsWith("=");
+    const completed = entry.is_dir && !entry.value.endsWith("/") ? `${entry.value}/` : entry.value;
+    const replacement = argumentName ? entry.value : JSON.stringify(completed);
+    const result = replaceCompletionRange(value,
+      argumentName && value[token.end] === "=" ? { ...token, end: token.end + 1 } : token,
+      replacement,
+    );
+    // Keep directory drilling inside the quoted value instead of after its closing quote.
+    if (entry.is_dir && !argumentName) result.cursor--;
+    return result;
+  }
   const suffix = entry.is_dir
     ? (entry.value.endsWith("/") ? "" : "/")
     : token.kind === "file" && action === "tab"
     ? ""
     : " ";
-  const replacement = `${token.sigil}${entry.value}${suffix}`;
-  const restStart = suffix === " " && value[token.end] === " "
+  return replaceCompletionRange(
+    value,
+    token,
+    `${token.sigil}${entry.value}${suffix}`,
+    suffix === " ",
+  );
+}
+
+function replaceCompletionRange(
+  value: string,
+  token: ComposerCompletionToken,
+  replacement: string,
+  consumeSpace = false,
+): CompletionApplyResult {
+  const restStart = consumeSpace && value[token.end] === " "
     ? token.end + 1
     : token.end;
   return {
-    value: `${value.slice(0, token.start)}${replacement}${
-      value.slice(restStart)
-    }`,
+    value: `${value.slice(0, token.start)}${replacement}${value.slice(restStart)}`,
     cursor: token.start + replacement.length,
   };
 }

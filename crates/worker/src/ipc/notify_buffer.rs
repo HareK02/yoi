@@ -24,8 +24,9 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use crate::worker::NotificationCommitIdentity;
 use protocol::WorkerEvent;
-use session_store::{LoggedSessionHistoryOrigin, SessionExtension, SystemItem};
+use session_store::{LoggedSessionHistoryOrigin, SystemItem};
 
 use crate::prompt::catalog::{CatalogError, PromptCatalog};
 
@@ -39,7 +40,7 @@ use crate::prompt::catalog::{CatalogError, PromptCatalog};
 pub enum PendingNotify {
     Notify {
         message: String,
-        extensions: Vec<SessionExtension>,
+        notification_commit: Option<NotificationCommitIdentity>,
         history_provenance: Option<LoggedSessionHistoryOrigin>,
     },
     WorkerEvent {
@@ -48,10 +49,13 @@ pub enum PendingNotify {
 }
 
 impl PendingNotify {
-    pub(crate) fn extensions(&self) -> Vec<SessionExtension> {
+    pub(crate) fn notification_commit(&self) -> Option<&NotificationCommitIdentity> {
         match self {
-            PendingNotify::Notify { extensions, .. } => extensions.clone(),
-            PendingNotify::WorkerEvent { .. } => Vec::new(),
+            PendingNotify::Notify {
+                notification_commit,
+                ..
+            } => notification_commit.as_ref(),
+            PendingNotify::WorkerEvent { .. } => None,
         }
     }
 
@@ -85,7 +89,7 @@ impl NotifyBuffer {
     pub fn push_notify(&self, message: String) {
         self.push_entry(PendingNotify::Notify {
             message,
-            extensions: Vec::new(),
+            notification_commit: None,
             history_provenance: None,
         });
     }
@@ -94,11 +98,11 @@ impl NotifyBuffer {
         &self,
         message: String,
         history_provenance: LoggedSessionHistoryOrigin,
-        extension: SessionExtension,
+        identity: NotificationCommitIdentity,
     ) {
         self.push_entry(PendingNotify::Notify {
             message,
-            extensions: vec![extension],
+            notification_commit: Some(identity),
             history_provenance: Some(history_provenance),
         });
     }
@@ -233,7 +237,7 @@ mod tests {
     fn build_system_item_for_notify_carries_wrapper_body() {
         let entry = PendingNotify::Notify {
             message: "hello".into(),
-            extensions: Vec::new(),
+            notification_commit: None,
             history_provenance: None,
         };
         let catalog = PromptCatalog::builtins_only().unwrap();

@@ -48,6 +48,7 @@ pub struct WorkerSharedState {
     /// `ListCompletions` queries without going through the controller. It is
     /// unset only in unit tests that construct `WorkerSharedState` directly.
     fs_view: OnceLock<WorkerFsView>,
+    feature_invocations: RwLock<crate::feature::FeatureInvocationRegistry>,
     flow_transition_enabled: AtomicBool,
 }
 
@@ -66,6 +67,7 @@ impl WorkerSharedState {
             state: RwLock::new(WorkerStateSnapshot::initial()),
             accepted_commands: RwLock::new(VecDeque::new()),
             fs_view: OnceLock::new(),
+            feature_invocations: RwLock::new(crate::feature::FeatureInvocationRegistry::default()),
             flow_transition_enabled: AtomicBool::new(false),
         }
     }
@@ -80,6 +82,20 @@ impl WorkerSharedState {
     /// tests that didn't wire one up.
     pub fn fs_view(&self) -> Option<&WorkerFsView> {
         self.fs_view.get()
+    }
+
+    pub fn feature_invocations(&self) -> crate::feature::FeatureInvocationRegistry {
+        self.feature_invocations
+            .read()
+            .expect("feature invocation registry lock poisoned")
+            .clone()
+    }
+
+    pub fn set_feature_invocations(&self, registry: crate::feature::FeatureInvocationRegistry) {
+        *self
+            .feature_invocations
+            .write()
+            .expect("feature invocation registry lock poisoned") = registry;
     }
 
     pub fn enable_flow_transition(&self) {

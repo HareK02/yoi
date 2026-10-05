@@ -562,15 +562,19 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         let entries = match auth_workspace_scope(&self.state, auth_extension().as_ref())
             .map_err(api_error)?
         {
-            Some(scope) => {
-                self.state
-                    .runtime
-                    .worker_completions_scoped(&scope, &worker_ref, kind, &prefix)
-            }
-            None => self
-                .state
-                .runtime
-                .worker_completions(&worker_ref, kind, &prefix),
+            Some(scope) => self.state.runtime.worker_completions_scoped(
+                &scope,
+                &worker_ref,
+                kind,
+                &prefix,
+                value.context.as_ref(),
+            ),
+            None => self.state.runtime.worker_completions(
+                &worker_ref,
+                kind,
+                &prefix,
+                value.context.as_ref(),
+            ),
         }
         .map_err(RuntimeHttpRestError::runtime)
         .map_err(api_error)?;
@@ -578,6 +582,8 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         Ok(runtime_api::CompletionResponse {
             kind,
             prefix,
+            context: value.context,
+            request_id: value.request_id,
             entries,
         })
     }
