@@ -668,7 +668,7 @@ CREATE TABLE "workdir_registry" (
     workspace_id TEXT NOT NULL,
     workdir_id TEXT NOT NULL,
     display_name TEXT,
-    source_kind TEXT NOT NULL CHECK (source_kind IN ('repository', 'external_grant')),
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('repository', 'external_grant', 'workspace_config')),
     runtime_id TEXT,
     repository_id TEXT,
     external_grant_id TEXT,
@@ -680,16 +680,20 @@ CREATE TABLE "workdir_registry" (
     updated_at TEXT NOT NULL,
     current_selector TEXT,
     current_ref TEXT, creation_tree TEXT, current_tree TEXT, observed_at_epoch_seconds INTEGER,
+    workspace_config_grant_id TEXT,
     PRIMARY KEY (workspace_id, workdir_id),
     CHECK (
-        (source_kind = 'repository' AND runtime_id IS NOT NULL AND repository_id IS NOT NULL AND external_grant_id IS NULL)
-        OR (source_kind = 'external_grant' AND runtime_id IS NULL AND repository_id IS NULL AND external_grant_id IS NOT NULL)
+        (source_kind = 'repository' AND runtime_id IS NOT NULL AND repository_id IS NOT NULL AND external_grant_id IS NULL AND workspace_config_grant_id IS NULL)
+        OR (source_kind = 'external_grant' AND runtime_id IS NULL AND repository_id IS NULL AND external_grant_id IS NOT NULL AND workspace_config_grant_id IS NULL)
+        OR (source_kind = 'workspace_config' AND runtime_id IS NULL AND repository_id IS NULL AND external_grant_id IS NULL AND workspace_config_grant_id IS NOT NULL)
     ),
     FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
     FOREIGN KEY (workspace_id, repository_id)
         REFERENCES "repositories"(workspace_id, repository_id),
     FOREIGN KEY (workspace_id, external_grant_id)
-        REFERENCES external_workdir_grants(workspace_id, grant_id) DEFERRABLE INITIALLY DEFERRED
+        REFERENCES external_workdir_grants(workspace_id, grant_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (workspace_id, workspace_config_grant_id)
+        REFERENCES workspace_config_grants(workspace_id, grant_id) DEFERRABLE INITIALLY DEFERRED
 );
 CREATE TABLE external_workdir_grants (
     grant_id TEXT NOT NULL,
@@ -841,6 +845,7 @@ CREATE TABLE backend_jobs (
             purpose TEXT NOT NULL,
             input_revision TEXT NOT NULL,
             input_ref TEXT NOT NULL,
+            resource_key TEXT,
             request_json TEXT NOT NULL,
             intent_fingerprint TEXT NOT NULL,
             state TEXT NOT NULL CHECK (state IN ('pending', 'completed', 'failed', 'unknown')),
@@ -859,6 +864,8 @@ CREATE TABLE backend_jobs (
         );
 CREATE INDEX backend_jobs_active
         ON backend_jobs(workspace_id, state, updated_at);
+CREATE INDEX backend_jobs_resource
+        ON backend_jobs(workspace_id, resource_key, created_at);
 CREATE TABLE backend_job_attempts (
             workspace_id TEXT NOT NULL,
             job_id TEXT NOT NULL,
@@ -1605,3 +1612,20 @@ CREATE TRIGGER ticket_worker_assignments_validate_update
         BEGIN
             SELECT RAISE(ABORT, 'Ticket assignment principal is not valid in this Workspace');
         END;
+
+CREATE TABLE workspace_config_grants (
+    workspace_id TEXT NOT NULL,
+    grant_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    workdir_id TEXT NOT NULL,
+    access TEXT NOT NULL CHECK(access IN ('read_only', 'read_write')),
+    revoked INTEGER NOT NULL CHECK(revoked IN (0, 1)),
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(workspace_id, grant_id),
+    UNIQUE(workspace_id, workdir_id),
+    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX workspace_config_grants_active_worker
+    ON workspace_config_grants(workspace_id, runtime_id, worker_id) WHERE revoked = 0;

@@ -34,6 +34,7 @@ internalWorkingBoundariesSection = import "./internal/working_boundaries_section
 internalAgentsMdSection = import "./internal/agents_md_section.md";
 internalResidentMemorySummarySection = import "./internal/resident_memory_summary_section.md";
 internalResidentMemoryRestoreSection = import "./internal/resident_memory_restore_section.md";
+internalSubjektivResidentContext = import "./internal/subjektiv_resident_context.md";
 internalSubWorkerSpawnToolDescription = import "./internal/sub_worker_spawn_tool_description.md";
 panelOrchestratorIdleQueueNotice = import "./panel/orchestrator_idle_queue_notice.md";
 in
@@ -74,6 +75,7 @@ in
         agents_md_section = internalAgentsMdSection.content;
         resident_memory_summary_section = internalResidentMemorySummarySection.content;
         resident_memory_restore_section = internalResidentMemoryRestoreSection.content;
+        subjektiv_resident_context = internalSubjektivResidentContext.content;
         worker_orchestration_guidance_section = commonWorkerOrchestration.content;
         sub_worker_spawn_tool_description = internalSubWorkerSpawnToolDescription.content;
     };

@@ -44,7 +44,8 @@ impl From<ToolsError> for ToolError {
                 | workdir::WorkdirError::Unavailable(_)
                 | workdir::WorkdirError::OperationFailed
                 | workdir::WorkdirError::Transport(_)
-                | workdir::WorkdirError::Conflict(_),
+                | workdir::WorkdirError::Conflict(_)
+                | workdir::WorkdirError::OutcomeUnknown(_),
             ) => ToolError::ExecutionFailed(err.to_string()),
             ToolsError::FileSystem(_)
             | ToolsError::WorkdirSession(_)
@@ -57,10 +58,66 @@ impl From<ToolsError> for ToolError {
     }
 }
 
+/// Pure text failures are pre-dispatch argument failures, never unknown outcomes.
+pub(crate) fn text_error(error: fs_operation::text::TextError) -> ToolError {
+    ToolError::InvalidArgument(error.to_string())
+}
+
+pub(crate) fn decode_file_input<T: serde::de::DeserializeOwned>(
+    input: &str,
+    name: &str,
+) -> Result<T, ToolError> {
+    fs_operation::text::decode_json(input).map_err(|error| decode_error(error, name))
+}
+
+pub(crate) fn decode_file_value<T: serde::de::DeserializeOwned>(
+    value: serde_json::Value,
+    name: &str,
+) -> Result<T, ToolError> {
+    fs_operation::text::decode(value).map_err(|error| decode_error(error, name))
+}
+
+fn decode_error(error: fs_operation::text::TextError, name: &str) -> ToolError {
+    match error {
+        fs_operation::text::TextError::Decode(error) => {
+            ToolError::InvalidArgument(format!("invalid {name} input: {error}"))
+        }
+        error => text_error(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use workdir::http::{WorkdirTransportError, WorkdirTransportErrorCode};
+
+    #[test]
+    fn flattened_file_tool_arguments_keep_raw_json_duplicate_rejection() {
+        let error = decode_file_input::<crate::edit::EditParams>(
+            r#"{"file_path":"a.txt","old_string":"a","old_string":"b","new_string":"c"}"#,
+            "Edit",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, ToolError::InvalidArgument(message) if message.contains("duplicate field `old_string`"))
+        );
+    }
+
+    #[test]
+    fn checkout_outcome_unknown_remains_execution_failure() {
+        let error = ToolError::from(ToolsError::WorkdirSession(
+            workdir::WorkdirError::OutcomeUnknown(
+                "mutation may have committed; do not retry automatically".into(),
+            ),
+        ));
+        match error {
+            ToolError::ExecutionFailed(message) => {
+                assert!(message.contains("mutation may have committed"));
+                assert!(message.contains("do not retry automatically"));
+            }
+            other => panic!("outcome unknown must not become invalid input: {other:?}"),
+        }
+    }
 
     #[test]
     fn local_workdir_content_conflict_is_retryable_execution_failure() {

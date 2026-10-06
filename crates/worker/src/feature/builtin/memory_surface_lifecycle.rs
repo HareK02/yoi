@@ -104,6 +104,23 @@ impl SubjektivSurfaceLifecycleFeature {
         if !lifecycle_enabled || !dedicated {
             return Ok(None);
         }
+        Self::for_job(
+            workspace_client,
+            manifest,
+            client,
+            prompts,
+            workspace_context,
+        )
+        .map(Some)
+    }
+
+    pub(crate) fn for_job(
+        workspace_client: Arc<dyn WorkspaceClient>,
+        manifest: WorkerManifest,
+        client: Box<dyn LlmClient>,
+        prompts: Arc<ArcSwap<PromptCatalog>>,
+        workspace_context: WorkerWorkspaceContext,
+    ) -> std::io::Result<Self> {
         manifest
             .feature
             .subjektiv
@@ -121,7 +138,7 @@ impl SubjektivSurfaceLifecycleFeature {
                 "subjektiv surface generation requires Backend Workspace API authority",
             ));
         }
-        Ok(Some(Self {
+        Ok(Self {
             task: SubjektivSurfaceLifecycleTask {
                 workspace_client,
                 manifest,
@@ -129,7 +146,18 @@ impl SubjektivSurfaceLifecycleFeature {
                 prompts,
                 workspace_context,
             },
-        }))
+        })
+    }
+
+    /// The Job tool awaits this clean-context lifecycle before submitting its result.
+    pub(crate) async fn complete_for_job(
+        &self,
+        cancellation: BackgroundTaskCancellation,
+        reusable_surface: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, HookError> {
+        self.task
+            .generate(None, cancellation, reusable_surface)
+            .await
     }
 }
 
@@ -182,80 +210,125 @@ impl FeatureBackgroundTask for SubjektivSurfaceLifecycleTask {
         context: BackgroundTaskContext,
         cancellation: BackgroundTaskCancellation,
     ) -> Result<(), HookError> {
+        self.generate(Some(&context), cancellation, None)
+            .await
+            .map(|_| ())
+    }
+}
+
+impl SubjektivSurfaceLifecycleTask {
+    async fn generate(
+        &self,
+        context: Option<&BackgroundTaskContext>,
+        cancellation: BackgroundTaskCancellation,
+        reusable_surface: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, HookError> {
         for attempt in 0..MAX_GENERATION_ATTEMPTS {
-            context.generation_fence.ensure_current()?;
+            if let Some(context) = context {
+                context.generation_fence.ensure_current()?;
+            }
             if cancellation.is_cancelled() {
-                return Ok(());
+                return Err(HookError::new(
+                    HookErrorCategory::Cancelled,
+                    "surface generation cancelled",
+                ));
             }
             let generation = self
                 .workspace_client
                 .prepare_subjektiv_memory_surface()
                 .await
                 .map_err(surface_hook_error)?;
+            if context.is_none() {
+                if let Some(snapshot_id) = &generation.current_snapshot_id {
+                    return Ok(serde_json::json!({
+                        "availability": "ready", "generation_id": generation.generation_id,
+                        "store_revision": generation.store_revision, "snapshot_id": snapshot_id,
+                    }));
+                }
+            }
+            // Preparation is Backend-fenced to the live attempt and immutable batch.
+            // Only a ready snapshot is immutable within its store revision. Never
+            // reuse a failed marker, which a later generation can replace.
+            if let Some(surface) = reusable_surface.filter(|surface| {
+                surface["availability"] == "ready"
+                    && surface["store_revision"].as_u64() == Some(generation.store_revision)
+            }) {
+                return Ok(surface.clone());
+            }
             if generation.materials.is_empty() && generation.active_memory_count > 0 {
-                self.record_failure(&generation.generation_id, "input_budget_exhausted")
+                return self
+                    .record_failure(&generation, "input_budget_exhausted", context.is_none())
                     .await;
-                tracing::warn!(
-                    active_memory_count = generation.active_memory_count,
-                    "subject Memory surface materials could not fit the bounded input"
-                );
-                return Ok(());
             }
             let points = if generation.materials.is_empty() {
                 Vec::new()
             } else {
-                match self.edit_surface(&generation, cancellation.clone()).await {
-                    Ok(points) => points,
-                    Err(failure) => {
-                        self.record_failure(&generation.generation_id, failure.reason_code)
-                            .await;
+                match tokio::time::timeout(
+                    TASK_TIMEOUT,
+                    self.edit_surface(&generation, cancellation.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(points)) => points,
+                    Ok(Err(failure)) => {
+                        if cancellation.is_cancelled() {
+                            return Err(HookError::new(
+                                HookErrorCategory::Cancelled,
+                                "surface generation cancelled",
+                            ));
+                        }
                         tracing::warn!(error = %failure.error, reason_code = failure.reason_code, "subject Memory surface editor failed");
-                        return Ok(());
+                        return self
+                            .record_failure(&generation, failure.reason_code, context.is_none())
+                            .await;
+                    }
+                    Err(_) => {
+                        return self
+                            .record_failure(&generation, "editor_timeout", context.is_none())
+                            .await;
                     }
                 }
             };
-            context.generation_fence.ensure_current()?;
-            if cancellation.is_cancelled() {
-                return Ok(());
+            if let Some(context) = context {
+                context.generation_fence.ensure_current()?;
             }
-            let publish = self
+            if cancellation.is_cancelled() {
+                return Err(HookError::new(
+                    HookErrorCategory::Cancelled,
+                    "surface generation cancelled",
+                ));
+            }
+            match self
                 .workspace_client
                 .publish_subjektiv_memory_surface(server_api::SubjektivSurfacePublishRequest {
                     generation_id: generation.generation_id.clone(),
                     points,
                 })
-                .await;
-            match publish {
+                .await
+            {
                 Ok(output) => {
-                    tracing::debug!(
-                        snapshot_id = output.snapshot_id,
-                        store_revision = output.built_from_store_revision,
-                        empty = output.empty,
-                        "published subject Memory surface"
-                    );
-                    return Ok(());
+                    return Ok(serde_json::json!({
+                        "availability": "ready", "generation_id": generation.generation_id,
+                        "store_revision": output.built_from_store_revision, "snapshot_id": output.snapshot_id,
+                    }));
                 }
                 Err(WorkspaceMemoryBackendError::Http { status, .. })
                     if status == reqwest::StatusCode::CONFLICT
                         && attempt + 1 < MAX_GENERATION_ATTEMPTS =>
                 {
-                    // Confirmed Memory moved while editing. Discard the stale
-                    // output and rebuild once from a fresh bounded generation.
                     continue;
                 }
                 Err(error) => {
-                    self.record_failure(&generation.generation_id, "publish_failed")
-                        .await;
                     tracing::warn!(%error, "subject Memory surface publication failed");
-                    return Ok(());
+                    return self
+                        .record_failure(&generation, "publish_failed", context.is_none())
+                        .await;
                 }
             }
         }
-        Ok(())
+        unreachable!("bounded generation loop always returns on its last attempt")
     }
-}
 
-impl SubjektivSurfaceLifecycleTask {
     async fn edit_surface(
         &self,
         generation: &server_api::SubjektivSurfacePrepareResponse,
@@ -344,17 +417,39 @@ impl SubjektivSurfaceLifecycleTask {
             .map_err(SurfaceEditorFailure::editor)
     }
 
-    async fn record_failure(&self, generation_id: &str, reason_code: &str) {
-        if let Err(error) = self
+    async fn record_failure(
+        &self,
+        generation: &server_api::SubjektivSurfacePrepareResponse,
+        reason_code: &str,
+        job_confirmation_required: bool,
+    ) -> Result<serde_json::Value, HookError> {
+        let failure = self
             .workspace_client
             .fail_subjektiv_memory_surface(server_api::SubjektivSurfaceFailureRequest {
-                generation_id: generation_id.to_string(),
+                generation_id: generation.generation_id.clone(),
                 reason_code: reason_code.to_string(),
             })
             .await
+            .map_err(surface_hook_error)?;
+        // Success must attest the actual persisted marker, not merely receipt of
+        // a failure notification. A protected ready surface or moved revision
+        // must yield a Backend rejection/non-failed status, never a failed claim.
+        let confirmed_status = if job_confirmation_required {
+            "failed_confirmed"
+        } else {
+            "failed"
+        };
+        if failure.status != confirmed_status || failure.store_revision != generation.store_revision
         {
-            tracing::debug!(%error, "could not record subject Memory surface failure");
+            return Err(HookError::new(
+                HookErrorCategory::Internal,
+                "Backend did not confirm a failed surface for this generation's revision; no Job result was submitted",
+            ));
         }
+        Ok(serde_json::json!({
+            "availability": "failed", "generation_id": generation.generation_id,
+            "store_revision": failure.store_revision, "reason_code": reason_code,
+        }))
     }
 }
 
@@ -537,6 +632,7 @@ mod tests {
     ) -> server_api::SubjektivSurfacePrepareResponse {
         server_api::SubjektivSurfacePrepareResponse {
             generation_id: "generation-1".into(),
+            current_snapshot_id: None,
             store_revision: 1,
             active_memory_count: materials.len(),
             materials,
@@ -561,6 +657,13 @@ mod tests {
         prepare_calls: AtomicUsize,
         publish_calls: AtomicUsize,
         failure_reasons: Mutex<Vec<String>>,
+        job_results: Mutex<Vec<serde_json::Value>>,
+        result_responses:
+            Mutex<std::collections::VecDeque<Result<WorkspaceResponse, WorkspaceClientError>>>,
+        current_revision: AtomicUsize,
+        failure_status: Mutex<String>,
+        failure_revision: AtomicUsize,
+        ready_snapshot: Mutex<Option<String>>,
     }
 
     impl SurfaceWorkspaceClient {
@@ -571,6 +674,12 @@ mod tests {
                 prepare_calls: AtomicUsize::new(0),
                 publish_calls: AtomicUsize::new(0),
                 failure_reasons: Mutex::new(Vec::new()),
+                job_results: Mutex::new(Vec::new()),
+                result_responses: Mutex::new(Default::default()),
+                current_revision: AtomicUsize::new(0),
+                failure_status: Mutex::new("failed".into()),
+                failure_revision: AtomicUsize::new(0),
+                ready_snapshot: Mutex::new(None),
             }
         }
 
@@ -578,6 +687,15 @@ mod tests {
             Self {
                 input_token_budget,
                 ..Self::new(0)
+            }
+        }
+
+        fn revision(&self, fallback: usize) -> u64 {
+            let current = self.current_revision.load(Ordering::SeqCst);
+            if current == 0 {
+                fallback as u64
+            } else {
+                current as u64
             }
         }
 
@@ -606,6 +724,28 @@ mod tests {
             &self,
             request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            if request.path.ends_with("/workers/self/backend-job-result") {
+                assert!(
+                    self.publish_calls.load(Ordering::SeqCst) > 0
+                        || !self.failure_reasons.lock().unwrap().is_empty(),
+                    "result must follow publication or recorded failure"
+                );
+                self.job_results
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(request.body.as_deref().unwrap()).unwrap());
+                return self
+                    .result_responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| {
+                        Ok(WorkspaceResponse {
+                            status: 200,
+                            body: "{\"replayed\":false}".into(),
+                        })
+                    });
+            }
             let request: server_api::SubjektivMemoryBackendRequest =
                 serde_json::from_str(request.body.as_deref().unwrap_or_default())
                     .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
@@ -615,7 +755,8 @@ mod tests {
                     let mut prepared =
                         generation(self.input_token_budget, vec![material("memory-1", 32)]);
                     prepared.generation_id = format!("generation-{call}");
-                    prepared.store_revision = call as u64;
+                    prepared.store_revision = self.revision(call);
+                    prepared.current_snapshot_id = self.ready_snapshot.lock().unwrap().clone();
                     Ok(Self::response(
                         server_api::SubjektivMemoryBackendResponse::SurfacePrepared(prepared),
                     ))
@@ -633,7 +774,7 @@ mod tests {
                         server_api::SubjektivMemoryBackendResponse::SurfacePublished(
                             server_api::SubjektivSurfacePublishResponse {
                                 snapshot_id: format!("surface-{call}"),
-                                built_from_store_revision: call as u64,
+                                built_from_store_revision: self.revision(call),
                                 empty: false,
                             },
                         ),
@@ -644,8 +785,13 @@ mod tests {
                     Ok(Self::response(
                         server_api::SubjektivMemoryBackendResponse::SurfaceFailed(
                             server_api::SubjektivSurfaceFailureResponse {
-                                store_revision: self.prepare_calls.load(Ordering::SeqCst) as u64,
-                                status: "failed".into(),
+                                store_revision: if self.failure_revision.load(Ordering::SeqCst) > 0
+                                {
+                                    self.failure_revision.load(Ordering::SeqCst) as u64
+                                } else {
+                                    self.revision(self.prepare_calls.load(Ordering::SeqCst))
+                                },
+                                status: self.failure_status.lock().unwrap().clone(),
                             },
                         ),
                     ))
@@ -973,5 +1119,341 @@ permission = "write"
         let generation = generation(1, vec![material("memory-1", 32)]);
         let error = bounded_editor_input("system policy", &generation).unwrap_err();
         assert!(error.to_string().contains("input budget"));
+    }
+    #[tokio::test]
+    async fn job_result_waits_for_surface_and_retries_the_exact_outcome() {
+        for failed in [false, true] {
+            let workspace = Arc::new(if failed {
+                SurfaceWorkspaceClient::with_input_token_budget(1)
+            } else {
+                SurfaceWorkspaceClient::new(0)
+            });
+            *workspace.failure_status.lock().unwrap() = "failed_confirmed".into();
+            let lifecycle = SubjektivSurfaceLifecycleFeature {
+                task: test_task(workspace.clone(), Arc::new(AtomicUsize::new(0))),
+            };
+            let mut pending = Vec::new();
+            let mut hooks = crate::hook::HookRegistryBuilder::default();
+            FeatureRegistryBuilder::new()
+                .with_module(
+                    crate::feature::builtin::backend_job_result::BackendJobResultFeature::new(
+                        workspace.clone(),
+                    )
+                    .with_surface(lifecycle),
+                )
+                .install_into_pending(&mut pending, &mut hooks);
+            let (_, tool) = pending.remove(0)();
+            let input = r#"{"result":{"subject_id":"subject-1","candidate_ids":["candidate-1"]}}"#;
+            for _ in 0..2 {
+                tool.execute(input, agen::tool::ToolExecutionContext::direct())
+                    .await
+                    .unwrap();
+            }
+            let results = workspace.job_results.lock().unwrap();
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[0], results[1]);
+            assert_eq!(
+                results[0]["result"]["surface"]["availability"],
+                if failed { "failed" } else { "ready" }
+            );
+            assert_eq!(
+                results[0]["result"]["surface"]["generation_id"],
+                "generation-1"
+            );
+            assert_eq!(results[0]["result"]["surface"]["store_revision"], 1);
+            assert_eq!(workspace.prepare_calls.load(Ordering::SeqCst), 1);
+            assert!(
+                tool.execute(
+                    r#"{"result":{"subject_id":"subject-1","candidate_ids":[]}}"#,
+                    agen::tool::ToolExecutionContext::direct()
+                )
+                .await
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn job_uses_backend_confirmed_current_surface_without_regeneration() {
+        let workspace = Arc::new(SurfaceWorkspaceClient::new(0));
+        *workspace.ready_snapshot.lock().unwrap() = Some("already-current".into());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task = test_task(workspace.clone(), calls.clone());
+        let outcome = task
+            .generate(None, BackgroundTaskCancellation::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(outcome["availability"], "ready");
+        assert_eq!(outcome["generation_id"], "generation-1");
+        assert_eq!(outcome["snapshot_id"], "already-current");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(workspace.publish_calls.load(Ordering::SeqCst), 0);
+        assert!(workspace.failure_reasons.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn job_result_rejects_model_surface_claims_before_generation() {
+        let workspace = Arc::new(SurfaceWorkspaceClient::new(0));
+        let lifecycle = SubjektivSurfaceLifecycleFeature {
+            task: test_task(workspace.clone(), Arc::new(AtomicUsize::new(0))),
+        };
+        let mut pending = Vec::new();
+        let mut hooks = crate::hook::HookRegistryBuilder::default();
+        FeatureRegistryBuilder::new()
+            .with_module(
+                crate::feature::builtin::backend_job_result::BackendJobResultFeature::new(
+                    workspace.clone(),
+                )
+                .with_surface(lifecycle),
+            )
+            .install_into_pending(&mut pending, &mut hooks);
+        let (_, tool) = pending.remove(0)();
+        assert!(tool.execute(r#"{"result":{"subject_id":"subject-1","candidate_ids":[],"surface":{"availability":"ready"}}}"#, agen::tool::ToolExecutionContext::direct()).await.is_err());
+        assert_eq!(workspace.prepare_calls.load(Ordering::SeqCst), 0);
+        assert!(workspace.job_results.lock().unwrap().is_empty());
+    }
+
+    #[derive(Clone)]
+    struct PendingSurfaceEditorClient(Arc<tokio::sync::Notify>);
+    #[async_trait]
+    impl LlmClient for PendingSurfaceEditorClient {
+        fn clone_boxed(&self) -> Box<dyn LlmClient> {
+            Box::new(self.clone())
+        }
+        async fn stream(
+            &self,
+            _request: Request,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmEvent, ClientError>> + Send>>, ClientError>
+        {
+            self.0.notify_one();
+            Ok(Box::pin(futures::stream::pending()))
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_job_surface_waits_for_editor_and_never_submits_result() {
+        let workspace = Arc::new(SurfaceWorkspaceClient::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let mut task = test_task(workspace.clone(), Arc::new(AtomicUsize::new(0)));
+        task.client = Box::new(PendingSurfaceEditorClient(entered.clone()));
+        let mut pending = Vec::new();
+        let mut hooks = crate::hook::HookRegistryBuilder::default();
+        FeatureRegistryBuilder::new()
+            .with_module(
+                crate::feature::builtin::backend_job_result::BackendJobResultFeature::new(
+                    workspace.clone(),
+                )
+                .with_surface(SubjektivSurfaceLifecycleFeature { task }),
+            )
+            .install_into_pending(&mut pending, &mut hooks);
+        let (_, tool) = pending.remove(0)();
+        let running_tool = tool.clone();
+        let context = agen::tool::ToolExecutionContext::new("result-call", "batch", 0);
+        let running_context = context.clone();
+        let running = tokio::spawn(async move {
+            running_tool
+                .execute(
+                    r#"{"result":{"subject_id":"subject-1","candidate_ids":[]}}"#,
+                    running_context,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        tool.cancel_execution(&context).await.unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, Err(agen::tool::ToolError::Cancelled(_))));
+        assert_eq!(workspace.publish_calls.load(Ordering::SeqCst), 0);
+        assert!(workspace.job_results.lock().unwrap().is_empty());
+        assert!(workspace.failure_reasons.lock().unwrap().is_empty());
+    }
+    fn job_result_tool(workspace: Arc<SurfaceWorkspaceClient>) -> Arc<dyn agen::tool::Tool> {
+        *workspace.failure_status.lock().unwrap() = "failed_confirmed".into();
+        let mut pending = Vec::new();
+        let mut hooks = crate::hook::HookRegistryBuilder::default();
+        FeatureRegistryBuilder::new()
+            .with_module(
+                crate::feature::builtin::backend_job_result::BackendJobResultFeature::new(
+                    workspace.clone(),
+                )
+                .with_surface(SubjektivSurfaceLifecycleFeature {
+                    task: test_task(workspace, Arc::new(AtomicUsize::new(0))),
+                }),
+            )
+            .install_into_pending(&mut pending, &mut hooks);
+        pending.remove(0)().1
+    }
+
+    const CORRECT_RESULT: &str =
+        r#"{"result":{"subject_id":"subject-1","candidate_ids":["candidate-1"]}}"#;
+    const WRONG_RESULT: &str = r#"{"result":{"subject_id":"wrong-subject","candidate_ids":[]}}"#;
+
+    fn rejection(status: u16) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        Ok(WorkspaceResponse {
+            status,
+            body: "explicit rejection before acceptance".into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn job_result_definitive_rejection_allows_correction_and_reuses_current_ready_surface() {
+        for status in [400, 403, 422] {
+            let workspace = Arc::new(SurfaceWorkspaceClient::new(0));
+            workspace.current_revision.store(1, Ordering::SeqCst);
+            workspace
+                .result_responses
+                .lock()
+                .unwrap()
+                .push_back(rejection(status));
+            let tool = job_result_tool(workspace.clone());
+            assert!(
+                tool.execute(WRONG_RESULT, agen::tool::ToolExecutionContext::direct())
+                    .await
+                    .is_err()
+            );
+            tool.execute(CORRECT_RESULT, agen::tool::ToolExecutionContext::direct())
+                .await
+                .unwrap();
+            let results = workspace.job_results.lock().unwrap();
+            assert_eq!(results.len(), 2);
+            assert_ne!(
+                results[0]["result"]["subject_id"],
+                results[1]["result"]["subject_id"]
+            );
+            assert_eq!(
+                results[0]["result"]["surface"],
+                results[1]["result"]["surface"]
+            );
+            assert_eq!(
+                workspace.prepare_calls.load(Ordering::SeqCst),
+                2,
+                "reuse must verify current revision"
+            );
+            assert_eq!(
+                workspace.publish_calls.load(Ordering::SeqCst),
+                1,
+                "correction must not duplicate publication"
+            );
+            drop(results);
+            assert!(
+                tool.execute(WRONG_RESULT, agen::tool::ToolExecutionContext::direct())
+                    .await
+                    .is_err(),
+                "accepted results stay sealed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn job_result_rejection_rebuilds_conflicting_or_stale_surfaces() {
+        for status in [400, 409] {
+            let workspace = Arc::new(SurfaceWorkspaceClient::new(0));
+            workspace.current_revision.store(1, Ordering::SeqCst);
+            workspace
+                .result_responses
+                .lock()
+                .unwrap()
+                .push_back(rejection(status));
+            let tool = job_result_tool(workspace.clone());
+            assert!(
+                tool.execute(CORRECT_RESULT, agen::tool::ToolExecutionContext::direct())
+                    .await
+                    .is_err()
+            );
+            workspace.current_revision.store(2, Ordering::SeqCst);
+            tool.execute(CORRECT_RESULT, agen::tool::ToolExecutionContext::direct())
+                .await
+                .unwrap();
+            let results = workspace.job_results.lock().unwrap();
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[0]["result"]["surface"]["store_revision"], 1);
+            assert_eq!(results[1]["result"]["surface"]["store_revision"], 2);
+            assert_ne!(
+                results[0]["result"]["surface"]["generation_id"],
+                results[1]["result"]["surface"]["generation_id"]
+            );
+            assert_eq!(workspace.prepare_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(workspace.publish_calls.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn job_result_ambiguous_acceptance_never_reopens_even_after_later_rejection() {
+        for first in [
+            Err(WorkspaceClientError::Request(
+                "accepted but response lost".into(),
+            )),
+            rejection(500),
+        ] {
+            let workspace = Arc::new(SurfaceWorkspaceClient::new(0));
+            workspace
+                .result_responses
+                .lock()
+                .unwrap()
+                .extend([first, rejection(403)]);
+            let tool = job_result_tool(workspace.clone());
+            assert!(
+                tool.execute(CORRECT_RESULT, agen::tool::ToolExecutionContext::direct())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                tool.execute(WRONG_RESULT, agen::tool::ToolExecutionContext::direct())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                tool.execute(CORRECT_RESULT, agen::tool::ToolExecutionContext::direct())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                tool.execute(WRONG_RESULT, agen::tool::ToolExecutionContext::direct())
+                    .await
+                    .is_err()
+            );
+            tool.execute(CORRECT_RESULT, agen::tool::ToolExecutionContext::direct())
+                .await
+                .unwrap();
+            let results = workspace.job_results.lock().unwrap();
+            assert_eq!(results.len(), 3);
+            assert_eq!(results[0], results[1]);
+            assert_eq!(results[1], results[2]);
+            assert_eq!(workspace.prepare_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(workspace.publish_calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn job_result_never_submits_unconfirmed_failure_or_wrong_revision() {
+        for (status, revision) in [
+            ("failed", 0),
+            ("ready", 0),
+            ("stale", 0),
+            ("failed_confirmed", 2),
+        ] {
+            let workspace = Arc::new(SurfaceWorkspaceClient::with_input_token_budget(1));
+            workspace.current_revision.store(1, Ordering::SeqCst);
+            let tool = job_result_tool(workspace.clone());
+            *workspace.failure_status.lock().unwrap() = status.into();
+            workspace.failure_revision.store(revision, Ordering::SeqCst);
+            assert!(
+                tool.execute(CORRECT_RESULT, agen::tool::ToolExecutionContext::direct())
+                    .await
+                    .is_err()
+            );
+            assert!(workspace.job_results.lock().unwrap().is_empty());
+            // Nothing was dispatched/sealed: a real confirmed outcome remains retryable.
+            *workspace.failure_status.lock().unwrap() = "failed_confirmed".into();
+            workspace.failure_revision.store(0, Ordering::SeqCst);
+            tool.execute(CORRECT_RESULT, agen::tool::ToolExecutionContext::direct())
+                .await
+                .unwrap();
+            assert_eq!(workspace.job_results.lock().unwrap().len(), 1);
+        }
     }
 }

@@ -1,4 +1,7 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
+  import { canRestoreWorker, createRestoreRequest, restoreWorkspaceWorker, restoreNotice, restoreErrorNotice, type RestoreRequest } from '#lib/workspace/sidebar/worker-actions.ts';
+  import { workspaceWorkersStore, refreshWorkspaceWorkers } from '#lib/workspace/sidebar/worker-subscription.ts';
   import { pushWorkspaceAlert } from '#lib/workspace/alerts/store.ts';
   import { workspaceApiPath } from '#lib/workspace/api/http.ts';
   import {
@@ -14,16 +17,71 @@
   import type { CleanupWorkerCandidate, RuntimeCleanupPlanResponse, Worker } from '#lib/workspace/sidebar/types.ts';
   import type { PageProps } from './$types';
 
-  type WorkerActionKind = 'pin' | 'delete';
+  type WorkerActionKind = 'restore' | 'pin' | 'delete';
 
   let { data }: PageProps = $props();
   let cleanupPlans = $state<Record<string, RuntimeCleanupPlanResponse>>({});
   let workers = $state<Worker[]>([]);
+  let restoreRetries = $state<Record<string, RestoreRequest>>({});
   let busyAction = $state<{ workerKey: string; kind: WorkerActionKind } | null>(null);
 
+  let lifetime = 0;
+  let cleanupEpoch = 0;
+  let catalogRefreshing = true;
+  let catalogReady = $state(false);
+
+  function actionScope() {
+    const id = data.workspaceId;
+    const epoch = lifetime;
+    return { workspaceId: id, isCurrent: () => lifetime === epoch && data.workspaceId === id };
+  }
+
   $effect(() => {
-    cleanupPlans = data.cleanupPlans;
-    workers = data.workers?.items ?? [];
+    const id = data.workspaceId;
+    lifetime++;
+    cleanupEpoch++;
+    busyAction = null;
+    restoreRetries = {};
+    catalogReady = false;
+    const initial = untrack(() => data);
+    workers = initial.workers?.items ?? [];
+    cleanupPlans = initial.cleanupPlans;
+    let previousCatalog: string | undefined;
+    let previousObservation: number | undefined;
+    let previousRefreshing: boolean | undefined;
+    const scope = actionScope();
+    const unsubscribe = workspaceWorkersStore(id).subscribe((state) => {
+      if (!scope.isCurrent()) return;
+      const observationChanged = previousObservation !== state.observationVersion;
+      const refreshStarted = state.catalogRefreshing && previousRefreshing !== true;
+      const refreshCompleted = !state.catalogRefreshing && previousRefreshing === true;
+      const catalog = state.catalogWorkers === null ? undefined : JSON.stringify(state.catalogWorkers);
+      const catalogChanged = catalog !== previousCatalog;
+      previousObservation = state.observationVersion;
+      previousRefreshing = state.catalogRefreshing;
+      previousCatalog = catalog;
+      catalogRefreshing = state.catalogRefreshing;
+      if (observationChanged || catalogChanged || refreshStarted) {
+        cleanupPlans = {};
+        ++cleanupEpoch;
+      }
+      if (state.catalogWorkers === null) return;
+      catalogReady = true;
+      workers = state.catalogWorkers;
+      // Subscription overlays stay visible during the GET, but cleanup must wait
+      // for its authoritative catalog result, even if that result is unchanged.
+      if (catalogRefreshing || (!catalogChanged && !observationChanged && !refreshCompleted)) return;
+      cleanupPlans = {};
+      const epoch = ++cleanupEpoch;
+      for (const runtimeId of new Set(state.catalogWorkers.map((worker) => worker.runtime_id))) {
+        void refreshCleanupPlan(runtimeId, scope, epoch).catch(() => {});
+      }
+    });
+    return () => {
+      lifetime++;
+      cleanupEpoch++;
+      unsubscribe();
+    };
   });
 
   function workerKey(worker: Worker): string {
@@ -56,41 +114,78 @@
     return fallback;
   }
 
-  async function refreshCleanupPlan(runtimeId: string): Promise<void> {
+  async function refreshCleanupPlan(
+    runtimeId: string,
+    scope = actionScope(),
+    epoch = cleanupEpoch,
+  ): Promise<void> {
+    if (!scope.isCurrent() || catalogRefreshing || cleanupEpoch !== epoch) return;
     const response = await fetch(
-      workspaceApiPath(data.workspaceId, `/runtimes/${encodeURIComponent(runtimeId)}/cleanup-plan`),
+      workspaceApiPath(scope.workspaceId, `/runtimes/${encodeURIComponent(runtimeId)}/cleanup-plan`),
     );
     if (!response.ok) return;
     const plan = parseRuntimeCleanupPlan(await response.json());
+    if (!scope.isCurrent() || catalogRefreshing || cleanupEpoch !== epoch) return;
     cleanupPlans = { ...cleanupPlans, [runtimeId]: plan };
+  }
+
+  async function restoreWorker(worker: Worker, retry = false): Promise<void> {
+    const key = workerKey(worker);
+    if (busyAction || (retry ? !restoreRetries[key] : restoreRetries[key] || !canRestoreWorker(worker))) return;
+    const scope = actionScope();
+    const request = retry ? restoreRetries[key] : createRestoreRequest(worker);
+    busyAction = { workerKey: key, kind: 'restore' };
+    cleanupPlans = {};
+    ++cleanupEpoch;
+    try {
+      let notice;
+      try {
+        notice = restoreNotice(await restoreWorkspaceWorker(scope.workspaceId, worker, request));
+      } catch (cause) {
+        notice = restoreErrorNotice(cause);
+      }
+      if (!scope.isCurrent()) return;
+      const next = { ...restoreRetries };
+      if (notice.retry) next[key] = request;
+      else delete next[key];
+      restoreRetries = next;
+      pushWorkspaceAlert(notice.level, notice.message, { title: notice.title });
+      await refreshWorkspaceWorkers(scope.workspaceId).catch(() => {});
+      if (!scope.isCurrent()) return;
+      await refreshCleanupPlan(worker.runtime_id, scope).catch(() => {});
+    } finally {
+      if (scope.isCurrent()) busyAction = null;
+    }
   }
 
   async function setPinned(worker: Worker, pinned: boolean): Promise<void> {
     if (busyAction) return;
+    const scope = actionScope();
     busyAction = { workerKey: workerKey(worker), kind: 'pin' };
+    cleanupPlans = {};
+    ++cleanupEpoch;
     try {
       const response = await fetch(
         workspaceApiPath(
-          data.workspaceId,
+          scope.workspaceId,
           `/runtimes/${encodeURIComponent(worker.runtime_id)}/workers/${encodeURIComponent(worker.worker_id)}/pin`,
         ),
         { method: pinned ? 'PUT' : 'DELETE' },
       );
       const payload = await response.json().catch(() => null);
-      if (!response.ok) {
-        pushWorkspaceAlert('error', errorMessage(payload, response.statusText), { title: 'Worker pin failed' });
-        return;
-      }
-      const retention = parseWorkerRetentionResponse(payload);
-      worker.pinned = retention.pinned;
-      worker.retention_state = retention.retention_state;
-      await refreshCleanupPlan(worker.runtime_id);
+      if (!scope.isCurrent()) return;
+      if (!response.ok) throw new Error(errorMessage(payload, response.statusText));
+      parseWorkerRetentionResponse(payload);
+      await refreshWorkspaceWorkers(scope.workspaceId);
+      if (!scope.isCurrent()) return;
+      await refreshCleanupPlan(worker.runtime_id, scope);
     } catch (error) {
+      if (!scope.isCurrent()) return;
       pushWorkspaceAlert('error', error instanceof Error ? error.message : 'Worker pin failed', {
         title: 'Worker pin failed',
       });
     } finally {
-      busyAction = null;
+      if (scope.isCurrent()) busyAction = null;
     }
   }
 
@@ -101,12 +196,15 @@
   }
 
   async function deleteWorker(worker: Worker, candidate: CleanupWorkerCandidate): Promise<void> {
-    if (!cleanupPlans?.[worker.runtime_id] || busyAction) return;
+    const plan = cleanupPlans?.[worker.runtime_id];
+    if (!plan || busyAction || candidate.blocking_reason || cleanupCandidate(worker) !== candidate) return;
+    const scope = actionScope();
     busyAction = { workerKey: workerKey(worker), kind: 'delete' };
+    cleanupPlans = {};
+    ++cleanupEpoch;
     try {
-      const plan = cleanupPlans[worker.runtime_id];
       const response = await fetch(
-        workspaceApiPath(data.workspaceId, `/runtimes/${encodeURIComponent(worker.runtime_id)}/cleanup-executions`),
+        workspaceApiPath(scope.workspaceId, `/runtimes/${encodeURIComponent(worker.runtime_id)}/cleanup-executions`),
         {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
@@ -120,22 +218,23 @@
         },
       );
       const payload = await response.json().catch(() => null);
+      if (!scope.isCurrent()) return;
       if (!response.ok) throw new Error(errorMessage(payload, response.statusText));
       const execution = parseRuntimeCleanupExecution(payload);
-      cleanupPlans = { ...cleanupPlans, [worker.runtime_id]: execution.plan_after };
       const result = execution.results.find((entry) => entry.target_id === candidate.target_id);
       if (!result || result.status !== 'deleted') {
         throw new Error(result?.message ?? 'Runtime did not delete the selected Worker');
       }
-      workers = workers.filter(
-        (item) => !(item.runtime_id === worker.runtime_id && item.worker_id === worker.worker_id),
-      );
+      await refreshWorkspaceWorkers(scope.workspaceId);
+      if (!scope.isCurrent()) return;
+      await refreshCleanupPlan(worker.runtime_id, scope);
     } catch (error) {
+      if (!scope.isCurrent()) return;
       pushWorkspaceAlert('error', error instanceof Error ? error.message : 'Worker deletion failed', {
         title: 'Worker deletion failed',
       });
     } finally {
-      busyAction = null;
+      if (scope.isCurrent()) busyAction = null;
     }
   }
 
@@ -180,9 +279,9 @@
     <a class="section-action" href={`/w/${data.workspaceId}/workers/new`}>New Worker</a>
   </header>
 
-  {#if data.workersError}
+  {#if !catalogReady && data.workersError}
     <p class="section-state error">{data.workersError}</p>
-  {:else if !data.workers}
+  {:else if !catalogReady && !data.workers}
     <p class="section-state">Loading Workers…</p>
   {:else if workers.length === 0}
     <p class="section-state">No Workers are visible.</p>
@@ -222,6 +321,24 @@
               <td>{workerDirectory(worker)}</td>
               <td>
                 <div class="worker-actions" aria-label={`Actions for ${workerDisplayName}`}>
+                  <button
+                    class="icon-action"
+                    type="button"
+                    disabled={anyActionDisabled || !canRestoreWorker(worker) || Boolean(restoreRetries[workerKey(worker)])}
+                    aria-label={`Restore ${workerDisplayName}`}
+                    title="Restore"
+                    onclick={() => restoreWorker(worker)}
+                  >
+                    {#if isActionBusy(worker, 'restore')}
+                      <span class="spinner" aria-hidden="true"></span>
+                    {:else}
+                      <svg class="action-icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M3 11a9 9 0 1 1 2.6 6.4" /><path d="M3 3v8h8" /></svg>
+                    {/if}
+                  </button>
+                  {#if restoreRetries[workerKey(worker)]}
+                    <button type="button" disabled={anyActionDisabled} onclick={() => restoreWorker(worker, true)} aria-label={`Retry Restore ${workerDisplayName}`}>Retry Restore</button>
+                    <span role="status">Restore outcome unresolved. Retry the same request to reconcile.</span>
+                  {/if}
                   <button
                     class="icon-action"
                     type="button"

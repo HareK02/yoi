@@ -64,6 +64,9 @@ pub struct OpenWorkdirSessionResponse {
 pub enum WorkdirSessionOperation {
     AuthorizeScope(WorkdirScopeAuthorizationRequest),
     ScopeRulesOverlap(WorkdirScopeOverlapRequest),
+    CheckoutSearch(crate::CheckoutSearchRequest),
+    CheckoutObserve(crate::WorkdirPath),
+    CheckoutExecute(crate::CheckoutRequest),
     Stat(StatRequest),
     Read(ReadRequest),
     ReadBytes(ReadBytesRequest),
@@ -96,6 +99,9 @@ pub struct WorkdirSessionOperationRequest {
 pub enum WorkdirSessionOperationResult {
     AuthorizeScope,
     ScopeRulesOverlap { overlaps: bool },
+    CheckoutSearch(crate::CheckoutSearchResult),
+    CheckoutObserve(crate::CheckoutObservation),
+    CheckoutExecute(crate::CheckoutResult),
     Stat(StatResult),
     Read(ReadResult),
     ReadBytes(ReadBytesResult),
@@ -129,6 +135,18 @@ pub async fn dispatch_workdir_session_operation(
             .scope_rules_overlap(request)
             .await
             .map(|overlaps| WorkdirSessionOperationResult::ScopeRulesOverlap { overlaps }),
+        WorkdirSessionOperation::CheckoutSearch(request) => session
+            .checkout_search(request)
+            .await
+            .map(WorkdirSessionOperationResult::CheckoutSearch),
+        WorkdirSessionOperation::CheckoutObserve(path) => session
+            .checkout_observe(path)
+            .await
+            .map(WorkdirSessionOperationResult::CheckoutObserve),
+        WorkdirSessionOperation::CheckoutExecute(request) => session
+            .checkout_execute(request)
+            .await
+            .map(WorkdirSessionOperationResult::CheckoutExecute),
         WorkdirSessionOperation::Stat(request) => session
             .stat(request)
             .await
@@ -186,6 +204,7 @@ pub async fn dispatch_workdir_session_operation(
 pub enum WorkdirTransportErrorCode {
     NotFound,
     Conflict,
+    OutcomeUnknown,
     Unsupported,
     InvalidRequest,
     Denied,
@@ -208,6 +227,7 @@ impl WorkdirTransportErrorCode {
         match self {
             Self::NotFound => "not_found",
             Self::Conflict => "conflict",
+            Self::OutcomeUnknown => "outcome_unknown",
             Self::Unsupported => "unsupported",
             Self::InvalidRequest => "invalid_request",
             Self::Denied => "denied",
@@ -239,7 +259,7 @@ impl WorkdirTransportErrorCode {
             | Self::IsDirectory
             | Self::SymlinkDirectoryNotTraversed => 400,
             Self::Unavailable => 503,
-            Self::Io | Self::Internal => 500,
+            Self::Io | Self::Internal | Self::OutcomeUnknown => 500,
             Self::Transport => 502,
         }
     }
@@ -256,6 +276,10 @@ impl WorkdirTransportError {
     pub fn from_workdir_error(error: &WorkdirError) -> Self {
         use WorkdirTransportErrorCode as Code;
         let (code, message) = match error {
+            WorkdirError::OutcomeUnknown(_) => (
+                Code::OutcomeUnknown,
+                "Workdir operation may have effects; inspect before retrying",
+            ),
             WorkdirError::NotFound(_) => (Code::NotFound, "Workdir path was not found"),
             WorkdirError::Conflict(_) => (
                 Code::Conflict,
@@ -330,6 +354,9 @@ impl WorkdirTransportError {
         match self.code {
             Code::NotFound => WorkdirError::NotFound("<remote>".into()),
             Code::Conflict => WorkdirError::Conflict(self.message),
+            Code::OutcomeUnknown => WorkdirError::OutcomeUnknown(
+                "Workdir operation may have effects; inspect before retrying".into(),
+            ),
             Code::Unsupported => WorkdirError::UnsupportedOperation(self.message),
             Code::InvalidRequest => WorkdirError::InvalidArgument(self.message),
             Code::Denied => WorkdirError::Denied(self.message),
@@ -564,6 +591,114 @@ mod client {
             }
         }
 
+        async fn checkout_search(
+            &self,
+            request: crate::CheckoutSearchRequest,
+        ) -> Result<crate::CheckoutSearchResult, WorkdirError> {
+            request.validate()?;
+            let expected = request.operation.capability();
+            match self
+                .operate(WorkdirSessionOperation::CheckoutSearch(request))
+                .await?
+            {
+                WorkdirSessionOperationResult::CheckoutSearch(result)
+                    if matches!(
+                        (&result, expected),
+                        (
+                            crate::CheckoutSearchResult::List(_),
+                            crate::WorkdirSessionCapability::Read
+                        ) | (
+                            crate::CheckoutSearchResult::Glob(_),
+                            crate::WorkdirSessionCapability::Glob
+                        ) | (
+                            crate::CheckoutSearchResult::Grep(_),
+                            crate::WorkdirSessionCapability::Grep
+                        )
+                    ) =>
+                {
+                    crate::external::ExternalWorkdirOperationResult::try_from(
+                        WorkdirSessionOperationResult::CheckoutSearch(result.clone()),
+                    )
+                    .map_err(|_| Self::mismatch("bounded checkout_search"))?;
+                    Ok(result)
+                }
+                _ => Err(Self::mismatch("checkout_search")),
+            }
+        }
+
+        async fn checkout_observe(
+            &self,
+            path: crate::WorkdirPath,
+        ) -> Result<crate::CheckoutObservation, WorkdirError> {
+            match self
+                .operate(WorkdirSessionOperation::CheckoutObserve(path.clone()))
+                .await?
+            {
+                WorkdirSessionOperationResult::CheckoutObserve(mut result)
+                    if result.path == path
+                        && !result.validator.is_empty()
+                        && result.validator.len() <= 256 =>
+                {
+                    result.capabilities = result.capabilities.intersection(self.capabilities());
+                    Ok(result)
+                }
+                _ => Err(Self::mismatch("checkout_observe")),
+            }
+        }
+        async fn checkout_execute(
+            &self,
+            request: crate::CheckoutRequest,
+        ) -> Result<crate::CheckoutResult, WorkdirError> {
+            let mutation = request.operation.capability() != crate::WorkdirSessionCapability::Read;
+            let expected_path = request.target.clone();
+            let expected_output = request.operation.capability();
+            match self
+                .operate(WorkdirSessionOperation::CheckoutExecute(request))
+                .await
+            {
+                Ok(WorkdirSessionOperationResult::CheckoutExecute(mut result))
+                    if result.observation.path == expected_path
+                        && !result.observation.validator.is_empty()
+                        && result.observation.validator.len() <= 256
+                        && match (&result.output, expected_output) {
+                            (
+                                crate::CheckoutOutput::Read(read),
+                                crate::WorkdirSessionCapability::Read,
+                            ) => {
+                                read.path == expected_path
+                                    && read.bytes.len()
+                                        <= crate::BoundedReadLimits::EXTERNAL_DEFAULT
+                                            .max_response_bytes
+                            }
+                            (
+                                crate::CheckoutOutput::Write(_),
+                                crate::WorkdirSessionCapability::Write,
+                            )
+                            | (
+                                crate::CheckoutOutput::Edit(_),
+                                crate::WorkdirSessionCapability::Edit,
+                            ) => true,
+                            _ => false,
+                        } =>
+                {
+                    result.observation.capabilities = result
+                        .observation
+                        .capabilities
+                        .intersection(self.capabilities());
+                    Ok(result)
+                }
+                Ok(_) if mutation => Err(WorkdirError::OutcomeUnknown(
+                    "mismatched response after checkout mutation".into(),
+                )),
+                Ok(_) => Err(Self::mismatch("checkout_execute")),
+                Err(WorkdirError::Unavailable(_) | WorkdirError::Transport(_)) if mutation => {
+                    Err(WorkdirError::OutcomeUnknown(
+                        "checkout transport failed; effects may have occurred".into(),
+                    ))
+                }
+                Err(error) => Err(error),
+            }
+        }
         async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {
             match self.operate(WorkdirSessionOperation::Stat(request)).await? {
                 WorkdirSessionOperationResult::Stat(result) => Ok(result),

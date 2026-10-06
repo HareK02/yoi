@@ -1,8 +1,15 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import Spinner from '#lib/workspace/console/Spinner.svelte';
   import { workerConsoleHref } from '#lib/workspace/resource-links.ts';
   import { pushWorkspaceAlert } from '#lib/workspace/alerts/store.ts';
   import {
+    canRestoreWorker,
+    createRestoreRequest,
+    restoreWorkspaceWorker,
+    restoreNotice,
+    restoreErrorNotice,
+    type RestoreRequest,
     canStopSidebarWorker,
     canDeleteSidebarWorker,
     deleteSidebarWorker,
@@ -10,6 +17,7 @@
   } from './worker-actions';
   import {
     workspaceWorkersStore,
+    refreshWorkspaceWorkers,
     type SidebarWorker,
   } from './worker-subscription';
   import {
@@ -21,7 +29,7 @@
   import { sidebarWorkdirMeta } from './worker-workdir-meta';
 
   const COLLAPSED_WORKER_COUNT = 6;
-  type WorkerActionKind = 'stop' | 'delete';
+  type WorkerActionKind = 'restore' | 'stop' | 'delete';
 
   type Props = {
     currentPath?: string;
@@ -35,6 +43,7 @@
   let openWorkerKey = $state<string | null>(null);
   let menuElement = $state<HTMLElement | null>(null);
   let menuTrigger = $state<HTMLButtonElement | null>(null);
+  let restoreRetries = $state<Record<string, RestoreRequest>>({});
   let busyAction = $state<{ workerKey: string; kind: WorkerActionKind } | null>(null);
   let visibleWorkers = $derived(
     visibleWorkersForSidebar(workers, {
@@ -90,58 +99,104 @@
     closeWorkerMenu(true);
   }
 
+  let lifetime = 0;
+
+  function actionScope() {
+    const id = workspaceId;
+    const epoch = lifetime;
+    return { workspaceId: id, isCurrent: () => lifetime === epoch && workspaceId === id };
+  }
+
+  async function restoreWorker(worker: SidebarWorker, retry = false) {
+    const key = workerKey(worker);
+    if (busyAction || (retry ? !restoreRetries[key] : restoreRetries[key] || !canRestoreWorker(worker))) return;
+    const scope = actionScope();
+    const request = retry ? restoreRetries[key] : createRestoreRequest(worker);
+    closeWorkerMenu();
+    busyAction = { workerKey: key, kind: 'restore' };
+    try {
+      let notice;
+      try {
+        notice = restoreNotice(await restoreWorkspaceWorker(scope.workspaceId, worker, request));
+      } catch (cause) {
+        notice = restoreErrorNotice(cause);
+      }
+      if (!scope.isCurrent()) return;
+      const next = { ...restoreRetries };
+      if (notice.retry) next[key] = request;
+      else delete next[key];
+      restoreRetries = next;
+      pushWorkspaceAlert(notice.level, notice.message, { title: notice.title });
+      await refreshWorkspaceWorkers(scope.workspaceId).catch(() => {});
+    } finally {
+      if (scope.isCurrent()) busyAction = null;
+    }
+  }
+
   async function stopWorker(worker: SidebarWorker) {
     if (busyAction || !canStopSidebarWorker(worker)) return;
+    const scope = actionScope();
     closeWorkerMenu();
     busyAction = { workerKey: workerKey(worker), kind: 'stop' };
     try {
-      await stopSidebarWorker(workspaceId, worker);
-      workers = workers.map((item) =>
-        workerKey(item) === workerKey(worker)
-          ? { ...item, state: 'stopped', lifecycleState: 'stopped' }
-          : item
-      );
+      await stopSidebarWorker(scope.workspaceId, worker);
+      if (!scope.isCurrent()) return;
+      await refreshWorkspaceWorkers(scope.workspaceId);
+      if (!scope.isCurrent()) return;
       pushWorkspaceAlert('info', `${worker.display_name || worker.label} stopped`, {
         title: 'Worker stopped',
       });
     } catch (cause) {
+      if (!scope.isCurrent()) return;
       pushWorkspaceAlert('error', cause instanceof Error ? cause.message : 'Worker stop failed', {
         title: 'Worker stop failed',
       });
     } finally {
-      busyAction = null;
+      if (scope.isCurrent()) busyAction = null;
     }
   }
 
   async function deleteWorker(worker: SidebarWorker) {
     if (busyAction || !canDeleteSidebarWorker(worker)) return;
+    const scope = actionScope();
     closeWorkerMenu();
     busyAction = { workerKey: workerKey(worker), kind: 'delete' };
     try {
-      await deleteSidebarWorker(workspaceId, worker);
-      workers = workers.filter((item) => workerKey(item) !== workerKey(worker));
+      await deleteSidebarWorker(scope.workspaceId, worker, (input, init) => {
+        if (!scope.isCurrent()) throw new Error('Worker action is no longer current');
+        return fetch(input, init);
+      });
+      if (!scope.isCurrent()) return;
+      await refreshWorkspaceWorkers(scope.workspaceId);
+      if (!scope.isCurrent()) return;
       pushWorkspaceAlert('info', `${worker.display_name || worker.label} deleted`, {
         title: 'Worker deleted',
       });
     } catch (cause) {
+      if (!scope.isCurrent()) return;
       pushWorkspaceAlert('error', cause instanceof Error ? cause.message : 'Worker deletion failed', {
         title: 'Worker deletion failed',
       });
     } finally {
-      busyAction = null;
+      if (scope.isCurrent()) busyAction = null;
     }
   }
 
   $effect(() => {
+    const id = workspaceId;
+    lifetime++;
+    busyAction = null;
+    restoreRetries = {};
     expanded = false;
-    openWorkerKey = null;
-    menuElement = null;
-    menuTrigger = null;
-    const subscription = workspaceWorkersStore(workspaceId);
-    return subscription.subscribe((state) => {
+    untrack(closeWorkerMenu);
+    const unsubscribe = workspaceWorkersStore(id).subscribe((state) => {
       loading = state.loading;
       workers = state.workers.filter(canShowWorkerInSidebar);
     });
+    return () => {
+      lifetime++;
+      unsubscribe();
+    };
   });
 </script>
 
@@ -221,6 +276,23 @@
           </button>
           {#if openWorkerKey === key}
             <div class="worker-actions-menu" role="menu" aria-label={`Actions for ${label}`} bind:this={menuElement}>
+              <button
+                type="button"
+                role="menuitem"
+                disabled={busyAction !== null || !canRestoreWorker(worker) || Boolean(restoreRetries[key])}
+                onclick={() => restoreWorker(worker)}
+              >
+                {isBusy(worker, 'restore') ? 'Restoring…' : 'Restore'}
+              </button>
+              {#if restoreRetries[key]}
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={busyAction !== null}
+                  onclick={() => restoreWorker(worker, true)}
+                >Retry Restore</button>
+                <p role="status">Restore outcome unresolved. Retry the same request to reconcile.</p>
+              {/if}
               <button
                 type="button"
                 role="menuitem"

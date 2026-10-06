@@ -64,6 +64,20 @@ pub struct WorkerHandle {
 }
 
 impl WorkerHandle {
+    /// Transport closure belongs to this Controller endpoint, not a WorkerRef.
+    pub fn protocol_is_closed(&self) -> bool {
+        self.method_tx.is_closed()
+    }
+
+    pub async fn protocol_closed(&self) {
+        self.method_tx.closed().await;
+    }
+
+    /// Compare actual endpoints when an execution-bound transport is dispatched.
+    pub fn same_controller(&self, other: &Self) -> bool {
+        self.method_tx.same_channel(&other.method_tx)
+    }
+
     pub async fn send(&self, method: Method) -> Result<(), mpsc::error::SendError<Method>> {
         // Reject known-busy sends before channel dispatch, including maintenance
         // that cannot receive methods until it finishes. The controller checks
@@ -184,6 +198,7 @@ impl WorkerHandle {
         &self,
         kind: protocol::CompletionKind,
         prefix: &str,
+        context: Option<&protocol::CompletionContext>,
     ) -> Vec<protocol::CompletionEntry> {
         match kind {
             protocol::CompletionKind::File => {
@@ -196,8 +211,61 @@ impl WorkerHandle {
                     .map(|candidate| protocol::CompletionEntry {
                         value: candidate.path,
                         is_dir: candidate.is_dir,
+                        description: None,
+                        usage: None,
+                        invocation: None,
                     })
                     .collect()
+            }
+            protocol::CompletionKind::Feature => self
+                .shared_state
+                .feature_invocations()
+                .feature_completions(prefix),
+            protocol::CompletionKind::FeatureArgument => {
+                let Some(context) = context else {
+                    return Vec::new();
+                };
+                let registry = self.shared_state.feature_invocations();
+                let Some(argument) = context.argument.as_deref() else {
+                    return registry.argument_name_completions(&context.invocation, prefix);
+                };
+                let worker_file = registry
+                    .descriptor(&context.invocation)
+                    .and_then(|descriptor| {
+                        descriptor
+                            .arguments
+                            .iter()
+                            .find(|candidate| candidate.name == argument)
+                    })
+                    .is_some_and(|descriptor| {
+                        matches!(
+                            descriptor.completion,
+                            protocol::InvocationCompletion::WorkerFile
+                        )
+                    });
+                if worker_file {
+                    let Some(view) = self.shared_state.fs_view() else {
+                        return Vec::new();
+                    };
+                    let candidates = view.list_file_completions(prefix).await;
+                    if registry.descriptor(&context.invocation).is_none() {
+                        return Vec::new();
+                    }
+                    return crate::feature::invocation::bounded_completion_entries(
+                        candidates
+                            .into_iter()
+                            .map(|candidate| protocol::CompletionEntry {
+                                value: candidate.path,
+                                is_dir: candidate.is_dir,
+                                description: None,
+                                usage: None,
+                                invocation: None,
+                            }),
+                    );
+                }
+                registry
+                    .argument_completions(&context.invocation, argument, prefix)
+                    .await
             }
         }
     }
@@ -435,11 +503,29 @@ fn stage_pending_notifications<St: Store + Clone>(
     count
 }
 
+/// The durable input append is the activation boundary. Clear live state in
+/// the same poll, before invocation preparation can checkpoint it again; the
+/// oneshot only publishes the already-completed transition to the Controller.
+pub(crate) fn input_committed_hook<St: Store + Clone>(
+    pending: crate::worker::PendingSubmissionHandle<St>,
+    submission_id: String,
+    sender: oneshot::Sender<()>,
+) -> impl FnOnce() {
+    move || {
+        pending.finish_activation(&submission_id);
+        let _ = sender.send(());
+    }
+}
+
 fn notification_coalesce_remaining<St: Store + Clone>(
     pending_submissions: &crate::worker::PendingSubmissionHandle<St>,
     notify_buffer: &NotifyBuffer,
     delay: Duration,
+    can_schedule_run: bool,
 ) -> Option<Duration> {
+    if !can_schedule_run {
+        return None;
+    }
     let Some(accepted_at_ms) = pending_submissions.oldest_pending_notification_accepted_at_ms()
     else {
         return notify_buffer
@@ -801,9 +887,6 @@ impl WorkerController {
             None,
         )
         .await?;
-        let command_observer = fs_for_view
-            .as_ref()
-            .and_then(|session| wire_workdir_command_events(session, &in_flight));
 
         // Intake role Workers self-terminate only after a successful
         // TicketIntakeReady turn has fully settled back to Idle. The request
@@ -846,6 +929,7 @@ impl WorkerController {
             manifest_toml.clone(),
             greeting,
         ));
+        shared_state.set_feature_invocations(worker.feature_invocations());
         let usage_state = shared_state.clone();
         let usage_events = working_event_tx.clone();
         worker.engine_mut().on_usage(move |event| {
@@ -856,8 +940,8 @@ impl WorkerController {
                 protocol::ContextTokenSource::Measured,
             );
         });
-        if let Some(fs_for_view) = fs_for_view {
-            shared_state.set_fs_view(crate::fs_view::WorkerFsView::new(fs_for_view));
+        if let Some(fs_for_view) = fs_for_view.as_ref() {
+            shared_state.set_fs_view(crate::fs_view::WorkerFsView::new(fs_for_view.clone()));
         }
         runtime_dir.write_manifest(&manifest_toml).await?;
         runtime_dir.write_status(&shared_state).await?;
@@ -879,8 +963,23 @@ impl WorkerController {
             pending_activations,
         };
 
+        // Do not start an observer before fallible head/recovery/runtime-file
+        // initialization. The only remaining fallible step is socket startup,
+        // whose error path must abort AND join this task before returning.
+        let command_observer = fs_for_view
+            .as_ref()
+            .and_then(|session| wire_workdir_command_events(session, &in_flight));
         let socket_server = match transport {
-            WorkerControllerTransport::UnixSocket => Some(SocketServer::start(&handle).await?),
+            WorkerControllerTransport::UnixSocket => match SocketServer::start(&handle).await {
+                Ok(server) => Some(server),
+                Err(error) => {
+                    if let Some(observer) = command_observer {
+                        observer.abort();
+                        let _ = observer.await;
+                    }
+                    return Err(error);
+                }
+            },
             WorkerControllerTransport::InProcess => None,
         };
 
@@ -1277,10 +1376,12 @@ where
         ),
         None => durable_parent_notifications,
     };
-    let backend_job_profile = worker.manifest().engine.instruction == "internal.backend_job_system";
+    let backend_job = worker.backend_job().cloned();
+    // Bounded Jobs complete their lifecycle synchronously, never by post-run background work.
+    let lifecycle_enabled = worker.manifest_lifecycle_features_enabled() && backend_job.is_none();
     let prompts = worker.prompts().clone();
     let tracker = tools::Tracker::new();
-    if !backend_job_profile {
+    {
         let paste_store = worker.store().clone();
         let paste_session_id = worker.session_id();
         worker
@@ -1327,7 +1428,9 @@ where
     let worker_enabled = feature_config.worker.enabled;
     let sub_worker_enabled = feature_config.sub_worker.enabled;
     let mut feature_registry = FeatureRegistryBuilder::new();
-    if backend_job_profile {
+    feature_registry
+        .add_module(crate::feature::builtin::chat_invocation::AttachmentInvocationFeature);
+    if let Some(binding) = backend_job.as_ref() {
         let workspace_client = worker.workspace_client_handle();
         if !workspace_client.is_available() || workspace_client.workspace_id().is_none() {
             return Err(std::io::Error::new(
@@ -1335,11 +1438,18 @@ where
                 "Backend Job result capability requires Backend Workspace API authority",
             ));
         }
-        feature_registry.add_module(
+        let mut result_feature =
             crate::feature::builtin::backend_job_result::BackendJobResultFeature::new(
-                workspace_client,
-            ),
-        );
+                workspace_client.clone(),
+            );
+        if binding.subjektiv_consolidation {
+            let surface = crate::feature::builtin::memory_surface_lifecycle::SubjektivSurfaceLifecycleFeature::for_job(
+                workspace_client, spawner_manifest.clone(), worker.llm_client_handle(),
+                prompts.clone(), spawner_workspace_context.clone(),
+            )?;
+            result_feature = result_feature.with_surface(surface);
+        }
+        feature_registry.add_module(result_feature);
     }
     let memory_profile = &worker.manifest().feature.memory.profile;
     let subjektiv_profile = &worker.manifest().feature.subjektiv.profile;
@@ -1352,7 +1462,11 @@ where
     let mut feature_prompt_contribution = memory_install_plan.as_ref().map(|plan| {
         (
             plan.resident_summary_source.clone(),
-            plan.system_prompt_override.clone(),
+            if backend_job.is_none() {
+                plan.system_prompt_override.clone()
+            } else {
+                None
+            },
         )
     });
     let memory_lifecycle_config = worker.manifest().feature.memory.clone();
@@ -1366,7 +1480,9 @@ where
             worker.prompts().load_full(),
         )?;
     if let Some(plan) = subjektiv_consolidation_plan {
-        feature_prompt_contribution = Some((None, Some(plan.system_prompt_override)));
+        if backend_job.is_none() {
+            feature_prompt_contribution = Some((None, Some(plan.system_prompt_override)));
+        }
         feature_registry.add_module(plan.module);
     }
     let ordinary_subjektiv_features_enabled =
@@ -1375,6 +1491,7 @@ where
         crate::feature::builtin::memory::ordinary_subjektiv_resident_summary_source(
             worker.manifest(),
             worker.workspace_client_handle(),
+            worker.prompts(),
         )?
     {
         let workspace_id = worker
@@ -1384,7 +1501,7 @@ where
             .to_string();
         if let Some(refresh_feature) =
             crate::feature::builtin::memory::SubjektivResidentRestoreRefreshFeature::for_host(
-                worker.manifest_lifecycle_features_enabled(),
+                lifecycle_enabled,
                 Arc::clone(&resident_summary_source),
                 worker.prompts(),
                 workspace_id,
@@ -1415,7 +1532,7 @@ where
     }
     if let Some(memory_lifecycle) =
         crate::feature::builtin::memory_lifecycle::MemoryLifecycleFeature::from_resolved_config(
-            worker.manifest_lifecycle_features_enabled(),
+            lifecycle_enabled,
             memory_lifecycle_config,
             worker.committed_session_capture_handle(),
             worker.session_extension_handle(),
@@ -1429,8 +1546,8 @@ where
     {
         feature_registry.add_module(memory_lifecycle);
     }
-    if let Some(surface_lifecycle) = crate::feature::builtin::memory_surface_lifecycle::SubjektivSurfaceLifecycleFeature::from_manifest(
-        worker.manifest_lifecycle_features_enabled(),
+    if backend_job.is_none() && let Some(surface_lifecycle) = crate::feature::builtin::memory_surface_lifecycle::SubjektivSurfaceLifecycleFeature::from_manifest(
+        lifecycle_enabled,
         worker.workspace_client_handle(),
         spawner_manifest.clone(),
         worker.llm_client_handle(),
@@ -1442,7 +1559,7 @@ where
     if ordinary_subjektiv_features_enabled
         && let Some(subjektiv_lifecycle) =
             crate::feature::builtin::memory_lifecycle::SubjektivLifecycleFeature::from_resolved_config(
-                worker.manifest_lifecycle_features_enabled(),
+                lifecycle_enabled,
                 worker.manifest().feature.subjektiv.clone(),
                 worker.committed_session_capture_handle(),
                 worker.session_extension_handle(),
@@ -1504,7 +1621,22 @@ where
             ),
         );
     }
-    if feature_config.manage_workdir.enabled {
+    let wip_mode = worker.manifest().worker.mode == manifest::WorkerMode::Wip;
+    let workspace_config_feature =
+        crate::feature::builtin::workspace_config::WorkspaceConfigFeature::configured(
+            worker.workspace_client_handle(),
+            feature_config.workspace_config.enabled,
+            wip_mode,
+        );
+    if let Some(module) = &workspace_config_feature {
+        feature_registry.add_module(module.clone());
+    }
+    let mut workdir_wip_feature = None;
+    if feature_config.manage_workdir.enabled
+        || (wip_mode
+            && feature_config.workdir_catalog.enabled
+            && worker.workspace_client_handle().is_available())
+    {
         // Workdir lifecycle is Workspace control-plane authority. The Worker
         // receives only the injected WorkspaceClient and never Runtime URLs,
         // repository paths, materializer handles, or cleanup sessions.
@@ -1520,7 +1652,7 @@ where
         }
         let shutdown_registry = spawned_registry.clone();
         let reopen_registry = spawned_registry.clone();
-        feature_registry.add_module(
+        let module =
             crate::feature::builtin::manage_workdir::ManageWorkdirFeature::with_child_lifecycle(
                 workspace_client,
                 worker.workdir_sessions(),
@@ -1529,8 +1661,11 @@ where
                     Box::pin(async move { child_registry.shutdown_internal().await })
                 }),
                 Arc::new(move || reopen_registry.reopen_internal()),
-            ),
-        );
+            );
+        if feature_config.manage_workdir.enabled {
+            feature_registry.add_module(module.clone());
+        }
+        workdir_wip_feature = Some(module);
     }
     if feature_config.workspace_worker_discovery.enabled {
         let workspace_client = worker.workspace_client_handle();
@@ -1585,20 +1720,60 @@ where
     }
 
     let host_worker_observation_provider = worker.worker_observation_provider();
-    let wip_mode = worker.manifest().worker.mode == manifest::WorkerMode::Wip;
     let wip_permissions = worker.manifest().permissions.clone();
     let mut wip_mount_registry = crate::wip::WipMountRegistry::new();
+    if let Some(feature) = &workspace_config_feature {
+        crate::feature::builtin::workspace_config::wip::mount_workspace_config_wip(
+            &mut wip_mount_registry,
+            feature,
+        )
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("mount Workspace config WIP projection: {error}"),
+            )
+        })?;
+    }
+    if wip_mode {
+        crate::checkout::mount_checkouts(
+            &mut wip_mount_registry,
+            worker.workdir_sessions(),
+            tracker.clone(),
+            wip_permissions.clone(),
+        )
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("mount checkout WIP projection: {error}"),
+            )
+        })?;
+    }
+    if wip_mode && let Some(feature) = &workdir_wip_feature {
+        crate::feature::builtin::manage_workdir::wip::mount_workspace_workdir_wip(
+            &mut wip_mount_registry,
+            feature,
+            feature_config.workdir_catalog.enabled,
+            feature_config.manage_workdir.enabled,
+            wip_permissions.clone(),
+        )
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("mount Workdir WIP projection: {error}"),
+            )
+        })?;
+    }
     {
         let workspace_client = worker.workspace_client_handle();
         let engine = worker.engine_mut();
 
         if feature_config.merge_request.any() && wip_mode {
-            let feature_route = wip_mount_registry
-                .allocate_feature_route("merge-request")
+            let namespace_route = wip_mount_registry
+                .allocate_namespace("merge-request", "merge-requests")
                 .map_err(|error| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        format!("allocate Merge Request WIP route: {error}"),
+                        format!("allocate Merge Request WIP namespace: {error}"),
                     )
                 })?;
             crate::feature::builtin::merge_request::mount_workspace_http_merge_request_wip(
@@ -1606,7 +1781,7 @@ where
                 workspace_client.clone(),
                 feature_config.merge_request,
                 wip_permissions.clone(),
-                &feature_route,
+                &namespace_route,
             )
             .map_err(|error| {
                 std::io::Error::new(
@@ -1623,12 +1798,12 @@ where
                 intake: feature_config.ticket.intake,
                 workflow: feature_config.ticket.workflow,
             };
-            let feature_route = wip_mount_registry
-                .allocate_feature_route("ticket")
+            let namespace_route = wip_mount_registry
+                .allocate_namespace("ticket", "tickets")
                 .map_err(|error| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        format!("allocate Ticket WIP route: {error}"),
+                        format!("allocate Ticket WIP namespace: {error}"),
                     )
                 })?;
             crate::feature::builtin::ticket::mount_workspace_http_ticket_wip(
@@ -1636,7 +1811,7 @@ where
                 workspace_client.clone(),
                 ticket_access,
                 wip_permissions.clone(),
-                &feature_route,
+                &namespace_route,
             )
             .map_err(|error| {
                 std::io::Error::new(
@@ -1657,19 +1832,19 @@ where
                     engine.register_tool(definition);
                 }
                 if wip_mode {
-                    let feature_route = wip_mount_registry
-                        .allocate_feature_route("objective")
+                    let namespace_route = wip_mount_registry
+                        .allocate_namespace("objective", "objectives")
                         .map_err(|error| {
                             std::io::Error::new(
                                 std::io::ErrorKind::InvalidInput,
-                                format!("allocate Objective WIP route: {error}"),
+                                format!("allocate Objective WIP namespace: {error}"),
                             )
                         })?;
                     crate::feature::builtin::objective::mount_workspace_http_objective_wip(
                         &mut wip_mount_registry,
                         workspace_client.clone(),
                         wip_permissions.clone(),
-                        &feature_route,
+                        &namespace_route,
                     )
                     .map_err(|error| {
                         std::io::Error::new(
@@ -2081,9 +2256,11 @@ async fn controller_loop<C, St>(
                             submission.input,
                             vec![extension],
                             submission.provenance,
-                            move || {
-                                let _ = input_commit_tx.send(());
-                            },
+                            input_committed_hook(
+                                pending_submissions.clone(),
+                                committed_submission.submission_id.clone(),
+                                input_commit_tx,
+                            ),
                         ),
                         &mut method_rx,
                         &working_event_tx,
@@ -2140,10 +2317,6 @@ async fn controller_loop<C, St>(
                     .await
                 }
             };
-            if notify_buffer.is_empty() {
-                pending_submissions.finish_notification_batch();
-            }
-
             if !shutdown && may_drain_pending && new_status == WorkerStatus::Idle {
                 match prepare_pending_run(&pending_submissions, &notify_buffer, None, false) {
                     Ok(Some(next)) => {
@@ -2192,12 +2365,16 @@ async fn controller_loop<C, St>(
             continue;
         }
 
+        // An expired Notify deadline must not repeatedly schedule a run that
+        // cannot cross the invocation fence. Keep the accepted notification for
+        // a fresh input/recovery boundary instead of retrying business effects.
         let notification_delay = (shared_state.catalog_status() == WorkerStatus::Idle)
             .then(|| {
                 notification_coalesce_remaining(
                     &pending_submissions,
                     &notify_buffer,
                     notification_coalesce_delay,
+                    worker.can_schedule_notification_run(),
                 )
             })
             .flatten();
@@ -3754,6 +3931,21 @@ mod tests {
         assert!(feature_install < materialize_gate);
         assert!(materialize_gate < materialize);
         assert!(materialize < exposure);
+        let observer = startup.find("let command_observer = fs_for_view").unwrap();
+        let recover = startup.find(".recover_unfinished_compaction()").unwrap();
+        let files = startup
+            .find("runtime_dir.write_status(&shared_state).await?")
+            .unwrap();
+        let loop_start = startup.find("tokio::spawn(controller_loop(").unwrap();
+        assert!(recover < observer && files < observer && observer < loop_start);
+        let socket_startup = &startup[observer..loop_start];
+        let abort = socket_startup.find("observer.abort()").unwrap();
+        let join = socket_startup.find("observer.await").unwrap();
+        let failure = socket_startup.find("return Err(error)").unwrap();
+        assert!(
+            abort < join && join < failure,
+            "startup cannot detach its observer on error"
+        );
         assert!(
             startup[materialize_gate..materialize]
                 .contains("needs_initial_session_head_materialization")
@@ -3869,6 +4061,40 @@ mod tests {
             Some(PendingRun::RunForNotification { .. })
         ));
         assert!(notify_buffer.has_notification_pending());
+    }
+
+    #[test]
+    fn invocation_fence_suspends_expired_notification_deadline_without_dropping_input() {
+        let temp = TempDir::new().unwrap();
+        let pending = crate::worker::PendingSubmissionHandle::for_test(temp.path());
+        let buffer = NotifyBuffer::new();
+        pending
+            .accept_notification("held".into(), "held".into())
+            .unwrap();
+        let before = pending.persisted_entries_for_test().len();
+        assert_eq!(
+            notification_coalesce_remaining(&pending, &buffer, Duration::ZERO, true),
+            Some(Duration::ZERO)
+        );
+        for _ in 0..4 {
+            assert_eq!(
+                notification_coalesce_remaining(&pending, &buffer, Duration::ZERO, false),
+                None
+            );
+        }
+        assert_eq!(pending.persisted_entries_for_test().len(), before);
+        assert_eq!(pending.snapshot().notification_count, 1);
+        // A busy-time staged notification is equally retained behind the fence.
+        stage_pending_notifications(&pending, &buffer);
+        assert_eq!(
+            notification_coalesce_remaining(&pending, &buffer, Duration::ZERO, false),
+            None
+        );
+        assert!(buffer.has_notification_pending());
+        assert_eq!(
+            notification_coalesce_remaining(&pending, &buffer, Duration::ZERO, true),
+            Some(Duration::ZERO)
+        );
     }
 
     #[test]

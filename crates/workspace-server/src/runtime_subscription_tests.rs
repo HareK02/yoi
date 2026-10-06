@@ -3,10 +3,10 @@ use protocol::subscription::{SubscriptionWorkerIds, SubscriptionWorkerState};
 use worker_runtime::Runtime;
 use worker_runtime::catalog::{CreateWorkerRequest, ProfileSelector, ProfileSourceArchiveSource};
 use worker_runtime::execution::{
-    WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation, WorkerExecutionResult,
+    WorkerExecutionBackend, WorkerExecutionOperation, WorkerExecutionResult,
     WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
 };
-use worker_runtime::identity::WorkerId;
+use worker_runtime::identity::{WorkerId, WorkerRef};
 
 #[derive(Debug)]
 struct TestExecutionBackend;
@@ -16,9 +16,8 @@ impl WorkerExecutionBackend for TestExecutionBackend {
         "runtime-subscription-test"
     }
 
-    fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
+    fn spawn_worker(&self, _request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
         WorkerExecutionSpawnResult::connected(
-            WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
             protocol::WorkerStateSnapshot {
                 ..protocol::WorkerStatus::Idle.into()
             },
@@ -28,7 +27,7 @@ impl WorkerExecutionBackend for TestExecutionBackend {
 
     fn dispatch_input(
         &self,
-        _handle: &WorkerExecutionHandle,
+        _worker_ref: &WorkerRef,
         input: worker_runtime::interaction::WorkerInput,
     ) -> WorkerExecutionResult {
         if let Some(submission_request_id) = input.submission_request_id {
@@ -43,7 +42,7 @@ impl WorkerExecutionBackend for TestExecutionBackend {
         }
     }
 
-    fn stop_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
+    fn stop_worker(&self, _worker_ref: &WorkerRef) -> WorkerExecutionResult {
         WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop)
     }
 }
@@ -75,6 +74,7 @@ fn create_request(name: &str) -> CreateWorkerRequest {
             language: "English".to_string(),
         }),
         subjektiv_attached: false,
+        backend_job: None,
     }
 }
 

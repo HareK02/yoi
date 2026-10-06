@@ -420,6 +420,18 @@ pub struct WorkerInput {
     pub segments: Option<Vec<Segment>>,
 }
 
+/// Host-authored Job/attempt identity, independent of Profile selection.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendJobExecutionBinding {
+    pub job_id: String,
+    pub attempt_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_revision: Option<String>,
+    #[serde(default)]
+    pub subjektiv_consolidation: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CreateWorkerRequest {
     pub worker_id: WorkerId,
@@ -448,10 +460,14 @@ pub struct CreateWorkerRequest {
     /// never activates subjektiv for an ordinary Workspace Worker.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub subjektiv_attached: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_job: Option<BackendJobExecutionBinding>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_observation_token: Option<String>,
     pub worker_ref: WorkerRef,
     pub worker_id: WorkerId,
     pub status: WorkerStatus,
@@ -482,6 +498,62 @@ pub struct WorkersResponse {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerResponse {
     pub worker: WorkerDetail,
+}
+
+/// Explicit observed Restore intent. Preparation is authored by the Workspace
+/// Backend, not browser/Tool JSON, and applied only after Runtime admission.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRestoreRequest {
+    pub expected_observation_token: String,
+    pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<WorkerRestorePreparation>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRestorePreparation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_api: Option<WorkspaceApiRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir_attachments: Option<Vec<LogicalWorkdirAttachment>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repository_access: Vec<WorkingDirectoryRepositoryAccessRequest>,
+    /// Read-only references resolved by Workspace only after this operation owns admission.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repository_access_workdirs: Vec<RepositoryAccessWorkdirReference>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryAccessWorkdirReference {
+    pub runtime_id: String,
+    pub working_directory_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRestoreCoordinationRequest {
+    pub expected_observation_token: String,
+    pub request_id: String,
+    /// None means owner/result recovery only; it can never admit a new intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<WorkerRestorePreparation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkerRestoreCoordinationResponse {
+    pub result: Option<WorkerRestoreResponse>,
+    /// Original read-only preparation, only when the existing operation still needs it.
+    pub preparation: Option<WorkerRestorePreparation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkingDirectoryRepositoryAccessRequest {
+    pub working_directory_id: String,
+    pub materialization: RepositoryMaterializationContext,
 }
 
 /// Explicit restore outcome returned for every reachable Runtime restore attempt,
@@ -567,12 +639,20 @@ pub struct CompletionRequest {
     pub kind: CompletionKind,
     #[serde(default)]
     pub prefix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<protocol::CompletionContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CompletionResponse {
     pub kind: CompletionKind,
     pub prefix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<protocol::CompletionContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     pub entries: Vec<CompletionEntry>,
 }
 
@@ -992,11 +1072,18 @@ pub trait RuntimeApi {
         #[body] request: WorkerLifecycleRequest,
     ) -> Result<WorkerLifecycleResponse, RuntimeApiError>;
 
-    #[post("/v1/workers/{worker_id}/restore", status = 200, error_status = 400)]
+    #[post("/v1/workers/{worker_id}/restore/coordinate", status = 200, error_status = 400, additional_error_statuses = [409])]
+    async fn coordinate_worker_restore(
+        &self,
+        #[path] worker_id: String,
+        #[body] request: WorkerRestoreCoordinationRequest,
+    ) -> Result<WorkerRestoreCoordinationResponse, RuntimeApiError>;
+
+    #[post("/v1/workers/{worker_id}/restore", status = 200, error_status = 400, additional_error_statuses = [409])]
     async fn restore_worker(
         &self,
         #[path] worker_id: String,
-        #[body] request: EmptyObjectRequest,
+        #[body] request: WorkerRestoreRequest,
     ) -> Result<WorkerRestoreResponse, RuntimeApiError>;
 
     #[post(
@@ -1202,6 +1289,61 @@ pub const REMAINING_RUNTIME_ROUTES: &[RemainingRuntimeRoute] = &[
 mod tests {
     use super::*;
 
+    #[test]
+    fn restore_request_is_mandatory_and_conflict_is_not_an_operation_state() {
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"request_id":"r"}),
+            serde_json::json!({"expected_observation_token":"t"}),
+        ] {
+            assert!(serde_json::from_value::<WorkerRestoreRequest>(invalid).is_err());
+        }
+        let request: WorkerRestoreRequest = serde_json::from_value(
+            serde_json::json!({"expected_observation_token":"t", "request_id":"r"}),
+        )
+        .unwrap();
+        assert!(request.preparation.is_none());
+        for state in [
+            "accepted",
+            "rejected",
+            "rolled_back",
+            "reconciliation_required",
+        ] {
+            assert!(serde_json::from_value::<WorkerRestoreState>(serde_json::json!(state)).is_ok());
+        }
+        assert!(
+            serde_json::from_value::<WorkerRestoreState>(serde_json::json!(
+                "restore_observation_conflict"
+            ))
+            .is_err()
+        );
+        let conflict = RuntimeApiError::new(
+            409,
+            "restore_observation_conflict",
+            "refresh before a new intent",
+        );
+        assert_eq!(conflict.status(), 409);
+        assert_eq!(
+            serde_json::to_value(conflict).unwrap()["error"]["code"],
+            "restore_observation_conflict"
+        );
+    }
+
+    #[test]
+    fn feature_argument_completion_wire_preserves_source_and_argument() {
+        let json = serde_json::json!({"kind":"feature_argument", "prefix":"資料/", "context": {"invocation":"builtin:test/prepare", "argument":"path"}});
+        let request: CompletionRequest = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(request.kind, CompletionKind::FeatureArgument);
+        assert_eq!(
+            request.context.as_ref().unwrap().argument.as_deref(),
+            Some("path")
+        );
+        assert_eq!(serde_json::to_value(request).unwrap(), json);
+        let legacy: CompletionRequest =
+            serde_json::from_value(serde_json::json!({"kind":"file"})).unwrap();
+        assert!(legacy.context.is_none());
+    }
+
     #[derive(Clone)]
     struct RoundTripService;
 
@@ -1365,10 +1507,17 @@ mod tests {
         ) -> Result<WorkerLifecycleResponse, RuntimeApiError> {
             Err(test_error(501))
         }
+        async fn coordinate_worker_restore(
+            &self,
+            _worker_id: String,
+            _request: WorkerRestoreCoordinationRequest,
+        ) -> Result<WorkerRestoreCoordinationResponse, RuntimeApiError> {
+            Err(test_error(501))
+        }
         async fn restore_worker(
             &self,
             _worker_id: String,
-            _request: EmptyObjectRequest,
+            _request: WorkerRestoreRequest,
         ) -> Result<WorkerRestoreResponse, RuntimeApiError> {
             Err(test_error(501))
         }
@@ -1468,7 +1617,7 @@ mod tests {
     #[test]
     fn contract_inventory_is_complete_and_unique() {
         let operations = RuntimeApiMetadata::OPERATIONS;
-        assert_eq!(operations.len(), 19);
+        assert_eq!(operations.len(), 20);
         let mut routes = operations
             .iter()
             .map(|operation| (format!("{:?}", operation.method), operation.path))

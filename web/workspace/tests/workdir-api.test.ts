@@ -23,6 +23,26 @@ const summary = {
   },
 };
 
+Deno.test("logical config Workdir source preserves WIP metadata without filesystem authority", () => {
+  const source = { kind: "workspace_config", access: "read_only", content_path: "/workspace-config", purpose: "Workspace configuration" };
+  const response = (source: unknown) => ({ workspace_id: "workspace-a", item: {
+    working_directory_id: "config-1", source, materializer_kind: "logical_workspace_config", status: "active",
+  }, diagnostics: [] });
+  const detail = parseWorkingDirectoryDetailResponse(response(source));
+  if (JSON.stringify(detail.item.source) !== JSON.stringify(source) || detail.runtime_id !== undefined) {
+    throw new Error("logical config identity was lost or acquired a fake Runtime");
+  }
+  for (const invalid of [
+    { ...source, access: "command" }, { ...source, content_path: "/home/config" },
+    { ...source, grant_id: "external-grant" }, { ...source, repository_key: "main" },
+    { ...source, token: "secret" }, { kind: "repository", repository_key: "main", access: "read_write" },
+  ]) {
+    let rejected = false;
+    try { parseWorkingDirectoryDetailResponse(response(invalid)); } catch { rejected = true; }
+    if (!rejected) throw new Error("mixed or unsafe source metadata was accepted");
+  }
+});
+
 Deno.test("Workdir REST validation accepts the generated list and create contracts", () => {
   const list = parseWorkingDirectoryListResponse({
     workspace_id: "workspace-a",

@@ -105,6 +105,7 @@ pub enum WorkerPrompt {
     AgentsMdSection,
     ResidentMemorySummarySection,
     ResidentMemoryRestoreSection,
+    SubjektivResidentContext,
     WorkerOrchestrationGuidanceSection,
     SubWorkerSpawnToolDescription,
 }
@@ -128,6 +129,7 @@ impl WorkerPrompt {
             Self::AgentsMdSection => "internal.agents_md_section",
             Self::ResidentMemorySummarySection => "internal.resident_memory_summary_section",
             Self::ResidentMemoryRestoreSection => "internal.resident_memory_restore_section",
+            Self::SubjektivResidentContext => "internal.subjektiv_resident_context",
             Self::WorkerOrchestrationGuidanceSection => {
                 "internal.worker_orchestration_guidance_section"
             }
@@ -150,6 +152,7 @@ impl WorkerPrompt {
         WorkerPrompt::AgentsMdSection,
         WorkerPrompt::ResidentMemorySummarySection,
         WorkerPrompt::ResidentMemoryRestoreSection,
+        WorkerPrompt::SubjektivResidentContext,
         WorkerPrompt::WorkerOrchestrationGuidanceSection,
         WorkerPrompt::SubWorkerSpawnToolDescription,
     ];
@@ -515,6 +518,21 @@ impl PromptCatalog {
             minijinja::context! {
                 surface_ready => surface_ready,
                 summary => summary.unwrap_or_default(),
+            },
+        )
+    }
+    pub fn subjektiv_resident_context(
+        &self,
+        behavior_md: &str,
+        surface_availability: &str,
+        surface_body: Option<&str>,
+    ) -> Result<String, CatalogError> {
+        self.render(
+            WorkerPrompt::SubjektivResidentContext,
+            minijinja::context! {
+                behavior_md => behavior_md,
+                surface_availability => surface_availability,
+                surface_body => surface_body.unwrap_or_default(),
             },
         )
     }

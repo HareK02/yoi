@@ -35,12 +35,29 @@ pub enum CommandCompletionApply {
 /// typing inside a `@` / `#` / `/` token. Cleared whenever the trigger
 /// is invalidated (cursor moved out, whitespace landed inside the
 /// token, the sigil was deleted, or the candidate was confirmed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompletionSnapshot {
+    input_revision: u64,
+    generation: u64,
+    target: String,
+    worker_view: Option<String>,
+}
+
+struct PendingFeatureEdit {
+    invocation: protocol::FeatureInvocation,
+    request_id: String,
+    snapshot: CompletionSnapshot,
+}
+
 pub struct CompletionState {
+    pub request_id: String,
+    snapshot: CompletionSnapshot,
     pub kind: CompletionKind,
     /// Atom index of the leading sigil (`@` / `#` / `/`).
     pub prefix_start: usize,
     /// Text typed after the sigil (sigil itself excluded).
     pub prefix: String,
+    pub context: Option<protocol::CompletionContext>,
     /// Latest candidate set returned by the Worker for `(kind, prefix)`.
     /// Initially empty until `Event::Completions` lands.
     pub entries: Vec<CompletionEntry>,
@@ -301,6 +318,13 @@ pub struct App {
     /// Completion popup state, when an `@` / `#` / `/` token is in
     /// flight. `None` whenever the trigger conditions don't hold.
     pub completion: Option<CompletionState>,
+    /// Invocation declarations explicitly selected from this composer's `/`
+    /// completion lane. Only these declarations may turn editable text into a
+    /// typed FeatureInvoke chip.
+    selected_feature_invocations: HashMap<String, protocol::FeatureInvocationDescriptor>,
+    pending_feature_edit: Option<PendingFeatureEdit>,
+    completion_generation: u64,
+    completion_target: String,
     /// Dedicated main-view rewind picker state.
     pub rewind_picker: Option<RewindPickerState>,
     rewind_request_pending: bool,
@@ -335,6 +359,7 @@ pub struct App {
     /// Local submit state kept until the accepted run either completes
     /// normally or reports that the empty assistant turn was rolled back.
     pending_submit_rollback: Option<RollbackSubmitState>,
+    retry_submission: Option<Method>,
     /// Last rolled-back submit that could not be restored because the
     /// composer already contained unsent user input.
     last_rolled_back_input: Option<Vec<Segment>>,
@@ -382,6 +407,10 @@ impl App {
             cache: FileCache::new(),
             assistant_streaming: false,
             completion: None,
+            selected_feature_invocations: HashMap::new(),
+            pending_feature_edit: None,
+            completion_generation: 0,
+            completion_target: protocol::new_submission_request_id(),
             rewind_picker: None,
             rewind_request_pending: false,
             rewind_refresh_fence: false,
@@ -394,6 +423,7 @@ impl App {
             input_history: ComposerInputHistory::new(),
             input_history_store: None,
             pending_submit_rollback: None,
+            retry_submission: None,
             last_rolled_back_input: None,
         }
     }
@@ -512,6 +542,7 @@ impl App {
     /// Cycle the presentation-only transcript/task view. Input and control
     /// methods continue to target the parent Worker regardless of selection.
     pub fn cycle_worker_view(&mut self) -> bool {
+        self.invalidate_completion_generation();
         if self.internal_workers.is_empty() {
             self.selected_internal_worker_session_id = None;
             return false;
@@ -571,38 +602,97 @@ impl App {
         }
     }
 
+    fn completion_snapshot(&self) -> CompletionSnapshot {
+        CompletionSnapshot {
+            input_revision: self.input.revision(),
+            generation: self.completion_generation,
+            target: self.completion_target.clone(),
+            worker_view: self.selected_internal_worker_session_id.clone(),
+        }
+    }
+
+    pub(crate) fn set_completion_target(&mut self, target: String) {
+        if self.completion_target != target {
+            self.completion_target = target;
+            self.invalidate_completion_generation();
+            self.selected_feature_invocations.clear();
+        }
+    }
+
+    /// Authority/snapshot/target changes revoke in-flight queries and visible candidates.
+    fn invalidate_completion_generation(&mut self) {
+        self.completion_generation = self.completion_generation.wrapping_add(1);
+        self.completion = None;
+        self.pending_feature_edit = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completion_request_id(&self) -> Option<String> {
+        self.completion
+            .as_ref()
+            .map(|state| state.request_id.clone())
+            .or_else(|| {
+                self.pending_feature_edit
+                    .as_ref()
+                    .map(|edit| edit.request_id.clone())
+            })
+    }
+
     /// Re-evaluate the completion popup against the current input.
-    /// Returns a `Method::ListCompletions` to send when the
-    /// `(kind, prefix_start, prefix)` triple changed; otherwise `None`.
+    /// Returns a fresh correlated `Method::ListCompletions` when the prefix,
+    /// context, token location, or composer/authority/target snapshot changes.
+    /// An unchanged active query returns `None`.
     /// Callers should invoke this after every input mutation that could
     /// move the cursor or change atoms.
     pub fn refresh_completion(&mut self) -> Option<Method> {
+        self.pending_feature_edit = None;
         if self.is_command_mode() {
             self.completion = None;
             return None;
         }
-        match self.input.pending_completion_prefix() {
-            Some((kind, start, prefix)) => {
-                let need_query = match &self.completion {
-                    Some(c) => c.kind != kind || c.prefix_start != start || c.prefix != prefix,
-                    None => true,
-                };
-                let entries = match self.completion.take() {
-                    Some(c) if c.kind == kind && c.prefix_start == start => c.entries,
-                    _ => Vec::new(),
-                };
+        let descriptors = self
+            .selected_feature_invocations
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let pending = self
+            .input
+            .pending_feature_argument_completion(&descriptors)
+            .map(|(kind, start, prefix, context)| (kind, start, prefix, Some(context)))
+            .or_else(|| {
+                self.input
+                    .pending_completion_prefix()
+                    .map(|(kind, start, prefix)| (kind, start, prefix, None))
+            });
+        match pending {
+            Some((kind, start, prefix, context)) => {
+                let snapshot = self.completion_snapshot();
+                if self.completion.as_ref().is_some_and(|state| {
+                    state.kind == kind
+                        && state.prefix_start == start
+                        && state.prefix == prefix
+                        && state.context == context
+                        && state.snapshot == snapshot
+                }) {
+                    return None;
+                }
+                let request_id = protocol::new_submission_request_id();
                 self.completion = Some(CompletionState {
+                    request_id: request_id.clone(),
+                    snapshot,
                     kind,
                     prefix_start: start,
                     prefix: prefix.clone(),
-                    entries,
+                    context: context.clone(),
+                    entries: Vec::new(),
                     selected: 0,
                 });
-                if need_query {
-                    Some(Method::ListCompletions { kind, prefix })
-                } else {
-                    None
-                }
+                Some(Method::ListCompletions {
+                    kind,
+                    prefix,
+                    context,
+                    request_id: Some(request_id),
+                })
             }
             None => {
                 self.completion = None;
@@ -632,7 +722,7 @@ impl App {
     }
 
     pub fn cancel_completion(&mut self) {
-        self.completion = None;
+        self.invalidate_completion_generation();
     }
 
     /// Tab path: insert the popup-selected entry's value (with a
@@ -643,21 +733,132 @@ impl App {
     /// Returns the follow-up `Method::ListCompletions` to send when
     /// the new prefix differs from the old one.
     pub fn apply_completion_text(&mut self) -> Option<Method> {
+        if self
+            .completion
+            .as_ref()
+            .is_some_and(|state| state.snapshot != self.completion_snapshot())
+        {
+            self.cancel_completion();
+            return None;
+        }
         let state = self.completion.as_ref()?;
         if state.entries.is_empty() {
             return None;
         }
-        let entry = &state.entries[state.selected];
-        let text = if entry.is_dir {
-            format!("{}/", entry.value)
-        } else {
-            entry.value.clone()
+        let entry = state.entries[state.selected].clone();
+        let mut typed_start = state.prefix_start + 1;
+        let text = match state.kind {
+            CompletionKind::File => {
+                if entry.is_dir {
+                    format!("{}/", entry.value)
+                } else {
+                    entry.value.clone()
+                }
+            }
+            CompletionKind::Feature => {
+                let descriptor = entry.invocation.clone()?;
+                if descriptor.validate().is_err()
+                    || !(entry.value == descriptor.name
+                        || descriptor.aliases.contains(&entry.value))
+                {
+                    return None;
+                }
+                self.selected_feature_invocations
+                    .insert(descriptor.identity.to_string(), descriptor.clone());
+                self.input
+                    .replace_feature_name_completion(typed_start, &format!("{}(", entry.value));
+                self.input
+                    .select_feature_invocation(state.prefix_start, descriptor);
+                self.input_history.cancel_browse();
+                return self.refresh_completion();
+            }
+            CompletionKind::FeatureArgument => {
+                if self.input.can_complete_argument_name(state.prefix_start)
+                    && let Some(name) = entry.value.strip_suffix('=')
+                    && state
+                        .context
+                        .as_ref()
+                        .and_then(|context| {
+                            self.selected_feature_invocations
+                                .get(&context.invocation.to_string())
+                        })
+                        .is_some_and(|descriptor| {
+                            descriptor
+                                .arguments
+                                .iter()
+                                .any(|argument| argument.name == name)
+                        })
+                {
+                    self.input
+                        .replace_argument_completion(typed_start, &entry.value);
+                    self.input_history.cancel_browse();
+                    return self.refresh_completion();
+                }
+                if state
+                    .context
+                    .as_ref()
+                    .and_then(|context| context.argument.as_ref())
+                    .is_some()
+                {
+                    if typed_start > 0 && self.input.char_at(typed_start - 1) == Some('"') {
+                        typed_start -= 1;
+                    }
+                    let context = state.context.as_ref()?;
+                    let descriptor = self
+                        .selected_feature_invocations
+                        .get(&context.invocation.to_string())?;
+                    let argument = descriptor
+                        .arguments
+                        .iter()
+                        .find(|argument| Some(&argument.name) == context.argument.as_ref())?;
+                    match &argument.value_type {
+                        protocol::InvocationArgumentType::Integer => {
+                            entry.value.parse::<i32>().ok()?.to_string()
+                        }
+                        protocol::InvocationArgumentType::Boolean
+                            if matches!(entry.value.as_str(), "true" | "false") =>
+                        {
+                            entry.value.clone()
+                        }
+                        protocol::InvocationArgumentType::Boolean => return None,
+                        _ => protocol::quote_invocation_string(&if entry.is_dir {
+                            format!("{}/", entry.value.trim_end_matches('/'))
+                        } else {
+                            entry.value.clone()
+                        }),
+                    }
+                } else {
+                    let context = state.context.as_ref()?;
+                    let descriptor = self
+                        .selected_feature_invocations
+                        .get(&context.invocation.to_string())?;
+                    if !entry.value.ends_with('=')
+                        || !descriptor
+                            .arguments
+                            .iter()
+                            .any(|argument| argument.name == entry.value.trim_end_matches('='))
+                    {
+                        return None;
+                    }
+                    entry.value.clone()
+                }
+            }
         };
-        // `prefix_start` indexes the sigil atom; the text we want to
-        // replace lives just after it (sigil itself stays).
-        let typed_start = state.prefix_start + 1;
+        // `prefix_start` indexes the sigil atom for Feature/file names and one
+        // atom before the active replacement range for Feature arguments.
+        let text =
+            if state.kind == CompletionKind::FeatureArgument && entry.is_dir && text.ends_with('"')
+            {
+                text[..text.len() - 1].to_string()
+            } else {
+                text
+            };
         self.input_history.cancel_browse();
-        self.input.replace_with_text_at(typed_start, &text);
+        if state.kind == CompletionKind::FeatureArgument {
+            self.input.replace_argument_completion(typed_start, &text);
+        } else {
+            self.input.replace_with_text_at(typed_start, &text);
+        }
         self.refresh_completion()
     }
 
@@ -681,6 +882,14 @@ impl App {
     /// so a race-y top entry shouldn't block confirmation when the
     /// typed text matches another entry.
     pub fn chipify_completion_if_exact_match(&mut self) -> bool {
+        if self
+            .completion
+            .as_ref()
+            .is_some_and(|state| state.snapshot != self.completion_snapshot())
+        {
+            self.cancel_completion();
+            return false;
+        }
         let Some(state) = self.completion.as_ref() else {
             return false;
         };
@@ -714,6 +923,7 @@ impl App {
         self.input_history.cancel_browse();
         match kind {
             CompletionKind::File => self.input.replace_with_file_ref(start, value),
+            CompletionKind::Feature | CompletionKind::FeatureArgument => return false,
         }
         self.completion = None;
         true
@@ -729,6 +939,14 @@ impl App {
     /// for drill-in — chip-ifying a directory on Enter would strand
     /// the user with no way to inspect children.
     pub fn chipify_selected_completion_if_committable(&mut self) -> bool {
+        if self
+            .completion
+            .as_ref()
+            .is_some_and(|state| state.snapshot != self.completion_snapshot())
+        {
+            self.cancel_completion();
+            return false;
+        }
         let Some(state) = self.completion.as_ref() else {
             return false;
         };
@@ -745,12 +963,98 @@ impl App {
         self.input_history.cancel_browse();
         match kind {
             CompletionKind::File => self.input.replace_with_file_ref(start, value),
+            CompletionKind::Feature | CompletionKind::FeatureArgument => return false,
         }
         self.completion = None;
         true
     }
 
+    pub fn is_client_file_completion(&self, context: &protocol::CompletionContext) -> bool {
+        self.selected_feature_invocations
+            .get(&context.invocation.to_string())
+            .is_some_and(|descriptor| {
+                descriptor.arguments.iter().any(|argument| {
+                    Some(&argument.name) == context.argument.as_ref()
+                        && (matches!(
+                            argument.completion,
+                            protocol::InvocationCompletion::ClientFile
+                        ) || matches!(
+                            argument.value_type,
+                            protocol::InvocationArgumentType::ClientFile
+                        ))
+                })
+            })
+    }
+
+    pub fn attachment_invocations(&self) -> Vec<(String, std::path::PathBuf)> {
+        self.input
+            .submit_segments()
+            .into_iter()
+            .filter_map(|segment| {
+                let Segment::FeatureInvoke { invocation } = segment else {
+                    return None;
+                };
+                let descriptor = self
+                    .selected_feature_invocations
+                    .get(&invocation.identity.to_string())?;
+                if descriptor.client_adapter != Some(protocol::InvocationClientAdapter::Attachment)
+                {
+                    return None;
+                }
+                invocation.arguments.iter().find_map(|argument| {
+                    let schema = descriptor
+                        .arguments
+                        .iter()
+                        .find(|schema| schema.name == argument.name)?;
+                    match (&schema.value_type, &argument.value) {
+                        (
+                            protocol::InvocationArgumentType::ClientFile,
+                            protocol::InvocationValue::String(path),
+                        ) if !path.is_empty() => Some((
+                            invocation.invocation_id.clone(),
+                            std::path::PathBuf::from(path),
+                        )),
+                        _ => None,
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Alt+Enter reopens an adjacent chip using freshly discovered enabled metadata.
+    pub fn edit_adjacent_feature_invocation(&mut self) -> Option<Method> {
+        let invocation = self.input.adjacent_feature_invocation()?;
+        let prefix = invocation.name.clone();
+        let request_id = protocol::new_submission_request_id();
+        self.pending_feature_edit = Some(PendingFeatureEdit {
+            invocation,
+            request_id: request_id.clone(),
+            snapshot: self.completion_snapshot(),
+        });
+        self.completion = None;
+        Some(Method::ListCompletions {
+            request_id: Some(request_id),
+            kind: CompletionKind::Feature,
+            prefix,
+            context: None,
+        })
+    }
+
     pub fn submit_input(&mut self) -> Option<Method> {
+        if self.input.has_attachment_stages() {
+            self.push_error("Attachment is still staging or failed; wait, retry with Alt+Enter, or delete its chip.");
+            return None;
+        }
+        let confirming = self.input.has_selected_feature_invocations();
+        if let Err(error) = self.input.finalize_feature_invocations() {
+            self.push_error(format!("Invalid Feature invocation: {error}"));
+            return None;
+        }
+        if confirming || !self.attachment_invocations().is_empty() {
+            // Console stages adapters in-place; never record local paths in history or send them.
+            self.completion = None;
+            return None;
+        }
         let segments = self.input.submit_segments();
         if segments_are_blank(&segments) {
             // Empty Enter only does something meaningful when the Worker
@@ -769,15 +1073,23 @@ impl App {
     }
 
     pub fn submit_notify_input(&mut self) -> Option<Method> {
+        if self.input.has_attachment_stages() || self.input.has_selected_feature_invocations() {
+            self.push_error("Notify accepts text only; confirm or remove Feature invocations and staging chips first.");
+            return None;
+        }
         let segments = self.input.submit_segments();
         if segments_are_blank(&segments) {
             return None;
         }
-        if segments
-            .iter()
-            .any(|segment| matches!(segment, Segment::UploadedFile { .. }))
-        {
-            self.push_error("Notify accepts text only; remove attachments or queue a Submit.");
+        if segments.iter().any(|segment| {
+            matches!(
+                segment,
+                Segment::UploadedFile { .. } | Segment::FeatureInvoke { .. }
+            )
+        }) {
+            self.push_error(
+                "Notify accepts text only; remove attachments or Feature invocations or queue a Submit.",
+            );
             return None;
         }
         let message = Segment::flatten_to_text(&segments);
@@ -794,7 +1106,8 @@ impl App {
             return;
         };
         self.pending_submit_rollback = None;
-        if self.input.is_empty() {
+        if self.input.is_empty() || self.input.submit_segments() == *input {
+            self.retry_submission = Some(method.clone());
             self.input.replace_with_segments(input);
             self.completion = None;
         } else {
@@ -816,6 +1129,11 @@ impl App {
             block_start: self.blocks.len(),
             turn_before: self.turn_index,
         });
+        if let Some(method @ Method::Submit { .. }) = self.retry_submission.take() {
+            if matches!(&method, Method::Submit { input, .. } if *input == segments) {
+                return method;
+            }
+        }
         Method::Submit {
             submission_request_id: protocol::new_submission_request_id(),
             input: segments,
@@ -862,7 +1180,10 @@ impl App {
     }
 
     pub fn browse_input_history_older(&mut self) -> bool {
-        if self.input_history.entries.is_empty() {
+        if self.input.has_attachment_stages()
+            || self.input.has_selected_feature_invocations()
+            || self.input_history.entries.is_empty()
+        {
             return false;
         }
         let draft = self.input.submit_segments();
@@ -1182,7 +1503,21 @@ impl App {
         }
 
         match event {
-            Event::SubmissionAccepted { .. } | Event::NotificationAccepted { .. } => {}
+            Event::SubmissionAccepted {
+                submission_request_id,
+                ..
+            } => {
+                if matches!(&self.retry_submission, Some(Method::Submit { submission_request_id: id, .. }) if *id == submission_request_id)
+                {
+                    if let Some(Method::Submit { input, .. }) = self.retry_submission.take() {
+                        if self.input.submit_segments() == input {
+                            self.input.clear();
+                            self.completion = None;
+                        }
+                    }
+                }
+            }
+            Event::NotificationAccepted { .. } => {}
             Event::SubmissionRejected { message, .. }
             | Event::NotificationRejected { message, .. } => self.push_error(message),
             Event::PendingSubmissionsChanged { pending } => {
@@ -1577,6 +1912,7 @@ impl App {
                 self.apply_worker_state_snapshot(&state);
                 self.restore_snapshot(&session, greeting, in_flight);
                 self.replace_internal_worker_snapshots(internal_workers);
+                return self.refresh_completion();
             }
             Event::InternalWorker {
                 worker,
@@ -1606,13 +1942,94 @@ impl App {
             // Command telemetry is an operational Web Console surface. The
             // TUI continues to render the final Bash ToolResult from history.
             Event::Command { .. } => {}
-            Event::Completions { kind, entries } => {
-                // Apply only if the popup is still on the same
-                // (kind, prefix) the request was issued for; an
-                // out-of-date reply (the user typed past it) is dropped.
-                if let Some(state) = self.completion.as_mut()
-                    && state.kind == kind
+            Event::Completions {
+                kind,
+                prefix,
+                request_id,
+                context,
+                entries,
+            } => {
+                let snapshot = self.completion_snapshot();
+                if kind == CompletionKind::Feature
+                    && context.is_none()
+                    && self.pending_feature_edit.as_ref().is_some_and(|edit| {
+                        edit.invocation.name == prefix
+                            && request_id.as_ref() == Some(&edit.request_id)
+                            && edit.snapshot == snapshot
+                    })
                 {
+                    let invocation = self.pending_feature_edit.take().unwrap().invocation;
+                    if let Some(descriptor) = entries
+                        .iter()
+                        .filter_map(|entry| entry.invocation.as_ref())
+                        .find(|descriptor| {
+                            descriptor.identity == invocation.identity
+                                && descriptor.validate().is_ok()
+                        })
+                    {
+                        self.selected_feature_invocations
+                            .insert(descriptor.identity.to_string(), descriptor.clone());
+                        self.input
+                            .edit_feature_invocation(&invocation.invocation_id, descriptor.clone());
+                    } else {
+                        self.push_error("Feature invocation is unknown or disabled; its typed chip was preserved.");
+                    }
+                    return self.refresh_completion();
+                }
+                // Apply only if the popup is still on the same request context;
+                // stale argument/provider replies cannot cross invocation scope.
+                if let Some(state) = self.completion.as_mut()
+                    && request_id.as_ref() == Some(&state.request_id)
+                    && state.snapshot == snapshot
+                    && state.kind == kind
+                    && state.prefix == prefix
+                    && state.context == context
+                {
+                    let mut entries = entries;
+                    if kind == CompletionKind::Feature {
+                        let mut expanded = Vec::new();
+                        for entry in entries {
+                            if let Some(descriptor) = &entry.invocation
+                                && entry.value == descriptor.name
+                                && descriptor.validate().is_ok()
+                            {
+                                for name in std::iter::once(&descriptor.name)
+                                    .chain(descriptor.aliases.iter())
+                                    .filter(|name| name.starts_with(&prefix))
+                                {
+                                    expanded.push(CompletionEntry {
+                                        value: name.clone(),
+                                        ..entry.clone()
+                                    });
+                                }
+                            } else {
+                                expanded.push(entry);
+                            }
+                        }
+                        entries = expanded;
+                    } else if kind == CompletionKind::FeatureArgument
+                        && prefix.bytes().all(|byte| {
+                            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                        })
+                        && self.input.can_complete_argument_name(state.prefix_start)
+                        && let Some(descriptor) = context.as_ref().and_then(|context| {
+                            self.selected_feature_invocations
+                                .get(&context.invocation.to_string())
+                        })
+                    {
+                        for argument in &descriptor.arguments {
+                            let value = format!("{}=", argument.name);
+                            if argument.name.starts_with(&prefix)
+                                && !entries.iter().any(|entry| entry.value == value)
+                            {
+                                entries.push(CompletionEntry {
+                                    value,
+                                    description: argument.description.clone(),
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    }
                     state.entries = entries;
                     state.selected = 0;
                 }
@@ -1682,6 +2099,7 @@ impl App {
                 );
             }
             Event::Shutdown => {
+                self.invalidate_completion_generation();
                 self.mark_orphan_compacts_incomplete();
                 self.quit = true;
             }
@@ -1890,6 +2308,7 @@ impl App {
     }
 
     pub fn enter_command_mode(&mut self) {
+        self.invalidate_completion_generation();
         self.input_mode = CommandInputMode::Command;
         self.completion = None;
         self.command_completion_selected = None;
@@ -1897,6 +2316,7 @@ impl App {
     }
 
     pub fn exit_command_mode(&mut self) {
+        self.invalidate_completion_generation();
         self.input_mode = CommandInputMode::Composer;
         self.command_input.clear();
         self.command_completion_selected = None;
@@ -2024,6 +2444,7 @@ impl App {
     }
 
     pub fn request_rewind_picker(&mut self) -> Option<Method> {
+        self.invalidate_completion_generation();
         // Rewind is a parent Worker control surface. Bring the parent transcript
         // back into view before presenting diagnostics or the picker.
         self.selected_internal_worker_session_id = None;
@@ -2411,6 +2832,7 @@ impl App {
     }
 
     fn remove_internal_worker(&mut self, worker: InternalWorkerRef, revision: u64) {
+        self.invalidate_completion_generation();
         let session_id = worker.session_id;
         let Some(index) = self
             .internal_workers
@@ -2495,6 +2917,7 @@ impl App {
         session: &protocol::SessionSnapshot,
         greeting: Option<protocol::Greeting>,
     ) {
+        self.invalidate_completion_generation();
         self.run_error_messages.clear();
         self.turn_index = 0;
         self.blocks.clear();
@@ -2615,9 +3038,11 @@ impl App {
             session_store::SystemItem::WorkerEvent { event, .. } => {
                 self.blocks.push(Block::WorkerEvent { event });
             }
-            session_store::SystemItem::FileAttachment { body, .. }
+            session_store::SystemItem::FeatureInvocationResult { body, .. }
+            | session_store::SystemItem::FileAttachment { body, .. }
             | session_store::SystemItem::SkillActivation { body, .. }
             | session_store::SystemItem::ResidentSummaryRefresh { body, .. }
+            | session_store::SystemItem::SubjectBehaviorRefresh { body, .. }
             | session_store::SystemItem::Interrupt { body, .. } => {
                 self.task_store.apply_system_message_text(&body);
                 self.blocks.push(Block::SystemMessage { text: body });
@@ -3179,7 +3604,7 @@ mod completion_flow_tests {
         app.insert_char('@');
         let method = app.refresh_completion();
         match method {
-            Some(Method::ListCompletions { kind, prefix }) => {
+            Some(Method::ListCompletions { kind, prefix, .. }) => {
                 assert_eq!(kind, CompletionKind::File);
                 assert_eq!(prefix, "");
             }
@@ -3196,12 +3621,35 @@ mod completion_flow_tests {
         app.insert_char('s');
         let method = app.refresh_completion();
         match method {
-            Some(Method::ListCompletions { kind, prefix }) => {
+            Some(Method::ListCompletions { kind, prefix, .. }) => {
                 assert_eq!(kind, CompletionKind::File);
                 assert_eq!(prefix, "s");
             }
             other => panic!("expected ListCompletions, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stale_completion_reply_for_prior_prefix_is_ignored() {
+        let mut app = App::new("test".into());
+        for c in "@a".chars() {
+            app.insert_char(c);
+        }
+        let _ = app.refresh_completion();
+        app.insert_char('b');
+        let _ = app.refresh_completion();
+        app.handle_worker_event(Event::Completions {
+            request_id: app.completion_request_id(),
+            kind: CompletionKind::File,
+            prefix: "a".into(),
+            context: None,
+            entries: vec![CompletionEntry {
+                value: "alpha".into(),
+                ..CompletionEntry::default()
+            }],
+        });
+        assert_eq!(app.completion.as_ref().unwrap().prefix, "ab");
+        assert!(app.completion.as_ref().unwrap().entries.is_empty());
     }
 
     #[test]
@@ -3228,6 +3676,7 @@ mod completion_flow_tests {
         app.completion.as_mut().unwrap().entries = vec![CompletionEntry {
             value: "src/main.rs".into(),
             is_dir: false,
+            ..CompletionEntry::default()
         }];
         // Tab path: text inserted, popup re-triggered with new prefix
         // (still File kind since the typed range stays after `@`).
@@ -3250,6 +3699,7 @@ mod completion_flow_tests {
         app.completion.as_mut().unwrap().entries = vec![CompletionEntry {
             value: "crates".into(),
             is_dir: true,
+            ..CompletionEntry::default()
         }];
         let _ = app.apply_completion_text();
         // Typed prefix advances to `crates/` so the next query can
@@ -3269,6 +3719,7 @@ mod completion_flow_tests {
         app.completion.as_mut().unwrap().entries = vec![CompletionEntry {
             value: "src/main.rs".into(),
             is_dir: false,
+            ..CompletionEntry::default()
         }];
         assert!(app.chipify_completion_if_exact_match());
         assert!(app.completion.is_none());
@@ -3287,6 +3738,7 @@ mod completion_flow_tests {
         app.completion.as_mut().unwrap().entries = vec![CompletionEntry {
             value: "src/main.rs".into(),
             is_dir: false,
+            ..CompletionEntry::default()
         }];
         // typed = "s", expected = "src/main.rs" → no match, no chip.
         assert!(!app.chipify_completion_if_exact_match());
@@ -3307,6 +3759,7 @@ mod completion_flow_tests {
         app.completion.as_mut().unwrap().entries = vec![CompletionEntry {
             value: "crates".into(),
             is_dir: true,
+            ..CompletionEntry::default()
         }];
         assert!(app.chipify_completion_if_exact_match());
         let segs = app.input.submit_segments();
@@ -3321,6 +3774,7 @@ mod completion_flow_tests {
         app.completion.as_mut().unwrap().entries = vec![CompletionEntry {
             value: "crates".into(),
             is_dir: true,
+            ..CompletionEntry::default()
         }];
         assert!(app.chipify_completion_if_exact_match());
         let segs = app.input.submit_segments();
@@ -3342,10 +3796,12 @@ mod completion_flow_tests {
             CompletionEntry {
                 value: "crates/client".into(),
                 is_dir: true,
+                ..CompletionEntry::default()
             },
             CompletionEntry {
                 value: "crates/agen".into(),
                 is_dir: true,
+                ..CompletionEntry::default()
             },
         ];
         assert!(app.chipify_completion_if_exact_match());
@@ -3366,6 +3822,7 @@ mod completion_flow_tests {
         app.completion.as_mut().unwrap().entries = vec![CompletionEntry {
             value: "crates".into(),
             is_dir: true,
+            ..CompletionEntry::default()
         }];
         assert!(!app.chipify_selected_completion_if_committable());
         // Popup is still active so the caller can fall through to
@@ -3386,6 +3843,7 @@ mod completion_flow_tests {
         app.completion.as_mut().unwrap().entries = vec![CompletionEntry {
             value: "README.md".into(),
             is_dir: false,
+            ..CompletionEntry::default()
         }];
         assert!(app.chipify_selected_completion_if_committable());
         app.insert_char(' ');
@@ -3408,6 +3866,7 @@ mod completion_flow_tests {
         app.completion.as_mut().unwrap().entries = vec![CompletionEntry {
             value: "README.md".into(),
             is_dir: false,
+            ..CompletionEntry::default()
         }];
         assert!(app.chipify_selected_completion_if_committable());
         assert!(app.completion.is_none());
@@ -3427,6 +3886,7 @@ mod completion_flow_tests {
         app.completion.as_mut().unwrap().entries = vec![CompletionEntry {
             value: "crates/client".into(),
             is_dir: true,
+            ..CompletionEntry::default()
         }];
         assert!(!app.chipify_completion_if_exact_match());
         let segs = app.input.submit_segments();
@@ -3447,10 +3907,12 @@ mod completion_flow_tests {
             CompletionEntry {
                 value: "src/main.rs.bak".into(),
                 is_dir: false,
+                ..CompletionEntry::default()
             },
             CompletionEntry {
                 value: "src/main.rs".into(),
                 is_dir: false,
+                ..CompletionEntry::default()
             },
         ];
         // selected stays at 0 (the non-matching one) but find() should
@@ -5098,5 +5560,314 @@ fn apply_cache_update(
             cache.apply_edit(path, old, new);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod completion_correlation_tests {
+    use super::*;
+
+    fn reply(request: &Method, value: &str) -> Event {
+        let Method::ListCompletions {
+            kind,
+            prefix,
+            context,
+            request_id,
+        } = request
+        else {
+            panic!("completion query expected")
+        };
+        assert!(request_id.as_ref().is_some_and(|id| !id.is_empty()));
+        Event::Completions {
+            kind: *kind,
+            prefix: prefix.clone(),
+            context: context.clone(),
+            request_id: request_id.clone(),
+            entries: vec![CompletionEntry {
+                value: value.into(),
+                ..Default::default()
+            }],
+        }
+    }
+
+    fn request_id(request: &Method) -> &str {
+        let Method::ListCompletions {
+            request_id: Some(id),
+            ..
+        } = request
+        else {
+            panic!("correlated completion query expected")
+        };
+        id
+    }
+
+    fn authority_snapshot(scope: &str) -> Event {
+        Event::Snapshot {
+            session: protocol::SessionSnapshot {
+                entries: Vec::new(),
+                pending_submissions: Default::default(),
+            },
+            greeting: protocol::Greeting {
+                worker_name: "test".into(),
+                cwd: "/tmp".into(),
+                provider: "test".into(),
+                model: "test".into(),
+                reasoning: None,
+                scope_summary: scope.into(),
+                tools: vec![],
+                context_window: 0,
+                context_tokens: 0,
+                context_usage: None,
+            },
+            state: protocol::WorkerStateSnapshot::from(WorkerStatus::Idle),
+            in_flight: Default::default(),
+            internal_workers: vec![],
+        }
+    }
+
+    #[test]
+    fn identical_file_prefix_aba_rejects_old_nonce_and_accepts_latest_query() {
+        let mut app = App::new("test".into());
+        app.input.insert_str("@same");
+        let first = app.refresh_completion().unwrap();
+        assert!(
+            app.refresh_completion().is_none(),
+            "an unchanged request is not reissued"
+        );
+        app.insert_char('x');
+        let second = app.refresh_completion().unwrap();
+        app.delete_char_before();
+        let third = app.refresh_completion().unwrap();
+        assert_ne!(request_id(&first), request_id(&second));
+        assert_ne!(request_id(&first), request_id(&third));
+        app.handle_worker_event(reply(&first, "old"));
+        assert!(app.completion.as_ref().unwrap().entries.is_empty());
+        app.handle_worker_event(reply(&third, "current"));
+        app.handle_worker_event(reply(&first, "late old"));
+        assert_eq!(app.completion.as_ref().unwrap().entries[0].value, "current");
+    }
+
+    #[test]
+    fn identical_argument_context_aba_rejects_reply_before_and_after_refresh() {
+        let mut app = App::new("test".into());
+        crate::invocation_tests::select(&mut app, crate::invocation_tests::descriptor(), "run");
+        app.input.insert_str("\"資料/a");
+        let first = app.refresh_completion().unwrap();
+        app.input.insert_char('x');
+        app.input.delete_before();
+        // Prefix, context, token location, and cursor are identical; semantic revision is not.
+        app.handle_worker_event(reply(&first, "old"));
+        assert!(app.completion.as_ref().unwrap().entries.is_empty());
+        let second = app.refresh_completion().unwrap();
+        assert_ne!(request_id(&first), request_id(&second));
+        app.handle_worker_event(reply(&first, "old"));
+        assert!(app.completion.as_ref().unwrap().entries.is_empty());
+        app.handle_worker_event(reply(&second, "資料/current"));
+        assert_eq!(
+            app.completion.as_ref().unwrap().entries[0].value,
+            "資料/current"
+        );
+    }
+
+    #[test]
+    fn identical_cursor_aba_and_same_prefix_at_another_location_are_fenced() {
+        let mut app = App::new("test".into());
+        app.input.insert_str("@same @same");
+        let last_location = app.refresh_completion().unwrap();
+        app.input.move_home();
+        for _ in 0..5 {
+            app.input.move_right();
+        }
+        let first_location = app.refresh_completion().unwrap();
+        app.handle_worker_event(reply(&last_location, "wrong location"));
+        assert!(app.completion.as_ref().unwrap().entries.is_empty());
+        app.input.move_end();
+        let returned_location = app.refresh_completion().unwrap();
+        app.handle_worker_event(reply(&last_location, "old same location"));
+        app.handle_worker_event(reply(&first_location, "wrong location"));
+        assert!(app.completion.as_ref().unwrap().entries.is_empty());
+        assert_ne!(request_id(&last_location), request_id(&returned_location));
+        app.input.move_left();
+        app.input.move_right();
+        app.handle_worker_event(reply(&returned_location, "cursor ABA before refresh"));
+        assert!(app.completion.as_ref().unwrap().entries.is_empty());
+        let current = app.refresh_completion().unwrap();
+        app.handle_worker_event(reply(&current, "current"));
+        assert_eq!(app.completion.as_ref().unwrap().entries[0].value, "current");
+    }
+
+    #[test]
+    fn visible_candidates_cannot_be_inserted_after_unrefreshed_aba_edit() {
+        let mut app = App::new("test".into());
+        app.input.insert_str("@same");
+        let request = app.refresh_completion().unwrap();
+        app.handle_worker_event(reply(&request, "candidate"));
+        app.input.move_left();
+        app.input.move_right();
+        assert!(app.apply_completion_text().is_none());
+        assert_eq!(app.input.plain_text(), "@same");
+        assert!(app.completion.is_none());
+    }
+
+    #[test]
+    fn cancelled_and_reopened_identical_feature_discovery_gets_new_nonce() {
+        let mut app = App::new("test".into());
+        app.input.insert_str("/");
+        let first = app.refresh_completion().unwrap();
+        app.cancel_completion();
+        let current = app.refresh_completion().unwrap();
+        assert_ne!(request_id(&first), request_id(&current));
+        app.handle_worker_event(reply(&first, "old feature"));
+        assert!(app.completion.as_ref().unwrap().entries.is_empty());
+        app.handle_worker_event(reply(&current, "current feature"));
+        assert_eq!(
+            app.completion.as_ref().unwrap().entries[0].value,
+            "current feature"
+        );
+    }
+
+    #[test]
+    fn permission_snapshot_generation_aba_revokes_queries_even_when_scope_returns_to_original() {
+        let mut app = App::new("test".into());
+        app.handle_worker_event(authority_snapshot("Writable: /tmp"));
+        crate::invocation_tests::select(&mut app, crate::invocation_tests::descriptor(), "run");
+        app.input.insert_str("\"資料/a");
+        let first = app.refresh_completion().unwrap();
+        let denied = app
+            .handle_worker_event(authority_snapshot("Readable: /tmp"))
+            .unwrap();
+        let current = app
+            .handle_worker_event(authority_snapshot("Writable: /tmp"))
+            .unwrap();
+        assert_ne!(request_id(&first), request_id(&denied));
+        assert_ne!(request_id(&first), request_id(&current));
+        app.handle_worker_event(reply(&first, "old permission generation"));
+        app.handle_worker_event(reply(&denied, "intermediate generation"));
+        assert!(app.completion.as_ref().unwrap().entries.is_empty());
+        app.handle_worker_event(reply(&current, "資料/current"));
+        assert_eq!(
+            app.completion.as_ref().unwrap().entries[0].value,
+            "資料/current"
+        );
+    }
+
+    #[test]
+    fn actual_worker_target_switch_aba_revokes_identical_queries() {
+        let mut app = App::new("test".into());
+        app.set_completion_target("workspace/runtime/worker-a".into());
+        app.input.insert_str("@same");
+        let first = app.refresh_completion().unwrap();
+        app.set_completion_target("workspace/runtime/worker-b".into());
+        let other = app.refresh_completion().unwrap();
+        app.set_completion_target("workspace/runtime/worker-a".into());
+        let current = app.refresh_completion().unwrap();
+        assert_ne!(request_id(&first), request_id(&current));
+        app.handle_worker_event(reply(&first, "worker-a old"));
+        app.handle_worker_event(reply(&other, "worker-b"));
+        assert!(app.completion.as_ref().unwrap().entries.is_empty());
+        app.handle_worker_event(reply(&current, "worker-a current"));
+        assert_eq!(
+            app.completion.as_ref().unwrap().entries[0].value,
+            "worker-a current"
+        );
+    }
+
+    #[test]
+    fn presentation_worker_view_switch_aba_revokes_queries_without_redirecting_parent_controls() {
+        let mut app = App::new("test".into());
+        app.handle_worker_event(Event::InternalWorker {
+            worker: InternalWorkerRef {
+                session_id: "child".into(),
+                name: "child".into(),
+                parent_session_id: Some("parent".into()),
+                kind: protocol::InternalWorkerKind::SubWorker,
+            },
+            revision: 1,
+            event: Box::new(Event::WorkerState {
+                snapshot: protocol::WorkerStateSnapshot::from(WorkerStatus::Idle),
+            }),
+        });
+        app.input.insert_str("@same");
+        let first = app.refresh_completion().unwrap();
+        assert!(app.cycle_worker_view());
+        let child_view = app.refresh_completion().unwrap();
+        assert!(app.cycle_worker_view());
+        let current = app.refresh_completion().unwrap();
+        assert!(app.selected_internal_worker_session_id.is_none());
+        app.handle_worker_event(reply(&first, "old parent"));
+        app.handle_worker_event(reply(&child_view, "old child view"));
+        assert!(app.completion.as_ref().unwrap().entries.is_empty());
+        app.handle_worker_event(reply(&current, "current parent"));
+        assert_eq!(
+            app.completion.as_ref().unwrap().entries[0].value,
+            "current parent"
+        );
+    }
+
+    #[test]
+    fn feature_chip_reedit_is_nonce_and_snapshot_correlated() {
+        let descriptor = crate::invocation_tests::descriptor();
+        let invocation = protocol::parse_feature_invocation("/run(x)", 0, &descriptor, "stable-id")
+            .unwrap()
+            .invocation;
+        let mut app = App::new("test".into());
+        app.input
+            .replace_with_segments(&[Segment::FeatureInvoke { invocation }]);
+        let first = app.edit_adjacent_feature_invocation().unwrap();
+        app.input.move_home();
+        app.input.move_end();
+        let mut event = reply(&first, "run");
+        if let Event::Completions { entries, .. } = &mut event {
+            entries[0].invocation = Some(descriptor.clone());
+        }
+        app.handle_worker_event(event);
+        assert!(matches!(
+            app.input.submit_segments().as_slice(),
+            [Segment::FeatureInvoke { .. }]
+        ));
+        let current = app.edit_adjacent_feature_invocation().unwrap();
+        assert_ne!(request_id(&first), request_id(&current));
+        let mut old = reply(&first, "run");
+        if let Event::Completions { entries, .. } = &mut old {
+            entries[0].invocation = Some(descriptor.clone());
+        }
+        app.handle_worker_event(old);
+        assert!(matches!(
+            app.input.submit_segments().as_slice(),
+            [Segment::FeatureInvoke { .. }]
+        ));
+        let mut event = reply(&current, "run");
+        if let Event::Completions { entries, .. } = &mut event {
+            entries[0].invocation = Some(descriptor);
+        }
+        app.handle_worker_event(event);
+        assert_eq!(app.input.plain_text(), "/run(path=\"x\")");
+        app.delete_char_before(); // Reopen the quoted argument prefix.
+        let arguments = app.refresh_completion().unwrap();
+        assert_ne!(request_id(&current), request_id(&arguments));
+    }
+
+    #[test]
+    fn uncorrelated_legacy_reply_and_wrong_context_are_never_applied_to_correlated_queries() {
+        let mut app = App::new("test".into());
+        app.input.insert_str("@same");
+        let request = app.refresh_completion().unwrap();
+        let mut missing = reply(&request, "missing nonce");
+        if let Event::Completions { request_id, .. } = &mut missing {
+            *request_id = None;
+        }
+        app.handle_worker_event(missing);
+        assert!(app.completion.as_ref().unwrap().entries.is_empty());
+        let mut mismatched = reply(&request, "wrong context");
+        if let Event::Completions { context, .. } = &mut mismatched {
+            *context = Some(protocol::CompletionContext {
+                invocation: protocol::FeatureInvocationIdentity("plugin:other/run".into()),
+                argument: None,
+            });
+        }
+        app.handle_worker_event(mismatched);
+        assert!(app.completion.as_ref().unwrap().entries.is_empty());
+        app.handle_worker_event(reply(&request, "current"));
+        assert_eq!(app.completion.as_ref().unwrap().entries[0].value, "current");
     }
 }

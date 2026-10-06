@@ -65,8 +65,9 @@ pub struct WorkerManifest {
     /// permission layer is disabled and tool calls run as before.
     #[serde(default)]
     pub permissions: Option<ToolPermissionConfig>,
-    /// Explicit built-in feature/tool-surface enablement. Omitted feature flags
-    /// resolve disabled so Profile authors choose the exposed built-in surfaces.
+    /// Built-in feature/tool-surface enablement. Omitted tool features resolve
+    /// disabled; the read-only WIP workdir catalog defaults enabled without
+    /// granting authority or registering normal Tools.
     #[serde(default)]
     pub feature: FeatureConfig,
     /// Explicit external Model Context Protocol provider configuration. This
@@ -131,12 +132,48 @@ pub struct FeatureConfig {
     pub objective: FeatureFlagConfig,
     #[serde(default)]
     pub manage_workdir: FeatureFlagConfig,
+    /// Read-only Repository/Workdir/attachment reference discovery. Defaults
+    /// enabled, is installed only in WIP mode, and exposes no normal Tools.
+    /// Independent of `manage_workdir`; permissions and host authority remain
+    /// separate, and discovering a reference grants no attachment or file access.
+    #[serde(
+        default = "default_workdir_catalog",
+        deserialize_with = "deserialize_workdir_catalog"
+    )]
+    pub workdir_catalog: FeatureFlagConfig,
+    /// Opt-in WIP-only logical Workspace configuration feature. This flag is
+    /// not an access grant; Backend-owned Worker grants remain authoritative.
+    #[serde(default, deserialize_with = "deserialize_workspace_config")]
+    pub workspace_config: FeatureFlagConfig,
     #[serde(default)]
     pub ticket: TicketFeatureConfig,
     #[serde(default)]
     pub merge_request: MergeRequestFeatureConfig,
     #[serde(default)]
     pub orchestration: FeatureFlagConfig,
+}
+
+fn default_workdir_catalog() -> FeatureFlagConfig {
+    FeatureFlagConfig {
+        enabled: defaults::WORKDIR_CATALOG_ENABLED,
+    }
+}
+
+fn deserialize_workdir_catalog<'de, D>(deserializer: D) -> Result<FeatureFlagConfig, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let flag = config::FeatureFlagConfigPartial::deserialize(deserializer)?;
+    Ok(FeatureFlagConfig {
+        enabled: flag.enabled.unwrap_or(defaults::WORKDIR_CATALOG_ENABLED),
+    })
+}
+
+fn deserialize_workspace_config<'de, D>(deserializer: D) -> Result<FeatureFlagConfig, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(config::WorkspaceConfigFeatureConfigPartial::deserialize(deserializer)?.into())
 }
 
 impl Default for FeatureConfig {
@@ -153,6 +190,8 @@ impl Default for FeatureConfig {
             workspace_worker_discovery: FeatureFlagConfig::disabled(),
             objective: FeatureFlagConfig::disabled(),
             manage_workdir: FeatureFlagConfig::disabled(),
+            workdir_catalog: default_workdir_catalog(),
+            workspace_config: FeatureFlagConfig::disabled(),
             ticket: TicketFeatureConfig::default(),
             merge_request: MergeRequestFeatureConfig::default(),
             orchestration: FeatureFlagConfig::disabled(),
@@ -363,6 +402,8 @@ impl ResolvedMemoryFeatureConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SubjektivFeatureProfileConfig {
     pub enabled: bool,
+    /// Explicit consolidation tool policy; never grants Job or subject authority.
+    pub consolidation_tools: bool,
     pub extraction: MemoryExtractionProfileConfig,
 }
 
@@ -370,6 +411,7 @@ impl Default for SubjektivFeatureProfileConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            consolidation_tools: false,
             extraction: MemoryExtractionProfileConfig::default(),
         }
     }

@@ -251,6 +251,27 @@ pub fn selector_for_workspace_candidate(
         .then(|| worker_runtime::catalog::ProfileSelector::Named(profile.to_string()))
 }
 
+/// Resolve a Host-owned launch selector against the complete existing registry.
+/// Browser candidates remain a narrower UI policy; this does not widen that surface.
+pub(crate) fn selector_for_registered_profile(
+    projection: &ProfileConfigProjection,
+    profile: &str,
+) -> Option<worker_runtime::catalog::ProfileSelector> {
+    let catalog = builtin_profile_catalog_snapshot();
+    let builtin = if profile.starts_with("builtin:") {
+        profile.to_string()
+    } else {
+        format!("builtin:{profile}")
+    };
+    if catalog.entrypoints.contains_key(&builtin) {
+        return Some(worker_runtime::catalog::ProfileSelector::Builtin(builtin));
+    }
+    projection
+        .entries
+        .contains_key(profile)
+        .then(|| worker_runtime::catalog::ProfileSelector::Named(profile.into()))
+}
+
 fn validate_prompt_projection_matches_state(
     workspace_id: &str,
     state: &WorkspaceConfigState,
@@ -401,8 +422,12 @@ pub fn build_virtual_profile_config_bundle_with_prompt_projection(
 ) -> Result<Option<ConfigBundle>> {
     validate_prompt_projection_matches_state(workspace_id, state, prompt_projection)?;
     let prompt_catalog = prompt_projection.catalog().clone();
-    let profile_selector = selector_for_builtin_candidate(selector)
-        .unwrap_or_else(|| worker_runtime::catalog::ProfileSelector::Named(selector.to_string()));
+    let profile_selector =
+        selector_for_registered_profile(projection, selector).ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "Profile `{selector}` is not a registered launch selector"
+            ))
+        })?;
     let archive = match projection.entries.get(selector) {
         Some(entry) => Some(build_virtual_profile_archive(
             selector,

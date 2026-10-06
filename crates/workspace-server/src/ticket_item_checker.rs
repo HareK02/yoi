@@ -129,6 +129,8 @@ pub fn request(
         })?,
         instruction,
         profile: "builtin:backend-job".to_string(),
+        grants: Default::default(),
+        serialization_key: None,
         source_worker: Some(source_worker.clone()),
         notification_target: Some(source_worker),
         limits: BackendJobLimits {

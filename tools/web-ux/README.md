@@ -217,6 +217,50 @@ It captures 1440px, 768px, and 390px; `browser-tests/console_pending_shell_test.
 monospace inheritance, truncation, and retained-session cancellation gating. Live revision-fenced
 cancellation and state transitions are covered by Console component tests. No real Worker is used.
 
+## Console live Feature invocation fixture
+
+`scenarios/console-live-light.json` and `console-live-dark.json` capture the **production Console**
+with a synthetic live Worker at 1440px, 768px, and 390px. The fixture provides metadata for `review`
+(enum, integer, boolean, and Worker-file arguments) and `attach` (the generic attachment client
+adapter), a real workspace protocol WebSocket, request-ID-preserving completion responses, and
+synthetic upload staging. It never executes a Worker or Feature invocation. No fixture CSS, shell,
+or editor overrides are used.
+
+Build production sources first, optionally from an isolated copy under `target/web-ux`, then select
+the build explicitly. From `tools/web-ux`:
+
+```sh
+export WEB_UX_BUILD_ROOT='<absolute-path-to-production-build>'
+deno task web-ux capture --scenario scenarios/console-live-light.json --output ../../target/web-ux --run-id console-live-light
+deno task web-ux capture --scenario scenarios/console-live-dark.json --output ../../target/web-ux --run-id console-live-dark
+deno test --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys browser-tests/console_live_shell_test.ts browser-tests/console_live_admission_shell_test.ts
+```
+
+`WEB_UX_LIFECYCLE_OUTPUT` optionally places browser interaction screenshots and JSON evidence at an
+explicit artifact path. Tests consume an existing build; they do not rebuild or mutate Web sources.
+The lifecycle test covers argument completion, editing/removing/undoing typed chips, native picker
+cancellation, generic-adapter staging, literal unselected slash prose, typed Submit values, and
+abandoned-file DELETE. Admission tests verify rejection preserves drafts and staged files,
+transport send alone cannot clear the draft, authoritative acceptance transfers ownership, and
+failed/in-flight-cancelled uploads cannot Submit. A retry/late-success matrix verifies stable upload
+IDs, deleted reservation non-resurrection, and abandoned resource cleanup at accepted draft boundaries.
+Intentional upload HTTP503 browser errors are recorded separately from unexpected failures.
+The Chromium picker helper awaits interception acknowledgement before real gestures (not a timeout
+extension or a replacement input); diagnostics retain user activation, input connectivity, and DOM
+lifecycle evidence.
+
+The localhost-only fixture control endpoint sets deterministic `submit: accept | reject | hold`
+and `upload: normal | fail | hold` modes; `accept_pending: true` releases held admission responses and
+`release_uploads: true` delivers real successful responses for held uploads.
+`/fixture-state` exposes actual received protocol methods, HTTP requests, emitted admission events,
+upload attempts (including retry IDs), completed uploads, and DELETE IDs for assertions. Only synthetic data is recorded.
+
+`console-live-baseline-light.json` and `console-live-baseline-dark.json` use the same production
+shell/data and capture initial plus unselected literal slash text. They support a pre-Feature HEAD
+build, where no implicit Feature completion or typed chip exists. Initial and `slash-plain` capture
+keys are shared with the current scenarios for like-for-like comparison; Feature-specific states
+are explicitly new behavior, not fabricated baseline controls.
+
 ## Adding a scenario
 
 1. Name the concrete user task and expected data state; do not write “looks correct”.

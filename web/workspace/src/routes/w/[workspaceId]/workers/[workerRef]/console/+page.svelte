@@ -11,6 +11,8 @@
     import ComposerInput from "#lib/workspace/console/ComposerInput.svelte";
     import type { ComposerDraftSnapshot } from "#lib/workspace/console/composer-draft.ts";
     import {
+        ComposerAdmissions,
+        type ComposerAdmission,
         canDeliverComposerDraft,
         sendComposerDelivery,
         type ComposerDelivery,
@@ -38,6 +40,7 @@
         type ConsoleViewScroll,
     } from "#lib/workspace/console/model.ts";
     import type {
+        CompletionContext,
         Event as ProtocolEvent,
         Method as ProtocolMethod,
         PendingSubmissionsSnapshot,
@@ -115,10 +118,15 @@
         containsTarget(target: EventTarget | null): boolean;
         cursor(): number;
         replaceRange(from: number, to: number, content: string): void;
-        clear(): void;
+        insertSegment(segment: Segment, cleanup?: boolean): boolean;
+        reserveUpload(fileName: string): number | null;
+        completeUpload(key: number, segment: Segment): boolean;
+        cancelUpload(key: number): void;
+        clear(acceptedTypedResources?: boolean): void;
         restoreSegments(
             segments: readonly Segment[],
             preserveExactText?: boolean,
+            ownStagedUploads?: boolean,
         ): void;
     };
 
@@ -138,9 +146,35 @@
     let draft = $state<ComposerDraftSnapshot>(EMPTY_DRAFT);
     let attachments = $state<ComposerAttachment[]>([]);
     let nextAttachmentId = 1;
+    const stagedAttachmentPaths = new Map<string, string>();
+    const uploadReservations = new Map<number, number>();
     let fileInput: HTMLInputElement | null = null;
     let isDraggingFiles = $state(false);
+    const admissions = new ComposerAdmissions();
+    let admission = $state.raw<ComposerAdmission | null>(null);
     let sending = $state(false);
+
+    function syncAdmission() {
+        admission = admissions.get(activeComposerTargetKey);
+        sending = admission !== null && admission.status !== "rejected";
+    }
+
+    function admissionDisconnected(targetKey = activeComposerTargetKey) {
+        admissions.disconnected(targetKey);
+        syncAdmission();
+    }
+
+    function retryAdmission() {
+        const retry = admissions.retry(activeComposerTargetKey);
+        if (!retry || protocolState !== "open") return;
+        syncAdmission();
+        try {
+            sendProtocolMethod(retry.method);
+        } catch (error) {
+            admissionDisconnected();
+            reportComposerError(error instanceof Error ? error.message : String(error));
+        }
+    }
     let rewindTargets = $state<RewindTarget[]>([]);
     let rewindHeadEntries = $state(0);
     let protocolState = $state<"connecting" | "open" | "closed" | "error">(
@@ -158,9 +192,30 @@
         submissions: [],
     });
     let pendingSubmissionItems = $derived(pendingSubmissions.submissions ?? []);
-    const fileCompletions = new FileCompletions((prefix) => sendProtocolMethod({
-        method: "list_completions", params: { kind: "file", prefix },
+    const fileCompletions = new FileCompletions((prefix, request_id) => sendProtocolMethod({
+        method: "list_completions", params: { kind: "file", prefix, request_id },
     }));
+    const featureCompletions = new FileCompletions((prefix, request_id) => sendProtocolMethod({
+        method: "list_completions", params: { kind: "feature", prefix, request_id },
+    }));
+    const featureArgumentCompletions = new Map<string, FileCompletions>();
+
+    function completionContextKey(context: CompletionContext): string {
+        return JSON.stringify([context.invocation, context.argument ?? null]);
+    }
+
+    function featureArgumentCompletionLane(context: CompletionContext): FileCompletions {
+        const key = completionContextKey(context);
+        let lane = featureArgumentCompletions.get(key);
+        if (!lane) {
+            lane = new FileCompletions((prefix, request_id) => sendProtocolMethod({
+                method: "list_completions",
+                params: { kind: "feature_argument", prefix, context, request_id },
+            }));
+            featureArgumentCompletions.set(key, lane);
+        }
+        return lane;
+    }
     let streamDiagnostics = $state<Diagnostic[]>([]);
     let workerDetailsOpen = $state(false);
     let taskPaneOpen = $state(false);
@@ -260,7 +315,9 @@
     const workerPaused = $derived(workerState === "paused");
     const composerEditable = $derived(protocolState === "open" && !sending);
     const draftHasText = $derived(draft.content.trim().length > 0);
-    const draftHasAttachments = $derived(attachments.length > 0);
+    const draftHasAttachments = $derived(
+        attachments.length > 0 || draft.segments.some((segment) => segment.kind === "uploaded_file"),
+    );
     const canSubmitDraft = $derived(
         canDeliverComposerDraft({
             delivery: "submit",
@@ -712,6 +769,17 @@
         initialSnapshot?: { token: number; source: ConsoleDisplaySource },
     ) {
         handleProtocolCommandEvent(payload);
+        if (payload.event === "rewind_applied") {
+            if (draft.segments.length === 0 && attachments.length === 0) {
+                composerInputElement?.restoreSegments(payload.data.input);
+            } else {
+                pushWorkspaceAlert(
+                    "info",
+                    "Rewind restored Session history but kept the non-empty Composer unchanged.",
+                    { id: controlAlertId, title: "Rewind" },
+                );
+            }
+        }
         if (payload.event === "snapshot") {
             pendingSubmissions = payload.data.session.pending_submissions;
         } else if (payload.event === "segment_rotated") {
@@ -928,6 +996,7 @@
     function discardAllAttachments(): void {
         const discarded = attachments;
         attachments = [];
+        uploadReservations.clear();
         for (const attachment of discarded) {
             attachment.request?.abort();
             if (attachment.reference) {
@@ -944,31 +1013,50 @@
         if (nextKey === activeComposerTargetKey) return;
         if (activeComposerTargetKey) discardAllAttachments();
         if (composerInputElement) {
-            composerDrafts.set(
-                activeComposerTargetKey,
-                cachedComposerDraft(composerInputElement.snapshot()),
-            );
+            const cached = cachedComposerDraft(draft);
+            const pending = admissions.get(activeComposerTargetKey);
+            if (!pending || pending.status === "rejected") {
+                cached.segments = cached.segments.filter((segment) => segment.kind !== "uploaded_file" && segment.kind !== "unknown");
+            }
+            composerDrafts.set(activeComposerTargetKey, cached);
         }
         activeComposerTargetKey = nextKey;
-        const restored = composerDrafts.get(nextKey) ?? {
-            segments: [],
-            preserveExactText: false,
-        };
+        syncAdmission();
+        const pending = admissions.get(nextKey);
+        const restored = pending && pending.status !== "rejected"
+            ? cachedComposerDraft(pending.snapshot)
+            : composerDrafts.get(nextKey) ?? {
+                segments: [],
+                preserveExactText: false,
+            };
         void tick().then(() => {
             if (activeComposerTargetKey !== nextKey) return;
             composerInputElement?.restoreSegments(
                 restored.segments,
                 restored.preserveExactText,
+                true,
             );
         });
     }
 
+    function composerSnapshotOrReport(): ComposerDraftSnapshot | null {
+        try {
+            return composerInputElement?.snapshot() ?? draft;
+        } catch (error) {
+            reportComposerError(error instanceof Error ? error.message : String(error));
+            return null;
+        }
+    }
+
     function handleComposerCommand() {
-        void submitDraft(composerInputElement?.snapshot() ?? draft);
+        const value = composerSnapshotOrReport();
+        if (value) void submitDraft(value);
     }
 
     function handleComposerSubmit() {
-        if ((composerInputElement?.snapshot() ?? draft).document.trimStart().startsWith(":")) {
+        const value = composerSnapshotOrReport();
+        if (!value) return;
+        if (value.document.trimStart().startsWith(":")) {
             handleComposerCommand();
             return;
         }
@@ -976,15 +1064,17 @@
             sendWorkerControl("cancel");
             return;
         }
-        void submitDraft(composerInputElement?.snapshot() ?? draft);
+        void submitDraft(value);
     }
 
     function handleQueueSubmit() {
-        void submitDraft(composerInputElement?.snapshot() ?? draft, "queue");
+        const value = composerSnapshotOrReport();
+        if (value) void submitDraft(value, "queue");
     }
 
     function handleNotifySubmit() {
-        void submitDraft(composerInputElement?.snapshot() ?? draft, "notify");
+        const value = composerSnapshotOrReport();
+        if (value) void submitDraft(value, "notify");
     }
 
     function attachmentPath(): string {
@@ -999,6 +1089,43 @@
         attachments = attachments.map((attachment) =>
             attachment.id === id ? { ...attachment, ...update } : attachment,
         );
+    }
+
+    function cancelComposerUpload(reservation: number): void {
+        const attachment = attachments.find((candidate) =>
+            uploadReservations.get(candidate.id) === reservation);
+        if (!attachment) return;
+        // The editor already cancelled/tombstoned its reservation. Do not call
+        // cancelUpload here: this may run inside a CodeMirror update listener.
+        uploadReservations.delete(attachment.id);
+        attachments = attachments.filter((candidate) => candidate.id !== attachment.id);
+        attachment.request?.abort();
+    }
+
+    function completeAttachmentUpload(
+        attachment: ComposerAttachment,
+        reference: NonNullable<ComposerAttachment["reference"]>,
+    ): void {
+        if (!attachments.some((candidate) => candidate.id === attachment.id) ||
+            !composerInputElement || !composerEditable || attachment.uploadPath !== attachmentPath()) {
+            const reservation = uploadReservations.get(attachment.id);
+            uploadReservations.delete(attachment.id);
+            if (reservation !== undefined) composerInputElement?.cancelUpload(reservation);
+            attachments = attachments.filter((candidate) => candidate.id !== attachment.id);
+            void fetch(
+                `${attachment.uploadPath}/attachments/${encodeURIComponent(reference.artifact_id)}`,
+                { method: "DELETE" },
+            ).catch(() => undefined);
+            return;
+        }
+        attachments = attachments.filter((candidate) => candidate.id !== attachment.id);
+        stagedAttachmentPaths.set(reference.artifact_id, attachment.uploadPath);
+        const segment: Segment = { kind: "uploaded_file", file: reference };
+        const reservation = uploadReservations.get(attachment.id);
+        uploadReservations.delete(attachment.id);
+        if (reservation === undefined || !composerInputElement.completeUpload(reservation, segment)) {
+            void releaseComposerAtom(segment);
+        }
     }
 
     function startAttachmentUpload(attachment: ComposerAttachment): void {
@@ -1020,14 +1147,7 @@
             attachment.uploadId,
             {
             progress: (progress) => updateAttachment(attachment.id, { progress }),
-            complete: (reference) =>
-                updateAttachment(attachment.id, {
-                    state: "uploaded",
-                    progress: 1,
-                    reference,
-                    error: null,
-                    request: null,
-                }),
+            complete: (reference) => completeAttachmentUpload(attachment, reference),
             failed: (message) =>
                 updateAttachment(attachment.id, {
                     state: "failed",
@@ -1044,7 +1164,8 @@
 
     function addAttachmentFiles(files: Iterable<File>): void {
         if (!composerEditable) return;
-        const available = Math.max(0, MAX_FILES_PER_SUBMISSION - attachments.length);
+        const stagedFiles = draft.segments.filter((segment) => segment.kind === "uploaded_file").length;
+        const available = Math.max(0, MAX_FILES_PER_SUBMISSION - attachments.length - stagedFiles);
         for (const file of Array.from(files).slice(0, available)) {
             const attachment: ComposerAttachment = {
                 id: nextAttachmentId++,
@@ -1057,13 +1178,30 @@
                 error: null,
                 request: null,
             };
+            const reservation = composerInputElement?.reserveUpload(file.name);
+            if (reservation === null || reservation === undefined) continue;
+            uploadReservations.set(attachment.id, reservation);
             attachments = [...attachments, attachment];
             startAttachmentUpload(attachment);
         }
     }
 
+    async function releaseComposerAtom(segment: Segment): Promise<void> {
+        if (segment.kind !== "uploaded_file" || admissions.protects(segment)) return;
+        const path = stagedAttachmentPaths.get(segment.file.artifact_id);
+        if (!path) return; // Restored references are Session-owned, not client staging.
+        stagedAttachmentPaths.delete(segment.file.artifact_id);
+        await fetch(
+            `${path}/attachments/${encodeURIComponent(segment.file.artifact_id)}`,
+            { method: "DELETE" },
+        ).catch(() => undefined);
+    }
+
     async function removeAttachment(attachment: ComposerAttachment): Promise<void> {
         attachment.request?.abort();
+        const reservation = uploadReservations.get(attachment.id);
+        uploadReservations.delete(attachment.id);
+        if (reservation !== undefined) composerInputElement?.cancelUpload(reservation);
         attachments = attachments.filter((candidate) => candidate.id !== attachment.id);
         if (attachment.reference) {
             await fetch(`${attachment.uploadPath}/attachments/${encodeURIComponent(attachment.reference.artifact_id)}`, {
@@ -1106,8 +1244,13 @@
         value: ComposerDraftSnapshot,
         delivery: ComposerDelivery = "submit",
     ) {
-        if (delivery === "notify" && attachments.length > 0) {
-            reportComposerError("Notify accepts text only; remove attachments or queue a Submit.");
+        if (
+            delivery === "notify" &&
+            (attachments.length > 0 || value.segments.some((segment) =>
+                segment.kind !== "text" && segment.kind !== "paste"
+            ))
+        ) {
+            reportComposerError("Notify accepts text only; remove attachments or Feature invocations or queue a Submit.");
             return;
         }
         const incompleteAttachment = attachments.find((attachment) =>
@@ -1119,12 +1262,8 @@
                 : incompleteAttachment.error ?? "Retry or remove the failed attachment.");
             return;
         }
-        const attachmentSegments: Segment[] = attachments.map((attachment) => ({
-            kind: "uploaded_file",
-            file: attachment.reference!,
-        }));
         const command = buildComposerSegmentsRequest(
-            [...value.segments, ...attachmentSegments],
+            value.segments,
             {
             preserveExactText: value.textPastes.length > 0,
         });
@@ -1143,7 +1282,8 @@
             protocolOpen: protocolState === "open",
             sending,
             hasText: value.content.trim().length > 0,
-            hasAttachments: attachments.length > 0,
+            hasAttachments: attachments.length > 0 ||
+                value.segments.some((segment) => segment.kind === "uploaded_file"),
         };
         // Commands are controls, not idle-only chat submissions. Keep the
         // removed header controls available while the Worker is busy too.
@@ -1166,22 +1306,28 @@
         }
         sending = true;
         try {
-            const method = composerRequestToProtocolMethod(request);
+            let method = composerRequestToProtocolMethod(request);
+            if (method.method === "submit" || method.method === "notify") {
+                // Store before send: even a synchronous acknowledgement must correlate.
+                const pending = admissions.begin(activeComposerTargetKey, method, value, delivery);
+                method = pending.method;
+                syncAdmission();
+            }
             if (isCommand) {
                 sendProtocolMethod(method);
             } else if (!sendComposerDelivery(deliveryState, method, sendProtocolMethod)) {
                 return;
             }
-            composerInputElement?.recordHistory(value);
-            composerInputElement?.clear();
-            attachments = [];
-            if (method.method === "submit" && delivery === "submit") {
-                liveWorkerState = "running";
+            if (method.method !== "submit" && method.method !== "notify") {
+                composerInputElement?.recordHistory(value);
+                composerInputElement?.clear();
             }
+            // Submit/Notify retain the editor, history and upload leases until ack.
         } catch (error) {
+            admissionDisconnected();
             reportComposerError(error instanceof Error ? error.message : String(error));
         } finally {
-            sending = false;
+            syncAdmission();
         }
     }
 
@@ -1229,6 +1375,7 @@
                 return (await response.json()) as WorkerSessionObservation;
             })
             .then((observation) => {
+                if (controller.signal.aborted || token !== reloadToken) return;
                 const currentTarget = consoleTarget;
                 if (!currentTarget) return;
                 const currentIdentity: WorkerSessionRequestIdentity = {
@@ -1362,6 +1509,9 @@
                                 );
                             }
                             fileCompletions.reset();
+                            featureCompletions.reset();
+                            for (const lane of featureArgumentCompletions.values()) lane.reset();
+                            featureArgumentCompletions.clear();
                             protocolState = "open";
                         } else if (
                             frame.frame === "event" &&
@@ -1416,7 +1566,7 @@
         return () => {
             if (protocolSubscription === subscription) {
                 protocolSubscription = null;
-                fileCompletions.close();
+                rejectPendingCompletion(new Error("Worker completion connection closed."), `${target.workspaceId}:${target.runtimeId}:${target.workerId}`);
             }
             subscription.close();
         };
@@ -1430,8 +1580,42 @@
     }
 
     function handleProtocolCommandEvent(event: ProtocolEvent) {
+        const acknowledgement = admissions.acknowledge(activeComposerTargetKey, event);
+        if (acknowledgement) {
+            const { record, accepted, message } = acknowledgement;
+            if (accepted) {
+                // Only an authoritative acceptance transfers staging ownership.
+                for (const segment of record.snapshot.segments) {
+                    if (segment.kind === "uploaded_file") stagedAttachmentPaths.delete(segment.file.artifact_id);
+                }
+                composerInputElement?.recordHistory(record.snapshot);
+                // A late acceptance of a previously rejected attempt must not erase
+                // edits made while the recovered draft was unlocked.
+                if (JSON.stringify(draft.segments) === JSON.stringify(record.snapshot.segments)) {
+                    composerInputElement?.clear(true);
+                    attachments = [];
+                }
+                if (event.event === "submission_accepted" && event.data.disposition === "started") {
+                    liveWorkerState = "running";
+                }
+            } else {
+                // The editor has stayed frozen with the exact typed input, Undo state
+                // and staged resources. Unlock it; unchanged retries reuse the IDs.
+                reportComposerError(message ?? "Worker rejected the input.");
+            }
+            syncAdmission();
+            return;
+        }
         if (event.event === "completions") {
-            if (event.data.kind === "file") fileCompletions.receive(event.data.entries);
+            if (event.data.kind === "file") {
+                fileCompletions.receive(event.data.entries, event.data.prefix, event.data.request_id);
+            } else if (event.data.kind === "feature") {
+                featureCompletions.receive(event.data.entries, event.data.prefix, event.data.request_id);
+            } else if (event.data.context) {
+                featureArgumentCompletions
+                    .get(completionContextKey(event.data.context))
+                    ?.receive(event.data.entries, event.data.prefix, event.data.request_id);
+            }
             return;
         }
         if (event.event === "rewind_targets") {
@@ -1448,7 +1632,10 @@
         }
         if (event.event === "error") {
             const error = new Error(event.data.message);
-            if (fileCompletions.pending) {
+            if (
+                fileCompletions.pending || featureCompletions.pending ||
+                [...featureArgumentCompletions.values()].some((lane) => lane.pending)
+            ) {
                 rejectPendingCompletion(error);
             }
             streamDiagnostics = [
@@ -1462,8 +1649,11 @@
         }
     }
 
-    function rejectPendingCompletion(error: Error) {
+    function rejectPendingCompletion(error: Error, targetKey = activeComposerTargetKey) {
+        admissionDisconnected(targetKey);
         fileCompletions.close(error);
+        featureCompletions.close(error);
+        for (const lane of featureArgumentCompletions.values()) lane.close(error);
     }
 
     function mergeDiagnostics(...groups: Diagnostic[][]): Diagnostic[] {
@@ -1633,7 +1823,13 @@
     });
 
     $effect(() => {
-        return () => discardAllAttachments();
+        return () => {
+            // Observation frames must not project or start history reads after
+            // this Console is gone. In-flight history must not enqueue a refresh.
+            cancelObservationFlush();
+            pendingHistoryRefreshes.clear();
+            discardAllAttachments();
+        };
     });
 
     $effect(() => {
@@ -1960,6 +2156,14 @@
                 onkeydown={handleComposerKeydown}
                 completionScope={activeComposerTargetKey}
                 resolveFileCompletions={(prefix, signal) => fileCompletions.request(prefix, signal)}
+                resolveFeatureCompletions={(prefix, signal) => featureCompletions.request(prefix, signal)}
+                resolveFeatureArgumentCompletions={(context, prefix, signal) =>
+                    featureArgumentCompletionLane(context).request(prefix, signal)}
+                onremoveatom={(segment) => void releaseComposerAtom(segment)}
+                oncancelupload={cancelComposerUpload}
+                onclientadapter={(descriptor) => {
+                    if (descriptor.client_adapter === "attachment") fileInput?.click();
+                }}
                 oncommand={handleComposerCommand}
                 onsubmit={handleComposerSubmit}
                 onpasteimages={addPastedImages}
@@ -1989,6 +2193,20 @@
             {/if}
             <div class="composer-input-footer">
                 <div class="composer-footer-slot">
+                    {#if admission && admission.status !== "rejected"}
+                        <button
+                            class="composer-retry-button"
+                            type="button"
+                            aria-label="Retry admission"
+                            title="Resend the same input and request ID; admission is not yet confirmed"
+                            disabled={protocolState !== "open"}
+                            onclick={retryAdmission}
+                        >
+                            <svg class="composer-retry-icon" aria-hidden="true" viewBox="0 0 24 24">
+                                <path d="M20 7V12H15M20 12A8 8 0 1 0 18 17" />
+                            </svg>
+                        </button>
+                    {/if}
                     <button
                         class="composer-attach-button"
                         type="button"
@@ -2583,6 +2801,7 @@
 
     .composer-attachment button,
     .composer-attach-button,
+    .composer-retry-button,
     .composer-queue-button,
     .composer-notify-button {
         border: 0;
@@ -2594,6 +2813,7 @@
     }
 
     .composer-attach-button,
+    .composer-retry-button,
     .composer-queue-button,
     .composer-notify-button {
         display: inline-grid;
@@ -2606,6 +2826,7 @@
     }
 
     .composer-attach-button:hover:not(:disabled),
+    .composer-retry-button:hover:not(:disabled),
     .composer-queue-button:hover:not(:disabled),
     .composer-notify-button:hover:not(:disabled) {
         background: var(--bg-subtle);
@@ -2613,6 +2834,7 @@
     }
 
     .composer-attach-button:disabled,
+    .composer-retry-button:disabled,
     .composer-queue-button:disabled,
     .composer-notify-button:disabled {
         cursor: not-allowed;
@@ -2660,6 +2882,7 @@
     }
 
     .composer-attach-icon,
+    .composer-retry-icon,
     .composer-queue-icon,
     .composer-notify-icon,
     .composer-send-icon {

@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use crate::error::ToolsError;
 use crate::tracker::Tracker;
-use workdir::{ReadRequest, WorkdirPath, WorkdirSessionHandle, WorkdirSessionRouter};
+use workdir::{WorkdirPath, WorkdirSessionHandle, WorkdirSessionRouter};
 
 const DESCRIPTION: &str = "Read a text file from a Workdir attachment selected by its Worker-local alias. \
 Supports offset/limit for large files. Returns line-numbered output (1-based). \
@@ -26,12 +26,8 @@ pub(crate) struct ReadParams {
     pub target_workdir: Option<String>,
     /// Workdir-relative path, or an absolute path covered by readable scope.
     pub file_path: String,
-    /// 0-based line offset from the start. Defaults to 0.
-    #[serde(default)]
-    pub offset: Option<usize>,
-    /// Maximum number of lines to return. Defaults to 2000.
-    #[serde(default)]
-    pub limit: Option<usize>,
+    #[serde(flatten)]
+    pub read: fs_operation::text::LineReadArgs,
 }
 
 pub(crate) struct ReadTool {
@@ -46,8 +42,7 @@ impl Tool for ReadTool {
         input_json: &str,
         _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
-        let params: ReadParams = serde_json::from_str(input_json)
-            .map_err(|e| ToolError::InvalidArgument(format!("invalid Read input: {e}")))?;
+        let params: ReadParams = crate::error::decode_file_input(input_json, "Read")?;
         let selected = crate::routing::resolve_session(
             &self.router,
             params.target_workdir.as_deref(),
@@ -56,58 +51,65 @@ impl Tool for ReadTool {
         let tracker = self
             .tracker
             .scoped_attachment(&selected.alias, selected.generation);
-        let offset = params.offset.unwrap_or(0);
-        let limit = params.limit.unwrap_or(DEFAULT_LIMIT).max(1);
-
-        let path = WorkdirPath::new_scoped(&params.file_path).map_err(ToolsError::from)?;
-        tracing::debug!(path = %path, offset, limit, "Read");
-
-        let result = selected
-            .session
-            .read(ReadRequest {
-                path: path.clone(),
-                offset,
-                limit,
-                max_bytes: PROVIDER_BYTE_LIMIT,
-            })
-            .await
-            .map_err(ToolsError::from)?;
-        tracker.record_workdir_hash(&path, result.content_hash);
-
-        let text = String::from_utf8_lossy(&result.bytes).into_owned();
-        let rendered = render_provider_read(
-            &text,
-            result.start_line,
-            result.total_lines,
-            result.truncated,
-        );
-
-        let summary = if rendered.truncated {
-            format!(
-                "Read {} line(s) [{}..{}] of {} from {}",
-                rendered.line_count,
-                offset + 1,
-                offset + rendered.line_count,
-                rendered.total_lines,
-                path
-            )
-        } else {
-            format!("Read {} line(s) from {}", rendered.line_count, path)
-        };
-
-        Ok(ToolOutput {
-            summary,
-            content: Some(rendered.body),
-            attachments: Vec::new(),
-        })
+        Ok(execute_read(
+            crate::file_target::FileTarget {
+                session: selected.session,
+                path: WorkdirPath::new_scoped(&params.file_path).map_err(ToolsError::from)?,
+                validator: None,
+            },
+            tracker,
+            params,
+        )
+        .await?
+        .output)
     }
 }
 
-struct Rendered {
-    body: String,
-    line_count: usize,
-    total_lines: usize,
-    truncated: bool,
+pub(crate) async fn execute_read(
+    target: crate::file_target::FileTarget,
+    tracker: Tracker,
+    params: ReadParams,
+) -> Result<crate::checkout::CheckoutToolOutput, ToolError> {
+    let (offset, limit) = params.read.range(DEFAULT_LIMIT);
+    let path = &target.path;
+    tracing::debug!(path = %path, offset, limit, "Read");
+    let (result, validator) = target.read(offset, limit, PROVIDER_BYTE_LIMIT).await?;
+    tracker.record_workdir_observation(path, result.content_hash, result.total_lines);
+    // Source/response bounds were enforced by the streaming provider. Lossy
+    // UTF-8 conversion is the existing Tool presentation contract; rendering
+    // below independently bounds its possible byte expansion.
+    let text = fs_operation::text::read(
+        String::from_utf8_lossy(&result.bytes).into_owned(),
+        Default::default(),
+    )
+    .map_err(crate::error::text_error)?;
+    let rendered = render_provider_read(
+        &text.content,
+        result.start_line,
+        result.total_lines,
+        result.truncated,
+    );
+    let summary = if rendered.truncated {
+        format!(
+            "Read {} line(s) [{}..{}] of {} from {}",
+            rendered.line_count,
+            offset.saturating_add(1),
+            offset.saturating_add(rendered.line_count),
+            rendered.total_lines,
+            path
+        )
+    } else {
+        format!("Read {} line(s) from {}", rendered.line_count, path)
+    };
+    Ok(crate::checkout::CheckoutToolOutput {
+        output: ToolOutput {
+            summary,
+            content: Some(rendered.body),
+            attachments: Vec::new(),
+        },
+        paths: Vec::new(),
+        validator,
+    })
 }
 
 fn render_provider_read(
@@ -115,45 +117,14 @@ fn render_provider_read(
     start_line: usize,
     total_lines: usize,
     truncated: bool,
-) -> Rendered {
-    use std::fmt::Write as _;
-    let lines = text.lines().collect::<Vec<_>>();
-    let mut body = String::with_capacity(text.len().saturating_add(lines.len() * 8));
-    for (index, line) in lines.iter().enumerate() {
-        let _ = writeln!(&mut body, "{:>6}\t{}", start_line + index + 1, line);
-    }
-    Rendered {
-        body,
-        line_count: lines.len(),
+) -> fs_operation::text::Rendered {
+    fs_operation::text::render_numbered(
+        text,
+        start_line,
         total_lines,
-        truncated: start_line > 0 || truncated,
-    }
-}
-
-/// Format a slice of lines from `text` with `cat -n` style 1-based line
-/// numbers. Pure function — no I/O, no history touching.
-#[cfg(test)]
-fn render_numbered(text: &str, offset: usize, limit: usize) -> Rendered {
-    let all_lines: Vec<&str> = text.lines().collect();
-    let total_lines = all_lines.len();
-    let start = offset.min(total_lines);
-    let end = start.saturating_add(limit).min(total_lines);
-    let slice = &all_lines[start..end];
-    let line_count = slice.len();
-
-    use std::fmt::Write as _;
-    let mut body = String::with_capacity(text.len().saturating_add(line_count * 8));
-    for (i, line) in slice.iter().enumerate() {
-        let lineno = start + i + 1;
-        let _ = writeln!(&mut body, "{:>6}\t{}", lineno, line);
-    }
-
-    Rendered {
-        body,
-        line_count,
-        total_lines,
-        truncated: start > 0 || end < total_lines,
-    }
+        truncated,
+        PROVIDER_BYTE_LIMIT,
+    )
 }
 
 /// Factory for the `Read` tool bound to one compatibility session.
@@ -193,6 +164,32 @@ mod tests {
             dir.path().to_path_buf(),
         ));
         (dir, session, Tracker::new())
+    }
+
+    #[test]
+    fn read_numbering_and_unicode_expansion_keep_rendered_output_bounded() {
+        for text in [
+            "\n".repeat(PROVIDER_BYTE_LIMIT),
+            "界".repeat(PROVIDER_BYTE_LIMIT),
+            "\u{1}".repeat(PROVIDER_BYTE_LIMIT),
+        ] {
+            let rendered = render_provider_read(&text, 0, text.lines().count(), false);
+            assert!(rendered.body.len() <= PROVIDER_BYTE_LIMIT);
+            assert!(serde_json::to_vec(&rendered.body).unwrap().len() < 2 * 1024 * 1024);
+        }
+        let rendered = render_provider_read(
+            &"\n".repeat(PROVIDER_BYTE_LIMIT),
+            0,
+            PROVIDER_BYTE_LIMIT,
+            false,
+        );
+        assert!(rendered.truncated);
+        assert!(rendered.line_count < PROVIDER_BYTE_LIMIT);
+        assert!(
+            rendered
+                .body
+                .contains("truncated at rendered output byte limit")
+        );
     }
 
     #[tokio::test]

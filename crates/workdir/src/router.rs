@@ -248,6 +248,29 @@ impl WorkdirSession for RoutedWorkdirSession {
         self.state.session.scope_rules_overlap(request).await
     }
 
+    async fn checkout_search(
+        &self,
+        request: crate::CheckoutSearchRequest,
+    ) -> Result<crate::CheckoutSearchResult, WorkdirError> {
+        let _active = self.state.enter()?;
+        self.state.session.checkout_search(request).await
+    }
+
+    async fn checkout_observe(
+        &self,
+        path: crate::WorkdirPath,
+    ) -> Result<crate::CheckoutObservation, WorkdirError> {
+        let _active = self.state.enter()?;
+        self.state.session.checkout_observe(path).await
+    }
+    async fn checkout_execute(
+        &self,
+        request: crate::CheckoutRequest,
+    ) -> Result<crate::CheckoutResult, WorkdirError> {
+        let _active = self.state.enter()?;
+        self.state.session.checkout_execute(request).await
+    }
+
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {
         let _active = self.state.enter()?;
         self.state.session.stat(request).await
@@ -648,6 +671,42 @@ mod tests {
             manifest::SharedScope::new(Scope::writable(dir.path()).unwrap()),
             WorkdirSessionCapabilities::ALL,
         ))
+    }
+
+    #[tokio::test]
+    async fn checkout_routes_use_active_operation_detach_fence_and_old_handles_stay_closed() {
+        let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join("a"), "contents").unwrap();
+        let router = WorkdirSessionRouter::new();
+        let alias = WorkdirAttachmentAlias::new("checkout").unwrap();
+        router.attach(alias.clone(), session("wd", &root)).unwrap();
+        let old = router.resolve(Some("checkout")).unwrap().session;
+        old.checkout_observe(crate::WorkdirPath::new("a").unwrap())
+            .await
+            .unwrap();
+        let state = router.sessions.read().unwrap().get(&alias).unwrap().clone();
+        let active = state.enter().unwrap();
+        assert!(router.begin_detach(&alias).await.is_err());
+        drop(active);
+        router.detach(&alias).await.unwrap();
+        assert!(
+            old.checkout_observe(crate::WorkdirPath::new("a").unwrap())
+                .await
+                .is_err()
+        );
+        router.attach(alias, session("wd-new", &root)).unwrap();
+        router
+            .resolve(Some("checkout"))
+            .unwrap()
+            .session
+            .checkout_observe(crate::WorkdirPath::new("a").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            old.checkout_observe(crate::WorkdirPath::new("a").unwrap())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

@@ -10,6 +10,7 @@ pub use server_api::{
     WorkerLaunchProfileCandidate as BackendWorkerLaunchProfileCandidate,
     WorkerLaunchRuntimeOption as BackendWorkerLaunchRuntimeOption,
     WorkerOperationState as BackendWorkerOperationState,
+    WorkerRestoreRequest as BackendWorkerRestoreRequest,
     WorkerRestoreResponse as BackendWorkerRestoreResponse,
     WorkerRestoreResult as BackendWorkerRestoreResult,
     WorkerRestoreState as BackendWorkerRestoreState, WorkerSummary as BackendWorkerSummary,
@@ -259,6 +260,15 @@ impl fmt::Display for BackendRuntimeClientError {
     }
 }
 
+impl BackendRuntimeClientError {
+    /// A stale intent is not a rejected Restore operation and must not be retried
+    /// with a silently refreshed token.
+    pub fn is_restore_observation_conflict(&self) -> bool {
+        matches!(self, Self::ContractApi(server_api::client_support::ClientError::Public { status, error })
+            if *status == reqwest::StatusCode::CONFLICT && error.error == "restore_observation_conflict")
+    }
+}
+
 impl std::error::Error for BackendRuntimeClientError {}
 
 impl From<server_api::ServerApiClientError> for BackendRuntimeClientError {
@@ -502,6 +512,7 @@ pub async fn list_backend_stopped_workers(
 
 pub async fn restore_backend_worker(
     target: &BackendRuntimeTarget,
+    request: BackendWorkerRestoreRequest,
 ) -> Result<BackendWorkerRestoreResponse, BackendRuntimeClientError> {
     validate_target(target)?;
     let api = BackendApiClient::from_stored_token(&target.base_url)?;
@@ -514,6 +525,7 @@ pub async fn restore_backend_worker(
                 ticket_id: None,
                 assignment_operation_id: None,
             },
+            request,
         )
         .await
         .map_err(Into::into)

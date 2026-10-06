@@ -162,6 +162,19 @@ fn run_read_with_limits(
         }
     }
 
+    #[cfg(unix)]
+    if crate::identity_validator(&metadata).map_err(|e| map_io(&logical, e))?
+        != crate::identity_validator(
+            &reader
+                .get_ref()
+                .metadata()
+                .map_err(|e| map_io(&logical, e))?,
+        )
+        .map_err(|e| map_io(&logical, e))?
+    {
+        return Err(FsError::Conflict(logical.as_str().to_string()));
+    }
+
     let total_lines =
         current_line.saturating_add(usize::from(last_byte.is_some_and(|byte| byte != b'\n')));
     if request.offset > total_lines && request.offset != 0 {
@@ -176,15 +189,7 @@ fn run_read_with_limits(
         .min(total_lines);
     let byte_truncated = selected_bytes_seen > response_limit;
     if byte_truncated {
-        let mut byte_end = response_limit.min(selected.len());
-        while byte_end > 0 {
-            match std::str::from_utf8(&selected[..byte_end]) {
-                Ok(_) => break,
-                Err(error) if error.error_len().is_none() => byte_end -= 1,
-                Err(_) => break,
-            }
-        }
-        selected.truncate(byte_end);
+        selected.truncate(crate::text::bounded_utf8_len(&selected, response_limit));
     }
     Ok(ReadResult {
         path: logical,
@@ -402,55 +407,33 @@ pub fn run_edit(
     let content = String::from_utf8(bytes).map_err(|_| {
         FsError::InvalidArgument(format!("{} is not valid UTF-8", logical.as_str()))
     })?;
-    let occurrences = content.matches(&request.old_string).count();
-    if occurrences == 0 {
-        return Err(FsError::InvalidArgument(
-            "old_string was not found".to_string(),
-        ));
-    }
-    if !request.replace_all && occurrences != 1 {
-        return Err(FsError::InvalidArgument(format!(
-            "old_string matched {occurrences} times; set replace_all=true or provide a unique string"
-        )));
-    }
-    let replacement_count = if request.replace_all { occurrences } else { 1 };
-    if let Some(limit) = access.max_edit_replacements()
-        && replacement_count > limit
-    {
-        return Err(FsError::InvalidArgument(format!(
-            "{} exceeds provider Edit replacement limit {limit}",
-            logical.as_str()
-        )));
-    }
-    let removed_bytes = request
-        .old_string
-        .len()
-        .checked_mul(replacement_count)
-        .ok_or_else(|| FsError::InvalidArgument("edited content size overflowed".to_string()))?;
-    let added_bytes = request
-        .new_string
-        .len()
-        .checked_mul(replacement_count)
-        .ok_or_else(|| FsError::InvalidArgument("edited content size overflowed".to_string()))?;
-    let edited_len = content
-        .len()
-        .checked_sub(removed_bytes)
-        .and_then(|size| size.checked_add(added_bytes))
-        .ok_or_else(|| FsError::InvalidArgument("edited content size overflowed".to_string()))?;
-    enforce_write_bound(&logical, edited_len, access)?;
-    let edited = if request.replace_all {
-        content.replace(&request.old_string, &request.new_string)
-    } else {
-        content.replacen(&request.old_string, &request.new_string, 1)
+    let args = crate::text::EditArgs {
+        old_string: request.old_string,
+        new_string: request.new_string,
+        replace_all: request.replace_all,
     };
-    debug_assert_eq!(edited.len(), edited_len);
+    let edited = crate::text::edit(
+        &content,
+        &args,
+        crate::text::TextLimits {
+            max_input_bytes: access.max_write_bytes(),
+            max_output_bytes: access.max_write_bytes(),
+            max_replacements: access.max_edit_replacements(),
+        },
+    )
+    .map_err(|error| map_text_error(&logical, error))?;
     access
-        .atomic_write_file(&path, &target, edited.as_bytes(), AtomicWriteMode::Replace)
+        .atomic_write_file(
+            &path,
+            &target,
+            edited.content.as_bytes(),
+            AtomicWriteMode::Replace,
+        )
         .map_err(|error| map_io(&logical, error))?;
     Ok(EditResult {
-        replacements: if request.replace_all { occurrences } else { 1 },
-        bytes_written: edited.len(),
-        content_hash: hash_bytes(edited.as_bytes()),
+        replacements: edited.replacements,
+        bytes_written: edited.bytes_written,
+        content_hash: hash_bytes(edited.content.as_bytes()),
     })
 }
 
@@ -473,6 +456,14 @@ pub fn run_list(
     if !metadata.is_dir() {
         return Err(FsError::NotDirectory(PathBuf::from(logical.as_str())));
     }
+    if !access.can_enumerate_directory(&logical_base, &path) {
+        return Ok(ListResult {
+            entries: Vec::new(),
+            total_entries: 0,
+            total_bytes: 0,
+            truncated: false,
+        });
+    }
     let mut entries = Vec::new();
     let mut retained_path_bytes = 0_usize;
     let mut provider_truncated = false;
@@ -490,6 +481,9 @@ pub fn run_list(
             )));
         }
         let entry = entry.map_err(|error| map_io(&logical, error))?;
+        if entry.file_name().to_str().is_none() {
+            continue;
+        }
         let logical_absolute = logical_base.join(entry.file_name());
         let resolved = match access.resolve_access_path(&logical_absolute) {
             Ok(resolved) => resolved,
@@ -513,7 +507,12 @@ pub fn run_list(
         let relative = logical_absolute.strip_prefix(root).map_err(|_| {
             FsError::InvalidArgument("provider returned a path outside its root".to_string())
         })?;
-        let result_path = FsPath::new(relative.to_string_lossy())?;
+        let Some(relative) = relative.to_str() else {
+            continue;
+        };
+        let Ok(result_path) = FsPath::new(relative) else {
+            continue;
+        };
         let retained = result_path.as_str().len().saturating_add(64);
         if retained_path_bytes.saturating_add(retained) > crate::MAX_RESULT_PATH_BYTES {
             provider_truncated = true;
@@ -550,15 +549,37 @@ fn enforce_write_bound(
     bytes: usize,
     access: &dyn FsAccessPolicy,
 ) -> Result<(), FsError> {
-    if let Some(limit) = access.max_write_bytes()
-        && bytes > limit
-    {
-        return Err(FsError::InvalidArgument(format!(
-            "{} exceeds provider write limit {limit}",
+    crate::text::check_output_bytes(
+        bytes,
+        crate::text::TextLimits {
+            max_output_bytes: access.max_write_bytes(),
+            ..Default::default()
+        },
+    )
+    .map_err(|error| map_text_error(logical, error))
+}
+
+fn map_text_error(logical: &FsPath, error: crate::text::TextError) -> FsError {
+    use crate::text::TextError;
+
+    let message = match error {
+        TextError::InputTooLarge { limit, .. } | TextError::OutputTooLarge { limit, .. } => {
+            format!("{} exceeds provider write limit {limit}", logical.as_str())
+        }
+        TextError::ReplacementLimitExceeded { limit, .. } => format!(
+            "{} exceeds provider Edit replacement limit {limit}",
             logical.as_str()
-        )));
-    }
-    Ok(())
+        ),
+        TextError::Decode(error) => format!("invalid arguments: {error}"),
+        TextError::EmptyOldString => "old_string must not be empty".to_string(),
+        TextError::IdenticalStrings => "old_string and new_string are identical".to_string(),
+        TextError::NotFound => "old_string was not found".to_string(),
+        TextError::MultipleMatches { occurrences } => format!(
+            "old_string matched {occurrences} times; set replace_all=true or provide a unique string"
+        ),
+        TextError::Overflow => "edited content size overflowed".to_string(),
+    };
+    FsError::InvalidArgument(message)
 }
 
 fn read_mutation_preimage(
@@ -610,9 +631,21 @@ fn require_access(
     write: bool,
     allow_symlink_directory: bool,
 ) -> Result<PathBuf, FsError> {
-    let resolved = access
-        .resolve_access_path(path)
-        .map_err(|error| map_io(logical, error))?;
+    let resolved = access.resolve_access_path(path).map_err(|error| {
+        // A dangling direct link has no resolved identity, but still needs the
+        // existing sanitized repair diagnostic rather than an ordinary missing-file error.
+        if error.kind() == std::io::ErrorKind::NotFound
+            && direct_symlink(path).is_some_and(|info| !info.target_exists)
+        {
+            FsError::BrokenSymlink {
+                path: PathBuf::from(logical.as_str()),
+                link: PathBuf::from(logical.as_str()),
+                target: PathBuf::from("<provider-internal target>"),
+            }
+        } else {
+            map_io(logical, error)
+        }
+    })?;
     let symlink = (resolved != path).then(|| direct_symlink(path)).flatten();
     if let Some(info) = symlink.as_ref()
         && !info.target_exists
@@ -771,5 +804,191 @@ mod bounded_read_tests {
         assert_eq!(result.bytes, b"alpha");
         assert_eq!(result.total_lines, 3);
         assert!(result.truncated);
+    }
+}
+
+#[cfg(test)]
+mod text_policy_tests {
+    use super::*;
+
+    struct Access {
+        root: PathBuf,
+        bytes: Option<usize>,
+        replacements: Option<usize>,
+    }
+
+    impl FsAccessPolicy for Access {
+        fn is_readable(&self, path: &Path) -> bool {
+            path.starts_with(&self.root)
+        }
+
+        fn is_writable(&self, path: &Path) -> bool {
+            path.starts_with(&self.root)
+        }
+
+        fn max_write_bytes(&self) -> Option<usize> {
+            self.bytes
+        }
+
+        fn max_edit_replacements(&self) -> Option<usize> {
+            self.replacements
+        }
+    }
+
+    #[test]
+    fn edit_policy_errors_preserve_the_preimage_and_provider_messages() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = "a a";
+        fs::write(root.join("text.txt"), source).unwrap();
+        let access = Access {
+            root: root.clone(),
+            bytes: Some(4),
+            replacements: Some(1),
+        };
+        for (old, new, all, expected_message) in [
+            ("", "x", false, "old_string must not be empty"),
+            ("a", "a", false, "old_string and new_string are identical"),
+            (
+                "missing",
+                "x",
+                false,
+                "text.txt exceeds provider write limit 4",
+            ),
+            ("b", "x", false, "old_string was not found"),
+            (
+                "a",
+                "x",
+                false,
+                "old_string matched 2 times; set replace_all=true or provide a unique string",
+            ),
+            (
+                "a",
+                "x",
+                true,
+                "text.txt exceeds provider Edit replacement limit 1",
+            ),
+            (
+                "a a",
+                "😀x",
+                false,
+                "text.txt exceeds provider write limit 4",
+            ),
+        ] {
+            let error = run_edit(
+                &root,
+                EditRequest {
+                    path: FsPath::new("text.txt").unwrap(),
+                    old_string: old.into(),
+                    new_string: new.into(),
+                    replace_all: all,
+                    expected_hash: hash_bytes(source.as_bytes()),
+                },
+                &access,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, FsError::InvalidArgument(message) if message == expected_message)
+            );
+            assert_eq!(fs::read_to_string(root.join("text.txt")).unwrap(), source);
+        }
+        let access = Access {
+            replacements: None,
+            ..access
+        };
+        let error = run_edit(
+            &root,
+            EditRequest {
+                path: FsPath::new("text.txt").unwrap(),
+                old_string: "a".into(),
+                new_string: "xxx".into(),
+                replace_all: true,
+                expected_hash: hash_bytes(source.as_bytes()),
+            },
+            &access,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, FsError::InvalidArgument(message) if message == "text.txt exceeds provider write limit 4")
+        );
+        assert_eq!(fs::read_to_string(root.join("text.txt")).unwrap(), source);
+    }
+
+    #[test]
+    fn edit_keeps_cas_before_content_policy_and_hashes_the_core_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::write(root.join("text.txt"), "é😀").unwrap();
+        let access = Access {
+            root: root.clone(),
+            bytes: None,
+            replacements: None,
+        };
+        let error = run_edit(
+            &root,
+            EditRequest {
+                path: FsPath::new("text.txt").unwrap(),
+                old_string: String::new(),
+                new_string: "x".into(),
+                replace_all: false,
+                expected_hash: [0; 32],
+            },
+            &access,
+        )
+        .unwrap_err();
+        assert!(matches!(error, FsError::Conflict(_)));
+        let result = run_edit(
+            &root,
+            EditRequest {
+                path: FsPath::new("text.txt").unwrap(),
+                old_string: "é".into(),
+                new_string: "界".into(),
+                replace_all: false,
+                expected_hash: hash_bytes("é😀".as_bytes()),
+            },
+            &access,
+        )
+        .unwrap();
+        assert_eq!(result.replacements, 1);
+        assert_eq!(result.bytes_written, 7);
+        assert_eq!(result.content_hash, hash_bytes("界😀".as_bytes()));
+        assert_eq!(fs::read_to_string(root.join("text.txt")).unwrap(), "界😀");
+    }
+
+    #[test]
+    fn local_write_remains_binary_safe_and_maps_shared_bounds() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let access = Access {
+            root: root.clone(),
+            bytes: Some(2),
+            replacements: None,
+        };
+        let result = run_write(
+            &root,
+            WriteRequest {
+                path: FsPath::new("binary").unwrap(),
+                content: vec![0xff, 0],
+                expected_hash: None,
+            },
+            &access,
+        )
+        .unwrap();
+        assert_eq!(result.bytes_written, 2);
+        assert_eq!(fs::read(root.join("binary")).unwrap(), vec![0xff, 0]);
+        let error = run_write(
+            &root,
+            WriteRequest {
+                path: FsPath::new("large").unwrap(),
+                content: vec![0xff, 0, 1],
+                expected_hash: None,
+            },
+            &access,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, FsError::InvalidArgument(message) if message == "large exceeds provider write limit 2")
+        );
+        assert!(!root.join("large").exists());
     }
 }

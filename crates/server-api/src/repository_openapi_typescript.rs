@@ -872,14 +872,14 @@ fn validate_runtime_operations(
             "/api/runtimes/{runtime_id}/workers/{worker_id}/restore",
             "post",
             "runtime_worker_restore_alias",
-            None,
+            Some("WorkerRestoreRequest"),
             &[("200", "WorkerRestoreResponse")],
         ),
         runtime_operation(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/restore",
             "post",
             "runtime_worker_restore",
-            None,
+            Some("WorkerRestoreRequest"),
             &[("200", "WorkerRestoreResponse")],
         ),
         runtime_operation(
@@ -1227,8 +1227,16 @@ fn json_content_schema<'a>(
 }
 
 fn schema_reference<'a>(value: &'a Value, context: &str) -> Result<&'a str, GenerationError> {
-    const ALLOWED_REFERENCE_SIBLINGS: &[&str] =
-        &["$ref", "$comment", "deprecated", "description", "title"];
+    // `default` is a JSON Schema annotation, not a constraint or a replacement
+    // for the referenced type. Schemars emits it for defaulted enum fields.
+    const ALLOWED_REFERENCE_SIBLINGS: &[&str] = &[
+        "$ref",
+        "$comment",
+        "default",
+        "deprecated",
+        "description",
+        "title",
+    ];
     let schema = object(value, context)?;
     if let Some(keyword) = schema
         .keys()
@@ -2021,6 +2029,27 @@ mod tests {
             .push(serde_json::json!({"type": "string"}));
         let error = generate_repository_typescript(&document.to_string()).unwrap_err();
         assert!(error.to_string().contains("ambiguous anyOf"));
+    }
+
+    #[test]
+    fn reference_default_annotations_do_not_replace_the_referenced_type() {
+        let value = serde_json::json!({"$ref":"#/components/schemas/InvocationCompletion", "default":{"kind":"none"}});
+        assert_eq!(
+            schema_reference(&value, "completion").unwrap(),
+            "#/components/schemas/InvocationCompletion"
+        );
+        let output = generate_runtime_typescript(
+            &crate::canonical_openapi_document()
+                .unwrap()
+                .to_json()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(output.contains("completion?: InvocationCompletion"));
+        assert!(output.contains("export type FeatureInvocation ="));
+        assert!(output.contains(
+            "export type CompletionKind = \"file\" | \"feature\" | \"feature_argument\""
+        ));
     }
 
     #[test]

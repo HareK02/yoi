@@ -5,6 +5,8 @@
 //! endpoints, credentials, materializer handles, and operation sessions stay
 //! behind [`WorkspaceClient`].
 
+pub mod wip;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -67,6 +69,7 @@ pub struct ManageWorkdirFeature {
     session_router: Arc<workdir::WorkdirSessionRouter>,
     before_workdir_release: Option<BeforeWorkdirRelease>,
     after_workdir_attach: Option<AfterWorkdirAttach>,
+    attachment_mutation_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for ManageWorkdirFeature {
@@ -86,6 +89,7 @@ impl ManageWorkdirFeature {
             session_router: Arc::new(workdir::WorkdirSessionRouter::new()),
             before_workdir_release: None,
             after_workdir_attach: None,
+            attachment_mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -100,7 +104,18 @@ impl ManageWorkdirFeature {
             session_router,
             before_workdir_release: Some(before_workdir_release),
             after_workdir_attach: Some(after_workdir_attach),
+            attachment_mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+    fn backend(&self) -> WorkspaceHttpWorkdirBackend {
+        let mut backend = WorkspaceHttpWorkdirBackend::new(self.client.clone())
+            .with_session_router(self.session_router.clone())
+            .with_child_lifecycle(
+                self.before_workdir_release.clone(),
+                self.after_workdir_attach.clone(),
+            );
+        backend.attachment_mutation_lock = self.attachment_mutation_lock.clone();
+        backend
     }
 }
 
@@ -120,12 +135,7 @@ impl FeatureModule for ManageWorkdirFeature {
     }
 
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
-        let backend = WorkspaceHttpWorkdirBackend::new(self.client.clone())
-            .with_session_router(self.session_router.clone())
-            .with_child_lifecycle(
-                self.before_workdir_release.clone(),
-                self.after_workdir_attach.clone(),
-            );
+        let backend = self.backend();
         for (name, definition) in [
             (
                 LIST_TOOL,
@@ -340,6 +350,102 @@ impl WorkdirSession for WorkspaceAttachedWorkdirSession {
         match self.operate(WorkdirSessionOperation::ScopeRulesOverlap(request))? {
             WorkdirSessionOperationResult::ScopeRulesOverlap { overlaps } => Ok(overlaps),
             _ => Err(Self::mismatch("scope_rules_overlap")),
+        }
+    }
+
+    async fn checkout_observe(
+        &self,
+        path: workdir::WorkdirPath,
+    ) -> Result<workdir::CheckoutObservation, WorkdirError> {
+        match self.operate(WorkdirSessionOperation::CheckoutObserve(path.clone()))? {
+            WorkdirSessionOperationResult::CheckoutObserve(mut result)
+                if result.path == path
+                    && !result.validator.is_empty()
+                    && result.validator.len() <= 256 =>
+            {
+                result.capabilities = result.capabilities.intersection(self.capabilities);
+                Ok(result)
+            }
+            _ => Err(Self::mismatch("checkout_observe")),
+        }
+    }
+
+    async fn checkout_execute(
+        &self,
+        request: workdir::CheckoutRequest,
+    ) -> Result<workdir::CheckoutResult, WorkdirError> {
+        let cap = request.operation.capability();
+        if !self.capabilities.supports(cap) {
+            return Err(WorkdirError::Unsupported(cap));
+        }
+        let target = request.target.clone();
+        let mutation = cap != workdir::WorkdirSessionCapability::Read;
+        match self.operate(WorkdirSessionOperation::CheckoutExecute(request)) {
+            Ok(WorkdirSessionOperationResult::CheckoutExecute(mut result))
+                if result.observation.path == target
+                    && !result.observation.validator.is_empty()
+                    && result.observation.validator.len() <= 256
+                    && matches!(
+                        (&result.output, cap),
+                        (
+                            workdir::CheckoutOutput::Read(_),
+                            workdir::WorkdirSessionCapability::Read
+                        ) | (
+                            workdir::CheckoutOutput::Write(_),
+                            workdir::WorkdirSessionCapability::Write
+                        ) | (
+                            workdir::CheckoutOutput::Edit(_),
+                            workdir::WorkdirSessionCapability::Edit
+                        )
+                    ) =>
+            {
+                result.observation.capabilities = result
+                    .observation
+                    .capabilities
+                    .intersection(self.capabilities);
+                Ok(result)
+            }
+            Ok(_) if mutation => Err(WorkdirError::OutcomeUnknown(
+                "mismatched checkout mutation response".into(),
+            )),
+            Ok(_) => Err(Self::mismatch("checkout_execute")),
+            Err(WorkdirError::Transport(_) | WorkdirError::Unavailable(_)) if mutation => {
+                Err(WorkdirError::OutcomeUnknown(
+                    "checkout mutation response lost; inspect effects before retry".into(),
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn checkout_search(
+        &self,
+        request: workdir::CheckoutSearchRequest,
+    ) -> Result<workdir::CheckoutSearchResult, WorkdirError> {
+        use workdir::{
+            CheckoutSearchOperation as Op, CheckoutSearchResult as SearchResult,
+            WorkdirSessionCapability as Cap,
+        };
+        let cap = match &request.operation {
+            Op::List(_) => Cap::Read,
+            Op::Glob(_) => Cap::Glob,
+            Op::Grep(_) => Cap::Grep,
+        };
+        if !self.capabilities.supports(cap) {
+            return Err(WorkdirError::Unsupported(cap));
+        }
+        match self.operate(WorkdirSessionOperation::CheckoutSearch(request))? {
+            WorkdirSessionOperationResult::CheckoutSearch(result)
+                if matches!(
+                    (&result, cap),
+                    (SearchResult::List(_), Cap::Read)
+                        | (SearchResult::Glob(_), Cap::Glob)
+                        | (SearchResult::Grep(_), Cap::Grep)
+                ) =>
+            {
+                Ok(result)
+            }
+            _ => Err(Self::mismatch("checkout_search")),
         }
     }
 
@@ -581,11 +687,24 @@ impl WorkspaceHttpWorkdirBackend {
     }
 
     fn detach(&self, alias: &str) -> Result<ToolOutput, ToolError> {
+        self.detach_expected(alias, None)
+    }
+
+    fn detach_expected(
+        &self,
+        alias: &str,
+        expected_connection_id: Option<&str>,
+    ) -> Result<ToolOutput, ToolError> {
         let workspace_id = encode_path_segment(self.workspace_id()?);
         let alias_path = encode_path_segment(alias);
+        let suffix = expected_connection_id
+            .map(|id| format!("?expected_connection_id={}", encode_path_segment(id)))
+            .unwrap_or_default();
         let response = self.execute_json::<WorkdirAttachmentResponse>(WorkspaceRequest {
             method: WorkspaceRequestMethod::Delete,
-            path: format!("/api/w/{workspace_id}/workers/self/workdir-attachments/{alias_path}"),
+            path: format!(
+                "/api/w/{workspace_id}/workers/self/workdir-attachments/{alias_path}{suffix}"
+            ),
             body: None,
         })?;
         workdir_output(
@@ -620,6 +739,72 @@ impl WorkspaceHttpWorkdirBackend {
             ),
             &response,
         )
+    }
+
+    async fn detach_managed(
+        &self,
+        alias: &str,
+        expected_connection_id: Option<&str>,
+    ) -> Result<ToolOutput, ToolError> {
+        let _mutation_guard = self.attachment_mutation_lock.lock().await;
+        let alias = validate_identity(alias, DETACH_TOOL, "alias")?;
+        if let Some(expected) = expected_connection_id {
+            // Under the shared local mutation lock, check lifetime before any
+            // local route exclusion or child cleanup. Backend DELETE still performs
+            // the authoritative conditional mutation under its lifecycle lock.
+            let workspace = encode_path_segment(self.workspace_id()?);
+            let page: serde_json::Value = self.execute_json(WorkspaceRequest::get(format!(
+                "/api/w/{workspace}/workers/self/workdir-attachments?limit=1&connection_id={}",
+                encode_path_segment(expected)
+            )))?;
+            let current = page
+                .get("items")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item.get("connection_id")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(expected)
+                            && item.get("alias").and_then(serde_json::Value::as_str) == Some(alias)
+                    })
+                });
+            if !current {
+                return Err(ToolError::StructuredConflict {
+                    code: "workspace_http_409".into(),
+                    message: "attachment lifetime changed before local cleanup".into(),
+                });
+            }
+        }
+        let alias_key = workdir::WorkdirAttachmentAlias::new(alias)
+            .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
+        self.session_router
+            .begin_detach(&alias_key)
+            .await
+            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+        if let Some(before_release) = &self.before_workdir_release
+            && let Err(error) = before_release().await
+        {
+            self.session_router.cancel_detach(&alias_key);
+            return Err(ToolError::ExecutionFailed(format!(
+                "stop Internal SubWorkers before Workdir detach: {error}"
+            )));
+        }
+        let result = match self.detach_expected(alias, expected_connection_id) {
+            Ok(result) => result,
+            Err(error) => {
+                self.session_router.cancel_detach(&alias_key);
+                return Err(error);
+            }
+        };
+        self.session_router
+            .finish_detach(&alias_key)
+            .await
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!(
+                    "detach Workdir session route after Backend release: {error}"
+                ))
+            })?;
+        Ok(result)
     }
 
     fn execute_json<T: for<'de> Deserialize<'de>>(
@@ -697,42 +882,10 @@ impl Tool for WorkspaceHttpWorkdirTool {
                 result
             }
             WorkdirOperation::Detach => {
-                let _mutation_guard = self.backend.attachment_mutation_lock.lock().await;
                 let input = parse_input::<WorkdirDetachInput>(input_json)?;
-                let alias = validate_identity(&input.alias, DETACH_TOOL, "alias")?;
-                let alias_key = workdir::WorkdirAttachmentAlias::new(alias)
-                    .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
-                self.backend
-                    .session_router
-                    .begin_detach(&alias_key)
-                    .await
-                    .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
-                if let Some(before_release) = &self.backend.before_workdir_release
-                    && let Err(error) = before_release().await
-                {
-                    self.backend.session_router.cancel_detach(&alias_key);
-                    return Err(ToolError::ExecutionFailed(format!(
-                        "stop Internal SubWorkers before Workdir detach: {error}"
-                    )));
-                }
-                let result = match self.backend.detach(alias) {
-                    Ok(result) => result,
-                    Err(error) => {
-                        self.backend.session_router.cancel_detach(&alias_key);
-                        return Err(error);
-                    }
-                };
-                self.backend
-                    .session_router
-                    .finish_detach(&alias_key)
-                    .await
-                    .map_err(|error| {
-                        ToolError::ExecutionFailed(format!(
-                            "detach Workdir session route after Backend release: {error}"
-                        ))
-                    })?;
-                Ok(result)
+                self.backend.detach_managed(&input.alias, None).await
             }
+
             WorkdirOperation::Delete => self
                 .backend
                 .delete(parse_input::<WorkdirDeleteInput>(input_json)?),
@@ -747,6 +900,12 @@ fn parse_input<T: for<'de> Deserialize<'de>>(input: &str) -> Result<T, ToolError
 fn decode_response<T: for<'de> Deserialize<'de>>(
     response: WorkspaceResponse,
 ) -> Result<T, ToolError> {
+    if matches!(response.status, 401 | 403 | 404 | 409) {
+        return Err(ToolError::StructuredConflict {
+            code: format!("workspace_http_{}", response.status),
+            message: "Workspace lifecycle authority rejected the request before execution".into(),
+        });
+    }
     if !response.is_success() {
         return Err(ToolError::ExecutionFailed(format!(
             "Workspace Workdir API returned HTTP {}: {}",
@@ -1349,6 +1508,56 @@ mod tests {
         assert!(body.get("expected_session_fence").is_none());
         assert!(body.get("runtime_id").is_none());
         assert!(body.get("session_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn attached_checkout_mutations_preserve_known_rejection_and_lost_outcomes() {
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![
+            response(json!({"operation":"write","result":{"bytes_written":3,"created":false}})),
+            WorkspaceResponse {
+                status: 200,
+                body: "invalid payload".into(),
+            },
+            error_response(
+                409,
+                workdir::http::WorkdirTransportErrorCode::Conflict,
+                "stale",
+            ),
+        ]));
+        let session = WorkspaceAttachedWorkdirSession::handle(client.clone(), "checkout");
+        let request = workdir::CheckoutRequest {
+            target: workdir::WorkdirPath::new("file.txt").unwrap(),
+            validator: vec![1],
+            operation: workdir::CheckoutOperation::Write {
+                content: b"new".to_vec(),
+                expected_hash: [0; 32],
+            },
+        };
+        for _ in 0..2 {
+            assert!(matches!(
+                session.checkout_execute(request.clone()).await,
+                Err(WorkdirError::OutcomeUnknown(_))
+            ));
+        }
+        assert!(matches!(
+            session.checkout_execute(request.clone()).await,
+            Err(WorkdirError::Conflict(_))
+        ));
+        // Missing response simulates the Workspace client losing the provider result.
+        assert!(matches!(
+            session.checkout_execute(request).await,
+            Err(WorkdirError::OutcomeUnknown(_))
+        ));
+        let calls = client.requests();
+        assert_eq!(calls.len(), 4);
+        for call in calls {
+            let body: serde_json::Value =
+                serde_json::from_str(call.body.as_deref().unwrap()).unwrap();
+            assert_eq!(body["target_workdir"], "checkout");
+            assert_eq!(body["operation"]["operation"], "checkout_execute");
+            assert_eq!(body["operation"]["request"]["target"], "file.txt");
+            assert!(body.get("runtime_id").is_none());
+        }
     }
 
     #[tokio::test]

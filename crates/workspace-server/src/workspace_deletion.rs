@@ -76,6 +76,7 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "worker_registry_projection_diagnostics",
     "worker_registry_projection_removals",
     "worker_removal_operations",
+    "worker_restore_intents",
     "worker_retention_audit_events",
     "worker_session_archive_observe_grants",
     "worker_session_archives",
@@ -84,6 +85,7 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "worker_workdir_attachment_reservations",
     "worker_workdir_links",
     "workspace_config_entries",
+    "workspace_config_grants",
     "workspace_config_tree_revisions",
     "workspace_config_trees",
     "workspace_create_operations",
@@ -936,6 +938,17 @@ mod tests {
                      ) VALUES (?1, 'runtime-a', 'jti-a', 1, '1')",
                     params![workspace_id],
                 )?;
+                for (workspace, grant, workdir, revoked) in [
+                    (workspace_id.as_str(), "config-active", "config-active-wd", 0),
+                    (workspace_id.as_str(), "config-revoked", "config-revoked-wd", 1),
+                    ("workspace-b", "other-config", "other-config-wd", 0),
+                ] {
+                    conn.execute(
+                        "INSERT INTO workspace_config_grants (workspace_id,grant_id,runtime_id,worker_id,workdir_id,access,revoked,created_by,created_at)
+                         VALUES (?1,?2,'runtime-a','worker-a',?3,'read_only',?4,'owner','1')",
+                        params![workspace, grant, workdir, revoked],
+                    )?;
+                }
                 Ok(())
             })
             .expect("non-FK scoped audit fixture");
@@ -1038,6 +1051,23 @@ mod tests {
             })
             .expect("scoped audit read");
         assert_eq!(proof_count, 0);
+        let grants = store
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT workspace_id,grant_id FROM workspace_config_grants ORDER BY grant_id",
+                )?;
+                statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(Error::from)
+            })
+            .expect("config grants purge is Workspace-scoped, including revoked history");
+        assert_eq!(
+            grants,
+            vec![("workspace-b".to_string(), "other-config".to_string())]
+        );
     }
 
     #[test]

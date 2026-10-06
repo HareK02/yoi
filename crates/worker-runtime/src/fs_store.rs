@@ -493,7 +493,12 @@ pub(crate) struct PersistedWorkerRestoreOperation {
 #[serde(deny_unknown_fields)]
 pub(crate) struct PersistedWorkerStopOperation {
     pub(crate) operation_id: WorkerLifecycleOperationId,
-    pub(crate) request: CreateWorkerRequest,
+    /// Restore resources remain operation-owned until stop confirms cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pending_restore: Option<PersistedWorkerRestoreOperation>,
+    /// Stop can reconcile an identity whose execution metadata is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) request: Option<CreateWorkerRequest>,
     pub(crate) binding: Option<PersistedWorkerExecutionBinding>,
     pub(crate) restore_intent: WorkerRestoreIntent,
     pub(crate) last_settled_status: WorkerStatus,
@@ -515,6 +520,7 @@ pub(crate) enum PersistedWorkerExecutionState {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PersistedWorkerRecord {
+    pub(crate) restore_guard: crate::runtime::RestoreGuard,
     pub(crate) worker_ref: WorkerRef,
     pub(crate) worker_id: WorkerId,
     pub(crate) profile: ProfileSelector,
@@ -1814,6 +1820,8 @@ impl RuntimeSnapshot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkerAggregateRecord {
+    #[serde(default)]
+    restore_guard: crate::runtime::RestoreGuard,
     schema_version: u32,
     worker_ref: WorkerRef,
     worker_id: WorkerId,
@@ -1869,6 +1877,7 @@ impl WorkerAggregateRecord {
         };
         Self {
             schema_version: SCHEMA_VERSION,
+            restore_guard: worker.restore_guard.clone(),
             worker_ref: worker.worker_ref.clone(),
             worker_id: worker.worker_id,
             profile: worker.profile.clone(),
@@ -1897,6 +1906,7 @@ impl WorkerAggregateRecord {
     }
 
     fn validate(self, path: &Path) -> Result<PersistedWorkerRecord, RuntimeError> {
+        let restore_guard = self.restore_guard;
         let last_finished_submission_request_id = self.last_finished_submission_request_id;
         let identity = WorkerIdentityRecord {
             schema_version: self.schema_version,
@@ -1942,7 +1952,7 @@ impl WorkerAggregateRecord {
                             });
                         }
                         (
-                            &restore.request,
+                            Some(&restore.request),
                             &restore.binding,
                             if restore.last_settled_status.is_active() {
                                 WorkerRestoreIntent::Automatic
@@ -1953,7 +1963,7 @@ impl WorkerAggregateRecord {
                         )
                     }
                     PersistedWorkerLifecycleOperation::Stop(stop) => {
-                        if !stop.last_settled_status.is_active() {
+                        if !stop.last_settled_status.is_active() && stop.pending_restore.is_none() {
                             return Err(RuntimeError::StoreCorrupt {
                                 operation: "read Worker stop reconciliation",
                                 path: path.to_path_buf(),
@@ -1961,8 +1971,18 @@ impl WorkerAggregateRecord {
                                     .to_string(),
                             });
                         }
+                        if stop.request.is_none()
+                            && (stop.binding.is_some() || stop.pending_restore.is_some())
+                        {
+                            return Err(RuntimeError::StoreCorrupt {
+                                operation: "read Worker stop reconciliation",
+                                path: path.to_path_buf(),
+                                message: "metadata-free stop cannot carry restore authority"
+                                    .to_string(),
+                            });
+                        }
                         (
-                            &stop.request,
+                            stop.request.as_ref(),
                             &stop.binding,
                             stop.restore_intent,
                             stop.last_settled_status,
@@ -1978,18 +1998,21 @@ impl WorkerAggregateRecord {
                                 .to_string(),
                     });
                 }
-                WorkerExecutionRecord {
-                    schema_version: SCHEMA_VERSION,
-                    request: request.clone(),
-                    binding: binding.clone(),
-                    restore_intent,
+                if let Some(request) = request {
+                    WorkerExecutionRecord {
+                        schema_version: SCHEMA_VERSION,
+                        request: request.clone(),
+                        binding: binding.clone(),
+                        restore_intent,
+                    }
+                    .validate_for_schema(&identity, path, SCHEMA_VERSION)?;
                 }
-                .validate_for_schema(&identity, path, SCHEMA_VERSION)?;
                 PersistedWorkerExecutionState::ReconciliationRequired(operation)
             }
             WorkerExecutionStateRecord::Unavailable => PersistedWorkerExecutionState::Unavailable,
         };
         let mut persisted = identity.into_persisted(execution_state);
+        persisted.restore_guard = restore_guard;
         persisted.last_finished_submission_request_id = last_finished_submission_request_id;
         Ok(persisted)
     }
@@ -2163,6 +2186,7 @@ impl WorkerIdentityRecord {
             self.workdir_attachments
         };
         PersistedWorkerRecord {
+            restore_guard: crate::runtime::RestoreGuard::default(),
             worker_ref: self.worker_ref,
             worker_id: self.worker_id,
             profile: self.profile,

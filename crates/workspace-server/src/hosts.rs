@@ -242,6 +242,8 @@ pub struct InternalWorkerImplementationSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InternalWorkerSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_observation_token: Option<String>,
     #[serde(flatten)]
     pub worker: RuntimeWorkerRef,
     pub host_id: String,
@@ -356,6 +358,7 @@ pub(crate) fn workspace_worker_summary(
     workdir_attachments: Vec<server_api::WorkerWorkdirAttachmentSummary>,
 ) -> server_api::WorkerSummary {
     server_api::WorkerSummary {
+        restore_observation_token: summary.restore_observation_token,
         runtime_id: summary.worker.runtime_id,
         worker_id: summary.worker.worker_id,
         resource_key,
@@ -561,6 +564,8 @@ pub enum WorkerSpawnIntent {
         job_id: String,
         attempt_id: String,
         purpose: String,
+        input_revision: String,
+        subjektiv_consolidation: bool,
     },
     TicketRole {
         ticket_id: String,
@@ -735,6 +740,10 @@ pub struct WorkerCompletionsRequest {
     pub kind: protocol::CompletionKind,
     #[serde(default)]
     pub prefix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<protocol::CompletionContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -743,6 +752,10 @@ pub struct WorkerCompletionsResult {
     pub worker: RuntimeWorkerRef,
     pub kind: protocol::CompletionKind,
     pub prefix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<protocol::CompletionContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     pub entries: Vec<protocol::CompletionEntry>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
@@ -826,11 +839,17 @@ impl RuntimeRegistryError {
                 runtime_id,
                 code,
                 message,
-            } => Error::RuntimeOperationFailed {
-                runtime_id,
-                code,
-                message,
-            },
+            } => {
+                if code == "restore_observation_conflict" {
+                    Error::RestoreObservationConflict
+                } else {
+                    Error::RuntimeOperationFailed {
+                        runtime_id,
+                        code,
+                        message,
+                    }
+                }
+            }
         }
     }
 }
@@ -930,7 +949,29 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
 
     fn worker(&self, worker_id: &str) -> WorkerLookupResult;
 
-    fn restore_worker(&self, worker_id: &str) -> InternalWorkerRestoreResult {
+    fn coordinate_worker_restore(
+        &self,
+        _worker_id: &str,
+        _request: runtime_api::WorkerRestoreCoordinationRequest,
+    ) -> Result<
+        (
+            Option<InternalWorkerRestoreResult>,
+            Option<runtime_api::WorkerRestorePreparation>,
+        ),
+        RuntimeDiagnostic,
+    > {
+        Err(diagnostic(
+            "worker_restore_coordination_unsupported",
+            HostDiagnosticSeverity::Error,
+            "Runtime does not support guarded Restore coordination",
+        ))
+    }
+
+    fn restore_worker(
+        &self,
+        worker_id: &str,
+        _request: runtime_api::WorkerRestoreRequest,
+    ) -> InternalWorkerRestoreResult {
         InternalWorkerRestoreResult {
             state: server_api::WorkerRestoreState::Rejected,
             worker: None,
@@ -1327,6 +1368,8 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
             worker: RuntimeWorkerRef::new(self.runtime_id().to_string(), worker_id.to_string()),
             kind: request.kind,
             prefix: request.prefix,
+            context: request.context,
+            request_id: request.request_id,
             entries: Vec::new(),
             diagnostics: vec![diagnostic(
                 "worker_completions_unsupported",
@@ -1592,16 +1635,39 @@ impl RuntimeRegistry {
         Ok(worker)
     }
 
+    pub fn coordinate_worker_restore(
+        &self,
+        worker: &RuntimeWorkerRef,
+        request: runtime_api::WorkerRestoreCoordinationRequest,
+    ) -> Result<
+        (
+            Option<InternalWorkerRestoreResult>,
+            Option<runtime_api::WorkerRestorePreparation>,
+        ),
+        RuntimeRegistryError,
+    > {
+        validate_backend_identifier("runtime_id", &worker.runtime_id)?;
+        validate_backend_identifier("worker_id", &worker.worker_id)?;
+        self.runtime(&worker.runtime_id)?
+            .coordinate_worker_restore(&worker.worker_id, request)
+            .map_err(|error| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: worker.runtime_id.clone(),
+                code: error.code,
+                message: error.message,
+            })
+    }
+
     pub fn restore_worker(
         &self,
         worker: &RuntimeWorkerRef,
+        request: runtime_api::WorkerRestoreRequest,
     ) -> Result<InternalWorkerRestoreResult, RuntimeRegistryError> {
         let runtime_id = worker.runtime_id.as_str();
         let worker_id = worker.worker_id.as_str();
         validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("worker_id", worker_id)?;
         let runtime = self.runtime(runtime_id)?;
-        Ok(runtime.restore_worker(worker_id))
+        Ok(runtime.restore_worker(worker_id, request))
     }
 
     pub fn replace_worker_workspace_api(
@@ -2362,6 +2428,7 @@ impl EmbeddedWorkerRuntime {
             true,
         );
         InternalWorkerSummary {
+            restore_observation_token: summary.restore_observation_token.clone(),
             worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
@@ -2406,6 +2473,7 @@ impl EmbeddedWorkerRuntime {
             true,
         );
         InternalWorkerSummary {
+            restore_observation_token: detail.restore_observation_token.clone(),
             worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
@@ -2572,7 +2640,48 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         }
     }
 
-    fn restore_worker(&self, worker_id: &str) -> InternalWorkerRestoreResult {
+    fn coordinate_worker_restore(
+        &self,
+        worker_id: &str,
+        request: runtime_api::WorkerRestoreCoordinationRequest,
+    ) -> Result<
+        (
+            Option<InternalWorkerRestoreResult>,
+            Option<runtime_api::WorkerRestorePreparation>,
+        ),
+        RuntimeDiagnostic,
+    > {
+        let worker_ref = self.worker_ref(worker_id).ok_or_else(|| {
+            diagnostic(
+                "worker_not_found",
+                HostDiagnosticSeverity::Warning,
+                "Unknown Worker",
+            )
+        })?;
+        let (result, preparation) = self
+            .runtime
+            .coordinate_worker_restore_operation(&worker_ref, request, None)
+            .map_err(|error| embedded_runtime_diagnostic(&error))?;
+        Ok((
+            result.map(|result| InternalWorkerRestoreResult {
+                state: result.state,
+                worker: result.worker.map(|detail| self.map_worker_detail(detail)),
+                diagnostics: match (result.reason_code, result.message) {
+                    (Some(code), Some(message)) => {
+                        vec![diagnostic(code, HostDiagnosticSeverity::Warning, message)]
+                    }
+                    _ => Vec::new(),
+                },
+            }),
+            preparation,
+        ))
+    }
+
+    fn restore_worker(
+        &self,
+        worker_id: &str,
+        request: runtime_api::WorkerRestoreRequest,
+    ) -> InternalWorkerRestoreResult {
         let Some(worker_ref) = self.worker_ref(worker_id) else {
             return InternalWorkerRestoreResult {
                 state: server_api::WorkerRestoreState::Rejected,
@@ -2584,7 +2693,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 )],
             };
         };
-        match self.runtime.restore_worker_operation(&worker_ref) {
+        match self.runtime.restore_worker_operation(&worker_ref, request) {
             Ok(result) => {
                 let diagnostics = match (result.reason_code, result.message) {
                     (Some(code), Some(message)) => {
@@ -2596,6 +2705,17 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                     state: result.state,
                     worker: result.worker.map(|detail| self.map_worker_detail(detail)),
                     diagnostics,
+                }
+            }
+            Err(worker_runtime::error::RuntimeError::RestoreObservationConflict { .. }) => {
+                InternalWorkerRestoreResult {
+                    state: server_api::WorkerRestoreState::Rejected,
+                    worker: None,
+                    diagnostics: vec![diagnostic(
+                        "restore_observation_conflict",
+                        HostDiagnosticSeverity::Warning,
+                        "Restore observation changed; refresh before a new intent".to_string(),
+                    )],
                 }
             }
             Err(err) => InternalWorkerRestoreResult {
@@ -3310,6 +3430,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 kind: request.kind,
                 prefix: request.prefix,
+                context: request.context,
+                request_id: request.request_id,
                 entries: Vec::new(),
                 diagnostics: vec![diagnostic(
                     "embedded_worker_execution_unavailable",
@@ -3325,6 +3447,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 kind: request.kind,
                 prefix: request.prefix,
+                context: request.context,
+                request_id: request.request_id,
                 entries: Vec::new(),
                 diagnostics: vec![diagnostic(
                     "embedded_worker_id_invalid",
@@ -3333,14 +3457,18 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 )],
             };
         };
-        match self
-            .runtime
-            .worker_completions(&worker_ref, request.kind, &request.prefix)
-        {
+        match self.runtime.worker_completions(
+            &worker_ref,
+            request.kind,
+            &request.prefix,
+            request.context.as_ref(),
+        ) {
             Ok(entries) => WorkerCompletionsResult {
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 kind: request.kind,
                 prefix: request.prefix,
+                context: request.context,
+                request_id: request.request_id,
                 entries,
                 diagnostics: Vec::new(),
             },
@@ -3348,6 +3476,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 kind: request.kind,
                 prefix: request.prefix,
+                context: request.context,
+                request_id: request.request_id,
                 entries: Vec::new(),
                 diagnostics: vec![embedded_runtime_diagnostic(&error)],
             },
@@ -4355,6 +4485,7 @@ impl RemoteWorkerRuntime {
             false,
         );
         InternalWorkerSummary {
+            restore_observation_token: summary.restore_observation_token.clone(),
             worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
@@ -4397,6 +4528,7 @@ impl RemoteWorkerRuntime {
             false,
         );
         InternalWorkerSummary {
+            restore_observation_token: detail.restore_observation_token.clone(),
             worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id.clone()),
             host_id: self.host_id.clone(),
             display_name: display.display_name.clone(),
@@ -4688,17 +4820,58 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         }
     }
 
-    fn restore_worker(&self, worker_id: &str) -> InternalWorkerRestoreResult {
+    fn coordinate_worker_restore(
+        &self,
+        worker_id: &str,
+        request: runtime_api::WorkerRestoreCoordinationRequest,
+    ) -> Result<
+        (
+            Option<InternalWorkerRestoreResult>,
+            Option<runtime_api::WorkerRestorePreparation>,
+        ),
+        RuntimeDiagnostic,
+    > {
+        let worker_id = worker_id.to_string();
+        let response = self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.coordinate_worker_restore(worker_id, request).await },
+        )?;
+        let result = response
+            .result
+            .map(|result| -> Result<_, RuntimeDiagnostic> {
+                let worker = result
+                    .worker
+                    .map(runtime_contract_convert::<_, worker_runtime::catalog::WorkerDetail>)
+                    .transpose()?;
+                let state =
+                    runtime_contract_convert::<_, server_api::WorkerRestoreState>(result.state)?;
+                Ok(InternalWorkerRestoreResult {
+                    state,
+                    worker: worker.map(|detail| self.map_worker_detail(detail)),
+                    diagnostics: match (result.reason_code, result.message) {
+                        (Some(code), Some(message)) => {
+                            vec![diagnostic(code, HostDiagnosticSeverity::Warning, message)]
+                        }
+                        _ => Vec::new(),
+                    },
+                })
+            })
+            .transpose()?;
+        Ok((result, response.preparation))
+    }
+
+    fn restore_worker(
+        &self,
+        worker_id: &str,
+        request: runtime_api::WorkerRestoreRequest,
+    ) -> InternalWorkerRestoreResult {
         let worker_id_owned = worker_id.to_string();
         match self
             .run_runtime_api(
                 self.request_timeout,
                 MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
-                move |client| async move {
-                    client
-                        .restore_worker(worker_id_owned, runtime_api::EmptyObjectRequest::default())
-                        .await
-                },
+                move |client| async move { client.restore_worker(worker_id_owned, request).await },
             )
             .and_then(|value| {
                 let worker = value
@@ -5415,9 +5588,13 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         let request = runtime_api::CompletionRequest {
             kind: request.kind,
             prefix: request.prefix,
+            context: request.context,
+            request_id: request.request_id,
         };
         let failure_kind = request.kind;
         let failure_prefix = request.prefix.clone();
+        let failure_context = request.context.clone();
+        let failure_request_id = request.request_id.clone();
         let worker_id_owned = worker_id.to_string();
         match self.run_runtime_api(
             self.request_timeout,
@@ -5432,6 +5609,8 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 kind: response.kind,
                 prefix: response.prefix,
+                context: response.context,
+                request_id: response.request_id,
                 entries: response.entries,
                 diagnostics: Vec::new(),
             },
@@ -5439,6 +5618,8 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 kind: failure_kind,
                 prefix: failure_prefix,
+                context: failure_context,
+                request_id: failure_request_id,
                 entries: Vec::new(),
                 diagnostics: vec![diagnostic],
             },
@@ -5529,6 +5710,21 @@ fn runtime_create_worker_request(
         workspace_api: Some(workspace_api),
         memory_settings: request.resolved_memory_settings.clone(),
         subjektiv_attached: request.resolved_subjektiv_attached,
+        backend_job: match &request.intent {
+            WorkerSpawnIntent::BackendJob {
+                job_id,
+                attempt_id,
+                input_revision,
+                subjektiv_consolidation,
+                ..
+            } => Some(worker_runtime::catalog::BackendJobExecutionBinding {
+                job_id: job_id.clone(),
+                attempt_id: attempt_id.clone(),
+                input_revision: Some(input_revision.clone()),
+                subjektiv_consolidation: *subjektiv_consolidation,
+            }),
+            _ => None,
+        },
     }
 }
 
@@ -5858,6 +6054,11 @@ fn sanitize_embedded_execution_detail(summary: &str, message: &str) -> String {
 
 fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnostic {
     match error {
+        EmbeddedRuntimeError::RestoreObservationConflict { .. } => diagnostic(
+            "restore_observation_conflict",
+            HostDiagnosticSeverity::Warning,
+            "Restore observation changed; refresh before a new intent".to_string(),
+        ),
         EmbeddedRuntimeError::RuntimeStopped => diagnostic(
             "embedded_runtime_stopped",
             HostDiagnosticSeverity::Warning,
@@ -6264,6 +6465,7 @@ fn worker_spawn_intent_label(intent: &WorkerSpawnIntent) -> &'static str {
 pub fn placeholder_worker(host_id: impl Into<String>) -> InternalWorkerSummary {
     let host_id = host_id.into();
     InternalWorkerSummary {
+        restore_observation_token: None,
         worker: RuntimeWorkerRef::new("placeholder", "worker-placeholder"),
         host_id,
         display_name: "Worker runtime actions are not implemented".to_string(),
@@ -6341,7 +6543,14 @@ mod tests {
         )
         .unwrap();
 
-        let result = provider.restore_worker("worker-transport-uncertain");
+        let result = provider.restore_worker(
+            "worker-transport-uncertain",
+            runtime_api::WorkerRestoreRequest {
+                expected_observation_token: "observation".into(),
+                request_id: "transport-uncertain".into(),
+                preparation: None,
+            },
+        );
 
         assert_eq!(
             result.state,
@@ -6712,6 +6921,46 @@ mod tests {
     }
 
     #[test]
+    fn feature_invocation_and_completion_context_survive_runtime_contract() {
+        let segments = vec![
+            protocol::Segment::FeatureInvoke {
+                invocation: protocol::FeatureInvocation {
+                    invocation_id: "stable-request".into(),
+                    identity: protocol::FeatureInvocationIdentity("builtin:test/prepare".into()),
+                    name: "prepare".into(),
+                    arguments: vec![protocol::InvocationArgumentValue {
+                        name: "path".into(),
+                        value: protocol::InvocationValue::String("資料/a b".into()),
+                    }],
+                },
+            },
+            protocol::Segment::text(" subsequent prose"),
+        ];
+        let input = EmbeddedWorkerInput {
+            kind: EmbeddedWorkerInputKind::User,
+            content: protocol::Segment::flatten_to_text(&segments),
+            submission_request_id: Some("submit-request".into()),
+            segments: Some(segments),
+        };
+        let wire: runtime_api::WorkerInput = runtime_contract_convert(input.clone()).unwrap();
+        let restored: EmbeddedWorkerInput = runtime_contract_convert(wire).unwrap();
+        assert_eq!(restored, input);
+        let request = WorkerCompletionsRequest {
+            kind: protocol::CompletionKind::FeatureArgument,
+            prefix: "資料/".into(),
+            context: Some(protocol::CompletionContext {
+                invocation: protocol::FeatureInvocationIdentity("builtin:test/prepare".into()),
+                argument: Some("path".into()),
+            }),
+            request_id: Some("completion-nonce".into()),
+        };
+        let wire: runtime_api::CompletionRequest =
+            runtime_contract_convert(request.clone()).unwrap();
+        let restored: WorkerCompletionsRequest = runtime_contract_convert(wire).unwrap();
+        assert_eq!(restored, request);
+    }
+
+    #[test]
     fn remote_profile_source_uses_workspace_config_archive_reference() {
         let request = embedded_spawn_request();
         let profile = ProfileSelector::Builtin("builtin:coder".to_string());
@@ -6801,7 +7050,7 @@ mod tests {
 
         fn dispatch_input(
             &self,
-            _handle: &worker_runtime::execution::WorkerExecutionHandle,
+            _worker_ref: &EmbeddedWorkerRef,
             _input: EmbeddedWorkerInput,
         ) -> worker_runtime::execution::WorkerExecutionResult {
             worker_runtime::execution::WorkerExecutionResult::rejected(
@@ -6830,7 +7079,7 @@ mod tests {
 
         fn dispatch_input(
             &self,
-            _handle: &worker_runtime::execution::WorkerExecutionHandle,
+            _worker_ref: &EmbeddedWorkerRef,
             _input: EmbeddedWorkerInput,
         ) -> worker_runtime::execution::WorkerExecutionResult {
             unreachable!("Repository observation test does not dispatch Worker input")
@@ -6910,10 +7159,6 @@ mod tests {
                 .unwrap()
                 .insert(request.worker_ref.clone(), request.context);
             worker_runtime::execution::WorkerExecutionSpawnResult::Connected {
-                handle: worker_runtime::execution::WorkerExecutionHandle::new(
-                    request.worker_ref,
-                    self.backend_id(),
-                ),
                 worker_state: protocol::WorkerStateSnapshot {
                     ..protocol::WorkerStatus::Idle.into()
                 },
@@ -6932,15 +7177,10 @@ mod tests {
 
         fn dispatch_input(
             &self,
-            handle: &worker_runtime::execution::WorkerExecutionHandle,
+            worker_ref: &EmbeddedWorkerRef,
             input: EmbeddedWorkerInput,
         ) -> worker_runtime::execution::WorkerExecutionResult {
-            let context = self
-                .contexts
-                .lock()
-                .unwrap()
-                .get(handle.worker_ref())
-                .cloned();
+            let context = self.contexts.lock().unwrap().get(worker_ref).cloned();
             let Some(context) = context else {
                 return worker_runtime::execution::WorkerExecutionResult::rejected(
                     worker_runtime::execution::WorkerExecutionOperation::Input,
@@ -6993,6 +7233,7 @@ mod tests {
                 runtime_id: runtime_id.to_string(),
                 host_id: host_id.to_string(),
                 workers: vec![InternalWorkerSummary {
+                    restore_observation_token: None,
                     worker: RuntimeWorkerRef::new(runtime_id, worker_id),
                     host_id: host_id.to_string(),
                     display_name: label.to_string(),
@@ -7639,7 +7880,16 @@ mod tests {
 
         let detail = registry.worker(&worker.worker).unwrap();
 
-        let json = serde_json::to_string(&(embedded_summary, worker, input, detail)).unwrap();
+        // The public observation generation is intentionally exposed, unlike
+        // private authentication tokens. Whitelist its key, not arbitrary token
+        // values or other token-bearing fields.
+        for summary in [&worker, &detail] {
+            let token = summary.restore_observation_token.as_ref().unwrap();
+            assert_eq!(uuid::Uuid::parse_str(token).unwrap().get_version_num(), 7);
+        }
+        let json = serde_json::to_string(&(embedded_summary, worker, input, detail))
+            .unwrap()
+            .replace("\"restore_observation_token\":", "\"restore_observation\":");
         for forbidden in [
             "/workspace/project",
             "metadata.json",

@@ -838,36 +838,126 @@ async fn feature_flags_default_to_core_tool_surface_only() {
 }
 
 #[tokio::test]
-async fn backend_job_profile_exposes_only_structured_result_capability() {
+async fn backend_job_capability_is_explicit_and_preserves_profile_features() {
+    for bound in [false, true] {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut resolved = ProfileResolver::new()
+            .with_workspace_base(workspace.path())
+            .resolve(
+                &ProfileSelector::source_named(ProfileRegistrySource::Builtin, "backend-job"),
+                ProfileResolveOptions::with_worker_name("backend-job-worker"),
+            )
+            .unwrap();
+        // A custom instruction and enabled feature must survive trusted Job binding.
+        if bound {
+            resolved.manifest.engine.instruction = "default".into();
+            resolved.manifest.feature.task.enabled = true;
+        }
+        let instruction = resolved.manifest.engine.instruction.clone();
+        let client = MockClient::new(simple_text_events());
+        let client_for_assert = client.clone();
+        let (mut worker, _pwd) = make_worker_with_manifest_and_workspace_context(
+            client,
+            resolved.manifest,
+            WorkerWorkspaceContext::with_client(None, Arc::new(AvailableWorkspaceClient)),
+        )
+        .await;
+        if bound {
+            worker
+                .bind_backend_job(worker::BackendJobExecutionBinding {
+                    job_id: "job-1".into(),
+                    attempt_id: "attempt-1".into(),
+                    input_revision: Some("input-1".into()),
+                    subjektiv_consolidation: false,
+                })
+                .unwrap();
+        }
+        assert_eq!(worker.manifest().engine.instruction, instruction);
+        let handle = spawn_controller(worker).await;
+        handle
+            .send(Method::submit_text(
+                protocol::new_submission_request_id(),
+                "Run the bounded Backend Job.",
+            ))
+            .await
+            .unwrap();
+        wait_for_status(&handle, WorkerStatus::Idle).await;
+        let request = wait_for_captured_request(&client_for_assert).await;
+        let names = request_tool_names(&request);
+        assert_eq!(
+            names.iter().any(|name| name == "SubmitBackendJobResult"),
+            bound
+        );
+        assert_eq!(names.iter().any(|name| name == "TaskCreate"), bound);
+    }
+}
+
+#[tokio::test]
+async fn consolidation_job_preserves_custom_instruction_and_explicit_tool_policy() {
     let workspace = tempfile::tempdir().unwrap();
-    let resolved = ProfileResolver::new()
+    let mut manifest = ProfileResolver::new()
         .with_workspace_base(workspace.path())
         .resolve(
-            &ProfileSelector::source_named(ProfileRegistrySource::Builtin, "backend-job"),
-            ProfileResolveOptions::with_worker_name("backend-job-worker"),
+            &ProfileSelector::source_named(
+                ProfileRegistrySource::Builtin,
+                "subjektiv-memory-consolidation",
+            ),
+            ProfileResolveOptions::with_worker_name("custom-consolidation-job"),
         )
+        .unwrap()
+        .manifest;
+    manifest.engine.instruction = "default".into();
+    manifest.feature.task.enabled = true;
+    manifest
+        .feature
+        .subjektiv
+        .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+            workspace_id: "workspace-1".into(),
+            settings_revision: 1,
+            language: "English".into(),
+        })
         .unwrap();
     let client = MockClient::new(simple_text_events());
-    let client_for_assert = client.clone();
-    let (worker, _pwd) = make_worker_with_manifest_and_workspace_context(
+    let captured = client.clone();
+    let (mut worker, _pwd) = make_worker_with_manifest_and_workspace_context(
         client,
-        resolved.manifest,
+        manifest,
         WorkerWorkspaceContext::with_client(None, Arc::new(AvailableWorkspaceClient)),
     )
     .await;
+    worker
+        .engine_mut()
+        .set_system_prompt("chosen custom instruction");
+    worker
+        .bind_backend_job(worker::BackendJobExecutionBinding {
+            job_id: "job-1".into(),
+            attempt_id: "attempt-1".into(),
+            input_revision: None,
+            subjektiv_consolidation: true,
+        })
+        .unwrap();
     let handle = spawn_controller(worker).await;
-
     handle
         .send(Method::submit_text(
             protocol::new_submission_request_id(),
-            "Run the bounded Backend Job.",
+            "Inspect the bounded batch.",
         ))
         .await
         .unwrap();
     wait_for_status(&handle, WorkerStatus::Idle).await;
-
-    let request = wait_for_captured_request(&client_for_assert).await;
-    assert_eq!(request_tool_names(&request), vec!["SubmitBackendJobResult"]);
+    let request = wait_for_captured_request(&captured).await;
+    assert_eq!(
+        request.system_prompt.as_deref(),
+        Some("chosen custom instruction")
+    );
+    let tools = request_tool_names(&request);
+    for tool in [
+        "SubmitBackendJobResult",
+        "MemoryApplyCandidate",
+        "TaskCreate",
+    ] {
+        assert!(tools.iter().any(|name| name == tool));
+    }
 }
 
 #[tokio::test]

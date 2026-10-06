@@ -4,10 +4,19 @@
 //! transport, or LLM Tool implementations. Paths are logical and root-relative;
 //! providers supply host roots and access policy.
 
+mod checked;
+pub use checked::{CheckedTarget, identity_validator};
+mod descriptor_ignore;
 mod glob;
+#[cfg(test)]
+mod ignore_tests;
 mod local;
 mod operation;
 mod search;
+pub mod text;
+#[cfg(test)]
+mod traversal_tests;
+mod walk;
 
 use std::path::{Path, PathBuf};
 
@@ -272,6 +281,7 @@ pub fn atomic_write_beneath_no_symlinks_at(
 #[derive(Debug)]
 pub struct FsTraversalRoot {
     path: PathBuf,
+    logical_root: Option<PathBuf>,
     _directory: std::fs::File,
 }
 
@@ -279,19 +289,43 @@ impl FsTraversalRoot {
     pub fn new(path: PathBuf, directory: std::fs::File) -> Self {
         Self {
             path,
+            logical_root: None,
             _directory: directory,
         }
     }
 
+    /// Map walked paths to this logical anchor rather than the provider root.
+    pub fn new_at(path: PathBuf, directory: std::fs::File, logical_root: PathBuf) -> Self {
+        Self {
+            path,
+            logical_root: Some(logical_root),
+            _directory: directory,
+        }
+    }
+    pub fn logical_root(&self) -> Option<&Path> {
+        self.logical_root.as_deref()
+    }
     pub fn path(&self) -> &Path {
         &self.path
     }
 }
 
+/// Owned predicate used before walker descent. Paths are provider-logical;
+/// true directories require enumeration authority, other entries require read.
+pub type FsTraversalFilter = std::sync::Arc<dyn Fn(&Path, bool) -> bool + Send + Sync>;
+
 /// Provider-owned access policy used by local filesystem operations.
 pub trait FsAccessPolicy: Send + Sync {
     fn is_readable(&self, path: &Path) -> bool;
     fn is_writable(&self, path: &Path) -> bool;
+
+    fn can_enumerate_directory(&self, logical: &Path, resolved: &Path) -> bool {
+        self.is_readable_paths(logical, resolved)
+    }
+    /// Owned because the shared walker requires a 'static entry predicate.
+    fn traversal_filter(&self) -> Option<FsTraversalFilter> {
+        None
+    }
 
     /// Cooperatively stop provider-owned filesystem work. Implementations may
     /// use this for per-operation cancellation and deadlines.

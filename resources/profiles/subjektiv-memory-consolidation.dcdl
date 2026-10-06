@@ -3,13 +3,13 @@ import "./base.dcdl" // {
     description = "Delegated subject Memory staging consolidation profile.";
     scope = "workspace_read";
     model = { ref = "codex-oauth/gpt-6-luna"; };
-    engine = { reasoning = "medium"; };
+    engine = { reasoning = "medium"; instruction = "internal.subjektiv_memory_consolidation_system"; };
     web = { enabled = false; };
 
     feature = {
         task = { enabled = false; };
         memory = { enabled = false; staging_tools = false; };
-        subjektiv = { enabled = true; extraction = { enabled = false; }; };
+        subjektiv = { enabled = true; consolidation_tools = true; extraction = { enabled = false; }; };
         web = { enabled = false; };
         image = { enabled = false; };
         sub_worker = { enabled = false; };

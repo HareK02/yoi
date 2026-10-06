@@ -352,7 +352,7 @@ Deno.test("console routing projects live errors but not completion replies", () 
   } satisfies Event;
   const completionEvent = {
     event: "completions",
-    data: { kind: "file", entries: [] },
+    data: { kind: "file", prefix: "", entries: [] },
   } satisfies Event;
 
   assert(
@@ -4058,4 +4058,12 @@ Deno.test("committed history inserts current live rows after their last stable a
     ),
     ["current-user", "live-assistant"],
   );
+});
+
+Deno.test("typed Feature invocations remain visible in live and restored user messages", () => {
+  const segment = { kind: "feature_invoke" as const, invocation: {
+    invocation_id: "invoke-1", identity: "test/run", name: "run",
+    arguments: [{ name: "path", value: { kind: "string" as const, value: "資料/a b" } }],
+  } };
+  assertEquals(segmentsToText([segment]), '/run(path="資料/a b")');
 });

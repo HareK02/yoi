@@ -24,12 +24,19 @@ use crate::inline_terminal::with_inline_terminal;
 const MAX_ROWS: usize = 10;
 const VIEWPORT_LINES: u16 = MAX_ROWS as u16 + 4;
 
+#[derive(Debug)]
+enum RestoreAttemptError {
+    Conflict,
+    Unknown(io::Error),
+}
+
 #[async_trait::async_trait]
 trait BackendWorkerLifecycle {
     async fn restore(
         &self,
         target: &client::BackendRuntimeTarget,
-    ) -> Result<BackendWorkerRestoreResponse, io::Error>;
+        request: client::BackendWorkerRestoreRequest,
+    ) -> Result<BackendWorkerRestoreResponse, RestoreAttemptError>;
 
     async fn observe(
         &self,
@@ -44,13 +51,19 @@ impl BackendWorkerLifecycle for LiveBackendWorkerLifecycle {
     async fn restore(
         &self,
         target: &client::BackendRuntimeTarget,
-    ) -> Result<BackendWorkerRestoreResponse, io::Error> {
-        restore_backend_worker(target).await.map_err(|error| {
-            io::Error::other(format!(
-                "failed to restore Backend Worker {}: {error}",
-                target.display_label()
-            ))
-        })
+        request: client::BackendWorkerRestoreRequest,
+    ) -> Result<BackendWorkerRestoreResponse, RestoreAttemptError> {
+        restore_backend_worker(target, request)
+            .await
+            .map_err(|error| {
+                if error.is_restore_observation_conflict() {
+                    return RestoreAttemptError::Conflict;
+                }
+                RestoreAttemptError::Unknown(io::Error::other(format!(
+                    "failed to restore Backend Worker {}: {error}",
+                    target.display_label()
+                )))
+            })
     }
 
     async fn observe(
@@ -133,8 +146,21 @@ pub(crate) async fn run(
         let attach_target = target
             .runtime_target(selected.runtime_id.clone(), selected.worker_id.clone())
             .map_err(|error| io::Error::other(error.to_string()))?;
-        let attach_target =
-            prepare_selected_worker(&LiveBackendWorkerLifecycle, attach_target, intent).await?;
+        let restore_request =
+            selected
+                .restore_observation_token
+                .map(|token| client::BackendWorkerRestoreRequest {
+                    expected_observation_token: token,
+                    request_id: uuid::Uuid::now_v7().to_string(),
+                });
+        let attach_target = prepare_selected_worker(
+            &LiveBackendWorkerLifecycle,
+            attach_target,
+            intent,
+            restore_request,
+            confirm_restore_recovery,
+        )
+        .await?;
         return console::run_backend_runtime(attach_target).await;
     }
 }
@@ -143,10 +169,62 @@ async fn prepare_selected_worker(
     lifecycle: &impl BackendWorkerLifecycle,
     mut target: client::BackendRuntimeTarget,
     intent: BackendWorkerPickerIntent,
+    restore_request: Option<client::BackendWorkerRestoreRequest>,
+    mut confirm_recovery: impl FnMut(&str) -> io::Result<bool>,
 ) -> Result<client::BackendRuntimeTarget, io::Error> {
     if intent == BackendWorkerPickerIntent::Resume {
-        let response = lifecycle.restore(&target).await?;
-        ensure_restore_accepted(&response)?;
+        let request = restore_request.ok_or_else(|| {
+            io::Error::other("Worker has no current Restore observation; refresh and select again")
+        })?;
+        loop {
+            let unknown = match lifecycle.restore(&target, request.clone()).await {
+                Ok(response) if response.result.state == BackendWorkerRestoreState::Accepted => {
+                    break;
+                }
+                Ok(response) => {
+                    let error = ensure_restore_accepted(&response).unwrap_err();
+                    if response.result.state != BackendWorkerRestoreState::ReconciliationRequired {
+                        return Err(error);
+                    }
+                    error
+                }
+                Err(RestoreAttemptError::Conflict) => {
+                    return Err(io::Error::other(
+                        "Restore observation changed; refresh the Worker list and select again. No new Restore was started.",
+                    ));
+                }
+                Err(RestoreAttemptError::Unknown(error)) => error,
+            };
+            // Refresh is evidence only: GET cannot reconcile a pending Restore.
+            // A changed observation must never replace this admitted/unknown tuple.
+            let observation = match lifecycle.observe(&target).await {
+                Ok(observation) => match observation.observation {
+                    WorkerSessionAvailability::LiveProtocol => "live_protocol".into(),
+                    WorkerSessionAvailability::RetainedSnapshot { .. } => {
+                        "retained_snapshot".into()
+                    }
+                    WorkerSessionAvailability::Unavailable { reason, message } => format!(
+                        "{reason:?}: {}",
+                        message.chars().take(512).collect::<String>()
+                    ),
+                },
+                Err(error) => format!("refresh failed: {error}"),
+            };
+            let detail = format!(
+                "Restore outcome unknown/pending: {}. Current observation: {}. Recovery request_id={}, expected_observation_token={}. Retry only this exact request; do not start a new Restore intent.",
+                unknown.to_string().chars().take(512).collect::<String>(),
+                observation.chars().take(512).collect::<String>(),
+                request.request_id,
+                request.expected_observation_token,
+            );
+            // Every subsequent POST requires a new explicit user confirmation.
+            let retry = confirm_recovery(&detail).map_err(|error| {
+                io::Error::other(format!("{detail}; recovery prompt failed: {error}"))
+            })?;
+            if !retry {
+                return Err(io::Error::other(detail));
+            }
+        }
         let observation = lifecycle.observe(&target).await?;
         require_live_resume_observation(observation.observation)?;
         return Ok(target);
@@ -157,8 +235,34 @@ async fn prepare_selected_worker(
     Ok(target)
 }
 
+fn confirm_restore_recovery(detail: &str) -> io::Result<bool> {
+    with_inline_terminal(8, |terminal| {
+        loop {
+            terminal.draw(|frame| {
+                let message = vec![
+                    Line::from("Restore needs explicit result recovery"),
+                    Line::from("Enter: retry the SAME request   Esc/Ctrl-C: cancel recovery"),
+                    Line::from(detail),
+                ];
+                frame.render_widget(
+                    Paragraph::new(message).wrap(ratatui::widgets::Wrap { trim: false }),
+                    frame.area(),
+                );
+            })?;
+            match poll_event()? {
+                Some(Action::Submit) => return Ok(true),
+                Some(Action::Cancel) => return Ok(false),
+                _ => {}
+            }
+        }
+    })
+}
+
 fn is_resume_candidate(worker: &BackendWorkerSummary) -> bool {
-    worker.worker_state.is_none()
+    worker.availability == protocol::subscription::SubscriptionWorkerAvailability::Observed
+        && worker.state == "stopped"
+        && worker.worker_state.is_none()
+        && worker.restore_observation_token.is_some()
 }
 
 fn ensure_restore_accepted(response: &BackendWorkerRestoreResponse) -> Result<(), io::Error> {
@@ -526,6 +630,18 @@ fn working_directory_text(worker: &BackendWorkerSummary) -> String {
         BackendWorkingDirectorySource::Repository { repository_key } => {
             (repository_key.as_str(), String::new())
         }
+        BackendWorkingDirectorySource::WorkspaceConfig { .. } => {
+            // Logical config access is not host filesystem or COMMAND authority.
+            let permissions = &attachment.effective_permissions;
+            let mut categories = Vec::new();
+            if permissions.read {
+                categories.push("READ");
+            }
+            if permissions.write {
+                categories.push("EDIT");
+            }
+            ("workspace-config", format!("・{}", categories.join("・")))
+        }
         BackendWorkingDirectorySource::ExternalGrant { .. } => {
             let permissions = &attachment.effective_permissions;
             let mut categories = Vec::new();
@@ -558,6 +674,7 @@ mod tests {
 
     fn worker(runtime_id: &str, worker_id: &str, profile: Option<&str>) -> BackendWorkerSummary {
         BackendWorkerSummary {
+            restore_observation_token: Some("observed-worker-generation".into()),
             runtime_id: runtime_id.to_string(),
             worker_id: worker_id.to_string(),
             resource_key: "W-1".to_string(),
@@ -630,7 +747,8 @@ mod tests {
         async fn restore(
             &self,
             _target: &client::BackendRuntimeTarget,
-        ) -> Result<BackendWorkerRestoreResponse, io::Error> {
+            _request: client::BackendWorkerRestoreRequest,
+        ) -> Result<BackendWorkerRestoreResponse, RestoreAttemptError> {
             self.calls.lock().unwrap().push("restore");
             Ok(self.restore_response.clone())
         }
@@ -661,6 +779,312 @@ mod tests {
         serde_json::from_value(value).unwrap()
     }
 
+    // Exercise the existing picker flow against real Runtime admission, not a
+    // fake request -> operation-ID association. Only execution and transport are
+    // faked; Runtime owns the pending operation and receipt reconciliation.
+    #[derive(Default)]
+    struct PendingRuntimeBackend {
+        operations: std::sync::Mutex<Vec<worker_runtime::execution::WorkerLifecycleOperationId>>,
+    }
+
+    impl worker_runtime::execution::WorkerExecutionBackend for PendingRuntimeBackend {
+        fn backend_id(&self) -> &str {
+            "tui-recovery-test"
+        }
+
+        fn spawn_worker(
+            &self,
+            _: worker_runtime::execution::WorkerExecutionSpawnRequest,
+        ) -> worker_runtime::execution::WorkerExecutionSpawnResult {
+            worker_runtime::execution::WorkerExecutionSpawnResult::connected(
+                protocol::WorkerStateSnapshot {
+                    last_command_id: 0,
+                    last_finished_submission_request_id: None,
+                    state: protocol::WorkerState::Idle,
+                },
+                Vec::new(),
+            )
+        }
+
+        fn restore_worker(
+            &self,
+            request: worker_runtime::execution::WorkerExecutionRestoreRequest,
+        ) -> worker_runtime::execution::WorkerExecutionSpawnResult {
+            use worker_runtime::execution::*;
+            let mut operations = self.operations.lock().unwrap();
+            operations.push(request.operation_id);
+            if operations.len() == 1 {
+                WorkerExecutionSpawnResult::ReconciliationRequired {
+                    result: WorkerExecutionResult::errored(
+                        WorkerExecutionOperation::Restore,
+                        "unknown execution acknowledgement",
+                    ),
+                    worker_state: None,
+                    workdir_attachments: Vec::new(),
+                }
+            } else {
+                WorkerExecutionSpawnResult::connected(
+                    protocol::WorkerStateSnapshot {
+                        last_command_id: 0,
+                        last_finished_submission_request_id: None,
+                        state: protocol::WorkerState::Idle,
+                    },
+                    Vec::new(),
+                )
+            }
+        }
+
+        fn stop_worker(
+            &self,
+            _: &worker_runtime::identity::WorkerRef,
+        ) -> worker_runtime::execution::WorkerExecutionResult {
+            worker_runtime::execution::WorkerExecutionResult::accepted(
+                worker_runtime::execution::WorkerExecutionOperation::Stop,
+            )
+        }
+
+        fn dispatch_input(
+            &self,
+            _: &worker_runtime::identity::WorkerRef,
+            _: worker_runtime::interaction::WorkerInput,
+        ) -> worker_runtime::execution::WorkerExecutionResult {
+            panic!("Restore must not dispatch input")
+        }
+    }
+
+    struct RuntimeRecoveryLifecycle {
+        runtime: worker_runtime::Runtime,
+        worker: worker_runtime::identity::WorkerRef,
+        lose_first_reply: bool,
+        requests: std::sync::Mutex<
+            Vec<(
+                client::BackendRuntimeTarget,
+                client::BackendWorkerRestoreRequest,
+            )>,
+        >,
+        observations: std::sync::Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl BackendWorkerLifecycle for RuntimeRecoveryLifecycle {
+        async fn restore(
+            &self,
+            target: &client::BackendRuntimeTarget,
+            request: client::BackendWorkerRestoreRequest,
+        ) -> Result<BackendWorkerRestoreResponse, RestoreAttemptError> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push((target.clone(), request.clone()));
+            assert_eq!(target.worker_id, self.worker.worker_id.to_string());
+            let result = self
+                .runtime
+                .restore_worker_operation(
+                    &self.worker,
+                    serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap(),
+                )
+                .map_err(|error| match error {
+                    worker_runtime::error::RuntimeError::RestoreObservationConflict { .. } => {
+                        RestoreAttemptError::Conflict
+                    }
+                    error => RestoreAttemptError::Unknown(io::Error::other(error.to_string())),
+                })?;
+            if self.lose_first_reply && self.requests.lock().unwrap().len() == 1 {
+                return Err(RestoreAttemptError::Unknown(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "reply lost after admission",
+                )));
+            }
+            let mut response = restore_response(result.state);
+            response.runtime_id = target.runtime_id.clone();
+            response.worker_id = target.worker_id.clone();
+            Ok(response)
+        }
+
+        async fn observe(
+            &self,
+            _: &client::BackendRuntimeTarget,
+        ) -> Result<WorkspaceWorkerSessionResponse, io::Error> {
+            *self.observations.lock().unwrap() += 1;
+            Ok(session_observation(
+                serde_json::json!({"availability": "live_protocol"}),
+            ))
+        }
+    }
+
+    fn pending_runtime_lifecycle(
+        lose_first_reply: bool,
+    ) -> (
+        RuntimeRecoveryLifecycle,
+        std::sync::Arc<PendingRuntimeBackend>,
+        client::BackendRuntimeTarget,
+        client::BackendWorkerRestoreRequest,
+    ) {
+        use worker_runtime::catalog::*;
+        let backend = std::sync::Arc::new(PendingRuntimeBackend::default());
+        let runtime =
+            worker_runtime::Runtime::with_execution_backend(Default::default(), backend.clone())
+                .unwrap();
+        let archive = worker_runtime::profile_archive::ProfileSourceArchive::build(
+            worker_runtime::profile_archive::ProfileSourceArchiveInput {
+                id: "tui-recovery-profile".into(),
+                entrypoints: std::collections::BTreeMap::from([(
+                    "builtin:coder".into(),
+                    "coder.dcdl".into(),
+                )]),
+                imports: Default::default(),
+                sources: std::collections::BTreeMap::from([("coder.dcdl".into(), "{}".into())]),
+            },
+        )
+        .unwrap();
+        let worker = runtime
+            .create_worker(CreateWorkerRequest {
+                worker_id: protocol::WorkerId::now_v7(),
+                create_fingerprint: "tui-recovery-create".into(),
+                profile: ProfileSelector::Builtin("builtin:coder".into()),
+                display_name: None,
+                profile_source: ProfileSourceArchiveSource::Embedded { archive },
+                config_bundle: None,
+                initial_input: None,
+                workdir_attachment_requests: Vec::new(),
+                workdir_attachments: Vec::new(),
+                worker_observation_enabled: false,
+                worker_observation_grants: Vec::new(),
+                workspace_api: None,
+                memory_settings: Some(manifest::WorkspaceMemorySettingsSnapshot {
+                    workspace_id: "local".into(),
+                    settings_revision: 1,
+                    language: "English".into(),
+                }),
+                subjektiv_attached: false,
+            })
+            .unwrap();
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        let request = client::BackendWorkerRestoreRequest {
+            expected_observation_token: runtime
+                .worker_detail(&worker.worker_ref)
+                .unwrap()
+                .restore_observation_token
+                .unwrap(),
+            request_id: "tui-original-request".into(),
+        };
+        let target = client::BackendRuntimeTarget::new(
+            "http://127.0.0.1:3000",
+            "workspace-a",
+            "runtime-a",
+            worker.worker_id.to_string(),
+        );
+        (
+            RuntimeRecoveryLifecycle {
+                runtime,
+                worker: worker.worker_ref,
+                lose_first_reply,
+                requests: Default::default(),
+                observations: Default::default(),
+            },
+            backend,
+            target,
+            request,
+        )
+    }
+
+    #[tokio::test]
+    async fn resume_explicit_transport_and_pending_retries_preserve_tuple_and_runtime_operation() {
+        for lost_reply in [true, false] {
+            let (lifecycle, backend, target, request) = pending_runtime_lifecycle(lost_reply);
+            let mut confirmations = 0;
+            let prepared = prepare_selected_worker(
+                &lifecycle,
+                target.clone(),
+                BackendWorkerPickerIntent::Resume,
+                Some(request.clone()),
+                |detail| {
+                    confirmations += 1;
+                    assert_eq!(
+                        backend.operations.lock().unwrap().len(),
+                        1,
+                        "no POST before explicit retry confirmation"
+                    );
+                    assert!(detail.contains(&format!("request_id={}", request.request_id)));
+                    assert!(detail.contains(&format!(
+                        "expected_observation_token={}",
+                        request.expected_observation_token
+                    )));
+                    assert_ne!(
+                        lifecycle
+                            .runtime
+                            .worker_detail(&lifecycle.worker)
+                            .unwrap()
+                            .restore_observation_token
+                            .as_ref(),
+                        Some(&request.expected_observation_token),
+                        "fresh observation must not replace recovery tuple"
+                    );
+                    Ok(true)
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(prepared, target);
+            assert_eq!(confirmations, 1);
+            assert_eq!(
+                lifecycle.requests.lock().unwrap().as_slice(),
+                &[(target.clone(), request.clone()), (target, request)]
+            );
+            let operations = backend.operations.lock().unwrap();
+            assert_eq!(operations.len(), 2);
+            assert_eq!(
+                operations[0], operations[1],
+                "Runtime pending lifecycle operation must not be replaced"
+            );
+            assert_eq!(
+                *lifecycle.observations.lock().unwrap(),
+                2,
+                "GET after uncertainty and after acceptance"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_cancelled_unknown_recovery_has_no_automatic_retry_and_reports_original_identity()
+     {
+        let (lifecycle, backend, target, request) = pending_runtime_lifecycle(true);
+        let error = prepare_selected_worker(
+            &lifecycle,
+            target,
+            BackendWorkerPickerIntent::Resume,
+            Some(request.clone()),
+            |_| Ok(false),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(&request.request_id));
+        assert!(error.contains(&request.expected_observation_token));
+        assert_eq!(backend.operations.lock().unwrap().len(), 1);
+        assert_eq!(lifecycle.requests.lock().unwrap().len(), 1);
+        assert_eq!(*lifecycle.observations.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn resume_stale_conflict_never_offers_same_intent_retry() {
+        let (lifecycle, backend, target, mut request) = pending_runtime_lifecycle(false);
+        request.expected_observation_token = "stale-token".into();
+        let error = prepare_selected_worker(
+            &lifecycle,
+            target,
+            BackendWorkerPickerIntent::Resume,
+            Some(request),
+            |_| panic!("stale conflict must not offer unknown-result retry"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("refresh the Worker list"));
+        assert!(backend.operations.lock().unwrap().is_empty());
+        assert_eq!(*lifecycle.observations.lock().unwrap(), 0);
+    }
+
     #[tokio::test]
     async fn resume_restores_before_requiring_live_observation() {
         let lifecycle = FakeBackendWorkerLifecycle {
@@ -677,10 +1101,18 @@ mod tests {
             "worker-a",
         );
 
-        let prepared =
-            prepare_selected_worker(&lifecycle, target, BackendWorkerPickerIntent::Resume)
-                .await
-                .unwrap();
+        let prepared = prepare_selected_worker(
+            &lifecycle,
+            target,
+            BackendWorkerPickerIntent::Resume,
+            Some(client::BackendWorkerRestoreRequest {
+                expected_observation_token: "observed-worker-generation".into(),
+                request_id: "resume-operation".into(),
+            }),
+            |_| Ok(false),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(*lifecycle.calls.lock().unwrap(), ["restore", "observe"]);
         assert!(prepared.initial_snapshot.is_none());
@@ -704,10 +1136,19 @@ mod tests {
             "worker-a",
         );
 
-        let error = prepare_selected_worker(&lifecycle, target, BackendWorkerPickerIntent::Resume)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = prepare_selected_worker(
+            &lifecycle,
+            target,
+            BackendWorkerPickerIntent::Resume,
+            Some(client::BackendWorkerRestoreRequest {
+                expected_observation_token: "observed-worker-generation".into(),
+                request_id: "resume-operation".into(),
+            }),
+            |_| Ok(false),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
 
         assert!(error.contains("Rejected"));
         assert_eq!(*lifecycle.calls.lock().unwrap(), ["restore"]);
@@ -724,7 +1165,7 @@ mod tests {
 
         assert!(!is_resume_candidate(&live));
         assert!(is_resume_candidate(&stopped));
-        assert!(is_resume_candidate(&unknown));
+        assert!(!is_resume_candidate(&unknown));
     }
 
     #[test]
@@ -858,6 +1299,37 @@ mod tests {
         );
         assert!(!text.contains("profile:"));
         assert!(!text.contains("active clean"));
+    }
+
+    #[test]
+    fn logical_config_attachment_labels_editability_without_command_or_host_path() {
+        for (access, write, expected) in [
+            ("read_only", false, "READ"),
+            ("read_write", true, "READ・EDIT"),
+        ] {
+            let mut worker = worker("runtime-a", "worker-b", None);
+            worker.workdir_attachments = vec![serde_json::from_value(serde_json::json!({
+                "alias": "workspace-config",
+                "effective_permissions": {"read": true, "write": write, "command": false},
+                "working_directory": {
+                    "working_directory_id": "logical-config-1",
+                    "display_name": "Workspace configuration",
+                    "source": {"kind": "workspace_config", "access": access,
+                        "content_path": "/workspace-config", "purpose": "Workspace configuration"},
+                    "materializer_kind": "logical_workspace_config",
+                    "status": "active"
+                }
+            })).unwrap()];
+            let text = working_directory_text(&worker);
+            assert_eq!(
+                text,
+                format!(
+                    "wd:workspace-config:Workspace configuration・{expected}・logical-config-1"
+                )
+            );
+            assert!(!text.contains("COMMAND"));
+            assert!(!text.contains("/workspace-config"));
+        }
     }
 
     #[test]

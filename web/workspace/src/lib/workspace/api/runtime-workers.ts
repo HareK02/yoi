@@ -10,8 +10,12 @@ import type {
   RuntimeCleanupPlanResponse,
   RuntimeWorkerLifecycleResult,
   WorkerOperationState,
+  WorkerRestoreResponse,
+  WorkerRestoreState,
   WorkerRetentionResponse,
 } from "#lib/generated/runtime-api.ts";
+
+import { parseWorkerSummary } from "#lib/workspace/api/workers.ts";
 
 const MAX_STRING_BYTES = 4_096;
 const MAX_CANDIDATES = 1_000;
@@ -68,14 +72,20 @@ function exactKeys(
 ): void {
   const allowed = new Set([...required, ...optional]);
   for (const key of Object.keys(value)) {
-    if (!allowed.has(key)) fail(`${path}.${key}`, "is not part of the wire contract");
+    if (!allowed.has(key)) {
+      fail(`${path}.${key}`, "is not part of the wire contract");
+    }
   }
   for (const key of required) {
     if (!Object.hasOwn(value, key)) fail(`${path}.${key}`, "is required");
   }
 }
 
-function boundedString(value: unknown, path: string, allowEmpty = false): string {
+function boundedString(
+  value: unknown,
+  path: string,
+  allowEmpty = false,
+): string {
   if (typeof value !== "string") return fail(path, "must be a string");
   if (!allowEmpty && value.length === 0) return fail(path, "must not be empty");
   if (encoder.encode(value).byteLength > MAX_STRING_BYTES) {
@@ -91,7 +101,9 @@ function boolean(value: unknown, path: string): boolean {
 
 function array(value: unknown, path: string, max: number): unknown[] {
   if (!Array.isArray(value)) return fail(path, "must be an array");
-  if (value.length > max) return fail(path, `must contain at most ${max} items`);
+  if (value.length > max) {
+    return fail(path, `must contain at most ${max} items`);
+  }
   return value;
 }
 
@@ -101,12 +113,18 @@ function strings(value: unknown, path: string): string[] {
   );
 }
 
-function optionalNullableString(value: unknown, path: string): string | null | undefined {
+function optionalNullableString(
+  value: unknown,
+  path: string,
+): string | null | undefined {
   if (value === undefined || value === null) return value;
   return boundedString(value, path);
 }
 
-function optionalNullableSafeInteger(value: unknown, path: string): number | null | undefined {
+function optionalNullableSafeInteger(
+  value: unknown,
+  path: string,
+): number | null | undefined {
   if (value === undefined || value === null) return value;
   if (!Number.isSafeInteger(value) || (value as number) < 0) {
     return fail(path, "must be a non-negative safe integer");
@@ -115,7 +133,9 @@ function optionalNullableSafeInteger(value: unknown, path: string): number | nul
 }
 
 function targetKind(value: unknown, path: string): CleanupTargetKind {
-  if (typeof value !== "string" || !TARGET_KINDS.has(value as CleanupTargetKind)) {
+  if (
+    typeof value !== "string" || !TARGET_KINDS.has(value as CleanupTargetKind)
+  ) {
     return fail(path, "has an unknown cleanup action");
   }
   return value as CleanupTargetKind;
@@ -164,13 +184,25 @@ function workerCandidate(value: unknown, path: string): CleanupWorkerCandidate {
     target_id: boundedString(item.target_id, `${path}.target_id`),
     action: targetKind(item.action, `${path}.action`),
     worker_id: boundedString(item.worker_id, `${path}.worker_id`),
-    runtime_worker_id: boundedString(item.runtime_worker_id, `${path}.runtime_worker_id`),
+    runtime_worker_id: boundedString(
+      item.runtime_worker_id,
+      `${path}.runtime_worker_id`,
+    ),
     runtime_id: boundedString(item.runtime_id, `${path}.runtime_id`),
     reason: boundedString(item.reason, `${path}.reason`, true),
-    blocking_reason: optionalNullableString(item.blocking_reason, `${path}.blocking_reason`),
+    blocking_reason: optionalNullableString(
+      item.blocking_reason,
+      `${path}.blocking_reason`,
+    ),
     pinned: boolean(item.pinned, `${path}.pinned`),
-    retention_state: boundedString(item.retention_state, `${path}.retention_state`),
-    linked_workdir_ids: strings(item.linked_workdir_ids, `${path}.linked_workdir_ids`),
+    retention_state: boundedString(
+      item.retention_state,
+      `${path}.retention_state`,
+    ),
+    linked_workdir_ids: strings(
+      item.linked_workdir_ids,
+      `${path}.linked_workdir_ids`,
+    ),
     running_linked: boolean(item.running_linked, `${path}.running_linked`),
     estimated_reclaim_bytes: optionalNullableSafeInteger(
       item.estimated_reclaim_bytes,
@@ -179,7 +211,10 @@ function workerCandidate(value: unknown, path: string): CleanupWorkerCandidate {
   };
 }
 
-function workdirCandidate(value: unknown, path: string): CleanupWorkdirCandidate {
+function workdirCandidate(
+  value: unknown,
+  path: string,
+): CleanupWorkdirCandidate {
   const item = object(value, path);
   exactKeys(
     item,
@@ -213,10 +248,19 @@ function workdirCandidate(value: unknown, path: string): CleanupWorkdirCandidate
     action: targetKind(item.action, `${path}.action`),
     workdir_id: boundedString(item.workdir_id, `${path}.workdir_id`),
     runtime_id: boundedString(item.runtime_id, `${path}.runtime_id`),
-    repository_key: boundedString(item.repository_key, `${path}.repository_key`),
+    repository_key: boundedString(
+      item.repository_key,
+      `${path}.repository_key`,
+    ),
     reason: boundedString(item.reason, `${path}.reason`, true),
-    blocking_reason: optionalNullableString(item.blocking_reason, `${path}.blocking_reason`),
-    linked_worker_ids: strings(item.linked_worker_ids, `${path}.linked_worker_ids`),
+    blocking_reason: optionalNullableString(
+      item.blocking_reason,
+      `${path}.blocking_reason`,
+    ),
+    linked_worker_ids: strings(
+      item.linked_worker_ids,
+      `${path}.linked_worker_ids`,
+    ),
     linked_running_worker_ids: strings(
       item.linked_running_worker_ids,
       `${path}.linked_running_worker_ids`,
@@ -232,7 +276,9 @@ function workdirCandidate(value: unknown, path: string): CleanupWorkdirCandidate
   };
 }
 
-export function parseWorkerRetentionResponse(value: unknown): WorkerRetentionResponse {
+export function parseWorkerRetentionResponse(
+  value: unknown,
+): WorkerRetentionResponse {
   const item = object(value, "Worker retention response");
   exactKeys(
     item,
@@ -241,9 +287,18 @@ export function parseWorkerRetentionResponse(value: unknown): WorkerRetentionRes
     "Worker retention response",
   );
   return {
-    workspace_id: boundedString(item.workspace_id, "Worker retention response.workspace_id"),
-    runtime_id: boundedString(item.runtime_id, "Worker retention response.runtime_id"),
-    worker_id: boundedString(item.worker_id, "Worker retention response.worker_id"),
+    workspace_id: boundedString(
+      item.workspace_id,
+      "Worker retention response.workspace_id",
+    ),
+    runtime_id: boundedString(
+      item.runtime_id,
+      "Worker retention response.runtime_id",
+    ),
+    worker_id: boundedString(
+      item.worker_id,
+      "Worker retention response.worker_id",
+    ),
     pinned: boolean(item.pinned, "Worker retention response.pinned"),
     retention_state: boundedString(
       item.retention_state,
@@ -268,7 +323,10 @@ export function parseRuntimeWorkerLifecycleResult(
     [],
     "Runtime Worker lifecycle result",
   );
-  const state = boundedString(item.state, "Runtime Worker lifecycle result.state");
+  const state = boundedString(
+    item.state,
+    "Runtime Worker lifecycle result.state",
+  );
   if (!WORKER_OPERATION_STATES.has(state as WorkerOperationState)) {
     fail("Runtime Worker lifecycle result.state", "has an unknown value");
   }
@@ -289,7 +347,58 @@ export function parseRuntimeWorkerLifecycleResult(
   };
 }
 
-export function parseRuntimeCleanupPlan(value: unknown): RuntimeCleanupPlanResponse {
+/** Restore is a wrapped Workspace response, not the flat Stop lifecycle result. */
+export function parseWorkerRestoreResponse(
+  value: unknown,
+): WorkerRestoreResponse {
+  const path = "Worker Restore response";
+  const item = object(value, path);
+  exactKeys(
+    item,
+    ["workspace_id", "runtime_id", "worker_id", "result"],
+    [],
+    path,
+  );
+  const result = object(item.result, `${path}.result`);
+  exactKeys(result, ["state"], ["diagnostics", "worker"], `${path}.result`);
+  const state = boundedString(result.state, `${path}.result.state`);
+  if (
+    !["accepted", "rejected", "rolled_back", "reconciliation_required"]
+      .includes(state)
+  ) {
+    fail(`${path}.result.state`, "has an unknown value");
+  }
+  const workspace_id = boundedString(item.workspace_id, `${path}.workspace_id`);
+  const runtime_id = boundedString(item.runtime_id, `${path}.runtime_id`);
+  const worker_id = boundedString(item.worker_id, `${path}.worker_id`);
+  const worker = result.worker == null
+    ? result.worker as null | undefined
+    : parseWorkerSummary(result.worker);
+  if (
+    worker &&
+    (worker.runtime_id !== runtime_id || worker.worker_id !== worker_id ||
+      (worker.workspace.workspace_id != null &&
+        worker.workspace.workspace_id !== workspace_id))
+  ) {
+    fail(`${path}.result.worker`, "does not match the response identity");
+  }
+  return {
+    workspace_id,
+    runtime_id,
+    worker_id,
+    result: {
+      state: state as WorkerRestoreState,
+      diagnostics: result.diagnostics === undefined
+        ? []
+        : diagnostics(result.diagnostics, `${path}.result.diagnostics`),
+      worker,
+    },
+  };
+}
+
+export function parseRuntimeCleanupPlan(
+  value: unknown,
+): RuntimeCleanupPlanResponse {
   const item = object(value, "Runtime cleanup plan");
   exactKeys(
     item,
@@ -307,22 +416,44 @@ export function parseRuntimeCleanupPlan(value: unknown): RuntimeCleanupPlanRespo
     "Runtime cleanup plan",
   );
   return {
-    workspace_id: boundedString(item.workspace_id, "Runtime cleanup plan.workspace_id"),
-    runtime_id: boundedString(item.runtime_id, "Runtime cleanup plan.runtime_id"),
-    generated_at: boundedString(item.generated_at, "Runtime cleanup plan.generated_at"),
+    workspace_id: boundedString(
+      item.workspace_id,
+      "Runtime cleanup plan.workspace_id",
+    ),
+    runtime_id: boundedString(
+      item.runtime_id,
+      "Runtime cleanup plan.runtime_id",
+    ),
+    generated_at: boundedString(
+      item.generated_at,
+      "Runtime cleanup plan.generated_at",
+    ),
     revision: boundedString(item.revision, "Runtime cleanup plan.revision"),
     digest: boundedString(item.digest, "Runtime cleanup plan.digest"),
-    workers: array(item.workers, "Runtime cleanup plan.workers", MAX_CANDIDATES).map(
-      (entry, index) => workerCandidate(entry, `Runtime cleanup plan.workers[${index}]`),
+    workers: array(item.workers, "Runtime cleanup plan.workers", MAX_CANDIDATES)
+      .map(
+        (entry, index) =>
+          workerCandidate(entry, `Runtime cleanup plan.workers[${index}]`),
+      ),
+    workdirs: array(
+      item.workdirs,
+      "Runtime cleanup plan.workdirs",
+      MAX_CANDIDATES,
+    ).map(
+      (entry, index) =>
+        workdirCandidate(entry, `Runtime cleanup plan.workdirs[${index}]`),
     ),
-    workdirs: array(item.workdirs, "Runtime cleanup plan.workdirs", MAX_CANDIDATES).map(
-      (entry, index) => workdirCandidate(entry, `Runtime cleanup plan.workdirs[${index}]`),
+    diagnostics: diagnostics(
+      item.diagnostics,
+      "Runtime cleanup plan.diagnostics",
     ),
-    diagnostics: diagnostics(item.diagnostics, "Runtime cleanup plan.diagnostics"),
   };
 }
 
-function executionResult(value: unknown, path: string): RuntimeCleanupExecutionResult {
+function executionResult(
+  value: unknown,
+  path: string,
+): RuntimeCleanupExecutionResult {
   const item = object(value, path);
   exactKeys(item, ["target_id", "action", "status", "message"], [], path);
   return {
@@ -339,18 +470,42 @@ export function parseRuntimeCleanupExecution(
   const item = object(value, "Runtime cleanup execution");
   exactKeys(
     item,
-    ["workspace_id", "runtime_id", "executed_at", "results", "plan_after", "diagnostics"],
+    [
+      "workspace_id",
+      "runtime_id",
+      "executed_at",
+      "results",
+      "plan_after",
+      "diagnostics",
+    ],
     [],
     "Runtime cleanup execution",
   );
   return {
-    workspace_id: boundedString(item.workspace_id, "Runtime cleanup execution.workspace_id"),
-    runtime_id: boundedString(item.runtime_id, "Runtime cleanup execution.runtime_id"),
-    executed_at: boundedString(item.executed_at, "Runtime cleanup execution.executed_at"),
-    results: array(item.results, "Runtime cleanup execution.results", MAX_RESULTS).map(
-      (entry, index) => executionResult(entry, `Runtime cleanup execution.results[${index}]`),
+    workspace_id: boundedString(
+      item.workspace_id,
+      "Runtime cleanup execution.workspace_id",
+    ),
+    runtime_id: boundedString(
+      item.runtime_id,
+      "Runtime cleanup execution.runtime_id",
+    ),
+    executed_at: boundedString(
+      item.executed_at,
+      "Runtime cleanup execution.executed_at",
+    ),
+    results: array(
+      item.results,
+      "Runtime cleanup execution.results",
+      MAX_RESULTS,
+    ).map(
+      (entry, index) =>
+        executionResult(entry, `Runtime cleanup execution.results[${index}]`),
     ),
     plan_after: parseRuntimeCleanupPlan(item.plan_after),
-    diagnostics: diagnostics(item.diagnostics, "Runtime cleanup execution.diagnostics"),
+    diagnostics: diagnostics(
+      item.diagnostics,
+      "Runtime cleanup execution.diagnostics",
+    ),
   };
 }

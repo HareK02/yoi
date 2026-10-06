@@ -13,6 +13,8 @@ mod console;
 mod e2e_observer;
 mod inline_terminal;
 mod input;
+#[cfg(test)]
+mod invocation_tests;
 pub mod keys;
 mod markdown;
 mod scroll;

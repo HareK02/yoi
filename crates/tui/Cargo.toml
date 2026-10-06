@@ -31,5 +31,6 @@ async-trait.workspace = true
 agen.workspace = true
 
 [dev-dependencies]
+worker-runtime.workspace = true
 async-trait.workspace = true
 tempfile = { workspace = true }

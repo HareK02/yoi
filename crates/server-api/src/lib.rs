@@ -11,6 +11,7 @@ pub use api_macros::axum as server_support;
 pub use api_macros::reqwest as client_support;
 pub use api_macros::{ApiContract, BinaryBody, HttpMethod, TransportMetadata, WebSocketOperation};
 pub mod repository_openapi_typescript;
+mod workspace_config;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -18,6 +19,7 @@ use webauthn_rs_proto::{
     CreationChallengeResponse, PublicKeyCredential, RegisterPublicKeyCredential,
     RequestChallengeResponse,
 };
+pub use workspace_config::*;
 
 #[allow(dead_code)]
 #[derive(JsonSchema)]
@@ -190,10 +192,32 @@ impl_openapi_schema!(
     WorkingDirectoryListResponse,
     WorkingDirectoryDetailResponse,
     WorkingDirectoryCreateResponse,
+    CurrentWorkerWorkdirCatalogQuery,
+    CurrentWorkerWorkdirCatalogResponse,
     CurrentWorkerWorkdirAttachRequest,
     CurrentWorkerWorkdirAttachmentResponse,
+    CurrentWorkerWorkdirAttachmentItem,
+    CurrentWorkerWorkdirAttachmentListQuery,
+    CurrentWorkerWorkdirAttachmentListResponse,
+    CurrentWorkerWorkdirDetachQuery,
     CurrentWorkerWorkdirOperationRequest,
     CurrentWorkerWorkdirOperationResponse,
+    WorkspaceConfigAccess,
+    WorkspaceConfigNodeKind,
+    WorkspaceConfigFailureClassification,
+    WorkspaceConfigAttachRequest,
+    WorkspaceConfigAttachment,
+    WorkspaceConfigCurrentResponse,
+    WorkspaceConfigObserveRequest,
+    WorkspaceConfigNode,
+    WorkspaceConfigObserveResponse,
+    WorkspaceConfigReadRequest,
+    WorkspaceConfigReadResponse,
+    WorkspaceConfigCommitRequest,
+    WorkspaceConfigCommitResponse,
+    WorkspaceConfigApiError,
+    WorkspaceConfigGrantCreateRequest,
+    WorkspaceConfigGrantResponse,
     ExternalWorkdirGrantCreateRequest,
     ExternalWorkdirGrantResponse,
     WorkspaceResponse,
@@ -237,6 +261,7 @@ impl_openapi_schema!(
     MemoryConsolidateStagingRequest,
     MemoryConsolidationResponse,
     SubjektivSubjectCreateRequest,
+    SubjektivSubjectBehaviorUpdateRequest,
     SubjektivSubjectListQuery,
     SubjektivSubjectListResponse,
     SubjektivSubjectResponse,
@@ -364,6 +389,7 @@ impl_openapi_schema!(
     WorkspaceRuntimeListResponse,
     RuntimeWorkerListResponse,
     WorkerRestoreResponse,
+    WorkerRestoreRequest,
     WorkerControlSubject,
     WorkerControlRecord,
     WorkerControlListResponse,
@@ -1163,6 +1189,20 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] subject_id: String,
     ) -> Result<SubjektivSubjectResponse, RepositoryApiError>;
+    #[patch(
+        "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/behavior",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        bearer_auth = true,
+        browser_auth = true,
+    )]
+    async fn subjektiv_subject_behavior_update(
+        &self,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+        #[body] request: SubjektivSubjectBehaviorUpdateRequest,
+    ) -> Result<SubjektivSubjectResponse, RepositoryApiError>;
     #[get(
         "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/surface",
         status = 200,
@@ -1513,6 +1553,7 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] runtime_id: String,
         #[path] worker_id: String,
+        #[body] request: WorkerRestoreRequest,
     ) -> Result<WorkerRestoreResponse, RepositoryApiError>;
     #[get(
         "/api/w/{workspace_id}/worker-observation/sessions",
@@ -2038,8 +2079,10 @@ pub trait ServerApi {
     )]
     async fn runtime_worker_restore_alias(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] runtime_id: String,
         #[path] worker_id: String,
+        #[body] request: WorkerRestoreRequest,
     ) -> Result<WorkerRestoreResponse, RepositoryApiError>;
 
     #[post(
@@ -2052,10 +2095,12 @@ pub trait ServerApi {
     )]
     async fn runtime_worker_restore(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] runtime_id: String,
         #[path] worker_id: String,
         #[query] query: RestoreTicketAssignmentQuery,
+        #[body] request: WorkerRestoreRequest,
     ) -> Result<WorkerRestoreResponse, RepositoryApiError>;
 
     #[put(
@@ -2068,6 +2113,7 @@ pub trait ServerApi {
     )]
     async fn runtime_worker_pin(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] runtime_id: String,
         #[path] worker_id: String,
@@ -2083,6 +2129,7 @@ pub trait ServerApi {
     )]
     async fn runtime_worker_unpin(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] runtime_id: String,
         #[path] worker_id: String,
@@ -2112,6 +2159,7 @@ pub trait ServerApi {
     )]
     async fn runtime_cleanup_execute(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] runtime_id: String,
         #[body] request: ExecuteRuntimeCleanupRequest,
@@ -2127,6 +2175,7 @@ pub trait ServerApi {
     )]
     async fn runtime_worker_input_alias(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] runtime_id: String,
         #[path] worker_id: String,
         #[body] request: RuntimeWorkerInputRequest,
@@ -2142,6 +2191,7 @@ pub trait ServerApi {
     )]
     async fn runtime_worker_input(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] runtime_id: String,
         #[path] worker_id: String,
@@ -2258,6 +2308,7 @@ pub trait ServerApi {
     )]
     async fn runtime_worker_stop_alias(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] runtime_id: String,
         #[path] worker_id: String,
         #[body] request: RuntimeWorkerLifecycleRequest,
@@ -2273,6 +2324,7 @@ pub trait ServerApi {
     )]
     async fn runtime_worker_stop(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] runtime_id: String,
         #[path] worker_id: String,
@@ -2289,6 +2341,7 @@ pub trait ServerApi {
     )]
     async fn runtime_worker_cancel_alias(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] runtime_id: String,
         #[path] worker_id: String,
         #[body] request: RuntimeWorkerLifecycleRequest,
@@ -2304,6 +2357,7 @@ pub trait ServerApi {
     )]
     async fn runtime_worker_cancel(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] runtime_id: String,
         #[path] worker_id: String,
@@ -2549,6 +2603,81 @@ pub trait ServerApi {
         #[path] working_directory_id: String,
         #[body] request: WorkingDirectoryRemovalRequest,
     ) -> Result<WorkingDirectoryRemovalResponse, RepositoryApiError>;
+    #[get("/api/w/{workspace_id}/workers/self/workspace-config", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,500,503], openapi = false)]
+    async fn current_worker_workspace_config_get(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+    ) -> Result<WorkspaceConfigCurrentResponse, WorkspaceConfigApiError>;
+    #[post("/api/w/{workspace_id}/workers/self/workspace-config", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,500,503], openapi = false)]
+    async fn current_worker_workspace_config_attach(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: WorkspaceConfigAttachRequest,
+    ) -> Result<WorkspaceConfigAttachment, WorkspaceConfigApiError>;
+    #[post("/api/w/{workspace_id}/workers/self/workspace-config/observe", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,500,503], openapi = false)]
+    async fn current_worker_workspace_config_observe(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: WorkspaceConfigObserveRequest,
+    ) -> Result<WorkspaceConfigObserveResponse, WorkspaceConfigApiError>;
+    #[post("/api/w/{workspace_id}/workers/self/workspace-config/read", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,500,503], openapi = false)]
+    async fn current_worker_workspace_config_read(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: WorkspaceConfigReadRequest,
+    ) -> Result<WorkspaceConfigReadResponse, WorkspaceConfigApiError>;
+    #[post("/api/w/{workspace_id}/workers/self/workspace-config/commit", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,500,503], openapi = false)]
+    async fn current_worker_workspace_config_commit(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: WorkspaceConfigCommitRequest,
+    ) -> Result<WorkspaceConfigCommitResponse, WorkspaceConfigApiError>;
+    #[post("/api/w/{workspace_id}/workspace-config-grants", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,500], bearer_auth = true, browser_auth = true)]
+    async fn workspace_config_grant_create(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[body] request: WorkspaceConfigGrantCreateRequest,
+    ) -> Result<WorkspaceConfigGrantResponse, WorkspaceConfigApiError>;
+    #[delete("/api/w/{workspace_id}/workspace-config-grants/{grant_id}", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,500], bearer_auth = true, browser_auth = true)]
+    async fn workspace_config_grant_revoke(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] grant_id: String,
+    ) -> Result<WorkspaceConfigGrantResponse, WorkspaceConfigApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/workers/self/workdir-catalog",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        openapi = false,
+    )]
+    async fn current_worker_workdir_catalog(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[query] query: CurrentWorkerWorkdirCatalogQuery,
+    ) -> Result<CurrentWorkerWorkdirCatalogResponse, RepositoryApiError>;
+    #[get(
+        "/api/w/{workspace_id}/workers/self/workdir-attachments",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        openapi = false,
+    )]
+    async fn current_worker_workdir_attachment_list(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[query] query: CurrentWorkerWorkdirAttachmentListQuery,
+    ) -> Result<CurrentWorkerWorkdirAttachmentListResponse, RepositoryApiError>;
     #[post(
         "/api/w/{workspace_id}/workers/self/workdir-attachments",
         status = 200,
@@ -2574,6 +2703,7 @@ pub trait ServerApi {
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] alias: String,
+        #[query] query: CurrentWorkerWorkdirDetachQuery,
     ) -> Result<CurrentWorkerWorkdirAttachmentResponse, RepositoryApiError>;
     #[post(
         "/api/w/{workspace_id}/workers/self/workdir-session/operations",
@@ -4579,9 +4709,20 @@ pub enum SubjektivSubjectState {
 #[serde(deny_unknown_fields)]
 pub struct SubjektivSubjectCreateRequest {
     pub role: String,
+    #[serde(default)]
+    pub behavior_md: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSubjectBehaviorUpdateRequest {
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub expected_behavior_revision: u64,
+    pub behavior_md: String,
 }
 
 pub const SUBJEKTIV_BROWSER_MAX_LIST_LIMIT: usize = 100;
+pub const SUBJEKTIV_MAX_BEHAVIOR_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -4609,6 +4750,9 @@ pub struct SubjektivSubjectListResponse {
 pub struct SubjektivSubjectResponse {
     pub id: String,
     pub role: String,
+    pub behavior_md: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub behavior_revision: u64,
     pub state: SubjektivSubjectState,
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub store_revision: u64,
@@ -5386,6 +5530,9 @@ pub struct SubjektivSurfacePrepareRequest {}
 #[serde(deny_unknown_fields)]
 pub struct SubjektivSurfacePrepareResponse {
     pub generation_id: String,
+    /// Existing ready surface at this exact store revision, if no rebuild is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_snapshot_id: Option<String>,
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub store_revision: u64,
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
@@ -5443,9 +5590,21 @@ pub struct SubjektivSurfaceFailureResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivResidentContextOutput {
+    /// Exact user-managed document. Empty means explicitly unset.
+    pub behavior_md: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub behavior_revision: u64,
+    /// Independently-fresh generated Memory projection.
+    pub memory_surface: memory::backend::MemoryResidentSummaryOutput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "operation", content = "input", rename_all = "snake_case")]
 pub enum SubjektivMemoryBackendOperation {
     ResidentSummary(memory::backend::MemoryResidentSummaryOperation),
+    ResidentContext(memory::backend::MemoryResidentSummaryOperation),
     Query(SubjektivMemoryQueryRequest),
     Read(SubjektivMemoryReadRequest),
     ListRevisions(SubjektivMemoryListRevisionsRequest),
@@ -5618,6 +5777,7 @@ pub struct SubjektivMemoryStageExplicitResponse {
 #[serde(tag = "result", content = "data", rename_all = "snake_case")]
 pub enum SubjektivMemoryBackendResponse {
     ResidentSummary(memory::backend::MemoryResidentSummaryOutput),
+    ResidentContext(SubjektivResidentContextOutput),
     Query(SubjektivMemoryQueryResponse),
     Read(SubjektivMemoryReadResponse),
     ListRevisions(SubjektivMemoryListRevisionsResponse),
@@ -6248,6 +6408,7 @@ pub struct Diagnostic {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkingDirectoryMaterializerKind {
+    LogicalWorkspaceConfig,
     #[default]
     RuntimeGitClone,
     ClientHostedExternal,
@@ -6387,6 +6548,11 @@ pub struct RuntimeWorkingDirectorySummary {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkingDirectorySource {
+    WorkspaceConfig {
+        access: WorkspaceConfigAccess,
+        content_path: String,
+        purpose: String,
+    },
     Repository {
         repository_key: String,
     },
@@ -6752,6 +6918,69 @@ pub struct HostWorkerListResponse {
 pub struct CurrentWorkerWorkdirAttachRequest {
     pub alias: String,
     pub working_directory_id: String,
+}
+
+/// Stable Workdir-ID keyset paging over the authoritative inventory, not a Runtime snapshot.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentWorkerWorkdirCatalogQuery {
+    /// Defaults to 50; valid range is 1..=100 scanned registry records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Exclusive stable Workdir ID. An empty policy-filtered page can still have a next cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentWorkerWorkdirCatalogResponse {
+    pub workspace_id: String,
+    pub items: Vec<WorkingDirectorySummary>,
+    pub next_cursor: Option<String>,
+    /// Opaque digest of the complete authoritative inventory and its occupancy.
+    pub revision: String,
+}
+
+/// Bounded, alias-ordered paging over the current Worker's active attachments.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentWorkerWorkdirAttachmentListQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
+    /// Exact caller-scoped connection lookup, applied before paging; 1..=128 bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentWorkerWorkdirAttachmentItem {
+    pub alias: String,
+    pub working_directory_id: String,
+    pub capabilities: workdir::WorkdirSessionCapabilities,
+    /// Opaque durable identity of this attachment lifetime, not a Workdir ID.
+    pub connection_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentWorkerWorkdirAttachmentListResponse {
+    pub workspace_id: String,
+    pub items: Vec<CurrentWorkerWorkdirAttachmentItem>,
+    pub next_offset: Option<u32>,
+    /// Opaque digest of this caller's complete active connection set, independent of query paging/filtering.
+    pub revision: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentWorkerWorkdirDetachQuery {
+    /// When omitted, retain the normal Tool's unconditional detach contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_connection_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -8233,7 +8462,7 @@ pub struct RuntimeWorkerInputRequest {
     pub kind: Option<String>,
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub segments: Option<Vec<serde_json::Value>>,
+    pub segments: Option<Vec<protocol::Segment>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -8268,9 +8497,13 @@ pub struct RuntimeWorkerLifecycleResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeWorkerCompletionsRequest {
-    pub kind: serde_json::Value,
+    pub kind: protocol::CompletionKind,
     #[serde(default)]
     pub prefix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<protocol::CompletionContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
@@ -8278,9 +8511,13 @@ pub struct RuntimeWorkerCompletionsRequest {
 pub struct RuntimeWorkerCompletionsResult {
     pub runtime_id: String,
     pub worker_id: String,
-    pub kind: serde_json::Value,
+    pub kind: protocol::CompletionKind,
     pub prefix: String,
-    pub entries: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<protocol::CompletionContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    pub entries: Vec<protocol::CompletionEntry>,
     #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -9364,6 +9601,10 @@ pub struct RuntimeWorkerWorkdirAttachmentSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct WorkerSummary {
+    /// Opaque Runtime-owned observation fence used by explicit Restore intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub restore_observation_token: Option<String>,
     pub runtime_id: String,
     pub worker_id: String,
     pub resource_key: String,
@@ -9598,6 +9839,16 @@ pub enum WorkerRestoreState {
     Rejected,
     RolledBack,
     ReconciliationRequired,
+}
+
+/// One explicit Restore intent. Retries retain both fields; conflicts require a
+/// fresh observation and a deliberate new intent, not automatic token replacement.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRestoreRequest {
+    pub expected_observation_token: String,
+    pub request_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -9861,9 +10112,11 @@ pub fn memory_api_typescript() -> String {
     // `ts-rs` solely for this read-only projection.
     let subjektiv_browser_declarations = r#"export type SubjektivSubjectState = "active" | "retired";
 
-export type SubjektivSubjectCreateRequest = { role: string, };
+export type SubjektivSubjectCreateRequest = { role: string, behavior_md?: string, };
 
-export type SubjektivSubjectResponse = { id: string, role: string, state: SubjektivSubjectState, store_revision: number, created_at: string, updated_at: string, current_worker?: | import("./worker-launch-api").WorkerLaunchWorkerSummary | null, };
+export type SubjektivSubjectBehaviorUpdateRequest = { expected_behavior_revision: number, behavior_md: string, };
+
+export type SubjektivSubjectResponse = { id: string, role: string, behavior_md: string, behavior_revision: number, state: SubjektivSubjectState, store_revision: number, created_at: string, updated_at: string, current_worker?: | import("./worker-launch-api").WorkerLaunchWorkerSummary | null, };
 
 export type SubjektivSubjectListResponse = { limit: number, items: Array<SubjektivSubjectResponse>, next_cursor?: string | null, has_more: boolean, };
 
@@ -9896,8 +10149,11 @@ export type SubjektivMemoryListRevisionsResponse = { memory_id: string, current_
     let limits = format!(
         "export const MEMORY_API_LIMITS = {{\n  maxResponseBytes: {MEMORY_API_MAX_RESPONSE_BYTES},\n  maxDocumentBytes: {MEMORY_API_MAX_DOCUMENT_BYTES},\n  maxCollectionItems: {MEMORY_API_MAX_COLLECTION_ITEMS},\n  maxStringBytes: {MEMORY_API_MAX_STRING_BYTES},\n  maxIdentifierBytes: {MEMORY_API_MAX_IDENTIFIER_BYTES},\n}} as const;"
     );
+    let subjektiv_limits = format!(
+        "export const SUBJEKTIV_API_LIMITS = {{\n  maxBehaviorBytes: {SUBJEKTIV_MAX_BEHAVIOR_BYTES},\n}} as const;"
+    );
     format!(
-        "// Generated from server-api. Do not edit by hand.\n// Regenerate: cargo run -q -p server-api --features typescript --example generate_memory_api_types > web/workspace/src/lib/generated/memory-api.ts\n\n{limits}\n\n{}\n\n{subjektiv_browser_declarations}\n",
+        "// Generated from server-api. Do not edit by hand.\n// Regenerate: cargo run -q -p server-api --features typescript --example generate_memory_api_types > web/workspace/src/lib/generated/memory-api.ts\n\n{limits}\n\n{subjektiv_limits}\n\n{}\n\n{subjektiv_browser_declarations}\n",
         declarations
             .into_iter()
             .map(|declaration| format!("export {declaration}"))
@@ -10572,6 +10828,22 @@ pub fn legacy_catalog_typescript() -> String {
         ToolchainContract::decl(&config),
         WorkspaceConfigTreeResponse::decl(&config),
         ConfigCommitRequest::decl(&config),
+        WorkspaceConfigAccess::decl(&config),
+        WorkspaceConfigNodeKind::decl(&config),
+        WorkspaceConfigFailureClassification::decl(&config),
+        WorkspaceConfigAttachRequest::decl(&config),
+        WorkspaceConfigAttachment::decl(&config),
+        WorkspaceConfigCurrentResponse::decl(&config),
+        WorkspaceConfigObserveRequest::decl(&config),
+        WorkspaceConfigNode::decl(&config),
+        WorkspaceConfigObserveResponse::decl(&config),
+        WorkspaceConfigReadRequest::decl(&config),
+        WorkspaceConfigReadResponse::decl(&config),
+        WorkspaceConfigCommitRequest::decl(&config),
+        WorkspaceConfigCommitResponse::decl(&config),
+        WorkspaceConfigApiError::decl(&config),
+        WorkspaceConfigGrantCreateRequest::decl(&config),
+        WorkspaceConfigGrantResponse::decl(&config),
         ProfileSettingsResponse::decl(&config),
         WorkspaceProfileSummary::decl(&config),
         WorkspaceProfileSourceSummary::decl(&config),
@@ -11444,6 +11716,28 @@ mod tests {
     }
 
     #[test]
+    fn worker_restore_request_requires_observation_and_request_identity() {
+        let valid = serde_json::json!({"expected_observation_token":"opaque-generation", "request_id":"restore-request"});
+        let request: WorkerRestoreRequest = serde_json::from_value(valid.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), valid);
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"request_id":"restore-request"}),
+            serde_json::json!({"expected_observation_token":"opaque-generation"}),
+            serde_json::json!({"expected_observation_token":"opaque-generation", "request_id":"restore-request", "command_id":701}),
+        ] {
+            assert!(serde_json::from_value::<WorkerRestoreRequest>(invalid).is_err());
+        }
+        let contract = canonical_openapi_document().unwrap().to_json().unwrap();
+        let contract: serde_json::Value = serde_json::from_str(&contract).unwrap();
+        let restore = &contract["paths"]["/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/restore"]
+            ["post"];
+        assert_eq!(restore["requestBody"]["required"], true);
+        assert!(restore["responses"]["409"].is_object());
+        assert!(contract["components"]["schemas"]["WorkerRestoreRequest"].is_object());
+    }
+
+    #[test]
     fn worker_restore_result_rejects_unknown_fields() {
         let result = serde_json::from_value::<WorkerRestoreResult>(serde_json::json!({
             "state": "rejected",
@@ -11927,6 +12221,135 @@ mod tests {
             }))
             .is_err(),
             "the API wire shape must not supply a default Repository key"
+        );
+    }
+
+    #[test]
+    fn current_worker_attachment_contract_keeps_normal_tool_response_closed() {
+        let lookup = CurrentWorkerWorkdirAttachmentListQuery {
+            limit: Some(1),
+            offset: None,
+            connection_id: Some("opaque-connection".to_string()),
+        };
+        let value = serde_json::json!({"limit": 1, "connection_id": "opaque-connection"});
+        assert_eq!(serde_json::to_value(&lookup).unwrap(), value);
+        assert_eq!(
+            serde_json::from_value::<CurrentWorkerWorkdirAttachmentListQuery>(value).unwrap(),
+            lookup
+        );
+        assert_eq!(
+            serde_json::to_value(CurrentWorkerWorkdirAttachmentListQuery::default()).unwrap(),
+            serde_json::json!({})
+        );
+        assert!(
+            serde_json::from_value::<CurrentWorkerWorkdirAttachmentListQuery>(
+                serde_json::json!({"connection_id": 123})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CurrentWorkerWorkdirAttachmentListQuery>(
+                serde_json::json!({"expected_connection_id": "wrong-field"})
+            )
+            .is_err()
+        );
+        let query: CurrentWorkerWorkdirDetachQuery =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(query.expected_connection_id, None);
+        assert_eq!(serde_json::to_value(query).unwrap(), serde_json::json!({}));
+        assert!(
+            serde_json::from_value::<CurrentWorkerWorkdirDetachQuery>(
+                serde_json::json!({"connection_id":"wrong-field"})
+            )
+            .is_err()
+        );
+        let response = CurrentWorkerWorkdirAttachmentResponse {
+            workspace_id: "workspace".to_string(),
+            alias: "checkout".to_string(),
+            working_directory_id: "workdir".to_string(),
+            capabilities: workdir::WorkdirSessionCapabilities::EMPTY,
+            attached: false,
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 5);
+        assert!(value.get("connection_id").is_none());
+        assert_eq!(
+            serde_json::from_value::<CurrentWorkerWorkdirAttachmentResponse>(value).unwrap(),
+            response
+        );
+        let list = CurrentWorkerWorkdirAttachmentListResponse {
+            workspace_id: "workspace".to_string(),
+            revision: "opaque-revision".to_string(),
+            next_offset: Some(1),
+            items: vec![CurrentWorkerWorkdirAttachmentItem {
+                alias: "checkout".to_string(),
+                working_directory_id: "workdir".to_string(),
+                capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+                connection_id: "opaque".to_string(),
+            }],
+        };
+        assert_eq!(
+            serde_json::from_value::<CurrentWorkerWorkdirAttachmentListResponse>(
+                serde_json::to_value(&list).unwrap()
+            )
+            .unwrap(),
+            list
+        );
+    }
+
+    #[test]
+    fn current_worker_workdir_catalog_contract_is_bounded_and_revision_is_required() {
+        let query = CurrentWorkerWorkdirCatalogQuery {
+            limit: Some(100),
+            cursor: Some("stable-id".to_string()),
+        };
+        assert_eq!(
+            serde_json::from_value::<CurrentWorkerWorkdirCatalogQuery>(
+                serde_json::to_value(&query).unwrap()
+            )
+            .unwrap(),
+            query
+        );
+        assert_eq!(
+            serde_json::to_value(CurrentWorkerWorkdirCatalogQuery::default()).unwrap(),
+            serde_json::json!({})
+        );
+        assert!(
+            serde_json::from_value::<CurrentWorkerWorkdirCatalogQuery>(
+                serde_json::json!({"offset": 0})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CurrentWorkerWorkdirCatalogQuery>(
+                serde_json::json!({"limit": -1})
+            )
+            .is_err()
+        );
+        let response = CurrentWorkerWorkdirCatalogResponse {
+            workspace_id: "workspace".to_string(),
+            items: Vec::new(),
+            next_cursor: Some("scanned-legacy-row".to_string()),
+            revision: "opaque".to_string(),
+        };
+        assert_eq!(
+            serde_json::from_value::<CurrentWorkerWorkdirCatalogResponse>(
+                serde_json::to_value(&response).unwrap()
+            )
+            .unwrap(),
+            response
+        );
+        assert!(
+            serde_json::from_value::<CurrentWorkerWorkdirCatalogResponse>(
+                serde_json::json!({"workspace_id": "workspace", "items": [], "next_cursor": null})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CurrentWorkerWorkdirAttachmentListResponse>(
+                serde_json::json!({"workspace_id": "workspace", "items": [], "next_offset": null})
+            )
+            .is_err()
         );
     }
 
@@ -12662,6 +13085,45 @@ mod tests {
     }
 
     #[test]
+    fn structured_invocation_input_round_trips_through_typed_api() {
+        let json = serde_json::json!({"kind":"user", "content":"", "segments":[{"kind":"feature_invoke", "invocation":{
+            "invocation_id":"stable-invoke", "identity":"builtin:test/prepare", "name":"prepare",
+            "arguments":[{"name":"path", "value":{"kind":"string","value":"資料/a b"}}]
+        }}]});
+        let request: RuntimeWorkerInputRequest = serde_json::from_value(json.clone()).unwrap();
+        assert!(
+            matches!(&request.segments.as_ref().unwrap()[0], protocol::Segment::FeatureInvoke { invocation }
+            if invocation.identity.0 == "builtin:test/prepare" && invocation.invocation_id == "stable-invoke")
+        );
+        assert_eq!(serde_json::to_value(request).unwrap(), json);
+        let mut invalid = json;
+        invalid["segments"][0]["invocation"]["arguments"][0]["value"] =
+            serde_json::json!({"kind":"integer","value":2147483648_i64});
+        assert!(serde_json::from_value::<RuntimeWorkerInputRequest>(invalid).is_err());
+    }
+
+    #[test]
+    fn feature_completion_contract_is_typed_and_preserves_argument_context() {
+        let json = serde_json::json!({"kind":"feature_argument", "prefix":"資料/", "context":{"invocation":"builtin:test/prepare","argument":"path"}});
+        let request: RuntimeWorkerCompletionsRequest =
+            serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(request.kind, protocol::CompletionKind::FeatureArgument);
+        assert_eq!(serde_json::to_value(request).unwrap(), json);
+        assert!(
+            serde_json::from_value::<RuntimeWorkerCompletionsRequest>(
+                serde_json::json!({"kind":"unknown"})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<RuntimeWorkerCompletionsRequest>(
+                serde_json::json!({"kind":"feature_argument", "context":{"invocation":123}})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn generated_companion_api_contract_is_current() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let input =
@@ -12895,6 +13357,13 @@ mod openapi_artifact_tests {
         // identity, or a one-use Reviewer capability. They remain generated Rust client/Axum
         // operations, but must not appear as unauthenticated operations in the public OpenAPI.
         const SIGNED_INTERNAL: &[&str] = &[
+            "current_worker_workspace_config_get",
+            "current_worker_workspace_config_attach",
+            "current_worker_workspace_config_observe",
+            "current_worker_workspace_config_read",
+            "current_worker_workspace_config_commit",
+            "current_worker_workdir_catalog",
+            "current_worker_workdir_attachment_list",
             "current_worker_workdir_attach",
             "current_worker_workdir_detach",
             "current_worker_workdir_operation",

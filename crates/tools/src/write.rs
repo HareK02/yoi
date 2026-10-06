@@ -9,10 +9,7 @@ use serde::Deserialize;
 
 use crate::error::ToolsError;
 use crate::tracker::Tracker;
-use workdir::{
-    StatRequest, WorkdirError, WorkdirPath, WorkdirSessionHandle, WorkdirSessionRouter,
-    WriteRequest,
-};
+use workdir::{StatRequest, WorkdirError, WorkdirPath, WorkdirSessionHandle, WorkdirSessionRouter};
 
 const DESCRIPTION: &str = "Create a new file or overwrite an existing one in the selected Workdir attachment. \
 Missing parent directories within scope are created automatically. Existing files must have been read first \
@@ -25,8 +22,8 @@ pub(crate) struct WriteParams {
     pub target_workdir: Option<String>,
     /// Logical path relative to the bound Workdir root.
     pub file_path: String,
-    /// Full content to write. Overwrites any existing content.
-    pub content: String,
+    #[serde(flatten)]
+    pub write: fs_operation::text::WriteArgs,
 }
 
 pub(crate) struct WriteTool {
@@ -41,8 +38,7 @@ impl Tool for WriteTool {
         input_json: &str,
         ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
-        let params: WriteParams = serde_json::from_str(input_json)
-            .map_err(|e| ToolError::InvalidArgument(format!("invalid Write input: {e}")))?;
+        let params: WriteParams = crate::error::decode_file_input(input_json, "Write")?;
 
         let selected = crate::routing::resolve_session(
             &self.router,
@@ -53,50 +49,84 @@ impl Tool for WriteTool {
             .tracker
             .scoped_attachment(&selected.alias, selected.generation);
         let path = WorkdirPath::new(&params.file_path).map_err(ToolsError::from)?;
-        tracing::debug!(path = %path, bytes = params.content.len(), "Write");
+        Ok(execute_write(
+            crate::file_target::FileTarget {
+                session: selected.session,
+                path,
+                validator: None,
+            },
+            tracker,
+            params.write.content,
+            None,
+            ctx,
+        )
+        .await?
+        .output)
+    }
+}
 
-        let mutation_key = PathBuf::from(path.as_str());
-        let _mutation_permit = tracker.acquire_mutation(&mutation_key, &ctx).await;
-        let expected_hash = match selected
+/// `create_path` is a checked parent-relative create-new target, never an overwrite.
+pub(crate) async fn execute_write(
+    target: crate::file_target::FileTarget,
+    tracker: Tracker,
+    content: String,
+    create_path: Option<WorkdirPath>,
+    ctx: agen::tool::ToolExecutionContext,
+) -> Result<crate::checkout::CheckoutToolOutput, ToolError> {
+    // Provider size/access checks still run inside the checked save. The shared
+    // core owns text semantics, not the provider's bounds or lifecycle.
+    let content = fs_operation::text::write(content, Default::default())
+        .map_err(crate::error::text_error)?
+        .content;
+    let path = create_path.as_ref().unwrap_or(&target.path);
+    tracing::debug!(path = %path, bytes = content.len(), "Write");
+    let mutation_key = PathBuf::from(path.as_str());
+    let _mutation_permit = tracker.acquire_mutation(&mutation_key, &ctx).await;
+    let expected_hash = if create_path.is_some() {
+        None
+    } else if target.validator.is_some() {
+        // Native Write is existing-file-only, and always requires a prior observation.
+        Some(tracker.expected_workdir_hash(path)?)
+    } else {
+        match target
             .session
             .stat(StatRequest { path: path.clone() })
             .await
         {
-            Ok(_) => Some(tracker.expected_workdir_hash(&path)?),
+            Ok(_) => Some(tracker.expected_workdir_hash(path)?),
             Err(WorkdirError::NotFound(_)) => None,
             Err(error) => return Err(ToolsError::from(error).into()),
-        };
-
-        let old_line_count = tracker.observed_workdir_line_count(&path).unwrap_or(0);
-        let outcome = selected
-            .session
-            .write(WriteRequest {
-                path: path.clone(),
-                content: params.content.as_bytes().to_vec(),
-                expected_hash,
-            })
-            .await
-            .map_err(ToolsError::from)?;
-
-        tracker.record_change(params.content.lines().count(), old_line_count);
-        tracker.record_workdir_content(&path, params.content.as_bytes());
-
-        let summary = format!(
-            "{} {} ({} bytes)",
-            if outcome.created {
-                "Created"
-            } else {
-                "Overwrote"
-            },
-            path,
-            outcome.bytes_written
-        );
-        Ok(ToolOutput {
+        }
+    };
+    let old_line_count = tracker.observed_workdir_line_count(path).unwrap_or(0);
+    let (outcome, validator) = target
+        .write(
+            content.as_bytes().to_vec(),
+            expected_hash,
+            create_path.clone(),
+        )
+        .await?;
+    tracker.record_change(content.lines().count(), old_line_count);
+    tracker.record_workdir_content(path, content.as_bytes());
+    let summary = format!(
+        "{} {} ({} bytes)",
+        if outcome.created {
+            "Created"
+        } else {
+            "Overwrote"
+        },
+        path,
+        outcome.bytes_written
+    );
+    Ok(crate::checkout::CheckoutToolOutput {
+        output: ToolOutput {
             summary,
             content: None,
             attachments: Vec::new(),
-        })
-    }
+        },
+        paths: create_path.into_iter().collect(),
+        validator,
+    })
 }
 
 /// Factory for the `Write` tool bound to one compatibility session.

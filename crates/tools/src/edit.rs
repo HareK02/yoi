@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use crate::error::ToolsError;
 use crate::tracker::Tracker;
-use workdir::{EditRequest, WorkdirPath, WorkdirSessionHandle, WorkdirSessionRouter};
+use workdir::{WorkdirPath, WorkdirSessionHandle, WorkdirSessionRouter};
 
 const DESCRIPTION: &str = "Replace a substring in an existing file in the selected Workdir attachment. By default \
 `old_string` must be unique in the file; set `replace_all: true` to replace \
@@ -23,13 +23,8 @@ pub(crate) struct EditParams {
     pub target_workdir: Option<String>,
     /// Logical path relative to the bound Workdir root.
     pub file_path: String,
-    /// String to replace. Must be unique in the file unless `replace_all` is true.
-    pub old_string: String,
-    /// Replacement string. Must differ from `old_string`.
-    pub new_string: String,
-    /// Replace all occurrences. Defaults to false.
-    #[serde(default)]
-    pub replace_all: bool,
+    #[serde(flatten)]
+    pub edit: fs_operation::text::EditArgs,
 }
 
 pub(crate) struct EditTool {
@@ -44,8 +39,7 @@ impl Tool for EditTool {
         input_json: &str,
         ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
-        let params: EditParams = serde_json::from_str(input_json)
-            .map_err(|e| ToolError::InvalidArgument(format!("invalid Edit input: {e}")))?;
+        let params: EditParams = crate::error::decode_file_input(input_json, "Edit")?;
 
         let selected = crate::routing::resolve_session(
             &self.router,
@@ -56,56 +50,68 @@ impl Tool for EditTool {
             .tracker
             .scoped_attachment(&selected.alias, selected.generation);
         let path = WorkdirPath::new(&params.file_path).map_err(ToolsError::from)?;
-        tracing::debug!(path = %path, replace_all = params.replace_all, "Edit");
+        Ok(execute_edit(
+            crate::file_target::FileTarget {
+                session: selected.session,
+                path,
+                validator: None,
+            },
+            tracker,
+            params,
+            ctx,
+        )
+        .await?
+        .output)
+    }
+}
 
-        if params.old_string.is_empty() {
-            return Err(ToolError::InvalidArgument(
-                "old_string must not be empty".into(),
-            ));
-        }
-        if params.old_string == params.new_string {
-            return Err(ToolError::InvalidArgument(
-                "old_string and new_string are identical".into(),
-            ));
-        }
-
-        let mutation_key = PathBuf::from(path.as_str());
-        let _mutation_permit = tracker.acquire_mutation(&mutation_key, &ctx).await;
-        let expected_hash = tracker.expected_workdir_hash(&path)?;
-        let result = selected
-            .session
-            .edit(EditRequest {
-                path: path.clone(),
-                old_string: params.old_string.clone(),
-                new_string: params.new_string.clone(),
-                replace_all: params.replace_all,
-                expected_hash,
-            })
-            .await
-            .map_err(ToolsError::from)?;
-        let replacements = result.replacements;
-        tracker.record_workdir_edit(
-            &path,
-            result.content_hash,
-            replacements,
-            params.new_string.lines().count(),
-            params.old_string.lines().count(),
-        );
-
-        let summary = format!(
-            "Edited {} ({} replacement{})",
-            path,
-            replacements,
-            if replacements == 1 { "" } else { "s" }
-        );
-        let preview = make_preview(&params.new_string, &params.new_string);
-
-        Ok(ToolOutput {
+pub(crate) async fn execute_edit(
+    target: crate::file_target::FileTarget,
+    tracker: Tracker,
+    params: EditParams,
+    ctx: agen::tool::ToolExecutionContext,
+) -> Result<crate::checkout::CheckoutToolOutput, ToolError> {
+    let path = &target.path;
+    tracing::debug!(path = %path, replace_all = params.edit.replace_all, "Edit");
+    params
+        .edit
+        .validate(Default::default())
+        .map_err(crate::error::text_error)?;
+    let mutation_key = PathBuf::from(path.as_str());
+    let _mutation_permit = tracker.acquire_mutation(&mutation_key, &ctx).await;
+    let expected_hash = tracker.expected_workdir_hash(path)?;
+    let (result, validator) = target
+        .edit(
+            params.edit.old_string.clone(),
+            params.edit.new_string.clone(),
+            params.edit.replace_all,
+            expected_hash,
+        )
+        .await?;
+    let replacements = result.replacements;
+    tracker.record_workdir_edit(
+        path,
+        result.content_hash,
+        replacements,
+        params.edit.new_string.lines().count(),
+        params.edit.old_string.lines().count(),
+    );
+    let summary = format!(
+        "Edited {} ({} replacement{})",
+        path,
+        replacements,
+        if replacements == 1 { "" } else { "s" }
+    );
+    let preview = make_preview(&params.edit.new_string, &params.edit.new_string);
+    Ok(crate::checkout::CheckoutToolOutput {
+        output: ToolOutput {
             summary,
             content: Some(preview),
             attachments: Vec::new(),
-        })
-    }
+        },
+        paths: Vec::new(),
+        validator,
+    })
 }
 
 /// Build a small line-numbered snippet centered on the first occurrence of
@@ -180,6 +186,27 @@ mod tests {
             .execute(&inp.to_string(), Default::default())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn edit_shared_validation_rejects_identical_text_before_read_or_mutation() {
+        let (dir, fs, tracker) = setup();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "same").unwrap();
+        let (_, tool) = edit_tool(fs, tracker.clone())();
+        let error = tool
+            .execute(
+                &serde_json::json!({"file_path":"a.txt","old_string":"same","new_string":"same"})
+                    .to_string(),
+                Default::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ToolError::InvalidArgument(message) if message == "old_string and new_string are identical")
+        );
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "same");
+        assert_eq!(tracker.change_stat(), crate::ChangeStat::default());
     }
 
     #[tokio::test]

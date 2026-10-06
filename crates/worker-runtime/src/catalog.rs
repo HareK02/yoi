@@ -258,6 +258,8 @@ impl std::fmt::Debug for WorkspaceApiRef {
     }
 }
 
+pub use worker::BackendJobExecutionBinding;
+
 /// Canonical Runtime Worker creation request.
 ///
 /// Browser/product launch semantics are resolved by a backend before this
@@ -302,6 +304,9 @@ pub struct CreateWorkerRequest {
     /// may enable subjektiv policy, but only this host-owned bit activates it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub subjektiv_attached: bool,
+    /// Backend-only immutable Job/attempt capability. Never inferred from Profile policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_job: Option<BackendJobExecutionBinding>,
 }
 
 /// Last persisted Worker lifecycle status.
@@ -334,6 +339,8 @@ pub(crate) enum WorkerRestoreIntent {
 /// Lightweight persisted Worker identity projection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_observation_token: Option<String>,
     pub worker_ref: WorkerRef,
     pub worker_id: WorkerId,
     pub status: WorkerStatus,
@@ -359,6 +366,8 @@ pub struct WorkerSummary {
 /// Full persisted Worker identity and lifecycle detail.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerDetail {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_observation_token: Option<String>,
     pub worker_ref: WorkerRef,
     pub worker_id: WorkerId,
     pub status: WorkerStatus,

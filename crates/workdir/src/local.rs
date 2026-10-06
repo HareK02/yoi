@@ -204,7 +204,7 @@ impl CommandTelemetry {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ScopeAccess {
     scope: Arc<Scope>,
     root: PathBuf,
@@ -314,13 +314,12 @@ impl fs_operation::FsAccessPolicy for ScopeAccess {
                     "path is not a directory",
                 ));
             }
-            let root = self
-                .pinned_root
-                .as_ref()
-                .expect("confined traversal requires a pinned root")
-                .try_clone()?;
-            let path = PathBuf::from(format!("/proc/self/fd/{}", root.as_raw_fd()));
-            return Ok(Some(fs_operation::FsTraversalRoot::new(path, root)));
+            let path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+            return Ok(Some(fs_operation::FsTraversalRoot::new_at(
+                path,
+                directory,
+                resolved.to_path_buf(),
+            )));
         }
         #[cfg(not(target_os = "linux"))]
         Err(std::io::Error::new(
@@ -443,6 +442,118 @@ impl fs_operation::FsAccessPolicy for ScopeAccess {
     }
 }
 
+/// A read-only, conjunctively narrowed descriptor policy for native searches.
+#[derive(Debug, Clone)]
+struct SearchAccess {
+    inner: ScopeAccess,
+    layers: Vec<Vec<crate::WorkdirToolScopeRule>>,
+    output_root: PathBuf,
+    source_allows: Arc<Vec<manifest::ScopeRule>>,
+}
+impl SearchAccess {
+    fn logical_path(&self, path: &Path) -> Option<WorkdirPath> {
+        WorkdirPath::new(path.strip_prefix(&self.inner.root).ok()?.to_str()?).ok()
+    }
+    fn read_allowed(&self, logical: &Path, resolved: &Path) -> bool {
+        use fs_operation::FsAccessPolicy;
+        let Some(path) = self.logical_path(logical) else {
+            return false;
+        };
+        logical.starts_with(&self.output_root)
+            && self.inner.is_readable_paths(logical, resolved)
+            && self.layers.iter().all(|layer| {
+                layer.iter().any(|rule| {
+                    crate::scope::rule_allows_path(rule, &path, WorkdirToolScopePermission::Read)
+                })
+            })
+    }
+    fn enumeration_allowed(&self, logical: &Path, resolved: &Path) -> bool {
+        self.read_allowed(logical, resolved)
+            && self.source_allows.iter().any(|rule| {
+                if rule.recursive {
+                    logical.starts_with(&rule.target) || rule.target.starts_with(logical)
+                } else {
+                    logical == rule.target || rule.target.starts_with(logical)
+                }
+            })
+            && self.layers.iter().all(|layer| {
+                layer.iter().any(|rule| {
+                    let target = self.inner.root.join(rule.target.as_str());
+                    if rule.recursive {
+                        logical.starts_with(&target) || target.starts_with(logical)
+                    } else {
+                        logical == target || target.starts_with(logical)
+                    }
+                })
+            })
+    }
+    fn require_read(&self, logical: &Path, resolved: &Path) -> std::io::Result<()> {
+        if self.read_allowed(logical, resolved) {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "checkout search path denied",
+            ))
+        }
+    }
+}
+impl fs_operation::FsAccessPolicy for SearchAccess {
+    fn is_readable(&self, path: &Path) -> bool {
+        self.read_allowed(path, path)
+    }
+    fn is_writable(&self, _: &Path) -> bool {
+        false
+    }
+    fn is_readable_paths(&self, logical: &Path, resolved: &Path) -> bool {
+        self.read_allowed(logical, resolved)
+    }
+    fn can_enumerate_directory(&self, logical: &Path, resolved: &Path) -> bool {
+        self.enumeration_allowed(logical, resolved)
+    }
+    fn traversal_filter(&self) -> Option<fs_operation::FsTraversalFilter> {
+        let policy = self.clone();
+        Some(Arc::new(move |path, directory| {
+            if directory {
+                policy.enumeration_allowed(path, path)
+            } else {
+                policy.read_allowed(path, path)
+            }
+        }))
+    }
+    fn check_cancelled(&self) -> std::io::Result<()> {
+        self.inner.check_cancelled()
+    }
+    fn resolve_access_path(&self, logical: &Path) -> std::io::Result<PathBuf> {
+        self.inner.resolve_access_path(logical)
+    }
+    fn open_traversal_root(
+        &self,
+        logical: &Path,
+        resolved: &Path,
+    ) -> std::io::Result<Option<fs_operation::FsTraversalRoot>> {
+        self.require_read(logical, resolved)?;
+        self.inner.open_traversal_root(logical, resolved)
+    }
+    fn open_read_file(&self, logical: &Path, resolved: &Path) -> std::io::Result<std::fs::File> {
+        self.require_read(logical, resolved)?;
+        self.inner.open_read_file(logical, resolved)
+    }
+    fn read_metadata(&self, logical: &Path, resolved: &Path) -> std::io::Result<std::fs::Metadata> {
+        self.require_read(logical, resolved)?;
+        self.inner.read_metadata(logical, resolved)
+    }
+    fn open_read_dir(&self, logical: &Path, resolved: &Path) -> std::io::Result<std::fs::ReadDir> {
+        if !self.enumeration_allowed(logical, resolved) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "checkout directory enumeration denied",
+            ));
+        }
+        self.inner.open_read_dir(logical, resolved)
+    }
+}
+
 fn path_sets_overlap(
     left: &Path,
     left_recursive: bool,
@@ -491,6 +602,7 @@ struct LocalWorkdirSessionInner {
     reject_symlinks: bool,
     closed: AtomicBool,
     close_lock: Mutex<()>,
+    checkout_lock: StdMutex<()>,
     next_command_id: AtomicU64,
     commands: Mutex<HashMap<String, LocalCommand>>,
     command_telemetry: CommandTelemetry,
@@ -911,6 +1023,7 @@ impl LocalWorkdirSession {
                 reject_symlinks,
                 closed: AtomicBool::new(false),
                 close_lock: Mutex::new(()),
+                checkout_lock: StdMutex::new(()),
                 next_command_id: AtomicU64::new(1),
                 commands: Mutex::new(HashMap::new()),
                 command_telemetry: CommandTelemetry::new(),
@@ -1129,6 +1242,69 @@ impl LocalWorkdirSession {
         Ok(())
     }
 
+    fn checkout_access(&self) -> ScopeAccess {
+        let guard = self
+            .operation_guard
+            .clone()
+            .unwrap_or_else(|| OperationGuard {
+                cancelled: Arc::new(AtomicBool::new(false)),
+                deadline: Instant::now() + Duration::from_secs(30),
+            });
+        ScopeAccess::new(
+            self.inner.scope.snapshot(),
+            &self.inner.root,
+            self.inner.pinned_root.clone(),
+            self.inner.reject_symlinks,
+            Some(guard),
+        )
+    }
+
+    fn checkout_root(&self) -> Result<Arc<std::fs::File>, WorkdirError> {
+        match &self.inner.pinned_root {
+            Some(root) => Ok(root.clone()),
+            None => fs_operation::open_root_no_symlinks(&self.inner.root)
+                .map(Arc::new)
+                .map_err(|e| WorkdirError::io(Path::new("<checkout-root>"), e)),
+        }
+    }
+
+    fn checkout_observation(
+        &self,
+        path: WorkdirPath,
+        pinned: &fs_operation::CheckedTarget<'_>,
+    ) -> Result<crate::CheckoutObservation, WorkdirError> {
+        let metadata = pinned
+            .metadata()
+            .map_err(|e| WorkdirError::io(Path::new(path.as_str()), e))?;
+        if fs_operation::identity_validator(&metadata).map_err(|e| checkout_io(&path, e))?
+            != pinned.validator()
+        {
+            return Err(WorkdirError::Conflict(
+                "checkout changed during observation".into(),
+            ));
+        }
+        let access = self.scope_access();
+        let absolute = self.resolve(&path);
+        let capabilities = if manifest::Scope::is_writable(&access.scope, &absolute) {
+            self.capabilities()
+                .intersection(WorkdirSessionCapabilities::READ_WRITE)
+        } else {
+            self.capabilities()
+                .intersection(WorkdirSessionCapabilities::READ_ONLY)
+        };
+        Ok(crate::CheckoutObservation {
+            path,
+            kind: if metadata.is_dir() {
+                crate::EntryKind::Directory
+            } else {
+                crate::EntryKind::File
+            },
+            size: metadata.len(),
+            validator: pinned.validator().to_vec(),
+            capabilities,
+        })
+    }
+
     fn scope_access(&self) -> ScopeAccess {
         ScopeAccess::new(
             self.inner.scope.snapshot(),
@@ -1236,6 +1412,255 @@ impl WorkdirSession for LocalWorkdirSession {
         ))
     }
 
+    async fn checkout_search(
+        &self,
+        mut request: crate::CheckoutSearchRequest,
+    ) -> Result<crate::CheckoutSearchResult, WorkdirError> {
+        use crate::{CheckoutSearchOperation as Op, CheckoutSearchResult as Output};
+        self.ensure_capability(request.operation.capability())?;
+        request.validate()?;
+        let _serial = self
+            .inner
+            .checkout_lock
+            .try_lock()
+            .map_err(|_| WorkdirError::Unavailable("checkout provider busy".into()))?;
+        let provider_root = self.checkout_root()?;
+        let mut inner = self.checkout_access();
+        inner.pinned_root = Some(provider_root);
+        inner.reject_symlinks = true;
+        let output_root = self.resolve(&request.output_root);
+        let logical = request.operation.path().clone();
+        let relative = Path::new(logical.as_str())
+            .strip_prefix(request.output_root.as_str())
+            .map_err(|_| WorkdirError::Denied("checkout search escaped output root".into()))?;
+        *request.operation.path_mut() = WorkdirPath::new(relative.to_str().ok_or_else(|| {
+            WorkdirError::InvalidPath("checkout search path is not UTF8".into())
+        })?)?;
+        let source_allows = Arc::new(inner.scope.allow_rules());
+        let access = SearchAccess {
+            inner,
+            layers: request.scope_layers,
+            output_root: output_root.clone(),
+            source_allows,
+        };
+        let result = match request.operation {
+            Op::List(r) => fs_operation::run_list(&output_root, r, &access).map(Output::List),
+            Op::Glob(r) => {
+                fs_operation::run_glob(&output_root, &self.resolve(&logical), r, &access)
+                    .map(Output::Glob)
+            }
+            Op::Grep(r) => fs_operation::run_grep(&output_root, self.resolve(&logical), r, &access)
+                .map(Output::Grep),
+        };
+        result
+            .map_err(WorkdirError::from)
+            .map_err(|error| sanitize_error(error, &logical))
+    }
+
+    async fn checkout_observe(
+        &self,
+        path: WorkdirPath,
+    ) -> Result<crate::CheckoutObservation, WorkdirError> {
+        self.ensure_capability(WorkdirSessionCapability::Read)?;
+        crate::checkout::validate_path(&path)?;
+        let _serial = self
+            .inner
+            .checkout_lock
+            .try_lock()
+            .map_err(|_| WorkdirError::Unavailable("checkout provider busy".into()))?;
+        let root = self.checkout_root().map_err(|error| match error {
+            WorkdirError::Io { source, .. } => checkout_observe_io(&path, source),
+            error => error,
+        })?;
+        let access = self.checkout_access();
+        let pinned = fs_operation::CheckedTarget::pin(
+            &root,
+            Path::new(path.as_str()),
+            &self.resolve(&path),
+            &access,
+            false,
+        )
+        .map_err(|e| checkout_observe_io(&path, e))?;
+        self.checkout_observation(path.clone(), &pinned)
+            .map_err(|error| match error {
+                WorkdirError::Io { source, .. } => checkout_observe_io(&path, source),
+                error => error,
+            })
+    }
+
+    async fn checkout_execute(
+        &self,
+        request: crate::CheckoutRequest,
+    ) -> Result<crate::CheckoutResult, WorkdirError> {
+        use crate::{CheckoutOperation as Op, CheckoutOutput as Output};
+        self.ensure_capability(request.operation.capability())?;
+        crate::checkout::validate_path(&request.target)?;
+        if request.validator.is_empty() || request.validator.len() > 256 {
+            return Err(WorkdirError::InvalidArgument(
+                "invalid checkout validator".into(),
+            ));
+        }
+        let _serial = self
+            .inner
+            .checkout_lock
+            .try_lock()
+            .map_err(|_| WorkdirError::Unavailable("checkout provider busy".into()))?;
+        let path = request.target;
+        let root = self
+            .checkout_root()
+            .map_err(|error| checkout_execute_error(&path, error))?;
+        let access = self.checkout_access();
+        let mut pinned = fs_operation::CheckedTarget::pin(
+            &root,
+            Path::new(path.as_str()),
+            &self.resolve(&path),
+            &access,
+            request.operation.capability() != WorkdirSessionCapability::Read,
+        )
+        .map_err(|e| checkout_io(&path, e))?;
+        if pinned.validator() != request.validator {
+            return Err(WorkdirError::Conflict(
+                "checkout observation changed; observe and read again".into(),
+            ));
+        }
+        let is_create = matches!(&request.operation, Op::Create { .. });
+        let output = match request.operation {
+            Op::Read {
+                offset,
+                limit,
+                max_bytes,
+            } => {
+                if limit > 1_000_000
+                    || max_bytes > BoundedReadLimits::EXTERNAL_DEFAULT.max_response_bytes
+                {
+                    return Err(WorkdirError::InvalidArgument(
+                        "checkout Read exceeds provider bounds".into(),
+                    ));
+                }
+                fs_operation::run_read_bounded(
+                    &self.inner.root,
+                    ReadRequest {
+                        path: path.clone(),
+                        offset,
+                        limit,
+                        max_bytes,
+                    },
+                    &pinned,
+                    self.inner
+                        .read_limits
+                        .unwrap_or(BoundedReadLimits::EXTERNAL_DEFAULT),
+                )
+                .map(Output::Read)
+            }
+            Op::Write {
+                content,
+                expected_hash,
+            } => fs_operation::run_write(
+                &self.inner.root,
+                WriteRequest {
+                    path: path.clone(),
+                    content,
+                    expected_hash: Some(expected_hash),
+                },
+                &pinned,
+            )
+            .map(Output::Write),
+            Op::Edit {
+                old_string,
+                new_string,
+                replace_all,
+                expected_hash,
+            } => {
+                if old_string.len().saturating_add(new_string.len()) > 8 * 1024 * 1024 {
+                    return Err(WorkdirError::InvalidArgument(
+                        "checkout Edit exceeds provider bounds".into(),
+                    ));
+                }
+                fs_operation::run_edit(
+                    &self.inner.root,
+                    EditRequest {
+                        path: path.clone(),
+                        old_string,
+                        new_string,
+                        replace_all,
+                        expected_hash,
+                    },
+                    &pinned,
+                )
+                .map(Output::Edit)
+            }
+            Op::Create {
+                path: destination,
+                content,
+            } => {
+                let suffix = crate::checkout::create_relative_path(&path, &destination)?;
+                let create = pinned.create_access(suffix, self.resolve(&destination));
+                fs_operation::run_write(
+                    &self.inner.root,
+                    WriteRequest {
+                        path: destination,
+                        content,
+                        expected_hash: None,
+                    },
+                    &create,
+                )
+                .map(Output::Write)
+            }
+        };
+        let output = output.map_err(|error| {
+            if pinned.effects_possible() {
+                WorkdirError::OutcomeUnknown(
+                    "checkout save or parent creation may have effects; inspect before retry"
+                        .into(),
+                )
+            } else {
+                checkout_execute_error(&path, WorkdirError::from(error))
+            }
+        })?;
+        if matches!(&output, Output::Read(_)) {
+            pinned.confirm().map_err(|e| checkout_io(&path, e))?;
+            return Ok(crate::CheckoutResult {
+                observation: self
+                    .checkout_observation(path.clone(), &pinned)
+                    .map_err(|error| checkout_execute_error(&path, error))?,
+                output,
+            });
+        }
+        if is_create {
+            pinned.refresh_directory_observation().map_err(|_| {
+                WorkdirError::OutcomeUnknown(
+                    "checkout Create may have effects but parent observation failed".into(),
+                )
+            })?;
+            let observation = self.checkout_observation(path, &pinned).map_err(|_| {
+                WorkdirError::OutcomeUnknown(
+                    "checkout Create may have effects but parent observation failed".into(),
+                )
+            })?;
+            return Ok(crate::CheckoutResult {
+                observation,
+                output,
+            });
+        }
+        let after = fs_operation::CheckedTarget::pin(
+            &root,
+            Path::new(path.as_str()),
+            &self.resolve(&path),
+            &access,
+            true,
+        )
+        .map_err(|_| {
+            WorkdirError::OutcomeUnknown("checkout saved but post-save observation failed".into())
+        })?;
+        let observation = self.checkout_observation(path, &after).map_err(|_| {
+            WorkdirError::OutcomeUnknown("checkout saved but post-save observation failed".into())
+        })?;
+        Ok(crate::CheckoutResult {
+            observation,
+            output,
+        })
+    }
+
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {
         self.ensure_capability(WorkdirSessionCapability::Read)?;
         let logical = request.path.clone();
@@ -1247,6 +1672,11 @@ impl WorkdirSession for LocalWorkdirSession {
     }
 
     async fn read(&self, request: ReadRequest) -> Result<ReadResult, WorkdirError> {
+        let _serial = self
+            .inner
+            .checkout_lock
+            .try_lock()
+            .map_err(|_| WorkdirError::Unavailable("filesystem provider busy".into()))?;
         self.ensure_capability(WorkdirSessionCapability::Read)?;
         let logical = request.path.clone();
         self.validate_operation_path(&request.path)?;
@@ -1277,6 +1707,11 @@ impl WorkdirSession for LocalWorkdirSession {
     }
 
     async fn write(&self, request: WriteRequest) -> Result<WriteResult, WorkdirError> {
+        let _serial = self
+            .inner
+            .checkout_lock
+            .try_lock()
+            .map_err(|_| WorkdirError::Unavailable("filesystem provider busy".into()))?;
         self.ensure_capability(WorkdirSessionCapability::Write)?;
         let logical = request.path.clone();
         self.validate_operation_path(&request.path)?;
@@ -1287,6 +1722,11 @@ impl WorkdirSession for LocalWorkdirSession {
     }
 
     async fn edit(&self, request: EditRequest) -> Result<EditResult, WorkdirError> {
+        let _serial = self
+            .inner
+            .checkout_lock
+            .try_lock()
+            .map_err(|_| WorkdirError::Unavailable("filesystem provider busy".into()))?;
         self.ensure_capability(WorkdirSessionCapability::Edit)?;
         let logical = request.path.clone();
         self.validate_operation_path(&request.path)?;
@@ -1559,6 +1999,44 @@ fn command_output_page(output: &CommandOutput, cursor: usize, limit: usize) -> C
         next_cursor: (end < total_chars).then_some(end),
         truncated: output.truncated || end < total_chars,
         output_path: output.output_path.clone(),
+    }
+}
+
+// Discovery of an absent route is not a stale-validator execution attempt.
+fn checkout_observe_io(path: &WorkdirPath, error: std::io::Error) -> WorkdirError {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    ) {
+        WorkdirError::NotFound(PathBuf::from(path.as_str()))
+    } else {
+        checkout_io(path, error)
+    }
+}
+
+// All pre-effect execution stages preserve the same stale-name classification,
+// including FsError::NotFound produced by the shared engine after pinning.
+fn checkout_execute_error(path: &WorkdirPath, error: WorkdirError) -> WorkdirError {
+    match error {
+        WorkdirError::NotFound(_) => {
+            WorkdirError::Conflict("checkout observation changed; observe and read again".into())
+        }
+        WorkdirError::Io { source, .. } => checkout_io(path, source),
+        error => sanitize_error(error, path),
+    }
+}
+
+fn checkout_io(path: &WorkdirPath, error: std::io::Error) -> WorkdirError {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::NotADirectory
+            | std::io::ErrorKind::AlreadyExists
+    ) {
+        WorkdirError::Conflict("checkout observation changed; observe and read again".into())
+    } else {
+        sanitize_error(WorkdirError::io(Path::new(path.as_str()), error), path)
     }
 }
 
@@ -2082,6 +2560,47 @@ mod tests {
     use manifest::{Permission, ScopeConfig, ScopeRule};
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn checkout_error_mapping_distinguishes_absence_from_stale_execution_at_all_boundaries() {
+        let path = WorkdirPath::new("missing").unwrap();
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::NotADirectory,
+        ] {
+            assert!(
+                matches!(checkout_observe_io(&path, std::io::Error::from(kind)), WorkdirError::NotFound(p) if p == Path::new("missing"))
+            );
+            assert!(matches!(
+                checkout_io(&path, std::io::Error::from(kind)),
+                WorkdirError::Conflict(_)
+            ));
+            assert!(matches!(
+                checkout_execute_error(
+                    &path,
+                    WorkdirError::io(Path::new("<provider-root>"), std::io::Error::from(kind))
+                ),
+                WorkdirError::Conflict(_)
+            ));
+        }
+        let shared_error =
+            WorkdirError::from(fs_operation::FsError::NotFound(PathBuf::from("missing")));
+        assert!(matches!(
+            checkout_execute_error(&path, shared_error),
+            WorkdirError::Conflict(_)
+        ));
+        assert!(matches!(
+            checkout_observe_io(&path, std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            WorkdirError::Conflict(_)
+        ));
+        assert!(matches!(
+            checkout_execute_error(
+                &path,
+                WorkdirError::OutcomeUnknown("possible save effects".into())
+            ),
+            WorkdirError::OutcomeUnknown(_)
+        ));
+    }
 
     fn make_fs(dir: &TempDir) -> LocalWorkdirSession {
         LocalWorkdirSession::new(

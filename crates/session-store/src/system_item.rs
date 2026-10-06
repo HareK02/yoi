@@ -123,6 +123,14 @@ pub enum SystemItem {
         prompt_provenance: Option<PromptRenderProvenance>,
     },
 
+    /// Result of an explicitly selected chat Feature invocation. The typed
+    /// result is retained for clients; `body` is the exact bounded context made
+    /// visible to the Worker model.
+    FeatureInvocationResult {
+        result: protocol::FeatureInvocationResult,
+        body: String,
+    },
+
     /// `@<path>` file reference resolution. `body` is the rendered
     /// LLM-context text (`[File: <path>]\n…` for regular files,
     /// `[Dir: <path>]\n…` for directory listings, possibly with a
@@ -167,6 +175,15 @@ pub enum SystemItem {
         prompt_provenance: Option<PromptRenderProvenance>,
     },
 
+    /// A Host-fetched change to user-managed Subject behavior. Each changed
+    /// revision is appended rather than rewriting prior prompt/session content.
+    SubjectBehaviorRefresh {
+        body: String,
+        behavior_revision: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_provenance: Option<PromptRenderProvenance>,
+    },
+
     /// Synthetic note inserted after an interrupted turn before the next
     /// user input. `body` is the exact LLM-context text explaining that the
     /// previous turn was cut short.
@@ -184,6 +201,7 @@ impl SystemItem {
         match self {
             SystemItem::Notification { body, .. } => body.clone(),
             SystemItem::WorkerEvent { body, .. } => body.clone(),
+            SystemItem::FeatureInvocationResult { body, .. } => body.clone(),
             SystemItem::FileAttachment { body, .. } => body.clone(),
             SystemItem::SkillActivation { body, .. } => body.clone(),
             SystemItem::LegacyKnowledgeIgnored { .. } => String::new(),
@@ -192,6 +210,7 @@ impl SystemItem {
             }
             SystemItem::TaskReminder { body, .. } => body.clone(),
             SystemItem::ResidentSummaryRefresh { body, .. } => body.clone(),
+            SystemItem::SubjectBehaviorRefresh { body, .. } => body.clone(),
             SystemItem::Interrupt { body, .. } => body.clone(),
         }
     }
@@ -208,12 +227,14 @@ impl SystemItem {
         match self {
             SystemItem::Notification { .. } => "notification",
             SystemItem::WorkerEvent { .. } => "worker_event",
+            SystemItem::FeatureInvocationResult { .. } => "feature_invocation_result",
             SystemItem::FileAttachment { .. } => "file_attachment",
             SystemItem::SkillActivation { .. } => "skill_activation",
             SystemItem::LegacyKnowledgeIgnored { .. } => "legacy_knowledge_ignored",
             SystemItem::LegacyIgnored { .. } => "legacy_ignored",
             SystemItem::TaskReminder { .. } => "task_reminder",
             SystemItem::ResidentSummaryRefresh { .. } => "resident_summary_refresh",
+            SystemItem::SubjectBehaviorRefresh { .. } => "subject_behavior_refresh",
             SystemItem::Interrupt { .. } => "interrupt",
         }
     }
@@ -265,6 +286,25 @@ mod tests {
             interrupt,
             SystemItem::Interrupt {
                 prompt_provenance: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn subject_behavior_refresh_round_trips_with_revision_and_exact_body() {
+        let item = SystemItem::SubjectBehaviorRefresh {
+            body: "current Subject context".to_string(),
+            behavior_revision: 7,
+            prompt_provenance: None,
+        };
+        let raw = serde_json::to_string(&item).unwrap();
+        let parsed: SystemItem = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed.history_text(), "current Subject context");
+        assert!(matches!(
+            parsed,
+            SystemItem::SubjectBehaviorRefresh {
+                behavior_revision: 7,
                 ..
             }
         ));
@@ -361,6 +401,29 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn invocation_result_retains_typed_outcome_and_exact_context() {
+        let result = protocol::FeatureInvocationResult {
+            invocation_id: "stable-invoke".into(),
+            identity: protocol::FeatureInvocationIdentity("builtin:test/prepare".into()),
+            status: protocol::FeatureInvocationStatus::OutcomeUnknown,
+            message: "operation may have committed".into(),
+            context: None,
+        };
+        let body = "Outcome unknown; do not retry automatically";
+        let item = SystemItem::FeatureInvocationResult {
+            result: result.clone(),
+            body: body.into(),
+        };
+        let restored: SystemItem =
+            serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap();
+        assert_eq!(restored.history_text(), body);
+        assert_eq!(restored.kind_label(), "feature_invocation_result");
+        assert!(
+            matches!(restored, SystemItem::FeatureInvocationResult { result: saved, .. } if saved == result)
+        );
     }
 
     #[test]

@@ -1075,6 +1075,70 @@
         ],
         "type": "object"
       },
+      "CompletionContext": {
+        "properties": {
+          "argument": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "invocation": {
+            "$ref": "#/components/schemas/FeatureInvocationIdentity"
+          }
+        },
+        "required": [
+          "invocation"
+        ],
+        "type": "object"
+      },
+      "CompletionEntry": {
+        "description": "One completion candidate for a prefix query.",
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "invocation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FeatureInvocationDescriptor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "is_dir": {
+            "default": false,
+            "type": "boolean"
+          },
+          "usage": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "type": "object"
+      },
+      "CompletionKind": {
+        "description": "Kind of completion requested by `Method::ListCompletions`.\n\n`File` is the existing `@` path lane. `Feature` lists installed chat\ninvocations. `FeatureArgument` resolves a declared argument using the\nsource-qualified [`CompletionContext`].",
+        "enum": [
+          "file",
+          "feature",
+          "feature_argument"
+        ],
+        "type": "string"
+      },
       "ConfigCommitRequest": {
         "additionalProperties": false,
         "description": "Compare-and-swap request for applying a complete set of source-tree changes.",
@@ -2232,6 +2296,98 @@
         },
         "type": "object"
       },
+      "FeatureInvocation": {
+        "properties": {
+          "arguments": {
+            "items": {
+              "$ref": "#/components/schemas/InvocationArgumentValue"
+            },
+            "type": "array"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/FeatureInvocationIdentity"
+          },
+          "invocation_id": {
+            "description": "Stable client-generated id retained across queueing and transport retry.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Selected public name, retained for exact draft/history restoration. Host\nresolution is always by `identity`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "invocation_id",
+          "identity",
+          "name",
+          "arguments"
+        ],
+        "type": "object"
+      },
+      "FeatureInvocationDescriptor": {
+        "properties": {
+          "aliases": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "arguments": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/InvocationArgumentDescriptor"
+            },
+            "type": "array"
+          },
+          "client_adapter": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InvocationClientAdapter"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "description": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/FeatureInvocationIdentity"
+          },
+          "name": {
+            "type": "string"
+          },
+          "syntax": {
+            "$ref": "#/components/schemas/FeatureInvocationSyntax"
+          }
+        },
+        "required": [
+          "identity",
+          "name",
+          "display_name",
+          "description",
+          "syntax"
+        ],
+        "type": "object"
+      },
+      "FeatureInvocationIdentity": {
+        "description": "Source-qualified identity of one invocation contribution, for example\n`builtin:attachments/attach`. Display names and aliases are never authority.",
+        "type": "string"
+      },
+      "FeatureInvocationSyntax": {
+        "oneOf": [
+          {
+            "const": "parenthesized",
+            "description": "`/name(value, key=value)` with JSON-style quoted strings and `)` as the\nexplicit boundary before following natural language.",
+            "type": "string"
+          }
+        ]
+      },
       "FindingSeverity": {
         "enum": [
           "blocker",
@@ -2608,6 +2764,285 @@
           "reason"
         ],
         "type": "object"
+      },
+      "InvocationArgumentDescriptor": {
+        "properties": {
+          "completion": {
+            "$ref": "#/components/schemas/InvocationCompletion",
+            "default": {
+              "kind": "none"
+            }
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "position": {
+            "description": "Zero-based positional index. `None` means named-only. A positional\nargument may also be supplied by name; this makes chip editing stable.",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "required": {
+            "default": false,
+            "type": "boolean"
+          },
+          "value_type": {
+            "$ref": "#/components/schemas/InvocationArgumentType"
+          }
+        },
+        "required": [
+          "name",
+          "value_type"
+        ],
+        "type": "object"
+      },
+      "InvocationArgumentType": {
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "string",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "integer",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "boolean",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "enum",
+                "type": "string"
+              },
+              "values": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "kind",
+              "values"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A Worker-readable path. This does not grant filesystem authority.",
+            "properties": {
+              "kind": {
+                "const": "worker_file",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A resource selected and staged by the client. It must never be resolved\nas a path on the Worker host.",
+            "properties": {
+              "kind": {
+                "const": "client_file",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "InvocationArgumentValue": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "value": {
+            "$ref": "#/components/schemas/InvocationValue"
+          }
+        },
+        "required": [
+          "name",
+          "value"
+        ],
+        "type": "object"
+      },
+      "InvocationClientAdapter": {
+        "oneOf": [
+          {
+            "const": "attachment",
+            "description": "The client stages a local file and replaces the draft invocation with an\n`UploadedFile` chip. Local paths are not sent to or persisted by Worker.",
+            "type": "string"
+          }
+        ]
+      },
+      "InvocationCompletion": {
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "none",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "static",
+                "type": "string"
+              },
+              "values": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "kind",
+              "values"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "worker_file",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "client_file",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Host-owned provider selected by source-qualified id. Metadata lookup is\nside-effect free; implementations never cross this wire boundary.",
+            "properties": {
+              "kind": {
+                "const": "provider",
+                "type": "string"
+              },
+              "provider": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "provider"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "InvocationValue": {
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "string",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "integer",
+                "type": "string"
+              },
+              "value": {
+                "format": "int32",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "boolean",
+                "type": "string"
+              },
+              "value": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "LegacyMemoryResetRequest": {
         "additionalProperties": false,
@@ -7356,10 +7791,28 @@
       "RuntimeWorkerCompletionsRequest": {
         "additionalProperties": false,
         "properties": {
-          "kind": true,
+          "context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CompletionContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/CompletionKind"
+          },
           "prefix": {
             "default": "",
             "type": "string"
+          },
+          "request_id": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -7370,6 +7823,16 @@
       "RuntimeWorkerCompletionsResult": {
         "additionalProperties": false,
         "properties": {
+          "context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CompletionContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "diagnostics": {
             "default": [],
             "items": {
@@ -7378,12 +7841,22 @@
             "type": "array"
           },
           "entries": {
-            "items": true,
+            "items": {
+              "$ref": "#/components/schemas/CompletionEntry"
+            },
             "type": "array"
           },
-          "kind": true,
+          "kind": {
+            "$ref": "#/components/schemas/CompletionKind"
+          },
           "prefix": {
             "type": "string"
+          },
+          "request_id": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "runtime_id": {
             "type": "string"
@@ -7415,7 +7888,9 @@
             ]
           },
           "segments": {
-            "items": true,
+            "items": {
+              "$ref": "#/components/schemas/Segment"
+            },
             "type": [
               "array",
               "null"
@@ -7586,6 +8061,13 @@
           },
           "resource_key": {
             "type": "string"
+          },
+          "restore_observation_token": {
+            "description": "Opaque Runtime-owned observation fence used by explicit Restore intent.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "retention_state": {
             "default": "",
@@ -8259,6 +8741,23 @@
             "required": [
               "kind",
               "path"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Explicitly selected, source-qualified Feature invocation. The host never\npromotes free text to this variant and validates it against the installed\ndeclaration before execution.",
+            "properties": {
+              "invocation": {
+                "$ref": "#/components/schemas/FeatureInvocation"
+              },
+              "kind": {
+                "const": "feature_invoke",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "invocation"
             ],
             "type": "object"
           },
@@ -9315,9 +9814,32 @@
         ],
         "type": "object"
       },
+      "SubjektivSubjectBehaviorUpdateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "behavior_md": {
+            "type": "string"
+          },
+          "expected_behavior_revision": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_behavior_revision",
+          "behavior_md"
+        ],
+        "type": "object"
+      },
       "SubjektivSubjectCreateRequest": {
         "additionalProperties": false,
         "properties": {
+          "behavior_md": {
+            "default": "",
+            "type": "string"
+          },
           "role": {
             "type": "string"
           }
@@ -9383,6 +9905,15 @@
       "SubjektivSubjectResponse": {
         "additionalProperties": false,
         "properties": {
+          "behavior_md": {
+            "type": "string"
+          },
+          "behavior_revision": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
           "created_at": {
             "type": "string"
           },
@@ -9419,6 +9950,8 @@
         "required": [
           "id",
           "role",
+          "behavior_md",
+          "behavior_revision",
           "state",
           "store_revision",
           "created_at",
@@ -12427,6 +12960,23 @@
         ],
         "type": "string"
       },
+      "WorkerRestoreRequest": {
+        "additionalProperties": false,
+        "description": "One explicit Restore intent. Retries retain both fields; conflicts require a\nfresh observation and a deliberate new intent, not automatic token replacement.",
+        "properties": {
+          "expected_observation_token": {
+            "type": "string"
+          },
+          "request_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_observation_token",
+          "request_id"
+        ],
+        "type": "object"
+      },
       "WorkerRestoreResponse": {
         "additionalProperties": false,
         "properties": {
@@ -12630,6 +13180,13 @@
           },
           "resource_key": {
             "type": "string"
+          },
+          "restore_observation_token": {
+            "description": "Opaque Runtime-owned observation fence used by explicit Restore intent.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "retention_state": {
             "default": "",
@@ -12878,6 +13435,7 @@
       "WorkingDirectoryMaterializerKind": {
         "description": "Public Workdir materializer classification.\n\nThe value identifies stable materialization provenance without exposing a\nprovider path, Runtime handle, or session identity.",
         "enum": [
+          "logical_workspace_config",
           "runtime_git_clone",
           "client_hosted_external"
         ],
@@ -12975,6 +13533,31 @@
       "WorkingDirectorySource": {
         "description": "Public Workdir source identity. Provider routing details and host paths are intentionally absent.",
         "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "access": {
+                "$ref": "#/components/schemas/WorkspaceConfigAccess"
+              },
+              "content_path": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "workspace_config",
+                "type": "string"
+              },
+              "purpose": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "access",
+              "content_path",
+              "purpose"
+            ],
+            "type": "object"
+          },
           {
             "additionalProperties": false,
             "properties": {
@@ -13172,6 +13755,103 @@
           "$ref": "#/components/schemas/WorkspaceSummary"
         },
         "type": "array"
+      },
+      "WorkspaceConfigAccess": {
+        "enum": [
+          "read_only",
+          "read_write"
+        ],
+        "type": "string"
+      },
+      "WorkspaceConfigApiError": {
+        "additionalProperties": false,
+        "properties": {
+          "classification": {
+            "$ref": "#/components/schemas/WorkspaceConfigFailureClassification"
+          },
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "status": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status",
+          "code",
+          "message",
+          "classification"
+        ],
+        "type": "object"
+      },
+      "WorkspaceConfigFailureClassification": {
+        "enum": [
+          "not_committed",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "WorkspaceConfigGrantCreateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "access": {
+            "$ref": "#/components/schemas/WorkspaceConfigAccess"
+          },
+          "runtime_id": {
+            "type": "string"
+          },
+          "worker_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "runtime_id",
+          "worker_id",
+          "access"
+        ],
+        "type": "object"
+      },
+      "WorkspaceConfigGrantResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "access": {
+            "$ref": "#/components/schemas/WorkspaceConfigAccess"
+          },
+          "grant_id": {
+            "type": "string"
+          },
+          "revoked": {
+            "type": "boolean"
+          },
+          "runtime_id": {
+            "type": "string"
+          },
+          "worker_id": {
+            "type": "string"
+          },
+          "working_directory_id": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "grant_id",
+          "workspace_id",
+          "runtime_id",
+          "worker_id",
+          "working_directory_id",
+          "access",
+          "revoked"
+        ],
+        "type": "object"
       },
       "WorkspaceConfigSchemaBundle": {
         "additionalProperties": false,
@@ -14794,7 +15474,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:f9f0f8918dbcce386e94d5368fa938f02565ca98f9f67f07537bd88ed8c49870"
+    "x-yoi-source-digest": "sha256:fd06f382c6d33a5c3cc98ef9e264545923c53fa95a9be555a85680f98c6065da"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -17367,6 +18047,16 @@
             "style": "simple"
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkerRestoreRequest"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
@@ -25784,6 +26474,16 @@
             "style": "form"
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkerRestoreRequest"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
@@ -29101,6 +29801,123 @@
             "description": "Error response"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/behavior": {
+      "patch": {
+        "operationId": "subjektiv_subject_behavior_update",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "subject_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubjektivSubjectBehaviorUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubjektivSubjectResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
             "content": {
               "application/json": {
                 "schema": {
@@ -34502,6 +35319,220 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/workspace-config-grants": {
+      "post": {
+        "operationId": "workspace_config_grant_create",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceConfigGrantCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceConfigGrantResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceConfigApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceConfigApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceConfigApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceConfigApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceConfigApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceConfigApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/workspace-config-grants/{grant_id}": {
+      "delete": {
+        "operationId": "workspace_config_grant_revoke",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "grant_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceConfigGrantResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceConfigApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceConfigApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceConfigApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceConfigApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceConfigApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceConfigApiError"
                 }
               }
             },

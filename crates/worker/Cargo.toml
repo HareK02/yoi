@@ -55,6 +55,8 @@ wip-http = { workspace = true }
 wip-protocol = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
+workdir = { workspace = true, features = ["http-client"] }
 dotenv = "0.15.0"
 futures = { workspace = true }
 serial_test = "3.4.0"

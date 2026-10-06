@@ -28,7 +28,8 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 77;
+const LATEST_SCHEMA_VERSION: i64 = 81;
+const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
 const RUNTIME_BINDING_AUDIT_MIGRATION_NAME: &str = "workspace Runtime binding revision and audit";
@@ -77,6 +78,9 @@ const ARCHIVE_OBSERVE_GRANTS_MIGRATION_NAME: &str =
     "preserve explicit observe grants for committed Worker Session archives";
 const BACKEND_JOB_WORKER_CLEANUP_MIGRATION_NAME: &str =
     "durable terminal Backend Job Worker cleanup";
+const WORKDIR_CONNECTION_ID_MIGRATION_NAME: &str = "durable Workdir attachment connection identity";
+const WORKER_RESTORE_INTENTS_MIGRATION_NAME: &str =
+    "durable internal Worker Restore request identity";
 const TICKET_SCHEMA_VERSION_WITH_TARGETS: i64 = 7;
 const TICKET_SCHEMA_BASELINE_NAME: &str = "ticket schema baseline";
 const WORKER_REGISTRY_PROJECTION_SCHEMA: &str = r#"
@@ -258,6 +262,26 @@ const MIGRATIONS: &[Migration] = &[
         version: 77,
         name: BACKEND_JOB_WORKER_CLEANUP_MIGRATION_NAME,
         apply: migrate_backend_job_worker_cleanup_v76_to_v77,
+    },
+    Migration {
+        version: 78,
+        name: WORKDIR_CONNECTION_ID_MIGRATION_NAME,
+        apply: migrate_workdir_connection_id_v77_to_v78,
+    },
+    Migration {
+        version: 79,
+        name: WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME,
+        apply: migrate_workspace_config_v78_to_v79,
+    },
+    Migration {
+        version: 80,
+        name: WORKER_RESTORE_INTENTS_MIGRATION_NAME,
+        apply: migrate_worker_restore_intents_v79_to_v80,
+    },
+    Migration {
+        version: 81,
+        name: "Backend Job immutable resource serialization",
+        apply: migrate_backend_job_resources_v80_to_v81,
     },
 ];
 
@@ -894,6 +918,9 @@ pub struct WorkdirCreateOperationRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkdirRegistrySource {
+    WorkspaceConfig {
+        grant_id: String,
+    },
     Repository {
         runtime_id: String,
         repository_id: String,
@@ -907,20 +934,20 @@ impl WorkdirRegistrySource {
     pub fn runtime_id(&self) -> Option<&str> {
         match self {
             Self::Repository { runtime_id, .. } => Some(runtime_id),
-            Self::ExternalGrant { .. } => None,
+            Self::ExternalGrant { .. } | Self::WorkspaceConfig { .. } => None,
         }
     }
 
     pub fn repository_id(&self) -> Option<&str> {
         match self {
             Self::Repository { repository_id, .. } => Some(repository_id),
-            Self::ExternalGrant { .. } => None,
+            Self::ExternalGrant { .. } | Self::WorkspaceConfig { .. } => None,
         }
     }
 
     pub fn external_grant_id(&self) -> Option<&str> {
         match self {
-            Self::Repository { .. } => None,
+            Self::Repository { .. } | Self::WorkspaceConfig { .. } => None,
             Self::ExternalGrant { grant_id } => Some(grant_id),
         }
     }
@@ -945,6 +972,23 @@ pub struct WorkdirRegistryRecord {
     pub updated_at: String,
 }
 
+/// Projection inputs captured together with the catalog revision in one SQLite snapshot.
+#[derive(Debug, Clone)]
+pub struct WorkdirCatalogEntry {
+    pub record: WorkdirRegistryRecord,
+    pub repository_key: Option<String>,
+    /// None for Repository records and unsupported legacy External grants.
+    pub external_grant_permissions: Option<workdir::workspace::WorkdirPermissionSummary>,
+    pub occupied_by: Option<workdir::workspace::WorkingDirectoryOccupancy>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkdirCatalogPage {
+    pub entries: Vec<WorkdirCatalogEntry>,
+    pub next_cursor: Option<String>,
+    pub revision: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExternalWorkdirGrantRecord {
     pub grant_id: String,
@@ -963,6 +1007,8 @@ pub struct ExternalWorkdirGrantRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerWorkdirLinkRecord {
+    /// Assigned by the ledger on attach; preserved only by explicit compensation.
+    pub connection_id: String,
     pub workspace_id: String,
     pub worker: RuntimeWorkerRef,
     pub workdir_id: String,
@@ -1542,6 +1588,20 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
     ) -> Result<BackendJobReservation>;
     fn get_backend_job(&self, workspace_id: &str, job_id: &str)
     -> Result<Option<BackendJobRecord>>;
+    /// Pending/unknown Jobs and terminal Jobs with unfinished Worker cleanup
+    /// retain their resource. This is a query, not an independent lock ledger.
+    fn find_active_backend_job_for_resource(
+        &self,
+        workspace_id: &str,
+        resource_key: &str,
+    ) -> Result<Option<BackendJobRecord>>;
+    /// Current dispatched Job bound to this Worker and Runtime run. Returns the
+    /// immutable grants for Backend authorization without trusting caller input.
+    fn get_active_backend_job_for_worker(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<BackendJobRecord>>;
     fn get_backend_job_attempt(
         &self,
         workspace_id: &str,
@@ -1888,7 +1948,30 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         workspace_id: &str,
         limit: usize,
     ) -> Result<Vec<WorkdirRegistryRecord>>;
+    fn workdir_catalog_page(
+        &self,
+        workspace_id: &str,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Result<WorkdirCatalogPage>;
     fn delete_workdir_registry(&self, workspace_id: &str, workdir_id: &str) -> Result<bool>;
+
+    fn create_workspace_config_grant(
+        &self,
+        grant: &server_api::WorkspaceConfigGrantResponse,
+        actor: &str,
+    ) -> Result<()>;
+    fn get_workspace_config_grant(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<Option<server_api::WorkspaceConfigGrantResponse>>;
+    fn current_workspace_config_grant(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<server_api::WorkspaceConfigGrantResponse>>;
+    fn revoke_workspace_config_grant(&self, workspace_id: &str, grant_id: &str) -> Result<()>;
 
     fn create_external_workdir_grant(
         &self,
@@ -1983,6 +2066,31 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         expected_workdir_id: Option<&str>,
         unlinked_at: &str,
     ) -> Result<Option<WorkerWorkdirLinkRecord>>;
+    fn detach_worker_workdir_connection(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        alias: &str,
+        expected_connection_id: &str,
+        unlinked_at: &str,
+    ) -> Result<WorkerWorkdirLinkRecord>;
+    fn restore_worker_workdir_connection(&self, record: &WorkerWorkdirLinkRecord) -> Result<()>;
+    fn list_worker_workdir_links_page(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        limit: u32,
+        offset: u32,
+        connection_id: Option<&str>,
+    ) -> Result<Vec<WorkerWorkdirLinkRecord>>;
+    fn list_worker_workdir_links_page_with_revision(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        limit: u32,
+        offset: u32,
+        connection_id: Option<&str>,
+    ) -> Result<(Vec<WorkerWorkdirLinkRecord>, String)>;
     fn worker_workdir_link_history_exists(
         &self,
         workspace_id: &str,
@@ -2082,6 +2190,52 @@ impl SqliteWorkspaceStore {
             let value = f(&tx)?;
             tx.commit()?;
             Ok(value)
+        })
+    }
+
+    /// Client intent journal, not a lifecycle state machine: pin the public tuple
+    /// before dispatch and keep it unchanged until a terminal receipt is obtained.
+    pub(crate) fn pin_internal_worker_restore_intent(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        domain_key: &str,
+        observed_token: Option<&str>,
+        explicit_request_id: Option<&str>,
+    ) -> Result<server_api::WorkerRestoreRequest> {
+        self.with_transaction(|tx| {
+            let existing: Option<(String, String)> = if let Some(id) = explicit_request_id {
+                tx.query_row("SELECT request_id, expected_token FROM worker_restore_intents WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND request_id=?4",
+                    params![workspace_id, worker.runtime_id, worker.worker_id, id], |row| Ok((row.get(0)?, row.get(1)?))).optional()?
+            } else {
+                tx.query_row("SELECT request_id, expected_token FROM worker_restore_intents WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND domain_key=?4 AND settled=0",
+                    params![workspace_id, worker.runtime_id, worker.worker_id, domain_key], |row| Ok((row.get(0)?, row.get(1)?))).optional()?
+            };
+            if let Some((request_id, expected_observation_token)) = existing {
+                return Ok(server_api::WorkerRestoreRequest { request_id, expected_observation_token });
+            }
+            let observed_token = observed_token.ok_or(Error::RestoreObservationConflict)?;
+            // A separate deliberate invocation after a settled conflict may
+            // still observe the same generation (e.g. another owner is pending).
+            // Give it a new identity rather than colliding with a retired row;
+            // retries of unsettled delivery always return the pinned tuple above.
+            let request_id = explicit_request_id.map(str::to_owned).unwrap_or_else(|| format!("{domain_key}:{}", uuid::Uuid::now_v7()));
+            tx.execute("INSERT INTO worker_restore_intents(workspace_id,runtime_id,worker_id,domain_key,request_id,expected_token,settled) VALUES(?1,?2,?3,?4,?5,?6,0)",
+                params![workspace_id, worker.runtime_id, worker.worker_id, domain_key, request_id, observed_token])?;
+            Ok(server_api::WorkerRestoreRequest { request_id, expected_observation_token: observed_token.to_owned() })
+        })
+    }
+
+    pub(crate) fn settle_internal_worker_restore_intent(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        request_id: &str,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute("UPDATE worker_restore_intents SET settled=1 WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND request_id=?4",
+                params![workspace_id, worker.runtime_id, worker.worker_id, request_id])?;
+            Ok(())
         })
     }
 
@@ -6337,7 +6491,18 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 let attempt = read_backend_job_attempt(&tx, workspace_id, &request.job_id, &attempt_id)?
                     .ok_or_else(|| Error::Store("Backend Job current attempt is missing".to_string()))?;
                 tx.commit()?;
-                return Ok(BackendJobReservation { job, attempt, replayed: true });
+                return Ok(BackendJobReservation { job, attempt, replayed: true, resource_reused: false });
+            }
+            if let Some(key) = request.resource_key()
+                && let Some(job) = read_active_backend_job_for_resource(&tx, workspace_id, &key)?
+            {
+                let id = attempt_id(&job.request.job_id, job.current_attempt);
+                let attempt = read_backend_job_attempt(&tx, workspace_id, &job.request.job_id, &id)?
+                    .ok_or_else(|| Error::Store("active Backend Job current attempt is missing".into()))?;
+                tx.commit()?;
+                return Ok(BackendJobReservation {
+                    job, attempt, replayed: false, resource_reused: true,
+                });
             }
             for (role, worker) in [
                 ("source", request.source_worker.as_ref()),
@@ -6354,8 +6519,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let current_attempt = 1_u8;
             let attempt_id = attempt_id(&request.job_id, current_attempt);
             tx.execute(
-                "INSERT INTO backend_jobs (workspace_id, job_id, purpose, input_revision, input_ref, request_json, intent_fingerprint, state, current_attempt, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?9)",
-                params![workspace_id, request.job_id, request.purpose, request.input_revision, request.input_ref, request_json, fingerprint, current_attempt as i64, now],
+                "INSERT INTO backend_jobs (workspace_id, job_id, purpose, input_revision, input_ref, request_json, intent_fingerprint, state, current_attempt, created_at, updated_at, resource_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?9, ?10)",
+                params![workspace_id, request.job_id, request.purpose, request.input_revision, request.input_ref, request_json, fingerprint, current_attempt as i64, now, request.resource_key()],
             )?;
             tx.execute(
                 "INSERT INTO backend_job_attempts (workspace_id, job_id, attempt_id, attempt, input_revision, state, deadline_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?7, ?7)",
@@ -6366,7 +6531,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let attempt = read_backend_job_attempt(&tx, workspace_id, &request.job_id, &attempt_id)?
                 .ok_or_else(|| Error::Store("reserved Backend Job attempt is missing".to_string()))?;
             tx.commit()?;
-            Ok(BackendJobReservation { job, attempt, replayed: false })
+            Ok(BackendJobReservation { job, attempt, replayed: false, resource_reused: false })
         })
     }
 
@@ -6383,10 +6548,23 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let previous_id = attempt_id(job_id, job.current_attempt);
             let previous = read_backend_job_attempt(&tx, workspace_id, job_id, &previous_id)?
                 .ok_or_else(|| Error::Store("Backend Job current attempt is missing".to_string()))?;
-            if previous.state != BackendJobAttemptState::Failed {
+            if job.state != BackendJobState::Failed || previous.state != BackendJobAttemptState::Failed {
                 return Err(Error::InvalidInput(
                     "Backend Job re-evaluation requires a definitively failed current attempt; unknown execution outcomes cannot be retried"
                         .to_string(),
+                ));
+            }
+            if backend_job_has_unfinished_cleanup(&tx, workspace_id, job_id)? {
+                return Err(Error::InvalidInput(
+                    "Backend Job retry requires completed Worker cleanup for every prior attempt".into(),
+                ));
+            }
+            if let Some(key) = job.request.resource_key()
+                && let Some(active) = read_active_backend_job_for_resource(&tx, workspace_id, &key)?
+                && active.request.job_id != job_id
+            {
+                return Err(Error::InvalidInput(
+                    "Backend Job retry resource is reserved by another Job".into(),
                 ));
             }
             if job.current_attempt >= job.request.limits.max_attempts {
@@ -6413,7 +6591,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, &next_id)?
                 .ok_or_else(|| Error::Store("retried Backend Job attempt is missing".to_string()))?;
             tx.commit()?;
-            Ok(BackendJobReservation { job, attempt, replayed: false })
+            Ok(BackendJobReservation { job, attempt, replayed: false, resource_reused: false })
         })
     }
 
@@ -6423,6 +6601,36 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         job_id: &str,
     ) -> Result<Option<BackendJobRecord>> {
         self.with_conn(|conn| read_backend_job(conn, workspace_id, job_id))
+    }
+
+    fn find_active_backend_job_for_resource(
+        &self,
+        workspace_id: &str,
+        resource_key: &str,
+    ) -> Result<Option<BackendJobRecord>> {
+        self.with_conn(|conn| {
+            read_active_backend_job_for_resource(conn, workspace_id, resource_key)
+        })
+    }
+
+    fn get_active_backend_job_for_worker(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<BackendJobRecord>> {
+        self.with_conn(|conn| {
+            let id = conn.query_row(
+                "SELECT job.job_id FROM backend_jobs job JOIN backend_job_attempts attempt
+                 ON attempt.workspace_id = job.workspace_id AND attempt.job_id = job.job_id
+                 AND attempt.attempt = job.current_attempt
+                 WHERE job.workspace_id = ?1 AND job.state = 'pending'
+                 AND attempt.state = 'dispatched' AND attempt.runtime_id = ?2 AND attempt.worker_id = ?3
+                 AND attempt.runtime_run_id IS NOT NULL",
+                params![workspace_id, worker.runtime_id.as_str(), worker.worker_id.as_str()],
+                |row| row.get::<_, String>(0),
+            ).optional()?;
+            id.map(|id| read_backend_job(conn, workspace_id, &id)).transpose().map(Option::flatten)
+        })
     }
 
     fn get_backend_job_attempt(
@@ -6479,7 +6687,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job attempt `{attempt_id}`")))?;
             if attempt.state != BackendJobAttemptState::Reserved {
                 tx.commit()?;
-                return Ok((BackendJobReservation { job, attempt, replayed: true }, false));
+                return Ok((BackendJobReservation { job, attempt, replayed: true, resource_reused: false }, false));
             }
             let active: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM backend_job_attempts WHERE workspace_id = ?1 AND state IN ('dispatching', 'dispatched')",
@@ -6488,7 +6696,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )?;
             if active >= i64::from(job.request.limits.max_concurrent_jobs) {
                 tx.commit()?;
-                return Ok((BackendJobReservation { job, attempt, replayed: true }, false));
+                return Ok((BackendJobReservation { job, attempt, replayed: true, resource_reused: false }, false));
             }
             let deadline = backend_job_deadline(now, job.request.limits.timeout_seconds)?;
             let changed = tx.execute(
@@ -6501,7 +6709,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, attempt_id)?
                 .ok_or_else(|| Error::Store("claimed Backend Job attempt disappeared".to_string()))?;
             tx.commit()?;
-            Ok((BackendJobReservation { job, attempt, replayed: false }, true))
+            Ok((BackendJobReservation { job, attempt, replayed: false, resource_reused: false }, true))
         })
     }
 
@@ -8793,13 +9001,13 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
 
     fn upsert_workdir_registry(&self, record: &WorkdirRegistryRecord) -> Result<()> {
         self.with_conn(|conn| {
-            conn.execute(
+            let changed = conn.execute(
                 r#"INSERT INTO workdir_registry (
                     workspace_id, workdir_id, display_name, source_kind, runtime_id, repository_id,
                     external_grant_id, creation_selector, creation_ref, creation_tree,
                     current_selector, current_ref, current_tree, observed_at_epoch_seconds,
-                    materialization_status, cleanliness, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                    materialization_status, cleanliness, created_at, updated_at, workspace_config_grant_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
                 ON CONFLICT(workspace_id, workdir_id) DO UPDATE SET
                     display_name = excluded.display_name,
                     source_kind = excluded.source_kind,
@@ -8815,12 +9023,13 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     observed_at_epoch_seconds = excluded.observed_at_epoch_seconds,
                     materialization_status = excluded.materialization_status,
                     cleanliness = excluded.cleanliness,
-                    updated_at = excluded.updated_at"#,
+                    updated_at = excluded.updated_at, workspace_config_grant_id = excluded.workspace_config_grant_id
+                    WHERE workdir_registry.source_kind != 'workspace_config' OR (excluded.source_kind = 'workspace_config' AND workdir_registry.workspace_config_grant_id = excluded.workspace_config_grant_id)"#,
                 params![
                     record.workspace_id,
                     record.workdir_id,
                     record.display_name,
-                    match &record.source { WorkdirRegistrySource::Repository { .. } => "repository", WorkdirRegistrySource::ExternalGrant { .. } => "external_grant" },
+                    match &record.source { WorkdirRegistrySource::Repository { .. } => "repository", WorkdirRegistrySource::ExternalGrant { .. } => "external_grant", WorkdirRegistrySource::WorkspaceConfig { .. } => "workspace_config" },
                     record.source.runtime_id(),
                     record.source.repository_id(),
                     record.source.external_grant_id(),
@@ -8835,8 +9044,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     record.cleanliness,
                     record.created_at,
                     record.updated_at,
+                    match &record.source { WorkdirRegistrySource::WorkspaceConfig { grant_id } => Some(grant_id.as_str()), _ => None },
                 ],
             )?;
+            if changed == 0 { return Err(Error::WorkspacePermissionDenied("Logical config source identity cannot be replaced by a Runtime observation".into())); }
             Ok(())
         })
     }
@@ -8876,7 +9087,83 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn workdir_catalog_page(
+        &self,
+        workspace_id: &str,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Result<WorkdirCatalogPage> {
+        if limit == 0 || limit > 100 {
+            return Err(Error::InvalidInput(
+                "catalog page limit must be 1..=100".to_string(),
+            ));
+        }
+        if cursor.is_some_and(|id| {
+            id.trim().is_empty() || id.len() > 128 || id.chars().any(char::is_control)
+        }) {
+            return Err(Error::InvalidInput(
+                "catalog cursor must contain 1..=128 bytes without control characters".to_string(),
+            ));
+        }
+        self.with_conn(|conn| {
+            // Also fence writers using other SQLite connections, not only this mutex.
+            let tx = conn.unchecked_transaction()?;
+            let sql = workdir_catalog_select_sql();
+            let mut hasher = Sha256::new();
+            update_public_collection_digest(&mut hasher, &("workdir-catalog:v1", workspace_id))?;
+            {
+                let mut stmt = tx.prepare(&format!("{sql} WHERE wr.workspace_id = ?1 ORDER BY wr.workdir_id"))?;
+                let mut rows = stmt.query(params![workspace_id])?;
+                while let Some(row) = rows.next()? {
+                    let (entry, connection_id) = read_workdir_catalog_entry(row)?;
+                    let record = &entry.record;
+                    // Safe projection fields and timestamps only: no paths, provider identity,
+                    // credentials, Repository UUIDs, or raw internal records.
+                    update_public_collection_digest(&mut hasher, &(
+                        &record.workdir_id, &record.display_name, &entry.repository_key,
+                        record.source.external_grant_id(), &entry.external_grant_permissions,
+                        (&record.creation_selector, &record.creation_ref, &record.creation_tree),
+                        (&record.current_selector, &record.current_ref, &record.current_tree),
+                        record.observed_at_epoch_seconds,
+                        (&record.materialization_status, &record.cleanliness),
+                        (&record.created_at, &record.updated_at),
+                        &entry.occupied_by, connection_id,
+                    ))?;
+                }
+            }
+            let mut stmt = tx.prepare(&format!(
+                "{sql} WHERE wr.workspace_id = ?1 AND (?2 IS NULL OR wr.workdir_id > ?2) ORDER BY wr.workdir_id ASC LIMIT ?3"
+            ))?;
+            let mut rows = stmt.query(params![workspace_id, cursor, limit + 1])?;
+            let mut entries = Vec::new();
+            while let Some(row) = rows.next()? {
+                entries.push(read_workdir_catalog_entry(row)?.0);
+            }
+            let next_cursor = if entries.len() > limit as usize {
+                entries.truncate(limit as usize);
+                entries.last().map(|entry| entry.record.workdir_id.clone())
+            } else {
+                None
+            };
+            Ok(WorkdirCatalogPage {
+                entries,
+                next_cursor,
+                revision: hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+            })
+        })
+    }
+
     fn delete_workdir_registry(&self, workspace_id: &str, workdir_id: &str) -> Result<bool> {
+        if self
+            .get_workdir_registry(workspace_id, workdir_id)?
+            .is_some_and(|record| {
+                matches!(record.source, WorkdirRegistrySource::WorkspaceConfig { .. })
+            })
+        {
+            return Err(Error::WorkspacePermissionDenied(
+                "Logical config Workdir cleanup is unsupported; revoke its grant".into(),
+            ));
+        }
         self.with_conn(|conn| {
             let tx = rusqlite::Transaction::new_unchecked(
                 conn,
@@ -8905,6 +9192,41 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             tx.commit()?;
             Ok(changed > 0)
         })
+    }
+
+    fn create_workspace_config_grant(
+        &self,
+        grant: &server_api::WorkspaceConfigGrantResponse,
+        actor: &str,
+    ) -> Result<()> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let active: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM workspaces WHERE workspace_id=?1 AND owner_account_id=?2 AND state='active')", params![grant.workspace_id, actor], |row|row.get(0))?;
+            if !active { return Err(Error::WorkspacePermissionDenied("Workspace no longer accepts new grants".into())); }
+            let now = chrono::Utc::now().to_rfc3339();
+            let access = match grant.access { server_api::WorkspaceConfigAccess::ReadOnly => "read_only", server_api::WorkspaceConfigAccess::ReadWrite => "read_write" };
+            tx.execute("INSERT INTO workspace_config_grants (workspace_id,grant_id,runtime_id,worker_id,workdir_id,access,revoked,created_by,created_at) VALUES (?1,?2,?3,?4,?5,?6,0,?7,?8)", params![grant.workspace_id,grant.grant_id,grant.runtime_id,grant.worker_id,grant.working_directory_id,access,actor,now])?;
+            tx.execute("INSERT INTO workdir_registry (workspace_id,workdir_id,display_name,source_kind,workspace_config_grant_id,materialization_status,cleanliness,created_at,updated_at) VALUES (?1,?2,'Workspace configuration','workspace_config',?3,'present','clean',?4,?4)", params![grant.workspace_id,grant.working_directory_id,grant.grant_id,now])?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+    fn get_workspace_config_grant(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<Option<server_api::WorkspaceConfigGrantResponse>> {
+        self.with_conn(|conn| conn.query_row("SELECT workspace_id,grant_id,runtime_id,worker_id,workdir_id,access,revoked FROM workspace_config_grants WHERE workspace_id=?1 AND grant_id=?2", params![workspace_id,grant_id], read_workspace_config_grant).optional().map_err(Error::from))
+    }
+    fn current_workspace_config_grant(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<server_api::WorkspaceConfigGrantResponse>> {
+        self.with_conn(|conn| conn.query_row("SELECT workspace_id,grant_id,runtime_id,worker_id,workdir_id,access,revoked FROM workspace_config_grants WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND revoked=0", params![workspace_id,worker.runtime_id,worker.worker_id], read_workspace_config_grant).optional().map_err(Error::from))
+    }
+    fn revoke_workspace_config_grant(&self, workspace_id: &str, grant_id: &str) -> Result<()> {
+        self.with_conn_mut(|conn| { let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?; tx.execute("UPDATE workspace_config_grants SET revoked=1 WHERE workspace_id=?1 AND grant_id=?2", params![workspace_id,grant_id])?; tx.execute("UPDATE workdir_registry SET materialization_status='not_found', updated_at=?3 WHERE workspace_id=?1 AND workspace_config_grant_id=?2", params![workspace_id,grant_id,chrono::Utc::now().to_rfc3339()])?; tx.commit()?; Ok(()) })
     }
 
     fn create_external_workdir_grant(
@@ -9349,6 +9671,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 "reserved attachment finalization requires an active attachment".to_string(),
             ));
         }
+        let mut record = record.clone();
+        record.connection_id = uuid::Uuid::now_v7().to_string();
         self.with_conn(|conn| {
             let tx = rusqlite::Transaction::new_unchecked(
                 conn,
@@ -9370,11 +9694,12 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             }
             tx.execute(
                 r#"INSERT INTO worker_workdir_links (
-                    workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
+                    workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)
                 ON CONFLICT(workspace_id, runtime_id, worker_id, workdir_id, alias) DO UPDATE SET
                     capabilities = excluded.capabilities,
                     linked_at = excluded.linked_at,
+                    connection_id = excluded.connection_id,
                     unlinked_at = NULL"#,
                 params![
                     record.workspace_id,
@@ -9384,6 +9709,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     record.alias,
                     encode_workdir_link_capabilities(record.capabilities)?,
                     record.linked_at,
+                    record.connection_id,
                 ],
             )
             .map_err(|error| {
@@ -9421,6 +9747,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 "a new attachment cannot already be unlinked".to_string(),
             ));
         }
+        let mut record = record.clone();
+        record.connection_id = uuid::Uuid::now_v7().to_string();
         self.with_conn(|conn| {
             let tx = rusqlite::Transaction::new_unchecked(
                 conn,
@@ -9456,7 +9784,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             }
             let active_for_alias = tx
                 .query_row(
-                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
+                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
                        FROM worker_workdir_links
                        WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
                          AND alias = ?4 AND unlinked_at IS NULL"#,
@@ -9499,7 +9827,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             }
             let active_for_workdir = tx
                 .query_row(
-                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
+                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
                        FROM worker_workdir_links
                        WHERE workspace_id = ?1 AND workdir_id = ?2 AND unlinked_at IS NULL"#,
                     params![record.workspace_id, record.workdir_id],
@@ -9514,11 +9842,12 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             }
             let write = tx.execute(
                 r#"INSERT INTO worker_workdir_links (
-                    workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
+                    workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)
                 ON CONFLICT(workspace_id, runtime_id, worker_id, workdir_id, alias) DO UPDATE SET
                     capabilities = excluded.capabilities,
                     linked_at = excluded.linked_at,
+                    connection_id = excluded.connection_id,
                     unlinked_at = NULL"#,
                 params![
                     record.workspace_id,
@@ -9528,6 +9857,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     record.alias,
                     encode_workdir_link_capabilities(record.capabilities)?,
                     record.linked_at,
+                    record.connection_id,
                 ],
             );
             if let Err(error) = write {
@@ -9556,7 +9886,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 rusqlite::TransactionBehavior::Immediate,
             )?;
             let mut stmt = tx.prepare(
-                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
+                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
                    FROM worker_workdir_links
                    WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
                      AND unlinked_at IS NULL"#,
@@ -9571,7 +9901,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
 
             let mut persisted_identity = persisted
                 .iter()
-                .map(|link| (link.alias.as_str(), link.workdir_id.as_str()))
+                .map(|link| (link.alias.as_str(), link.workdir_id.as_str(), link.connection_id.as_str()))
                 .collect::<Vec<_>>();
             persisted_identity.sort_unstable();
             let mut requested_identity = active_links
@@ -9592,7 +9922,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                             link.alias
                         ))
                     })?;
-                    Ok((link.alias.as_str(), link.workdir_id.as_str()))
+                    Ok((link.alias.as_str(), link.workdir_id.as_str(), link.connection_id.as_str()))
                 })
                 .collect::<Result<Vec<_>>>()?;
             requested_identity.sort_unstable();
@@ -9644,7 +9974,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )?;
             let active = tx
                 .query_row(
-                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
+                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
                        FROM worker_workdir_links
                        WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
                          AND (?4 IS NULL OR workdir_id = ?4) AND unlinked_at IS NULL"#,
@@ -9683,6 +10013,202 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn detach_worker_workdir_connection(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        alias: &str,
+        expected_connection_id: &str,
+        unlinked_at: &str,
+    ) -> Result<WorkerWorkdirLinkRecord> {
+        self.with_conn(|conn| {
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let active = tx
+                .query_row(
+                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities,
+                          linked_at, unlinked_at, connection_id
+                   FROM worker_workdir_links
+                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
+                     AND alias = ?4 AND connection_id = ?5 AND unlinked_at IS NULL"#,
+                    params![
+                        workspace_id,
+                        worker.runtime_id,
+                        worker.worker_id,
+                        alias,
+                        expected_connection_id
+                    ],
+                    read_worker_workdir_link_record,
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    Error::WorkdirAttachmentConflict(format!(
+                        "Workdir attachment `{alias}` connection changed during detach"
+                    ))
+                })?;
+            let changed = tx.execute(
+                r#"UPDATE worker_workdir_links SET unlinked_at = ?6
+                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
+                     AND alias = ?4 AND connection_id = ?5 AND unlinked_at IS NULL"#,
+                params![
+                    workspace_id,
+                    worker.runtime_id,
+                    worker.worker_id,
+                    alias,
+                    expected_connection_id,
+                    unlinked_at
+                ],
+            )?;
+            if changed != 1 {
+                return Err(Error::WorkdirAttachmentConflict(format!(
+                    "Workdir attachment `{alias}` connection changed during detach"
+                )));
+            }
+            tx.commit()?;
+            Ok(WorkerWorkdirLinkRecord {
+                unlinked_at: Some(unlinked_at.to_string()),
+                ..active
+            })
+        })
+    }
+
+    fn restore_worker_workdir_connection(&self, record: &WorkerWorkdirLinkRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            // Compensation reactivates only the same lifetime, never an intervening attach.
+            let changed = conn.execute(
+                r#"UPDATE worker_workdir_links SET unlinked_at = NULL
+                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
+                     AND workdir_id = ?4 AND alias = ?5 AND connection_id = ?6
+                     AND unlinked_at IS NOT NULL
+                     AND NOT EXISTS (
+                         SELECT 1 FROM worker_workdir_attachment_reservations
+                         WHERE workspace_id = ?1 AND workdir_id = ?4
+                     )"#,
+                params![record.workspace_id, record.worker.runtime_id, record.worker.worker_id,
+                        record.workdir_id, record.alias, record.connection_id],
+            ).map_err(|error| {
+                if matches!(error, rusqlite::Error::SqliteFailure(ref code, _) if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE) {
+                    Error::WorkdirAttachmentConflict("Workdir acquired another active attachment during compensation".to_string())
+                } else {
+                    error.into()
+                }
+            })?;
+            if changed != 1 {
+                return Err(Error::WorkdirAttachmentConflict(
+                    "Workdir attachment connection changed during compensation".to_string(),
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    fn list_worker_workdir_links_page(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        limit: u32,
+        offset: u32,
+        connection_id: Option<&str>,
+    ) -> Result<Vec<WorkerWorkdirLinkRecord>> {
+        self.list_worker_workdir_links_page_with_revision(
+            workspace_id,
+            worker,
+            limit,
+            offset,
+            connection_id,
+        )
+        .map(|(links, _)| links)
+    }
+
+    fn list_worker_workdir_links_page_with_revision(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        limit: u32,
+        offset: u32,
+        connection_id: Option<&str>,
+    ) -> Result<(Vec<WorkerWorkdirLinkRecord>, String)> {
+        if limit == 0 || limit > 101 {
+            return Err(Error::InvalidInput(
+                "attachment page limit must be 1..=101".to_string(),
+            ));
+        }
+        if connection_id.is_some_and(|id| {
+            id.trim().is_empty() || id.len() > 128 || id.chars().any(char::is_control)
+        }) {
+            return Err(Error::InvalidInput(
+                "attachment connection_id must contain 1..=128 bytes without control characters"
+                    .to_string(),
+            ));
+        }
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut hasher = Sha256::new();
+            update_public_collection_digest(
+                &mut hasher,
+                &(
+                    "workdir-connections:v1",
+                    workspace_id,
+                    &worker.runtime_id,
+                    &worker.worker_id,
+                ),
+            )?;
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT alias, connection_id, workdir_id, capabilities FROM worker_workdir_links
+                     WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
+                       AND unlinked_at IS NULL ORDER BY alias"
+                )?;
+                let mut rows =
+                    stmt.query(params![workspace_id, worker.runtime_id, worker.worker_id])?;
+                while let Some(row) = rows.next()? {
+                    let alias: String = row.get(0)?;
+                    let id: String = row.get(1)?;
+                    let workdir: String = row.get(2)?;
+                    let capabilities =
+                        decode_workdir_link_capabilities(&row.get::<_, String>(3)?, 3).map_err(
+                            |_| Error::Store("invalid public connection capabilities".to_string()),
+                        )?;
+                    update_public_collection_digest(
+                        &mut hasher,
+                        &(alias, id, workdir, capabilities),
+                    )?;
+                }
+            }
+            let mut stmt = tx.prepare(
+                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities,
+                          linked_at, unlinked_at, connection_id
+                   FROM worker_workdir_links
+                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
+                     AND unlinked_at IS NULL
+                     AND (?6 IS NULL OR connection_id = ?6)
+                   ORDER BY alias LIMIT ?4 OFFSET ?5"#,
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    workspace_id,
+                    worker.runtime_id,
+                    worker.worker_id,
+                    limit,
+                    offset,
+                    connection_id
+                ],
+                read_worker_workdir_link_record,
+            )?;
+            let links = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok((
+                links,
+                hasher
+                    .finalize()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
+            ))
+        })
+    }
+
     fn worker_workdir_link_history_exists(
         &self,
         workspace_id: &str,
@@ -9708,7 +10234,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<Vec<WorkerWorkdirLinkRecord>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
+                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
                    FROM worker_workdir_links
                    WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3 AND unlinked_at IS NULL
                    ORDER BY linked_at DESC"#,
@@ -9729,7 +10255,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<Vec<WorkerWorkdirLinkRecord>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
+                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
                    FROM worker_workdir_links
                    WHERE workspace_id = ?1 AND workdir_id = ?2 AND unlinked_at IS NULL
                    ORDER BY linked_at DESC"#,
@@ -9750,7 +10276,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<Option<WorkerWorkdirLinkRecord>> {
         self.with_conn(|conn| {
             conn.query_row(
-                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at
+                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
                    FROM worker_workdir_links
                    WHERE workspace_id = ?1 AND workdir_id = ?2
                    ORDER BY linked_at DESC, rowid DESC
@@ -10497,6 +11023,7 @@ fn read_worker_workdir_link_record(
         capabilities,
         linked_at: row.get(6)?,
         unlinked_at: row.get(7)?,
+        connection_id: row.get(8)?,
     })
 }
 
@@ -10577,6 +11104,41 @@ fn backend_job_deadline(now: &str, timeout_seconds: u32) -> Result<String> {
     let now = chrono::DateTime::parse_from_rfc3339(now)
         .map_err(|error| Error::InvalidInput(format!("invalid Backend Job timestamp: {error}")))?;
     Ok((now + chrono::Duration::seconds(i64::from(timeout_seconds))).to_rfc3339())
+}
+
+fn backend_job_has_unfinished_cleanup(
+    conn: &Connection,
+    workspace_id: &str,
+    job_id: &str,
+) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM backend_job_attempts WHERE workspace_id = ?1 AND job_id = ?2
+         AND worker_cleanup_state IS NOT 'completed')",
+        params![workspace_id, job_id],
+        |row| row.get(0),
+    )?)
+}
+
+fn read_active_backend_job_for_resource(
+    conn: &Connection,
+    workspace_id: &str,
+    resource_key: &str,
+) -> Result<Option<BackendJobRecord>> {
+    // Resource ownership is computed from common Job/attempt authority. Unknown
+    // effects block even after Worker removal; cleanup is not outcome resolution.
+    let id = conn.query_row(
+        "SELECT job.job_id FROM backend_jobs job WHERE job.workspace_id = ?1 AND job.resource_key = ?2
+         AND (job.state IN ('pending', 'unknown') OR EXISTS (
+             SELECT 1 FROM backend_job_attempts attempt WHERE attempt.workspace_id = job.workspace_id
+             AND attempt.job_id = job.job_id
+             AND attempt.worker_cleanup_state IS NOT 'completed'))
+         ORDER BY job.created_at, job.job_id LIMIT 1",
+        params![workspace_id, resource_key],
+        |row| row.get::<_, String>(0),
+    ).optional()?;
+    id.map(|id| read_backend_job(conn, workspace_id, &id))
+        .transpose()
+        .map(Option::flatten)
 }
 
 fn read_backend_job(
@@ -10847,6 +11409,7 @@ fn read_worker_registry_projection(
                 })?
             } else {
                 SubscriptionWorker {
+                    restore_observation_token: None,
                     worker_id: SubscriptionWorkerId::new(worker.worker_id.to_string())
                         .map_err(|error| Error::InvalidInput(error.to_string()))?,
                     runtime_id: Some(worker.runtime_id.to_string()),
@@ -11442,9 +12005,100 @@ fn require_expected_ticket_assignment(
     )))
 }
 
+// Length-framed canonical JSON prevents ambiguous concatenations and never hashes raw ledgers.
+fn update_public_collection_digest(hasher: &mut Sha256, value: &impl Serialize) -> Result<()> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|_| Error::Store("unable to encode public collection metadata".to_string()))?;
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+    Ok(())
+}
+
+fn workdir_catalog_select_sql() -> String {
+    format!(
+        "SELECT wr.*, r.repository_key, g.permissions,
+                l.runtime_id, l.worker_id, w.display_name, l.linked_at, l.connection_id
+         FROM ({}) wr
+         LEFT JOIN repositories r ON r.workspace_id = wr.workspace_id AND r.repository_id = wr.repository_id
+         LEFT JOIN external_workdir_grants g ON g.workspace_id = wr.workspace_id AND g.grant_id = wr.external_grant_id
+         LEFT JOIN worker_workdir_links l ON l.rowid = (
+             SELECT rowid FROM worker_workdir_links
+             WHERE workspace_id = wr.workspace_id AND workdir_id = wr.workdir_id AND unlinked_at IS NULL
+             ORDER BY linked_at DESC, rowid DESC LIMIT 1
+         )
+         LEFT JOIN worker_registry w ON w.workspace_id = l.workspace_id AND w.runtime_id = l.runtime_id AND w.worker_id = l.worker_id",
+        workdir_registry_select_sql("")
+    )
+}
+
+fn read_workdir_catalog_entry(
+    row: &rusqlite::Row<'_>,
+) -> Result<(WorkdirCatalogEntry, Option<String>)> {
+    let record = read_workdir_registry_record(row)?;
+    let repository_key: Option<String> = row.get(18)?;
+    let external_grant_permissions = match &record.source {
+        WorkdirRegistrySource::Repository { .. } => {
+            if repository_key.is_none() {
+                return Err(Error::Store(
+                    "Workdir catalog Repository is unavailable".to_string(),
+                ));
+            }
+            None
+        }
+        WorkdirRegistrySource::WorkspaceConfig { .. } => None,
+        WorkdirRegistrySource::ExternalGrant { .. } => {
+            let permissions: Option<String> = row.get(19)?;
+            match permissions.as_deref() {
+                Some("read_only") => Some(workdir::workspace::WorkdirPermissionSummary {
+                    read: true,
+                    write: false,
+                    command: false,
+                }),
+                Some("read_write") => Some(workdir::workspace::WorkdirPermissionSummary {
+                    read: true,
+                    write: true,
+                    command: false,
+                }),
+                Some("read_write_command") => Some(workdir::workspace::WorkdirPermissionSummary {
+                    read: true,
+                    write: true,
+                    command: true,
+                }),
+                Some("command_only" | "read_command") => None,
+                _ => {
+                    return Err(Error::Store(
+                        "Workdir catalog External grant permissions are unavailable".to_string(),
+                    ));
+                }
+            }
+        }
+    };
+    let runtime_id: Option<String> = row.get(20)?;
+    let occupied_by = match runtime_id {
+        Some(runtime_id) => Some(workdir::workspace::WorkingDirectoryOccupancy {
+            runtime_id,
+            worker_id: row.get(21)?,
+            display_name: row.get::<_, Option<String>>(22)?.ok_or_else(|| {
+                Error::Store("Workdir catalog occupant is unavailable".to_string())
+            })?,
+            linked_at: row.get(23)?,
+        }),
+        None => None,
+    };
+    Ok((
+        WorkdirCatalogEntry {
+            record,
+            repository_key,
+            external_grant_permissions,
+            occupied_by,
+        },
+        row.get(24)?,
+    ))
+}
+
 fn workdir_registry_select_sql(where_clause: &str) -> String {
     format!(
-        "SELECT workspace_id, workdir_id, display_name, source_kind, runtime_id, repository_id, external_grant_id, \
+        "SELECT workspace_id, workdir_id, display_name, source_kind, runtime_id, repository_id, COALESCE(external_grant_id, workspace_config_grant_id) AS external_grant_id, \
          creation_selector, creation_ref, creation_tree, \
          current_selector, current_ref, current_tree, observed_at_epoch_seconds, \
          materialization_status, cleanliness, created_at, updated_at \
@@ -11472,6 +12126,15 @@ fn read_workdir_registry_record(
                 rusqlite::Error::InvalidColumnType(
                     5,
                     "repository_id".to_string(),
+                    rusqlite::types::Type::Null,
+                )
+            })?,
+        },
+        "workspace_config" => WorkdirRegistrySource::WorkspaceConfig {
+            grant_id: external_grant_id.clone().ok_or_else(|| {
+                rusqlite::Error::InvalidColumnType(
+                    6,
+                    "workspace_config_grant_id".into(),
                     rusqlite::types::Type::Null,
                 )
             })?,
@@ -11510,6 +12173,24 @@ fn read_workdir_registry_record(
         created_at: row.get(16)?,
         updated_at: row.get(17)?,
     })
+}
+
+fn migrate_worker_restore_intents_v79_to_v80(conn: &Connection) -> Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    tx.execute_batch("CREATE TABLE worker_restore_intents (
+        workspace_id TEXT NOT NULL, runtime_id TEXT NOT NULL, worker_id TEXT NOT NULL,
+        domain_key TEXT NOT NULL, request_id TEXT NOT NULL, expected_token TEXT NOT NULL,
+        settled INTEGER NOT NULL CHECK(settled IN (0,1)),
+        PRIMARY KEY(workspace_id,runtime_id,worker_id,request_id),
+        FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+    );
+    CREATE UNIQUE INDEX worker_restore_intent_pending_domain ON worker_restore_intents(workspace_id,runtime_id,worker_id,domain_key) WHERE settled=0;")?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(?1,?2)",
+        params![80_i64, WORKER_RESTORE_INTENTS_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn prepare_connection(conn: &Connection) -> Result<()> {
@@ -14447,6 +15128,27 @@ fn migrate_archive_observe_grants_v75_to_v76(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_backend_job_resources_v80_to_v81(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 80 {
+        return Err(Error::Store(
+            "Backend Job resource migration requires schema 80".into(),
+        ));
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    tx.execute_batch(
+        "ALTER TABLE backend_jobs ADD COLUMN resource_key TEXT;
+         CREATE INDEX backend_jobs_resource ON backend_jobs(workspace_id, resource_key, created_at);",
+    )?;
+    // Pre-grant requests had no resource lock. Preserve their exact stored JSON
+    // and fingerprint; serde defaults read them as empty grants / no key.
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version, name) VALUES (81, 'Backend Job immutable resource serialization')",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn migrate_backend_job_worker_cleanup_v76_to_v77(conn: &Connection) -> Result<()> {
     let current = current_schema_version(conn)?;
     if current != 76 {
@@ -14486,7 +15188,122 @@ fn migrate_backend_job_worker_cleanup_v76_to_v77(conn: &Connection) -> Result<()
     Ok(())
 }
 
+fn read_workspace_config_grant(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<server_api::WorkspaceConfigGrantResponse> {
+    let access: String = row.get(5)?;
+    Ok(server_api::WorkspaceConfigGrantResponse {
+        workspace_id: row.get(0)?,
+        grant_id: row.get(1)?,
+        runtime_id: row.get(2)?,
+        worker_id: row.get(3)?,
+        working_directory_id: row.get(4)?,
+        access: match access.as_str() {
+            "read_only" => server_api::WorkspaceConfigAccess::ReadOnly,
+            "read_write" => server_api::WorkspaceConfigAccess::ReadWrite,
+            _ => {
+                return Err(rusqlite::Error::InvalidColumnType(
+                    5,
+                    "access".into(),
+                    rusqlite::types::Type::Text,
+                ));
+            }
+        },
+        revoked: row.get(6)?,
+    })
+}
+
+fn migrate_workspace_config_v78_to_v79(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 78 {
+        return Err(Error::Store(
+            "Workspace config migration requires schema 78".into(),
+        ));
+    }
+    let foreign_keys =
+        conn.pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))?;
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let result = (|| {
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+        let dependents = {
+            let mut stmt = tx.prepare("SELECT sql FROM sqlite_schema WHERE tbl_name='workdir_registry' AND type IN ('index','trigger') AND sql IS NOT NULL")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let schema = include_str!("latest_schema.sql");
+        let start = schema
+            .find("CREATE TABLE \"workdir_registry\"")
+            .ok_or_else(|| Error::Store("Missing Workdir schema".into()))?;
+        let end = schema[start..]
+            .find("CREATE TABLE external_workdir_grants")
+            .ok_or_else(|| Error::Store("Missing Workdir schema end".into()))?
+            + start;
+        if column_exists(&tx, "workdir_registry", "workspace_config_grant_id")?
+            && table_exists(&tx, "workspace_config_grants")?
+        {
+            tx.execute("INSERT INTO __yoi_schema_migrations(version,name) VALUES (79,'Workspace config grants and logical Workdirs')", [])?;
+            tx.commit()?;
+            return Ok(());
+        }
+        tx.execute_batch(include_str!("workspace_config_grants.sql"))?;
+        tx.execute_batch(&schema[start..end].replace(
+            "CREATE TABLE \"workdir_registry\"",
+            "CREATE TABLE workdir_registry_v79",
+        ))?;
+        tx.execute_batch("INSERT INTO workdir_registry_v79 (workspace_id,workdir_id,display_name,source_kind,runtime_id,repository_id,external_grant_id,creation_selector,creation_ref,creation_tree,current_selector,current_ref,current_tree,observed_at_epoch_seconds,materialization_status,cleanliness,created_at,updated_at) SELECT workspace_id,workdir_id,display_name,source_kind,runtime_id,repository_id,external_grant_id,creation_selector,creation_ref,creation_tree,current_selector,current_ref,current_tree,observed_at_epoch_seconds,materialization_status,cleanliness,created_at,updated_at FROM workdir_registry; DROP TABLE workdir_registry; ALTER TABLE workdir_registry_v79 RENAME TO workdir_registry;")?;
+        for sql in dependents {
+            tx.execute_batch(&sql)?;
+        }
+        let broken: bool = {
+            let mut stmt = tx.prepare("PRAGMA foreign_key_check")?;
+            let mut rows = stmt.query([])?;
+            rows.next()?.is_some()
+        };
+        if broken {
+            return Err(Error::Store(
+                "Workspace config migration foreign-key verification failed".into(),
+            ));
+        }
+        tx.execute("INSERT INTO __yoi_schema_migrations(version,name) VALUES (79,'Workspace config grants and logical Workdirs')", [])?;
+        tx.commit()?;
+        Ok(())
+    })();
+    if foreign_keys {
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    }
+    result
+}
+
+fn migrate_workdir_connection_id_v77_to_v78(conn: &Connection) -> Result<()> {
+    use rusqlite::TransactionBehavior;
+    let current = current_schema_version(conn)?;
+    if current != 77 {
+        return Err(Error::Store(format!(
+            "expected schema version 77 before {WORKDIR_CONNECTION_ID_MIGRATION_NAME} migration, found {current}"
+        )));
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    tx.execute_batch(
+        "ALTER TABLE worker_workdir_links ADD COLUMN connection_id TEXT NOT NULL DEFAULT '';
+         UPDATE worker_workdir_links SET connection_id = lower(hex(randomblob(16)));",
+    )?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
+        params![78_i64, WORKDIR_CONNECTION_ID_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch("CREATE TABLE worker_restore_intents (
+        workspace_id TEXT NOT NULL, runtime_id TEXT NOT NULL, worker_id TEXT NOT NULL,
+        domain_key TEXT NOT NULL, request_id TEXT NOT NULL, expected_token TEXT NOT NULL,
+        settled INTEGER NOT NULL CHECK(settled IN (0,1)),
+        PRIMARY KEY(workspace_id,runtime_id,worker_id,request_id),
+        FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+    );
+    CREATE UNIQUE INDEX worker_restore_intent_pending_domain ON worker_restore_intents(workspace_id,runtime_id,worker_id,domain_key) WHERE settled=0;")?;
+
     conn.execute_batch("DROP TABLE IF EXISTS typed_ticket_targets;")?;
     conn.execute_batch(include_str!("latest_schema.sql"))?;
     conn.execute_batch(
@@ -14546,6 +15363,7 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX typed_ticket_targets_workspace_repository
             ON typed_ticket_targets(workspace_id, repository_key, ticket_id);
+        ALTER TABLE worker_workdir_links ADD COLUMN connection_id TEXT NOT NULL DEFAULT '';
         ALTER TABLE worker_workdir_links
             ADD COLUMN capabilities TEXT NOT NULL
             CHECK (capabilities IN (
@@ -15348,6 +16166,7 @@ fn migrate_workdir_credential_candidate_snapshots_v58_to_v59(conn: &Connection) 
 
 #[cfg(test)]
 mod tests {
+    include!("store_workspace_config_tests.rs");
     use super::*;
 
     #[test]
@@ -15593,6 +16412,7 @@ mod tests {
     }
 
     fn downgrade_schema_66_ticket_and_workdir_authority(conn: &Connection) -> Result<()> {
+        conn.execute_batch("DROP TABLE IF EXISTS worker_restore_intents;")?;
         conn.execute_batch(
             "DROP TABLE backend_job_deliveries;
              DROP TABLE backend_job_attempts;
@@ -15608,6 +16428,46 @@ mod tests {
              VALUES (6, 'ticket schema baseline', CURRENT_TIMESTAMP);",
         )?;
         Ok(())
+    }
+
+    #[test]
+    fn workdir_connection_migration_backfills_distinct_durable_lifetimes() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE __yoi_schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             INSERT INTO __yoi_schema_migrations VALUES (77, 'workspace schema baseline');
+             CREATE TABLE worker_workdir_links (alias TEXT, linked_at TEXT, unlinked_at TEXT);
+             INSERT INTO worker_workdir_links VALUES ('checkout', 'same-time', NULL), ('docs', 'same-time', 'removed');",
+        ).unwrap();
+        migrate_workdir_connection_id_v77_to_v78(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 78);
+        let rows = || {
+            let mut stmt = conn.prepare("SELECT alias, linked_at, unlinked_at, connection_id FROM worker_workdir_links ORDER BY alias").unwrap();
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        let migrated = rows();
+        assert_eq!(migrated[0].0, "checkout");
+        assert_eq!(migrated[0].1, "same-time");
+        assert_eq!(migrated[0].2, None);
+        assert_eq!(migrated[1].2.as_deref(), Some("removed"));
+        assert!(!migrated[0].3.is_empty());
+        assert_ne!(migrated[0].3, migrated[1].3);
+        assert!(migrate_workdir_connection_id_v77_to_v78(&conn).is_err());
+        assert_eq!(
+            rows(),
+            migrated,
+            "a retry cannot replace an already durable connection ID"
+        );
     }
 
     #[test]
@@ -17052,6 +17912,22 @@ mod tests {
                     version: 77,
                     name: BACKEND_JOB_WORKER_CLEANUP_MIGRATION_NAME.to_string(),
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 78,
+                    name: WORKDIR_CONNECTION_ID_MIGRATION_NAME.to_string(),
+                },
+                WorkspaceSchemaMigrationStep {
+                    version: 79,
+                    name: WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME.to_string()
+                },
+                WorkspaceSchemaMigrationStep {
+                    version: 80,
+                    name: WORKER_RESTORE_INTENTS_MIGRATION_NAME.to_string()
+                },
+                WorkspaceSchemaMigrationStep {
+                    version: 81,
+                    name: "Backend Job immutable resource serialization".to_string()
+                },
             ]
         );
 
@@ -17139,6 +18015,10 @@ mod tests {
                             77,
                             BACKEND_JOB_WORKER_CLEANUP_MIGRATION_NAME.to_string(),
                         ),
+                        (78, WORKDIR_CONNECTION_ID_MIGRATION_NAME.to_string()),
+                        (79, WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME.to_string()),
+                        (80, WORKER_RESTORE_INTENTS_MIGRATION_NAME.to_string()),
+                        (81, "Backend Job immutable resource serialization".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -17490,7 +18370,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72,
-                73, 74, 75, 76, 77
+                73, 74, 75, 76, 77, 78, 79, 80, 81
             ]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
@@ -17499,7 +18379,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 28);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 32);
         assert!(column_exists(&conn, "worker_workdir_links", "alias").unwrap());
         assert!(column_exists(&conn, "worker_workdir_links", "capabilities").unwrap());
         assert!(!column_exists(&conn, "worker_workdir_links", "role").unwrap());
@@ -20855,6 +21735,7 @@ INSERT INTO worker_registry (
         store.upsert_workdir_registry(&unmanaged_workdir).unwrap();
 
         let link = WorkerWorkdirLinkRecord {
+            connection_id: String::new(),
             workspace_id: "local-dev".to_string(),
             worker: worker.worker.clone(),
             workdir_id: workdir.workdir_id.clone(),
@@ -20883,12 +21764,10 @@ INSERT INTO worker_registry (
             store.attach_worker_workdir(&link),
             Err(Error::WorkdirAttachmentConflict(_))
         ));
-        assert_eq!(
-            store
-                .finalize_reserved_worker_workdir_attachment(&link, "spawn-1")
-                .unwrap(),
-            link
-        );
+        let link = store
+            .finalize_reserved_worker_workdir_attachment(&link, "spawn-1")
+            .unwrap();
+        assert!(!link.connection_id.is_empty());
         assert_eq!(store.attach_worker_workdir(&link).unwrap(), link);
         let downgraded_link = WorkerWorkdirLinkRecord {
             capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
@@ -20958,10 +21837,7 @@ INSERT INTO worker_registry (
             store.attach_worker_workdir(&invalid_capabilities),
             Err(Error::InvalidInput(_))
         ));
-        assert_eq!(
-            store.attach_worker_workdir(&second_attachment).unwrap(),
-            second_attachment
-        );
+        let second_attachment = store.attach_worker_workdir(&second_attachment).unwrap();
         assert_eq!(
             store
                 .list_worker_workdir_links("local-dev", &worker.worker)
@@ -20991,6 +21867,157 @@ INSERT INTO worker_registry (
             store.detach_worker_workdir("local-dev", &worker.worker, Some("wrong-workdir"), "6",),
             Err(Error::WorkdirAttachmentConflict(_))
         ));
+        let old_connection = downgraded_link.connection_id.clone();
+        let removed = store
+            .detach_worker_workdir_connection(
+                "local-dev",
+                &worker.worker,
+                "checkout",
+                &old_connection,
+                "5",
+            )
+            .unwrap();
+        store.restore_worker_workdir_connection(&removed).unwrap();
+        assert_eq!(
+            store
+                .list_worker_workdir_links_page("local-dev", &worker.worker, 1, 0, None)
+                .unwrap()[0],
+            downgraded_link
+        );
+        store
+            .detach_worker_workdir_connection(
+                "local-dev",
+                &worker.worker,
+                "checkout",
+                &old_connection,
+                "5",
+            )
+            .unwrap();
+        // Reusing the exact record, including alias, Workdir ID and timestamp, starts a fresh lifetime.
+        let replacement = store.attach_worker_workdir(&downgraded_link).unwrap();
+        assert_ne!(replacement.connection_id, old_connection);
+        assert!(matches!(
+            store.detach_worker_workdir_connection(
+                "local-dev",
+                &worker.worker,
+                "checkout",
+                &old_connection,
+                "6",
+            ),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
+        assert!(matches!(
+            store.restore_worker_workdir_connection(&removed),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
+        assert!(matches!(
+            store.replace_worker_workdir_link_capabilities(
+                "local-dev",
+                &worker.worker,
+                &[downgraded_link.clone(), second_attachment.clone()],
+            ),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
+        assert_eq!(store.attach_worker_workdir(&link).unwrap(), replacement);
+        assert_eq!(
+            store
+                .list_worker_workdir_links_page("local-dev", &worker.worker, 1, 0, None)
+                .unwrap(),
+            vec![replacement.clone()]
+        );
+        assert_eq!(
+            store
+                .list_worker_workdir_links_page("local-dev", &worker.worker, 1, 1, None)
+                .unwrap(),
+            vec![second_attachment.clone()]
+        );
+        assert!(
+            store
+                .list_worker_workdir_links_page("local-dev", &worker.worker, 1, 2, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_worker_workdir_links_page("foreign", &worker.worker, 1, 0, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_worker_workdir_links_page(
+                    "local-dev",
+                    &RuntimeWorkerRef::new("foreign", worker.worker.worker_id.clone()),
+                    1,
+                    0,
+                    None
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .list_worker_workdir_links_page(
+                    "local-dev",
+                    &worker.worker,
+                    1,
+                    0,
+                    Some(&second_attachment.connection_id)
+                )
+                .unwrap(),
+            vec![second_attachment.clone()],
+            "connection filtering must precede paging"
+        );
+        for (workspace_id, identity, connection_id) in [
+            (
+                "foreign",
+                worker.worker.clone(),
+                second_attachment.connection_id.as_str(),
+            ),
+            (
+                "local-dev",
+                second_worker.worker.clone(),
+                second_attachment.connection_id.as_str(),
+            ),
+            (
+                "local-dev",
+                RuntimeWorkerRef::new("foreign", worker.worker.worker_id.clone()),
+                second_attachment.connection_id.as_str(),
+            ),
+            ("local-dev", worker.worker.clone(), old_connection.as_str()),
+            ("local-dev", worker.worker.clone(), "nonexistent"),
+        ] {
+            assert!(
+                store
+                    .list_worker_workdir_links_page(
+                        workspace_id,
+                        &identity,
+                        1,
+                        0,
+                        Some(connection_id)
+                    )
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        drop(store);
+        let store = SqliteWorkspaceStore::open(&db).unwrap();
+        assert_eq!(
+            store
+                .list_worker_workdir_links_page("local-dev", &worker.worker, 1, 0, None)
+                .unwrap(),
+            vec![replacement]
+        );
+        assert!(matches!(
+            store.detach_worker_workdir_connection(
+                "local-dev",
+                &worker.worker,
+                "checkout",
+                &old_connection,
+                "6",
+            ),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
         let detached = store
             .detach_worker_workdir("local-dev", &worker.worker, Some(&workdir.workdir_id), "6")
             .unwrap()
@@ -21001,10 +22028,7 @@ INSERT INTO worker_registry (
                 .worker_workdir_link_history_exists("local-dev", &worker.worker)
                 .unwrap()
         );
-        assert_eq!(
-            store.attach_worker_workdir(&workdir_conflict).unwrap(),
-            workdir_conflict
-        );
+        let workdir_conflict = store.attach_worker_workdir(&workdir_conflict).unwrap();
 
         drop(store);
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
@@ -21057,6 +22081,7 @@ INSERT INTO worker_registry (
 
         for record in [&runtime_a, &runtime_b] {
             let observed = SubscriptionWorker {
+                restore_observation_token: None,
                 worker_id: SubscriptionWorkerId::new("shared-local-id").unwrap(),
                 runtime_id: Some(record.worker.runtime_id.clone()),
                 resource_key: None,
@@ -21193,6 +22218,7 @@ INSERT INTO worker_registry (
             Some("W-1")
         );
         let observed = SubscriptionWorker {
+            restore_observation_token: None,
             worker_id: SubscriptionWorkerId::new("known").unwrap(),
             runtime_id: Some("embedded".to_string()),
             resource_key: None,
@@ -21213,6 +22239,7 @@ INSERT INTO worker_registry (
         };
         store.upsert_worker_registry(&other_catalog).unwrap();
         let other_observed = SubscriptionWorker {
+            restore_observation_token: None,
             worker_id: SubscriptionWorkerId::new("other").unwrap(),
             runtime_id: Some("runtime-other".to_string()),
             display_name: Some("Other Runtime Worker".to_string()),
@@ -21222,6 +22249,7 @@ INSERT INTO worker_registry (
             .apply_worker_registry_observation("local-dev", "runtime-other", &other_observed, "2")
             .unwrap();
         let orphan = SubscriptionWorker {
+            restore_observation_token: None,
             worker_id: SubscriptionWorkerId::new("orphan").unwrap(),
             ..observed.clone()
         };
@@ -21387,6 +22415,7 @@ INSERT INTO worker_registry (
                 .is_none()
         );
         let event = SubscriptionWorker {
+            restore_observation_token: None,
             worker_id: SubscriptionWorkerId::new("removed").unwrap(),
             runtime_id: Some("embedded".to_string()),
             resource_key: None,
@@ -21783,6 +22812,816 @@ INSERT INTO worker_registry (
         );
     }
 
+    const RESOURCE_JOB_NOW: &str = "2026-09-01T00:00:00Z";
+
+    async fn seed_resource_job_workspace(store: &SqliteWorkspaceStore) {
+        store
+            .upsert_account(&AccountRecord {
+                account_id: "resource-owner".into(),
+                kind: "user".into(),
+                handle: "resource-owner".into(),
+                display_name: "Resource Owner".into(),
+                created_at: RESOURCE_JOB_NOW.into(),
+                updated_at: RESOURCE_JOB_NOW.into(),
+            })
+            .unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "resource-workspace".into(),
+                owner_account_id: "resource-owner".into(),
+                display_name: "Resource Workspace".into(),
+                state: "active".into(),
+                created_at: RESOURCE_JOB_NOW.into(),
+                updated_at: RESOURCE_JOB_NOW.into(),
+            })
+            .await
+            .unwrap();
+    }
+
+    fn resource_job_request(id: &str, subject: &str, candidate: &str) -> BackendJobRequest {
+        BackendJobRequest {
+            job_id: id.into(),
+            purpose: "subjektiv_consolidation".into(),
+            input_revision: candidate.into(),
+            input_ref: format!("subject://{subject}/{candidate}"),
+            input: serde_json::json!({"candidate": candidate}),
+            instruction: "Consolidate this immutable candidate snapshot.".into(),
+            profile: "project:custom-consolidation".into(),
+            grants: crate::backend_job::BackendJobGrants {
+                subjektiv_consolidation: Some(crate::backend_job::SubjektivConsolidationGrant {
+                    subject_id: subject.into(),
+                    candidate_ids: vec![candidate.into()],
+                }),
+            },
+            serialization_key: None,
+            source_worker: None,
+            notification_target: None,
+            limits: Default::default(),
+        }
+    }
+
+    fn bind_resource_job_worker(
+        store: &SqliteWorkspaceStore,
+        reservation: &BackendJobReservation,
+        id: &str,
+    ) -> RuntimeWorkerRef {
+        let worker = RuntimeWorkerRef::new("embedded-worker-runtime", id);
+        store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: "resource-workspace".into(),
+                worker: worker.clone(),
+                display_name: id.into(),
+                profile: Some(reservation.job.request.profile.clone()),
+                retention_state: "normal".into(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: RESOURCE_JOB_NOW.into(),
+                updated_at: RESOURCE_JOB_NOW.into(),
+            })
+            .unwrap();
+        let (_, claimed) = store
+            .claim_backend_job_attempt_dispatch(
+                "resource-workspace",
+                &reservation.job.request.job_id,
+                &reservation.attempt.attempt_id,
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        assert!(claimed);
+        store
+            .bind_backend_job_attempt_worker(
+                "resource-workspace",
+                &reservation.job.request.job_id,
+                &reservation.attempt.attempt_id,
+                &worker,
+                Some("resource-run"),
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        worker
+    }
+
+    fn finish_resource_job_cleanup(
+        store: &SqliteWorkspaceStore,
+        reservation: &BackendJobReservation,
+    ) {
+        let (_, claimed) = store
+            .claim_backend_job_worker_cleanup(
+                "resource-workspace",
+                &reservation.job.request.job_id,
+                &reservation.attempt.attempt_id,
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        assert!(claimed);
+        store
+            .finish_backend_job_worker_cleanup(
+                "resource-workspace",
+                &reservation.job.request.job_id,
+                &reservation.attempt.attempt_id,
+                BackendJobWorkerCleanupState::Completed,
+                None,
+                None,
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn backend_job_resource_reserve_converges_across_connections_without_changing_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resource-jobs.sqlite");
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        seed_resource_job_workspace(&store).await;
+        let other = SqliteWorkspaceStore::open(&path).unwrap();
+        let requests = [
+            resource_job_request("first", "subject-a", "candidate-1"),
+            resource_job_request("followup", "subject-a", "candidate-2"),
+        ];
+        let barrier = std::sync::Barrier::new(2);
+        let reservations = std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                barrier.wait();
+                store
+                    .reserve_backend_job("resource-workspace", &requests[0], RESOURCE_JOB_NOW)
+                    .unwrap()
+            });
+            let b = scope.spawn(|| {
+                barrier.wait();
+                other
+                    .reserve_backend_job("resource-workspace", &requests[1], RESOURCE_JOB_NOW)
+                    .unwrap()
+            });
+            [a.join().unwrap(), b.join().unwrap()]
+        });
+        assert_eq!(reservations.iter().filter(|r| r.resource_reused).count(), 1);
+        assert!(reservations.iter().all(|r| !r.replayed));
+        assert_eq!(reservations[0].job.request, reservations[1].job.request);
+        let original = &reservations[0];
+        let deferred = requests
+            .iter()
+            .find(|r| r.job_id != original.job.request.job_id)
+            .unwrap();
+        assert!(
+            store
+                .get_backend_job("resource-workspace", &deferred.job_id)
+                .unwrap()
+                .is_none()
+        );
+        let replay = other
+            .reserve_backend_job(
+                "resource-workspace",
+                &original.job.request,
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        assert!(replay.replayed && !replay.resource_reused);
+        let mut changed = original.job.request.clone();
+        changed.input = serde_json::json!({"changed": true});
+        assert!(
+            other
+                .reserve_backend_job("resource-workspace", &changed, RESOURCE_JOB_NOW)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .find_active_backend_job_for_resource(
+                    "resource-workspace",
+                    &original.job.request.resource_key().unwrap()
+                )
+                .unwrap()
+                .unwrap()
+                .request,
+            original.job.request
+        );
+        // A separate subject does not collide.
+        assert!(
+            !store
+                .reserve_backend_job(
+                    "resource-workspace",
+                    &resource_job_request("other", "subject-b", "candidate-3"),
+                    RESOURCE_JOB_NOW
+                )
+                .unwrap()
+                .resource_reused
+        );
+        store
+            .finish_backend_job_attempt(
+                "resource-workspace",
+                &original.job.request.job_id,
+                &original.attempt.attempt_id,
+                BackendJobAttemptState::Failed,
+                "not_started",
+                "no Worker allocated",
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        let followup = other
+            .reserve_backend_job("resource-workspace", deferred, RESOURCE_JOB_NOW)
+            .unwrap();
+        assert!(!followup.replayed && !followup.resource_reused);
+        assert_eq!(&followup.job.request, deferred);
+        assert_ne!(
+            followup.job.intent_fingerprint,
+            original.job.intent_fingerprint
+        );
+        assert_eq!(
+            store
+                .get_backend_job("resource-workspace", &original.job.request.job_id)
+                .unwrap()
+                .unwrap()
+                .request,
+            original.job.request
+        );
+        assert!(
+            store
+                .reserve_backend_job_retry(
+                    "resource-workspace",
+                    &original.job.request.job_id,
+                    RESOURCE_JOB_NOW
+                )
+                .is_err(),
+            "retry cannot displace a followup that reserved the same resource"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_job_resource_retry_and_unknown_are_fenced_by_durable_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cleanup-jobs.sqlite");
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        seed_resource_job_workspace(&store).await;
+        let request = resource_job_request("failed", "subject-a", "candidate-1");
+        let first = store
+            .reserve_backend_job("resource-workspace", &request, RESOURCE_JOB_NOW)
+            .unwrap();
+        let worker = bind_resource_job_worker(&store, &first, "failed-worker");
+        assert_eq!(
+            store
+                .get_active_backend_job_for_worker("resource-workspace", &worker)
+                .unwrap()
+                .unwrap()
+                .request
+                .grants,
+            request.grants
+        );
+        assert!(
+            store
+                .get_active_backend_job_for_worker("other-workspace", &worker)
+                .unwrap()
+                .is_none()
+        );
+        store
+            .finish_backend_job_attempt(
+                "resource-workspace",
+                &request.job_id,
+                &first.attempt.attempt_id,
+                BackendJobAttemptState::Failed,
+                "definite_failure",
+                "known failed",
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        assert!(
+            store
+                .get_active_backend_job_for_worker("resource-workspace", &worker)
+                .unwrap()
+                .is_none()
+        );
+        let deferred = resource_job_request("later", "subject-a", "candidate-2");
+        for cleanup_state in [
+            BackendJobWorkerCleanupState::Pending,
+            BackendJobWorkerCleanupState::Executing,
+            BackendJobWorkerCleanupState::Failed,
+        ] {
+            assert!(
+                store
+                    .reserve_backend_job_retry(
+                        "resource-workspace",
+                        &request.job_id,
+                        RESOURCE_JOB_NOW
+                    )
+                    .is_err()
+            );
+            let reused = store
+                .reserve_backend_job("resource-workspace", &deferred, RESOURCE_JOB_NOW)
+                .unwrap();
+            assert!(reused.resource_reused && !reused.replayed);
+            assert_eq!(reused.job.request, request);
+            match cleanup_state {
+                BackendJobWorkerCleanupState::Pending => {
+                    store
+                        .claim_backend_job_worker_cleanup(
+                            "resource-workspace",
+                            &request.job_id,
+                            &first.attempt.attempt_id,
+                            RESOURCE_JOB_NOW,
+                        )
+                        .unwrap();
+                }
+                BackendJobWorkerCleanupState::Executing => {
+                    store
+                        .finish_backend_job_worker_cleanup(
+                            "resource-workspace",
+                            &request.job_id,
+                            &first.attempt.attempt_id,
+                            BackendJobWorkerCleanupState::Failed,
+                            Some("cleanup_failed"),
+                            Some("Worker still exists"),
+                            RESOURCE_JOB_NOW,
+                        )
+                        .unwrap();
+                }
+                _ => {}
+            }
+        }
+        finish_resource_job_cleanup(&store, &first);
+        let second = store
+            .reserve_backend_job_retry("resource-workspace", &request.job_id, RESOURCE_JOB_NOW)
+            .unwrap();
+        assert_eq!(second.job.request, request);
+        assert_eq!(second.attempt.attempt, 2);
+        bind_resource_job_worker(&store, &second, "unknown-worker");
+        store
+            .finish_backend_job_attempt(
+                "resource-workspace",
+                &request.job_id,
+                &second.attempt.attempt_id,
+                BackendJobAttemptState::Unknown,
+                "unknown_effects",
+                "domain outcome unknown",
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        finish_resource_job_cleanup(&store, &second);
+        drop(store);
+        let restarted = SqliteWorkspaceStore::open(&path).unwrap();
+        let active = restarted
+            .find_active_backend_job_for_resource(
+                "resource-workspace",
+                &request.resource_key().unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.state, BackendJobState::Unknown);
+        assert_eq!(active.request, request);
+        assert!(
+            restarted
+                .reserve_backend_job("resource-workspace", &deferred, RESOURCE_JOB_NOW)
+                .unwrap()
+                .resource_reused,
+            "Worker removal must not resolve unknown domain effects"
+        );
+        assert!(
+            restarted
+                .reserve_backend_job_retry("resource-workspace", &request.job_id, RESOURCE_JOB_NOW)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn backend_job_resource_migration_preserves_legacy_intent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE __yoi_schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             INSERT INTO __yoi_schema_migrations VALUES (80, 'workspace schema baseline');
+             CREATE TABLE backend_jobs(workspace_id TEXT, job_id TEXT, request_json TEXT, intent_fingerprint TEXT, created_at TEXT);
+             INSERT INTO backend_jobs VALUES ('workspace', 'legacy', '{\"profile\":\"builtin:backend-job\"}', 'sha256:original', '1');",
+        ).unwrap();
+        migrate_backend_job_resources_v80_to_v81(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 81);
+        assert_eq!(
+            conn.query_row(
+                "SELECT request_json, intent_fingerprint, resource_key FROM backend_jobs",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                }
+            )
+            .unwrap(),
+            (
+                "{\"profile\":\"builtin:backend-job\"}".into(),
+                "sha256:original".into(),
+                None
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_job_resource_retry_races_new_intent_atomically_and_remains_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retry-race.sqlite");
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        seed_resource_job_workspace(&store).await;
+        // Generic resources use the same common reservation API without domain grants.
+        let mut request = resource_job_request("generic", "subject-a", "candidate-1");
+        request.grants = Default::default();
+        request.serialization_key = Some("custom-resource".into());
+        let first = store
+            .reserve_backend_job("resource-workspace", &request, RESOURCE_JOB_NOW)
+            .unwrap();
+        store
+            .finish_backend_job_attempt(
+                "resource-workspace",
+                &request.job_id,
+                &first.attempt.attempt_id,
+                BackendJobAttemptState::Failed,
+                "not_started",
+                "no Worker allocated",
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        let mut followup = request.clone();
+        followup.job_id = "generic-followup".into();
+        followup.input = serde_json::json!({"candidate": "new"});
+        let other = SqliteWorkspaceStore::open(&path).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let (retry, reserve) = std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                barrier.wait();
+                store.reserve_backend_job_retry(
+                    "resource-workspace",
+                    &request.job_id,
+                    RESOURCE_JOB_NOW,
+                )
+            });
+            let b = scope.spawn(|| {
+                barrier.wait();
+                other
+                    .reserve_backend_job("resource-workspace", &followup, RESOURCE_JOB_NOW)
+                    .unwrap()
+            });
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        match retry {
+            Ok(retried) => {
+                assert!(reserve.resource_reused);
+                assert_eq!(reserve.job.request, request);
+                assert_eq!(retried.attempt.attempt, 2);
+                store
+                    .finish_backend_job_attempt(
+                        "resource-workspace",
+                        &request.job_id,
+                        &retried.attempt.attempt_id,
+                        BackendJobAttemptState::Failed,
+                        "not_started",
+                        "no Worker allocated",
+                        RESOURCE_JOB_NOW,
+                    )
+                    .unwrap();
+            }
+            Err(_) => {
+                assert!(!reserve.resource_reused);
+                assert_eq!(reserve.job.request, followup);
+                store
+                    .finish_backend_job_attempt(
+                        "resource-workspace",
+                        &followup.job_id,
+                        &reserve.attempt.attempt_id,
+                        BackendJobAttemptState::Failed,
+                        "not_started",
+                        "no Worker allocated",
+                        RESOURCE_JOB_NOW,
+                    )
+                    .unwrap();
+                let retried = store
+                    .reserve_backend_job_retry(
+                        "resource-workspace",
+                        &request.job_id,
+                        RESOURCE_JOB_NOW,
+                    )
+                    .unwrap();
+                store
+                    .finish_backend_job_attempt(
+                        "resource-workspace",
+                        &request.job_id,
+                        &retried.attempt.attempt_id,
+                        BackendJobAttemptState::Failed,
+                        "not_started",
+                        "no Worker allocated",
+                        RESOURCE_JOB_NOW,
+                    )
+                    .unwrap();
+            }
+        }
+        assert!(
+            store
+                .reserve_backend_job_retry("resource-workspace", &request.job_id, RESOURCE_JOB_NOW)
+                .is_err(),
+            "retry limit cannot be reset by new candidates"
+        );
+        assert!(
+            store
+                .find_active_backend_job_for_resource("resource-workspace", "custom-resource")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_job_all_older_attempt_cleanups_fence_retry_and_resource_release() {
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        seed_resource_job_workspace(&store).await;
+        let mut request = resource_job_request("legacy-overlap", "subject-a", "candidate-1");
+        request.limits.max_attempts = 3;
+        let first = store
+            .reserve_backend_job("resource-workspace", &request, RESOURCE_JOB_NOW)
+            .unwrap();
+        bind_resource_job_worker(&store, &first, "old-worker");
+        store
+            .finish_backend_job_attempt(
+                "resource-workspace",
+                &request.job_id,
+                &first.attempt.attempt_id,
+                BackendJobAttemptState::Failed,
+                "partial_apply",
+                "some candidate effects durably applied",
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        // Model a pre-fence durable journal: the old runner permitted attempt 2
+        // before attempt 1's Worker cleanup. Current reservation must fail closed
+        // on this inherited state, even after the current attempt is cleaned.
+        let second_id = attempt_id(&request.job_id, 2);
+        store.with_conn(|conn| {
+            conn.execute("UPDATE backend_jobs SET state = 'pending', current_attempt = 2, completed_at = NULL WHERE workspace_id = 'resource-workspace' AND job_id = ?1", params![request.job_id])?;
+            conn.execute("INSERT INTO backend_job_attempts (workspace_id, job_id, attempt_id, attempt, input_revision, state, deadline_at, created_at, updated_at) VALUES ('resource-workspace', ?1, ?2, 2, ?3, 'reserved', ?4, ?4, ?4)",
+                params![request.job_id, second_id, request.input_revision, RESOURCE_JOB_NOW])?;
+            Ok(())
+        }).unwrap();
+        let second = store
+            .reserve_backend_job("resource-workspace", &request, RESOURCE_JOB_NOW)
+            .unwrap();
+        assert_eq!(second.attempt.attempt, 2);
+        bind_resource_job_worker(&store, &second, "current-worker");
+        store
+            .finish_backend_job_attempt(
+                "resource-workspace",
+                &request.job_id,
+                &second.attempt.attempt_id,
+                BackendJobAttemptState::Failed,
+                "partial_apply",
+                "remaining candidate effects not yet applied",
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        finish_resource_job_cleanup(&store, &second);
+        let followup = resource_job_request("new-batch", "subject-a", "candidate-2");
+        assert!(
+            store
+                .reserve_backend_job_retry("resource-workspace", &request.job_id, RESOURCE_JOB_NOW)
+                .is_err(),
+            "completed current cleanup must not hide incomplete attempt 1"
+        );
+        assert!(
+            store
+                .reserve_backend_job("resource-workspace", &followup, RESOURCE_JOB_NOW)
+                .unwrap()
+                .resource_reused
+        );
+        assert_eq!(
+            store
+                .find_active_backend_job_for_resource(
+                    "resource-workspace",
+                    &request.resource_key().unwrap()
+                )
+                .unwrap()
+                .unwrap()
+                .current_attempt,
+            2
+        );
+        finish_resource_job_cleanup(&store, &first);
+        let third = store
+            .reserve_backend_job_retry("resource-workspace", &request.job_id, RESOURCE_JOB_NOW)
+            .unwrap();
+        assert_eq!(
+            third.job.request, request,
+            "partial apply retry keeps its original snapshot and grants"
+        );
+        assert_eq!(third.attempt.attempt, 3);
+        let worker = bind_resource_job_worker(&store, &third, "converged-worker");
+        let submission = BackendJobResultSubmission {
+            job_id: request.job_id.clone(),
+            attempt_id: third.attempt.attempt_id.clone(),
+            input_revision: request.input_revision.clone(),
+            result: serde_json::json!({"converged": true}),
+        };
+        store
+            .accept_backend_job_result("resource-workspace", &worker, &submission, RESOURCE_JOB_NOW)
+            .unwrap();
+        finish_resource_job_cleanup(&store, &third);
+        // A legacy incomplete older cleanup also fences a completed current Job.
+        store.with_conn(|conn| {
+            conn.execute("UPDATE backend_job_attempts SET worker_cleanup_state = 'failed', worker_cleanup_completed_at = NULL WHERE workspace_id = 'resource-workspace' AND attempt_id = ?1", params![first.attempt.attempt_id])?;
+            Ok(())
+        }).unwrap();
+        assert!(
+            store
+                .reserve_backend_job("resource-workspace", &followup, RESOURCE_JOB_NOW)
+                .unwrap()
+                .resource_reused,
+            "completed Job and current cleanup must not release an older unremoved Worker"
+        );
+        finish_resource_job_cleanup(&store, &first);
+        assert!(
+            !store
+                .reserve_backend_job("resource-workspace", &followup, RESOURCE_JOB_NOW)
+                .unwrap()
+                .resource_reused
+        );
+        let replay = store
+            .accept_backend_job_result("resource-workspace", &worker, &submission, RESOURCE_JOB_NOW)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.job.result, Some(submission.result));
+        assert!(
+            store
+                .reserve_backend_job_retry("resource-workspace", &request.job_id, RESOURCE_JOB_NOW)
+                .is_err(),
+            "converged intent cannot be reopened or exceed its bounded attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_job_empty_batch_surface_refresh_locks_subject_and_defers_candidates() {
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        seed_resource_job_workspace(&store).await;
+        for surface_state in ["ungenerated", "stale", "failed"] {
+            let subject = format!("subject-{surface_state}");
+            let mut refresh = resource_job_request(
+                &format!("surface-{surface_state}"),
+                &subject,
+                "surface-revision",
+            );
+            refresh
+                .grants
+                .subjektiv_consolidation
+                .as_mut()
+                .unwrap()
+                .candidate_ids
+                .clear();
+            refresh.input = serde_json::json!({"subject_id": subject, "candidate_ids": [], "surface_state": surface_state});
+            refresh.instruction =
+                "Regenerate only the Subject surface; this batch grants no candidate access."
+                    .into();
+            let first = store
+                .reserve_backend_job("resource-workspace", &refresh, RESOURCE_JOB_NOW)
+                .unwrap();
+            assert_eq!(first.job.request, refresh);
+            assert!(
+                store
+                    .reserve_backend_job("resource-workspace", &refresh, RESOURCE_JOB_NOW)
+                    .unwrap()
+                    .replayed
+            );
+            let worker = bind_resource_job_worker(
+                &store,
+                &first,
+                &format!("surface-worker-{surface_state}"),
+            );
+            let active = store
+                .get_active_backend_job_for_worker("resource-workspace", &worker)
+                .unwrap()
+                .unwrap();
+            let grant = active
+                .request
+                .grants
+                .subjektiv_consolidation
+                .as_ref()
+                .unwrap();
+            assert_eq!(grant.subject_id, subject);
+            assert!(
+                grant.candidate_ids.is_empty(),
+                "surface-only Job grants no candidate capability"
+            );
+            assert!(
+                active
+                    .request
+                    .worker_input(&first.attempt.attempt_id)
+                    .unwrap()
+                    .contains("Regenerate only the Subject surface")
+            );
+            assert_eq!(
+                store
+                    .find_active_backend_job_for_resource(
+                        "resource-workspace",
+                        &refresh.resource_key().unwrap()
+                    )
+                    .unwrap()
+                    .unwrap()
+                    .request,
+                refresh
+            );
+            let followup = resource_job_request(
+                &format!("candidates-{surface_state}"),
+                &subject,
+                "new-candidate",
+            );
+            let reused = store
+                .reserve_backend_job("resource-workspace", &followup, RESOURCE_JOB_NOW)
+                .unwrap();
+            assert!(reused.resource_reused && !reused.replayed);
+            assert_eq!(
+                reused.job.request, refresh,
+                "later candidates must not expand surface-only authority"
+            );
+            store
+                .accept_backend_job_result(
+                    "resource-workspace",
+                    &worker,
+                    &BackendJobResultSubmission {
+                        job_id: refresh.job_id.clone(),
+                        attempt_id: first.attempt.attempt_id.clone(),
+                        input_revision: refresh.input_revision.clone(),
+                        result: serde_json::json!({"surface": {"availability": "available"}}),
+                    },
+                    RESOURCE_JOB_NOW,
+                )
+                .unwrap();
+            assert!(
+                store
+                    .reserve_backend_job("resource-workspace", &followup, RESOURCE_JOB_NOW)
+                    .unwrap()
+                    .resource_reused,
+                "completed surface refresh still fences the subject until Worker cleanup"
+            );
+            finish_resource_job_cleanup(&store, &first);
+            let next = store
+                .reserve_backend_job("resource-workspace", &followup, RESOURCE_JOB_NOW)
+                .unwrap();
+            assert!(!next.resource_reused);
+            assert_eq!(next.job.request, followup);
+            assert_eq!(
+                store
+                    .get_backend_job("resource-workspace", &refresh.job_id)
+                    .unwrap()
+                    .unwrap()
+                    .request,
+                refresh
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_job_completed_resource_releases_only_after_worker_cleanup() {
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        seed_resource_job_workspace(&store).await;
+        let request = resource_job_request("completed", "subject-a", "candidate-1");
+        let first = store
+            .reserve_backend_job("resource-workspace", &request, RESOURCE_JOB_NOW)
+            .unwrap();
+        let worker = bind_resource_job_worker(&store, &first, "completed-worker");
+        store
+            .accept_backend_job_result(
+                "resource-workspace",
+                &worker,
+                &BackendJobResultSubmission {
+                    job_id: request.job_id.clone(),
+                    attempt_id: first.attempt.attempt_id.clone(),
+                    input_revision: request.input_revision.clone(),
+                    result: serde_json::json!({"done": true}),
+                },
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        let followup = resource_job_request("new-candidates", "subject-a", "candidate-2");
+        assert!(
+            store
+                .reserve_backend_job("resource-workspace", &followup, RESOURCE_JOB_NOW)
+                .unwrap()
+                .resource_reused
+        );
+        finish_resource_job_cleanup(&store, &first);
+        assert!(
+            store
+                .find_active_backend_job_for_resource(
+                    "resource-workspace",
+                    &request.resource_key().unwrap()
+                )
+                .unwrap()
+                .is_none()
+        );
+        let next = store
+            .reserve_backend_job("resource-workspace", &followup, RESOURCE_JOB_NOW)
+            .unwrap();
+        assert!(!next.resource_reused);
+        assert_eq!(next.job.request, followup);
+        assert_eq!(
+            store
+                .get_backend_job("resource-workspace", &request.job_id)
+                .unwrap()
+                .unwrap()
+                .request,
+            request
+        );
+    }
+
     #[tokio::test]
     async fn backend_jobs_fence_results_project_ownership_and_bound_retries() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
@@ -21870,6 +23709,8 @@ INSERT INTO worker_registry (
             input: serde_json::json!({"title": "check"}),
             instruction: "Check the immutable input.".to_string(),
             profile: "builtin:backend-job".to_string(),
+            grants: Default::default(),
+            serialization_key: None,
             source_worker: Some(source.clone()),
             notification_target: Some(source.clone()),
             limits: crate::backend_job::BackendJobLimits {
@@ -22290,6 +24131,35 @@ INSERT INTO worker_registry (
                 )
                 .is_err()
         );
+        assert!(
+            store
+                .reserve_backend_job_retry(
+                    workspace_id,
+                    &retry_request.job_id,
+                    "2026-09-01T00:01:04Z"
+                )
+                .is_err(),
+            "failed attempt cannot retry before canonical Worker cleanup"
+        );
+        store
+            .claim_backend_job_worker_cleanup(
+                workspace_id,
+                &retry_request.job_id,
+                &failed.attempt.attempt_id,
+                "2026-09-01T00:01:04Z",
+            )
+            .unwrap();
+        store
+            .finish_backend_job_worker_cleanup(
+                workspace_id,
+                &retry_request.job_id,
+                &failed.attempt.attempt_id,
+                BackendJobWorkerCleanupState::Completed,
+                None,
+                None,
+                "2026-09-01T00:01:04Z",
+            )
+            .unwrap();
         let second = store
             .reserve_backend_job_retry(workspace_id, &retry_request.job_id, "2026-09-01T00:01:04Z")
             .unwrap();

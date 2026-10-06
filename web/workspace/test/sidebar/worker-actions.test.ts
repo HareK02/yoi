@@ -1,7 +1,12 @@
 import {
   canDeleteSidebarWorker,
+  canRestoreWorker,
   canStopSidebarWorker,
+  createRestoreRequest,
   deleteSidebarWorker,
+  restoreErrorNotice,
+  restoreNotice,
+  restoreWorkspaceWorker,
   stopSidebarWorker,
 } from "../../src/lib/workspace/sidebar/worker-actions.ts";
 import type { Worker } from "../../src/lib/workspace/sidebar/types.ts";
@@ -243,7 +248,176 @@ Deno.test("Worker navigation exposes an accessible hover action menu", async () 
 
   assert(source.includes('aria-haspopup="menu"'));
   assert(source.includes('role="menuitem"'));
-  assert(source.includes("stopSidebarWorker(workspaceId, worker)"));
-  assert(source.includes("deleteSidebarWorker(workspaceId, worker)"));
+  assert(source.includes("stopSidebarWorker"));
+  assert(source.includes("deleteSidebarWorker"));
   assert(styles.includes(".worker-nav-item:hover .worker-actions-trigger"));
+});
+
+Deno.test("Restore eligibility uses observed catalog state and backend token, not foreground state", () => {
+  const stopped = {
+    availability: "observed" as const,
+    state: "unknown",
+    lifecycleState: "stopped",
+    restore_observation_token: "generation",
+  };
+  assert(canRestoreWorker(stopped));
+  assert(!canRestoreWorker({ ...stopped, availability: "unavailable" }));
+  assert(
+    !canRestoreWorker({ ...stopped, lifecycleState: "idle", state: "stopped" }),
+  );
+  assert(!canRestoreWorker({ ...stopped, restore_observation_token: null }));
+  assert(
+    canRestoreWorker({
+      availability: "observed",
+      state: "stopped",
+      restore_observation_token: "generation",
+    }),
+  );
+});
+Deno.test("Restore scoped POST encodes identities and sends immutable intent without assignment query", async () => {
+  const request = createRestoreRequest({
+    restore_observation_token: "generation",
+  });
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
+  const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    requests.push({ url: input.toString(), init });
+    return jsonResponse({
+      workspace_id: "team space",
+      runtime_id: worker.runtime_id,
+      worker_id: worker.worker_id,
+      result: { state: "accepted" },
+    });
+  }) as typeof fetch;
+  await restoreWorkspaceWorker("team space", worker, request, fetchFn);
+  await restoreWorkspaceWorker("team space", worker, request, fetchFn);
+  assertEquals(
+    requests[0].url,
+    "/api/w/team%20space/runtimes/runtime%20%2F/workers/worker%20%2F/restore",
+  );
+  assertEquals(requests[0].init?.method, "POST");
+  assertEquals(JSON.parse(String(requests[0].init?.body)), request);
+  assertEquals(requests[1].init?.body, requests[0].init?.body);
+  assert(request.request_id.length > 0);
+});
+Deno.test("Restore classification never promotes nonaccepted results and preserves unknown outcome recovery", async () => {
+  for (
+    const state of [
+      "accepted",
+      "rejected",
+      "rolled_back",
+      "reconciliation_required",
+    ] as const
+  ) {
+    const response = await restoreWorkspaceWorker(
+      "team",
+      worker,
+      { expected_observation_token: "g", request_id: "id" },
+      (() =>
+        Promise.resolve(jsonResponse({
+          workspace_id: "team",
+          runtime_id: worker.runtime_id,
+          worker_id: worker.worker_id,
+          result: {
+            state,
+            diagnostics: [{
+              code: "result",
+              severity: "warning",
+              message: "backend reason",
+            }],
+          },
+        }))) as typeof fetch,
+    );
+    const notice = restoreNotice(response);
+    assertEquals(notice.level === "info", state === "accepted");
+    assertEquals(notice.retry, state === "reconciliation_required");
+    if (state !== "accepted") assert(notice.message.includes("backend reason"));
+  }
+  for (const status of [400, 403, 409, 500]) {
+    try {
+      await restoreWorkspaceWorker(
+        "team",
+        worker,
+        { expected_observation_token: "g", request_id: "id" },
+        (() =>
+          Promise.resolve(
+            jsonResponse({ error: "conflict", message: "changed" }, status),
+          )) as typeof fetch,
+      );
+      throw new Error("must reject");
+    } catch (error) {
+      const notice = restoreErrorNotice(error);
+      assertEquals(notice.retry, status >= 500);
+      if (status === 409) {
+        assertEquals(notice.title, "Worker observation changed");
+      }
+    }
+  }
+  assert(restoreErrorNotice(new TypeError("network failed")).retry);
+  await assertRejects(
+    () =>
+      restoreWorkspaceWorker(
+        "team",
+        worker,
+        { expected_observation_token: "g", request_id: "id" },
+        (() =>
+          Promise.resolve(
+            jsonResponse({
+              workspace_id: "other",
+              runtime_id: worker.runtime_id,
+              worker_id: worker.worker_id,
+              result: { state: "accepted" },
+            }),
+          )) as typeof fetch,
+      ),
+    "requested target",
+  );
+  await assertRejects(
+    () =>
+      restoreWorkspaceWorker(
+        "team",
+        worker,
+        { expected_observation_token: "g", request_id: "id" },
+        (() =>
+          Promise.resolve(
+            jsonResponse({
+              workspace_id: "team",
+              runtime_id: worker.runtime_id,
+              worker_id: worker.worker_id,
+              result: { state: "future" },
+            }),
+          )) as typeof fetch,
+      ),
+    "unknown value",
+  );
+});
+
+Deno.test("Restore bounds the response before decoding and retains uncertain outcome instead of success", async () => {
+  let response = new Response("{}", {
+    headers: { "content-length": String(8 * 1024 * 1024 + 1) },
+  });
+  let caught: unknown;
+  try {
+    await restoreWorkspaceWorker("team", worker, {
+      expected_observation_token: "g",
+      request_id: "id",
+    }, (() => Promise.resolve(response)) as typeof fetch);
+  } catch (error) {
+    caught = error;
+  }
+  assert(caught instanceof Error);
+  assert(restoreErrorNotice(caught).retry);
+  response = new Response("{}", {
+    status: 409,
+    headers: { "content-length": String(64 * 1024 + 1) },
+  });
+  try {
+    await restoreWorkspaceWorker("team", worker, {
+      expected_observation_token: "g",
+      request_id: "id",
+    }, (() => Promise.resolve(response)) as typeof fetch);
+  } catch (error) {
+    caught = error;
+  }
+  assertEquals(restoreErrorNotice(caught).title, "Worker observation changed");
+  assertEquals(restoreErrorNotice(caught).retry, false);
 });

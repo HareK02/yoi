@@ -19,6 +19,7 @@ import type {
   WorkerStateSnapshot,
   WorkerStatus,
 } from "#lib/generated/protocol.ts";
+import { invocationInput } from "./composer-invocation.ts";
 import { stringify as stringifyYaml } from "yaml";
 import {
   applyRunActivityEvent,
@@ -1348,6 +1349,8 @@ export function segmentsToText(segments: Segment[]): string {
           return `[Large paste artifact ${segment.artifact.artifact_id}: ${segment.artifact.byte_len} bytes, ${segment.artifact.media_type}, ${segment.artifact.availability}, created ${segment.artifact.created_at_ms} ms, sha256 ${segment.artifact.sha256}]`;
         case "uploaded_file":
           return `[Attachment: ${segment.file.file_name} · ${segment.file.media_type} · ${segment.file.byte_len} bytes · ${segment.file.availability}]`;
+        case "feature_invoke":
+          return invocationInput(segment.invocation);
         case "file_ref":
           return `@file ${segment.path}`;
         case "unknown":

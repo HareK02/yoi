@@ -66,7 +66,15 @@ ${"detail-wide-code-".repeat(18)}
 <script>alert("not rendered")</script>`;
 
 const subjects = [
-  subject(representativeSubjectId, "Release coordination", "active", 42),
+  subject(
+    representativeSubjectId,
+    "Release coordination",
+    "active",
+    42,
+    "Prefer explicit evidence over assumptions.\nAsk before irreversible actions, and state uncertainty plainly.",
+    3,
+    connectedWorker("Release coordination Worker with a deliberately long display name"),
+  ),
   subject(emptySubjectId, "Empty ready subject", "active", 0),
   subject(staleSubjectId, "Stale surface subject", "active", 19),
   subject(failedSubjectId, "Failed surface subject", "active", 8),
@@ -75,14 +83,49 @@ const subjects = [
 ];
 const pagedSubject = subject(pagedSubjectId, "Subject on the next page", "active", 1);
 
-function subject(id: string, role: string, state: "active" | "retired", storeRevision: number) {
+function connectedWorker(displayName: string) {
+  return {
+    runtime_id: "embedded-worker-runtime",
+    worker_id: "release-coordination-worker",
+    host_id: "fixture-host",
+    display_name: displayName,
+    label: displayName,
+    profile: "builtin:companion",
+    singleton_key: `subjektiv:${representativeSubjectId}`,
+    tags: [],
+    workspace: {
+      visibility: "workspace",
+      identity: workspaceId,
+      workspace_id: workspaceId,
+    },
+    state: "idle",
+    last_seen_at: "2026-01-02T03:04:05Z",
+    pinned: false,
+    retention_state: "retained",
+    implementation: { kind: "embedded", display_hint: "Fixture Worker" },
+    diagnostics: [],
+  };
+}
+
+function subject(
+  id: string,
+  role: string,
+  state: "active" | "retired",
+  storeRevision: number,
+  behaviorMd = "",
+  behaviorRevision = 0,
+  currentWorker?: ReturnType<typeof connectedWorker>,
+) {
   return {
     id,
     role,
+    behavior_md: behaviorMd,
+    behavior_revision: behaviorRevision,
     state,
     store_revision: storeRevision,
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-02T03:04:05Z",
+    ...(currentWorker ? { current_worker: currentWorker } : {}),
   };
 }
 
@@ -125,7 +168,7 @@ function memoriesFor(subjectId: string) {
       1,
       "working_assumption",
       "retracted",
-      "T-672 UNIQUE END MARKER",
+      "Memory list end marker for scroll validation",
     ),
   ];
 }
@@ -235,7 +278,7 @@ function memoryDetail(memoryId: string, requestedRevision: number | null) {
         evidence_id: "evidence-message-0001",
         origin: { kind: "human_input", account_id: "account-fixture" },
         evidence_kind: "message",
-        label: "T-672 product direction",
+        label: "Memory information design source",
         summary: "Bounded source reference retained with the committed revision.",
       }],
       source_refs_total: 1,
@@ -403,7 +446,10 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
   const subjectsPath = `/api/w/${workspaceId}/subjektiv/subjects`;
   if (url.pathname === subjectsPath) {
     if (request.method === "POST") {
-      const payload = await request.json().catch(() => null) as { role?: unknown } | null;
+      const payload = await request.json().catch(() => null) as {
+        role?: unknown;
+        behavior_md?: unknown;
+      } | null;
       subjectCreateRequests.push(payload);
       if (!payload || typeof payload.role !== "string" || payload.role.trim().length === 0) {
         return json({ error: "Bad Request", message: "subject role must not be empty" }, 400);
@@ -411,9 +457,12 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
       if (payload.role === "Permission denied") {
         return json({ error: "Forbidden", message: "workspace permission denied" }, 403);
       }
+      if (typeof payload.behavior_md !== "string") {
+        return json({ error: "Bad Request", message: "subject behavior must be a string" }, 400);
+      }
       createdSubjectCount += 1;
       const id = `created-subject-${String(createdSubjectCount).padStart(4, "0")}`;
-      const created = subject(id, payload.role, "active", 0);
+      const created = subject(id, payload.role, "active", 0, payload.behavior_md);
       createdSubjectIds.add(id);
       subjects.unshift(created);
       return json(created, 201);
@@ -442,6 +491,27 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
     const foundSubject = subjects.find((item) => item.id === subjectId);
     if (!foundSubject) return json({}, 404);
 
+    if (parts.length === 2 && parts[1] === "behavior" && request.method === "PATCH") {
+      const payload = await request.json().catch(() => null) as {
+        expected_behavior_revision?: unknown;
+        behavior_md?: unknown;
+      } | null;
+      if (
+        !payload ||
+        typeof payload.expected_behavior_revision !== "number" ||
+        typeof payload.behavior_md !== "string"
+      ) {
+        return json({ error: "Bad Request", message: "invalid behavior update" }, 400);
+      }
+      if (payload.expected_behavior_revision !== foundSubject.behavior_revision) {
+        return json({ error: "Conflict", message: "subject behavior revision conflict" }, 409);
+      }
+      foundSubject.behavior_md = payload.behavior_md;
+      foundSubject.behavior_revision += 1;
+      foundSubject.updated_at = "2026-01-03T04:05:06Z";
+      return json(foundSubject);
+    }
+    if (request.method !== "GET") return new Response("method not allowed", { status: 405 });
     if (parts.length === 1) return json(foundSubject);
     if (parts.length === 2 && parts[1] === "surface") return json(surfaceFor(subjectId));
     if (parts.length === 2 && parts[1] === "memories") {

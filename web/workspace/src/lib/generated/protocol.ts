@@ -6,7 +6,52 @@ export type AlertLevel = "warn" | "error";
 
 export type AlertSource = "worker" | "engine" | "compactor" | "agents_md";
 
-export type CompletionKind = "file";
+export type CompletionKind = "file" | "feature" | "feature_argument";
+
+export type CompletionContext = { invocation: FeatureInvocationIdentity, argument?: string | null, };
+
+export type FeatureInvocationIdentity = string;
+
+export type FeatureInvocationSyntax = "parenthesized";
+
+export type InvocationArgumentType = { "kind": "string" } | { "kind": "integer" } | { "kind": "boolean" } | { "kind": "enum", values: Array<string>, } | { "kind": "worker_file" } | { "kind": "client_file" };
+
+export type InvocationCompletion = { "kind": "none" } | { "kind": "static", values: Array<string>, } | { "kind": "worker_file" } | { "kind": "client_file" } | { "kind": "provider", provider: string, };
+
+export type InvocationArgumentDescriptor = { name: string,
+/**
+ * Zero-based positional index. `None` means named-only. A positional
+ * argument may also be supplied by name; this makes chip editing stable.
+ */
+position?: number | null, required: boolean, value_type: InvocationArgumentType, completion: InvocationCompletion, description?: string | null, };
+
+export type InvocationClientAdapter = "attachment";
+
+export type FeatureInvocationDescriptor = { identity: FeatureInvocationIdentity, name: string, aliases: Array<string>, display_name: string, description: string, syntax: FeatureInvocationSyntax, arguments: Array<InvocationArgumentDescriptor>, client_adapter?: InvocationClientAdapter | null, };
+
+export type InvocationValue = { "kind": "string", "value": string } | { "kind": "integer", "value": number } | { "kind": "boolean", "value": boolean };
+
+export type InvocationArgumentValue = { name: string, value: InvocationValue, };
+
+export type FeatureInvocation = {
+/**
+ * Stable client-generated id retained across queueing and transport retry.
+ */
+invocation_id: string, identity: FeatureInvocationIdentity,
+/**
+ * Selected public name, retained for exact draft/history restoration. Host
+ * resolution is always by `identity`.
+ */
+name: string, arguments: Array<InvocationArgumentValue>, };
+
+export type FeatureInvocationStatus = "succeeded" | "failed" | "outcome_unknown";
+
+export type FeatureInvocationResult = { invocation_id: string, identity: FeatureInvocationIdentity, status: FeatureInvocationStatus, message: string,
+/**
+ * Bounded model-visible context produced by the handler. Credentials and
+ * executable implementation details must not be included.
+ */
+context?: string | null, };
 
 export type WorkerStatus = "idle" | "running" | "paused" | "stopped";
 
@@ -108,7 +153,7 @@ recursive: boolean,
  */
 symlink_policy: SymlinkPolicy, };
 
-export type CompletionEntry = { value: string, is_dir: boolean, };
+export type CompletionEntry = { value: string, is_dir: boolean, description?: string | null, usage?: string | null, invocation?: FeatureInvocationDescriptor | null, };
 
 export type RewindTargetId = { segment_id: string, user_input_entry_index: number, };
 
@@ -270,7 +315,7 @@ export type PasteArtifactRef = { artifact_id: string, created_at_ms: number, med
  */
 availability: PasteArtifactAvailability, byte_len: number, char_count: number, line_count: number, sha256: string, source_entry_id: string, };
 
-export type Segment = { "kind": "text", content: string, } | { "kind": "paste", id: number, chars: number, lines: number, content: string, } | { "kind": "paste_artifact", artifact: PasteArtifactRef, } | { "kind": "uploaded_file", file: UploadedFileRef, } | { "kind": "file_ref", path: string, } | { "kind": "flow", selector: string, } | { "kind": "unknown" };
+export type Segment = { "kind": "text", content: string, } | { "kind": "paste", id: number, chars: number, lines: number, content: string, } | { "kind": "paste_artifact", artifact: PasteArtifactRef, } | { "kind": "uploaded_file", file: UploadedFileRef, } | { "kind": "file_ref", path: string, } | { "kind": "feature_invoke", invocation: FeatureInvocation, } | { "kind": "flow", selector: string, } | { "kind": "unknown" };
 
 export type WorkerEvent = { "kind": "turn_ended", worker_name: string, } | { "kind": "errored", worker_name: string, message: string, } | { "kind": "shut_down", worker_name: string, } | { "kind": "scope_sub_delegated",
 /**
@@ -314,7 +359,11 @@ alias: string, repository_key?: string | null, working_directory_id: Subscriptio
 
 export type SubscriptionWorkerJob = { job_id: string, attempt_id: string, purpose: string, };
 
-export type SubscriptionWorker = { worker_id: SubscriptionWorkerId,
+export type SubscriptionWorker = {
+/**
+ * Opaque Runtime-owned Restore observation identity, never a display-state hash.
+ */
+restore_observation_token?: string | null, worker_id: SubscriptionWorkerId,
 /**
  * Set by the Workspace Server when projecting a Runtime-owned Worker to clients.
  * Runtime producers leave this unset because the connection identifies the Runtime.
@@ -367,7 +416,12 @@ export type SubscriptionFramePayload = { "frame": "request", "message": Subscrip
 
 export type SubscriptionFrame = { protocol_version: number, } & ({ "frame": "request", "message": SubscriptionRequest } | { "frame": "response", "message": SubscriptionResponse } | { "frame": "event", "message": SubscriptionEvent } | { "frame": "worker_protocol", "message": SubscriptionWorkerProtocolMethod });
 
-export type Method = { "method": "submit", "params": { submission_request_id: string, input: Array<Segment>, } } | { "method": "notify", "params": { notification_request_id: string, message: string, } } | { "method": "worker_event", "params": WorkerEvent } | { "method": "list_pending_submissions" } | { "method": "cancel_pending_submission", "params": { submission_id: string, expected_revision: number, } } | { "method": "clear_pending_submissions", "params": { expected_revision: number, } } | { "method": "continue_pending", "params": { expected_revision: number, expected_head_id: string, } } | { "method": "resume", "params": { command: WorkerCommandEnvelope, } } | { "method": "cancel", "params": { command: WorkerCommandEnvelope, } } | { "method": "pause", "params": { command: WorkerCommandEnvelope, } } | { "method": "compact", "params": { command: WorkerCommandEnvelope, } } | { "method": "list_rewind_targets" } | { "method": "rewind_to", "params": { target: RewindTargetId, expected_head_entries: number, } } | { "method": "shutdown", "params": { command: WorkerCommandEnvelope, } } | { "method": "list_completions", "params": { kind: CompletionKind, prefix: string, } } | { "method": "list_workers" } | { "method": "restore_worker", "params": { name: string, } } | { "method": "register_peer", "params": { name: string, } };
+export type Method = { "method": "submit", "params": { submission_request_id: string, input: Array<Segment>, } } | { "method": "notify", "params": { notification_request_id: string, message: string, } } | { "method": "worker_event", "params": WorkerEvent } | { "method": "list_pending_submissions" } | { "method": "cancel_pending_submission", "params": { submission_id: string, expected_revision: number, } } | { "method": "clear_pending_submissions", "params": { expected_revision: number, } } | { "method": "continue_pending", "params": { expected_revision: number, expected_head_id: string, } } | { "method": "resume", "params": { command: WorkerCommandEnvelope, } } | { "method": "cancel", "params": { command: WorkerCommandEnvelope, } } | { "method": "pause", "params": { command: WorkerCommandEnvelope, } } | { "method": "compact", "params": { command: WorkerCommandEnvelope, } } | { "method": "list_rewind_targets" } | { "method": "rewind_to", "params": { target: RewindTargetId, expected_head_entries: number, } } | { "method": "shutdown", "params": { command: WorkerCommandEnvelope, } } | { "method": "list_completions", "params": { kind: CompletionKind, prefix: string,
+/**
+ * Client query generation. Echoed verbatim so identical-prefix ABA
+ * responses cannot cross edits, target switches, or permission changes.
+ */
+request_id?: string | null, context?: CompletionContext | null, } } | { "method": "list_workers" } | { "method": "restore_worker", "params": { name: string, } } | { "method": "register_peer", "params": { name: string, } };
 
 export type Event = { "event": "submission_accepted", "data": { submission_request_id: string, submission_id: string, disposition: SubmissionDisposition, } } | { "event": "submission_rejected", "data": { submission_request_id: string, message: string, } } | { "event": "notification_accepted", "data": { notification_request_id: string, } } | { "event": "notification_rejected", "data": { notification_request_id: string, message: string, } } | { "event": "pending_submissions_changed", "data": { pending: PendingSubmissionsSnapshot, } } | { "event": "user_message", "data": {
 /**
@@ -406,4 +460,4 @@ in_flight?: InFlightSnapshot,
  * Parent-owned Internal Worker sessions visible to this client.
  * Service-private Internal Workers are deliberately excluded.
  */
-internal_workers?: Array<InternalWorkerSnapshot>, } } | { "event": "internal_worker", "data": { worker: InternalWorkerRef, revision: number, event: Event, } } | { "event": "internal_worker_removed", "data": { worker: InternalWorkerRef, revision: number, } } | { "event": "segment_rotated", "data": { session: SessionSnapshot, } } | { "event": "worker_state", "data": { snapshot: WorkerStateSnapshot, } } | { "event": "command_acknowledged", "data": { acknowledgement: WorkerCommandAcknowledgement, } } | { "event": "command", "data": { event: CommandEvent, } } | { "event": "completions", "data": { kind: CompletionKind, entries: Array<CompletionEntry>, } } | { "event": "rewind_targets", "data": { head_entries: number, targets: Array<RewindTarget>, } } | { "event": "rewind_applied", "data": { session: SessionSnapshot, input: Array<Segment>, summary: RewindSummary, } } | { "event": "workers_listed", "data": { workers: unknown, } } | { "event": "worker_restored", "data": { result: unknown, } } | { "event": "peer_registered", "data": { result: unknown, } } | { "event": "alert", "data": Alert } | { "event": "memory_worker", "data": MemoryWorkerEvent } | { "event": "compaction_progress", "data": { compaction: InFlightCompaction | null, } } | { "event": "compact_start", "data": { lifecycle: CompactionLifecycle, } } | { "event": "compact_done", "data": { lifecycle: CompactionLifecycle, } } | { "event": "compact_failed", "data": { lifecycle: CompactionLifecycle, } } | { "event": "shutdown" };
+internal_workers?: Array<InternalWorkerSnapshot>, } } | { "event": "internal_worker", "data": { worker: InternalWorkerRef, revision: number, event: Event, } } | { "event": "internal_worker_removed", "data": { worker: InternalWorkerRef, revision: number, } } | { "event": "segment_rotated", "data": { session: SessionSnapshot, } } | { "event": "worker_state", "data": { snapshot: WorkerStateSnapshot, } } | { "event": "command_acknowledged", "data": { acknowledgement: WorkerCommandAcknowledgement, } } | { "event": "command", "data": { event: CommandEvent, } } | { "event": "completions", "data": { kind: CompletionKind, prefix: string, request_id?: string | null, context?: CompletionContext | null, entries: Array<CompletionEntry>, } } | { "event": "rewind_targets", "data": { head_entries: number, targets: Array<RewindTarget>, } } | { "event": "rewind_applied", "data": { session: SessionSnapshot, input: Array<Segment>, summary: RewindSummary, } } | { "event": "workers_listed", "data": { workers: unknown, } } | { "event": "worker_restored", "data": { result: unknown, } } | { "event": "peer_registered", "data": { result: unknown, } } | { "event": "alert", "data": Alert } | { "event": "memory_worker", "data": MemoryWorkerEvent } | { "event": "compaction_progress", "data": { compaction: InFlightCompaction | null, } } | { "event": "compact_start", "data": { lifecycle: CompactionLifecycle, } } | { "event": "compact_done", "data": { lifecycle: CompactionLifecycle, } } | { "event": "compact_failed", "data": { lifecycle: CompactionLifecycle, } } | { "event": "shutdown" };

@@ -6,6 +6,7 @@ import {
   pushWorkspaceAlert,
 } from "#lib/workspace/alerts/store.ts";
 import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
+import { parseWorkerListResponse } from "#lib/workspace/api/workers.ts";
 import { parseWorkingDirectoryListResponse } from "#lib/workspace/api/workdirs.ts";
 import {
   workspaceMultiplexer,
@@ -31,11 +32,17 @@ export type SidebarWorker = Omit<Worker, "workdir_attachments"> & {
 export type WorkspaceWorkersState = {
   loading: boolean;
   workers: SidebarWorker[];
+  /** Full catalog metadata; null until fetched. Never substitutes sidebar display state. */
+  catalogWorkers: Worker[] | null;
+  /** Changes immediately when an observation invalidates dependent cleanup plans. */
+  observationVersion: number;
+  catalogRefreshing: boolean;
 };
 
-type WorkerAlertKind = "subscription" | "workdirs";
+type WorkerAlertKind = "subscription" | "workdirs" | "catalog";
 type WorkspaceWorkersStoreEntry = {
   store: Readable<WorkspaceWorkersState>;
+  refresh(): Promise<void>;
   dispose(): void;
 };
 
@@ -55,6 +62,8 @@ function reportWorkerFailure(
     id: workerAlertId(workspaceId, kind),
     title: kind === "workdirs"
       ? "Worker Workdirs unavailable"
+      : kind === "catalog"
+      ? "Worker catalog unavailable"
       : "Worker updates unavailable",
   });
 }
@@ -66,6 +75,7 @@ function clearWorkerFailure(workspaceId: string, kind: WorkerAlertKind): void {
 function clearWorkerFailures(workspaceId: string): void {
   clearWorkerFailure(workspaceId, "subscription");
   clearWorkerFailure(workspaceId, "workdirs");
+  clearWorkerFailure(workspaceId, "catalog");
 }
 
 export function disposeWorkspaceWorkersStore(workspaceId: string): void {
@@ -78,6 +88,13 @@ export function disposeWorkspaceWorkersStore(workspaceId: string): void {
   entry.dispose();
 }
 
+/** Refresh observations only; this does not POST or complete pending reconciliation. */
+export async function refreshWorkspaceWorkers(
+  workspaceId: string,
+): Promise<void> {
+  await stores.get(workspaceId)?.refresh();
+}
+
 export function workspaceWorkersStore(
   workspaceId: string,
 ): Readable<WorkspaceWorkersState> {
@@ -85,11 +102,24 @@ export function workspaceWorkersStore(
   if (cached) return cached.store;
 
   let stopActive: (() => void) | null = null;
+  let refreshActive: (() => Promise<void>) | null = null;
   const store = readable<WorkspaceWorkersState>(
-    { loading: true, workers: [] },
+    {
+      loading: true,
+      workers: [],
+      catalogWorkers: null,
+      observationVersion: 0,
+      catalogRefreshing: true,
+    },
     (set) => {
       if (!workspaceId) {
-        set({ loading: false, workers: [] });
+        set({
+          loading: false,
+          workers: [],
+          catalogWorkers: [],
+          observationVersion: 0,
+          catalogRefreshing: false,
+        });
         return;
       }
       const projection = createWorkspaceWorkersProjection();
@@ -99,13 +129,24 @@ export function workspaceWorkersStore(
       let workers: SidebarWorker[] = [];
       let loading = true;
       let disposed = false;
+      let catalogWorkers: Worker[] | null = null;
+      let observationVersion = 0;
+      let catalogRefreshing = true;
+      let refreshSequence = 0;
+      let catalogAbort: AbortController | null = null;
       const publish = (): boolean => {
         if (disposed) return false;
         try {
           workers = [...projection.workers.values()]
             .map((worker) => projectWorker(worker, workdirs))
             .sort(compareWorkersForSidebar);
-          set({ loading, workers });
+          set({
+            loading,
+            workers,
+            catalogWorkers,
+            observationVersion,
+            catalogRefreshing,
+          });
           return true;
         } catch (cause) {
           reportWorkerFailure(
@@ -115,9 +156,85 @@ export function workspaceWorkersStore(
               ? cause.message
               : "Invalid Worker subscription frame",
           );
-          set({ loading: false, workers });
+          set({
+            loading: false,
+            workers,
+            catalogWorkers,
+            observationVersion,
+            catalogRefreshing,
+          });
           return false;
         }
+      };
+      const refreshCatalog = async () => {
+        if (disposed) return;
+        const sequence = ++refreshSequence;
+        const version = ++observationVersion;
+        catalogAbort?.abort();
+        const abort = new AbortController();
+        catalogAbort = abort;
+        catalogRefreshing = true;
+        publish(); // Invalidate cleanup plans before any request can settle.
+        const result = await loadJson(
+          fetch,
+          workspaceApiPath(workspaceId, "/workers"),
+          { signal: abort.signal },
+          parseWorkerListResponse,
+          { diagnosticLabel: "Worker API", maxResponseBytes: 8 * 1024 * 1024 },
+        );
+        if (
+          disposed || sequence !== refreshSequence ||
+          version !== observationVersion
+        ) return;
+        if (!result.data || result.data.workspace_id !== workspaceId) {
+          reportWorkerFailure(
+            workspaceId,
+            "catalog",
+            result.error ?? "Worker catalog identity mismatch",
+            "warning",
+          );
+          return;
+        }
+        catalogWorkers = result.data.items;
+        catalogRefreshing = false;
+        // GET is a new observation, never a cached POST response. Existing
+        // subscription-only fields (Job/Internal activity) retain their owners.
+        for (const summary of catalogWorkers) {
+          const key = JSON.stringify([summary.runtime_id, summary.worker_id]);
+          const current = projection.workers.get(key);
+          if (current) {
+            projection.workers.set(key, {
+              ...current,
+              availability: summary.availability,
+              state: summary.state as SubscriptionWorker["state"],
+              worker_state: summary.worker_state,
+              restore_observation_token: summary.restore_observation_token,
+            });
+          }
+        }
+        clearWorkerFailure(workspaceId, "catalog");
+        publish();
+      };
+      refreshActive = refreshCatalog;
+      const observeCatalog = () => {
+        if (catalogWorkers !== null) {
+          catalogWorkers = catalogWorkers.map((worker) => {
+            const latest = projection.workers.get(
+              JSON.stringify([worker.runtime_id, worker.worker_id]),
+            );
+            // The catalog can contain targets absent from the sidebar stream;
+            // absence is not a new filtering rule for the Workers page.
+            if (!latest) return worker;
+            return {
+              ...worker,
+              availability: latest.availability,
+              state: latest.state,
+              worker_state: latest.worker_state,
+              restore_observation_token: latest.restore_observation_token,
+            };
+          });
+        }
+        void refreshCatalog();
       };
       const loadWorkdirs = async () => {
         const result = await loadJson(
@@ -183,6 +300,13 @@ export function workspaceWorkersStore(
             try {
               applyWorkspaceWorkersFrame(projection, frame);
               loading = false;
+              if (
+                (frame.frame === "response" &&
+                  frame.message.result === "subscribed") ||
+                (frame.frame === "event" && frame.message.event === "event" &&
+                  frame.message.data.subscription_id ===
+                    projection.subscriptionId)
+              ) observeCatalog();
               if (publish()) clearWorkerFailure(workspaceId, "subscription");
             } catch (cause) {
               loading = false;
@@ -216,11 +340,14 @@ export function workspaceWorkersStore(
         },
       );
       void loadWorkdirs();
+      void refreshCatalog();
 
       const stop = () => {
         if (disposed) return;
         disposed = true;
         workdirRequest.abort();
+        catalogAbort?.abort();
+        if (refreshActive === refreshCatalog) refreshActive = null;
         subscription?.close();
         clearWorkerFailures(workspaceId);
         if (stopActive === stop) stopActive = null;
@@ -231,6 +358,9 @@ export function workspaceWorkersStore(
   );
   const entry: WorkspaceWorkersStoreEntry = {
     store,
+    refresh: async () => {
+      await refreshActive?.();
+    },
     dispose: () => {
       stopActive?.();
       clearWorkerFailures(workspaceId);
@@ -268,6 +398,7 @@ function projectWorker(
     availability: worker.availability,
     state: liveWorkerState(worker),
     lifecycleState: worker.state,
+    restore_observation_token: worker.restore_observation_token,
     worker_state: worker.worker_state,
     pinned: false,
     retention_state: "transient",

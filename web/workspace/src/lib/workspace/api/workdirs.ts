@@ -131,6 +131,7 @@ export function parseWorkingDirectorySummary(
     materializer_kind: enumField(record, "materializer_kind", [
       "runtime_git_clone",
       "client_hosted_external",
+      "logical_workspace_config",
     ]),
     status: enumField(record, "status", [
       "active",
@@ -177,10 +178,27 @@ export function parseWorkingDirectorySummary(
 function parseWorkingDirectorySource(value: unknown): WorkingDirectorySource {
   const source = exactRecord(
     value,
-    new Set(["kind", "repository_key", "grant_id", "grant_permissions"]),
+    new Set(["kind", "repository_key", "grant_id", "grant_permissions", "access", "content_path", "purpose"]),
     "Workdir source",
   );
   const kind = stringField(source, "kind");
+  if (kind === "workspace_config") {
+    if (source.repository_key !== undefined || source.grant_id !== undefined || source.grant_permissions !== undefined) {
+      throw new Error("Logical config source must not contain repository or External authority");
+    }
+    const access = stringField(source, "access");
+    if (access !== "read_only" && access !== "read_write") {
+      throw new Error("Logical config access has an unsupported value");
+    }
+    const content_path = stringField(source, "content_path");
+    if (content_path !== "/workspace-config") {
+      throw new Error("Logical config must reference its WIP content entrance");
+    }
+    return { kind, access, content_path, purpose: stringField(source, "purpose") };
+  }
+  if (source.access !== undefined || source.content_path !== undefined || source.purpose !== undefined) {
+    throw new Error("Filesystem Workdir source must not contain logical config metadata");
+  }
   if (kind === "repository") {
     if (
       source.grant_id !== undefined || source.grant_permissions !== undefined

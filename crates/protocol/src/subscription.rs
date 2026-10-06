@@ -651,6 +651,10 @@ impl SubscriptionWorkerJob {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct SubscriptionWorker {
+    /// Opaque Runtime-owned Restore observation identity, never a display-state hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub restore_observation_token: Option<String>,
     pub worker_id: SubscriptionWorkerId,
     /// Set by the Workspace Server when projecting a Runtime-owned Worker to clients.
     /// Runtime producers leave this unset because the connection identifies the Runtime.
@@ -689,6 +693,9 @@ pub struct SubscriptionWorker {
 impl SubscriptionWorker {
     pub fn validate(&self) -> Result<(), SubscriptionValidationError> {
         self.worker_id.validate()?;
+        if let Some(token) = &self.restore_observation_token {
+            validate_identifier("restore_observation_token", token, MAX_RESOURCE_ID_BYTES)?;
+        }
         if let Some(runtime_id) = &self.runtime_id {
             validate_identifier("runtime_id", runtime_id, MAX_RESOURCE_ID_BYTES)?;
         }
@@ -962,6 +969,7 @@ mod tests {
 
     fn worker(value: &str) -> SubscriptionWorker {
         SubscriptionWorker {
+            restore_observation_token: None,
             worker_id: worker_id(value),
             runtime_id: None,
             resource_key: None,
@@ -1197,6 +1205,8 @@ mod tests {
                 method: crate::Method::ListCompletions {
                     kind: crate::CompletionKind::File,
                     prefix: "src/".to_string(),
+                    request_id: None,
+                    context: None,
                 },
             },
         ));

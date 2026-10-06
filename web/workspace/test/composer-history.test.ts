@@ -199,3 +199,22 @@ Deno.test("Composer input uses boundary-aware Up and Down history navigation", a
   assert(consoleSource.includes("historyScope={workspaceId}"));
   assert(consoleSource.includes("composerInputElement?.recordHistory(value)"));
 });
+
+Deno.test("declarative invocation history persists typed values without sharing mutable arguments", () => {
+  const value: ComposerHistoryEntry = { preserveExactText: false, segments: [{ kind: "feature_invoke", invocation: {
+    invocation_id: "invoke-1", identity: "test/run", name: "run", arguments: [
+      { name: "path", value: { kind: "string", value: "資料/a b" } },
+      { name: "count", value: { kind: "integer", value: 2 } },
+      { name: "enabled", value: { kind: "boolean", value: true } },
+    ],
+  } }] };
+  const history = new ComposerHistory([value]);
+  const storage = memoryStorage();
+  saveComposerHistory(storage, "workspace-1", history);
+  const expected = [{ segments: value.segments, preserveExactText: false }];
+  assertEquals(loadComposerHistory(storage, "workspace-1").entries, expected);
+  const copy = history.entries[0].segments[0];
+  assert(copy.kind === "feature_invoke");
+  copy.invocation.arguments[0].value = { kind: "string", value: "modified" };
+  assertEquals(history.entries, expected);
+});

@@ -181,6 +181,8 @@ pub fn validate_profile_execution_target(
     if feature.flow.enabled {
         requirements.insert(WorkspaceAuthorityRequirement::Flow);
     }
+    // workdir_catalog is a WIP-only reference provider, not Workspace authority
+    // or normal Tools. It must not prevent standalone Tools-mode launches.
     if feature.manage_workdir.enabled {
         requirements.insert(WorkspaceAuthorityRequirement::ManageWorkdir);
     }
@@ -1480,6 +1482,59 @@ mod tests {
         assert!(!resolved.manifest.feature.flow.enabled);
         assert!(!resolved.manifest.feature.worker.enabled);
         assert!(!resolved.manifest.feature.manage_workdir.enabled);
+    }
+
+    #[test]
+    fn workdir_catalog_does_not_require_workspace_authority_or_grant_scope() {
+        let tmp = TempDir::new().unwrap();
+        for catalog in [None, Some(false), Some(true)] {
+            let mut artifact = serde_json::json!({
+                "worker": { "mode": "tools" },
+                "feature": { "manage_workdir": { "enabled": false } },
+                "permissions": { "default_action": "deny" }
+            });
+            if let Some(enabled) = catalog {
+                artifact["feature"]["workdir_catalog"] = serde_json::json!({ "enabled": enabled });
+            }
+            let resolved = resolve_profile_artifact_value(
+                artifact,
+                ProfileSource::Archive {
+                    archive_id: "catalog-test".into(),
+                    source: "test".into(),
+                },
+                tmp.path(),
+                "catalog-worker",
+            )
+            .unwrap();
+            let manifest = resolved.manifest;
+            assert_eq!(
+                manifest.feature.workdir_catalog.enabled,
+                catalog.unwrap_or(true)
+            );
+            assert!(!manifest.feature.manage_workdir.enabled);
+            assert_eq!(manifest.worker.mode, crate::WorkerMode::Tools);
+            assert!(manifest.scope.allow.is_empty());
+            assert!(manifest.delegation_scope.allow.is_empty());
+            assert_eq!(
+                manifest.permissions.as_ref().unwrap().default_action,
+                crate::ToolPermissionAction::Deny
+            );
+            validate_profile_execution_target(&manifest, ProfileExecutionTarget::Standalone)
+                .unwrap();
+
+            let mut manage_manifest = manifest;
+            manage_manifest.feature.manage_workdir.enabled = true;
+            let error = validate_profile_execution_target(
+                &manage_manifest,
+                ProfileExecutionTarget::Standalone,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                ProfileError::UnsupportedExecutionTarget { requirements, .. }
+                    if requirements == vec![WorkspaceAuthorityRequirement::ManageWorkdir]
+            ));
+        }
     }
 
     #[test]

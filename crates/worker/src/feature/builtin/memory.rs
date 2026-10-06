@@ -4,7 +4,8 @@
 //! authority. In that case model-visible Memory tools must go through the
 //! workspace backend instead of resolving `.yoi/memory` from a Worker workdir.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
@@ -24,11 +25,15 @@ use crate::feature::{
     FeatureDescriptor, FeatureHookPoint, FeatureInstallContext, FeatureInstallError, FeatureModule,
     HookDeclaration, ToolContribution, ToolDeclaration,
 };
-use crate::hook::{Hook, HookError, HookErrorCategory, HookExecutionPolicy, WorkerRestored};
+use crate::hook::{
+    BeforeSessionRewrite, BeforeSessionRewriteAction, BeforeSessionRewriteContext, Hook, HookError,
+    HookErrorCategory, HookExecutionPolicy, HookPreRequestAction, PreLlmRequest, PreRequestContext,
+    WorkerRestored,
+};
 use crate::prompt::catalog::{PromptCatalog, WorkerPrompt};
 use crate::worker::{
-    SystemPromptContribution, SystemPromptContributionSource, WorkspaceClient,
-    WorkspaceClientError, WorkspaceRequest, WorkspaceRequestMethod,
+    ResidentContextRefresh, SystemPromptContribution, SystemPromptContributionSource,
+    WorkspaceClient, WorkspaceClientError, WorkspaceRequest, WorkspaceRequestMethod,
 };
 
 #[derive(Clone, Debug)]
@@ -74,6 +79,8 @@ pub enum WorkspaceMemoryBackendError {
     Decode(#[from] serde_json::Error),
     #[error("workspace memory backend rejected operation: {0}")]
     Backend(String),
+    #[error("workspace memory backend returned an invalid response: {0}")]
+    InvalidResponse(String),
 }
 
 impl dyn WorkspaceClient + '_ {
@@ -672,12 +679,17 @@ struct WorkspaceResidentSummarySource {
     client: Arc<dyn WorkspaceClient>,
 }
 
-struct WorkspaceSubjektivResidentSummarySource {
-    client: Arc<dyn WorkspaceClient>,
+#[derive(Default)]
+struct SubjectBehaviorRefreshState {
+    applied: Option<(u64, String)>,
+    pending: HashMap<u64, String>,
 }
 
-const READY_EMPTY_RESIDENT_SURFACE: &str =
-    "The current ready resident memory surface is intentionally empty.";
+struct WorkspaceSubjektivResidentSummarySource {
+    client: Arc<dyn WorkspaceClient>,
+    prompts: Arc<ArcSwap<PromptCatalog>>,
+    behavior_state: Mutex<SubjectBehaviorRefreshState>,
+}
 
 fn resident_summary_contribution(
     output: memory::backend::MemoryResidentSummaryOutput,
@@ -715,37 +727,133 @@ impl SystemPromptContributionSource for WorkspaceResidentSummarySource {
     }
 }
 
-#[async_trait]
-impl SystemPromptContributionSource for WorkspaceSubjektivResidentSummarySource {
-    async fn load(&self) -> SystemPromptContribution {
+impl WorkspaceSubjektivResidentSummarySource {
+    async fn fetch(
+        &self,
+    ) -> Result<server_api::SubjektivResidentContextOutput, WorkspaceMemoryBackendError> {
         match execute_subjektiv_memory_operation_with(
             self.client.as_ref(),
-            server_api::SubjektivMemoryBackendOperation::ResidentSummary(Default::default()),
+            server_api::SubjektivMemoryBackendOperation::ResidentContext(Default::default()),
             |client, request| {
                 client.execute_with_timeout(request, RESIDENT_SUMMARY_REQUEST_TIMEOUT)
             },
-        ) {
-            Ok(server_api::SubjektivMemoryBackendResponse::ResidentSummary(output)) => {
-                match resident_summary_contribution(output) {
-                    SystemPromptContribution::Ready(content) if content.trim().is_empty() => {
-                        SystemPromptContribution::Ready(READY_EMPTY_RESIDENT_SURFACE.to_string())
-                    }
-                    contribution => contribution,
+        )? {
+            server_api::SubjektivMemoryBackendResponse::ResidentContext(output) => Ok(output),
+            other => Err(WorkspaceMemoryBackendError::InvalidResponse(format!(
+                "unexpected subject resident context response: {other:?}"
+            ))),
+        }
+    }
+
+    fn render(
+        &self,
+        output: &server_api::SubjektivResidentContextOutput,
+    ) -> Result<String, String> {
+        use memory::backend::MemoryResidentSummaryAvailability as Availability;
+        let availability = match output.memory_surface.availability {
+            Availability::Ready => "ready",
+            Availability::Ungenerated => "ungenerated",
+            Availability::Stale => "stale",
+            Availability::Failed => "failed",
+            Availability::Unavailable => "unavailable",
+        };
+        self.prompts
+            .load()
+            .subjektiv_resident_context(
+                &output.behavior_md,
+                availability,
+                output.memory_surface.content.as_deref(),
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    fn remember_behavior(&self, output: &server_api::SubjektivResidentContextOutput) {
+        let mut state = self
+            .behavior_state
+            .lock()
+            .expect("subject behavior state poisoned");
+        state.applied = Some((output.behavior_revision, output.behavior_md.clone()));
+        state.pending.remove(&output.behavior_revision);
+    }
+}
+
+#[async_trait]
+impl SystemPromptContributionSource for WorkspaceSubjektivResidentSummarySource {
+    async fn load(&self) -> SystemPromptContribution {
+        match self.fetch().await {
+            Ok(output) => match self.render(&output) {
+                Ok(rendered) => {
+                    self.remember_behavior(&output);
+                    SystemPromptContribution::Ready(rendered)
                 }
-            }
-            Ok(other) => {
-                tracing::debug!(?other, "unexpected subject resident Memory response");
-                SystemPromptContribution::Unavailable
-            }
+                Err(error) => {
+                    tracing::error!(%error, "subject resident context render failed");
+                    SystemPromptContribution::Ready(
+                        "The Host could not render the Subject resident context. Do not treat this as unset behavior or infer replacement behavior from Memory."
+                            .to_string(),
+                    )
+                }
+            },
             Err(error) => {
-                tracing::debug!(%error, "subject resident Memory unavailable");
-                SystemPromptContribution::Unavailable
+                tracing::error!(%error, "subject resident context fetch failed");
+                SystemPromptContribution::Ready(
+                    "The Host could not fetch the Subject resident context. Do not treat this as unset behavior or infer replacement behavior from Memory."
+                        .to_string(),
+                )
             }
         }
+    }
+
+    async fn load_changed_resident_context(
+        &self,
+    ) -> Result<Option<ResidentContextRefresh>, String> {
+        let output = self.fetch().await.map_err(|error| error.to_string())?;
+        let changed = self
+            .behavior_state
+            .lock()
+            .expect("subject behavior state poisoned")
+            .applied
+            .as_ref()
+            .is_none_or(|(revision, body)| {
+                *revision != output.behavior_revision || body != &output.behavior_md
+            });
+        if !changed {
+            return Ok(None);
+        }
+        let rendered = self.render(&output)?;
+        let revision = output.behavior_revision;
+        self.behavior_state
+            .lock()
+            .expect("subject behavior state poisoned")
+            .pending
+            .insert(revision, output.behavior_md);
+        Ok(Some(ResidentContextRefresh {
+            body: rendered,
+            revision,
+        }))
+    }
+
+    fn confirm_resident_context_revision(&self, revision: u64) {
+        let mut state = self
+            .behavior_state
+            .lock()
+            .expect("subject behavior state poisoned");
+        if let Some(body) = state.pending.remove(&revision) {
+            state.applied = Some((revision, body));
+        }
+    }
+
+    fn invalidate_resident_context_representation(&self) {
+        self.behavior_state
+            .lock()
+            .expect("subject behavior state poisoned")
+            .applied = None;
     }
 }
 
 const SUBJEKTIV_RESTORE_REFRESH_HOOK: &str = "refresh-resident-surface-after-restore";
+const SUBJEKTIV_BEHAVIOR_REFRESH_HOOK: &str = "refresh-subject-behavior-before-request";
+const SUBJEKTIV_BEHAVIOR_REWRITE_HOOK: &str = "invalidate-subject-behavior-before-rewrite";
 
 /// subjektiv-owned restore behavior. Initial prompt contribution remains a
 /// shared host facility, while loading and rendering a post-restore refresh is
@@ -793,6 +901,14 @@ impl FeatureModule for SubjektivResidentRestoreRefreshFeature {
             SUBJEKTIV_RESTORE_REFRESH_HOOK,
             FeatureHookPoint::WorkerRestored,
         ))
+        .with_hook(HookDeclaration::new(
+            SUBJEKTIV_BEHAVIOR_REFRESH_HOOK,
+            FeatureHookPoint::PreLlmRequest,
+        ))
+        .with_hook(HookDeclaration::new(
+            SUBJEKTIV_BEHAVIOR_REWRITE_HOOK,
+            FeatureHookPoint::BeforeSessionRewrite,
+        ))
     }
 
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
@@ -804,7 +920,61 @@ impl FeatureModule for SubjektivResidentRestoreRefreshFeature {
                 prompts: Arc::clone(&self.prompts),
                 workspace_id: self.workspace_id.clone(),
             },
+        )?;
+        context.hooks().add_pre_llm_request(
+            SUBJEKTIV_BEHAVIOR_REFRESH_HOOK,
+            HookExecutionPolicy::fail_closed(),
+            SubjektivBehaviorRefreshHook {
+                source: Arc::clone(&self.source),
+            },
+        )?;
+        context.hooks().add_before_session_rewrite(
+            SUBJEKTIV_BEHAVIOR_REWRITE_HOOK,
+            HookExecutionPolicy::fail_closed(),
+            SubjektivBehaviorRewriteHook {
+                source: Arc::clone(&self.source),
+            },
         )
+    }
+}
+
+struct SubjektivBehaviorRewriteHook {
+    source: Arc<dyn SystemPromptContributionSource>,
+}
+
+#[async_trait]
+impl Hook<BeforeSessionRewrite> for SubjektivBehaviorRewriteHook {
+    async fn call(
+        &self,
+        _context: &BeforeSessionRewriteContext,
+    ) -> Result<BeforeSessionRewriteAction, HookError> {
+        self.source.invalidate_resident_context_representation();
+        Ok(BeforeSessionRewriteAction::Continue)
+    }
+}
+
+struct SubjektivBehaviorRefreshHook {
+    source: Arc<dyn SystemPromptContributionSource>,
+}
+
+#[async_trait]
+impl Hook<PreLlmRequest> for SubjektivBehaviorRefreshHook {
+    async fn call(&self, context: &PreRequestContext) -> Result<HookPreRequestAction, HookError> {
+        let refresh = self
+            .source
+            .load_changed_resident_context()
+            .await
+            .map_err(|error| HookError::new(HookErrorCategory::Dependency, error))?;
+        if let Some(refresh) = refresh {
+            let system_items = context.system_items().ok_or_else(|| {
+                HookError::new(
+                    HookErrorCategory::Dependency,
+                    "Subject behavior refresh requires durable session append authority",
+                )
+            })?;
+            system_items.append_subject_behavior_refresh(refresh.body, refresh.revision);
+        }
+        Ok(HookPreRequestAction::Continue)
     }
 }
 
@@ -945,12 +1115,13 @@ pub(crate) fn is_builtin_subjektiv_consolidation_profile(
 
 pub(crate) fn ordinary_subjektiv_features_enabled(manifest: &manifest::WorkerManifest) -> bool {
     manifest.feature.subjektiv.execution_enabled()
-        && !is_builtin_subjektiv_consolidation_profile(manifest)
+        && !manifest.feature.subjektiv.profile.consolidation_tools
 }
 
 pub(crate) fn ordinary_subjektiv_resident_summary_source(
     manifest: &manifest::WorkerManifest,
     client: Arc<dyn WorkspaceClient>,
+    prompts: Arc<ArcSwap<PromptCatalog>>,
 ) -> std::io::Result<Option<Arc<dyn SystemPromptContributionSource>>> {
     if !ordinary_subjektiv_features_enabled(manifest) {
         return Ok(None);
@@ -988,6 +1159,8 @@ pub(crate) fn ordinary_subjektiv_resident_summary_source(
     }
     Ok(Some(Arc::new(WorkspaceSubjektivResidentSummarySource {
         client,
+        prompts,
+        behavior_state: Mutex::new(SubjectBehaviorRefreshState::default()),
     })))
 }
 
@@ -1002,7 +1175,7 @@ impl SubjektivConsolidationFeatureInstallPlan {
         client: Arc<dyn WorkspaceClient>,
         prompts: Arc<crate::prompt::catalog::PromptCatalog>,
     ) -> std::io::Result<Option<Self>> {
-        if !is_builtin_subjektiv_consolidation_profile(manifest) {
+        if !manifest.feature.subjektiv.profile.consolidation_tools {
             return Ok(None);
         }
         let config = &manifest.feature.subjektiv;
@@ -1120,6 +1293,10 @@ mod tests {
     use agen::tool::ToolDefinition;
     use std::sync::Mutex;
 
+    fn test_prompts() -> Arc<ArcSwap<PromptCatalog>> {
+        Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap()))
+    }
+
     fn test_client() -> Arc<dyn WorkspaceClient> {
         Arc::new(crate::worker::TestWorkspaceHttpClient::new(
             "workspace",
@@ -1132,6 +1309,7 @@ mod tests {
         availability: memory::backend::MemoryResidentSummaryAvailability,
         content: Option<String>,
         scope_allowed: bool,
+        behavior: Mutex<(u64, String)>,
         paths: Mutex<Vec<String>>,
         timeouts: Mutex<Vec<Duration>>,
     }
@@ -1145,6 +1323,7 @@ mod tests {
                 availability,
                 content: content.map(str::to_string),
                 scope_allowed: true,
+                behavior: Mutex::new((3, "Be deliberate.".to_string())),
                 paths: Mutex::new(Vec::new()),
                 timeouts: Mutex::new(Vec::new()),
             }
@@ -1155,6 +1334,7 @@ mod tests {
                 availability: memory::backend::MemoryResidentSummaryAvailability::Ready,
                 content: Some("must not be injected".into()),
                 scope_allowed: false,
+                behavior: Mutex::new((3, "must not be injected".to_string())),
                 paths: Mutex::new(Vec::new()),
                 timeouts: Mutex::new(Vec::new()),
             }
@@ -1184,7 +1364,7 @@ mod tests {
                 serde_json::from_str(request.body.as_deref().unwrap_or_default()).unwrap();
             assert!(matches!(
                 request.operation,
-                server_api::SubjektivMemoryBackendOperation::ResidentSummary(_)
+                server_api::SubjektivMemoryBackendOperation::ResidentContext(_)
             ));
             if !self.scope_allowed {
                 return Ok(WorkspaceResponse {
@@ -1192,13 +1372,18 @@ mod tests {
                     body: "subject scope unavailable".into(),
                 });
             }
+            let (behavior_revision, behavior_md) = self.behavior.lock().unwrap().clone();
             Ok(WorkspaceResponse {
                 status: 200,
                 body: serde_json::to_string(
-                    &server_api::SubjektivMemoryBackendResponse::ResidentSummary(
-                        memory::backend::MemoryResidentSummaryOutput {
-                            availability: self.availability,
-                            content: self.content.clone(),
+                    &server_api::SubjektivMemoryBackendResponse::ResidentContext(
+                        server_api::SubjektivResidentContextOutput {
+                            behavior_md,
+                            behavior_revision,
+                            memory_surface: memory::backend::MemoryResidentSummaryOutput {
+                                availability: self.availability,
+                                content: self.content.clone(),
+                            },
                         },
                     ),
                 )
@@ -1511,13 +1696,19 @@ permission = "write"
             memory::backend::MemoryResidentSummaryAvailability::Ready,
             Some("current subject surface"),
         ));
-        let ready = ordinary_subjektiv_resident_summary_source(&manifest, ready_client.clone())
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            ready.load().await,
-            SystemPromptContribution::Ready("current subject surface".into())
-        );
+        let ready = ordinary_subjektiv_resident_summary_source(
+            &manifest,
+            ready_client.clone(),
+            test_prompts(),
+        )
+        .unwrap()
+        .unwrap();
+        let loaded = ready.load().await;
+        let SystemPromptContribution::Ready(loaded) = loaded else {
+            panic!("subject resident context must be present");
+        };
+        assert!(loaded.contains("Be deliberate."));
+        assert!(loaded.contains("current subject surface"));
         assert_eq!(
             ready_client.paths.lock().unwrap().clone(),
             vec!["/api/w/workspace/subjektiv/memory".to_string()]
@@ -1531,13 +1722,18 @@ permission = "write"
             memory::backend::MemoryResidentSummaryAvailability::Ready,
             None,
         ));
-        let ready_empty = ordinary_subjektiv_resident_summary_source(&manifest, ready_empty_client)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            ready_empty.load().await,
-            SystemPromptContribution::Ready(READY_EMPTY_RESIDENT_SURFACE.into())
-        );
+        let ready_empty = ordinary_subjektiv_resident_summary_source(
+            &manifest,
+            ready_empty_client,
+            test_prompts(),
+        )
+        .unwrap()
+        .unwrap();
+        let SystemPromptContribution::Ready(ready_empty) = ready_empty.load().await else {
+            panic!("empty surface must retain Subject behavior");
+        };
+        assert!(ready_empty.contains("Be deliberate."));
+        assert!(ready_empty.contains("intentionally empty"));
 
         for availability in [
             memory::backend::MemoryResidentSummaryAvailability::Ungenerated,
@@ -1550,22 +1746,107 @@ permission = "write"
                     availability,
                     Some("must not be injected"),
                 )),
+                test_prompts(),
             )
             .unwrap()
             .unwrap();
-            assert_eq!(source.load().await, SystemPromptContribution::Unavailable);
+            let SystemPromptContribution::Ready(loaded) = source.load().await else {
+                panic!("Subject behavior must survive unavailable surfaces");
+            };
+            assert!(loaded.contains("Be deliberate."));
+            assert!(!loaded.contains("must not be injected"));
         }
+    }
+
+    #[tokio::test]
+    async fn subject_resident_source_emits_only_changed_behavior_revisions() {
+        let manifest = subject_manifest("workspace");
+        let client = Arc::new(SubjectResidentClient::new(
+            memory::backend::MemoryResidentSummaryAvailability::Ungenerated,
+            None,
+        ));
+        let source =
+            ordinary_subjektiv_resident_summary_source(&manifest, client.clone(), test_prompts())
+                .unwrap()
+                .unwrap();
+
+        let initial = source.load().await;
+        assert!(matches!(initial, SystemPromptContribution::Ready(_)));
+        assert!(
+            source
+                .load_changed_resident_context()
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        *client.behavior.lock().unwrap() = (4, "Ask when uncertain.".to_string());
+        let refresh = source
+            .load_changed_resident_context()
+            .await
+            .unwrap()
+            .expect("changed behavior must produce one refresh");
+        assert_eq!(refresh.revision, 4);
+        assert!(refresh.body.contains("Ask when uncertain."));
+        source.confirm_resident_context_revision(refresh.revision);
+        assert!(
+            source
+                .load_changed_resident_context()
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        *client.behavior.lock().unwrap() = (5, String::new());
+        let cleared = source
+            .load_changed_resident_context()
+            .await
+            .unwrap()
+            .expect("cleared behavior must produce one refresh");
+        assert_eq!(cleared.revision, 5);
+        assert!(cleared.body.contains("No user-managed behavior is set"));
+        source.confirm_resident_context_revision(cleared.revision);
+        assert!(
+            source
+                .load_changed_resident_context()
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        source.invalidate_resident_context_representation();
+        let replay_after_rewrite = source
+            .load_changed_resident_context()
+            .await
+            .unwrap()
+            .expect("history rewrite must require a durable current representation");
+        assert_eq!(replay_after_rewrite.revision, 5);
+        assert!(
+            replay_after_rewrite
+                .body
+                .contains("No user-managed behavior is set")
+        );
+        // Initial load and every live update/clear/replay probe retain the
+        // target-side bounded resident request contract.
+        assert_eq!(
+            client.timeouts.lock().unwrap().as_slice(),
+            &[RESIDENT_SUMMARY_REQUEST_TIMEOUT; 7]
+        );
     }
 
     #[tokio::test]
     async fn subject_resident_source_fails_closed_without_trusted_subject_scope() {
         let manifest = subject_manifest("workspace");
         let client = Arc::new(SubjectResidentClient::denied());
-        let source = ordinary_subjektiv_resident_summary_source(&manifest, client.clone())
-            .unwrap()
-            .unwrap();
+        let source =
+            ordinary_subjektiv_resident_summary_source(&manifest, client.clone(), test_prompts())
+                .unwrap()
+                .unwrap();
 
-        assert_eq!(source.load().await, SystemPromptContribution::Unavailable);
+        let SystemPromptContribution::Ready(failure) = source.load().await else {
+            panic!("fetch failure must be explicit in resident context");
+        };
+        assert!(failure.contains("could not fetch"));
         assert_eq!(
             client.paths.lock().unwrap().clone(),
             vec!["/api/w/workspace/subjektiv/memory".to_string()]
@@ -1593,7 +1874,7 @@ permission = "write"
         )
         .unwrap();
         assert!(
-            ordinary_subjektiv_resident_summary_source(&disabled, test_client())
+            ordinary_subjektiv_resident_summary_source(&disabled, test_client(), test_prompts())
                 .unwrap()
                 .is_none()
         );
@@ -1605,22 +1886,30 @@ permission = "write"
             Some("policy-only surface must not load"),
         ));
         assert!(
-            ordinary_subjektiv_resident_summary_source(&policy_only, unattached_client.clone())
-                .unwrap()
-                .is_none()
+            ordinary_subjektiv_resident_summary_source(
+                &policy_only,
+                unattached_client.clone(),
+                test_prompts()
+            )
+            .unwrap()
+            .is_none()
         );
         assert!(unattached_client.paths.lock().unwrap().is_empty());
 
         let foreign = subject_manifest("other-workspace");
-        assert!(ordinary_subjektiv_resident_summary_source(&foreign, test_client()).is_err());
+        assert!(
+            ordinary_subjektiv_resident_summary_source(&foreign, test_client(), test_prompts())
+                .is_err()
+        );
     }
 
     #[test]
     fn subject_restore_refresh_is_suppressed_for_internal_hosts() {
         let manifest = subject_manifest("workspace");
-        let source = ordinary_subjektiv_resident_summary_source(&manifest, test_client())
-            .unwrap()
-            .unwrap();
+        let source =
+            ordinary_subjektiv_resident_summary_source(&manifest, test_client(), test_prompts())
+                .unwrap()
+                .unwrap();
         let prompts = Arc::new(ArcSwap::from(
             crate::prompt::catalog::PromptCatalog::builtins_only().unwrap(),
         ));
@@ -1634,9 +1923,10 @@ permission = "write"
     #[test]
     fn subject_restore_refresh_feature_declares_only_restore_lifecycle() {
         let manifest = subject_manifest("workspace");
-        let source = ordinary_subjektiv_resident_summary_source(&manifest, test_client())
-            .unwrap()
-            .unwrap();
+        let source =
+            ordinary_subjektiv_resident_summary_source(&manifest, test_client(), test_prompts())
+                .unwrap()
+                .unwrap();
         let feature = SubjektivResidentRestoreRefreshFeature::new(
             source,
             Arc::new(ArcSwap::from(
@@ -1647,8 +1937,13 @@ permission = "write"
         let descriptor = feature.descriptor();
 
         assert!(descriptor.tools.is_empty());
-        assert_eq!(descriptor.hooks.len(), 1);
+        assert_eq!(descriptor.hooks.len(), 3);
         assert_eq!(descriptor.hooks[0].point, FeatureHookPoint::WorkerRestored);
+        assert_eq!(descriptor.hooks[1].point, FeatureHookPoint::PreLlmRequest);
+        assert_eq!(
+            descriptor.hooks[2].point,
+            FeatureHookPoint::BeforeSessionRewrite
+        );
     }
 
     #[test]

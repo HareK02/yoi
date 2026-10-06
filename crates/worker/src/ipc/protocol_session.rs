@@ -122,9 +122,22 @@ pub async fn dispatch_worker_protocol_method(
     method: Method,
 ) -> Option<Event> {
     match method {
-        Method::ListCompletions { kind, prefix } => {
-            let entries = handle.completion_entries(kind, &prefix).await;
-            Some(Event::Completions { kind, entries })
+        Method::ListCompletions {
+            request_id,
+            kind,
+            prefix,
+            context,
+        } => {
+            let entries = handle
+                .completion_entries(kind, &prefix, context.as_ref())
+                .await;
+            Some(Event::Completions {
+                request_id,
+                kind,
+                prefix,
+                context,
+                entries,
+            })
         }
         method => {
             let _ = handle.send(method).await;

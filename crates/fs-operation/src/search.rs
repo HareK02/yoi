@@ -1,49 +1,19 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+use crate::descriptor_ignore::{DescriptorIgnores, SourceBoundedReader};
 
 use crate::FsAccessPolicy;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::sinks::UTF8 as UTF8Sink;
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use ignore::WalkBuilder;
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::overrides::{Override, OverrideBuilder};
 use ignore::types::{Types, TypesBuilder};
 
 use crate::{FsError, GrepOutputMode, GrepRequest, GrepResult, direct_symlink};
-
-struct SourceBoundedReader<'a, R> {
-    inner: R,
-    remaining: &'a mut u64,
-    access: &'a dyn FsAccessPolicy,
-}
-
-impl<R: Read> Read for SourceBoundedReader<'_, R> {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        self.access.check_cancelled()?;
-        if buffer.is_empty() {
-            return Ok(0);
-        }
-        if *self.remaining == 0 {
-            let mut probe = [0_u8; 1];
-            return match self.inner.read(&mut probe)? {
-                0 => Ok(0),
-                _ => Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "grep source exceeded provider byte limit",
-                )),
-            };
-        }
-        let limit = usize::try_from(*self.remaining)
-            .unwrap_or(usize::MAX)
-            .min(buffer.len());
-        let read = self.inner.read(&mut buffer[..limit])?;
-        *self.remaining = (*self.remaining).saturating_sub(read as u64);
-        Ok(read)
-    }
-}
 
 struct ContentLine {
     path: PathBuf,
@@ -79,6 +49,28 @@ fn reserve_report_bytes(report: &mut GrepReport, bytes: usize) -> bool {
 
 impl GrepReport {
     fn into_result(self, root: &Path) -> GrepResult {
+        // Build Object paths from retained provider identities, never by parsing
+        // rendered text. Offset, limit and truncation already selected this set.
+        let paths = match self.mode {
+            GrepOutputMode::FilesWithMatches => self
+                .files
+                .iter()
+                .filter_map(|path| logical_path(root, path))
+                .collect(),
+            GrepOutputMode::Count => self
+                .counts
+                .iter()
+                .filter_map(|(path, _)| logical_path(root, path))
+                .collect(),
+            GrepOutputMode::Content => self
+                .lines
+                .iter()
+                .map(|line| line.path.as_path())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .filter_map(|path| logical_path(root, path))
+                .collect(),
+        };
         let (match_count, matched_files) = match self.mode {
             GrepOutputMode::FilesWithMatches => (self.files.len(), self.files.len()),
             GrepOutputMode::Count => (
@@ -116,6 +108,7 @@ impl GrepReport {
             }
         }
         GrepResult {
+            paths,
             output,
             match_count,
             matched_files,
@@ -166,11 +159,15 @@ fn render_content_lines(root: &Path, lines: &[ContentLine], show_line_numbers: b
     output
 }
 
+fn logical_path(root: &Path, path: &Path) -> Option<crate::FsPath> {
+    crate::FsPath::new_scoped(path.strip_prefix(root).unwrap_or(path).to_str()?).ok()
+}
+
 fn logical_display(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+    logical_path(root, path)
+        .expect("only representable provider paths enter a report")
+        .as_str()
+        .to_string()
 }
 
 const DEFAULT_HEAD_LIMIT: usize = 250;
@@ -205,119 +202,6 @@ fn build_types(file_type: Option<&str>) -> Result<Option<Types>, FsError> {
 fn direct_file_selected(path: &Path, overrides: Option<&Override>, types: Option<&Types>) -> bool {
     !overrides.is_some_and(|filter| filter.matched(path, false).is_ignore())
         && !types.is_some_and(|filter| filter.matched(path, false).is_ignore())
-}
-
-#[derive(Default)]
-struct DescriptorIgnoreMatchers {
-    loaded_directories: HashSet<PathBuf>,
-    by_directory: BTreeMap<PathBuf, Gitignore>,
-}
-
-impl DescriptorIgnoreMatchers {
-    fn load_directory(
-        &mut self,
-        directory: &Path,
-        explicit_base: &Path,
-        source_bytes_remaining: &mut u64,
-        access: &dyn FsAccessPolicy,
-    ) -> Result<(), FsError> {
-        if !self.loaded_directories.insert(directory.to_path_buf()) {
-            return Ok(());
-        }
-        let mut builder = GitignoreBuilder::new(directory);
-        let mut has_patterns = false;
-        for name in [".gitignore", ".ignore"] {
-            let path = directory.join(name);
-            let resolved = access
-                .resolve_access_path(&path)
-                .map_err(|error| FsError::io(&path, error))?;
-            if !access.is_readable_paths(&path, &resolved) {
-                continue;
-            }
-            let file = match access.open_read_file(&path, &resolved) {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(FsError::io(&path, error)),
-            };
-            if !file
-                .metadata()
-                .map_err(|error| FsError::io(&path, error))?
-                .is_file()
-            {
-                continue;
-            }
-            let bounded = SourceBoundedReader {
-                inner: file,
-                remaining: source_bytes_remaining,
-                access,
-            };
-            let mut reader = BufReader::new(bounded);
-            let mut line = String::new();
-            let mut line_number = 0_u64;
-            loop {
-                line.clear();
-                let read = reader
-                    .read_line(&mut line)
-                    .map_err(|error| FsError::io(&path, error))?;
-                if read == 0 {
-                    break;
-                }
-                line_number = line_number.saturating_add(1);
-                if line.len() > 1024 * 1024 {
-                    return Err(FsError::InvalidArgument(format!(
-                        "ignore pattern line {line_number} exceeds provider limit"
-                    )));
-                }
-                let line = line.trim_end_matches(['\r', '\n']);
-                // Match the ignore crate's partial-error behavior: one invalid
-                // pattern does not discard the remaining valid lines.
-                if builder.add_line(Some(path.clone()), line).is_ok() {
-                    has_patterns = true;
-                }
-            }
-        }
-        if !has_patterns {
-            return Ok(());
-        }
-        let matcher = builder.build().map_err(|_| {
-            FsError::InvalidArgument("ignore patterns could not be compiled".to_string())
-        })?;
-        // An explicitly selected search root is traversed even when a strict
-        // ancestor ignores that directory, matching path-backed Grep behavior.
-        if directory != explicit_base
-            && explicit_base.starts_with(directory)
-            && matcher
-                .matched_path_or_any_parents(explicit_base, true)
-                .is_ignore()
-        {
-            return Ok(());
-        }
-        self.by_directory.insert(directory.to_path_buf(), matcher);
-        Ok(())
-    }
-
-    fn is_ignored(&self, root: &Path, path: &Path) -> bool {
-        let mut directories = path
-            .parent()
-            .into_iter()
-            .flat_map(Path::ancestors)
-            .take_while(|directory| directory.starts_with(root))
-            .collect::<Vec<_>>();
-        directories.reverse();
-        let mut ignored = false;
-        for directory in directories {
-            let Some(matcher) = self.by_directory.get(directory) else {
-                continue;
-            };
-            let matched = matcher.matched_path_or_any_parents(path, false);
-            if matched.is_ignore() {
-                ignored = true;
-            } else if matched.is_whitelist() {
-                ignored = false;
-            }
-        }
-        ignored
-    }
 }
 
 struct GrepParams {
@@ -464,6 +348,9 @@ pub fn run_grep(
         retained_bytes: 0,
         truncated: false,
     };
+    if head_limit == 0 {
+        return Ok(report.into_result(root));
+    }
     let mut matching_files_seen = 0;
     let mut matches_seen = 0;
 
@@ -474,6 +361,7 @@ pub fn run_grep(
                 &mut searcher,
                 &matcher,
                 &base,
+                root,
                 mode,
                 &mut report,
                 &mut matching_files_seen,
@@ -494,6 +382,10 @@ pub fn run_grep(
         .as_ref()
         .map(|traversal| traversal.path())
         .unwrap_or(&base);
+    let logical_walk_root = traversal
+        .as_ref()
+        .and_then(|t| t.logical_root())
+        .unwrap_or(root);
     let mut walker = WalkBuilder::new(walker_root);
     if traversal.is_some() {
         walker
@@ -506,19 +398,6 @@ pub fn run_grep(
             .ignore(false)
             .parents(false)
             .follow_links(false);
-        let search_relative = base.strip_prefix(root).map_err(|_| {
-            FsError::InvalidArgument("grep base is outside its provider root".to_string())
-        })?;
-        let search_relative = search_relative.to_path_buf();
-        let filter_root = walker_root.to_path_buf();
-        walker.filter_entry(move |entry| {
-            entry
-                .path()
-                .strip_prefix(&filter_root)
-                .is_ok_and(|relative| {
-                    relative.starts_with(&search_relative) || search_relative.starts_with(relative)
-                })
-        });
     } else {
         walker
             .hidden(true)
@@ -538,32 +417,17 @@ pub fn run_grep(
 
     let mut visited = 0_usize;
     let mut source_bytes_remaining = crate::MAX_GREP_SOURCE_BYTES;
-    let mut descriptor_ignores = DescriptorIgnoreMatchers::default();
-    if traversal.is_some() {
-        let mut directory = root.to_path_buf();
-        descriptor_ignores.load_directory(
-            &directory,
-            &base,
-            &mut source_bytes_remaining,
-            access,
-        )?;
-        for component in base
-            .strip_prefix(root)
-            .map_err(|_| {
-                FsError::InvalidArgument("grep base is outside its provider root".to_string())
-            })?
-            .components()
-        {
-            directory.push(component);
-            descriptor_ignores.load_directory(
-                &directory,
-                &base,
-                &mut source_bytes_remaining,
-                access,
-            )?;
-        }
-    }
-    for entry in walker.build().flatten() {
+    let mut descriptor_ignores = traversal
+        .as_ref()
+        .map(|_| DescriptorIgnores::grep(root, logical_walk_root, access))
+        .transpose()?;
+    let mut walk = if traversal.is_some() {
+        crate::walk::Walk::descriptor(logical_walk_root, access)
+    } else {
+        crate::walk::Walk::Plain(walker.build())
+    };
+    while let Some(entry) = walk.next() {
+        let entry = entry?;
         access
             .check_cancelled()
             .map_err(|error| FsError::io(&base, error))?;
@@ -574,39 +438,41 @@ pub fn run_grep(
                 crate::MAX_TRAVERSAL_ENTRIES
             )));
         }
-        let walked_path = entry.path();
-        let path = if traversal.is_some() {
-            let relative = walked_path.strip_prefix(walker_root).map_err(|_| {
-                FsError::InvalidArgument(
-                    "descriptor traversal returned a path outside its root".to_string(),
-                )
-            })?;
-            root.join(relative)
-        } else {
-            walked_path.to_path_buf()
-        };
-        let file_type = entry.file_type();
-        if traversal.is_some() && file_type.as_ref().is_some_and(|kind| kind.is_dir()) {
-            descriptor_ignores.load_directory(&path, &base, &mut source_bytes_remaining, access)?;
+        let path = entry.path;
+        if logical_path(root, &path).is_none() {
             continue;
         }
-        if !file_type.map(|kind| kind.is_file()).unwrap_or(false) {
-            continue;
-        }
-        if traversal.is_some() {
+        let file_type = entry.kind;
+        if let Some(ignores) = descriptor_ignores.as_mut() {
             let relative = path.strip_prefix(&base).map_err(|_| {
                 FsError::InvalidArgument(
                     "descriptor traversal returned a path outside its search base".to_string(),
                 )
             })?;
-            if relative
-                .components()
-                .any(|component| component.as_os_str().to_string_lossy().starts_with('.'))
-                || descriptor_ignores.is_ignored(root, &path)
-                || !direct_file_selected(&path, overrides.as_ref(), types.as_ref())
+            let is_dir = file_type.is_some_and(|kind| kind.is_dir());
+            if path != logical_walk_root
+                && (relative.components().any(|component| {
+                    component
+                        .as_os_str()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with('.'))
+                }) || ignores.is_ignored(&path, is_dir))
             {
+                if is_dir {
+                    walk.skip_current_dir();
+                }
                 continue;
             }
+            if is_dir {
+                ignores.load_directory(&path, access)?;
+                continue;
+            }
+            if !direct_file_selected(&path, overrides.as_ref(), types.as_ref()) {
+                continue;
+            }
+        }
+        if !file_type.map(|kind| kind.is_file()).unwrap_or(false) {
+            continue;
         }
         let readable = access
             .resolve_access_path(&path)
@@ -618,6 +484,7 @@ pub fn run_grep(
             &mut searcher,
             &matcher,
             &path,
+            root,
             mode,
             &mut report,
             &mut matching_files_seen,
@@ -639,6 +506,7 @@ fn scan_path(
     searcher: &mut Searcher,
     matcher: &grep_regex::RegexMatcher,
     path: &Path,
+    root: &Path,
     mode: GrepOutputMode,
     report: &mut GrepReport,
     matching_files_seen: &mut usize,
@@ -648,6 +516,9 @@ fn scan_path(
     source_bytes_remaining: &mut u64,
     access: &dyn FsAccessPolicy,
 ) -> Result<bool, FsError> {
+    if logical_path(root, path).is_none() {
+        return Ok(false);
+    }
     let resolved = access
         .resolve_access_path(path)
         .map_err(|error| FsError::io(path, error))?;
@@ -678,7 +549,7 @@ fn scan_path(
                 return Ok(false);
             }
             if *matching_files_seen >= offset {
-                if !reserve_report_bytes(report, path.to_string_lossy().len().saturating_add(1)) {
+                if !reserve_report_bytes(report, path.as_os_str().len().saturating_add(1)) {
                     return Ok(true);
                 }
                 report.files.push(path.to_path_buf());
@@ -695,7 +566,7 @@ fn scan_path(
                 return Ok(false);
             }
             if *matching_files_seen >= offset {
-                if !reserve_report_bytes(report, path.to_string_lossy().len().saturating_add(32)) {
+                if !reserve_report_bytes(report, path.as_os_str().len().saturating_add(32)) {
                     return Ok(true);
                 }
                 report.counts.push((path.to_path_buf(), count));
@@ -780,7 +651,7 @@ impl ContentSink<'_> {
     fn reserve(&mut self, content_bytes: usize) -> bool {
         let retained = self
             .path
-            .to_string_lossy()
+            .as_os_str()
             .len()
             .saturating_add(content_bytes)
             .saturating_add(64);

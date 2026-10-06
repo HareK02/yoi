@@ -353,6 +353,10 @@ pub struct GrepRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GrepResult {
+    /// Exact typed provider paths represented in this returned report, not all
+    /// candidate/matched source files. Older providers may omit this field.
+    #[serde(default)]
+    pub paths: Vec<FsPath>,
     /// Provider-rendered bounded grep report. Keeping rendering here avoids
     /// transferring candidate files across a remote provider boundary.
     pub output: String,

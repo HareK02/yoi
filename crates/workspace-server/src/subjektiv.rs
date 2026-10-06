@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use chrono::{SecondsFormat, Utc};
 use memory::extract::{CandidateKind, STAGING_SCHEMA_VERSION, StagingEvidence, StagingRecord};
 use memory::schema::{SourceEvidenceRef, SourceRef};
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
@@ -24,6 +24,8 @@ pub const SUBJEKTIV_SCHEMA_VERSION: u32 = 1;
 pub const SUBJEKTIV_FEATURE_ID: &str = "subjektiv";
 pub const SUBJECT_WORKER_SINGLETON_PREFIX: &str = "subjektiv:";
 pub const MAX_STAGING_ANCHORS: usize = 10;
+/// Maximum UTF-8 size of the user-managed Subject behavior document.
+pub const MAX_SUBJECT_BEHAVIOR_BYTES: usize = server_api::SUBJEKTIV_MAX_BEHAVIOR_BYTES;
 /// Deterministic surface-generation policy. Input estimates use the repository's
 /// provider-independent UTF-8 byte estimate (`ceil(bytes / 4)`). The material
 /// payload is capped below the whole-input budget to reserve room for the fixed
@@ -71,6 +73,14 @@ pub enum SubjektivError {
     #[error("memory `{memory_id}` revision conflict: expected {expected}, current {actual}")]
     RevisionConflict {
         memory_id: String,
+        expected: u64,
+        actual: u64,
+    },
+    #[error(
+        "subject `{subject_id}` behavior revision conflict: expected {expected}, current {actual}"
+    )]
+    SubjectBehaviorConflict {
+        subject_id: String,
         expected: u64,
         actual: u64,
     },
@@ -136,6 +146,14 @@ pub struct SubjectRecord {
     pub schema_version: u32,
     pub id: String,
     pub role: SubjectRole,
+    /// User-managed, host-injected behavior document. This is not Memory and
+    /// Memory lifecycle operations must preserve it byte-for-byte.
+    #[serde(default)]
+    pub behavior_md: String,
+    /// Monotonic CAS generation for behavior updates, independent of Memory's
+    /// `store_revision`.
+    #[serde(default)]
+    pub behavior_revision: u64,
     pub state: SubjectState,
     /// Monotonic generation incremented exactly once for every committed Memory
     /// creation or revision for this subject.
@@ -498,6 +516,12 @@ pub enum SurfaceAvailability {
 pub struct ResidentSurface {
     pub availability: SurfaceAvailability,
     pub snapshot: Option<SurfaceSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubjectResidentContext {
+    pub subject: SubjectRecord,
+    pub surface: ResidentSurface,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -986,6 +1010,22 @@ END;
     Ok(())
 }
 
+fn add_subject_behavior(transaction: &Transaction<'_>) -> crate::feature_storage::Result<()> {
+    transaction.execute_batch(
+        r#"
+ALTER TABLE subjects ADD COLUMN behavior_md TEXT NOT NULL DEFAULT '';
+ALTER TABLE subjects ADD COLUMN behavior_revision INTEGER NOT NULL DEFAULT 0
+    CHECK (behavior_revision >= 0);
+"#,
+    )?;
+    Ok(())
+}
+
+fn add_surface_job_provenance(transaction: &Transaction<'_>) -> crate::feature_storage::Result<()> {
+    transaction.execute_batch("ALTER TABLE surface_generation_runs ADD COLUMN job_id TEXT; ALTER TABLE surface_generation_runs ADD COLUMN attempt_id TEXT;")?;
+    Ok(())
+}
+
 static MIGRATIONS: &[FeatureMigration] = &[
     FeatureMigration::new(1, "create subjektiv subject memory store", create_schema),
     FeatureMigration::new(
@@ -1002,6 +1042,12 @@ static MIGRATIONS: &[FeatureMigration] = &[
         4,
         "add bounded surface generation state and runs",
         add_surface_generation_state,
+    ),
+    FeatureMigration::new(5, "add user-managed subject behavior", add_subject_behavior),
+    FeatureMigration::new(
+        6,
+        "bind surface generation provenance to Job attempts",
+        add_surface_job_provenance,
     ),
 ];
 
@@ -1070,11 +1116,23 @@ impl SubjektivStore {
     /// Issues a random host-owned subject id. It is never derived from Worker,
     /// Profile, Session, or Memory content.
     pub fn create_subject(&self, role: SubjectRole) -> Result<SubjectRecord> {
+        self.create_subject_with_behavior(role, String::new())
+    }
+
+    /// Creates a Subject with its optional user-managed behavior document.
+    pub fn create_subject_with_behavior(
+        &self,
+        role: SubjectRole,
+        behavior_md: String,
+    ) -> Result<SubjectRecord> {
+        validate_subject_behavior(&behavior_md)?;
         let timestamp = now();
         let record = SubjectRecord {
             schema_version: SUBJEKTIV_SCHEMA_VERSION,
             id: issued_id("subject"),
             role,
+            behavior_md,
+            behavior_revision: 0,
             state: SubjectState::Active,
             store_revision: 0,
             created_at: timestamp.clone(),
@@ -1084,11 +1142,13 @@ impl SubjektivStore {
         self.database.try_transaction(|transaction| {
             transaction.execute(
                 "INSERT INTO subjects (
-                    subject_id, role, state, store_revision, record_json, created_at, updated_at
-                 ) VALUES (?1, ?2, 'active', 0, ?3, ?4, ?5)",
+                    subject_id, role, behavior_md, behavior_revision, state,
+                    store_revision, record_json, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 0, 'active', 0, ?4, ?5, ?6)",
                 params![
                     record.id,
                     record.role.as_str(),
+                    record.behavior_md,
                     raw,
                     record.created_at,
                     record.updated_at
@@ -1108,6 +1168,51 @@ impl SubjektivStore {
                 )
                 .optional()?;
             raw.map(|raw| parse_subject(&raw)).transpose()
+        })
+    }
+
+    /// Replaces or clears the user-managed behavior document using its own CAS
+    /// generation. Memory revisions do not participate in this generation.
+    pub fn update_subject_behavior(
+        &self,
+        subject_id: &str,
+        expected_behavior_revision: u64,
+        behavior_md: String,
+    ) -> Result<SubjectRecord> {
+        validate_subject_behavior(&behavior_md)?;
+        self.database.try_transaction(|transaction| {
+            let mut subject = require_subject(transaction, subject_id)?;
+            if subject.behavior_revision != expected_behavior_revision {
+                return Err(SubjektivError::SubjectBehaviorConflict {
+                    subject_id: subject_id.to_string(),
+                    expected: expected_behavior_revision,
+                    actual: subject.behavior_revision,
+                });
+            }
+            if subject.behavior_md == behavior_md {
+                return Ok(subject);
+            }
+            subject.behavior_md = behavior_md;
+            subject.behavior_revision =
+                subject.behavior_revision.checked_add(1).ok_or_else(|| {
+                    SubjektivError::InvalidRecord("subject behavior revision overflow".to_string())
+                })?;
+            subject.updated_at = now();
+            let raw = serde_json::to_string(&subject)?;
+            transaction.execute(
+                "UPDATE subjects
+                 SET behavior_md = ?2, behavior_revision = ?3,
+                     record_json = ?4, updated_at = ?5
+                 WHERE subject_id = ?1",
+                params![
+                    subject.id,
+                    subject.behavior_md,
+                    to_i64(subject.behavior_revision)?,
+                    raw,
+                    subject.updated_at
+                ],
+            )?;
+            Ok(subject)
         })
     }
 
@@ -1863,6 +1968,14 @@ impl SubjektivStore {
     /// active Memory revisions. Kind order is fixed and selection is round-robin
     /// across kinds; within each kind, updated_at desc then memory id asc.
     pub fn prepare_surface_generation(&self, subject_id: &str) -> Result<SurfaceGeneration> {
+        self.prepare_job_surface_generation(subject_id, None)
+    }
+
+    pub(crate) fn prepare_job_surface_generation(
+        &self,
+        subject_id: &str,
+        job_attempt: Option<(&str, &str)>,
+    ) -> Result<SurfaceGeneration> {
         self.database.try_transaction(|transaction| {
             let subject = require_active_subject(transaction, subject_id)?;
             let (active_memory_count, materials) =
@@ -1878,18 +1991,68 @@ impl SubjektivStore {
             transaction.execute(
                 "INSERT INTO surface_generation_runs (
                     subject_id, generation_id, store_revision, active_memory_count,
-                    materials_json, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    materials_json, created_at, job_id, attempt_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     subject_id,
                     generation.id,
                     to_i64(generation.store_revision)?,
                     to_i64(generation.active_memory_count as u64)?,
                     serde_json::to_string(&generation.materials)?,
-                    generation.created_at
+                    generation.created_at,
+                    job_attempt.map(|(job_id, _)| job_id),
+                    job_attempt.map(|(_, attempt_id)| attempt_id),
                 ],
             )?;
             Ok(generation)
+        })
+    }
+
+    /// Validate a Job's structured surface claim against the existing generation
+    /// and publication/failure records. This does not create another receipt or
+    /// roll back Memory. The generation must have begun inside this attempt.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn validate_job_surface_outcome(
+        &self,
+        subject_id: &str,
+        generation_id: &str,
+        store_revision: u64,
+        availability: &str,
+        snapshot_id: Option<&str>,
+        reason_code: Option<&str>,
+        job_id: &str,
+        attempt_id: &str,
+    ) -> Result<()> {
+        self.database.try_with_connection(|connection| {
+            let subject = require_subject_in_connection(connection, subject_id)?;
+            let generation_revision = require_job_generation(connection, subject_id, generation_id, job_id, attempt_id)?;
+            if generation_revision != store_revision || subject.store_revision != store_revision {
+                return Err(SubjektivError::InvalidRecord("surface generation is stale".into()));
+            }
+            let state = connection.query_row(
+                "SELECT store_revision, status, snapshot_id, reason_code FROM surface_generation_state WHERE subject_id = ?1",
+                [subject_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?)),
+            ).optional()?.ok_or_else(|| SubjektivError::InvalidRecord("surface generation has no terminal outcome".into()))?;
+            if state.0 != to_i64(store_revision)? || state.1 != availability
+                || !matches!(availability, "ready" | "failed")
+                || state.2.as_deref() != snapshot_id || state.3.as_deref() != reason_code {
+                return Err(SubjektivError::InvalidRecord("surface claim differs from the persisted outcome".into()));
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn require_job_surface_generation(
+        &self,
+        subject_id: &str,
+        generation_id: &str,
+        job_id: &str,
+        attempt_id: &str,
+    ) -> Result<()> {
+        self.database.try_with_connection(|connection| {
+            require_job_generation(connection, subject_id, generation_id, job_id, attempt_id)?;
+            Ok(())
         })
     }
 
@@ -2021,60 +2184,17 @@ impl SubjektivStore {
     pub fn resident_surface(&self, subject_id: &str) -> Result<ResidentSurface> {
         self.database.try_with_connection(|connection| {
             let subject = require_subject_in_connection(connection, subject_id)?;
-            let state = connection
-                .query_row(
-                    "SELECT store_revision, status, snapshot_id
-                     FROM surface_generation_state WHERE subject_id = ?1",
-                    [subject_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, Option<String>>(2)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            let Some((revision, status, snapshot_id)) = state else {
-                return Ok(ResidentSurface {
-                    availability: SurfaceAvailability::Ungenerated,
-                    snapshot: None,
-                });
-            };
-            let revision = u64::try_from(revision).map_err(|_| {
-                SubjektivError::InvalidRecord("surface state revision is negative".into())
-            })?;
-            if revision != subject.store_revision || status == "dirty" {
-                return Ok(ResidentSurface {
-                    availability: SurfaceAvailability::Stale,
-                    snapshot: None,
-                });
-            }
-            if status == "failed" {
-                return Ok(ResidentSurface {
-                    availability: SurfaceAvailability::Failed,
-                    snapshot: None,
-                });
-            }
-            let snapshot_id = snapshot_id.ok_or_else(|| {
-                SubjektivError::InvalidRecord("ready surface state has no snapshot id".into())
-            })?;
-            let raw = connection.query_row(
-                "SELECT snapshot_json FROM surface_snapshots
-                 WHERE subject_id = ?1 AND snapshot_id = ?2",
-                params![subject_id, snapshot_id],
-                |row| row.get::<_, String>(0),
-            )?;
-            let snapshot = parse_surface_snapshot(&raw)?;
-            if snapshot.built_from_store_revision != subject.store_revision {
-                return Err(SubjektivError::InvalidRecord(
-                    "ready surface snapshot generation does not match subject".into(),
-                ));
-            }
-            Ok(ResidentSurface {
-                availability: SurfaceAvailability::Ready,
-                snapshot: Some(snapshot),
-            })
+            resident_surface_in_connection(connection, &subject)
+        })
+    }
+
+    /// Atomically reads user-managed behavior and the independently-fresh
+    /// generated Memory surface from one SQLite connection snapshot.
+    pub fn resident_context(&self, subject_id: &str) -> Result<SubjectResidentContext> {
+        self.database.try_transaction(|transaction| {
+            let subject = require_subject(transaction, subject_id)?;
+            let surface = resident_surface_in_connection(transaction, &subject)?;
+            Ok(SubjectResidentContext { subject, surface })
         })
     }
 
@@ -3414,6 +3534,87 @@ fn validate_range(kind: &str, range: [u64; 2]) -> Result<()> {
     }
 }
 
+fn resident_surface_in_connection(
+    connection: &Connection,
+    subject: &SubjectRecord,
+) -> Result<ResidentSurface> {
+    let state = connection
+        .query_row(
+            "SELECT store_revision, status, snapshot_id
+             FROM surface_generation_state WHERE subject_id = ?1",
+            [&subject.id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((revision, status, snapshot_id)) = state else {
+        return Ok(ResidentSurface {
+            availability: SurfaceAvailability::Ungenerated,
+            snapshot: None,
+        });
+    };
+    let revision = u64::try_from(revision)
+        .map_err(|_| SubjektivError::InvalidRecord("surface state revision is negative".into()))?;
+    if revision != subject.store_revision || status == "dirty" {
+        return Ok(ResidentSurface {
+            availability: SurfaceAvailability::Stale,
+            snapshot: None,
+        });
+    }
+    if status == "failed" {
+        return Ok(ResidentSurface {
+            availability: SurfaceAvailability::Failed,
+            snapshot: None,
+        });
+    }
+    let snapshot_id = snapshot_id.ok_or_else(|| {
+        SubjektivError::InvalidRecord("ready surface state has no snapshot id".into())
+    })?;
+    let raw = connection.query_row(
+        "SELECT snapshot_json FROM surface_snapshots
+         WHERE subject_id = ?1 AND snapshot_id = ?2",
+        params![subject.id, snapshot_id],
+        |row| row.get::<_, String>(0),
+    )?;
+    let snapshot = parse_surface_snapshot(&raw)?;
+    if snapshot.built_from_store_revision != subject.store_revision {
+        return Err(SubjektivError::InvalidRecord(
+            "ready surface snapshot generation does not match subject".into(),
+        ));
+    }
+    Ok(ResidentSurface {
+        availability: SurfaceAvailability::Ready,
+        snapshot: Some(snapshot),
+    })
+}
+
+pub fn validate_subject_behavior(value: &str) -> Result<()> {
+    if value.len() > MAX_SUBJECT_BEHAVIOR_BYTES {
+        return Err(SubjektivError::InvalidRecord(format!(
+            "subject behavior must be at most {MAX_SUBJECT_BEHAVIOR_BYTES} bytes"
+        )));
+    }
+    if !value.is_empty() && value.trim().is_empty() {
+        return Err(SubjektivError::InvalidRecord(
+            "subject behavior must be empty or contain non-whitespace text".to_string(),
+        ));
+    }
+    if value
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err(SubjektivError::InvalidRecord(
+            "subject behavior contains an unsupported control character".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_label(kind: &str, value: &str) -> Result<()> {
     validate_nonempty(kind, value)?;
     if value.len() > 256 || value.chars().any(char::is_control) {
@@ -3470,6 +3671,26 @@ fn reject_duplicate_memory_ids(kind: &str, values: &[MemoryRevisionRef]) -> Resu
         )));
     }
     Ok(())
+}
+
+fn require_job_generation(
+    connection: &Connection,
+    subject_id: &str,
+    generation_id: &str,
+    job_id: &str,
+    attempt_id: &str,
+) -> Result<u64> {
+    let revision: Option<i64> = connection.query_row(
+        "SELECT store_revision FROM surface_generation_runs WHERE subject_id = ?1 AND generation_id = ?2 AND job_id = ?3 AND attempt_id = ?4",
+        params![subject_id, generation_id, job_id, attempt_id], |row| row.get(0),
+    ).optional()?;
+    revision
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(|| {
+            SubjektivError::InvalidRecord(
+                "surface generation is not owned by this Job attempt".into(),
+            )
+        })
 }
 
 fn to_i64(value: u64) -> Result<i64> {
@@ -3666,6 +3887,67 @@ mod tests {
         let complete = store.list_subjects(3).unwrap();
         assert_eq!(complete.items, expected);
         assert!(!complete.has_more);
+    }
+
+    #[test]
+    fn subject_behavior_is_bounded_revisioned_and_independent_from_memory_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_manager, _workspace, store) = open_store(temp.path(), "workspace-a");
+        let subject = store
+            .create_subject_with_behavior(role(), "Prefer explicit evidence.".to_string())
+            .unwrap();
+        assert_eq!(subject.behavior_revision, 0);
+        assert_eq!(subject.store_revision, 0);
+
+        let updated = store
+            .update_subject_behavior(
+                &subject.id,
+                0,
+                "Prefer explicit evidence.\nAsk when uncertain.".to_string(),
+            )
+            .unwrap();
+        assert_eq!(updated.behavior_revision, 1);
+        assert_eq!(updated.store_revision, 0);
+
+        store
+            .create_memory(
+                &subject.id,
+                draft(
+                    "A confirmed observation",
+                    "exercise Memory lifecycle isolation",
+                ),
+            )
+            .unwrap();
+        let after_memory = store.subject(&subject.id).unwrap().unwrap();
+        assert_eq!(after_memory.behavior_md, updated.behavior_md);
+        assert_eq!(after_memory.behavior_revision, 1);
+        assert_eq!(after_memory.store_revision, 1);
+
+        let (_reopened_manager, _reopened_workspace, reopened) =
+            open_store(temp.path(), "workspace-a");
+        let persisted = reopened.subject(&subject.id).unwrap().unwrap();
+        assert_eq!(persisted.behavior_md, updated.behavior_md);
+        assert_eq!(persisted.behavior_revision, 1);
+        assert!(matches!(
+            store.update_subject_behavior(&subject.id, 0, String::new()),
+            Err(SubjektivError::SubjectBehaviorConflict {
+                expected: 0,
+                actual: 1,
+                ..
+            })
+        ));
+
+        let unchanged = store
+            .update_subject_behavior(&subject.id, 1, updated.behavior_md.clone())
+            .unwrap();
+        assert_eq!(unchanged.behavior_revision, 1);
+        let cleared = store
+            .update_subject_behavior(&subject.id, 1, String::new())
+            .unwrap();
+        assert_eq!(cleared.behavior_revision, 2);
+        assert!(cleared.behavior_md.is_empty());
+        assert!(validate_subject_behavior(&"x".repeat(MAX_SUBJECT_BEHAVIOR_BYTES + 1)).is_err());
+        assert!(validate_subject_behavior("   ").is_err());
     }
 
     #[test]
@@ -3892,10 +4174,38 @@ mod tests {
                 ))
                 .unwrap();
             let store = SubjektivStore::open(&workspace, &registration).unwrap();
-            store.create_subject(role()).unwrap().id
+            let timestamp = now();
+            let subject_id = issued_id("subject");
+            let mut raw = serde_json::json!({
+                "schema_version": SUBJEKTIV_SCHEMA_VERSION,
+                "id": subject_id,
+                "role": role(),
+                "state": SubjectState::Active,
+                "store_revision": 0,
+                "created_at": timestamp.clone(),
+                "updated_at": timestamp.clone(),
+            });
+            let raw = serde_json::to_string(&raw.take()).unwrap();
+            store
+                .database
+                .try_transaction(|transaction| -> Result<()> {
+                    transaction.execute(
+                        "INSERT INTO subjects (
+                            subject_id, role, state, store_revision,
+                            record_json, created_at, updated_at
+                         ) VALUES (?1, ?2, 'active', 0, ?3, ?4, ?5)",
+                        params![subject_id, role().as_str(), raw, timestamp, timestamp],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            subject_id
         };
 
         let (_manager, _workspace, store) = open_store(&root, "workspace-a");
+        let migrated_subject = store.subject(&subject_id).unwrap().unwrap();
+        assert!(migrated_subject.behavior_md.is_empty());
+        assert_eq!(migrated_subject.behavior_revision, 0);
         let lifecycle_attribution = attribution(
             &subject_id,
             "runtime-1",
@@ -3935,26 +4245,50 @@ mod tests {
                 ))
                 .unwrap();
             let store = SubjektivStore::open(&workspace, &registration).unwrap();
-            let subject = store.create_subject(role()).unwrap();
+            let subject_id = issued_id("subject");
+            let timestamp = now();
+            let subject_json = serde_json::to_string(&serde_json::json!({
+                "schema_version": SUBJEKTIV_SCHEMA_VERSION,
+                "id": subject_id,
+                "role": role(),
+                "state": SubjectState::Active,
+                "store_revision": 0,
+                "created_at": timestamp,
+                "updated_at": timestamp,
+            }))
+            .unwrap();
             let snapshot = SurfaceSnapshot {
                 schema_version: SUBJEKTIV_SCHEMA_VERSION,
                 id: "legacy-surface".into(),
-                subject_id: subject.id.clone(),
+                subject_id: subject_id.clone(),
                 body_md: "Legacy summary without generation-policy evidence.".into(),
                 memory_refs: Vec::new(),
-                built_from_store_revision: subject.store_revision,
+                built_from_store_revision: 0,
                 created_at: now(),
             };
             store
                 .database
                 .try_transaction(|transaction| -> Result<()> {
                     transaction.execute(
+                        "INSERT INTO subjects (
+                            subject_id, role, state, store_revision,
+                            record_json, created_at, updated_at
+                         ) VALUES (?1, ?2, 'active', 0, ?3, ?4, ?5)",
+                        params![
+                            subject_id,
+                            role().as_str(),
+                            subject_json,
+                            timestamp,
+                            timestamp
+                        ],
+                    )?;
+                    transaction.execute(
                         "INSERT INTO surface_snapshots (
                             subject_id, snapshot_id, built_from_store_revision,
                             snapshot_json, created_at
                          ) VALUES (?1, ?2, ?3, ?4, ?5)",
                         params![
-                            subject.id,
+                            subject_id,
                             snapshot.id,
                             to_i64(snapshot.built_from_store_revision)?,
                             serde_json::to_string(&snapshot)?,
@@ -3964,12 +4298,12 @@ mod tests {
                     transaction.execute(
                         "INSERT INTO surface_snapshot_seals (subject_id, snapshot_id)
                          VALUES (?1, ?2)",
-                        params![subject.id, snapshot.id],
+                        params![subject_id, snapshot.id],
                     )?;
                     Ok(())
                 })
                 .unwrap();
-            (subject.id, snapshot.id)
+            (subject_id, snapshot.id)
         };
 
         let (_manager, _workspace, store) = open_store(&root, "workspace-a");

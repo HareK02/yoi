@@ -994,6 +994,138 @@ impl WorkdirSession for ScopedWorkdirSession {
         self.capabilities
     }
 
+    async fn checkout_search(
+        &self,
+        mut request: crate::CheckoutSearchRequest,
+    ) -> Result<crate::CheckoutSearchResult, WorkdirError> {
+        let _scope_guard = self.scope_lock.lock().await;
+        request.validate()?;
+        let path = self
+            .resolve_operation_path(request.operation.path(), WorkdirToolScopePermission::Read)
+            .await?;
+        self.ensure_read(&path, request.operation.capability())?;
+        *request.operation.path_mut() = path;
+        request.output_root = self.resolve_path(&request.output_root)?;
+        for layer in &mut request.scope_layers {
+            for rule in layer {
+                rule.target = self.resolve_path(&rule.target)?;
+            }
+        }
+        if let Some(rules) = &self.scope {
+            request.scope_layers.push(rules.clone());
+        }
+        request.validate()?;
+        // Source results already use the composed output_root, not this source's
+        // cwd. Rewriting them here would duplicate cwd through nested wrappers.
+        let result = self.source.checkout_search(request).await?;
+        self.ensure_active()?;
+        Ok(result)
+    }
+
+    async fn checkout_observe(
+        &self,
+        caller_path: crate::WorkdirPath,
+    ) -> Result<crate::CheckoutObservation, WorkdirError> {
+        let _scope_guard = self.scope_lock.lock().await;
+        let path = self
+            .resolve_operation_path(&caller_path, WorkdirToolScopePermission::Read)
+            .await?;
+        self.ensure_read(&path, WorkdirSessionCapability::Read)?;
+        let mut observation = self.source.checkout_observe(path.clone()).await?;
+        observation.capabilities = observation.capabilities.intersection(self.capabilities());
+        // Capability bits must not advertise authority over a read-only path or
+        // a path whose write authority is currently leased to a child.
+        if self
+            .resolve_operation_path(&caller_path, WorkdirToolScopePermission::Write)
+            .await
+            .is_err()
+            || self
+                .ensure_write(&path, WorkdirSessionCapability::Write)
+                .is_err()
+        {
+            observation.capabilities = observation
+                .capabilities
+                .intersection(WorkdirSessionCapabilities::READ_ONLY);
+        }
+        observation.path = caller_path;
+        Ok(observation)
+    }
+    async fn checkout_execute(
+        &self,
+        mut request: crate::CheckoutRequest,
+    ) -> Result<crate::CheckoutResult, WorkdirError> {
+        let _scope_guard = self.scope_lock.lock().await;
+        let caller_path = request.target.clone();
+        let capability = request.operation.capability();
+        let permission = if capability == WorkdirSessionCapability::Read {
+            WorkdirToolScopePermission::Read
+        } else {
+            WorkdirToolScopePermission::Write
+        };
+        let path = self
+            .resolve_operation_path(&request.target, permission)
+            .await?;
+        if permission == WorkdirToolScopePermission::Read {
+            self.ensure_read(&path, capability)?;
+        } else {
+            self.ensure_write(&path, capability)?;
+        }
+        let result_path = caller_path;
+        if let crate::CheckoutOperation::Create {
+            path: destination, ..
+        } = &mut request.operation
+        {
+            let suffix = crate::checkout::create_relative_path(&request.target, destination)?;
+            let mut intermediate = std::path::PathBuf::from(request.target.as_str());
+            let mut components = suffix.components().peekable();
+            while let Some(component) = components.next() {
+                intermediate.push(component.as_os_str());
+                if components.peek().is_some() {
+                    let intermediate =
+                        crate::WorkdirPath::new(intermediate.to_str().ok_or_else(|| {
+                            WorkdirError::InvalidPath("non-UTF8 Create path".into())
+                        })?)?;
+                    let resolved = self
+                        .resolve_operation_path(&intermediate, WorkdirToolScopePermission::Write)
+                        .await?;
+                    self.ensure_write(&resolved, WorkdirSessionCapability::Write)?;
+                }
+            }
+            let resolved = self
+                .resolve_operation_path(destination, WorkdirToolScopePermission::Write)
+                .await?;
+            self.ensure_write(&resolved, WorkdirSessionCapability::Write)?;
+            *destination = resolved;
+        }
+        request.target = path;
+        let mut result = self.source.checkout_execute(request).await?;
+        result.observation.path = result_path.clone();
+        result.observation.capabilities = result
+            .observation
+            .capabilities
+            .intersection(self.capabilities());
+        if self
+            .resolve_operation_path(&result_path, WorkdirToolScopePermission::Write)
+            .await
+            .is_err()
+            || self
+                .ensure_write(
+                    &self.resolve_path(&result_path)?,
+                    WorkdirSessionCapability::Write,
+                )
+                .is_err()
+        {
+            result.observation.capabilities = result
+                .observation
+                .capabilities
+                .intersection(WorkdirSessionCapabilities::READ_ONLY);
+        }
+        if let crate::CheckoutOutput::Read(read) = &mut result.output {
+            read.path = result_path;
+        }
+        Ok(result)
+    }
+
     async fn stat(&self, mut request: StatRequest) -> Result<StatResult, WorkdirError> {
         let path = self
             .resolve_operation_path(&request.path, WorkdirToolScopePermission::Read)
@@ -1048,6 +1180,19 @@ impl WorkdirSession for ScopedWorkdirSession {
     }
 
     async fn list(&self, mut request: ListRequest) -> Result<ListResult, WorkdirError> {
+        if self.scope.is_some() || !self.cwd.is_root() {
+            return match self
+                .checkout_search(crate::CheckoutSearchRequest::new(
+                    crate::CheckoutSearchOperation::List(request),
+                ))
+                .await?
+            {
+                crate::CheckoutSearchResult::List(result) => Ok(result),
+                _ => Err(WorkdirError::Unavailable(
+                    "mismatched checkout search result".into(),
+                )),
+            };
+        }
         let path = self
             .resolve_operation_path(&request.path, WorkdirToolScopePermission::Read)
             .await?;
@@ -1057,6 +1202,19 @@ impl WorkdirSession for ScopedWorkdirSession {
     }
 
     async fn glob(&self, mut request: GlobRequest) -> Result<GlobResult, WorkdirError> {
+        if self.scope.is_some() || !self.cwd.is_root() {
+            return match self
+                .checkout_search(crate::CheckoutSearchRequest::new(
+                    crate::CheckoutSearchOperation::Glob(request),
+                ))
+                .await?
+            {
+                crate::CheckoutSearchResult::Glob(result) => Ok(result),
+                _ => Err(WorkdirError::Unavailable(
+                    "mismatched checkout search result".into(),
+                )),
+            };
+        }
         let path = self
             .resolve_operation_path(&request.path, WorkdirToolScopePermission::Read)
             .await?;
@@ -1066,6 +1224,19 @@ impl WorkdirSession for ScopedWorkdirSession {
     }
 
     async fn grep(&self, mut request: GrepRequest) -> Result<GrepResult, WorkdirError> {
+        if self.scope.is_some() || !self.cwd.is_root() {
+            return match self
+                .checkout_search(crate::CheckoutSearchRequest::new(
+                    crate::CheckoutSearchOperation::Grep(request),
+                ))
+                .await?
+            {
+                crate::CheckoutSearchResult::Grep(result) => Ok(result),
+                _ => Err(WorkdirError::Unavailable(
+                    "mismatched checkout search result".into(),
+                )),
+            };
+        }
         let path = self
             .resolve_operation_path(&request.path, WorkdirToolScopePermission::Read)
             .await?;
@@ -1284,6 +1455,44 @@ impl WorkdirSession for ReadOnlyWorkdirSession {
         self.inner.scope_rules_overlap(request).await
     }
 
+    async fn checkout_search(
+        &self,
+        request: crate::CheckoutSearchRequest,
+    ) -> Result<crate::CheckoutSearchResult, WorkdirError> {
+        if !self
+            .capabilities()
+            .intersection(self.inner.capabilities())
+            .supports(request.operation.capability())
+        {
+            return Err(WorkdirError::Unsupported(request.operation.capability()));
+        }
+        self.inner.checkout_search(request).await
+    }
+
+    async fn checkout_observe(
+        &self,
+        path: crate::WorkdirPath,
+    ) -> Result<crate::CheckoutObservation, WorkdirError> {
+        let mut observation = self.inner.checkout_observe(path).await?;
+        observation.capabilities = observation
+            .capabilities
+            .intersection(WorkdirSessionCapabilities::READ_ONLY);
+        Ok(observation)
+    }
+    async fn checkout_execute(
+        &self,
+        request: crate::CheckoutRequest,
+    ) -> Result<crate::CheckoutResult, WorkdirError> {
+        if request.operation.capability() != WorkdirSessionCapability::Read {
+            return Err(WorkdirError::Unsupported(request.operation.capability()));
+        }
+        let mut result = self.inner.checkout_execute(request).await?;
+        result.observation.capabilities = result
+            .observation
+            .capabilities
+            .intersection(WorkdirSessionCapabilities::READ_ONLY);
+        Ok(result)
+    }
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {
         self.inner.stat(request).await
     }
@@ -1652,6 +1861,53 @@ mod tests {
             block_next_write: std::sync::atomic::AtomicBool::new(true),
         });
         (WorkdirToolBroker::new(source), receiver, release)
+    }
+
+    #[tokio::test]
+    async fn checkout_search_unsupported_source_never_falls_back_to_broad_traversal() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir(root.path().join("child")).unwrap();
+        fs::write(root.path().join("child/a"), "needle").unwrap();
+        let (parent, _, _) = blocking_session(root.path());
+        // Unscoped normal Tools still use their established provider contract.
+        assert_eq!(
+            parent
+                .list(ListRequest {
+                    path: fs_path("child"),
+                    limit: 100
+                })
+                .await
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+        let child = parent
+            .scope(request("child", WorkdirToolScopePermission::Read))
+            .await
+            .unwrap();
+        assert!(matches!(
+            child
+                .tool_session()
+                .list(ListRequest {
+                    path: FsPath::root(),
+                    limit: 100
+                })
+                .await,
+            Err(WorkdirError::UnsupportedOperation(_))
+        ));
+        assert!(matches!(
+            child
+                .tool_session()
+                .checkout_search(crate::CheckoutSearchRequest::new(
+                    crate::CheckoutSearchOperation::List(ListRequest {
+                        path: FsPath::root(),
+                        limit: 100
+                    })
+                ))
+                .await,
+            Err(WorkdirError::UnsupportedOperation(_))
+        ));
     }
 
     fn request(path: &str, permission: WorkdirToolScopePermission) -> WorkdirToolScope {

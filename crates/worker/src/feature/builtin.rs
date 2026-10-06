@@ -5,6 +5,7 @@
 //! an external plugin-loading surface.
 
 pub mod backend_job_result;
+pub mod chat_invocation;
 pub mod flow_transition;
 pub mod manage_workdir;
 pub mod manage_worker;
@@ -23,6 +24,7 @@ pub(crate) mod subjektiv_session;
 pub mod task;
 pub mod ticket;
 pub mod worker_observation;
+pub mod workspace_config;
 pub mod workspace_worker_discovery;
 
 pub use task::{TaskFeature, task_tools_feature};

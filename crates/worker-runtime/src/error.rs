@@ -12,6 +12,9 @@ pub enum RuntimeError {
     #[error("initial worker input must be user input, got {kind}")]
     InvalidInitialInputKind { kind: String },
 
+    #[error("worker {worker_id} Restore observation conflicts with the current operation")]
+    RestoreObservationConflict { worker_id: WorkerId },
+
     #[error("worker {worker_id} was not found")]
     WorkerNotFound { worker_id: WorkerId },
 

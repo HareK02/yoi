@@ -42,6 +42,13 @@ use wip_protocol::{
 
 use crate::permission::permission_action_for;
 
+#[cfg(test)]
+#[path = "checkout_http_tests.rs"]
+mod checkout_http_tests;
+#[cfg(test)]
+#[path = "checkout_wip_tests.rs"]
+mod checkout_wip_tests;
+
 const WIP_ENDPOINT: &str = "https://worker.wip.invalid/v1/";
 const WIP_ROOT: &str = "/";
 const WIP_TOOLS_ROOT: &str = "/tools";
@@ -68,6 +75,14 @@ pub enum WipMountError {
     RouteCollision { route: String, existing: String },
     #[error("WIP interface `{interface}` has conflicting descriptors")]
     InterfaceCollision { interface: String },
+    #[error("WIP operation `{operation}` on `{route}` is already contributed by `{existing}`")]
+    OperationCollision {
+        route: String,
+        operation: String,
+        existing: String,
+    },
+    #[error("WIP operation contribution target `{route}` is not a mounted Object")]
+    OperationTargetNotFound { route: String },
     #[error("invalid WIP projection for `{route}`: {message}")]
     InvalidProjection { route: String, message: String },
 }
@@ -84,6 +99,8 @@ pub struct WipCallContext {
 pub struct WipOperationOutput {
     pub value: Value,
     tool_output: Option<ToolOutput>,
+    // Exact post-operation provider state; never substitute a later path stat.
+    validator: Option<Vec<u8>>,
 }
 
 impl WipOperationOutput {
@@ -91,6 +108,15 @@ impl WipOperationOutput {
         Self {
             value,
             tool_output: None,
+            validator: None,
+        }
+    }
+
+    pub fn native_with_validator(value: Value, validator: Vec<u8>) -> Self {
+        Self {
+            value,
+            tool_output: None,
+            validator: Some(validator),
         }
     }
 
@@ -98,6 +124,7 @@ impl WipOperationOutput {
         Self {
             value,
             tool_output: Some(output),
+            validator: None,
         }
     }
 }
@@ -113,6 +140,28 @@ pub enum WipOperationError {
 /// routing and validators are resolved before this trait is called.
 #[async_trait]
 pub trait WipOperationHandler: Send + Sync {
+    /// Whether the owning provider currently exposes this Object to its subject.
+    fn is_visible(&self) -> bool {
+        true
+    }
+
+    /// Override the Object's registered validator with current provider state.
+    /// None preserves the registered validator and requires no inventory fetch.
+    fn object_validator(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Current target capability and subject permission intersection. Providers
+    /// must still enforce authority at execution; this hook controls publication.
+    fn operation_available(&self, _operation: &str) -> bool {
+        true
+    }
+
+    /// Opt into path-qualified, freshly resolved interface descriptors.
+    fn contextual_interface(&self) -> bool {
+        false
+    }
+
     async fn call(
         &self,
         operation: &str,
@@ -122,6 +171,16 @@ pub trait WipOperationHandler: Send + Sync {
 
     async fn cancel(&self, _context: &ToolExecutionContext) -> Result<(), ToolError> {
         Ok(())
+    }
+
+    /// Cancel the selected operation on this exact handler instance. Providers
+    /// that share a cancellation boundary may keep implementing `cancel`.
+    async fn cancel_operation(
+        &self,
+        _operation: &str,
+        context: &ToolExecutionContext,
+    ) -> Result<(), ToolError> {
+        self.cancel(context).await
     }
 }
 
@@ -139,9 +198,21 @@ pub struct WipProjection {
     pub handler: Arc<dyn WipOperationHandler>,
 }
 
-/// One dynamically resolved direct-child object beneath a Feature-owned
-/// collection route. The Host retains route allocation and descriptor authority;
-/// the Feature only binds a validated child segment to an object and handler.
+/// An additional Feature's operations for an Object whose existence and route
+/// are already owned by the Host registry. Contributions may extend the mounted
+/// interface, but cannot replace Object resolution or another operation.
+#[derive(Clone)]
+pub struct WipOperationContribution {
+    pub route: String,
+    pub contributor: String,
+    pub interface: String,
+    pub descriptor: InterfaceDescriptor,
+    pub handler: Arc<dyn WipOperationHandler>,
+}
+
+/// One dynamically resolved direct-child object beneath a Host-owned collection
+/// route. Object resolution stays unique; operation contribution is independent
+/// for statically mounted Objects and can be extended without remounting them.
 pub struct WipDynamicItem {
     pub object: Object,
     pub handler: Arc<dyn WipOperationHandler>,
@@ -149,6 +220,12 @@ pub struct WipDynamicItem {
 
 pub trait WipDynamicItemResolver: Send + Sync {
     fn resolve(&self, item_reference: &str) -> Option<WipDynamicItem>;
+
+    /// Family-level opt-in, needed to deny unqualified descriptor fetches before
+    /// resolving any item. A contextual collection owner also opts in its family.
+    fn contextual_interface(&self) -> bool {
+        false
+    }
 }
 
 pub struct WipDynamicMount {
@@ -160,43 +237,138 @@ pub struct WipDynamicMount {
     pub resolver: Arc<dyn WipDynamicItemResolver>,
 }
 
+/// Explicit arbitrary-depth request-time subtree provider. Unlike item families,
+/// this resolves both files and directories and enumerates authorized children.
+#[async_trait]
+pub trait WipSubtreeProvider: Send + Sync {
+    /// Provider-specific observation bounds, capped by the Host global bounds.
+    fn max_depth(&self) -> u32 {
+        32
+    }
+    fn max_nodes(&self) -> usize {
+        1024
+    }
+    async fn projection(&self, path: &str) -> Result<Option<WipProjection>, ProtocolError>;
+    async fn children(&self, path: &str) -> Result<Vec<String>, ProtocolError>;
+}
+
+pub struct WipSubtreeMount {
+    pub root: String,
+    pub provider: Arc<dyn WipSubtreeProvider>,
+}
+
+pub trait WipDynamicOperationResolver: Send + Sync {
+    fn handler(&self, item_reference: &str) -> Arc<dyn WipOperationHandler>;
+}
+
+pub struct WipDynamicOperationContribution {
+    pub collection_route: String,
+    pub contributor: String,
+    pub interface: String,
+    pub descriptor: InterfaceDescriptor,
+    pub resolver: Arc<dyn WipDynamicOperationResolver>,
+}
+
+struct MountedDynamicOperationContribution {
+    contributor: String,
+    operations: Vec<String>,
+    resolver: Arc<dyn WipDynamicOperationResolver>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WipFeatureRoute {
+pub struct WipNamespaceRoute {
     root: String,
 }
 
-impl WipFeatureRoute {
+impl WipNamespaceRoute {
     pub fn root(&self) -> &str {
         &self.root
-    }
-
-    pub fn child(&self, segment: &str) -> Result<String, WipMountError> {
-        if segment.is_empty()
-            || segment == "."
-            || segment == ".."
-            || segment.contains('/')
-            || !segment
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        {
-            return Err(WipMountError::InvalidRoute {
-                route: format!("{}/{}", self.root, segment),
-                message: "Feature child must be one canonical path segment".into(),
-            });
-        }
-        Ok(format!("{}/{}", self.root, segment))
     }
 }
 
 struct MountedProjection {
     projection: WipProjection,
+    operation_handlers: BTreeMap<String, (String, Arc<dyn WipOperationHandler>)>,
+}
+
+impl MountedProjection {
+    fn resolved(&self) -> WipProjection {
+        let mut projection = self.projection.clone();
+        projection.handler = Arc::new(OperationDispatchHandler {
+            owner: Arc::clone(&self.projection.handler),
+            handlers: self
+                .operation_handlers
+                .iter()
+                .map(|(operation, (_, handler))| (operation.clone(), Arc::clone(handler)))
+                .collect(),
+        });
+        projection
+    }
+}
+
+struct OperationDispatchHandler {
+    owner: Arc<dyn WipOperationHandler>,
+    handlers: BTreeMap<String, Arc<dyn WipOperationHandler>>,
+}
+
+#[async_trait]
+impl WipOperationHandler for OperationDispatchHandler {
+    fn is_visible(&self) -> bool {
+        self.owner.is_visible()
+    }
+
+    fn object_validator(&self) -> Option<Vec<u8>> {
+        self.owner.object_validator()
+    }
+
+    fn operation_available(&self, operation: &str) -> bool {
+        self.handlers
+            .get(operation)
+            .is_some_and(|handler| handler.operation_available(operation))
+    }
+
+    fn contextual_interface(&self) -> bool {
+        self.owner.contextual_interface()
+            || self
+                .handlers
+                .values()
+                .any(|handler| handler.contextual_interface())
+    }
+
+    async fn call(
+        &self,
+        operation: &str,
+        arguments: &BTreeMap<String, Value>,
+        context: WipCallContext,
+    ) -> Result<WipOperationOutput, WipOperationError> {
+        let handler = self.handlers.get(operation).ok_or_else(|| {
+            WipOperationError::Protocol(protocol_error(
+                ProtocolErrorCode::OperationNotFound,
+                "operation is not published by the selected interface",
+            ))
+        })?;
+        handler.call(operation, arguments, context).await
+    }
+
+    async fn cancel_operation(
+        &self,
+        operation: &str,
+        context: &ToolExecutionContext,
+    ) -> Result<(), ToolError> {
+        let handler = self.handlers.get(operation).ok_or_else(|| {
+            ToolError::InvalidArgument("WIP cancellation operation is not published".into())
+        })?;
+        handler.cancel_operation(operation, context).await
+    }
 }
 
 #[derive(Default)]
 pub struct WipMountRegistry {
     mounts: BTreeMap<String, MountedProjection>,
     dynamic_mounts: Vec<WipDynamicMount>,
-    feature_routes: BTreeSet<String>,
+    subtree_mounts: Vec<WipSubtreeMount>,
+    dynamic_operation_contributions: BTreeMap<String, Vec<MountedDynamicOperationContribution>>,
+    namespaces: BTreeMap<String, String>,
     replaced_compatibility_capabilities: BTreeMap<String, String>,
 }
 
@@ -205,30 +377,57 @@ impl WipMountRegistry {
         Self::default()
     }
 
-    /// Allocate the Host namespace owned by one enabled Feature. Features join
-    /// checked relative segments to this route instead of selecting global paths.
-    pub fn allocate_feature_route(
+    /// Allocate one Host-owned root namespace to its unique Object provider.
+    /// The provider identity is registry metadata, never a public path segment.
+    pub fn allocate_namespace(
         &mut self,
-        feature: &str,
-    ) -> Result<WipFeatureRoute, WipMountError> {
-        if feature.is_empty()
-            || !feature
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        {
+        owner: &str,
+        namespace: &str,
+    ) -> Result<WipNamespaceRoute, WipMountError> {
+        let valid_segment = |value: &str| {
+            !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        };
+        if !valid_segment(owner) {
             return Err(WipMountError::InvalidRoute {
-                route: format!("/features/{feature}"),
-                message: "Feature name must use lowercase ASCII letters, digits, or '-'".into(),
+                route: format!("/{namespace}"),
+                message: "namespace owner must use lowercase ASCII letters, digits, or '-'".into(),
             });
         }
-        let root = format!("/features/{feature}");
-        if !self.feature_routes.insert(root.clone()) {
+        if !valid_segment(namespace) {
+            return Err(WipMountError::InvalidRoute {
+                route: format!("/{namespace}"),
+                message: "root namespace must be one lowercase ASCII path segment".into(),
+            });
+        }
+        if matches!(namespace, "features" | "tools") {
+            return Err(WipMountError::InvalidRoute {
+                route: format!("/{namespace}"),
+                message: "the Host reserves this root namespace".into(),
+            });
+        }
+        let root = format!("/{namespace}");
+        if let Some(existing) = self.namespaces.get(&root) {
             return Err(WipMountError::RouteCollision {
                 route: root,
-                existing: format!("feature:{feature}"),
+                existing: format!("namespace owner `{existing}`"),
             });
         }
-        Ok(WipFeatureRoute { root })
+        if self.mounts.contains_key(&root)
+            || self
+                .mounts
+                .keys()
+                .any(|route| route.starts_with(&format!("{root}/")))
+        {
+            return Err(WipMountError::RouteCollision {
+                route: root,
+                existing: "already mounted route".into(),
+            });
+        }
+        self.namespaces.insert(root.clone(), owner.to_string());
+        Ok(WipNamespaceRoute { root })
     }
 
     pub fn mount(
@@ -236,6 +435,49 @@ impl WipMountRegistry {
         projection: WipProjection,
     ) -> Result<WipMountDisposition, WipMountError> {
         validate_projection(&projection)?;
+        if projection.kind == WipProjectionKind::Compatibility
+            && self.replaces_compatibility(&projection.capability)
+        {
+            return Ok(WipMountDisposition::NativeAlreadySelected);
+        }
+        if projection.kind == WipProjectionKind::Compatibility && !is_tool_route(&projection.route)
+        {
+            return Err(WipMountError::InvalidProjection {
+                route: projection.route,
+                message: "compatibility Objects must use /tools/<tool-name>".into(),
+            });
+        }
+        if projection.kind == WipProjectionKind::Native && !is_tool_route(&projection.route) {
+            let namespace_root = projection
+                .route
+                .strip_prefix('/')
+                .and_then(|path| path.split('/').next())
+                .map(|segment| format!("/{segment}"))
+                .unwrap_or_default();
+            let Some(owner) = self.namespaces.get(&namespace_root) else {
+                return Err(WipMountError::InvalidProjection {
+                    route: projection.route,
+                    message: "native Object route requires an allocated Host namespace".into(),
+                });
+            };
+            if projection.capability.split(':').next() != Some(owner.as_str()) {
+                return Err(WipMountError::InvalidProjection {
+                    route: projection.route,
+                    message: format!(
+                        "native Object capability does not belong to namespace owner `{owner}`"
+                    ),
+                });
+            }
+        }
+        if self.subtree_mounts.iter().any(|mount| {
+            projection.route == mount.root
+                || projection.route.starts_with(&format!("{}/", mount.root))
+        }) {
+            return Err(WipMountError::RouteCollision {
+                route: projection.route,
+                existing: "request-time subtree".into(),
+            });
+        }
         if self.dynamic_mounts.iter().any(|dynamic| {
             projection
                 .route
@@ -256,8 +498,15 @@ impl WipMountRegistry {
             match (existing.projection.kind, projection.kind) {
                 (WipProjectionKind::Compatibility, WipProjectionKind::Native) => {
                     self.ensure_interface_available(&projection, Some(&existing.projection.route))?;
-                    self.mounts
-                        .insert(projection.route.clone(), MountedProjection { projection });
+                    let operation_handlers =
+                        operation_handlers(&projection, &projection.capability);
+                    self.mounts.insert(
+                        projection.route.clone(),
+                        MountedProjection {
+                            projection,
+                            operation_handlers,
+                        },
+                    );
                     return Ok(WipMountDisposition::ReplacedCompatibility);
                 }
                 (WipProjectionKind::Native, WipProjectionKind::Compatibility) => {
@@ -273,8 +522,97 @@ impl WipMountRegistry {
         }
         self.ensure_interface_available(&projection, None)?;
         let route = projection.route.clone();
-        self.mounts.insert(route, MountedProjection { projection });
+        let operation_handlers = operation_handlers(&projection, &projection.capability);
+        self.mounts.insert(
+            route,
+            MountedProjection {
+                projection,
+                operation_handlers,
+            },
+        );
         Ok(WipMountDisposition::Mounted)
+    }
+
+    /// Add operations from another Feature without changing Object ownership or
+    /// resolution. Interface shape and operation names are global protocol
+    /// contracts, so incompatible declarations fail at registration time.
+    pub fn contribute_operations(
+        &mut self,
+        contribution: WipOperationContribution,
+    ) -> Result<(), WipMountError> {
+        contribution
+            .descriptor
+            .validate()
+            .map_err(|error| WipMountError::InvalidProjection {
+                route: contribution.route.clone(),
+                message: error.to_string(),
+            })?;
+        let Some(mounted) = self.mounts.get(&contribution.route) else {
+            return Err(WipMountError::OperationTargetNotFound {
+                route: contribution.route,
+            });
+        };
+        if mounted.projection.interface != contribution.interface {
+            return Err(WipMountError::InterfaceCollision {
+                interface: contribution.interface,
+            });
+        }
+        if !same_interface_shape(&mounted.projection.descriptor, &contribution.descriptor) {
+            return Err(WipMountError::InterfaceCollision {
+                interface: contribution.interface,
+            });
+        }
+        for operation in &contribution.descriptor.operations {
+            if let Some((existing, _)) = mounted.operation_handlers.get(&operation.name) {
+                return Err(WipMountError::OperationCollision {
+                    route: contribution.route,
+                    operation: operation.name.clone(),
+                    existing: existing.clone(),
+                });
+            }
+        }
+
+        let mut merged = mounted.projection.descriptor.clone();
+        merged
+            .operations
+            .extend(contribution.descriptor.operations.iter().cloned());
+        merged
+            .operations
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        merged
+            .validate()
+            .map_err(|error| WipMountError::InvalidProjection {
+                route: contribution.route.clone(),
+                message: error.to_string(),
+            })?;
+        if self.interface_conflicts(
+            &contribution.interface,
+            &merged,
+            Some(&descriptor_validator(&merged)),
+            Some(&contribution.route),
+        ) {
+            return Err(WipMountError::InterfaceCollision {
+                interface: contribution.interface,
+            });
+        }
+
+        let mounted = self
+            .mounts
+            .get_mut(&contribution.route)
+            .expect("operation contribution target was checked");
+        for operation in contribution.descriptor.operations {
+            mounted.operation_handlers.insert(
+                operation.name,
+                (
+                    contribution.contributor.clone(),
+                    Arc::clone(&contribution.handler),
+                ),
+            );
+        }
+        mounted.projection.descriptor = merged;
+        mounted.projection.interface_validator =
+            Some(descriptor_validator(&mounted.projection.descriptor));
+        Ok(())
     }
 
     /// Mount a one-segment item family below an already mounted collection.
@@ -287,6 +625,16 @@ impl WipMountRegistry {
                 message: error.to_string(),
             }
         })?;
+        if self.subtree_mounts.iter().any(|m| {
+            m.root == mount.collection_route
+                || m.root.starts_with(&format!("{}/", mount.collection_route))
+                || mount.collection_route.starts_with(&format!("{}/", m.root))
+        }) {
+            return Err(WipMountError::RouteCollision {
+                route: mount.collection_route,
+                existing: "request-time subtree".into(),
+            });
+        }
         let Some(collection) = self.mounts.get(&mount.collection_route) else {
             return Err(WipMountError::InvalidProjection {
                 route: mount.collection_route,
@@ -297,6 +645,13 @@ impl WipMountRegistry {
             return Err(WipMountError::InvalidProjection {
                 route: mount.collection_route,
                 message: "dynamic item mount requires a native collection projection".into(),
+            });
+        }
+        if mount.capability.split(':').next() != collection.projection.capability.split(':').next()
+        {
+            return Err(WipMountError::InvalidProjection {
+                route: mount.collection_route,
+                message: "dynamic Object capability must belong to the collection owner".into(),
             });
         }
         mount
@@ -344,6 +699,164 @@ impl WipMountRegistry {
         Ok(())
     }
 
+    /// Delegate an entire descendant namespace to one request-time provider.
+    /// The root Object remains registry-owned; nested/static/item collisions fail.
+    pub fn mount_subtree(&mut self, mount: WipSubtreeMount) -> Result<(), WipMountError> {
+        let Some(root) = self.mounts.get(&mount.root) else {
+            return Err(WipMountError::OperationTargetNotFound { route: mount.root });
+        };
+        if root.projection.kind != WipProjectionKind::Native {
+            return Err(WipMountError::InvalidProjection {
+                route: mount.root,
+                message: "subtree requires a native root Object".into(),
+            });
+        }
+        let overlaps = |path: &str| {
+            path == mount.root
+                || path.starts_with(&format!("{}/", mount.root))
+                || mount.root.starts_with(&format!("{path}/"))
+        };
+        if self.subtree_mounts.iter().any(|m| overlaps(&m.root))
+            || self
+                .dynamic_mounts
+                .iter()
+                .any(|m| overlaps(&m.collection_route))
+            || self
+                .mounts
+                .keys()
+                .any(|p| p != &mount.root && p.starts_with(&format!("{}/", mount.root)))
+        {
+            return Err(WipMountError::RouteCollision {
+                route: mount.root,
+                existing: "subtree/static/item provider".into(),
+            });
+        }
+        self.subtree_mounts.push(mount);
+        Ok(())
+    }
+
+    /// Add operations to every item resolved by one existing dynamic Object
+    /// family. The family keeps exactly one Object resolver; each Feature only
+    /// supplies handlers for its own disjoint operation names.
+    pub fn contribute_dynamic_operations(
+        &mut self,
+        contribution: WipDynamicOperationContribution,
+    ) -> Result<(), WipMountError> {
+        contribution
+            .descriptor
+            .validate()
+            .map_err(|error| WipMountError::InvalidProjection {
+                route: contribution.collection_route.clone(),
+                message: error.to_string(),
+            })?;
+        let Some(index) = self
+            .dynamic_mounts
+            .iter()
+            .position(|mount| mount.collection_route == contribution.collection_route)
+        else {
+            return Err(WipMountError::OperationTargetNotFound {
+                route: contribution.collection_route,
+            });
+        };
+        let mounted = &self.dynamic_mounts[index];
+        if mounted.interface != contribution.interface
+            || !same_interface_shape(&mounted.descriptor, &contribution.descriptor)
+        {
+            return Err(WipMountError::InterfaceCollision {
+                interface: contribution.interface,
+            });
+        }
+        for operation in &contribution.descriptor.operations {
+            if mounted
+                .descriptor
+                .operations
+                .iter()
+                .any(|existing| existing.name == operation.name)
+            {
+                let existing = self
+                    .dynamic_operation_contributions
+                    .get(&contribution.collection_route)
+                    .and_then(|contributions| {
+                        contributions.iter().find(|existing| {
+                            existing
+                                .operations
+                                .iter()
+                                .any(|name| name == &operation.name)
+                        })
+                    })
+                    .map(|existing| existing.contributor.clone())
+                    .unwrap_or_else(|| mounted.capability.clone());
+                return Err(WipMountError::OperationCollision {
+                    route: contribution.collection_route,
+                    operation: operation.name.clone(),
+                    existing,
+                });
+            }
+        }
+        let mut merged = mounted.descriptor.clone();
+        merged
+            .operations
+            .extend(contribution.descriptor.operations.iter().cloned());
+        merged
+            .operations
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        merged
+            .validate()
+            .map_err(|error| WipMountError::InvalidProjection {
+                route: contribution.collection_route.clone(),
+                message: error.to_string(),
+            })?;
+        let validator = descriptor_validator(&merged);
+        let conflicts_static = self.registry_interface_conflicts_static(
+            &contribution.interface,
+            &merged,
+            Some(&validator),
+        );
+        let conflicts_dynamic = self.dynamic_mounts.iter().any(|other| {
+            other.collection_route != contribution.collection_route
+                && other.interface == contribution.interface
+                && (other.descriptor != merged
+                    || other.interface_validator.as_deref() != Some(validator.as_slice()))
+        });
+        if conflicts_static || conflicts_dynamic {
+            return Err(WipMountError::InterfaceCollision {
+                interface: contribution.interface,
+            });
+        }
+
+        let operations = contribution
+            .descriptor
+            .operations
+            .into_iter()
+            .map(|operation| operation.name)
+            .collect();
+        let mounted = &mut self.dynamic_mounts[index];
+        mounted.descriptor = merged;
+        mounted.interface_validator = Some(validator);
+        self.dynamic_operation_contributions
+            .entry(contribution.collection_route)
+            .or_default()
+            .push(MountedDynamicOperationContribution {
+                contributor: contribution.contributor,
+                operations,
+                resolver: contribution.resolver,
+            });
+        Ok(())
+    }
+
+    fn registry_interface_conflicts_static(
+        &self,
+        interface: &str,
+        descriptor: &InterfaceDescriptor,
+        validator: Option<&[u8]>,
+    ) -> bool {
+        self.mounts.values().any(|mounted| {
+            mounted.projection.interface == interface
+                && (mounted.projection.descriptor != *descriptor
+                    || mounted.projection.interface_validator.as_deref() != validator)
+        })
+    }
+
     /// Declare ordinary tool capabilities fully represented by native mounts.
     /// Claimed compatibility projections are removed from WIP mode while the
     /// normal Tool-mode registration remains unchanged.
@@ -380,6 +893,10 @@ impl WipMountRegistry {
             }
         }
         for capability in capabilities {
+            self.mounts.retain(|_, mounted| {
+                mounted.projection.kind != WipProjectionKind::Compatibility
+                    || mounted.projection.capability != capability
+            });
             self.replaced_compatibility_capabilities
                 .insert(capability, owner_route.to_string());
         }
@@ -431,6 +948,71 @@ impl WipMountRegistry {
     pub fn routes(&self) -> impl Iterator<Item = &str> {
         self.mounts.keys().map(String::as_str)
     }
+}
+
+fn operation_handlers(
+    projection: &WipProjection,
+    contributor: &str,
+) -> BTreeMap<String, (String, Arc<dyn WipOperationHandler>)> {
+    projection
+        .descriptor
+        .operations
+        .iter()
+        .map(|operation| {
+            (
+                operation.name.clone(),
+                (contributor.to_string(), Arc::clone(&projection.handler)),
+            )
+        })
+        .collect()
+}
+
+fn same_interface_shape(left: &InterfaceDescriptor, right: &InterfaceDescriptor) -> bool {
+    left.format == right.format
+        && left.documentation == right.documentation
+        && left.types == right.types
+}
+
+fn descriptor_validator(descriptor: &InterfaceDescriptor) -> Vec<u8> {
+    let mut digest = Sha256::new();
+    digest.update(format!("{descriptor:?}").as_bytes());
+    digest.finalize().to_vec()
+}
+
+pub(crate) fn contextual_reference(base: &str, path: &str) -> String {
+    let encoded: String = path
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{base}/@/{encoded}")
+}
+
+fn decode_contextual_path(encoded: &str) -> Option<String> {
+    if encoded.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let digit = |byte| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                _ => None,
+            };
+            Some(digit(pair[0])? * 16 + digit(pair[1])?)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let path = String::from_utf8(bytes).ok()?;
+    wip_protocol::validate_path(&path).ok()?;
+    Some(path)
+}
+
+fn is_tool_route(route: &str) -> bool {
+    route
+        .strip_prefix("/tools/")
+        .is_some_and(|name| !name.is_empty() && !name.contains('/'))
 }
 
 fn validate_projection(projection: &WipProjection) -> Result<(), WipMountError> {
@@ -486,36 +1068,284 @@ impl WipHost {
         }
     }
 
-    fn descriptor(&self, reference: &str) -> Option<(&InterfaceDescriptor, Option<&[u8]>)> {
+    fn subtree(&self, path: &str) -> Option<&WipSubtreeMount> {
         self.registry
-            .mounts
-            .values()
-            .find(|mounted| mounted.projection.interface == reference)
-            .map(|mounted| {
-                (
-                    &mounted.projection.descriptor,
-                    mounted.projection.interface_validator.as_deref(),
+            .subtree_mounts
+            .iter()
+            .find(|m| path == m.root || path.starts_with(&format!("{}/", m.root)))
+    }
+
+    async fn projection_live(&self, path: &str) -> Result<Option<WipProjection>, ProtocolError> {
+        wip_protocol::validate_path(path).map_err(|_| unpublished_path_error(path))?;
+        if let Some(mount) = self.subtree(path) {
+            let Some(projection) = mount.provider.projection(path).await? else {
+                return Ok(None);
+            };
+            validate_projection(&projection).map_err(|_| {
+                protocol_error(
+                    ProtocolErrorCode::Internal,
+                    "subtree returned an invalid Object",
                 )
-            })
-            .or_else(|| {
-                self.registry
-                    .dynamic_mounts
-                    .iter()
-                    .find(|mounted| mounted.interface == reference)
-                    .map(|mounted| (&mounted.descriptor, mounted.interface_validator.as_deref()))
-            })
+            })?;
+            let owner = &self.registry.mounts[&mount.root].projection.capability;
+            if projection.route != path
+                || projection.kind != WipProjectionKind::Native
+                || projection.capability.split(':').next() != owner.split(':').next()
+            {
+                return Err(protocol_error(
+                    ProtocolErrorCode::Internal,
+                    "subtree changed route or ownership",
+                ));
+            }
+            return Ok(Some(projection));
+        }
+        Ok(self.projection(path))
+    }
+
+    async fn descriptor_live(
+        &self,
+        reference: &str,
+    ) -> Result<Option<(InterfaceDescriptor, Option<Vec<u8>>)>, ProtocolError> {
+        if let Some((_, encoded)) = reference.rsplit_once("/@/")
+            && let Some(path) = decode_contextual_path(encoded)
+            && self.subtree(&path).is_some()
+        {
+            return Ok(self
+                .projection_live(&path)
+                .await?
+                .filter(|p| p.interface == reference)
+                .map(|p| (p.descriptor, p.interface_validator)));
+        }
+        // Never expose the static registration placeholder descriptor of a subtree.
+        if self
+            .registry
+            .subtree_mounts
+            .iter()
+            .any(|m| self.registry.mounts[&m.root].projection.interface == reference)
+        {
+            return Ok(None);
+        }
+        Ok(self.descriptor(reference))
+    }
+
+    async fn fetch_interface_live(
+        &self,
+        reference: &str,
+    ) -> Result<FetchInterfaceResponse, ProtocolError> {
+        let (descriptor, validator) = self.descriptor_live(reference).await?.ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::InterfaceNotFound,
+                "interface is not published",
+            )
+        })?;
+        Ok(FetchInterfaceResponse {
+            interface: reference.into(),
+            descriptor,
+            validator,
+        })
+    }
+
+    async fn observe_live(
+        &self,
+        path: &str,
+        depth: u32,
+    ) -> Result<ObjectObservation, ProtocolError> {
+        if depth > 32 {
+            return Err(protocol_error(
+                ProtocolErrorCode::ResourceLimitExceeded,
+                "observation depth exceeds 32",
+            ));
+        }
+        let mut remaining = 1024usize;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.observe_live_node(path, depth, &mut remaining),
+        )
+        .await
+        .map_err(|_| {
+            protocol_error(
+                ProtocolErrorCode::ResourceLimitExceeded,
+                "observation deadline exceeded",
+            )
+        })?
+    }
+
+    fn observe_live_node<'a>(
+        &'a self,
+        path: &'a str,
+        depth: u32,
+        remaining: &'a mut usize,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ObjectObservation, ProtocolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            if let Some(mount) = self.subtree(path) {
+                if depth > mount.provider.max_depth() {
+                    return Err(protocol_error(
+                        ProtocolErrorCode::ResourceLimitExceeded,
+                        "observation exceeds provider depth limit",
+                    ));
+                }
+                *remaining = (*remaining).min(mount.provider.max_nodes());
+            }
+            if *remaining == 0 {
+                return Err(protocol_error(
+                    ProtocolErrorCode::ResourceLimitExceeded,
+                    "observation exceeds 1024 nodes",
+                ));
+            }
+            *remaining -= 1;
+            let object = if self.subtree(path).is_some() {
+                self.projection_live(path).await?.map(|p| p.object)
+            } else {
+                self.object_at(path)
+            }
+            .ok_or_else(|| unpublished_path_error(path))?;
+            let children = if depth == 0 {
+                None
+            } else {
+                let paths = if let Some(mount) = self.subtree(path) {
+                    mount.provider.children(path).await?
+                } else {
+                    self.children(path)
+                };
+                let mut values = Vec::new();
+                let mut seen = BTreeSet::new();
+                for child in paths {
+                    let prefix = if path == "/" {
+                        "/".to_string()
+                    } else {
+                        format!("{path}/")
+                    };
+                    let suffix = child.strip_prefix(&prefix).ok_or_else(|| {
+                        protocol_error(ProtocolErrorCode::Internal, "subtree child outside parent")
+                    })?;
+                    if suffix.is_empty() || suffix.contains('/') || !seen.insert(child.clone()) {
+                        return Err(protocol_error(
+                            ProtocolErrorCode::Internal,
+                            "invalid/duplicate subtree child",
+                        ));
+                    }
+                    values.push(self.observe_live_node(&child, depth - 1, remaining).await?);
+                }
+                Some(values)
+            };
+            Ok(ObjectObservation { object, children })
+        })
+    }
+
+    fn descriptor(&self, reference: &str) -> Option<(InterfaceDescriptor, Option<Vec<u8>>)> {
+        for (path, mounted) in &self.registry.mounts {
+            if mounted.projection.interface == reference {
+                let Some(projection) = self.projection(path) else {
+                    continue;
+                };
+                if projection.interface == reference {
+                    return Some((projection.descriptor, projection.interface_validator));
+                }
+            }
+        }
+        if let Some(descriptor) = self.registry.dynamic_mounts.iter().find_map(|mounted| {
+            if mounted.interface != reference || self.dynamic_contextual(mounted) {
+                return None;
+            }
+            // Legacy families retain their shared descriptor. Contextual
+            // families must always resolve a qualified item reference below.
+            Some((
+                mounted.descriptor.clone(),
+                mounted.interface_validator.clone(),
+            ))
+        }) {
+            return Some(descriptor);
+        }
+        let (_, encoded_path) = reference.rsplit_once("/@/")?;
+        let path = decode_contextual_path(encoded_path)?;
+        let projection = self.projection(&path)?;
+        // Re-resolve the exact current Object, not a cached descriptor or an
+        // arbitrary base interface with an appended path. Exact legacy refs
+        // above remain opaque even if they contain our contextual delimiter.
+        if projection.interface != reference {
+            return None;
+        }
+        Some((projection.descriptor, projection.interface_validator))
+    }
+
+    fn dynamic_contextual(&self, mounted: &WipDynamicMount) -> bool {
+        mounted.resolver.contextual_interface()
+            || self.registry.mounts[&mounted.collection_route]
+                .resolved()
+                .handler
+                .contextual_interface()
+    }
+
+    fn project_current(
+        &self,
+        mut projection: WipProjection,
+        contextual_family: bool,
+    ) -> Option<WipProjection> {
+        if !projection.handler.is_visible() {
+            return None;
+        }
+        if let Some(validator) = projection.handler.object_validator() {
+            projection.object.validator = Some(validator);
+        }
+        let contextual = contextual_family || projection.handler.contextual_interface();
+        let original_len = projection.descriptor.operations.len();
+        projection
+            .descriptor
+            .operations
+            .retain(|operation| projection.handler.operation_available(&operation.name));
+        if contextual || projection.descriptor.operations.len() != original_len {
+            let mut digest = Sha256::new();
+            digest.update(descriptor_validator(&projection.descriptor));
+            // Keep an explicit provider version authoritative even when the
+            // filtered shape is unchanged.
+            if let Some(validator) = &projection.interface_validator {
+                digest.update(validator);
+            }
+            projection.interface_validator = Some(digest.finalize().to_vec());
+        }
+        if contextual {
+            projection.interface = contextual_reference(&projection.interface, &projection.route);
+            projection.object.interfaces = vec![projection.interface.clone()];
+        }
+        Some(projection)
     }
 
     fn projection(&self, path: &str) -> Option<WipProjection> {
         if let Some(mounted) = self.registry.mounts.get(path) {
-            return Some(mounted.projection.clone());
+            return self.project_current(mounted.resolved(), false);
         }
         self.registry.dynamic_mounts.iter().find_map(|mounted| {
             let item_reference = path.strip_prefix(&format!("{}/", mounted.collection_route))?;
             if item_reference.is_empty() || item_reference.contains('/') {
                 return None;
             }
+            // Collection listing authority is independent of item read authority.
+            // The resolved item's owner gates its own visibility below.
             let item = mounted.resolver.resolve(item_reference)?;
+            let contributions = self
+                .registry
+                .dynamic_operation_contributions
+                .get(&mounted.collection_route);
+            let contributed_names = contributions
+                .into_iter()
+                .flatten()
+                .flat_map(|contribution| contribution.operations.iter())
+                .collect::<BTreeSet<_>>();
+            let mut handlers = mounted
+                .descriptor
+                .operations
+                .iter()
+                .filter(|operation| !contributed_names.contains(&operation.name))
+                .map(|operation| (operation.name.clone(), Arc::clone(&item.handler)))
+                .collect::<BTreeMap<_, _>>();
+            for contribution in contributions.into_iter().flatten() {
+                let handler = contribution.resolver.handler(item_reference);
+                for operation in &contribution.operations {
+                    handlers.insert(operation.clone(), Arc::clone(&handler));
+                }
+            }
             let projection = WipProjection {
                 route: path.to_string(),
                 capability: mounted.capability.clone(),
@@ -524,14 +1354,32 @@ impl WipHost {
                 interface: mounted.interface.clone(),
                 descriptor: mounted.descriptor.clone(),
                 interface_validator: mounted.interface_validator.clone(),
-                handler: item.handler,
+                handler: Arc::new(OperationDispatchHandler {
+                    owner: item.handler,
+                    handlers,
+                }),
             };
             validate_projection(&projection).ok()?;
-            Some(projection)
+            self.project_current(projection, self.dynamic_contextual(mounted))
         })
     }
 
     fn object_at(&self, path: &str) -> Option<Object> {
+        // An explicit Object can also have static descendants. Do not replace
+        // its identity, interfaces, or validator with a synthetic namespace.
+        if let Some(projection) = self.projection(path) {
+            return Some(projection.object);
+        }
+        if self.registry.mounts.contains_key(path)
+            || self
+                .registry
+                .dynamic_mounts
+                .iter()
+                .any(|mount| path.starts_with(&format!("{}/", mount.collection_route)))
+        {
+            // A denied native Object must not reappear as a synthetic namespace.
+            return None;
+        }
         if path == WIP_ROOT || self.is_namespace(path) {
             let name = if path == WIP_ROOT {
                 String::new()
@@ -546,8 +1394,7 @@ impl WipHost {
                 validator: Some(self.generation.clone()),
             });
         }
-        self.projection(path)
-            .map(|projection| projection.object.clone())
+        None
     }
 
     fn is_namespace(&self, path: &str) -> bool {
@@ -559,7 +1406,7 @@ impl WipHost {
         self.registry
             .mounts
             .keys()
-            .any(|route| route.starts_with(&prefix))
+            .any(|route| route.starts_with(&prefix) && self.projection(route).is_some())
     }
 
     fn children(&self, path: &str) -> Vec<String> {
@@ -584,15 +1431,18 @@ impl WipHost {
             } else {
                 format!("{path}/{segment}")
             };
-            children.insert(child);
+            if self.object_at(&child).is_some() {
+                children.insert(child);
+            }
         }
         children.into_iter().collect()
     }
 
+    #[cfg(test)]
     fn observe(&self, path: &str, depth: u32) -> Result<ObjectObservation, ProtocolError> {
-        let object = self.object_at(path).ok_or_else(|| {
-            protocol_error(ProtocolErrorCode::NotFound, "target path is not published")
-        })?;
+        let object = self
+            .object_at(path)
+            .ok_or_else(|| unpublished_path_error(path))?;
         let children = if depth == 0 {
             None
         } else {
@@ -605,6 +1455,7 @@ impl WipHost {
         Ok(ObjectObservation { object, children })
     }
 
+    #[cfg(test)]
     fn fetch_interface(&self, reference: &str) -> Result<FetchInterfaceResponse, ProtocolError> {
         let (descriptor, validator) = self.descriptor(reference).ok_or_else(|| {
             protocol_error(
@@ -614,22 +1465,33 @@ impl WipHost {
         })?;
         Ok(FetchInterfaceResponse {
             interface: reference.to_string(),
-            descriptor: descriptor.clone(),
-            validator: validator.map(<[u8]>::to_vec),
+            descriptor,
+            validator,
         })
     }
 
+    #[cfg(test)]
     async fn call(
         &self,
         request: CallOperationRequest,
         context: WipCallContext,
     ) -> Result<WipOperationOutput, WipOperationError> {
-        let projection = self.projection(&request.target.path).ok_or_else(|| {
-            WipOperationError::Protocol(protocol_error(
-                ProtocolErrorCode::NotFound,
-                "target path is not published",
-            ))
-        })?;
+        let projection = self
+            .projection_live(&request.target.path)
+            .await
+            .map_err(WipOperationError::Protocol)?
+            .ok_or_else(|| {
+                WipOperationError::Protocol(unpublished_path_error(&request.target.path))
+            })?;
+        self.call_projection(projection, request, context).await
+    }
+
+    async fn call_projection(
+        &self,
+        projection: WipProjection,
+        request: CallOperationRequest,
+        context: WipCallContext,
+    ) -> Result<WipOperationOutput, WipOperationError> {
         let expected_object_validator = projection.object.validator.as_deref();
         match (
             expected_object_validator,
@@ -698,13 +1560,15 @@ impl WipHost {
             .call(&request.operation, &request.arguments, context)
             .await
     }
+}
 
-    async fn cancel(&self, path: &str, context: &ToolExecutionContext) -> Result<(), ToolError> {
-        let projection = self.projection(path).ok_or_else(|| {
-            ToolError::InvalidArgument("WIP cancellation target is no longer published".into())
-        })?;
-        projection.handler.cancel(context).await
-    }
+fn unpublished_path_error(path: &str) -> ProtocolError {
+    let message = if path == "/features" || path.starts_with("/features/") {
+        "legacy /features/... routes are no longer published; rediscover from `/` and use the root namespace"
+    } else {
+        "target path is not published"
+    };
+    protocol_error(ProtocolErrorCode::NotFound, message)
 }
 
 fn protocol_error(code: ProtocolErrorCode, message: impl Into<String>) -> ProtocolError {
@@ -953,6 +1817,12 @@ struct ClientState {
     session: SessionId,
 }
 
+#[derive(Clone)]
+struct ActiveOperation {
+    operation: String,
+    handler: Arc<dyn WipOperationHandler>,
+}
+
 pub struct WipRuntime {
     endpoint: Endpoint,
     wire_limits: Limits,
@@ -960,12 +1830,25 @@ pub struct WipRuntime {
     security_context: SecurityContext,
     state: Arc<Mutex<ClientState>>,
     host: Arc<WipHost>,
-    active: Arc<Mutex<HashMap<String, String>>>,
+    active: Arc<Mutex<HashMap<String, ActiveOperation>>>,
     audit: Arc<Mutex<VecDeque<WipAuditRecord>>>,
     metrics: Arc<WipMetrics>,
 }
 
 impl WipRuntime {
+    /// Build an isolated Client/Host endpoint from native application mounts.
+    /// Useful to embedders and in-process integration tests without an LLM Engine.
+    pub fn from_mounts(
+        registry: WipMountRegistry,
+        security_context: String,
+    ) -> Result<Self, String> {
+        Self::new(
+            WipHost::new(registry),
+            SecurityContext::new(security_context),
+            0,
+        )
+    }
+
     fn new(
         host: WipHost,
         security_context: SecurityContext,
@@ -1020,7 +1903,7 @@ impl WipRuntime {
         Ok(())
     }
 
-    async fn discover(
+    pub async fn discover(
         &self,
         path: String,
         depth: u32,
@@ -1045,10 +1928,11 @@ impl WipRuntime {
                 .fetch_add(1, Ordering::Relaxed);
             let response = self.dispatch_retrieval(&prepared.request).await?;
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            state
+            let completion = state
                 .client
                 .complete(prepared.id, response)
                 .map_err(client_tool_error)?;
+            check_retrieval_completion(completion)?;
         }
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let values = state
@@ -1072,7 +1956,7 @@ impl WipRuntime {
         ))
     }
 
-    async fn inspect(&self, interface: String, refresh: bool) -> Result<ToolOutput, ToolError> {
+    pub async fn inspect(&self, interface: String, refresh: bool) -> Result<ToolOutput, ToolError> {
         let prepared = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             let session = state.session.clone();
@@ -1092,10 +1976,11 @@ impl WipRuntime {
                 .fetch_add(1, Ordering::Relaxed);
             let response = self.dispatch_retrieval(&prepared.request).await?;
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            state
+            let completion = state
                 .client
                 .complete(prepared.id, response)
                 .map_err(client_tool_error)?;
+            check_retrieval_completion(completion)?;
         }
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let observed = state
@@ -1114,7 +1999,7 @@ impl WipRuntime {
         ))
     }
 
-    async fn call(
+    pub async fn call(
         &self,
         path: String,
         interface: String,
@@ -1122,7 +2007,12 @@ impl WipRuntime {
         arguments: Json,
         execution: ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
-        let arguments = match self.host.projection(&path) {
+        let arguments = match self
+            .host
+            .projection_live(&path)
+            .await
+            .map_err(|e| ToolError::InvalidArgument(e.message))?
+        {
             Some(projection) if projection.kind == WipProjectionKind::Compatibility => {
                 BTreeMap::from([(
                     "input".to_string(),
@@ -1139,9 +2029,8 @@ impl WipRuntime {
             )
             .map_err(ToolError::InvalidArgument)?,
             None => {
-                return Err(ToolError::InvalidArgument(format!(
-                    "WIP target `{path}` is not published"
-                )));
+                let error = unpublished_path_error(&path);
+                return Err(ToolError::InvalidArgument(error.message));
             }
         };
         let prepared = {
@@ -1163,10 +2052,6 @@ impl WipRuntime {
             .operation_round_trips
             .fetch_add(1, Ordering::Relaxed);
         let execution_id = execution.execution_id();
-        self.active
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(execution_id.clone(), path.clone());
         let mut guard = DispatchedCallGuard::new(
             Arc::clone(&self.state),
             Arc::clone(&self.active),
@@ -1208,14 +2093,19 @@ impl WipRuntime {
     }
 
     async fn cancel(&self, execution: &ToolExecutionContext) -> Result<(), ToolError> {
-        let path = self
+        let active = self
             .active
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(&execution.execution_id())
             .cloned();
-        match path {
-            Some(path) => self.host.cancel(&path, execution).await,
+        match active {
+            Some(active) => {
+                active
+                    .handler
+                    .cancel_operation(&active.operation, execution)
+                    .await
+            }
             None => Ok(()),
         }
     }
@@ -1253,7 +2143,11 @@ impl WipRuntime {
             Route::Observe => {
                 let request_value = decode_observe_request(request.body(), self.wire_limits)
                     .map_err(|error| ToolError::Internal(error.to_string()))?;
-                match self.host.observe(&request_value.path, request_value.depth) {
+                match self
+                    .host
+                    .observe_live(&request_value.path, request_value.depth)
+                    .await
+                {
                     Ok(value) => encode_observe_response(&request_value, &value, self.wire_limits),
                     Err(error) => encode_protocol_error_response(
                         ProtocolInteraction::Observe,
@@ -1267,7 +2161,11 @@ impl WipRuntime {
                 let request_value =
                     decode_fetch_interface_request(request.body(), self.wire_limits)
                         .map_err(|error| ToolError::Internal(error.to_string()))?;
-                match self.host.fetch_interface(&request_value.interface) {
+                match self
+                    .host
+                    .fetch_interface_live(&request_value.interface)
+                    .await
+                {
                     Ok(value) => {
                         encode_fetch_interface_response(&request_value, &value, self.wire_limits)
                     }
@@ -1301,7 +2199,9 @@ impl WipRuntime {
             .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
         let descriptor = self
             .host
-            .descriptor(&metadata.interface.reference)
+            .descriptor_live(&metadata.interface.reference)
+            .await
+            .map_err(|e| ToolError::InvalidArgument(e.message))?
             .map(|(descriptor, _)| descriptor.clone())
             .ok_or_else(|| ToolError::InvalidArgument("interface is not published".into()))?;
         let request_value = metadata
@@ -1311,21 +2211,71 @@ impl WipRuntime {
             execution,
             security_context: self.security_context.as_str().to_string(),
         };
-        match self.host.call(request_value.clone(), context).await {
+        let result = match self
+            .host
+            .projection_live(&request_value.target.path)
+            .await
+            .map_err(|e| ToolError::InvalidArgument(e.message))?
+        {
+            Some(projection) => {
+                // Pin the exact resolved instance used for dispatch. A dynamic
+                // resolver may return a fresh stateful handler on each lookup.
+                self.active
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(
+                        context.execution.execution_id(),
+                        ActiveOperation {
+                            operation: request_value.operation.clone(),
+                            handler: Arc::clone(&projection.handler),
+                        },
+                    );
+                self.host
+                    .call_projection(projection, request_value.clone(), context)
+                    .await
+            }
+            None => Err(WipOperationError::Protocol(unpublished_path_error(
+                &request_value.target.path,
+            ))),
+        };
+        match result {
             Ok(output) => {
                 let response = encode_call_operation_response(
                     &request_value,
                     &descriptor,
                     &CallOperationResponse {
                         result: output.value,
-                        validator: self
-                            .host
-                            .projection(&request_value.target.path)
-                            .and_then(|projection| projection.object.validator.clone()),
+                        validator: match output.validator {
+                            Some(validator) => Some(validator),
+                            None if self.host.subtree(&request_value.target.path).is_some() => None,
+                            None => self
+                                .host
+                                .projection(&request_value.target.path)
+                                .and_then(|projection| projection.object.validator.clone()),
+                        },
                     },
                     self.wire_limits,
-                )
-                .map_err(|error| ToolError::Internal(error.to_string()))?;
+                );
+                let response = match response {
+                    Ok(response) => response,
+                    Err(_) => {
+                        // Dispatch has completed: losing its result is not a pre-effect refusal.
+                        let message = "completed operation result could not be encoded; inspect effects before retry";
+                        let response = encode_protocol_error_response(
+                            ProtocolInteraction::CallOperation,
+                            &protocol_error(ProtocolErrorCode::OperationOutcomeUnknown, message),
+                            self.wire_limits,
+                        )
+                        .map_err(|error| ToolError::Internal(error.to_string()))?;
+                        return Ok((
+                            response,
+                            Some(Err(ToolError::ExecutionFailed(format!(
+                                "WIP operation outcome unknown; do not retry automatically: {message}"
+                            )))),
+                            WipAuditOutcome::OutcomeUnknown,
+                        ));
+                    }
+                };
                 Ok((
                     response,
                     output.tool_output.map(Ok),
@@ -1394,7 +2344,7 @@ impl WipRuntime {
 
 struct DispatchedCallGuard {
     state: Arc<Mutex<ClientState>>,
-    active: Arc<Mutex<HashMap<String, String>>>,
+    active: Arc<Mutex<HashMap<String, ActiveOperation>>>,
     request_id: RequestId,
     execution_id: String,
     armed: bool,
@@ -1403,7 +2353,7 @@ struct DispatchedCallGuard {
 impl DispatchedCallGuard {
     fn new(
         state: Arc<Mutex<ClientState>>,
-        active: Arc<Mutex<HashMap<String, String>>>,
+        active: Arc<Mutex<HashMap<String, ActiveOperation>>>,
         request_id: RequestId,
         execution_id: String,
     ) -> Self {
@@ -1833,6 +2783,19 @@ fn tool_output_value(output: &ToolOutput) -> Value {
     Value::Record(record)
 }
 
+fn check_retrieval_completion(completion: Completion) -> Result<(), ToolError> {
+    match completion {
+        Completion::Object(_) | Completion::Interface(_) => Ok(()),
+        Completion::ProtocolFailure(error) => Err(ToolError::ExecutionFailed(error.to_string())),
+        Completion::StaleResponseRejected(_) => Err(ToolError::ExecutionFailed(
+            "WIP retrieval superseded; refresh observations".into(),
+        )),
+        Completion::Call(_) => Err(ToolError::Internal(
+            "WIP retrieval returned a call result".into(),
+        )),
+    }
+}
+
 fn render_call_completion(completion: Completion) -> Result<ToolOutput, ToolError> {
     let Completion::Call(record) = completion else {
         return Err(ToolError::Internal(
@@ -1956,7 +2919,7 @@ mod tests {
     use agen::llm_client::{ClientError, Request as LlmRequest, ResponseStream};
     use futures::stream;
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use wip_protocol::{EnumCase, FieldDeclaration, TypeDeclaration, UnionCase};
 
     struct EchoTool {
@@ -2184,6 +3147,1827 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn completed_native_result_encoding_failure_is_unknown_and_not_retried() {
+        struct OversizedResult(Arc<AtomicUsize>);
+        #[async_trait]
+        impl WipOperationHandler for OversizedResult {
+            async fn call(
+                &self,
+                _: &str,
+                _: &BTreeMap<String, Value>,
+                _: WipCallContext,
+            ) -> Result<WipOperationOutput, WipOperationError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(WipOperationOutput::native(Value::String(
+                    "x".repeat(3 * 1024 * 1024),
+                )))
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut p = contribution_projection(Arc::new(OversizedResult(calls.clone())));
+        p.descriptor.operations[0].returns.r#type = TypeExpr::String;
+        p.interface_validator = Some(descriptor_validator(&p.descriptor));
+        let mut registry = WipMountRegistry::new();
+        registry.allocate_namespace("asset", "assets").unwrap();
+        registry.mount(p).unwrap();
+        let runtime = WipRuntime::new(
+            WipHost::new(registry),
+            SecurityContext::new("encoding-test"),
+            0,
+        )
+        .unwrap();
+        runtime
+            .discover("/assets/A-1".into(), 0, true)
+            .await
+            .unwrap();
+        runtime
+            .inspect("test.asset/item/v1".into(), true)
+            .await
+            .unwrap();
+        let error = runtime
+            .call(
+                "/assets/A-1".into(),
+                "test.asset/item/v1".into(),
+                "read".into(),
+                Json::Object(Default::default()),
+                Default::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("outcome unknown"), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    struct ContributionHandler {
+        calls: Arc<AtomicUsize>,
+        allowed: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl WipOperationHandler for ContributionHandler {
+        async fn call(
+            &self,
+            _operation: &str,
+            _arguments: &BTreeMap<String, Value>,
+            _context: WipCallContext,
+        ) -> Result<WipOperationOutput, WipOperationError> {
+            if !self.allowed.load(Ordering::SeqCst) {
+                return Err(WipOperationError::Protocol(protocol_error(
+                    ProtocolErrorCode::PermissionDenied,
+                    "current subject is not authorized",
+                )));
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(WipOperationOutput::native(Value::Unit))
+        }
+    }
+
+    fn contributed_operation(name: &str) -> OperationDeclaration {
+        OperationDeclaration {
+            name: name.into(),
+            documentation: documentation(name),
+            parameters: Vec::new(),
+            returns: ReturnDeclaration {
+                documentation: None,
+                r#type: TypeExpr::Unit,
+            },
+        }
+    }
+
+    fn contribution_projection(handler: Arc<dyn WipOperationHandler>) -> WipProjection {
+        let descriptor = InterfaceDescriptor {
+            format: INTERFACE_FORMAT_V1.into(),
+            documentation: documentation("shared object interface"),
+            types: Vec::new(),
+            operations: vec![contributed_operation("read")],
+        };
+        WipProjection {
+            route: "/assets/A-1".into(),
+            capability: "asset:object".into(),
+            kind: WipProjectionKind::Native,
+            object: Object {
+                name: "A-1".into(),
+                description: Some("host-resolved asset".into()),
+                interfaces: vec!["test.asset/item/v1".into()],
+                r#ref: Some("asset:A-1".into()),
+                validator: Some(vec![1]),
+            },
+            interface: "test.asset/item/v1".into(),
+            interface_validator: Some(descriptor_validator(&descriptor)),
+            descriptor,
+            handler,
+        }
+    }
+
+    #[tokio::test]
+    async fn host_namespace_object_resolution_and_operation_contributions_are_independent() {
+        let read_calls = Arc::new(AtomicUsize::new(0));
+        let manage_calls = Arc::new(AtomicUsize::new(0));
+        let read_allowed = Arc::new(AtomicBool::new(true));
+        let manage_allowed = Arc::new(AtomicBool::new(false));
+        let mut registry = WipMountRegistry::new();
+        assert!(matches!(
+            registry.allocate_namespace("host", "features"),
+            Err(WipMountError::InvalidRoute { .. })
+        ));
+        assert!(matches!(
+            registry.allocate_namespace("host", "tools"),
+            Err(WipMountError::InvalidRoute { .. })
+        ));
+        let namespace = registry.allocate_namespace("asset", "assets").unwrap();
+        assert_eq!(namespace.root(), "/assets");
+        assert!(matches!(
+            registry.allocate_namespace("other", "assets"),
+            Err(WipMountError::RouteCollision { .. })
+        ));
+        registry
+            .mount(contribution_projection(Arc::new(ContributionHandler {
+                calls: Arc::clone(&read_calls),
+                allowed: Arc::clone(&read_allowed),
+            })))
+            .unwrap();
+
+        let host_without_management = WipHost::new(registry);
+        let resolved = host_without_management.projection("/assets/A-1").unwrap();
+        assert_eq!(resolved.object.r#ref.as_deref(), Some("asset:A-1"));
+        assert_eq!(
+            resolved
+                .descriptor
+                .operations
+                .iter()
+                .map(|operation| operation.name.as_str())
+                .collect::<Vec<_>>(),
+            ["read"]
+        );
+
+        let mut registry = host_without_management.registry;
+        let contribution_descriptor = InterfaceDescriptor {
+            format: INTERFACE_FORMAT_V1.into(),
+            documentation: documentation("shared object interface"),
+            types: Vec::new(),
+            operations: vec![contributed_operation("manage")],
+        };
+        registry
+            .contribute_operations(WipOperationContribution {
+                route: "/assets/A-1".into(),
+                contributor: "asset-management".into(),
+                interface: "test.asset/item/v1".into(),
+                descriptor: contribution_descriptor.clone(),
+                handler: Arc::new(ContributionHandler {
+                    calls: Arc::clone(&manage_calls),
+                    allowed: Arc::clone(&manage_allowed),
+                }),
+            })
+            .unwrap();
+        assert!(matches!(
+            registry.contribute_operations(WipOperationContribution {
+                route: "/assets/A-1".into(),
+                contributor: "duplicate-management".into(),
+                interface: "test.asset/item/v1".into(),
+                descriptor: contribution_descriptor,
+                handler: Arc::new(ContributionHandler {
+                    calls: Arc::clone(&manage_calls),
+                    allowed: Arc::clone(&manage_allowed),
+                }),
+            }),
+            Err(WipMountError::OperationCollision { .. })
+        ));
+        let host = WipHost::new(registry);
+        let projection = host.projection("/assets/A-1").unwrap();
+        assert_eq!(
+            projection
+                .descriptor
+                .operations
+                .iter()
+                .map(|operation| operation.name.as_str())
+                .collect::<Vec<_>>(),
+            ["manage", "read"]
+        );
+
+        let request = |operation: &str| CallOperationRequest {
+            target: wip_protocol::Target {
+                path: "/assets/A-1".into(),
+                validator: projection.object.validator.clone(),
+            },
+            interface: wip_protocol::InterfaceTarget {
+                reference: projection.interface.clone(),
+                validator: projection.interface_validator.clone(),
+            },
+            operation: operation.into(),
+            arguments: BTreeMap::new(),
+        };
+        let context = || WipCallContext {
+            execution: ToolExecutionContext::direct(),
+            security_context: "worker-a".into(),
+        };
+        assert!(matches!(
+            host.call(request("manage"), context()).await,
+            Err(WipOperationError::Protocol(ProtocolError {
+                code: ProtocolErrorCode::PermissionDenied,
+                ..
+            }))
+        ));
+        manage_allowed.store(true, Ordering::SeqCst);
+        host.call(request("manage"), context())
+            .await
+            .unwrap_or_else(|_| panic!("authorized management contribution should run"));
+        manage_allowed.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            host.call(request("manage"), context()).await,
+            Err(WipOperationError::Protocol(ProtocolError {
+                code: ProtocolErrorCode::PermissionDenied,
+                ..
+            }))
+        ));
+        host.call(request("read"), context())
+            .await
+            .unwrap_or_else(|_| panic!("independent read contribution should run"));
+        assert_eq!(manage_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(read_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn operation_contributions_reject_interface_and_target_conflicts() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let allowed = Arc::new(AtomicBool::new(true));
+        let handler: Arc<dyn WipOperationHandler> =
+            Arc::new(ContributionHandler { calls, allowed });
+        let mut registry = WipMountRegistry::new();
+        let projection = contribution_projection(Arc::clone(&handler));
+        assert!(matches!(
+            registry.mount(projection.clone()),
+            Err(WipMountError::InvalidProjection { .. })
+        ));
+        registry.allocate_namespace("asset", "assets").unwrap();
+        registry.mount(projection).unwrap();
+        let mut inconsistent = InterfaceDescriptor {
+            format: INTERFACE_FORMAT_V1.into(),
+            documentation: documentation("different interface contract"),
+            types: Vec::new(),
+            operations: vec![contributed_operation("manage")],
+        };
+        assert!(matches!(
+            registry.contribute_operations(WipOperationContribution {
+                route: "/assets/A-1".into(),
+                contributor: "management".into(),
+                interface: "test.asset/item/v1".into(),
+                descriptor: inconsistent.clone(),
+                handler: Arc::clone(&handler),
+            }),
+            Err(WipMountError::InterfaceCollision { .. })
+        ));
+        inconsistent.documentation = documentation("shared object interface");
+        assert!(matches!(
+            registry.contribute_operations(WipOperationContribution {
+                route: "/assets/A-2".into(),
+                contributor: "management".into(),
+                interface: "test.asset/item/v1".into(),
+                descriptor: inconsistent,
+                handler,
+            }),
+            Err(WipMountError::OperationTargetNotFound { .. })
+        ));
+    }
+
+    fn asset_registry(
+        read: Arc<AtomicBool>,
+        manage: Option<Arc<AtomicBool>>,
+        calls: Arc<AtomicUsize>,
+    ) -> WipMountRegistry {
+        let mut registry = WipMountRegistry::new();
+        registry.allocate_namespace("asset", "assets").unwrap();
+        let projection = contribution_projection(Arc::new(ContributionHandler {
+            calls: Arc::clone(&calls),
+            allowed: read,
+        }));
+        let mut descriptor = projection.descriptor.clone();
+        descriptor.operations = vec![contributed_operation("manage")];
+        registry.mount(projection).unwrap();
+        if let Some(allowed) = manage {
+            registry
+                .contribute_operations(WipOperationContribution {
+                    route: "/assets/A-1".into(),
+                    contributor: "asset-management".into(),
+                    interface: "test.asset/item/v1".into(),
+                    descriptor,
+                    handler: Arc::new(ContributionHandler { calls, allowed }),
+                })
+                .unwrap();
+        }
+        registry
+    }
+
+    fn asset_request(projection: &WipProjection, operation: &str) -> CallOperationRequest {
+        CallOperationRequest {
+            target: wip_protocol::Target {
+                path: projection.route.clone(),
+                validator: projection.object.validator.clone(),
+            },
+            interface: wip_protocol::InterfaceTarget {
+                reference: projection.interface.clone(),
+                validator: projection.interface_validator.clone(),
+            },
+            operation: operation.into(),
+            arguments: BTreeMap::new(),
+        }
+    }
+
+    fn direct_wip_context() -> WipCallContext {
+        WipCallContext {
+            execution: ToolExecutionContext::direct(),
+            security_context: "worker-a".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn management_enablement_is_independent_of_read_and_operation_permissions() {
+        for enabled in [false, true] {
+            for can_read in [false, true] {
+                for can_manage in [false, true] {
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let host = WipHost::new(asset_registry(
+                        Arc::new(AtomicBool::new(can_read)),
+                        enabled.then(|| Arc::new(AtomicBool::new(can_manage))),
+                        Arc::clone(&calls),
+                    ));
+                    // Metadata resolution is not authorization to read domain data.
+                    let projection = host.projection("/assets/A-1").unwrap();
+                    let read = host
+                        .call(asset_request(&projection, "read"), direct_wip_context())
+                        .await;
+                    if can_read {
+                        assert!(read.is_ok());
+                    } else {
+                        assert!(matches!(
+                            read,
+                            Err(WipOperationError::Protocol(ProtocolError {
+                                code: ProtocolErrorCode::PermissionDenied,
+                                ..
+                            }))
+                        ));
+                    }
+                    let manage = host
+                        .call(asset_request(&projection, "manage"), direct_wip_context())
+                        .await;
+                    if !enabled {
+                        assert!(matches!(
+                            manage,
+                            Err(WipOperationError::Protocol(ProtocolError {
+                                code: ProtocolErrorCode::OperationNotFound,
+                                ..
+                            }))
+                        ));
+                    } else if !can_manage {
+                        assert!(matches!(
+                            manage,
+                            Err(WipOperationError::Protocol(ProtocolError {
+                                code: ProtocolErrorCode::PermissionDenied,
+                                ..
+                            }))
+                        ));
+                    } else {
+                        assert!(manage.is_ok());
+                    }
+                    assert_eq!(
+                        calls.load(Ordering::SeqCst),
+                        usize::from(can_read) + usize::from(enabled && can_manage)
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn contributed_interface_invalidates_observations_and_restore_requires_discovery() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let allowed = Arc::new(AtomicBool::new(true));
+        let old_host = WipHost::new(asset_registry(
+            Arc::clone(&allowed),
+            None,
+            Arc::clone(&calls),
+        ));
+        let old_projection = old_host.projection("/assets/A-1").unwrap();
+        let old_runtime = WipRuntime::new(old_host, SecurityContext::new("worker-a"), 0).unwrap();
+        old_runtime
+            .discover("/assets/A-1".into(), 0, false)
+            .await
+            .unwrap();
+        old_runtime
+            .inspect(old_projection.interface.clone(), false)
+            .await
+            .unwrap();
+        let restored_host = WipHost::new(asset_registry(
+            Arc::clone(&allowed),
+            Some(Arc::clone(&allowed)),
+            Arc::clone(&calls),
+        ));
+        let current = restored_host.projection("/assets/A-1").unwrap();
+        assert_eq!(old_projection.object, current.object);
+        assert_ne!(
+            old_projection.interface_validator,
+            current.interface_validator
+        );
+        assert!(matches!(
+            restored_host
+                .call(asset_request(&old_projection, "read"), direct_wip_context())
+                .await,
+            Err(WipOperationError::Protocol(ProtocolError {
+                code: ProtocolErrorCode::InterfaceValidatorMismatch,
+                ..
+            }))
+        ));
+        let restored = WipRuntime::new(restored_host, SecurityContext::new("worker-a"), 0).unwrap();
+        // Same Worker security identity, fresh runtime: no inherited observations.
+        assert!(
+            restored
+                .call(
+                    "/assets/A-1".into(),
+                    current.interface.clone(),
+                    "read".into(),
+                    json!({}),
+                    ToolExecutionContext::direct()
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        restored
+            .discover("/assets/A-1".into(), 0, false)
+            .await
+            .unwrap();
+        restored
+            .inspect(current.interface.clone(), false)
+            .await
+            .unwrap();
+        restored
+            .call(
+                "/assets/A-1".into(),
+                current.interface.clone(),
+                "manage".into(),
+                json!({}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        allowed.store(false, Ordering::SeqCst);
+        assert!(
+            restored
+                .call(
+                    "/assets/A-1".into(),
+                    current.interface.clone(),
+                    "manage".into(),
+                    json!({}),
+                    ToolExecutionContext::direct()
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("PermissionDenied")
+        );
+        restored.reset_observations().unwrap();
+        assert!(
+            restored
+                .call(
+                    "/assets/A-1".into(),
+                    current.interface,
+                    "manage".into(),
+                    json!({}),
+                    ToolExecutionContext::direct()
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn mounted_collection_keeps_identity_and_interface_with_static_children() {
+        let mut registry = asset_registry(
+            Arc::new(AtomicBool::new(true)),
+            None,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let mut collection = contribution_projection(Arc::new(ContributionHandler {
+            calls: Arc::new(AtomicUsize::new(0)),
+            allowed: Arc::new(AtomicBool::new(true)),
+        }));
+        collection.route = "/assets".into();
+        collection.object.name = "assets".into();
+        collection.object.r#ref = Some("asset:collection".into());
+        let expected = collection.object.clone();
+        registry.mount(collection).unwrap();
+        let observation = WipHost::new(registry).observe("/assets", 1).unwrap();
+        assert_eq!(observation.object, expected);
+        assert_eq!(observation.children.unwrap()[0].object.name, "A-1");
+    }
+
+    #[test]
+    fn compatibility_mounts_cannot_claim_host_or_legacy_namespaces() {
+        for route in [
+            "/features/ticket/tickets",
+            "/assets/A-1",
+            "/tools/Echo/child",
+        ] {
+            let mut projection = compatibility_projection(
+                meta("Echo"),
+                Arc::new(EchoTool {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                }),
+                None,
+            )
+            .unwrap();
+            projection.route = route.into();
+            projection.object.name = route.rsplit('/').next().unwrap().into();
+            let mut registry = WipMountRegistry::new();
+            registry.allocate_namespace("asset", "assets").unwrap();
+            assert!(matches!(
+                registry.mount(projection),
+                Err(WipMountError::InvalidProjection { .. })
+            ));
+            assert!(registry.routes().next().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_feature_routes_fail_with_rediscovery_guidance() {
+        let host = WipHost::new(WipMountRegistry::new());
+        let error = host.observe("/features/ticket/tickets/T-1", 0).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::NotFound);
+        assert!(error.message.contains("rediscover from `/`"));
+        assert!(error.message.contains("no longer published"));
+
+        let runtime = WipRuntime::new(host, SecurityContext::new("worker-a"), 0).unwrap();
+        let error = runtime
+            .call(
+                "/features/ticket/tickets/T-1".into(),
+                "yoi.ticket/item/v1".into(),
+                "read".into(),
+                json!({}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("rediscover from `/`"));
+    }
+
+    #[derive(Clone)]
+    struct ContextualHandler {
+        visible: Arc<AtomicBool>,
+        permitted: Arc<AtomicBool>,
+        capable: Arc<AtomicBool>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ContextualHandler {
+        fn new(permitted: bool, capable: bool) -> Self {
+            Self {
+                visible: Arc::new(AtomicBool::new(true)),
+                permitted: Arc::new(AtomicBool::new(permitted)),
+                capable: Arc::new(AtomicBool::new(capable)),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl WipOperationHandler for ContextualHandler {
+        fn is_visible(&self) -> bool {
+            self.visible.load(Ordering::SeqCst)
+        }
+
+        fn operation_available(&self, _operation: &str) -> bool {
+            self.permitted.load(Ordering::SeqCst) && self.capable.load(Ordering::SeqCst)
+        }
+
+        fn contextual_interface(&self) -> bool {
+            true
+        }
+
+        async fn call(
+            &self,
+            operation: &str,
+            _arguments: &BTreeMap<String, Value>,
+            _context: WipCallContext,
+        ) -> Result<WipOperationOutput, WipOperationError> {
+            if !self.is_visible() || !self.operation_available(operation) {
+                return Err(WipOperationError::Protocol(protocol_error(
+                    ProtocolErrorCode::PermissionDenied,
+                    "current native authority denied",
+                )));
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(WipOperationOutput::native(Value::Unit))
+        }
+    }
+
+    fn operation_names(descriptor: &InterfaceDescriptor) -> Vec<&str> {
+        descriptor
+            .operations
+            .iter()
+            .map(|operation| operation.name.as_str())
+            .collect()
+    }
+
+    fn contextual_static_registry(
+        owner: Arc<ContextualHandler>,
+        contributor: Arc<ContextualHandler>,
+    ) -> WipMountRegistry {
+        let mut registry = WipMountRegistry::new();
+        registry.allocate_namespace("asset", "assets").unwrap();
+        let projection = contribution_projection(owner);
+        let mut descriptor = projection.descriptor.clone();
+        descriptor.operations = vec![contributed_operation("manage")];
+        registry.mount(projection).unwrap();
+        registry
+            .contribute_operations(WipOperationContribution {
+                route: "/assets/A-1".into(),
+                contributor: "management".into(),
+                interface: "test.asset/item/v1".into(),
+                descriptor,
+                handler: contributor,
+            })
+            .unwrap();
+        registry
+    }
+
+    #[tokio::test]
+    async fn contextual_static_filters_contributors_and_rechecks_old_references() {
+        let owner = Arc::new(ContextualHandler::new(true, true));
+        let contributor = Arc::new(ContextualHandler::new(false, true));
+        let mut registry = contextual_static_registry(Arc::clone(&owner), Arc::clone(&contributor));
+        // Same base contract, different Object/capability. It must not share the
+        // first Object's cached contextual descriptor.
+        let mut other = registry.mounts["/assets/A-1"].projection.clone();
+        other.route = "/assets/A-2".into();
+        other.object.name = "A-2".into();
+        other.handler = Arc::new(ContextualHandler::new(true, false));
+        registry.mount(other).unwrap();
+        let host = WipHost::new(registry);
+        let initial = host.projection("/assets/A-1").unwrap();
+        let other = host.projection("/assets/A-2").unwrap();
+        assert_eq!(
+            initial.interface,
+            contextual_reference("test.asset/item/v1", "/assets/A-1")
+        );
+        assert_ne!(initial.interface, other.interface);
+        assert_eq!(operation_names(&initial.descriptor), ["read"]);
+        assert!(other.descriptor.operations.is_empty());
+        assert!(host.fetch_interface("test.asset/item/v1").is_err());
+        assert_eq!(
+            host.fetch_interface(&initial.interface).unwrap().descriptor,
+            initial.descriptor
+        );
+        host.call(asset_request(&initial, "read"), direct_wip_context())
+            .await
+            .unwrap_or_else(|_| panic!("available owner operation must run"));
+        assert!(matches!(
+            host.call(asset_request(&initial, "manage"), direct_wip_context())
+                .await,
+            Err(WipOperationError::Protocol(ProtocolError {
+                code: ProtocolErrorCode::OperationNotFound,
+                ..
+            }))
+        ));
+
+        contributor.permitted.store(true, Ordering::SeqCst);
+        let enabled = host.projection("/assets/A-1").unwrap();
+        assert_eq!(enabled.interface, initial.interface);
+        assert_eq!(
+            operation_names(&host.fetch_interface(&initial.interface).unwrap().descriptor),
+            ["manage", "read"]
+        );
+        assert_ne!(enabled.interface_validator, initial.interface_validator);
+        assert!(matches!(
+            host.call(asset_request(&initial, "read"), direct_wip_context())
+                .await,
+            Err(WipOperationError::Protocol(ProtocolError {
+                code: ProtocolErrorCode::InterfaceValidatorMismatch,
+                ..
+            }))
+        ));
+        host.call(asset_request(&enabled, "manage"), direct_wip_context())
+            .await
+            .unwrap_or_else(|_| panic!("available contributor operation must run"));
+        contributor.capable.store(false, Ordering::SeqCst);
+        assert_eq!(
+            operation_names(&host.fetch_interface(&initial.interface).unwrap().descriptor),
+            ["read"]
+        );
+        assert!(matches!(
+            host.call(asset_request(&enabled, "manage"), direct_wip_context())
+                .await,
+            Err(WipOperationError::Protocol(ProtocolError {
+                code: ProtocolErrorCode::InterfaceValidatorMismatch,
+                ..
+            }))
+        ));
+        let current = host.projection("/assets/A-1").unwrap();
+        assert!(matches!(
+            host.call(asset_request(&current, "manage"), direct_wip_context())
+                .await,
+            Err(WipOperationError::Protocol(ProtocolError {
+                code: ProtocolErrorCode::OperationNotFound,
+                ..
+            }))
+        ));
+        let mut unqualified = asset_request(&current, "read");
+        unqualified.interface.reference = "test.asset/item/v1".into();
+        assert!(matches!(
+            host.call(unqualified, direct_wip_context()).await,
+            Err(WipOperationError::Protocol(ProtocolError {
+                code: ProtocolErrorCode::InterfaceMismatch,
+                ..
+            }))
+        ));
+        owner.visible.store(false, Ordering::SeqCst);
+        contributor.permitted.store(true, Ordering::SeqCst);
+        contributor.capable.store(true, Ordering::SeqCst);
+        assert!(host.projection("/assets/A-1").is_none());
+        assert!(host.fetch_interface(&initial.interface).is_err());
+        assert!(host.observe("/assets/A-1", 0).is_err());
+        let observed = host.observe("/assets", 1).unwrap();
+        assert_eq!(
+            observed
+                .children
+                .unwrap()
+                .iter()
+                .map(|item| item.object.name.as_str())
+                .collect::<Vec<_>>(),
+            ["A-2"]
+        );
+        assert!(matches!(
+            host.call(asset_request(&enabled, "manage"), direct_wip_context())
+                .await,
+            Err(WipOperationError::Protocol(ProtocolError {
+                code: ProtocolErrorCode::NotFound,
+                ..
+            }))
+        ));
+        assert_eq!(owner.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(contributor.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn contextual_visibility_cannot_fall_back_to_namespace_and_provider_versions_stay_current() {
+        let owner = Arc::new(ContextualHandler::new(true, true));
+        let mut registry = contextual_static_registry(
+            Arc::clone(&owner),
+            Arc::new(ContextualHandler::new(true, true)),
+        );
+        let mut child = contribution_projection(Arc::new(DynamicHandler {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        child.route = "/assets/A-1/child".into();
+        child.object.name = "child".into();
+        // Legacy interface references stay opaque, including this delimiter.
+        child.interface = "legacy/@/opaque".into();
+        child.object.interfaces = vec![child.interface.clone()];
+        registry.mount(child.clone()).unwrap();
+        let mut host = WipHost::new(registry);
+        assert_eq!(
+            host.fetch_interface(&child.interface).unwrap().descriptor,
+            child.descriptor
+        );
+        let initial = host.projection("/assets/A-1").unwrap();
+        host.registry
+            .mounts
+            .get_mut("/assets/A-1")
+            .unwrap()
+            .projection
+            .interface_validator = Some(vec![99]);
+        let current = host.fetch_interface(&initial.interface).unwrap();
+        assert_eq!(current.descriptor, initial.descriptor);
+        assert_ne!(current.validator, initial.interface_validator);
+        owner.visible.store(false, Ordering::SeqCst);
+        assert!(host.object_at("/assets/A-1").is_none());
+        assert!(host.observe("/assets/A-1", 1).is_err());
+        assert!(
+            host.observe("/assets", 1)
+                .unwrap()
+                .children
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    struct ContextualItemResolver {
+        owner: Arc<ContextualHandler>,
+        revision: Arc<AtomicUsize>,
+        contextual_family: bool,
+    }
+
+    impl WipDynamicItemResolver for ContextualItemResolver {
+        fn contextual_interface(&self) -> bool {
+            self.contextual_family
+        }
+
+        fn resolve(&self, item_reference: &str) -> Option<WipDynamicItem> {
+            if !matches!(item_reference, "O-1" | "O-2") {
+                return None;
+            }
+            let mut handler = self.owner.as_ref().clone();
+            if item_reference == "O-2" {
+                handler.capable = Arc::new(AtomicBool::new(false));
+            }
+            Some(WipDynamicItem {
+                object: Object {
+                    name: item_reference.into(),
+                    description: None,
+                    interfaces: vec!["test.dynamic/v1".into()],
+                    r#ref: Some(format!("objective:{item_reference}")),
+                    validator: Some(vec![self.revision.load(Ordering::SeqCst) as u8]),
+                },
+                handler: Arc::new(handler),
+            })
+        }
+    }
+
+    struct ContextualContributionResolver(Arc<ContextualHandler>);
+
+    impl WipDynamicOperationResolver for ContextualContributionResolver {
+        fn handler(&self, _item_reference: &str) -> Arc<dyn WipOperationHandler> {
+            self.0.clone()
+        }
+    }
+
+    fn contextual_dynamic_registry(
+        owner: Arc<ContextualHandler>,
+        contributor: Arc<ContextualHandler>,
+        revision: Arc<AtomicUsize>,
+        contextual_collection: bool,
+    ) -> WipMountRegistry {
+        let mut registry = dynamic_registry(Arc::clone(&revision), Arc::clone(&owner.calls));
+        let mut mounted = registry.dynamic_mounts.pop().unwrap();
+        mounted.descriptor.operations = vec![contributed_operation("read")];
+        mounted.interface_validator = Some(descriptor_validator(&mounted.descriptor));
+        mounted.resolver = Arc::new(ContextualItemResolver {
+            owner,
+            revision,
+            contextual_family: !contextual_collection,
+        });
+        if contextual_collection {
+            let collection = registry.mounts.get_mut("/objectives").unwrap();
+            collection.projection.handler = Arc::new(ContextualHandler::new(true, true));
+            collection.operation_handlers =
+                operation_handlers(&collection.projection, "objective:collection");
+        }
+        let mut descriptor = mounted.descriptor.clone();
+        descriptor.operations = vec![contributed_operation("manage")];
+        registry.mount_dynamic(mounted).unwrap();
+        registry
+            .contribute_dynamic_operations(WipDynamicOperationContribution {
+                collection_route: "/objectives".into(),
+                contributor: "management".into(),
+                interface: "test.dynamic/v1".into(),
+                descriptor,
+                resolver: Arc::new(ContextualContributionResolver(contributor)),
+            })
+            .unwrap();
+        registry
+    }
+
+    #[tokio::test]
+    async fn contextual_dynamic_filters_by_path_and_rechecks_permission_and_object_revision() {
+        // Both ways to opt in a family must block unqualified descriptor fetches.
+        for contextual_collection in [false, true] {
+            let owner = Arc::new(ContextualHandler::new(true, true));
+            let contributor = Arc::new(ContextualHandler::new(true, true));
+            let revision = Arc::new(AtomicUsize::new(1));
+            let host = WipHost::new(contextual_dynamic_registry(
+                Arc::clone(&owner),
+                Arc::clone(&contributor),
+                Arc::clone(&revision),
+                contextual_collection,
+            ));
+            let initial = host.projection("/objectives/O-1").unwrap();
+            let other = host.projection("/objectives/O-2").unwrap();
+            assert_ne!(initial.interface, other.interface);
+            assert_eq!(
+                operation_names(&host.fetch_interface(&initial.interface).unwrap().descriptor),
+                ["manage", "read"]
+            );
+            assert_eq!(
+                operation_names(&host.fetch_interface(&other.interface).unwrap().descriptor),
+                ["manage"]
+            );
+            assert!(host.fetch_interface("test.dynamic/v1").is_err());
+            assert!(
+                host.fetch_interface(&contextual_reference("wrong.base/v1", "/objectives/O-1"))
+                    .is_err()
+            );
+            assert!(
+                host.fetch_interface(&contextual_reference(
+                    "test.dynamic/v1",
+                    "/objectives/missing"
+                ))
+                .is_err()
+            );
+            assert!(host.fetch_interface("test.dynamic/v1/@/ff").is_err());
+            assert!(host.fetch_interface("test.dynamic/v1/@/2f0").is_err());
+            let mut wrong_path = asset_request(&initial, "read");
+            wrong_path.target.path = other.route.clone();
+            assert!(matches!(
+                host.call(wrong_path, direct_wip_context()).await,
+                Err(WipOperationError::Protocol(ProtocolError {
+                    code: ProtocolErrorCode::InterfaceMismatch,
+                    ..
+                }))
+            ));
+            contributor.permitted.store(false, Ordering::SeqCst);
+            assert_eq!(
+                operation_names(&host.fetch_interface(&initial.interface).unwrap().descriptor),
+                ["read"]
+            );
+            assert!(matches!(
+                host.call(asset_request(&initial, "manage"), direct_wip_context())
+                    .await,
+                Err(WipOperationError::Protocol(ProtocolError {
+                    code: ProtocolErrorCode::InterfaceValidatorMismatch,
+                    ..
+                }))
+            ));
+            let current = host.projection("/objectives/O-1").unwrap();
+            assert!(matches!(
+                host.call(asset_request(&current, "manage"), direct_wip_context())
+                    .await,
+                Err(WipOperationError::Protocol(ProtocolError {
+                    code: ProtocolErrorCode::OperationNotFound,
+                    ..
+                }))
+            ));
+            revision.store(2, Ordering::SeqCst);
+            assert!(matches!(
+                host.call(asset_request(&current, "read"), direct_wip_context())
+                    .await,
+                Err(WipOperationError::Protocol(ProtocolError {
+                    code: ProtocolErrorCode::ValidatorMismatch,
+                    ..
+                }))
+            ));
+            let current = host.projection("/objectives/O-1").unwrap();
+            host.call(asset_request(&current, "read"), direct_wip_context())
+                .await
+                .unwrap_or_else(|_| panic!("fresh available dynamic operation must run"));
+            owner.visible.store(false, Ordering::SeqCst);
+            assert!(host.observe("/objectives/O-1", 0).is_err());
+            assert!(host.fetch_interface(&initial.interface).is_err());
+            assert!(host.fetch_interface(&other.interface).is_err());
+            assert!(matches!(
+                host.call(asset_request(&current, "read"), direct_wip_context())
+                    .await,
+                Err(WipOperationError::Protocol(ProtocolError {
+                    code: ProtocolErrorCode::NotFound,
+                    ..
+                }))
+            ));
+            assert_eq!(owner.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(contributor.calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn contextual_runtime_cached_descriptor_does_not_authorize_removed_operations() {
+        let owner = Arc::new(ContextualHandler::new(true, true));
+        let contributor = Arc::new(ContextualHandler::new(true, true));
+        let runtime = WipRuntime::new(
+            WipHost::new(contextual_static_registry(
+                Arc::clone(&owner),
+                Arc::clone(&contributor),
+            )),
+            SecurityContext::new("worker-a"),
+            0,
+        )
+        .unwrap();
+        runtime
+            .discover("/assets/A-1".into(), 0, false)
+            .await
+            .unwrap();
+        let interface = runtime.host.projection("/assets/A-1").unwrap().interface;
+        runtime.inspect(interface.clone(), false).await.unwrap();
+        contributor.permitted.store(false, Ordering::SeqCst);
+        // The Client still knows the old descriptor; the Host must independently
+        // check its current filtered descriptor rather than trust Known Space.
+        let error = runtime
+            .call(
+                "/assets/A-1".into(),
+                interface.clone(),
+                "read".into(),
+                json!({}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("InterfaceValidatorMismatch"));
+        assert!(
+            runtime
+                .call(
+                    "/assets/A-1".into(),
+                    interface.clone(),
+                    "manage".into(),
+                    json!({}),
+                    ToolExecutionContext::direct(),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(owner.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(contributor.calls.load(Ordering::SeqCst), 0);
+        runtime.inspect(interface.clone(), true).await.unwrap();
+        runtime
+            .call(
+                "/assets/A-1".into(),
+                interface.clone(),
+                "read".into(),
+                json!({}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        owner.visible.store(false, Ordering::SeqCst);
+        assert!(runtime.host.fetch_interface(&interface).is_err());
+        let error = runtime.inspect(interface.clone(), true).await.unwrap_err();
+        assert!(error.to_string().contains("InterfaceNotFound"));
+        {
+            let state = runtime.state.lock().unwrap();
+            let observed = state.client.interface(&state.session, &interface).unwrap();
+            assert!(matches!(observed.state, ObservationState::Error(_)));
+        }
+        assert!(
+            runtime
+                .call(
+                    "/assets/A-1".into(),
+                    interface,
+                    "read".into(),
+                    json!({}),
+                    ToolExecutionContext::direct(),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(owner.calls.load(Ordering::SeqCst), 1);
+    }
+
+    struct CurrentObjectValidatorHandler {
+        inner: Arc<ContextualHandler>,
+        revision: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl WipOperationHandler for CurrentObjectValidatorHandler {
+        fn contextual_interface(&self) -> bool {
+            true
+        }
+
+        fn object_validator(&self) -> Option<Vec<u8>> {
+            Some(self.revision.load(Ordering::SeqCst).to_be_bytes().to_vec())
+        }
+
+        async fn call(
+            &self,
+            operation: &str,
+            arguments: &BTreeMap<String, Value>,
+            context: WipCallContext,
+        ) -> Result<WipOperationOutput, WipOperationError> {
+            self.inner.call(operation, arguments, context).await
+        }
+    }
+
+    #[tokio::test]
+    async fn static_object_validator_hook_rejects_current_owner_state_changes() {
+        let owner = Arc::new(ContextualHandler::new(true, true));
+        let revision = Arc::new(AtomicUsize::new(1));
+        let mut registry = WipMountRegistry::new();
+        registry.allocate_namespace("asset", "assets").unwrap();
+        registry
+            .mount(contribution_projection(Arc::new(
+                CurrentObjectValidatorHandler {
+                    inner: Arc::clone(&owner),
+                    revision: Arc::clone(&revision),
+                },
+            )))
+            .unwrap();
+        // Contributors cannot override Object ownership or its current validator.
+        let mut descriptor = registry.mounts["/assets/A-1"].projection.descriptor.clone();
+        descriptor.operations = vec![contributed_operation("manage")];
+        registry
+            .contribute_operations(WipOperationContribution {
+                route: "/assets/A-1".into(),
+                contributor: "management".into(),
+                interface: "test.asset/item/v1".into(),
+                descriptor,
+                handler: Arc::new(CurrentObjectValidatorHandler {
+                    inner: Arc::new(ContextualHandler::new(true, true)),
+                    revision: Arc::new(AtomicUsize::new(99)),
+                }),
+            })
+            .unwrap();
+        let runtime =
+            WipRuntime::new(WipHost::new(registry), SecurityContext::new("worker-a"), 0).unwrap();
+        let interface = observed_contextual_interface(&runtime, "/assets/A-1").await;
+        let initial = runtime.host.projection("/assets/A-1").unwrap();
+        assert_eq!(
+            initial.object.validator,
+            Some(1usize.to_be_bytes().to_vec())
+        );
+        revision.store(2, Ordering::SeqCst);
+        assert_eq!(
+            runtime.host.object_at("/assets/A-1").unwrap().validator,
+            Some(2usize.to_be_bytes().to_vec())
+        );
+        assert!(matches!(
+            runtime
+                .host
+                .call(asset_request(&initial, "read"), direct_wip_context())
+                .await,
+            Err(WipOperationError::Protocol(ProtocolError {
+                code: ProtocolErrorCode::ValidatorMismatch,
+                ..
+            }))
+        ));
+        let error = runtime
+            .call(
+                "/assets/A-1".into(),
+                interface.clone(),
+                "read".into(),
+                json!({}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("ValidatorMismatch"));
+        assert_eq!(owner.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            observed_contextual_interface(&runtime, "/assets/A-1").await,
+            interface
+        );
+        transport_call_json(&runtime, "/assets/A-1", &interface, "read", json!({})).await;
+        assert_eq!(owner.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dynamic_item_read_is_independent_of_collection_visibility_and_list_permission() {
+        let owner = Arc::new(ContextualHandler::new(true, true));
+        let mut registry = contextual_dynamic_registry(
+            Arc::clone(&owner),
+            Arc::new(ContextualHandler::new(false, true)),
+            Arc::new(AtomicUsize::new(1)),
+            true,
+        );
+        let denied_collection = Arc::new(ContextualHandler::new(false, true));
+        denied_collection.visible.store(false, Ordering::SeqCst);
+        let collection = registry.mounts.get_mut("/objectives").unwrap();
+        collection.projection.handler = denied_collection;
+        collection.operation_handlers =
+            operation_handlers(&collection.projection, "objective:collection");
+        let runtime =
+            WipRuntime::new(WipHost::new(registry), SecurityContext::new("worker-a"), 0).unwrap();
+        assert!(runtime.host.projection("/objectives").is_none());
+        let interface = observed_contextual_interface(&runtime, "/objectives/O-1").await;
+        transport_call_json(&runtime, "/objectives/O-1", &interface, "read", json!({})).await;
+        owner.visible.store(false, Ordering::SeqCst);
+        assert!(runtime.host.fetch_interface(&interface).is_err());
+        assert!(
+            runtime
+                .call(
+                    "/objectives/O-1".into(),
+                    interface,
+                    "read".into(),
+                    json!({}),
+                    ToolExecutionContext::direct()
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(owner.calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn transport_output_json(output: ToolOutput) -> Json {
+        serde_json::from_str(output.content.as_deref().expect("transport JSON output")).unwrap()
+    }
+
+    async fn observed_contextual_interface(runtime: &WipRuntime, path: &str) -> String {
+        let observed = transport_output_json(runtime.discover(path.into(), 0, true).await.unwrap());
+        let object = observed["known_space"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["path"] == path)
+            .unwrap();
+        assert_eq!(object["state"], "fresh");
+        let interface = object["object"]["interfaces"][0]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(interface.contains("/@/"));
+        let inspected =
+            transport_output_json(runtime.inspect(interface.clone(), true).await.unwrap());
+        assert_eq!(inspected["state"], "fresh");
+        interface
+    }
+
+    async fn transport_call_json(
+        runtime: &WipRuntime,
+        path: &str,
+        interface: &str,
+        operation: &str,
+        arguments: Json,
+    ) -> Json {
+        transport_output_json(
+            runtime
+                .call(
+                    path.into(),
+                    interface.into(),
+                    operation.into(),
+                    arguments,
+                    ToolExecutionContext::direct(),
+                )
+                .await
+                .unwrap(),
+        )
+    }
+
+    fn catalog_transport_runtime(
+        client: Arc<dyn crate::worker::WorkspaceClient>,
+        manage: bool,
+        permissions: Option<ToolPermissionConfig>,
+    ) -> Arc<WipRuntime> {
+        use crate::feature::FeatureRegistryBuilder;
+        use crate::feature::builtin::manage_workdir::{
+            ManageWorkdirFeature, wip::mount_workspace_workdir_wip,
+        };
+        let feature = ManageWorkdirFeature::new(client);
+        let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
+        let report = FeatureRegistryBuilder::new()
+            .with_module(feature.clone())
+            .install_into_engine(&mut engine, &mut crate::hook::HookRegistryBuilder::new());
+        assert!(!report.has_errors());
+        assert_eq!(report.installed_tool_names().len(), 5);
+        let mut registry = WipMountRegistry::new();
+        mount_workspace_workdir_wip(&mut registry, &feature, true, manage, permissions.clone())
+            .unwrap();
+        let runtime =
+            install_wip_mode_with_mounts(&mut engine, permissions, "worker-a".into(), registry)
+                .unwrap();
+        for name in [
+            "WorkdirList",
+            "WorkdirCreate",
+            "WorkdirAttach",
+            "WorkdirDetach",
+            "WorkdirDelete",
+        ] {
+            assert!(runtime.host.projection(&format!("/tools/{name}")).is_none());
+        }
+        assert!(runtime.host.object_at("/features/manage-workdir").is_none());
+        runtime
+    }
+
+    #[tokio::test]
+    async fn catalog_native_transport_pages_all_workdirs_beyond_legacy_200_cap() {
+        use crate::feature::builtin::manage_workdir::wip::tests::CatalogClient;
+        let client = Arc::new(CatalogClient::default());
+        client.state.lock().unwrap().workdirs = (0..205).map(|n| json!({
+            "working_directory_id":format!("wd-{n:03}"), "source":{"kind":"repository", "repository_key":"registered-key"}, "status":"active"
+        })).collect();
+        let runtime = catalog_transport_runtime(client.clone(), false, None);
+        let interface = observed_contextual_interface(&runtime, "/workdirs").await;
+        let mut cursor = Json::Null;
+        let mut ids = BTreeSet::new();
+        let mut pages = 0;
+        loop {
+            let page = transport_call_json(
+                &runtime,
+                "/workdirs",
+                &interface,
+                "list",
+                if cursor.is_null() {
+                    json!({"limit":100})
+                } else {
+                    json!({"limit":100, "cursor":cursor})
+                },
+            )
+            .await;
+            pages += 1;
+            let items = page["items"].as_array().unwrap();
+            assert!(items.len() <= 100);
+            for item in items {
+                assert!(ids.insert(item["working_directory_id"].as_str().unwrap().to_owned()));
+            }
+            if !page["has_more"].as_bool().unwrap() {
+                assert!(page["next_cursor"].is_null());
+                break;
+            }
+            cursor = page["next_cursor"].clone();
+            assert!(pages < 4, "cursor must progress");
+        }
+        assert_eq!(pages, 3);
+        assert_eq!(ids.len(), 205);
+        assert!(ids.contains("wd-000"));
+        let item_interface = observed_contextual_interface(&runtime, "/workdirs/wd-000").await;
+        let read = transport_call_json(
+            &runtime,
+            "/workdirs/wd-000",
+            &item_interface,
+            "read",
+            json!({}),
+        )
+        .await;
+        assert_eq!(read["working_directory_id"], "wd-000");
+        assert!(
+            client
+                .state
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .all(|r| !r.path.ends_with("/working-directories")),
+            "WIP must not use a capped legacy inventory"
+        );
+
+        let permissions = Some(ToolPermissionConfig {
+            default_action: ToolPermissionAction::Deny,
+            rules: vec![
+                manifest::ToolPermissionRule {
+                    tool: "WorkdirList".into(),
+                    pattern: "*".into(),
+                    action: ToolPermissionAction::Allow,
+                },
+                manifest::ToolPermissionRule {
+                    tool: "WorkdirRead".into(),
+                    pattern: "*wd-204*".into(),
+                    action: ToolPermissionAction::Allow,
+                },
+            ],
+        });
+        let runtime = catalog_transport_runtime(client, false, permissions);
+        let interface = observed_contextual_interface(&runtime, "/workdirs").await;
+        let first = transport_call_json(
+            &runtime,
+            "/workdirs",
+            &interface,
+            "list",
+            json!({"limit":100}),
+        )
+        .await;
+        assert_eq!(first["empty"], true);
+        assert_eq!(
+            first["has_more"], true,
+            "empty filtered page is not terminal"
+        );
+        let second = transport_call_json(
+            &runtime,
+            "/workdirs",
+            &interface,
+            "list",
+            json!({"limit":100, "cursor":first["next_cursor"]}),
+        )
+        .await;
+        assert_eq!(second["has_more"], true);
+        let last = transport_call_json(
+            &runtime,
+            "/workdirs",
+            &interface,
+            "list",
+            json!({"limit":100, "cursor":second["next_cursor"]}),
+        )
+        .await;
+        assert_eq!(last["items"][0]["working_directory_id"], "wd-204");
+        assert_eq!(last["has_more"], false);
+    }
+
+    #[tokio::test]
+    async fn catalog_native_transport_invalidates_attachment_change_beyond_first_page() {
+        use crate::feature::builtin::manage_workdir::wip::tests::CatalogClient;
+        for capability_change in [false, true] {
+            let client = Arc::new(CatalogClient::default());
+            client.state.lock().unwrap().attachments = (0..65).map(|n| json!({
+                "connection_id":format!("lifetime-{n:03}"), "alias":format!("alias-{n:03}"), "working_directory_id":"wd", "capabilities":{"bits":25}
+            })).collect();
+            let first_fifty = client.state.lock().unwrap().attachments[..50].to_vec();
+            let runtime = catalog_transport_runtime(client.clone(), true, None);
+            let interface = observed_contextual_interface(&runtime, "/workdir-attachments").await;
+            let old_validator = runtime
+                .host
+                .projection("/workdir-attachments")
+                .unwrap()
+                .object
+                .validator;
+            if capability_change {
+                client.state.lock().unwrap().attachments[64]["capabilities"] = json!({"bits":63});
+            } else {
+                client.state.lock().unwrap().attachments[64]["connection_id"] =
+                    json!("new-lifetime");
+            }
+            assert_eq!(client.state.lock().unwrap().attachments[..50], first_fifty);
+            assert_ne!(
+                runtime
+                    .host
+                    .projection("/workdir-attachments")
+                    .unwrap()
+                    .object
+                    .validator,
+                old_validator
+            );
+            let error = runtime
+                .call(
+                    "/workdir-attachments".into(),
+                    interface.clone(),
+                    "list".into(),
+                    json!({"cursor":"offset:50", "limit":100}),
+                    ToolExecutionContext::direct(),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("ValidatorMismatch"), "{error}");
+            let interface = observed_contextual_interface(&runtime, "/workdir-attachments").await;
+            let page = transport_call_json(
+                &runtime,
+                "/workdir-attachments",
+                &interface,
+                "list",
+                json!({"cursor":"offset:50"}),
+            )
+            .await;
+            assert_eq!(page["items"].as_array().unwrap().len(), 15);
+            if capability_change {
+                assert_eq!(page["items"][14]["capabilities"]["bits"], 63);
+            } else {
+                assert_eq!(page["items"][14]["connection_id"], "new-lifetime");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_native_transport_discovers_creates_attaches_reads_and_detaches() {
+        use crate::feature::builtin::manage_workdir::wip::tests::CatalogClient;
+        use crate::worker::WorkspaceRequestMethod;
+        let client = Arc::new(CatalogClient::default());
+        let runtime = catalog_transport_runtime(client.clone(), true, None);
+        let root = transport_output_json(runtime.discover("/".into(), 1, false).await.unwrap());
+        let paths = root["known_space"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["path"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        for path in ["/repositories", "/workdirs", "/workdir-attachments"] {
+            assert!(paths.contains(&path));
+        }
+        assert!(!paths.iter().any(|path| path.starts_with("/tools/Workdir")
+            || path.starts_with("/features/manage-workdir")));
+        let repositories_interface = observed_contextual_interface(&runtime, "/repositories").await;
+        let listed = transport_call_json(
+            &runtime,
+            "/repositories",
+            &repositories_interface,
+            "list",
+            json!({}),
+        )
+        .await;
+        let repository = &listed["items"][0];
+        assert_eq!(repository["repository_key"], "registered-key");
+        assert!(repository["default_selector"].is_null());
+        assert!(!listed.to_string().contains("SECRET"));
+        assert!(!listed.to_string().contains("/secret/host"));
+        let repository_path = repository["path"].as_str().unwrap();
+        let repository_interface = observed_contextual_interface(&runtime, repository_path).await;
+        let read = transport_call_json(
+            &runtime,
+            repository_path,
+            &repository_interface,
+            "read",
+            json!({}),
+        )
+        .await;
+        assert_eq!(read["repository_key"], repository["repository_key"]);
+        let workdirs_interface = observed_contextual_interface(&runtime, "/workdirs").await;
+        let created = transport_call_json(
+            &runtime,
+            "/workdirs",
+            &workdirs_interface,
+            "create",
+            json!({"repository_key":read["repository_key"]}),
+        )
+        .await;
+        assert_eq!(created["item"]["path"], "/workdirs/wd-created");
+        {
+            let state = client.state.lock().unwrap();
+            assert_eq!(state.workdirs.len(), 1);
+            assert!(state.attachments.is_empty(), "creation must not attach");
+            assert!(
+                !state
+                    .requests
+                    .iter()
+                    .any(|request| request.method == WorkspaceRequestMethod::Post
+                        && request.path.ends_with("workdir-attachments"))
+            );
+        }
+        let workdir_path = created["item"]["path"].as_str().unwrap();
+        let workdir_interface = observed_contextual_interface(&runtime, workdir_path).await;
+        let attached = transport_call_json(
+            &runtime,
+            workdir_path,
+            &workdir_interface,
+            "attach",
+            json!({"alias":"checkout"}),
+        )
+        .await;
+        assert_eq!(attached["attachments_path"], "/workdir-attachments");
+        let attachments_interface =
+            observed_contextual_interface(&runtime, "/workdir-attachments").await;
+        let listed = transport_call_json(
+            &runtime,
+            "/workdir-attachments",
+            &attachments_interface,
+            "list",
+            json!({}),
+        )
+        .await;
+        let attachment = &listed["items"][0];
+        assert_eq!(attachment["alias"], "checkout");
+        assert_eq!(attachment["workdir_path"], workdir_path);
+        let attachment_path = attachment["path"].as_str().unwrap();
+        let attachment_interface = observed_contextual_interface(&runtime, attachment_path).await;
+        let read = transport_call_json(
+            &runtime,
+            attachment_path,
+            &attachment_interface,
+            "read",
+            json!({}),
+        )
+        .await;
+        assert_eq!(read["connection_id"], attachment["connection_id"]);
+        transport_call_json(
+            &runtime,
+            attachment_path,
+            &attachment_interface,
+            "detach",
+            json!({}),
+        )
+        .await;
+        let attachments_interface =
+            observed_contextual_interface(&runtime, "/workdir-attachments").await;
+        let listed = transport_call_json(
+            &runtime,
+            "/workdir-attachments",
+            &attachments_interface,
+            "list",
+            json!({}),
+        )
+        .await;
+        assert_eq!(listed["empty"], true);
+        assert!(client.state.lock().unwrap().attachments.is_empty());
+        assert_eq!(
+            client.state.lock().unwrap().workdirs.len(),
+            1,
+            "detach must preserve persistent Workdir"
+        );
+        assert!(runtime.host.projection(attachment_path).is_none());
+        assert!(runtime.host.fetch_interface(&attachment_interface).is_err());
+        let state = client.state.lock().unwrap();
+        let writes = state
+            .requests
+            .iter()
+            .filter(|request| request.method != WorkspaceRequestMethod::Get)
+            .collect::<Vec<_>>();
+        assert_eq!(writes.len(), 3);
+        assert!(
+            writes[2]
+                .path
+                .contains("expected_connection_id=connection-1")
+        );
+        drop(state);
+        // A dirty provider result is a retained lifecycle outcome, not transport
+        // uncertainty or implicit destructive success.
+        client.state.lock().unwrap().workdirs[0]["cleanliness"] = json!("dirty");
+        let workdir_interface = observed_contextual_interface(&runtime, workdir_path).await;
+        let read = transport_call_json(
+            &runtime,
+            workdir_path,
+            &workdir_interface,
+            "read",
+            json!({}),
+        )
+        .await;
+        assert_eq!(read["cleanliness"], "dirty");
+        let retained = transport_call_json(
+            &runtime,
+            workdir_path,
+            &workdir_interface,
+            "delete",
+            json!({"reason":"dirty checkout retained"}),
+        )
+        .await;
+        assert_eq!(retained["disposition"], "retained");
+        assert_eq!(client.state.lock().unwrap().workdirs.len(), 1);
+        assert_eq!(
+            runtime.audit().last().unwrap().outcome,
+            WipAuditOutcome::Success
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_native_transport_read_only_and_read_without_list_permissions() {
+        use crate::feature::builtin::manage_workdir::wip::tests::CatalogClient;
+        use crate::worker::WorkspaceRequestMethod;
+        let client = Arc::new(CatalogClient::default());
+        client.state.lock().unwrap().workdirs.push(json!({
+            "working_directory_id":"wd-read", "status":"active", "cleanliness":"clean",
+            "source":{"kind":"repository", "repository_key":"registered-key"},
+        }));
+        let runtime = catalog_transport_runtime(client.clone(), false, None);
+        runtime.discover("/".into(), 1, false).await.unwrap();
+        let collection_interface = observed_contextual_interface(&runtime, "/workdirs").await;
+        assert_eq!(
+            operation_names(
+                &runtime
+                    .host
+                    .fetch_interface(&collection_interface)
+                    .unwrap()
+                    .descriptor
+            ),
+            ["list"]
+        );
+        let listed = transport_call_json(
+            &runtime,
+            "/workdirs",
+            &collection_interface,
+            "list",
+            json!({}),
+        )
+        .await;
+        let path = listed["items"][0]["path"].as_str().unwrap();
+        let interface = observed_contextual_interface(&runtime, path).await;
+        assert_eq!(
+            operation_names(&runtime.host.fetch_interface(&interface).unwrap().descriptor),
+            ["read"]
+        );
+        transport_call_json(&runtime, path, &interface, "read", json!({})).await;
+        for (target, reference, operation, input) in [
+            (
+                "/workdirs",
+                &collection_interface,
+                "create",
+                json!({"repository_key":"registered-key"}),
+            ),
+            (path, &interface, "attach", json!({"alias":"checkout"})),
+            (path, &interface, "delete", json!({"reason":"done"})),
+        ] {
+            assert!(
+                runtime
+                    .call(
+                        target.into(),
+                        reference.clone(),
+                        operation.into(),
+                        input,
+                        ToolExecutionContext::direct()
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            client
+                .state
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .all(|request| request.method == WorkspaceRequestMethod::Get)
+        );
+        let read_only = ToolPermissionConfig {
+            default_action: ToolPermissionAction::Deny,
+            rules: ["RepositoryRead", "WorkdirRead"]
+                .iter()
+                .map(|name| manifest::ToolPermissionRule {
+                    tool: (*name).into(),
+                    pattern: "*".into(),
+                    action: ToolPermissionAction::Allow,
+                })
+                .collect(),
+        };
+        let runtime = catalog_transport_runtime(client.clone(), false, Some(read_only));
+        for path in ["/repositories/registered-key", "/workdirs/wd-read"] {
+            let interface = observed_contextual_interface(&runtime, path).await;
+            assert_eq!(
+                operation_names(&runtime.host.fetch_interface(&interface).unwrap().descriptor),
+                ["read"]
+            );
+            transport_call_json(&runtime, path, &interface, "read", json!({})).await;
+        }
+        client.state.lock().unwrap().denied = true;
+        let interface = contextual_reference("yoi.workdir/item/v1", "/workdirs/wd-read");
+        assert!(runtime.host.fetch_interface(&interface).is_err());
+        assert!(
+            runtime
+                .call(
+                    "/workdirs/wd-read".into(),
+                    interface,
+                    "read".into(),
+                    json!({}),
+                    ToolExecutionContext::direct()
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .state
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .all(|request| request.method == WorkspaceRequestMethod::Get)
+        );
+    }
+
+    #[derive(Debug)]
+    struct UncertainCatalogClient {
+        catalog: Arc<crate::feature::builtin::manage_workdir::wip::tests::CatalogClient>,
+    }
+
+    impl crate::worker::WorkspaceClient for UncertainCatalogClient {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("test-workspace")
+        }
+        fn kind(&self) -> &str {
+            "uncertain-catalog-test"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn execute(
+            &self,
+            request: crate::worker::WorkspaceRequest,
+        ) -> Result<crate::worker::WorkspaceResponse, crate::worker::WorkspaceClientError> {
+            use crate::worker::{WorkspaceClientError, WorkspaceRequestMethod};
+            if request.method == WorkspaceRequestMethod::Post
+                && request.path.ends_with("/working-directories")
+            {
+                self.catalog.state.lock().unwrap().requests.push(request);
+                return Err(WorkspaceClientError::Unavailable(
+                    "SECRET /host/path uncertain write".into(),
+                ));
+            }
+            self.catalog.execute(request)
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_native_transport_unknown_mutation_is_terminal_and_not_retried() {
+        use crate::feature::builtin::manage_workdir::wip::tests::CatalogClient;
+        use crate::worker::WorkspaceRequestMethod;
+        let catalog = Arc::new(CatalogClient::default());
+        let runtime = catalog_transport_runtime(
+            Arc::new(UncertainCatalogClient {
+                catalog: catalog.clone(),
+            }),
+            true,
+            None,
+        );
+        let interface = observed_contextual_interface(&runtime, "/workdirs").await;
+        let error = runtime
+            .call(
+                "/workdirs".into(),
+                interface,
+                "create".into(),
+                json!({"repository_key":"registered-key"}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap_err();
+        let error = error.to_string();
+        assert!(error.contains("outcome unknown"));
+        assert!(!error.contains("SECRET"));
+        assert!(!error.contains("/host/path"));
+        assert_eq!(
+            runtime.audit().last().unwrap().outcome,
+            WipAuditOutcome::OutcomeUnknown
+        );
+        let state = runtime.state.lock().unwrap();
+        assert!(matches!(
+            state
+                .client
+                .call_history(&state.session)
+                .unwrap()
+                .back()
+                .unwrap()
+                .outcome,
+            CallOutcome::Unknown { .. }
+        ));
+        let state = catalog.state.lock().unwrap();
+        assert_eq!(
+            state
+                .requests
+                .iter()
+                .filter(|request| request.method == WorkspaceRequestMethod::Post)
+                .count(),
+            1
+        );
+        assert!(state.workdirs.is_empty());
+        assert!(state.attachments.is_empty());
+    }
+
     struct NativeTyped;
 
     #[async_trait]
@@ -2338,6 +5122,7 @@ mod tests {
     #[tokio::test]
     async fn native_projection_preserves_descriptor_and_decodes_typed_arguments_end_to_end() {
         let mut registry = WipMountRegistry::new();
+        registry.allocate_namespace("native", "native").unwrap();
         registry.mount(native_typed_projection()).unwrap();
         let runtime =
             WipRuntime::new(WipHost::new(registry), SecurityContext::new("worker-a"), 0).unwrap();
@@ -2600,10 +5385,26 @@ mod tests {
         }
     }
 
+    struct DynamicContributionResolver {
+        calls: Arc<AtomicUsize>,
+        allowed: Arc<AtomicBool>,
+    }
+
+    impl WipDynamicOperationResolver for DynamicContributionResolver {
+        fn handler(&self, _item_reference: &str) -> Arc<dyn WipOperationHandler> {
+            Arc::new(ContributionHandler {
+                calls: Arc::clone(&self.calls),
+                allowed: Arc::clone(&self.allowed),
+            })
+        }
+    }
+
     fn dynamic_registry(revision: Arc<AtomicUsize>, calls: Arc<AtomicUsize>) -> WipMountRegistry {
         let mut registry = WipMountRegistry::new();
-        let feature = registry.allocate_feature_route("objective").unwrap();
-        let collection_route = feature.child("objectives").unwrap();
+        let namespace = registry
+            .allocate_namespace("objective", "objectives")
+            .unwrap();
+        let collection_route = namespace.root().to_string();
         let mut collection = compatibility_projection(
             meta("Dynamic"),
             Arc::new(EchoTool {
@@ -2616,8 +5417,8 @@ mod tests {
         collection.capability = "objective:collection".into();
         collection.kind = WipProjectionKind::Native;
         collection.object.name = "objectives".into();
-        collection.object.interfaces = vec!["test.dynamic/v1".into()];
-        collection.interface = "test.dynamic/v1".into();
+        collection.object.interfaces = vec!["test.dynamic.collection/v1".into()];
+        collection.interface = "test.dynamic.collection/v1".into();
         collection.handler = Arc::new(DynamicHandler {
             calls: Arc::clone(&calls),
         });
@@ -2642,17 +5443,9 @@ mod tests {
         let revision = Arc::new(AtomicUsize::new(1));
         let calls = Arc::new(AtomicUsize::new(0));
         let host = WipHost::new(dynamic_registry(Arc::clone(&revision), Arc::clone(&calls)));
-        let initial = host
-            .projection("/features/objective/objectives/O-3")
-            .unwrap();
-        assert!(
-            host.projection("/features/objective/objectives/O-3/other")
-                .is_none()
-        );
-        assert!(
-            host.projection("/features/objective/objectives/T-3")
-                .is_none()
-        );
+        let initial = host.projection("/objectives/O-3").unwrap();
+        assert!(host.projection("/objectives/O-3/other").is_none());
+        assert!(host.projection("/objectives/T-3").is_none());
         assert!(host.projection("/hidden/objectives/O-3").is_none());
 
         revision.store(2, Ordering::SeqCst);
@@ -2660,7 +5453,7 @@ mod tests {
             .call(
                 CallOperationRequest {
                     target: wip_protocol::Target {
-                        path: "/features/objective/objectives/O-3".into(),
+                        path: "/objectives/O-3".into(),
                         validator: initial.object.validator,
                     },
                     interface: wip_protocol::InterfaceTarget {
@@ -2690,6 +5483,127 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_registration_rejects_foreign_owners_and_operation_collisions_atomically() {
+        let revision = Arc::new(AtomicUsize::new(1));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = dynamic_registry(Arc::clone(&revision), Arc::clone(&calls));
+        let mounted = registry.dynamic_mounts.pop().unwrap();
+        let foreign = WipDynamicMount {
+            collection_route: mounted.collection_route.clone(),
+            capability: "unrelated:item".into(),
+            interface: mounted.interface.clone(),
+            descriptor: mounted.descriptor.clone(),
+            interface_validator: mounted.interface_validator.clone(),
+            resolver: Arc::new(DynamicResolver {
+                revision,
+                calls: Arc::clone(&calls),
+            }),
+        };
+        assert!(matches!(
+            registry.mount_dynamic(foreign),
+            Err(WipMountError::InvalidProjection { .. })
+        ));
+        assert!(registry.dynamic_mounts.is_empty());
+        registry.mount_dynamic(mounted).unwrap();
+        let original = registry.dynamic_mounts[0].descriptor.clone();
+        let contribution = |descriptor| WipDynamicOperationContribution {
+            collection_route: "/objectives".into(),
+            contributor: "management".into(),
+            interface: "test.dynamic/v1".into(),
+            descriptor,
+            resolver: Arc::new(DynamicContributionResolver {
+                calls: Arc::clone(&calls),
+                allowed: Arc::new(AtomicBool::new(true)),
+            }),
+        };
+        assert!(matches!(
+            registry.contribute_dynamic_operations(contribution(original.clone())),
+            Err(WipMountError::OperationCollision { .. })
+        ));
+        let mut inconsistent = original.clone();
+        inconsistent.operations = vec![contributed_operation("manage")];
+        inconsistent.documentation = documentation("different shape");
+        assert!(matches!(
+            registry.contribute_dynamic_operations(contribution(inconsistent)),
+            Err(WipMountError::InterfaceCollision { .. })
+        ));
+        assert_eq!(registry.dynamic_mounts[0].descriptor, original);
+        assert!(registry.dynamic_operation_contributions.is_empty());
+        let mut valid = original;
+        valid.operations = vec![contributed_operation("manage")];
+        registry
+            .contribute_dynamic_operations(contribution(valid.clone()))
+            .unwrap();
+        assert!(matches!(
+            registry.contribute_dynamic_operations(contribution(valid)),
+            Err(WipMountError::OperationCollision { .. })
+        ));
+        assert_eq!(
+            registry.dynamic_operation_contributions["/objectives"].len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_object_resolver_accepts_disjoint_feature_operations() {
+        let revision = Arc::new(AtomicUsize::new(1));
+        let base_calls = Arc::new(AtomicUsize::new(0));
+        let contribution_calls = Arc::new(AtomicUsize::new(0));
+        let allowed = Arc::new(AtomicBool::new(true));
+        let mut registry = dynamic_registry(revision, base_calls);
+        let mounted = registry
+            .dynamic_mounts
+            .first()
+            .expect("dynamic object family is mounted");
+        let mut descriptor = mounted.descriptor.clone();
+        descriptor.operations = vec![contributed_operation("manage")];
+        registry
+            .contribute_dynamic_operations(WipDynamicOperationContribution {
+                collection_route: "/objectives".into(),
+                contributor: "objective-management".into(),
+                interface: "test.dynamic/v1".into(),
+                descriptor,
+                resolver: Arc::new(DynamicContributionResolver {
+                    calls: Arc::clone(&contribution_calls),
+                    allowed,
+                }),
+            })
+            .unwrap();
+        let host = WipHost::new(registry);
+        let projection = host.projection("/objectives/O-7").unwrap();
+        assert_eq!(
+            projection
+                .descriptor
+                .operations
+                .iter()
+                .map(|operation| operation.name.as_str())
+                .collect::<Vec<_>>(),
+            ["call", "manage"]
+        );
+        host.call(
+            CallOperationRequest {
+                target: wip_protocol::Target {
+                    path: "/objectives/O-7".into(),
+                    validator: projection.object.validator,
+                },
+                interface: wip_protocol::InterfaceTarget {
+                    reference: projection.interface,
+                    validator: projection.interface_validator,
+                },
+                operation: "manage".into(),
+                arguments: BTreeMap::new(),
+            },
+            WipCallContext {
+                execution: ToolExecutionContext::direct(),
+                security_context: "worker-a".into(),
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("dynamic contributed operation should run"));
+        assert_eq!(contribution_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn native_capability_claim_hides_only_claimed_compatibility_route() {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
@@ -2699,18 +5613,13 @@ mod tests {
         let revision = Arc::new(AtomicUsize::new(1));
         let mut registry = dynamic_registry(revision, calls);
         registry
-            .replace_compatibility_tools("/features/objective/objectives", ["Echo"])
+            .replace_compatibility_tools("/objectives", ["Echo"])
             .unwrap();
         let runtime =
             install_wip_mode_with_mounts(&mut engine, None, "worker-a".into(), registry).unwrap();
         assert!(runtime.host.projection("/tools/Echo").is_none());
         assert!(runtime.host.projection("/tools/Other").is_some());
-        assert!(
-            runtime
-                .host
-                .projection("/features/objective/objectives")
-                .is_some()
-        );
+        assert!(runtime.host.projection("/objectives").is_some());
     }
 
     #[tokio::test]
@@ -2752,7 +5661,9 @@ mod tests {
             authoring_engine.register_tool(definition);
         }
         let mut authoring_registry = WipMountRegistry::new();
-        let route = authoring_registry.allocate_feature_route("ticket").unwrap();
+        let route = authoring_registry
+            .allocate_namespace("ticket", "tickets")
+            .unwrap();
         crate::feature::builtin::ticket::mount_workspace_http_ticket_wip(
             &mut authoring_registry,
             authoring_client.clone(),
@@ -2771,14 +5682,15 @@ mod tests {
 
         let discovered = authoring.discover("/".into(), 3, false).await.unwrap();
         let discovered = discovered.content.unwrap();
-        assert!(discovered.contains("/features/ticket/tickets"));
+        assert!(discovered.contains("/tickets"));
+        assert!(!discovered.contains("/features"));
         assert!(!discovered.contains("/tools/QueryTicket"));
         assert!(!discovered.contains("/tools/TicketCreate"));
         authoring
             .inspect("yoi.ticket/collection/v1".into(), false)
             .await
             .unwrap();
-        let collection = "/features/ticket/tickets";
+        let collection = "/tickets";
         authoring
             .call(
                 collection.into(),
@@ -2799,13 +5711,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            created
-                .content
-                .unwrap()
-                .contains("/features/ticket/tickets/T-9")
-        );
-        let item = "/features/ticket/tickets/T-9";
+        assert!(created.content.unwrap().contains("/tickets/T-9"));
+        let item = "/tickets/T-9";
         authoring.discover(item.into(), 0, false).await.unwrap();
         authoring
             .inspect("yoi.ticket/item/v1".into(), false)
@@ -2862,7 +5769,9 @@ mod tests {
             workflow_engine.register_tool(definition);
         }
         let mut workflow_registry = WipMountRegistry::new();
-        let route = workflow_registry.allocate_feature_route("ticket").unwrap();
+        let route = workflow_registry
+            .allocate_namespace("ticket", "tickets")
+            .unwrap();
         crate::feature::builtin::ticket::mount_workspace_http_ticket_wip(
             &mut workflow_registry,
             workflow_client.clone(),
@@ -2963,7 +5872,7 @@ mod tests {
         }
         let mut coder_registry = WipMountRegistry::new();
         let route = coder_registry
-            .allocate_feature_route("merge-request")
+            .allocate_namespace("merge-request", "merge-requests")
             .unwrap();
         crate::feature::builtin::merge_request::mount_workspace_http_merge_request_wip(
             &mut coder_registry,
@@ -2982,14 +5891,14 @@ mod tests {
         .unwrap();
         let discovered = coder.discover("/".into(), 3, false).await.unwrap();
         let discovered = discovered.content.unwrap();
-        assert!(discovered.contains("/features/merge-request/merge-requests"));
+        assert!(discovered.contains("/merge-requests"));
         assert!(!discovered.contains("/tools/OpenMergeRequest"));
         assert!(!discovered.contains("/tools/ShowMergeRequest"));
         coder
             .inspect("yoi.merge-request/collection/v1".into(), false)
             .await
             .unwrap();
-        let collection = "/features/merge-request/merge-requests";
+        let collection = "/merge-requests";
         let opened = coder
             .call(
                 collection.into(),
@@ -3085,7 +5994,7 @@ mod tests {
         }
         let mut reviewer_registry = WipMountRegistry::new();
         let route = reviewer_registry
-            .allocate_feature_route("merge-request")
+            .allocate_namespace("merge-request", "merge-requests")
             .unwrap();
         crate::feature::builtin::merge_request::mount_workspace_http_merge_request_wip(
             &mut reviewer_registry,
@@ -3174,7 +6083,7 @@ mod tests {
         }
         let mut orchestrator_registry = WipMountRegistry::new();
         let route = orchestrator_registry
-            .allocate_feature_route("merge-request")
+            .allocate_namespace("merge-request", "merge-requests")
             .unwrap();
         crate::feature::builtin::merge_request::mount_workspace_http_merge_request_wip(
             &mut orchestrator_registry,
@@ -3348,12 +6257,14 @@ mod tests {
             }],
         });
         let mut registry = WipMountRegistry::new();
-        let feature_route = registry.allocate_feature_route("objective").unwrap();
+        let namespace_route = registry
+            .allocate_namespace("objective", "objectives")
+            .unwrap();
         crate::feature::builtin::objective::mount_workspace_http_objective_wip(
             &mut registry,
             client.clone(),
             permissions.clone(),
-            &feature_route,
+            &namespace_route,
         )
         .unwrap();
         let runtime =
@@ -3362,13 +6273,13 @@ mod tests {
 
         let discovered = runtime.discover("/".into(), 3, false).await.unwrap();
         let discovered = discovered.content.unwrap();
-        assert!(discovered.contains("/features/objective/objectives"));
+        assert!(discovered.contains("/objectives"));
         assert!(!discovered.contains("/tools/QueryObjective"));
         runtime
             .inspect("yoi.objective/collection/v1".into(), false)
             .await
             .unwrap();
-        let collection_path = "/features/objective/objectives";
+        let collection_path = "/objectives";
         runtime
             .call(
                 collection_path.into(),
@@ -3401,14 +6312,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            created
-                .content
-                .unwrap()
-                .contains("/features/objective/objectives/O-3")
-        );
+        assert!(created.content.unwrap().contains("/objectives/O-3"));
 
-        let item_path = "/features/objective/objectives/O-3";
+        let item_path = "/objectives/O-3";
         runtime.discover(item_path.into(), 0, false).await.unwrap();
         runtime
             .inspect("yoi.objective/item/v1".into(), false)
@@ -3477,6 +6383,212 @@ mod tests {
             .await
             .unwrap();
         runtime
+    }
+
+    struct UnrelatedCancellation {
+        cancellations: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl WipOperationHandler for UnrelatedCancellation {
+        async fn call(
+            &self,
+            _: &str,
+            _: &BTreeMap<String, Value>,
+            _: WipCallContext,
+        ) -> Result<WipOperationOutput, WipOperationError> {
+            panic!("unrelated provider must not execute");
+        }
+
+        async fn cancel(&self, _: &ToolExecutionContext) -> Result<(), ToolError> {
+            self.cancellations.fetch_add(1, Ordering::SeqCst);
+            Err(ToolError::InvalidArgument(
+                "unknown execution in unrelated provider".into(),
+            ))
+        }
+    }
+
+    struct PendingCancellation {
+        started: Arc<tokio::sync::Notify>,
+        cancelled: tokio::sync::Notify,
+        was_called: AtomicBool,
+        cancellations: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl WipOperationHandler for PendingCancellation {
+        async fn call(
+            &self,
+            _: &str,
+            _: &BTreeMap<String, Value>,
+            _: WipCallContext,
+        ) -> Result<WipOperationOutput, WipOperationError> {
+            self.was_called.store(true, Ordering::SeqCst);
+            self.started.notify_one();
+            self.cancelled.notified().await;
+            Err(WipOperationError::Cancelled(
+                "provider confirmed cancellation".to_string().into(),
+            ))
+        }
+
+        async fn cancel(&self, _: &ToolExecutionContext) -> Result<(), ToolError> {
+            // A second resolution of the same path would produce another instance.
+            assert!(
+                self.was_called.load(Ordering::SeqCst),
+                "cancel must use the dispatched instance"
+            );
+            self.cancellations.fetch_add(1, Ordering::SeqCst);
+            self.cancelled.notify_one();
+            Ok(())
+        }
+    }
+
+    struct PendingCancellationResolver {
+        started: Arc<tokio::sync::Notify>,
+        cancellations: Arc<AtomicUsize>,
+    }
+
+    impl WipDynamicOperationResolver for PendingCancellationResolver {
+        fn handler(&self, _: &str) -> Arc<dyn WipOperationHandler> {
+            Arc::new(PendingCancellation {
+                started: Arc::clone(&self.started),
+                cancelled: tokio::sync::Notify::new(),
+                was_called: AtomicBool::new(false),
+                cancellations: Arc::clone(&self.cancellations),
+            })
+        }
+    }
+
+    struct CancellationItemResolver {
+        unrelated: Arc<AtomicUsize>,
+    }
+
+    impl WipDynamicItemResolver for CancellationItemResolver {
+        fn resolve(&self, item: &str) -> Option<WipDynamicItem> {
+            if item != "A-1" {
+                return None;
+            }
+            let projection = contribution_projection(Arc::new(UnrelatedCancellation {
+                cancellations: Arc::clone(&self.unrelated),
+            }));
+            Some(WipDynamicItem {
+                object: projection.object,
+                handler: projection.handler,
+            })
+        }
+    }
+
+    async fn assert_contributed_cancellation_is_selected_once(dynamic: bool) {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let unrelated = Arc::new(AtomicUsize::new(0));
+        let mut registry = WipMountRegistry::new();
+        registry.allocate_namespace("asset", "assets").unwrap();
+        let projection = contribution_projection(Arc::new(UnrelatedCancellation {
+            cancellations: Arc::clone(&unrelated),
+        }));
+        let mut descriptor = projection.descriptor.clone();
+        // Two names share one provider; read sorts first and fails cancellation.
+        descriptor.operations = vec![
+            contributed_operation("write"),
+            contributed_operation("write_again"),
+        ];
+        if dynamic {
+            let mut collection = projection.clone();
+            collection.route = "/assets".into();
+            collection.object.name = "assets".into();
+            collection.interface = "test.asset/collection/v1".into();
+            collection.object.interfaces = vec![collection.interface.clone()];
+            registry.mount(collection).unwrap();
+            registry
+                .mount_dynamic(WipDynamicMount {
+                    collection_route: "/assets".into(),
+                    capability: "asset:item".into(),
+                    interface: projection.interface.clone(),
+                    descriptor: projection.descriptor,
+                    interface_validator: projection.interface_validator,
+                    resolver: Arc::new(CancellationItemResolver {
+                        unrelated: Arc::clone(&unrelated),
+                    }),
+                })
+                .unwrap();
+            registry
+                .contribute_dynamic_operations(WipDynamicOperationContribution {
+                    collection_route: "/assets".into(),
+                    contributor: "management".into(),
+                    interface: projection.interface,
+                    descriptor,
+                    resolver: Arc::new(PendingCancellationResolver {
+                        started: Arc::clone(&started),
+                        cancellations: Arc::clone(&cancellations),
+                    }),
+                })
+                .unwrap();
+        } else {
+            registry.mount(projection).unwrap();
+            registry
+                .contribute_operations(WipOperationContribution {
+                    route: "/assets/A-1".into(),
+                    contributor: "management".into(),
+                    interface: "test.asset/item/v1".into(),
+                    descriptor,
+                    handler: PendingCancellationResolver {
+                        started: Arc::clone(&started),
+                        cancellations: Arc::clone(&cancellations),
+                    }
+                    .handler("A-1"),
+                })
+                .unwrap();
+        }
+        let runtime =
+            WipRuntime::new(WipHost::new(registry), SecurityContext::new("worker-a"), 0).unwrap();
+        runtime
+            .discover("/assets/A-1".into(), 0, false)
+            .await
+            .unwrap();
+        runtime
+            .inspect("test.asset/item/v1".into(), false)
+            .await
+            .unwrap();
+        let execution = ToolExecutionContext::direct();
+        let call = runtime.call(
+            "/assets/A-1".into(),
+            "test.asset/item/v1".into(),
+            "write".into(),
+            json!({}),
+            execution.clone(),
+        );
+        let cancel = async {
+            started.notified().await;
+            // Unknown executions must not invoke any provider.
+            runtime
+                .cancel(&ToolExecutionContext::new("unknown", "other-batch", 0))
+                .await
+                .unwrap();
+            runtime.cancel(&execution).await.unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(call, cancel)
+        })
+        .await
+        .expect("selected provider must receive cancellation");
+        assert!(matches!(result, Err(ToolError::Cancelled(_))));
+        assert_eq!(unrelated.load(Ordering::SeqCst), 0);
+        assert_eq!(cancellations.load(Ordering::SeqCst), 1);
+        assert!(runtime.active.lock().unwrap().is_empty());
+        assert_eq!(runtime.audit()[0].outcome, WipAuditOutcome::Cancelled);
+        runtime.cancel(&execution).await.unwrap();
+        assert_eq!(cancellations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn static_contributed_cancellation_ignores_unrelated_and_shared_handlers() {
+        assert_contributed_cancellation_is_selected_once(false).await;
+    }
+
+    #[tokio::test]
+    async fn dynamic_contributed_cancellation_pins_the_dispatched_instance() {
+        assert_contributed_cancellation_is_selected_once(true).await;
     }
 
     #[tokio::test]
