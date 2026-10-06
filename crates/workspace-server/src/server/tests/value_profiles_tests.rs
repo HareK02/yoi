@@ -303,6 +303,141 @@ async fn value_profiles_scalar_and_table_scopes_analyze_save_and_resolve_equally
     assert_eq!(scopes[1], scopes[2]);
 }
 
+fn profile_fixture_decodal(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(fields) => format!(
+            "{{ {} }}",
+            fields
+                .iter()
+                .map(|(key, value)| format!("{key} = {};", profile_fixture_decodal(value)))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+        serde_json::Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(profile_fixture_decodal)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        serde_json::Value::Null => panic!("fixture omission must not be represented as null"),
+        value => value.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn value_profiles_authoring_corpus_preserves_effective_runtime_settings() {
+    let cases: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+        "../../../../../resources/config-schema/profile-authoring-values.json"
+    ))
+    .unwrap();
+    // The canonical token fixture must exercise every serializable setting,
+    // so adding a field to CompactionConfigPartial cannot silently outgrow the
+    // editor-shape coverage. Aliases/ratio helpers have separate corpus cases.
+    let default = serde_json::to_value(manifest::CompactionConfigPartial::default()).unwrap();
+    let canonical = cases
+        .iter()
+        .find(|case| case["name"] == "canonical_compaction_tokens")
+        .unwrap();
+    assert_eq!(
+        default
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<std::collections::BTreeSet<_>>(),
+        canonical["profile"]["compaction"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|name| name.as_str() != "kind")
+            .collect()
+    );
+    for case in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        let recipe = profile_fixture_decodal(&case["profile"]);
+        for (index, (form, patched)) in [
+            (recipe.clone(), false),
+            (r#"import "./recipe.dcdl""#.into(), false),
+            (
+                r#"(import "./recipe.dcdl") // { description = "patched"; }"#.into(),
+                true,
+            ),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let extra = if index == 0 {
+                vec![config_source::ConfigTreeChange::Create {
+                    path: config_source::VirtualPath::parse("recipe.dcdl").unwrap(),
+                    content_type: config_source::ConfigContentType::Decodal,
+                    content: recipe.clone(),
+                }]
+            } else {
+                vec![]
+            };
+            let authored = format!("{} as WorkspaceConfigSchema", source(form));
+            let state = commit_workspace_config_tree(
+                &api,
+                TEST_WORKSPACE_ID,
+                &request(&api, &authored, extra),
+            )
+            .unwrap();
+            let environment = config_source::SnapshotEnvironment::new(state.snapshot.clone())
+                .with_schema_bundle(state.contract.schema_bundle.clone());
+            let diagnostics = environment.analyze(
+                &config_source::VirtualPath::parse("main.dcdl").unwrap(),
+                None,
+            );
+            assert!(diagnostics.is_empty(), "{}: {diagnostics:?}", case["name"]);
+            let mut expected = case["profile"].clone();
+            if *patched {
+                expected["description"] = serde_json::json!("patched");
+            }
+            let evaluated = environment.evaluate_contract(&state.contract).unwrap();
+            assert_eq!(
+                evaluated.projections[0]
+                    .data_json
+                    .pointer("/profile/entries/0/profile"),
+                Some(&expected)
+            );
+            let projection =
+                project_profiles_from_workspace_config(TEST_WORKSPACE_ID, &state).unwrap();
+            let bundle = build_virtual_profile_config_bundle(
+                &projection,
+                &state,
+                TEST_WORKSPACE_ID,
+                "created",
+                "project:alpha",
+            )
+            .unwrap()
+            .unwrap();
+            let resolved = bundle
+                .profile_source_archive
+                .as_ref()
+                .unwrap()
+                .verify()
+                .unwrap()
+                .resolve_profile(
+                    "project:alpha",
+                    Path::new("/runtime-worker"),
+                    "corpus-worker",
+                )
+                .unwrap();
+            let manifest = serde_json::to_value(resolved).unwrap();
+            for (pointer, value) in case["manifest_expect"].as_object().unwrap() {
+                assert_eq!(
+                    manifest.pointer(pointer),
+                    Some(value),
+                    "{}: {pointer}",
+                    case["name"]
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn value_profiles_invalid_saves_preserve_the_active_config() {
     let dir = tempfile::tempdir().unwrap();

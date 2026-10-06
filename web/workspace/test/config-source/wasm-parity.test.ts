@@ -382,6 +382,22 @@ Deno.test("generated WASM completes asserted WorkspaceConfigSchema keys", () => 
   assertEquals(result.items.some((item) => item.label === "profile"), true);
 });
 
+function fixtureDecodal(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(fixtureDecodal).join(", ")}]`;
+  if (value !== null && typeof value === "object") {
+    return `{ ${
+      Object.entries(value).map(([key, value]) =>
+        `${key} = ${fixtureDecodal(value)};`
+      ).join(" ")
+    } }`;
+  }
+  if (
+    typeof value === "string" || typeof value === "number" ||
+    typeof value === "boolean"
+  ) return JSON.stringify(value);
+  throw new Error("fixture omission must not be represented as null/undefined");
+}
+
 Deno.test("generated WASM authors value-based Profiles using the Backend schema without materializing authoring fields", async () => {
   const source = await Deno.readTextFile(
     new URL(
@@ -655,6 +671,85 @@ Deno.test("generated WASM authors value-based Profiles using the Backend schema 
           : expected,
       );
     }
+  }
+  const cases = JSON.parse(
+    await Deno.readTextFile(
+      new URL(
+        "../../../../resources/config-schema/profile-authoring-values.json",
+        import.meta.url,
+      ),
+    ),
+  ) as Array<{ name: string; profile: Record<string, unknown> }>;
+  for (const fixture of cases) {
+    const recipe = fixtureDecodal(fixture.profile);
+    for (
+      const [form, patched] of [[recipe, false], [
+        'import "./recipe.dcdl"',
+        false,
+      ], [
+        '(import "./recipe.dcdl") // { description = "patched"; }',
+        true,
+      ]] as const
+    ) {
+      const fixtureContent = content.replace(
+        "profile = {};",
+        `profile = ${form};`,
+      );
+      const fixtureTree = {
+        ...tree,
+        entries: {
+          "main.dcdl": {
+            ...tree.entries["main.dcdl"],
+            content: fixtureContent,
+            content_digest: await digestText(fixtureContent),
+          },
+          "recipe.dcdl": {
+            path: "recipe.dcdl",
+            content_type: "decodal",
+            content: recipe,
+            content_digest: await digestText(recipe),
+          },
+        },
+      };
+      assertEquals(
+        analyze_snapshot(fixtureTree, "main.dcdl", undefined),
+        [],
+        `${fixture.name}: ${form}`,
+      );
+      const result = evaluate_snapshot(
+        fixtureTree,
+        valueContract,
+      ) as typeof evaluated;
+      assertEquals(
+        result.projections[0].data_json.profile.entries[0].profile,
+        patched
+          ? { ...fixture.profile, description: "patched" }
+          : fixture.profile,
+      );
+    }
+  }
+  for (
+    const [path, prefix, label] of [
+      ["compaction", "reta", "retained_tokens"],
+      ["compaction", "prune_min", "prune_min_savings"],
+      ["compaction", "req", "request"],
+      ["compaction", "wor", "worker"],
+      ["compaction", "compact_ret", "compact_retained_tokens"],
+      ["feature.memory.extraction", "reas", "reasoning"],
+      ["feature.subjektiv.extraction", "reas", "reasoning"],
+    ]
+  ) {
+    const body =
+      `{ profile.entries = [{ profile.${path} = { ${prefix} } }]; } as WorkspaceConfigSchema`;
+    const cursor = body.lastIndexOf(prefix) + prefix.length;
+    const result = complete_current("main.dcdl", body, cursor, true) as {
+      items: Array<{ label: string }>;
+    };
+    assertEquals(
+      result.items.some((item) => item.label === label),
+      true,
+      `${path}.${label}`,
+    );
   }
   // Neither completion nor diagnostic shape checking changes the saved value.
   assertEquals(evaluate_snapshot(tree, valueContract), evaluated);

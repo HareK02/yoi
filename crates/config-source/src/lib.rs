@@ -2738,6 +2738,110 @@ mod tests {
         }
     }
 
+    fn fixture_decodal(value: &serde_json::Value) -> String {
+        match value {
+            serde_json::Value::Object(fields) => format!(
+                "{{ {} }}",
+                fields
+                    .iter()
+                    .map(|(key, value)| format!("{key} = {};", fixture_decodal(value)))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            serde_json::Value::Array(values) => format!(
+                "[{}]",
+                values
+                    .iter()
+                    .map(fixture_decodal)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            serde_json::Value::Null => panic!("fixture omission must not be represented as null"),
+            value => value.to_string(),
+        }
+    }
+
+    #[test]
+    fn actual_profile_authoring_value_corpus_preserves_supported_forms() {
+        let cases: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../../resources/config-schema/profile-authoring-values.json"
+        ))
+        .unwrap();
+        for case in cases {
+            let recipe = fixture_decodal(&case["profile"]);
+            for (form, patched) in [
+                (recipe.clone(), false),
+                (r#"import "./recipe.dcdl""#.into(), false),
+                (
+                    r#"(import "./recipe.dcdl") // { description = "patched"; }"#.into(),
+                    true,
+                ),
+            ] {
+                let source = format!(
+                    r#"{{ profile.entries = [{{ selector = "project:corpus"; profile = {form}; }}]; }} as WorkspaceConfigSchema"#
+                );
+                let snapshot = ConfigTreeSnapshot::from_entries(
+                    10,
+                    [entry("main.dcdl", &source), entry("recipe.dcdl", &recipe)],
+                )
+                .unwrap();
+                let schema = actual_profile_schema();
+                let environment =
+                    SnapshotEnvironment::new(snapshot).with_schema_bundle(schema.clone());
+                let contract =
+                    ToolchainContract::with_schema_bundle(1, vec![path("main.dcdl")], 1, schema);
+                let before = environment.evaluate_contract(&contract).unwrap();
+                let diagnostics = environment.analyze(&path("main.dcdl"), None);
+                assert!(
+                    diagnostics.is_empty(),
+                    "{}: {form}: {diagnostics:?}",
+                    case["name"]
+                );
+                let mut expected = case["profile"].clone();
+                if patched {
+                    expected["description"] = serde_json::json!("patched");
+                }
+                assert_eq!(
+                    before.projections[0]
+                        .data_json
+                        .pointer("/profile/entries/0/profile"),
+                    Some(&expected),
+                    "{}",
+                    case["name"]
+                );
+                assert_eq!(environment.evaluate_contract(&contract).unwrap(), before);
+            }
+        }
+        let source = "{} as WorkspaceConfigSchema";
+        let environment = SnapshotEnvironment::new(
+            ConfigTreeSnapshot::from_entries(10, [entry("main.dcdl", source)]).unwrap(),
+        )
+        .with_schema_bundle(actual_profile_schema());
+        for (profile_path, prefix, label) in [
+            ("compaction", "reta", "retained_tokens"),
+            ("compaction", "prune_min", "prune_min_savings"),
+            ("compaction", "req", "request"),
+            ("compaction", "wor", "worker"),
+            ("compaction", "compact_ret", "compact_retained_tokens"),
+            ("feature.memory.extraction", "reas", "reasoning"),
+            ("feature.subjektiv.extraction", "reas", "reasoning"),
+        ] {
+            let marked = format!(
+                "{{ profile.entries = [{{ profile.{profile_path} = {{ {prefix}| }}; }}]; }} as WorkspaceConfigSchema"
+            );
+            let cursor = marked.find('|').unwrap();
+            let source = marked.replace('|', "");
+            let result = environment
+                .complete_config(&path("main.dcdl"), &source, cursor, true)
+                .unwrap()
+                .unwrap();
+            assert!(
+                result.items.iter().any(|item| item.label == label),
+                "{source}: {result:?}"
+            );
+        }
+    }
+
     #[test]
     fn completion_authoring_sources_compose_with_validation_source_fallbacks() {
         let schema = WorkspaceConfigSchemaBundle::compose([

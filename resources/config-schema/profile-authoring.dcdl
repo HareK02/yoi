@@ -9,7 +9,8 @@ let
         capability = Unknown; context_window = Int; max_context_window = Int;
     };
     Extraction = {
-        enabled = Bool; model = Model; reasoning = String;
+        # ReasoningControl accepts string effort or signed integer budget.
+        enabled = Bool; model = Model; reasoning = Unknown;
         threshold = Int; worker_max_turns = Int;
     };
     # Profile scope accepts either a string intent or a table. Decodal 0.4 has
@@ -56,9 +57,19 @@ let
             env = { inherit = [...String]; set = { ...Unknown }; };
         }]; };
         compaction = {
+            # Token settings (CompactionConfigPartial) and ratio helper fields.
+            # Threshold/context values accept integer tokens or numeric ratios.
             kind = String; threshold = Unknown; request_threshold = Unknown;
-            prune_enabled = Bool; worker_context_max_tokens = Unknown;
-            worker_max_turns = Int; model = Model;
+            worker_context_max_tokens = Unknown; request = Unknown; worker = Unknown;
+            prune_enabled = Bool; prune_protected_tokens = Int; prune_min_savings = Int;
+            retained_tokens = Int;
+            overview_target_tokens = Int; overview_warning_tokens = Int; overview_deadline_tokens = Int;
+            finish_warning_remaining_tokens = Int; final_reserve_tokens = Int;
+            worker_max_turns = Int; summary_target_tokens = Int; summary_max_tokens = Int;
+            auto_read_budget_tokens = Int; result_context_max_tokens = Int; model = Model;
+            # Supported token aliases remain authorable without rewriting recipes.
+            compact_threshold = Int; compact_request_threshold = Int; compact_retained_tokens = Int;
+            compact_worker_max_input_tokens = Int; compact_worker_max_turns = Int; compact_auto_read_budget = Int;
         };
         web = {
             enabled = Bool; allow_private_addresses = Bool;
