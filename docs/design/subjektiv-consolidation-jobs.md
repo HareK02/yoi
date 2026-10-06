@@ -10,7 +10,10 @@ planned in T-708/T-709 are outside this Backend change.
 
 The existing backlog/byte thresholds and missing/stale/failed surface policy
 remain the launch decision. A Job captures an immutable bounded batch (up to 100
-candidate IDs) plus the Subject store revision. An empty batch is valid for a
+candidate IDs) plus the Subject store revision. Selection also reserves the Job's
+16 KiB result budget, accounting for JSON-escaped IDs appearing in both the batch
+claim and compact verified outcomes. Excess candidates remain staged for a later
+batch. An empty batch is valid for a
 surface-only rebuild. The Backend explicitly binds the Subject and candidate
 batch grant in durable Job intent before Worker execution. No subject-body
 singleton ownership or Session attribution is transferred to the Job.
@@ -49,7 +52,10 @@ structured surface outcome. It does **not** schedule a Worker-owned post-Run tas
 The result call serializes and caches the exact generated outcome for ambiguous
 submission replay. The Backend verifies every batch disposition and the current
 store revision, generation ownership and persisted ready/failed surface fields;
-it enriches the durable result with actual immutable candidate dispositions.
+it enriches the durable result with actual immutable candidate disposition
+summaries (`candidate_id` and `action`). Full reasons, affected revisions and
+source edges remain in the existing immutable receipt store; they are not copied
+into a bounded Job result. Exact replay uses the same verified compact projection.
 Thus confirmed-memory consolidation and surface readiness are separate outcomes.
 A recorded surface failure does not undo Memory. A stale/unfinished/fabricated
 surface cannot be reported completed. Final prose or Idle is never success.

@@ -147,6 +147,29 @@ pub(super) async fn retire_legacy_worker(api: &WorkspaceApi, subject_id: &str) -
         .is_none())
 }
 
+fn bounded_candidate_batch(
+    ids: impl IntoIterator<Item = String>,
+    max_result_bytes: u32,
+) -> Result<Vec<String>> {
+    // Reserve the bounded subject and Host surface envelope. Each candidate ID
+    // appears twice (input claims and verified outcome); account for JSON escaping,
+    // not raw UTF-8 bytes. The fixed per-item allowance covers action and framing.
+    let mut estimated_bytes = 2_048_usize;
+    let mut selected = Vec::new();
+    for id in ids.into_iter().take(CANDIDATE_BATCH_LIMIT) {
+        let id_bytes = serde_json::to_vec(&id)
+            .map_err(|e| Error::InvalidInput(e.to_string()))?
+            .len();
+        let additional = 2 * id_bytes + 128;
+        if estimated_bytes + additional > max_result_bytes as usize {
+            break;
+        }
+        estimated_bytes += additional;
+        selected.push(id);
+    }
+    Ok(selected)
+}
+
 pub(super) fn dispatch(
     api: &WorkspaceApi,
     subject_id: &str,
@@ -158,12 +181,14 @@ pub(super) fn dispatch(
         .subject(subject_id)
         .map_err(subjektiv_store_error)?
         .ok_or_else(|| Error::SubjektivSubjectNotFound(subject_id.into()))?;
-    let candidate_ids: Vec<_> = store
-        .pending_staging_candidates(subject_id, CANDIDATE_BATCH_LIMIT)
-        .map_err(subjektiv_store_error)?
-        .into_iter()
-        .map(|c| c.id)
-        .collect();
+    let candidate_ids = bounded_candidate_batch(
+        store
+            .pending_staging_candidates(subject_id, CANDIDATE_BATCH_LIMIT)
+            .map_err(subjektiv_store_error)?
+            .into_iter()
+            .map(|c| c.id),
+        crate::backend_job::DEFAULT_MAX_RESULT_BYTES,
+    )?;
     let batch_len = candidate_ids.len();
     let request = BackendJobRequest {
         job_id: format!("subjektiv-consolidation:{}", Uuid::new_v4()),
@@ -296,8 +321,10 @@ pub(super) fn with_dispositions(
             .ok_or_else(|| {
                 Error::InvalidInput(format!("candidate `{id}` has no durable disposition"))
             })?;
-        dispositions
-            .push(serde_json::to_value(resolution).map_err(|e| Error::Store(e.to_string()))?);
+        // Full reasons, affected revisions and source edges remain in the existing
+        // immutable receipt store. Duplicating them makes a valid bounded batch's
+        // completion unbounded; this result is its verified compact projection.
+        dispositions.push(serde_json::json!({ "candidate_id": id, "action": resolution.action }));
     }
     let mut enriched = value.clone();
     enriched
@@ -308,4 +335,35 @@ pub(super) fn with_dispositions(
             serde_json::Value::Array(dispositions),
         );
     Ok(enriched)
+}
+
+#[cfg(test)]
+mod result_budget_tests {
+    use super::*;
+
+    #[test]
+    fn escaped_maximum_ids_leave_a_bounded_complete_result() {
+        let ids: Vec<_> = (0..100)
+            .map(|i| format!("{i:03}{}", "\\\"".repeat(126)))
+            .collect();
+        let batch =
+            bounded_candidate_batch(ids.clone(), crate::backend_job::DEFAULT_MAX_RESULT_BYTES)
+                .unwrap();
+        assert!(!batch.is_empty());
+        assert!(batch.len() < ids.len());
+        assert_eq!(batch, ids[..batch.len()]);
+        let dispositions: Vec<_> = batch
+            .iter()
+            .map(|id| serde_json::json!({"candidate_id":id,"action":"already_covered"}))
+            .collect();
+        let result = serde_json::json!({
+            "subject_id":"\\\"".repeat(128),"candidate_ids":batch,
+            "candidate_dispositions":dispositions,
+            "surface":{"availability":"failed","generation_id":"g".repeat(100),"store_revision":u64::MAX,"reason_code":"\\\"".repeat(128)},
+        });
+        assert!(
+            serde_json::to_vec(&result).unwrap().len()
+                <= crate::backend_job::DEFAULT_MAX_RESULT_BYTES as usize
+        );
+    }
 }

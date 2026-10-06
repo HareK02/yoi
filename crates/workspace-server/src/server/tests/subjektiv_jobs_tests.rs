@@ -607,3 +607,126 @@ async fn subjektiv_job_legacy_cutover_waits_foreground_then_removes_only_owned_c
     assert!(api.runtime.worker(&subject_body).is_ok());
     assert!(store.subject(&subject.id).unwrap().is_some());
 }
+
+#[tokio::test]
+async fn subjektiv_job_long_receipts_and_escaped_ids_fit_result_budget_without_losing_followup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (api, _) = test_api_with_recording_backend(dir.path()).await;
+    let store = open_subjektiv_store(&api).unwrap();
+    let subject = store
+        .create_subject(SubjectRole::new("result-budget").unwrap())
+        .unwrap();
+    for i in 0..100 {
+        stage(
+            &store,
+            &subject.id,
+            &format!("candidate-{i:03}-{}", "\\\"".repeat(60)),
+        );
+    }
+    start_subjektiv_staging_consolidation(
+        api.clone(),
+        &subject.id,
+        MemoryConsolidateStagingOperation { force: true },
+    )
+    .await
+    .unwrap();
+    let job = resource(&api, &subject.id);
+    let ids = job
+        .request
+        .grants
+        .subjektiv_consolidation
+        .as_ref()
+        .unwrap()
+        .candidate_ids
+        .clone();
+    assert!(!ids.is_empty() && ids.len() < 100);
+    let attempt = current_attempt(&api, &job);
+    let worker = attempt.worker.as_ref().unwrap();
+    for id in &ids {
+        store
+            .decide_candidate(
+                &subject.id,
+                CandidateDecisionRequest {
+                    request_id: format!("decision-{}", uuid::Uuid::new_v4()),
+                    candidate_id: id.clone(),
+                    reason: "Existing confirmed detail remains in its immutable receipt. "
+                        .repeat(500),
+                    decision: CandidateDecision::Close {
+                        action: crate::subjektiv::StagingResolutionAction::Discarded,
+                        affected_memory: vec![],
+                    },
+                },
+            )
+            .unwrap();
+    }
+    let generation = store
+        .prepare_job_surface_generation(
+            &subject.id,
+            Some((&job.request.job_id, &attempt.attempt_id)),
+        )
+        .unwrap();
+    let snapshot = store
+        .publish_surface_generation(&subject.id, &generation.id, vec![])
+        .unwrap();
+    let submission = BackendJobResultSubmission {
+        job_id: job.request.job_id.clone(),
+        attempt_id: attempt.attempt_id.clone(),
+        input_revision: job.request.input_revision.clone(),
+        result: serde_json::json!({"subject_id":subject.id,"candidate_ids":ids,"surface":{"availability":"ready","generation_id":generation.id,"store_revision":generation.store_revision,"snapshot_id":snapshot.id}}),
+    };
+    seed_worker_session_for_cleanup(dir.path(), worker);
+    let accepted = api.accept_backend_job_result(worker, &submission).unwrap();
+    let result = accepted.job.result.as_ref().unwrap();
+    assert!(
+        serde_json::to_vec(result).unwrap().len() <= job.request.limits.max_result_bytes as usize
+    );
+    let outcomes = result["candidate_dispositions"].as_array().unwrap();
+    assert_eq!(outcomes.len(), ids.len());
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| o["action"] == "discarded" && o.get("reason").is_none())
+    );
+    assert_eq!(
+        store.pending_staging_backlog(&subject.id).unwrap().0,
+        100 - ids.len()
+    );
+    assert!(
+        api.accept_backend_job_result(worker, &submission)
+            .unwrap()
+            .replayed
+    );
+    wait_for_backend_job_worker_cleanup(
+        &api,
+        &job.request.job_id,
+        &attempt.attempt_id,
+        BackendJobWorkerCleanupState::Completed,
+    )
+    .await;
+    start_subjektiv_staging_consolidation(
+        api.clone(),
+        &subject.id,
+        MemoryConsolidateStagingOperation { force: true },
+    )
+    .await
+    .unwrap();
+    let next = resource(&api, &subject.id);
+    assert!(
+        next.request
+            .grants
+            .subjektiv_consolidation
+            .unwrap()
+            .candidate_ids
+            .iter()
+            .all(|id| !ids.contains(id))
+    );
+    assert!(
+        store
+            .staging_resolution(&subject.id, &ids[0])
+            .unwrap()
+            .unwrap()
+            .reason
+            .len()
+            > 16 * 1024
+    );
+}
