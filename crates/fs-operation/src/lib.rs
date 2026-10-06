@@ -13,6 +13,7 @@ mod ignore_tests;
 mod local;
 mod operation;
 mod search;
+pub mod text;
 #[cfg(test)]
 mod traversal_tests;
 mod walk;
