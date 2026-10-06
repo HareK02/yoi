@@ -544,6 +544,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "builtin-source"
+version = "0.1.0"
+dependencies = [
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -766,6 +773,7 @@ dependencies = [
 name = "config-source"
 version = "0.1.0"
 dependencies = [
+ "builtin-source",
  "decodal",
  "decodal-language-service",
  "decodal-language-tools",
@@ -2598,6 +2606,7 @@ version = "0.1.0"
 dependencies = [
  "agen",
  "arc-swap",
+ "builtin-source",
  "decodal",
  "protocol",
  "secrets",

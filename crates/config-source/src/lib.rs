@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::{Arc, Mutex};
+
+use builtin_source::BUILTIN_PROFILE_RESOURCES;
 
 use decodal::{
     Data, Diagnostic, DiagnosticKind, Engine, HostEnvironment, ImportCandidate, ImportLoader,
@@ -22,6 +25,7 @@ pub const MAX_CHANGE_COUNT: usize = 256;
 pub const MAX_ENTRY_BYTES: usize = 256 * 1024;
 pub const MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_PATH_BYTES: usize = 512;
+pub const MAX_IMPORT_DEPTH: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, ts_rs::TS)]
 pub struct VirtualPath(String);
@@ -249,6 +253,7 @@ impl ConfigEntry {
         content_type: ConfigContentType,
         content: impl Into<String>,
     ) -> Result<Self, ConfigTreeError> {
+        validate_workspace_path(&path)?;
         let content = content.into();
         if content.len() > MAX_ENTRY_BYTES {
             return Err(ConfigTreeError::LimitExceeded("entry bytes"));
@@ -282,6 +287,10 @@ impl ConfigTreeSnapshot {
         let mut ordered = BTreeMap::new();
         let mut total = 0usize;
         for entry in entries {
+            validate_workspace_path(&entry.path)?;
+            if entry.content.len() > MAX_ENTRY_BYTES {
+                return Err(ConfigTreeError::LimitExceeded("entry bytes"));
+            }
             total = total
                 .checked_add(entry.content.len())
                 .ok_or(ConfigTreeError::LimitExceeded("total bytes"))?;
@@ -363,6 +372,7 @@ impl ConfigTreeSnapshot {
         let mut touched = BTreeSet::new();
         for change in changes {
             for path in change.paths() {
+                validate_workspace_path(path)?;
                 if !touched.insert(path.clone()) {
                     return Err(ConfigTreeError::PathChangedMoreThanOnce(path.clone()));
                 }
@@ -1087,6 +1097,26 @@ impl SnapshotEnvironment {
         &self,
         contract: &ToolchainContract,
     ) -> Result<EvaluationResult, Vec<ConfigDiagnostic>> {
+        self.evaluate_with_builtin_sources(contract, Arc::default())
+    }
+
+    /// Capture only builtin sources actually loaded by evaluation, including transitive imports.
+    /// These immutable bytes are provenance for the evaluated value, not Runtime inputs.
+    pub fn builtin_import_sources(
+        &self,
+        contract: &ToolchainContract,
+    ) -> Result<BTreeMap<String, String>, Vec<ConfigDiagnostic>> {
+        let sources = Arc::default();
+        self.evaluate_with_builtin_sources(contract, Arc::clone(&sources))?;
+        let captured = sources.lock().expect("builtin source capture lock").clone();
+        Ok(captured)
+    }
+
+    fn evaluate_with_builtin_sources(
+        &self,
+        contract: &ToolchainContract,
+        sources: Arc<Mutex<BTreeMap<String, String>>>,
+    ) -> Result<EvaluationResult, Vec<ConfigDiagnostic>> {
         if let Err(error) = contract.validate() {
             return Err(vec![self.config_error(
                 VirtualPath::parse(WORKSPACE_CONFIG_SCHEMA_SOURCE).expect("schema path is valid"),
@@ -1144,9 +1174,9 @@ impl SnapshotEnvironment {
                 "configured entrypoint is not Decodal source",
             )]);
         }
-        let mut engine = decodal::Engine::new(SnapshotImportLoader {
-            snapshot: self.snapshot.clone(),
-        });
+        let mut loader = SnapshotImportLoader::new(self.snapshot.clone());
+        loader.builtin_sources = sources;
+        let mut engine = decodal::Engine::new(loader);
         let schema_module = engine
             .add_root_source(
                 WORKSPACE_CONFIG_SCHEMA_SOURCE,
@@ -1424,9 +1454,7 @@ impl HostEnvironment for &SnapshotEnvironment {
     type Loader = SnapshotImportLoader;
 
     fn create_loader(&self) -> Self::Loader {
-        SnapshotImportLoader {
-            snapshot: self.snapshot.clone(),
-        }
+        SnapshotImportLoader::new(self.snapshot.clone())
     }
 
     fn configure_engine(&self, engine: &mut Engine<Self::Loader>) -> decodal::Result<()> {
@@ -1532,9 +1560,18 @@ impl HostEnvironment for ConfigAuthoringEnvironment<'_> {
 #[derive(Debug, Clone)]
 pub struct SnapshotImportLoader {
     snapshot: ConfigTreeSnapshot,
+    builtin_sources: Arc<Mutex<BTreeMap<String, String>>>,
+    import_edges: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl SnapshotImportLoader {
+    fn new(snapshot: ConfigTreeSnapshot) -> Self {
+        Self {
+            snapshot,
+            builtin_sources: Arc::default(),
+            import_edges: BTreeMap::new(),
+        }
+    }
     pub fn resolve(
         &self,
         current_key: Option<&str>,
@@ -1555,6 +1592,70 @@ impl ImportLoader for SnapshotImportLoader {
         specifier: &str,
     ) -> decodal::Result<LoadedImport> {
         let path = self.resolve(current_key, specifier).map_err(import_error)?;
+        // Guard the import graph before returning a module to Decodal. In particular,
+        // cycles hidden inside lazy object fields must not recurse during materialization.
+        let current = current_key
+            .expect("resolve requires a source context")
+            .split("@sha256:")
+            .next()
+            .unwrap();
+        if self
+            .import_edges
+            .entry(current.to_string())
+            .or_default()
+            .insert(path.to_string())
+        {
+            let mut depths = BTreeMap::new();
+            let validation = self.import_edges.keys().try_for_each(|root| {
+                validate_import_graph(&self.import_edges, root, &mut BTreeSet::new(), &mut depths)
+                    .map(|_| ())
+            });
+            if let Err(diagnostic) = validation {
+                // A language service can keep using its loader after a diagnostic.
+                // Only successful edges may be cached as already validated.
+                self.import_edges
+                    .get_mut(current)
+                    .unwrap()
+                    .remove(path.as_str());
+                return Err(diagnostic);
+            }
+        }
+        if is_builtin_path(&path) {
+            let public_path = path.as_str().strip_prefix("$builtin/").unwrap_or("");
+            let resource = BUILTIN_PROFILE_RESOURCES
+                .iter()
+                .find(|resource| resource.path == public_path)
+                .ok_or_else(|| {
+                    Diagnostic::new(
+                        DiagnosticKind::Import,
+                        Span::default(),
+                        format!("unknown or non-public read-only builtin source: {path}"),
+                    )
+                })?;
+            let mut captured = self
+                .builtin_sources
+                .lock()
+                .expect("builtin source capture lock");
+            captured.insert(path.to_string(), resource.source.to_string());
+            if captured.len() + self.snapshot.entries.len() > MAX_ENTRY_COUNT {
+                return Err(import_error(ConfigTreeError::LimitExceeded("entry count")));
+            }
+            let bytes: usize = captured.values().map(String::len).sum::<usize>()
+                + self
+                    .snapshot
+                    .entries
+                    .values()
+                    .map(|entry| entry.content.len())
+                    .sum::<usize>();
+            if resource.source.len() > MAX_ENTRY_BYTES || bytes > MAX_TOTAL_BYTES {
+                return Err(import_error(ConfigTreeError::LimitExceeded("total bytes")));
+            }
+            return Ok(LoadedImport::source(
+                format!("{path}@{}", digest_bytes(resource.source.as_bytes())),
+                path.as_str(),
+                resource.source,
+            ));
+        }
         let entry = self.snapshot.get(&path).ok_or_else(|| {
             Diagnostic::new(
                 DiagnosticKind::Import,
@@ -1598,9 +1699,50 @@ impl ImportLoader for SnapshotImportLoader {
             .map_err(import_error)?;
         Ok(import_completions(&self.snapshot, current.as_ref(), prefix)
             .into_iter()
-            .map(|specifier| ImportCandidate::new(specifier).with_detail("virtual config source"))
+            .map(|specifier| {
+                let builtin = specifier.starts_with("$builtin/")
+                    || current.as_ref().is_some_and(|p| is_builtin_path(p));
+                ImportCandidate::new(specifier).with_detail(if builtin {
+                    "read-only builtin Decodal source"
+                } else {
+                    "virtual config source"
+                })
+            })
             .collect())
     }
+}
+
+fn validate_import_graph(
+    edges: &BTreeMap<String, BTreeSet<String>>,
+    current: &str,
+    visiting: &mut BTreeSet<String>,
+    depths: &mut BTreeMap<String, usize>,
+) -> decodal::Result<usize> {
+    if let Some(depth) = depths.get(current) {
+        return Ok(*depth);
+    }
+    if !visiting.insert(current.to_string()) {
+        return Err(Diagnostic::new(
+            DiagnosticKind::Cycle,
+            Span::default(),
+            format!("virtual config import cycle at {current}"),
+        ));
+    }
+    if visiting.len() > MAX_IMPORT_DEPTH + 1 {
+        return Err(import_error(ConfigTreeError::LimitExceeded("import depth")));
+    }
+    let mut depth = 0;
+    if let Some(children) = edges.get(current) {
+        for child in children {
+            depth = depth.max(validate_import_graph(edges, child, visiting, depths)? + 1);
+        }
+    }
+    if depth > MAX_IMPORT_DEPTH {
+        return Err(import_error(ConfigTreeError::LimitExceeded("import depth")));
+    }
+    visiting.remove(current);
+    depths.insert(current.to_string(), depth);
+    Ok(depth)
 }
 
 fn snapshot_import_cache_key(entry: &ConfigEntry) -> String {
@@ -1608,6 +1750,19 @@ fn snapshot_import_cache_key(entry: &ConfigEntry) -> String {
     // resolution. The cache identity also includes immutable source content so
     // equal paths from different revisions cannot alias in an Engine cache.
     format!("{}@{}", entry.path, entry.content_digest)
+}
+
+fn is_builtin_path(path: &VirtualPath) -> bool {
+    path.as_str() == "$builtin" || path.as_str().starts_with("$builtin/")
+}
+
+fn validate_workspace_path(path: &VirtualPath) -> Result<(), ConfigTreeError> {
+    if is_builtin_path(path) {
+        return Err(ConfigTreeError::InvalidPath(format!(
+            "{path}: builtin namespace is read-only"
+        )));
+    }
+    Ok(())
 }
 
 pub fn resolve_import(
@@ -1623,6 +1778,15 @@ pub fn resolve_import(
     {
         return Err(ConfigTreeError::InvalidImport(specifier.into()));
     }
+    let current_builtin = is_builtin_path(current);
+    let explicit_builtin = specifier == "$builtin" || specifier.starts_with("$builtin/");
+    if current_builtin
+        && !explicit_builtin
+        && !specifier.starts_with("./")
+        && !specifier.starts_with("../")
+    {
+        return Err(ConfigTreeError::InvalidImport(specifier.into()));
+    }
     let mut components = if specifier.starts_with("./") || specifier.starts_with("../") {
         current.parent_components()
     } else {
@@ -1632,6 +1796,9 @@ pub fn resolve_import(
         match component {
             "" | "." => {}
             ".." => {
+                if (current_builtin || explicit_builtin) && components.len() <= 1 {
+                    return Err(ConfigTreeError::ImportEscape(specifier.into()));
+                }
                 components
                     .pop()
                     .ok_or_else(|| ConfigTreeError::ImportEscape(specifier.into()))?;
@@ -1648,6 +1815,26 @@ pub fn import_completions(
     prefix: &str,
 ) -> Vec<String> {
     let mut candidates = BTreeSet::new();
+    for resource in BUILTIN_PROFILE_RESOURCES {
+        let specifier = format!("$builtin/{}", resource.path);
+        if specifier.starts_with(prefix) {
+            candidates.insert(specifier);
+        }
+        if let Some(current) = current.filter(|path| is_builtin_path(path)) {
+            let parent = current.parent_components().join("/");
+            if let Some(relative) =
+                format!("$builtin/{}", resource.path).strip_prefix(&format!("{parent}/"))
+            {
+                let relative = format!("./{relative}");
+                if relative.starts_with(prefix) {
+                    candidates.insert(relative);
+                }
+            }
+        }
+    }
+    if current.is_some_and(is_builtin_path) {
+        return candidates.into_iter().collect();
+    }
     for path in snapshot.entries.keys() {
         if current == Some(path) {
             continue;
@@ -3366,6 +3553,254 @@ mod tests {
         assert_eq!(diagnostics[0].kind, "import");
         assert!(diagnostics[0].message.contains("invalid YAML frontmatter"));
         assert!(diagnostics[0].message.contains("skills/broken/SKILL.md"));
+    }
+
+    #[test]
+    fn builtin_imports_are_ordinary_values_with_confined_transitive_sources() {
+        let snapshot = ConfigTreeSnapshot::from_entries(1, [
+            entry("main.dcdl", r#"import "$builtin/profiles/companion.dcdl" // { worker = { mode = "wip"; }; feature = { workspace_config = { enabled = true; }; }; }"#),
+            entry("profiles/base.dcdl", "{ slug = \"workspace-shadow\"; }"),
+        ]).unwrap();
+        let environment = SnapshotEnvironment::new(snapshot);
+        let contract = ToolchainContract::new(1, vec![path("main.dcdl")], 1);
+        let result = environment.evaluate_contract(&contract).unwrap();
+        let value = &result.projections[0].data_json;
+        assert_eq!(value["slug"], "companion");
+        assert_eq!(value["worker"]["mode"], "wip");
+        assert_eq!(value["feature"]["workspace_config"]["enabled"], true);
+        assert_eq!(value["feature"]["ticket"]["enabled"], true);
+        let closure = environment.builtin_import_sources(&contract).unwrap();
+        assert_eq!(
+            closure.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "$builtin/profiles/base.dcdl",
+                "$builtin/profiles/companion.dcdl"
+            ]
+        );
+        assert_eq!(
+            closure["$builtin/profiles/base.dcdl"],
+            BUILTIN_PROFILE_RESOURCES[0].source
+        );
+
+        // Intersections conflict on explicit builtin values, exactly like any other import.
+        let snapshot = ConfigTreeSnapshot::from_entries(
+            1,
+            [entry(
+                "main.dcdl",
+                r#"import "$builtin/profiles/companion.dcdl" & { slug = "different"; }"#,
+            )],
+        )
+        .unwrap();
+        assert!(
+            SnapshotEnvironment::new(snapshot)
+                .evaluate_contract(&contract)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn builtin_namespace_rejects_unknown_sources_escape_and_host_paths() {
+        let contract = ToolchainContract::new(1, vec![path("main.dcdl")], 1);
+        for specifier in [
+            "$builtin/profiles/private.dcdl",
+            "$builtin/prompts/default.md",
+            "$builtin/../profiles/base.dcdl",
+            "$builtin/profiles/../../profiles/base.dcdl",
+            "/etc/passwd",
+            "file:///etc/passwd",
+            "https://example.com/main.dcdl",
+            "builtin:companion",
+        ] {
+            let source = format!("import {specifier:?}");
+            let snapshot = ConfigTreeSnapshot::from_entries(
+                1,
+                [
+                    entry("main.dcdl", &source),
+                    entry("profiles/base.dcdl", "{ spoof = true; }"),
+                ],
+            )
+            .unwrap();
+            let diagnostics = SnapshotEnvironment::new(snapshot)
+                .evaluate_contract(&contract)
+                .unwrap_err();
+            assert_eq!(
+                diagnostics[0].kind, "import",
+                "{specifier}: {diagnostics:?}"
+            );
+            assert!(!diagnostics[0].message.is_empty());
+        }
+        let current = path("$builtin/profiles/companion.dcdl");
+        assert_eq!(
+            resolve_import(&current, "./base.dcdl").unwrap(),
+            path("$builtin/profiles/base.dcdl")
+        );
+        assert!(resolve_import(&current, "../../main.dcdl").is_err());
+        assert!(resolve_import(&current, "main.dcdl").is_err());
+        assert!(resolve_import(&current, "/main.dcdl").is_err());
+    }
+
+    #[test]
+    fn builtin_namespace_is_not_a_mutable_workspace_tree() {
+        let builtin = path("$builtin/profiles/companion.dcdl");
+        assert!(
+            ConfigEntry::new(builtin.clone(), ConfigContentType::Decodal, "{}")
+                .unwrap_err()
+                .to_string()
+                .contains("read-only")
+        );
+        for change in [
+            ConfigTreeChange::Create {
+                path: builtin.clone(),
+                content_type: ConfigContentType::Decodal,
+                content: "{}".into(),
+            },
+            ConfigTreeChange::Delete {
+                path: builtin.clone(),
+                expected_digest: "digest".into(),
+            },
+            ConfigTreeChange::Rename {
+                from: path("main.dcdl"),
+                to: builtin,
+                expected_digest: "digest".into(),
+            },
+        ] {
+            assert!(
+                ConfigTreeSnapshot::empty()
+                    .apply(&[change])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("read-only")
+            );
+        }
+        let environment = SnapshotEnvironment::new(ConfigTreeSnapshot::empty());
+        let completions = import_completions(
+            environment.snapshot(),
+            Some(&path("main.dcdl")),
+            "$builtin/profiles/",
+        );
+        assert_eq!(completions.len(), BUILTIN_PROFILE_RESOURCES.len());
+        assert!(environment.snapshot().list_prefix(None).is_empty());
+    }
+
+    #[test]
+    fn builtin_values_do_not_bypass_cycle_or_path_limits() {
+        let snapshot = ConfigTreeSnapshot::from_entries(1, [
+            entry("main.dcdl", r#"{ builtin = import "$builtin/profiles/companion.dcdl"; cycle = import "./cycle.dcdl"; }"#),
+            entry("cycle.dcdl", r#"import "./main.dcdl""#),
+        ]).unwrap();
+        let contract = ToolchainContract::new(1, vec![path("main.dcdl")], 1);
+        let diagnostics = SnapshotEnvironment::new(snapshot)
+            .evaluate_contract(&contract)
+            .unwrap_err();
+        assert_eq!(diagnostics[0].kind, "cycle");
+        let mut loader = SnapshotImportLoader::new(ConfigTreeSnapshot::empty());
+        for index in 0..=MAX_IMPORT_DEPTH {
+            loader.import_edges.insert(
+                format!("{index}.dcdl"),
+                BTreeSet::from([format!("{}.dcdl", index + 1)]),
+            );
+        }
+        let diagnostic = validate_import_graph(
+            &loader.import_edges,
+            "0.dcdl",
+            &mut BTreeSet::new(),
+            &mut BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(diagnostic.message.contains("import depth"));
+        let oversized = format!("$builtin/profiles/{}.dcdl", "x".repeat(MAX_PATH_BYTES));
+        assert!(matches!(
+            resolve_import(&path("main.dcdl"), &oversized),
+            Err(ConfigTreeError::LimitExceeded("path bytes"))
+        ));
+    }
+
+    #[test]
+    fn rejected_import_graph_edges_stay_rejected_after_diagnostics() {
+        let mut loader = SnapshotImportLoader::new(
+            ConfigTreeSnapshot::from_entries(1, [entry("a.dcdl", "{}"), entry("b.dcdl", "{}")])
+                .unwrap(),
+        );
+        loader.load(Some("a.dcdl"), "./b.dcdl").unwrap();
+        for _ in 0..2 {
+            let diagnostic = loader.load(Some("b.dcdl"), "./a.dcdl").unwrap_err();
+            assert_eq!(diagnostic.kind, DiagnosticKind::Cycle);
+        }
+    }
+
+    #[test]
+    fn import_graph_shared_dependencies_are_memoized_without_losing_depth() {
+        let mut edges = BTreeMap::new();
+        for index in 0..=MAX_IMPORT_DEPTH {
+            edges.insert(
+                format!("{index}"),
+                BTreeSet::from([format!("{}", index + 1), format!("{}", index + 2)]),
+            );
+        }
+        let mut depths = BTreeMap::new();
+        assert!(validate_import_graph(&edges, "0", &mut BTreeSet::new(), &mut depths).is_err());
+        edges.remove(&MAX_IMPORT_DEPTH.to_string());
+        let mut depths = BTreeMap::new();
+        assert_eq!(
+            validate_import_graph(&edges, "0", &mut BTreeSet::new(), &mut depths).unwrap(),
+            MAX_IMPORT_DEPTH
+        );
+        assert_eq!(depths.len(), MAX_IMPORT_DEPTH + 2);
+    }
+
+    #[test]
+    fn snapshot_import_depth_is_checked_before_evaluation_recurses() {
+        let mut entries = Vec::new();
+        for index in 0..=MAX_IMPORT_DEPTH + 1 {
+            let source = if index == MAX_IMPORT_DEPTH + 1 {
+                "{}".to_string()
+            } else {
+                format!("import \"./{}.dcdl\"", index + 1)
+            };
+            entries.push(entry(&format!("{index}.dcdl"), &source));
+        }
+        let diagnostics =
+            SnapshotEnvironment::new(ConfigTreeSnapshot::from_entries(1, entries).unwrap())
+                .evaluate_contract(&ToolchainContract::new(1, vec![path("0.dcdl")], 1))
+                .unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("import depth"))
+        );
+    }
+
+    #[test]
+    fn builtin_dependencies_share_snapshot_count_and_byte_budgets() {
+        let contract = ToolchainContract::new(1, vec![path("main.dcdl")], 1);
+        let mut entries = vec![entry(
+            "main.dcdl",
+            r#"import "$builtin/profiles/companion.dcdl""#,
+        )];
+        for i in 1..MAX_ENTRY_COUNT {
+            entries.push(text_entry(&format!("unused/{i}.txt"), ""));
+        }
+        let environment =
+            SnapshotEnvironment::new(ConfigTreeSnapshot::from_entries(1, entries).unwrap());
+        let diagnostics = environment.evaluate_contract(&contract).unwrap_err();
+        assert!(diagnostics[0].message.contains("entry count"));
+        let mut entries = vec![entry(
+            "main.dcdl",
+            r#"import "$builtin/profiles/companion.dcdl""#,
+        )];
+        let source_len = entries[0].content.len();
+        for i in 0..16 {
+            let bytes = if i == 15 {
+                MAX_ENTRY_BYTES - source_len
+            } else {
+                MAX_ENTRY_BYTES
+            };
+            entries.push(text_entry(&format!("unused/{i}.txt"), &"a".repeat(bytes)));
+        }
+        let environment =
+            SnapshotEnvironment::new(ConfigTreeSnapshot::from_entries(1, entries).unwrap());
+        let diagnostics = environment.evaluate_contract(&contract).unwrap_err();
+        assert!(diagnostics[0].message.contains("total bytes"));
     }
 
     #[test]

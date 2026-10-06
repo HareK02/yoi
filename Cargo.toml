@@ -25,6 +25,7 @@ members = [
     "crates/tools",
     "crates/fs-operation",
     "crates/flow",
+    "crates/builtin-source",
     "crates/config-source",
     "crates/config-source-wasm",
     "crates/workdir",
@@ -63,6 +64,7 @@ default-members = [
     "crates/tools",
     "crates/fs-operation",
     "crates/flow",
+    "crates/builtin-source",
     "crates/config-source",
     "crates/config-source-wasm",
     "crates/workdir",
@@ -116,6 +118,7 @@ runtime-api = { path = "crates/runtime-api" }
 server-api = { path = "crates/server-api" }
 secrets = { path = "crates/secrets" }
 tools = { path = "crates/tools" }
+builtin-source = { path = "crates/builtin-source" }
 config-source = { path = "crates/config-source" }
 fs-operation = { path = "crates/fs-operation" }
 workdir = { path = "crates/workdir" }
