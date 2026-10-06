@@ -1,3 +1,8 @@
+mod worker_operations;
+pub(crate) use worker_operations::{
+    WorkerOperationContext, WorkspaceWorker, WorkspaceWorkerMethodSender,
+};
+
 #[path = "server_workspace_config.rs"]
 mod workspace_config;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -6674,7 +6679,18 @@ fn worker_spawn_result_to_api(
     })
 }
 
-fn worker_input_result_to_api(result: WorkerInputResult) -> server_api::RuntimeWorkerInputResult {
+fn worker_input_result_to_api(
+    mut result: WorkerInputResult,
+) -> server_api::RuntimeWorkerInputResult {
+    // The existing wire result has no disposition field. Keep uncertain delivery
+    // distinguishable without collapsing it into a definite refusal or replaying input.
+    if result.disposition == WorkerInputDisposition::Unknown {
+        result.diagnostics.push(RuntimeDiagnostic {
+            code: "worker_input_outcome_unknown".into(),
+            severity: HostDiagnosticSeverity::Warning,
+            message: "Worker input delivery outcome is unknown; inspect the current session before retrying".into(),
+        });
+    }
     server_api::RuntimeWorkerInputResult {
         state: result.state.into(),
         runtime_id: result.worker.runtime_id,
@@ -8127,7 +8143,7 @@ impl server_api::ServerApi for ServerApiContractService {
         let Json(response) = list_known_workers(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedWorkspacePath { workspace_id }),
-            contract_request_headers(&context)?,
+            current_worker_contract_headers(&context)?,
         )
         .await
         .map_err(ApiError::into_repository_api_error)?;
@@ -8144,7 +8160,7 @@ impl server_api::ServerApi for ServerApiContractService {
         spawn_known_worker(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedWorkspacePath { workspace_id }),
-            contract_request_headers(&context)?,
+            current_worker_contract_headers(&context)?,
             Json(request),
         )
         .await
@@ -8167,7 +8183,7 @@ impl server_api::ServerApi for ServerApiContractService {
                 workspace_id,
                 worker: RuntimeWorkerRef::new(runtime_id, worker_id),
             }),
-            contract_request_headers(&context)?,
+            current_worker_contract_headers(&context)?,
             Json(request),
         )
         .await
@@ -8190,7 +8206,7 @@ impl server_api::ServerApi for ServerApiContractService {
                 workspace_id,
                 worker: RuntimeWorkerRef::new(runtime_id, worker_id),
             }),
-            contract_request_headers(&context)?,
+            current_worker_contract_headers(&context)?,
             Json(request),
         )
         .await
@@ -8213,7 +8229,7 @@ impl server_api::ServerApi for ServerApiContractService {
                 workspace_id,
                 worker: RuntimeWorkerRef::new(runtime_id, worker_id),
             }),
-            contract_request_headers(&context)?,
+            current_worker_contract_headers(&context)?,
             Json(request),
         )
         .await
@@ -8235,7 +8251,7 @@ impl server_api::ServerApi for ServerApiContractService {
                 workspace_id,
                 worker: RuntimeWorkerRef::new(runtime_id, worker_id),
             }),
-            contract_request_headers(&context)?,
+            current_worker_contract_headers(&context)?,
         )
         .await
         .map(|Json(response)| response)
@@ -8253,7 +8269,7 @@ impl server_api::ServerApi for ServerApiContractService {
         let Json(response) = scoped_list_worker_observation_sessions(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedWorkspacePath { workspace_id }),
-            contract_request_headers(&context)?,
+            current_worker_contract_headers(&context)?,
         )
         .await
         .map_err(ApiError::into_repository_api_error)?;
@@ -8272,7 +8288,7 @@ impl server_api::ServerApi for ServerApiContractService {
         let Json(response) = scoped_capture_worker_observation_session(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedWorkspacePath { workspace_id }),
-            contract_request_headers(&context)?,
+            current_worker_contract_headers(&context)?,
             Json(request),
         )
         .await
@@ -8947,34 +8963,40 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn runtime_worker_restore_alias(
         &self,
+        context: server_api::ServerRequestContext,
         runtime_id: String,
         worker_id: String,
     ) -> std::result::Result<server_api::WorkerRestoreResponse, server_api::RepositoryApiError>
     {
-        restore_runtime_worker(
-            State(self.workspace_api()?.clone()),
-            AxumPath((runtime_id, worker_id)),
-        )
-        .await
-        .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
+        let api = self.workspace_api()?.clone();
+        let operation_context = WorkerOperationContext::from_request(&api, &context)?;
+        restore_runtime_worker_with_context(api, runtime_id, worker_id, operation_context)
+            .await
+            .map(|Json(response)| response)
+            .map_err(ApiError::into_repository_api_error)
     }
 
     async fn runtime_worker_restore(
         &self,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         runtime_id: String,
         worker_id: String,
         query: server_api::RestoreTicketAssignmentQuery,
     ) -> std::result::Result<server_api::WorkerRestoreResponse, server_api::RepositoryApiError>
     {
-        scoped_restore_runtime_worker(
-            State(self.workspace_api()?.clone()),
-            AxumPath(ScopedRuntimeWorkerPath {
+        let api = self.workspace_api()?.clone();
+        let operation_context = WorkerOperationContext::from_request(&api, &context)?;
+        validate_workspace_scope(&api, &workspace_id)
+            .map_err(ApiError::into_repository_api_error)?;
+        scoped_restore_runtime_worker_with_context(
+            api,
+            ScopedRuntimeWorkerPath {
                 workspace_id,
                 worker: RuntimeWorkerRef::new(runtime_id, worker_id),
-            }),
-            Query(query),
+            },
+            query,
+            operation_context,
         )
         .await
         .map(|Json(response)| response)
@@ -8983,40 +9005,42 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn runtime_worker_pin(
         &self,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         runtime_id: String,
         worker_id: String,
     ) -> std::result::Result<server_api::WorkerRetentionResponse, server_api::RepositoryApiError>
     {
-        let Json(response) = scoped_pin_runtime_worker(
-            State(self.workspace_api()?.clone()),
-            AxumPath(ScopedRuntimeWorkerPath {
-                workspace_id,
-                worker: RuntimeWorkerRef::new(runtime_id, worker_id),
-            }),
-        )
-        .await
-        .map_err(ApiError::into_repository_api_error)?;
-        Ok(response)
+        let api = self.workspace_api()?.clone();
+        let operation_context = WorkerOperationContext::from_request(&api, &context)?;
+        validate_workspace_scope(&api, &workspace_id)
+            .map_err(ApiError::into_repository_api_error)?;
+        let worker = WorkspaceWorker::resolve(&api, &runtime_id, &worker_id)
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+        worker
+            .set_pinned(&operation_context, true)
+            .await
+            .map_err(ApiError::into_repository_api_error)
     }
 
     async fn runtime_worker_unpin(
         &self,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         runtime_id: String,
         worker_id: String,
     ) -> std::result::Result<server_api::WorkerRetentionResponse, server_api::RepositoryApiError>
     {
-        let Json(response) = scoped_unpin_runtime_worker(
-            State(self.workspace_api()?.clone()),
-            AxumPath(ScopedRuntimeWorkerPath {
-                workspace_id,
-                worker: RuntimeWorkerRef::new(runtime_id, worker_id),
-            }),
-        )
-        .await
-        .map_err(ApiError::into_repository_api_error)?;
-        Ok(response)
+        let api = self.workspace_api()?.clone();
+        let operation_context = WorkerOperationContext::from_request(&api, &context)?;
+        validate_workspace_scope(&api, &workspace_id)
+            .map_err(ApiError::into_repository_api_error)?;
+        let worker = WorkspaceWorker::resolve(&api, &runtime_id, &worker_id)
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+        worker
+            .set_pinned(&operation_context, false)
+            .await
+            .map_err(ApiError::into_repository_api_error)
     }
 
     async fn runtime_cleanup_plan(
@@ -9039,6 +9063,7 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn runtime_cleanup_execute(
         &self,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         runtime_id: String,
         request: server_api::ExecuteRuntimeCleanupRequest,
@@ -9046,55 +9071,58 @@ impl server_api::ServerApi for ServerApiContractService {
         server_api::RuntimeCleanupExecutionResponse,
         server_api::RepositoryApiError,
     > {
-        let Json(response) = scoped_execute_runtime_cleanup(
-            State(self.workspace_api()?.clone()),
-            AxumPath(ScopedRuntimePath {
-                workspace_id,
-                runtime_id,
-            }),
-            Json(request),
-        )
-        .await
-        .map_err(ApiError::into_repository_api_error)?;
-        Ok(response)
+        let api = self.workspace_api()?.clone();
+        let operation_context = WorkerOperationContext::from_request(&api, &context)?;
+        validate_workspace_scope(&api, &workspace_id)
+            .map_err(ApiError::into_repository_api_error)?;
+        execute_runtime_cleanup_with_context(&api, &runtime_id, request, &operation_context)
+            .await
+            .map_err(ApiError::into_repository_api_error)
     }
 
     async fn runtime_worker_input_alias(
         &self,
+        context: server_api::ServerRequestContext,
         runtime_id: String,
         worker_id: String,
         request: server_api::RuntimeWorkerInputRequest,
     ) -> std::result::Result<server_api::RuntimeWorkerInputResult, server_api::RepositoryApiError>
     {
-        let Json(response) = send_runtime_worker_input(
-            State(self.workspace_api()?.clone()),
-            AxumPath((runtime_id, worker_id)),
-            Json(request),
-        )
-        .await
-        .map_err(ApiError::into_repository_api_error)?;
-        Ok(response)
+        let api = self.workspace_api()?.clone();
+        let operation_context = WorkerOperationContext::from_request(&api, &context)?;
+        let worker = WorkspaceWorker::resolve(&api, &runtime_id, &worker_id)
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+        let request = worker_input_request_from_api(request)
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+        worker
+            .input(&operation_context, request)
+            .await
+            .map(worker_input_result_to_api)
+            .map_err(ApiError::into_repository_api_error)
     }
 
     async fn runtime_worker_input(
         &self,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         runtime_id: String,
         worker_id: String,
         request: server_api::RuntimeWorkerInputRequest,
     ) -> std::result::Result<server_api::RuntimeWorkerInputResult, server_api::RepositoryApiError>
     {
-        let Json(response) = scoped_send_runtime_worker_input(
-            State(self.workspace_api()?.clone()),
-            AxumPath(ScopedRuntimeWorkerPath {
-                workspace_id,
-                worker: RuntimeWorkerRef::new(runtime_id, worker_id),
-            }),
-            Json(request),
-        )
-        .await
-        .map_err(ApiError::into_repository_api_error)?;
-        Ok(response)
+        let api = self.workspace_api()?.clone();
+        let operation_context = WorkerOperationContext::from_request(&api, &context)?;
+        validate_workspace_scope(&api, &workspace_id)
+            .map_err(ApiError::into_repository_api_error)?;
+        let worker = WorkspaceWorker::resolve(&api, &runtime_id, &worker_id)
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+        let request = worker_input_request_from_api(request)
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+        worker
+            .input(&operation_context, request)
+            .await
+            .map(worker_input_result_to_api)
+            .map_err(ApiError::into_repository_api_error)
     }
 
     async fn runtime_worker_attachment_upload_grant(
@@ -9239,78 +9267,96 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn runtime_worker_stop_alias(
         &self,
+        context: server_api::ServerRequestContext,
         runtime_id: String,
         worker_id: String,
         request: server_api::RuntimeWorkerLifecycleRequest,
     ) -> std::result::Result<server_api::RuntimeWorkerLifecycleResult, server_api::RepositoryApiError>
     {
-        let Json(response) = stop_runtime_worker(
-            State(self.workspace_api()?.clone()),
-            AxumPath((runtime_id, worker_id)),
-            Json(request),
-        )
-        .await
-        .map_err(ApiError::into_repository_api_error)?;
-        Ok(response)
+        let api = self.workspace_api()?.clone();
+        let operation_context = WorkerOperationContext::from_request(&api, &context)?;
+        let worker = WorkspaceWorker::resolve(&api, &runtime_id, &worker_id)
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+        worker
+            .stop(
+                &operation_context,
+                worker_lifecycle_request_from_api(request),
+            )
+            .await
+            .map(worker_lifecycle_result_to_api)
+            .map_err(ApiError::into_repository_api_error)
     }
 
     async fn runtime_worker_stop(
         &self,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         runtime_id: String,
         worker_id: String,
         request: server_api::RuntimeWorkerLifecycleRequest,
     ) -> std::result::Result<server_api::RuntimeWorkerLifecycleResult, server_api::RepositoryApiError>
     {
-        let Json(response) = scoped_stop_runtime_worker(
-            State(self.workspace_api()?.clone()),
-            AxumPath(ScopedRuntimeWorkerPath {
-                workspace_id,
-                worker: RuntimeWorkerRef::new(runtime_id, worker_id),
-            }),
-            Json(request),
-        )
-        .await
-        .map_err(ApiError::into_repository_api_error)?;
-        Ok(response)
+        let api = self.workspace_api()?.clone();
+        let operation_context = WorkerOperationContext::from_request(&api, &context)?;
+        validate_workspace_scope(&api, &workspace_id)
+            .map_err(ApiError::into_repository_api_error)?;
+        let worker = WorkspaceWorker::resolve(&api, &runtime_id, &worker_id)
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+        worker
+            .stop(
+                &operation_context,
+                worker_lifecycle_request_from_api(request),
+            )
+            .await
+            .map(worker_lifecycle_result_to_api)
+            .map_err(ApiError::into_repository_api_error)
     }
 
     async fn runtime_worker_cancel_alias(
         &self,
+        context: server_api::ServerRequestContext,
         runtime_id: String,
         worker_id: String,
         request: server_api::RuntimeWorkerLifecycleRequest,
     ) -> std::result::Result<server_api::RuntimeWorkerLifecycleResult, server_api::RepositoryApiError>
     {
-        let Json(response) = cancel_runtime_worker(
-            State(self.workspace_api()?.clone()),
-            AxumPath((runtime_id, worker_id)),
-            Json(request),
-        )
-        .await
-        .map_err(ApiError::into_repository_api_error)?;
-        Ok(response)
+        let api = self.workspace_api()?.clone();
+        let operation_context = WorkerOperationContext::from_request(&api, &context)?;
+        let worker = WorkspaceWorker::resolve(&api, &runtime_id, &worker_id)
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+        worker
+            .cancel(
+                &operation_context,
+                worker_lifecycle_request_from_api(request),
+            )
+            .await
+            .map(worker_lifecycle_result_to_api)
+            .map_err(ApiError::into_repository_api_error)
     }
 
     async fn runtime_worker_cancel(
         &self,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         runtime_id: String,
         worker_id: String,
         request: server_api::RuntimeWorkerLifecycleRequest,
     ) -> std::result::Result<server_api::RuntimeWorkerLifecycleResult, server_api::RepositoryApiError>
     {
-        let Json(response) = scoped_cancel_runtime_worker(
-            State(self.workspace_api()?.clone()),
-            AxumPath(ScopedRuntimeWorkerPath {
-                workspace_id,
-                worker: RuntimeWorkerRef::new(runtime_id, worker_id),
-            }),
-            Json(request),
-        )
-        .await
-        .map_err(ApiError::into_repository_api_error)?;
-        Ok(response)
+        let api = self.workspace_api()?.clone();
+        let operation_context = WorkerOperationContext::from_request(&api, &context)?;
+        validate_workspace_scope(&api, &workspace_id)
+            .map_err(ApiError::into_repository_api_error)?;
+        let worker = WorkspaceWorker::resolve(&api, &runtime_id, &worker_id)
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?;
+        worker
+            .cancel(
+                &operation_context,
+                worker_lifecycle_request_from_api(request),
+            )
+            .await
+            .map(worker_lifecycle_result_to_api)
+            .map_err(ApiError::into_repository_api_error)
     }
 
     async fn repository_list(
@@ -22229,13 +22275,17 @@ async fn scoped_workspace_protocol_ws(
     State(api): State<WorkspaceApi>,
     Extension(actor): Extension<RequestActor>,
     AxumPath(workspace_id): AxumPath<String>,
+    headers: HeaderMap,
     ws: axum::extract::ws::WebSocketUpgrade,
 ) -> std::result::Result<Response, Response> {
     validate_workspace_scope(&api, &workspace_id).map_err(|error| error.into_response())?;
-    let input_source = authenticated_browser_input_source(&actor);
+    let context = WorkerOperationContext::Browser {
+        headers,
+        source: authenticated_browser_input_source(&actor),
+    };
     Ok(ws
         .on_upgrade(move |socket| {
-            crate::workspace_subscription::serve_workspace_subscription(api, socket, input_source)
+            crate::workspace_subscription::serve_workspace_subscription(api, socket, context)
         })
         .into_response())
 }
@@ -22380,13 +22430,22 @@ async fn worker_remove_contract(
             None,
         )
     })?;
-    let response = WorkerRemovalService::new(api)
-        .execute_async(
-            source,
-            &request.target_runtime_id,
-            &request.target_worker_id,
-            &request.reason,
-        )
+    let worker =
+        WorkspaceWorker::resolve(api, &request.target_runtime_id, &request.target_worker_id)
+            .map_err(|error| match error {
+                Error::UnknownWorker { .. } => server_api::WorkerRemoveApiError::new(
+                    StatusCode::NOT_FOUND.as_u16(),
+                    None,
+                    Some("unknown_worker".into()),
+                    Some("The target Worker is not known in this Workspace".into()),
+                    None,
+                ),
+                error => worker_remove_repository_error(
+                    ApiError::from(error).into_repository_api_error(),
+                ),
+            })?;
+    let response = worker
+        .remove(source, &request.reason)
         .await
         .unwrap_or_else(|_| {
             worker_remove_error_response(
@@ -22736,36 +22795,16 @@ async fn send_known_worker_input(
 ) -> ApiResult<Json<server_api::RuntimeWorkerInputResult>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
-    let controller = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
-    let permission = if request.kind.as_deref() == Some("notify") {
-        "notify"
-    } else {
-        "send_input"
+    let context = WorkerOperationContext::WorkerControl {
+        controller: RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id),
     };
-    let grant = authorize_known_worker_permission(
-        &api,
-        &path.workspace_id,
-        &controller,
-        &path.worker,
-        permission,
-    )?;
-    let lock = worker_control_lock(&api, &grant.grant_id);
-    let _guard = lock.lock().await;
-    authorize_known_worker_permission(
-        &api,
-        &path.workspace_id,
-        &controller,
-        &path.worker,
-        permission,
-    )?;
-    let mut request = worker_input_request_from_api(request)?;
+    let worker = WorkspaceWorker::resolve(&api, &path.worker.runtime_id, &path.worker.worker_id)?;
+    let request = worker_input_request_from_api(request)?;
     let idle_only = request.kind == WorkerInputKind::User;
-    if idle_only {
-        request.kind = WorkerInputKind::UserIfIdle;
-    }
-    let Json(result) =
-        dispatch_runtime_worker_input(api, path.worker.runtime_id, path.worker.worker_id, request)?;
-    if result.state != server_api::WorkerOperationState::Accepted {
+    let result = worker.input(&context, request).await?;
+    let outcome_unknown = result.disposition == WorkerInputDisposition::Unknown;
+    let result = worker_input_result_to_api(result);
+    if result.state != server_api::WorkerOperationState::Accepted && !outcome_unknown {
         let detail = result
             .diagnostics
             .iter()
@@ -22792,24 +22831,15 @@ async fn cancel_known_worker(
 ) -> ApiResult<Json<server_api::RuntimeWorkerLifecycleResult>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
-    let controller = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
-    let grant = authorize_known_worker_permission(
-        &api,
-        &path.workspace_id,
-        &controller,
-        &path.worker,
-        "cancel",
-    )?;
-    let lock = worker_control_lock(&api, &grant.grant_id);
-    let _guard = lock.lock().await;
-    authorize_known_worker_permission(
-        &api,
-        &path.workspace_id,
-        &controller,
-        &path.worker,
-        "cancel",
-    )?;
-    scoped_cancel_runtime_worker(State(api), AxumPath(path), Json(request)).await
+    let context = WorkerOperationContext::WorkerControl {
+        controller: RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id),
+    };
+    let worker = WorkspaceWorker::resolve(&api, &path.worker.runtime_id, &path.worker.worker_id)?;
+    Ok(Json(worker_lifecycle_result_to_api(
+        worker
+            .cancel(&context, worker_lifecycle_request_from_api(request))
+            .await?,
+    )))
 }
 
 async fn stop_known_worker(
@@ -22820,14 +22850,15 @@ async fn stop_known_worker(
 ) -> ApiResult<Json<server_api::RuntimeWorkerLifecycleResult>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
-    let subject = path.worker.clone();
-    let controller = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
-    let grant =
-        authorize_known_worker_permission(&api, &path.workspace_id, &controller, &subject, "stop")?;
-    let lock = worker_control_lock(&api, &grant.grant_id);
-    let _guard = lock.lock().await;
-    authorize_known_worker_permission(&api, &path.workspace_id, &controller, &subject, "stop")?;
-    scoped_stop_runtime_worker(State(api), AxumPath(path), Json(request)).await
+    let context = WorkerOperationContext::WorkerControl {
+        controller: RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id),
+    };
+    let worker = WorkspaceWorker::resolve(&api, &path.worker.runtime_id, &path.worker.worker_id)?;
+    Ok(Json(worker_lifecycle_result_to_api(
+        worker
+            .stop(&context, worker_lifecycle_request_from_api(request))
+            .await?,
+    )))
 }
 
 async fn restore_known_worker(
@@ -22837,27 +22868,11 @@ async fn restore_known_worker(
 ) -> ApiResult<Json<server_api::WorkerRestoreResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
-    let subject = path.worker.clone();
-    let controller = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
-    let grant = authorize_known_worker_permission(
-        &api,
-        &path.workspace_id,
-        &controller,
-        &subject,
-        "restore",
-    )?;
-    let lock = worker_control_lock(&api, &grant.grant_id);
-    let _guard = lock.lock().await;
-    authorize_known_worker_permission(&api, &path.workspace_id, &controller, &subject, "restore")?;
-    scoped_restore_runtime_worker(
-        State(api),
-        AxumPath(path),
-        Query(RestoreTicketAssignmentQuery {
-            ticket_id: None,
-            assignment_operation_id: None,
-        }),
-    )
-    .await
+    let context = WorkerOperationContext::WorkerControl {
+        controller: RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id),
+    };
+    restore_runtime_worker_with_context(api, path.worker.runtime_id, path.worker.worker_id, context)
+        .await
 }
 
 async fn scoped_list_worker_observation_sessions(
@@ -25388,48 +25403,19 @@ fn recover_workdir_removals(api: &WorkspaceApi) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 async fn set_worker_retention(
     api: WorkspaceApi,
     runtime_id: String,
     runtime_worker_id: String,
     pinned: bool,
 ) -> ApiResult<Json<WorkerRetentionResponse>> {
-    parse_runtime_worker_id_for_registry(&runtime_worker_id)?;
-    let worker_ref = RuntimeWorkerRef::new(runtime_id.clone(), runtime_worker_id.clone());
-    if api
-        .store
-        .get_worker_registry(&api.config.workspace_id, &worker_ref)?
-        .is_none()
-    {
-        if let Ok(worker) = api.runtime.worker(&worker_ref) {
-            let _ = sync_worker_observation(&api, &worker);
-        }
-    }
-    let retention_state = if pinned { "pinned" } else { "normal" };
-    let changed = api.worker_projection.publish_ordered(|| {
-        api.store
-            .update_worker_retention(
-                &api.config.workspace_id,
-                &worker_ref,
-                retention_state,
-                now_registry_timestamp().as_str(),
-            )
-            .map(|commit| (!commit.changes.is_empty(), commit))
-    })?;
-    if !changed {
-        return Err(cleanup_api_error(
-            runtime_id.as_str(),
-            "workspace_worker_retention_unknown_worker",
-            "Worker is not known to the Backend registry",
-        ));
-    }
-    Ok(Json(WorkerRetentionResponse {
-        workspace_id: api.config.workspace_id,
-        runtime_id: worker_ref.runtime_id,
-        worker_id: worker_ref.worker_id,
-        pinned,
-        retention_state: retention_state.to_string(),
-    }))
+    let worker = WorkspaceWorker::resolve(&api, &runtime_id, &runtime_worker_id)?;
+    Ok(Json(
+        worker
+            .set_pinned(&WorkerOperationContext::Backend, pinned)
+            .await?,
+    ))
 }
 
 fn build_runtime_cleanup_plan(
@@ -25656,11 +25642,30 @@ fn cleanup_plan_digest(
     Ok(format!("sha256:{digest}"))
 }
 
+#[cfg(test)]
 async fn execute_runtime_cleanup(
     api: &WorkspaceApi,
     runtime_id: &str,
     request: ExecuteRuntimeCleanupRequest,
 ) -> ApiResult<RuntimeCleanupExecutionResponse> {
+    execute_runtime_cleanup_with_context(api, runtime_id, request, &WorkerOperationContext::Backend)
+        .await
+}
+
+async fn execute_runtime_cleanup_with_context(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+    request: ExecuteRuntimeCleanupRequest,
+    context: &WorkerOperationContext,
+) -> ApiResult<RuntimeCleanupExecutionResponse> {
+    if matches!(context, WorkerOperationContext::WorkerControl { .. }) {
+        return Err(Error::WorkspacePermissionDenied(
+            "Worker control uses target-bound WorkerRemove authority, not aggregate cleanup".into(),
+        )
+        .into());
+    }
+
+    context.authorize_workspace(api).await?;
     let plan = build_runtime_cleanup_plan(api, runtime_id)?;
     if request.expected_plan_revision != plan.revision
         || request.expected_plan_digest != plan.digest
@@ -25713,8 +25718,8 @@ async fn execute_runtime_cleanup(
             ));
         }
         parse_runtime_worker_id_for_registry(&candidate.runtime_worker_id)?;
-        WorkerRemovalService::new(api)
-            .execute_cleanup_removal(candidate)
+        WorkspaceWorker::resolve(api, &worker.runtime_id, &worker.worker_id)?
+            .delete_from_plan(context, candidate)
             .await?;
         api.workdir_session_locks
             .lock()
@@ -26063,15 +26068,26 @@ async fn scoped_get_runtime_worker(
     .await
 }
 
-async fn scoped_restore_runtime_worker(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
-    Query(query): Query<RestoreTicketAssignmentQuery>,
+async fn scoped_restore_runtime_worker_with_context(
+    api: WorkspaceApi,
+    path: ScopedRuntimeWorkerPath,
+    query: RestoreTicketAssignmentQuery,
+    context: WorkerOperationContext,
 ) -> ApiResult<Json<server_api::WorkerRestoreResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
+    let resolved = WorkspaceWorker::resolve(&api, &path.worker.runtime_id, &path.worker.worker_id)?;
+    let _authorization = resolved.authorize_operation(&context, "restore").await?;
     let workspace_id = path.workspace_id.clone();
-    let runtime_id = path.worker.runtime_id.clone();
-    let worker_id = path.worker.worker_id.clone();
+    let runtime_id = resolved.identity().runtime_id.clone();
+    let worker_id = resolved.identity().worker_id.clone();
+    if matches!(context, WorkerOperationContext::WorkerControl { .. })
+        && (query.ticket_id.is_some() || query.assignment_operation_id.is_some())
+    {
+        return Err(Error::WorkspacePermissionDenied(
+            "Worker control grants do not authorize Ticket assignment".into(),
+        )
+        .into());
+    }
     let assignment_request = match (
         query.ticket_id.clone(),
         query.assignment_operation_id.clone(),
@@ -26134,9 +26150,12 @@ async fn scoped_restore_runtime_worker(
             }));
         }
     }
-    let response = restore_runtime_worker(
-        State(api.clone()),
-        AxumPath((runtime_id.clone(), worker_id.clone())),
+    drop(_authorization);
+    let response = restore_runtime_worker_with_context(
+        api.clone(),
+        runtime_id.clone(),
+        worker_id.clone(),
+        context,
     )
     .await?;
     if let Some(assignment) = assignment_request.as_ref() {
@@ -26144,22 +26163,6 @@ async fn scoped_restore_runtime_worker(
         accept_queued_ticket_after_worker_spawn(&api, assignment)?;
     }
     Ok(response)
-}
-
-async fn scoped_pin_runtime_worker(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
-) -> ApiResult<Json<WorkerRetentionResponse>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    set_worker_retention(api, path.worker.runtime_id, path.worker.worker_id, true).await
-}
-
-async fn scoped_unpin_runtime_worker(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
-) -> ApiResult<Json<WorkerRetentionResponse>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    set_worker_retention(api, path.worker.runtime_id, path.worker.worker_id, false).await
 }
 
 async fn scoped_runtime_cleanup_plan(
@@ -26171,6 +26174,7 @@ async fn scoped_runtime_cleanup_plan(
     Ok(Json(plan))
 }
 
+#[cfg(test)]
 async fn scoped_execute_runtime_cleanup(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimePath>,
@@ -26403,6 +26407,7 @@ async fn scoped_delete_runtime_worker_uploaded_file(
     .await
 }
 
+#[cfg(test)]
 async fn scoped_send_runtime_worker_input(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
@@ -26431,36 +26436,9 @@ async fn scoped_runtime_worker_completions(
     .await
 }
 
-async fn scoped_stop_runtime_worker(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
-    Json(request): Json<server_api::RuntimeWorkerLifecycleRequest>,
-) -> ApiResult<Json<server_api::RuntimeWorkerLifecycleResult>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    stop_runtime_worker(
-        State(api),
-        AxumPath((path.worker.runtime_id, path.worker.worker_id)),
-        Json(request),
-    )
-    .await
-}
-
-async fn scoped_cancel_runtime_worker(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
-    Json(request): Json<server_api::RuntimeWorkerLifecycleRequest>,
-) -> ApiResult<Json<server_api::RuntimeWorkerLifecycleResult>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    cancel_runtime_worker(
-        State(api),
-        AxumPath((path.worker.runtime_id, path.worker.worker_id)),
-        Json(request),
-    )
-    .await
-}
-
 async fn scoped_worker_protocol_ws(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     State(api): State<WorkspaceApi>,
     Extension(actor): Extension<RequestActor>,
     AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
@@ -26472,6 +26450,7 @@ async fn scoped_worker_protocol_ws(
         State(api),
         Extension(actor),
         AxumPath((path.worker.runtime_id, path.worker.worker_id)),
+        headers,
         ws,
     )
     .await
@@ -28984,12 +28963,14 @@ async fn get_runtime_worker(
     }))
 }
 
-async fn restore_runtime_worker(
-    State(api): State<WorkspaceApi>,
-    AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
+async fn restore_runtime_worker_with_context(
+    api: WorkspaceApi,
+    runtime_id: String,
+    worker_id: String,
+    context: WorkerOperationContext,
 ) -> ApiResult<Json<server_api::WorkerRestoreResponse>> {
-    let worker = resolve_workspace_worker_reference(&api, &runtime_id, &worker_id)?;
-    let result = api.restore_workspace_worker(&worker)?;
+    let worker = WorkspaceWorker::resolve(&api, &runtime_id, &worker_id)?;
+    let result = worker.restore(&context).await?;
     let projected_worker = if let Some(worker) = result.worker.as_ref() {
         let record = sync_worker_observation(&api, worker)?;
         let links = api
@@ -29665,37 +29646,27 @@ async fn check_runtime_config_bundle(
     )?))
 }
 
+#[cfg(test)]
 async fn send_runtime_worker_input(
     State(api): State<WorkspaceApi>,
     AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
     Json(request): Json<server_api::RuntimeWorkerInputRequest>,
 ) -> ApiResult<Json<server_api::RuntimeWorkerInputResult>> {
     let request = worker_input_request_from_api(request)?;
-    dispatch_runtime_worker_input(api, runtime_id, worker_id, request)
+    dispatch_runtime_worker_input(api, runtime_id, worker_id, request).await
 }
 
-fn dispatch_runtime_worker_input(
+#[cfg(test)]
+async fn dispatch_runtime_worker_input(
     api: WorkspaceApi,
     runtime_id: String,
     worker_id: String,
     request: WorkerInputRequest,
 ) -> ApiResult<Json<server_api::RuntimeWorkerInputResult>> {
-    let worker = resolve_workspace_worker_reference(&api, &runtime_id, &worker_id)?;
-    if api
-        .store
-        .worker_registry_projection(&api.config.workspace_id, &worker)?
-        .and_then(|projection| projection.job)
-        .is_some()
-    {
-        return Err(Error::InvalidInput(
-            "Backend Job Workers accept only their Backend-owned immutable input".to_string(),
-        )
-        .into());
-    }
-    let result = api
-        .runtime
-        .send_input(&worker, request)
-        .map_err(|err| err.into_error())?;
+    let worker = WorkspaceWorker::resolve(&api, &runtime_id, &worker_id)?;
+    let result = worker
+        .input(&WorkerOperationContext::Backend, request)
+        .await?;
     Ok(Json(worker_input_result_to_api(result)))
 }
 
@@ -29722,44 +29693,6 @@ async fn runtime_worker_completions(
         .worker_completions(&worker, request)
         .map_err(|err| err.into_error())?;
     Ok(Json(worker_completions_result_to_api(result)?))
-}
-
-async fn stop_runtime_worker(
-    State(api): State<WorkspaceApi>,
-    AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
-    Json(request): Json<server_api::RuntimeWorkerLifecycleRequest>,
-) -> ApiResult<Json<server_api::RuntimeWorkerLifecycleResult>> {
-    let request = worker_lifecycle_request_from_api(request);
-    let worker = resolve_workspace_worker_reference(&api, &runtime_id, &worker_id)?;
-    let result = api
-        .runtime
-        .stop_worker(&worker, request)
-        .map_err(|err| err.into_error())?;
-    parse_runtime_worker_id_for_registry(&worker.worker_id)?;
-    let session_lock = current_worker_session_lock(&api, &worker);
-    let _session_guard = session_lock.lock().await;
-    close_current_worker_session_locked(&api, &worker).await?;
-    if let Some(record) = api
-        .store
-        .get_worker_registry(&api.config.workspace_id, &worker)?
-    {
-        sync_linked_workdir_after_worker_stop(&api, &worker.runtime_id, &record)?;
-    }
-    Ok(Json(worker_lifecycle_result_to_api(result)))
-}
-
-async fn cancel_runtime_worker(
-    State(api): State<WorkspaceApi>,
-    AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
-    Json(request): Json<server_api::RuntimeWorkerLifecycleRequest>,
-) -> ApiResult<Json<server_api::RuntimeWorkerLifecycleResult>> {
-    let request = worker_lifecycle_request_from_api(request);
-    let worker = resolve_workspace_worker_reference(&api, &runtime_id, &worker_id)?;
-    let result = api
-        .runtime
-        .cancel_worker(&worker, request)
-        .map_err(|err| err.into_error())?;
-    Ok(Json(worker_lifecycle_result_to_api(result)))
 }
 
 fn authenticated_browser_input_source(actor: &RequestActor) -> protocol::AuthenticatedInputSource {
@@ -29791,10 +29724,25 @@ pub(crate) fn authorize_browser_worker_method(
         }),
         protocol::Method::SubmitTracked { .. }
         | protocol::Method::SubmitIfIdle { .. }
-        | protocol::Method::NotifyTracked { .. } => {
+        | protocol::Method::NotifyTracked { .. }
+        | protocol::Method::WorkerEvent(_) => {
             Err("authenticated Worker input source is server-owned")
         }
-        other => Ok(other),
+        other @ (protocol::Method::ListPendingSubmissions
+        | protocol::Method::CancelPendingSubmission { .. }
+        | protocol::Method::ClearPendingSubmissions { .. }
+        | protocol::Method::ContinuePending { .. }
+        | protocol::Method::Resume { .. }
+        | protocol::Method::Cancel { .. }
+        | protocol::Method::Pause { .. }
+        | protocol::Method::Compact { .. }
+        | protocol::Method::ListRewindTargets
+        | protocol::Method::RewindTo { .. }
+        | protocol::Method::Shutdown { .. }
+        | protocol::Method::ListCompletions { .. }
+        | protocol::Method::ListWorkers
+        | protocol::Method::RestoreWorker { .. }
+        | protocol::Method::RegisterPeer { .. }) => Ok(other),
     }
 }
 
@@ -29802,40 +29750,59 @@ async fn worker_protocol_ws(
     State(api): State<WorkspaceApi>,
     Extension(actor): Extension<RequestActor>,
     AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
-) -> impl IntoResponse {
-    let worker = RuntimeWorkerRef::new(&runtime_id, &worker_id);
-    let job_read_only = match api
-        .store
-        .worker_registry_projection(&api.config.workspace_id, &worker)
-    {
-        Ok(projection) => projection.and_then(|projection| projection.job).is_some(),
+) -> Response {
+    let worker = match WorkspaceWorker::resolve(&api, &runtime_id, &worker_id) {
+        Ok(worker) => worker,
         Err(error) => return ApiError::from(error).into_response(),
     };
-    let source = match api.observation_proxy.source(&worker) {
-        Ok(source) => source,
-        Err(ObservationProxyError::WorkerNotFound(_)) => {
-            match api.runtime.observation_source(&worker) {
-                Ok(source) => source,
-                Err(error) => return ApiError::from(error.into_error()).into_response(),
+    let context = WorkerOperationContext::Browser {
+        headers,
+        source: authenticated_browser_input_source(&actor),
+    };
+    ws.on_upgrade(move |mut socket| async move {
+        match worker.connect_protocol(&context).await {
+            Ok(connection) => workspace_worker_protocol_session(connection, socket, context).await,
+            Err(error) => {
+                let _ = send_protocol_event(&mut socket, &protocol_error_event(error.to_string()))
+                    .await;
+                let _ = socket.send(WsMessage::Close(None)).await;
             }
         }
-        Err(error) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": error.code(),
-                    "message": error.message(),
-                })),
-            )
-                .into_response();
-        }
-    };
-    let input_source = authenticated_browser_input_source(&actor);
-    let scope = worker_runtime::RuntimeWorkspaceScope::new(api.workspace_id(), "embedded-backend");
-    ws.on_upgrade(move |socket| {
-        worker_protocol_ws_session(source, socket, input_source, job_read_only, scope)
     })
+    .into_response()
+}
+
+async fn workspace_worker_protocol_session(
+    mut connection: worker_operations::WorkspaceWorkerConnection,
+    mut socket: WebSocket,
+    context: WorkerOperationContext,
+) {
+    loop {
+        tokio::select! {
+            inbound = socket.next() => match inbound {
+                Some(Ok(WsMessage::Text(text))) => {
+                    let result = match decode_method(&text) {
+                        Ok(method) => connection.sender.send(&context, method).await.map_err(|error| error.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    };
+                    if let Err(error) = result {
+                        if !send_protocol_event(&mut socket, &protocol_error_event(error)).await { break; }
+                    }
+                }
+                Some(Ok(WsMessage::Ping(value))) => { if socket.send(WsMessage::Pong(value)).await.is_err() { break; } }
+                Some(Ok(WsMessage::Pong(_))) => {}
+                _ => break,
+            },
+            event = connection.events.recv() => {
+                let Some(event) = event else { break; };
+                let shutdown = matches!(event, protocol::Event::Shutdown);
+                if !send_protocol_event(&mut socket, &event).await || shutdown { break; }
+            }
+        }
+    }
+    let _ = socket.send(WsMessage::Close(None)).await;
 }
 
 pub(crate) struct WorkspaceWorkerProtocolConnection {
@@ -30024,6 +29991,7 @@ fn embedded_protocol_dispatch_is_terminal(
     ) || transport.validate().is_err()
 }
 
+#[cfg(test)]
 async fn worker_protocol_ws_session(
     source: RuntimeObservationSource,
     socket: WebSocket,
@@ -30042,6 +30010,7 @@ async fn worker_protocol_ws_session(
     }
 }
 
+#[cfg(test)]
 async fn remote_worker_protocol_ws_session(
     config: RuntimeObservationSourceConfig,
     socket: WebSocket,
@@ -30192,6 +30161,7 @@ async fn remote_worker_protocol_ws_session(
     }
 }
 
+#[cfg(test)]
 async fn embedded_worker_protocol_ws_session(
     source: crate::observation::EmbeddedRuntimeObservationSource,
     mut socket: WebSocket,
@@ -33172,6 +33142,7 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
+    mod worker_operations_tests;
     include!("server_workspace_config_tests.rs");
     use super::*;
     use axum::body::{Body, to_bytes};
@@ -38521,6 +38492,11 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri(format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers"))
+                    // Unit fixture stands below proof middleware, so inject its verified subject.
+                    .extension(crate::worker_source::VerifiedRuntimeRequestSource {
+                        runtime_id: fixture.controller.runtime_id.clone(),
+                        worker_id: Some(fixture.controller.worker_id.clone()),
+                    })
                     .header("content-type", "application/json")
                     .header("x-yoi-runtime-id", &fixture.controller.runtime_id)
                     .header("x-yoi-worker-id", &fixture.controller.worker_id)
@@ -38836,6 +38812,10 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri(format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers"))
+                    .extension(crate::worker_source::VerifiedRuntimeRequestSource {
+                        runtime_id: controller.runtime_id.clone(),
+                        worker_id: Some(controller.worker_id.clone()),
+                    })
                     .header("content-type", "application/json")
                     .header("x-yoi-runtime-id", &controller.runtime_id)
                     .header("x-yoi-worker-id", &controller.worker_id)
@@ -57854,7 +57834,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let app = build_inner_router(api.clone());
+        let app = authenticated_protocol_fixture_router(api.clone());
 
         let runtimes = get_json(app.clone(), "/api/runtimes").await;
         let embedded_summary = runtimes["items"]
@@ -58813,6 +58793,25 @@ mod tests {
         }
     }
 
+    // Transport fixtures below the authentication router still need real credentials
+    // for operation-time reauthorization. Public-router tests use real proofs/tokens.
+    fn authenticated_protocol_fixture_router(api: WorkspaceApi) -> Router {
+        let token = seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
+        build_inner_router(api)
+            .layer(Extension(test_browser_request_actor()))
+            .layer(axum::middleware::from_fn(
+                move |mut request: axum::extract::Request, next: Next| {
+                    let value = format!("Bearer {token}");
+                    async move {
+                        request
+                            .headers_mut()
+                            .insert(axum::http::header::AUTHORIZATION, value.parse().unwrap());
+                        next.run(request).await
+                    }
+                },
+            ))
+    }
+
     async fn spawn_workspace_proxy(
         source: RuntimeObservationSourceConfig,
     ) -> (String, tempfile::TempDir) {
@@ -58831,7 +58830,8 @@ mod tests {
         .unwrap();
         let app_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let app_addr = app_listener.local_addr().unwrap();
-        let app = build_inner_router(api).layer(Extension(test_browser_request_actor()));
+        seed_worker_source_member(&api, &runtime_id, &worker_id);
+        let app = authenticated_protocol_fixture_router(api);
         tokio::spawn(async move { axum::serve(app_listener, app).await.unwrap() });
         (
             format!("ws://{app_addr}/api/runtimes/{runtime_id}/workers/{worker_id}/protocol/ws"),
@@ -58844,8 +58844,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let app = build_inner_router(test_api(dir.path()).await)
-            .layer(Extension(test_browser_request_actor()));
+        let app = authenticated_protocol_fixture_router(test_api(dir.path()).await);
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -58942,7 +58941,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let projection_api = api.clone();
-        let app = build_inner_router(api).layer(Extension(test_browser_request_actor()));
+        let app = authenticated_protocol_fixture_router(api);
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });

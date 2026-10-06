@@ -2077,6 +2077,7 @@ pub trait ServerApi {
     )]
     async fn runtime_worker_restore_alias(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] runtime_id: String,
         #[path] worker_id: String,
     ) -> Result<WorkerRestoreResponse, RepositoryApiError>;
@@ -2091,6 +2092,7 @@ pub trait ServerApi {
     )]
     async fn runtime_worker_restore(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] runtime_id: String,
         #[path] worker_id: String,
@@ -2107,6 +2109,7 @@ pub trait ServerApi {
     )]
     async fn runtime_worker_pin(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] runtime_id: String,
         #[path] worker_id: String,
@@ -2122,6 +2125,7 @@ pub trait ServerApi {
     )]
     async fn runtime_worker_unpin(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] runtime_id: String,
         #[path] worker_id: String,
@@ -2151,6 +2155,7 @@ pub trait ServerApi {
     )]
     async fn runtime_cleanup_execute(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] runtime_id: String,
         #[body] request: ExecuteRuntimeCleanupRequest,
@@ -2166,6 +2171,7 @@ pub trait ServerApi {
     )]
     async fn runtime_worker_input_alias(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] runtime_id: String,
         #[path] worker_id: String,
         #[body] request: RuntimeWorkerInputRequest,
@@ -2181,6 +2187,7 @@ pub trait ServerApi {
     )]
     async fn runtime_worker_input(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] runtime_id: String,
         #[path] worker_id: String,
@@ -2297,6 +2304,7 @@ pub trait ServerApi {
     )]
     async fn runtime_worker_stop_alias(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] runtime_id: String,
         #[path] worker_id: String,
         #[body] request: RuntimeWorkerLifecycleRequest,
@@ -2312,6 +2320,7 @@ pub trait ServerApi {
     )]
     async fn runtime_worker_stop(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] runtime_id: String,
         #[path] worker_id: String,
@@ -2328,6 +2337,7 @@ pub trait ServerApi {
     )]
     async fn runtime_worker_cancel_alias(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] runtime_id: String,
         #[path] worker_id: String,
         #[body] request: RuntimeWorkerLifecycleRequest,
@@ -2343,6 +2353,7 @@ pub trait ServerApi {
     )]
     async fn runtime_worker_cancel(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] runtime_id: String,
         #[path] worker_id: String,

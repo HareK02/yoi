@@ -12,7 +12,7 @@ use worker_runtime::identity::RuntimeWorkerRef;
 
 use crate::runtime_subscription::RuntimeSubscriptionBroker;
 use crate::server::{
-    WorkspaceApi, authorize_browser_worker_method, connect_workspace_worker_protocol,
+    WorkerOperationContext, WorkspaceApi, WorkspaceWorker, WorkspaceWorkerMethodSender,
 };
 
 const OUTBOUND_CAPACITY: usize = 256;
@@ -20,13 +20,13 @@ const WORKER_PROTOCOL_SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duratio
 
 struct ActiveSubscription {
     task: tokio::task::JoinHandle<()>,
-    methods: Option<mpsc::Sender<protocol::Method>>,
+    methods: Option<WorkspaceWorkerMethodSender>,
 }
 
 pub(crate) async fn serve_workspace_subscription(
     api: WorkspaceApi,
     socket: WebSocket,
-    input_source: protocol::AuthenticatedInputSource,
+    context: WorkerOperationContext,
 ) {
     let broker = api.runtime_subscription_broker().clone();
     let (mut socket_sender, mut socket_receiver) = socket.split();
@@ -90,16 +90,20 @@ pub(crate) async fn serve_workspace_subscription(
                                 worker_id,
                                 runtime_id: Some(runtime_id),
                             } => {
-                                let worker = RuntimeWorkerRef::new(&runtime_id, worker_id.as_str());
-                                match connect_workspace_worker_protocol(
+                                let connection = match WorkspaceWorker::resolve(
                                     &api,
-                                    &worker,
-                                    Some(&input_source),
-                                )
-                                .await
-                                {
+                                    &runtime_id,
+                                    worker_id.as_str(),
+                                ) {
+                                    Ok(worker) => worker
+                                        .connect_protocol(&context)
+                                        .await
+                                        .map_err(|error| error.to_string()),
+                                    Err(error) => Err(error.to_string()),
+                                };
+                                match connection {
                                     Ok(connection) => {
-                                        let methods = connection.methods.clone();
+                                        let methods = connection.sender.clone();
                                         let task = tokio::spawn(run_worker_protocol(
                                             request_id,
                                             subscription_id.clone(),
@@ -165,12 +169,7 @@ pub(crate) async fn serve_workspace_subscription(
                         else {
                             break;
                         };
-                        let Ok(method) =
-                            authorize_browser_worker_method(message.method, &input_source)
-                        else {
-                            break;
-                        };
-                        if methods.send(method).await.is_err() {
+                        if methods.send(&context, message.method).await.is_err() {
                             break;
                         }
                     }
