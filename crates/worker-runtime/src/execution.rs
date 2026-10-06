@@ -207,34 +207,6 @@ impl WorkerExecutionResult {
     }
 }
 
-/// Opaque per-Worker execution handle returned by a backend.
-///
-/// The handle is a typed token for routing calls back into the same backend. It
-/// intentionally contains no socket path, process id, credential, manifest path,
-/// or session path.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkerExecutionHandle {
-    worker_ref: WorkerRef,
-    backend_id: String,
-}
-
-impl WorkerExecutionHandle {
-    pub fn new(worker_ref: WorkerRef, backend_id: impl Into<String>) -> Self {
-        Self {
-            worker_ref,
-            backend_id: backend_id.into(),
-        }
-    }
-
-    pub fn worker_ref(&self) -> &WorkerRef {
-        &self.worker_ref
-    }
-
-    pub fn backend_id(&self) -> &str {
-        &self.backend_id
-    }
-}
-
 /// Runtime hooks available to an execution backend for one Worker.
 #[cfg(feature = "ws-server")]
 type WorkerObservationPublisher = Arc<
@@ -348,7 +320,17 @@ impl WorkerExecutionContext {
             let Some(event) = event else {
                 return Ok(());
             };
-            (self.observation_publisher)(self.worker_ref.clone(), event)?;
+            if let Err(error) = (self.observation_publisher)(self.worker_ref.clone(), event.clone())
+            {
+                let mut state = self
+                    .publication_state
+                    .lock()
+                    .map_err(|_| RuntimeError::StatePoisoned)?;
+                if let WorkerExecutionPublicationState::Activating(events) = &mut *state {
+                    events.push_front(event);
+                }
+                return Err(error);
+            }
         }
     }
 
@@ -443,7 +425,6 @@ pub struct WorkerExecutionRestoreRequest {
 pub struct WorkerExecutionStopRequest {
     pub operation_id: WorkerLifecycleOperationId,
     pub worker_ref: WorkerRef,
-    pub handle: Option<WorkerExecutionHandle>,
 }
 
 /// Runtime-side request to refresh the latest Workspace Config before Worker creation.
@@ -466,7 +447,6 @@ pub enum WorkspaceConfigFetchResult {
 #[derive(Clone, Debug)]
 pub enum WorkerExecutionSpawnResult {
     Connected {
-        handle: WorkerExecutionHandle,
         worker_state: protocol::WorkerStateSnapshot,
         workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
     },
@@ -475,11 +455,10 @@ pub enum WorkerExecutionSpawnResult {
     /// Live work started, failed, and all operation-owned resources were joined/released.
     RolledBack(WorkerExecutionResult),
     /// The operation crossed the live side-effect boundary and could not prove
-    /// either commit or complete cleanup. Optional handle/state fields preserve
+    /// either commit or complete cleanup. Optional state fields preserve
     /// concrete execution evidence for retry reconciliation.
     ReconciliationRequired {
         result: WorkerExecutionResult,
-        handle: Option<WorkerExecutionHandle>,
         worker_state: Option<protocol::WorkerStateSnapshot>,
         workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
     },
@@ -490,12 +469,10 @@ pub enum WorkerExecutionSpawnResult {
 
 impl WorkerExecutionSpawnResult {
     pub fn connected(
-        handle: WorkerExecutionHandle,
         worker_state: protocol::WorkerStateSnapshot,
         workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
     ) -> Self {
         Self::Connected {
-            handle,
             worker_state,
             workdir_attachments,
         }
@@ -521,6 +498,57 @@ pub struct WorkerSessionAttachmentRequest {
     pub attachment_id: String,
 }
 
+/// One real protocol connection, bound to the execution that was attached.
+/// This is not a routing token and is never persisted as Worker authority.
+#[cfg(feature = "ws-server")]
+pub struct WorkerProtocolTransport {
+    pub(crate) worker_ref: WorkerRef,
+    pub snapshot: protocol::Event,
+    pub events: tokio::sync::mpsc::Receiver<protocol::Event>,
+    dispatch:
+        Arc<dyn Fn(Method) -> Result<Vec<protocol::Event>, WorkerExecutionResult> + Send + Sync>,
+    validate: Arc<dyn Fn() -> Result<(), WorkerExecutionResult> + Send + Sync>,
+}
+
+#[cfg(feature = "ws-server")]
+impl WorkerProtocolTransport {
+    pub fn new(
+        worker_ref: WorkerRef,
+        snapshot: protocol::Event,
+        events: tokio::sync::mpsc::Receiver<protocol::Event>,
+        dispatch: Arc<
+            dyn Fn(Method) -> Result<Vec<protocol::Event>, WorkerExecutionResult> + Send + Sync,
+        >,
+        validate: Arc<dyn Fn() -> Result<(), WorkerExecutionResult> + Send + Sync>,
+    ) -> Self {
+        Self {
+            worker_ref,
+            snapshot,
+            events,
+            dispatch,
+            validate,
+        }
+    }
+
+    pub fn dispatch(&self, method: Method) -> Result<Vec<protocol::Event>, WorkerExecutionResult> {
+        (self.dispatch)(method)
+    }
+
+    pub fn validate(&self) -> Result<(), WorkerExecutionResult> {
+        (self.validate)()
+    }
+}
+
+#[cfg(feature = "ws-server")]
+impl fmt::Debug for WorkerProtocolTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorkerProtocolTransport")
+            .finish_non_exhaustive()
+    }
+}
+
+/// The connection selects this backend; WorkerRef identifies an execution,
+/// never a capability or authorization token.
 pub trait WorkerExecutionBackend: Send + Sync + 'static {
     fn backend_id(&self) -> &str;
 
@@ -580,8 +608,9 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
     fn activate_restored_worker(
         &self,
         _operation_id: WorkerLifecycleOperationId,
-        _handle: &WorkerExecutionHandle,
+        worker_ref: &WorkerRef,
     ) -> Result<(), String> {
+        let _ = worker_ref;
         Ok(())
     }
 
@@ -673,20 +702,17 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         Ok(())
     }
 
-    fn dispatch_input(
-        &self,
-        handle: &WorkerExecutionHandle,
-        input: WorkerInput,
-    ) -> WorkerExecutionResult;
+    fn dispatch_input(&self, worker_ref: &WorkerRef, input: WorkerInput) -> WorkerExecutionResult;
 
     fn upload_file(
         &self,
-        _handle: &WorkerExecutionHandle,
+        worker_ref: &WorkerRef,
         _file_name: &str,
         _media_type: &str,
         _content: &[u8],
         _context: Option<&session_store::UploadedFileUploadContext>,
     ) -> Result<UploadedFileRef, WorkerExecutionResult> {
+        let _ = worker_ref;
         Err(WorkerExecutionResult::unsupported(
             WorkerExecutionOperation::UploadFile,
             "execution backend does not support file upload",
@@ -695,20 +721,18 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
 
     fn delete_uploaded_file(
         &self,
-        _handle: &WorkerExecutionHandle,
+        worker_ref: &WorkerRef,
         _artifact_id: &str,
     ) -> WorkerExecutionResult {
+        let _ = worker_ref;
         WorkerExecutionResult::unsupported(
             WorkerExecutionOperation::DeleteUploadedFile,
             "execution backend does not support uploaded-file deletion",
         )
     }
 
-    fn dispatch_method(
-        &self,
-        _handle: &WorkerExecutionHandle,
-        _method: Method,
-    ) -> WorkerExecutionResult {
+    fn dispatch_method(&self, worker_ref: &WorkerRef, _method: Method) -> WorkerExecutionResult {
+        let _ = worker_ref;
         WorkerExecutionResult::unsupported(
             WorkerExecutionOperation::ProtocolMethod,
             "execution backend does not support direct Worker protocol methods",
@@ -717,32 +741,29 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
 
     fn worker_completions(
         &self,
-        _handle: &WorkerExecutionHandle,
+        worker_ref: &WorkerRef,
         _kind: protocol::CompletionKind,
         _prefix: &str,
         _context: Option<&protocol::CompletionContext>,
     ) -> Vec<protocol::CompletionEntry> {
+        let _ = worker_ref;
         Vec::new()
     }
 
     fn stop_worker_operation(&self, request: WorkerExecutionStopRequest) -> WorkerExecutionResult {
-        let Some(handle) = request.handle.as_ref() else {
-            return WorkerExecutionResult::unsupported(
-                WorkerExecutionOperation::Stop,
-                "execution backend cannot reconcile a stopped Worker without a live handle",
-            );
-        };
-        self.stop_worker(handle)
+        self.stop_worker(&request.worker_ref)
     }
 
-    fn stop_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
+    fn stop_worker(&self, worker_ref: &WorkerRef) -> WorkerExecutionResult {
+        let _ = worker_ref;
         WorkerExecutionResult::unsupported(
             WorkerExecutionOperation::Stop,
             "execution backend does not support stopping workers",
         )
     }
 
-    fn cancel_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
+    fn cancel_worker(&self, worker_ref: &WorkerRef) -> WorkerExecutionResult {
+        let _ = worker_ref;
         WorkerExecutionResult::unsupported(
             WorkerExecutionOperation::Cancel,
             "execution backend does not support cancelling workers",
@@ -750,7 +771,20 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
     }
 
     #[cfg(feature = "ws-server")]
-    fn worker_snapshot(&self, _handle: &WorkerExecutionHandle) -> Option<protocol::Event> {
+    fn attach_worker_protocol(
+        self: Arc<Self>,
+        worker_ref: &WorkerRef,
+    ) -> Result<WorkerProtocolTransport, WorkerExecutionResult> {
+        let _ = worker_ref;
+        Err(WorkerExecutionResult::unsupported(
+            WorkerExecutionOperation::ProtocolMethod,
+            "execution backend does not support bound Worker protocol connections",
+        ))
+    }
+
+    #[cfg(feature = "ws-server")]
+    fn worker_snapshot(&self, worker_ref: &WorkerRef) -> Option<protocol::Event> {
+        let _ = worker_ref;
         None
     }
 }
@@ -828,9 +862,10 @@ impl WorkerExecutionBackendRef {
     pub(crate) fn activate_restored_worker(
         &self,
         operation_id: WorkerLifecycleOperationId,
-        handle: &WorkerExecutionHandle,
+        worker_ref: &WorkerRef,
     ) -> Result<(), String> {
-        self.backend.activate_restored_worker(operation_id, handle)
+        self.backend
+            .activate_restored_worker(operation_id, worker_ref)
     }
 
     pub(crate) fn restore_worker(
@@ -896,57 +931,62 @@ impl WorkerExecutionBackendRef {
 
     pub(crate) fn dispatch_input(
         &self,
-        handle: &WorkerExecutionHandle,
+        worker_ref: &WorkerRef,
         input: WorkerInput,
     ) -> WorkerExecutionResult {
-        self.backend.dispatch_input(handle, input)
+        self.backend.dispatch_input(worker_ref, input)
     }
 
     pub(crate) fn upload_file(
         &self,
-        handle: &WorkerExecutionHandle,
+        worker_ref: &WorkerRef,
         file_name: &str,
         media_type: &str,
         content: &[u8],
         context: Option<&session_store::UploadedFileUploadContext>,
     ) -> Result<UploadedFileRef, WorkerExecutionResult> {
         self.backend
-            .upload_file(handle, file_name, media_type, content, context)
+            .upload_file(worker_ref, file_name, media_type, content, context)
     }
 
     pub(crate) fn delete_uploaded_file(
         &self,
-        handle: &WorkerExecutionHandle,
+        worker_ref: &WorkerRef,
         artifact_id: &str,
     ) -> WorkerExecutionResult {
-        self.backend.delete_uploaded_file(handle, artifact_id)
+        self.backend.delete_uploaded_file(worker_ref, artifact_id)
     }
 
     pub(crate) fn dispatch_method(
         &self,
-        handle: &WorkerExecutionHandle,
+        worker_ref: &WorkerRef,
         method: Method,
     ) -> WorkerExecutionResult {
-        self.backend.dispatch_method(handle, method)
+        self.backend.dispatch_method(worker_ref, method)
     }
 
     #[cfg(feature = "ws-server")]
-    pub(crate) fn worker_snapshot(
+    pub(crate) fn attach_worker_protocol(
         &self,
-        handle: &WorkerExecutionHandle,
-    ) -> Option<protocol::Event> {
-        self.backend.worker_snapshot(handle)
+        worker_ref: &WorkerRef,
+    ) -> Result<WorkerProtocolTransport, WorkerExecutionResult> {
+        Arc::clone(&self.backend).attach_worker_protocol(worker_ref)
+    }
+
+    #[cfg(feature = "ws-server")]
+    pub(crate) fn worker_snapshot(&self, worker_ref: &WorkerRef) -> Option<protocol::Event> {
+        self.backend.worker_snapshot(worker_ref)
     }
 
     pub(crate) fn worker_completions(
         &self,
-        handle: &WorkerExecutionHandle,
+        worker_ref: &WorkerRef,
         kind: protocol::CompletionKind,
         prefix: &str,
         context: Option<&protocol::CompletionContext>,
     ) -> Vec<protocol::CompletionEntry> {
         self.backend
-            .worker_completions(handle, kind, prefix, context)
+            .worker_completions(worker_ref, kind, prefix, context)
     }
 
     pub(crate) fn stop_worker_operation(
@@ -956,12 +996,12 @@ impl WorkerExecutionBackendRef {
         self.backend.stop_worker_operation(request)
     }
 
-    pub(crate) fn stop_worker(&self, handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
-        self.backend.stop_worker(handle)
+    pub(crate) fn stop_worker(&self, worker_ref: &WorkerRef) -> WorkerExecutionResult {
+        self.backend.stop_worker(worker_ref)
     }
 
-    pub(crate) fn cancel_worker(&self, handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
-        self.backend.cancel_worker(handle)
+    pub(crate) fn cancel_worker(&self, worker_ref: &WorkerRef) -> WorkerExecutionResult {
+        self.backend.cancel_worker(worker_ref)
     }
 }
 

@@ -1589,78 +1589,30 @@ async fn worker_protocol_ws_session(
     input_source: Option<protocol::AuthenticatedInputSource>,
     mut socket: WebSocket,
 ) {
-    let mut cursor = match query.cursor.as_deref() {
-        Some(raw) => match WorkerObservationCursor::decode(raw) {
-            Some(cursor) => cursor,
-            None => {
-                let event =
-                    protocol_error_event(format!("malformed worker observation cursor: {raw}"));
-                let _ = send_protocol_event(&mut socket, &event).await;
-                return;
-            }
-        },
-        None => match runtime.worker_observation_cursor_now(&worker_ref) {
-            Ok(cursor) => cursor,
-            Err(error) => {
-                let event = protocol_error_event(error.to_string());
-                let _ = send_protocol_event(&mut socket, &event).await;
-                return;
-            }
-        },
-    };
-    // Observation cursors are process-local. After a Runtime restart (or
-    // bounded backlog expiry), the current Worker snapshot is authoritative
-    // and replay resumes from the current in-memory tail.
-    if runtime
-        .read_worker_observation_events(&worker_ref, cursor)
-        .is_err()
+    if let Some(raw) = query.cursor.as_deref()
+        && WorkerObservationCursor::decode(raw).is_none()
     {
-        cursor = match runtime.worker_observation_cursor_now(&worker_ref) {
-            Ok(cursor) => cursor,
-            Err(error) => {
-                let event = protocol_error_event(error.to_string());
-                let _ = send_protocol_event(&mut socket, &event).await;
-                return;
-            }
-        };
-    }
-
-    let mut receiver = match runtime.subscribe_worker_observation() {
-        Ok(receiver) => receiver,
-        Err(error) => {
-            let event =
-                protocol_error_event(format!("runtime observation bus unavailable: {error}"));
-            let _ = send_protocol_event(&mut socket, &event).await;
-            return;
-        }
-    };
-
-    let snapshot = match runtime.worker_observation_snapshot(&worker_ref) {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            let event = protocol_error_event(error.to_string());
-            let _ = send_protocol_event(&mut socket, &event).await;
-            return;
-        }
-    };
-    if !send_protocol_event(&mut socket, &snapshot).await {
+        let event = protocol_error_event("malformed worker observation cursor");
+        let _ = send_protocol_event(&mut socket, &event).await;
         return;
     }
-
-    match runtime.read_worker_observation_events(&worker_ref, cursor) {
-        Ok(backlog) => {
-            for event in backlog {
-                cursor = WorkerObservationCursor::new(event.sequence);
-                if !send_protocol_event(&mut socket, &event.payload).await {
-                    return;
-                }
-            }
-        }
+    // The complete Controller snapshot reconstitutes this protocol connection.
+    // A WorkerRef-wide catalog cursor cannot attribute historical operational
+    // events to this captured execution; never append that bus after its snapshot.
+    let attached = match scope.as_ref() {
+        Some(scope) => runtime.attach_worker_protocol_scoped(scope, &worker_ref),
+        None => runtime.attach_worker_protocol(&worker_ref),
+    };
+    let mut transport = match attached {
+        Ok(transport) => transport,
         Err(error) => {
             let event = protocol_error_event(error.to_string());
             let _ = send_protocol_event(&mut socket, &event).await;
             return;
         }
+    };
+    if !send_protocol_event(&mut socket, &transport.snapshot).await {
+        return;
     }
 
     loop {
@@ -1673,9 +1625,13 @@ async fn worker_protocol_ws_session(
                                 authorize_runtime_protocol_method(method, input_source.as_ref());
                             let result = match scope.as_ref() {
                                 Some(scope) => {
-                                    runtime.send_protocol_method_scoped(scope, &worker_ref, method)
+                                    runtime.send_connected_protocol_method_scoped(
+                                        scope, &worker_ref, &transport, method,
+                                    )
                                 }
-                                None => runtime.send_protocol_method(&worker_ref, method),
+                                None => runtime.send_connected_protocol_method(
+                                    &worker_ref, &transport, method,
+                                ),
                             };
                             match result {
                                 Ok(events) => {
@@ -1688,6 +1644,10 @@ async fn worker_protocol_ws_session(
                                 Err(error) => {
                                     let event = protocol_error_event(error.to_string());
                                     if !send_protocol_event(&mut socket, &event).await {
+                                        return;
+                                    }
+                                    if transport.validate().is_err() {
+                                        let _ = socket.send(WsMessage::Close(None)).await;
                                         return;
                                     }
                                 }
@@ -1716,23 +1676,20 @@ async fn worker_protocol_ws_session(
                     }
                 }
             }
-            event = receiver.recv() => {
+            event = transport.events.recv() => {
                 match event {
-                    Ok(event) if event.worker_ref == worker_ref && event.sequence > cursor.sequence => {
-                        cursor = WorkerObservationCursor::new(event.sequence);
-                        if !send_protocol_event(&mut socket, &event.payload).await {
+                    Some(event) => {
+                        let terminal = matches!(event, protocol::Event::Shutdown);
+                        if !send_protocol_event(&mut socket, &event).await {
+                            return;
+                        }
+                        if terminal {
+                            let _ = socket.send(WsMessage::Close(None)).await;
                             return;
                         }
                     }
-                    Ok(_) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let event = protocol_error_event("runtime observation backlog was overrun");
-                        let _ = send_protocol_event(&mut socket, &event).await;
-                        return;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        let event = protocol_error_event("runtime observation bus closed");
-                        let _ = send_protocol_event(&mut socket, &event).await;
+                    None => {
+                        let _ = socket.send(WsMessage::Close(None)).await;
                         return;
                     }
                 }
@@ -2641,9 +2598,8 @@ mod tests {
         ConfigBundle, ConfigBundleMetadata, ConfigBundleProvenance, ConfigProfileDescriptor,
     };
     use crate::execution::{
-        WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation,
-        WorkerExecutionRestoreRequest, WorkerExecutionResult, WorkerExecutionSpawnRequest,
-        WorkerExecutionSpawnResult,
+        WorkerExecutionBackend, WorkerExecutionOperation, WorkerExecutionRestoreRequest,
+        WorkerExecutionResult, WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
     };
     use crate::management::RuntimeOptions;
     use crate::retention::{DiagnosticsDisposition, SessionDisposition};
@@ -3018,6 +2974,7 @@ mod tests {
         assert_eq!(error.error.code, "worker_not_found");
     }
 
+    #[cfg(feature = "ws-server")]
     #[test]
     fn runtime_protocol_replaces_serialized_tracked_source() {
         let wire = serde_json::to_string(&protocol::Method::SubmitTracked {
@@ -3045,6 +3002,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "ws-server")]
     #[test]
     fn runtime_protocol_uses_transport_authenticated_account_source() {
         let mut headers = HeaderMap::new();
@@ -3398,12 +3356,9 @@ mod tests {
         }
 
         fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
-            WorkerExecutionSpawnResult::Connected {
-                handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
-                worker_state: protocol::WorkerStateSnapshot {
-                    ..protocol::WorkerStatus::Idle.into()
-                },
-                workdir_attachments: request
+            WorkerExecutionSpawnResult::connected(
+                protocol::WorkerStatus::Idle.into(),
+                request
                     .workdir_attachments
                     .iter()
                     .map(
@@ -3413,25 +3368,22 @@ mod tests {
                         },
                     )
                     .collect(),
-            }
+            )
         }
 
         fn restore_worker(
             &self,
             request: WorkerExecutionRestoreRequest,
         ) -> WorkerExecutionSpawnResult {
-            WorkerExecutionSpawnResult::Connected {
-                handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
-                worker_state: protocol::WorkerStateSnapshot {
-                    ..protocol::WorkerStatus::Idle.into()
-                },
-                workdir_attachments: request.previous_workdir_attachments,
-            }
+            WorkerExecutionSpawnResult::connected(
+                protocol::WorkerStatus::Idle.into(),
+                request.previous_workdir_attachments,
+            )
         }
 
         fn dispatch_input(
             &self,
-            _handle: &WorkerExecutionHandle,
+            _worker_ref: &WorkerRef,
             input: WorkerInput,
         ) -> WorkerExecutionResult {
             if let Some(submission_id) = input.submission_request_id {
@@ -3446,7 +3398,57 @@ mod tests {
             }
         }
 
-        fn stop_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
+        fn stop_worker(&self, _worker_ref: &WorkerRef) -> WorkerExecutionResult {
+            WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop)
+        }
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[derive(Default)]
+    struct RejectingRestoreBackend {
+        restores: Mutex<Vec<WorkerRef>>,
+        inputs: Mutex<Vec<WorkerRef>>,
+        stops: Mutex<Vec<WorkerRef>>,
+    }
+
+    #[cfg(feature = "fs-store")]
+    impl WorkerExecutionBackend for RejectingRestoreBackend {
+        fn backend_id(&self) -> &str {
+            "http-test"
+        }
+
+        fn spawn_worker(
+            &self,
+            _request: WorkerExecutionSpawnRequest,
+        ) -> WorkerExecutionSpawnResult {
+            panic!("a saved Worker must be restored, not spawned again");
+        }
+
+        fn restore_worker(
+            &self,
+            request: WorkerExecutionRestoreRequest,
+        ) -> WorkerExecutionSpawnResult {
+            self.restores.lock().unwrap().push(request.worker_ref);
+            WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::rejected(
+                WorkerExecutionOperation::Restore,
+                "repository access must be reacquired",
+            ))
+        }
+
+        fn dispatch_input(
+            &self,
+            worker_ref: &WorkerRef,
+            _input: WorkerInput,
+        ) -> WorkerExecutionResult {
+            self.inputs.lock().unwrap().push(worker_ref.clone());
+            WorkerExecutionResult::rejected(
+                WorkerExecutionOperation::Input,
+                "Worker execution is unavailable after restore rejection",
+            )
+        }
+
+        fn stop_worker(&self, worker_ref: &WorkerRef) -> WorkerExecutionResult {
+            self.stops.lock().unwrap().push(worker_ref.clone());
             WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop)
         }
     }
@@ -3831,6 +3833,192 @@ mod tests {
         assert_eq!(summary.runtime.stopped_worker_count, 1);
     }
 
+    #[cfg(feature = "fs-store")]
+    #[tokio::test]
+    async fn rest_saved_active_worker_restore_rejection_is_observable_and_can_be_stopped_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let options = crate::fs_store::FsRuntimeStoreOptions::new(temp.path().join("runtime"));
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            options.clone(),
+            Arc::new(AcceptingBackend),
+        )
+        .unwrap();
+        runtime
+            .store_config_bundle(test_bundle(ProfileSelector::Builtin(
+                "builtin:coder".to_string(),
+            )))
+            .unwrap();
+        let mut request = task_request("saved active Worker");
+        request.workspace_api = Some(WorkspaceApiRef {
+            workspace_id: "local".to_string(),
+            base_url: "http://127.0.0.1:8787".to_string(),
+        });
+        let created = runtime
+            .create_worker_scoped(&RuntimeWorkspaceScope::new("local", "local-token"), request)
+            .unwrap();
+        assert_eq!(created.status, crate::catalog::WorkerStatus::Idle);
+        assert!(created.worker_state.is_some());
+        drop(runtime);
+
+        let backend = Arc::new(RejectingRestoreBackend::default());
+        let runtime =
+            Runtime::with_fs_store_and_execution_backend(options, backend.clone()).unwrap();
+        // Startup attempted automatic restore without turning rejection into a
+        // fabricated live Worker or silently changing its saved lifecycle status.
+        assert_eq!(
+            *backend.restores.lock().unwrap(),
+            vec![created.worker_ref.clone()],
+            "startup diagnostics: {:?}; Worker: {:?}",
+            runtime.diagnostics().unwrap(),
+            runtime.worker_detail(&created.worker_ref)
+        );
+        let token = "local-token";
+        let app = runtime_http_router(runtime.clone(), token.to_string());
+        let worker_uri = format!("/v1/workers/{}", created.worker_id);
+
+        let response = authed_empty_request(app.clone(), Method::GET, &worker_uri, token).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let detail: RuntimeHttpWorkerResponse = read_json(response).await;
+        assert_eq!(detail.worker.worker_ref, created.worker_ref);
+        assert_eq!(detail.worker.status, crate::catalog::WorkerStatus::Idle);
+        assert!(detail.worker.execution_metadata_available);
+        assert!(detail.worker.worker_state.is_none());
+
+        let response = authed_empty_request(app.clone(), Method::GET, "/v1/workers", token).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let listed: RuntimeHttpWorkersResponse = read_json(response).await;
+        assert_eq!(listed.workers.len(), 1);
+        assert_eq!(listed.workers[0].worker_ref, created.worker_ref);
+        assert_eq!(listed.workers[0].status, crate::catalog::WorkerStatus::Idle);
+        assert!(listed.workers[0].worker_state.is_none());
+
+        let response = authed_empty_request(
+            app.clone(),
+            Method::POST,
+            &format!("{worker_uri}/restore"),
+            token,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let rejected: runtime_api::WorkerRestoreResponse = read_json(response).await;
+        assert_eq!(rejected.state, WorkerRestoreState::Rejected);
+        assert_eq!(
+            rejected.reason_code.as_deref(),
+            Some("worker_restore_rejected")
+        );
+        assert!(rejected.worker.is_none());
+        assert_eq!(
+            *backend.restores.lock().unwrap(),
+            vec![created.worker_ref.clone(), created.worker_ref.clone()]
+        );
+
+        let response = authed_json_request(
+            app.clone(),
+            Method::POST,
+            &format!("{worker_uri}/input"),
+            token,
+            &WorkerInput::user("must not be accepted by a fabricated execution"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error: RuntimeHttpErrorResponse = read_json(response).await;
+        assert_eq!(error.error.code, "worker_execution_rejected");
+        assert_eq!(
+            *backend.inputs.lock().unwrap(),
+            vec![created.worker_ref.clone()]
+        );
+
+        #[cfg(feature = "ws-server")]
+        {
+            use tokio_tungstenite::tungstenite::Message;
+            use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+            assert!(matches!(
+                runtime.worker_observation_snapshot(&created.worker_ref),
+                Err(RuntimeError::WorkerExecutionUnavailable { worker_id, .. })
+                    if worker_id == created.worker_id
+            ));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server_app = app.clone();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, server_app).await.unwrap();
+            });
+            let mut request = format!("ws://{address}{worker_uri}/protocol/ws")
+                .into_client_request()
+                .unwrap();
+            request.headers_mut().insert(
+                tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
+                format!("Bearer {token}").parse().unwrap(),
+            );
+            let (mut stream, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+                .await
+                .expect("unavailable snapshot must produce a protocol error promptly")
+                .unwrap()
+                .unwrap();
+            let Message::Text(text) = frame else {
+                panic!("expected protocol error frame, not a fabricated snapshot");
+            };
+            let event: protocol::Event = serde_json::from_str(&text).unwrap();
+            assert!(matches!(event, protocol::Event::Error { .. }));
+            drop(stream);
+            server.abort();
+            let _ = server.await;
+        }
+
+        // Saved active status still requires a normal stop before removal,
+        // even though automatic restore never connected a live execution.
+        let response = authed_empty_request(app.clone(), Method::DELETE, &worker_uri, token).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: RuntimeHttpErrorResponse = read_json(response).await;
+        assert_eq!(error.error.code, "invalid_request");
+        assert!(backend.stops.lock().unwrap().is_empty());
+
+        let response = authed_empty_request(
+            app.clone(),
+            Method::POST,
+            &format!("{worker_uri}/stop"),
+            token,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let stopped: RuntimeHttpWorkerLifecycleResponse = read_json(response).await;
+        assert_eq!(stopped.ack.worker_ref, created.worker_ref);
+        assert_eq!(stopped.ack.status, crate::catalog::WorkerStatus::Stopped);
+        assert_eq!(
+            *backend.stops.lock().unwrap(),
+            vec![created.worker_ref.clone()]
+        );
+
+        let response = authed_empty_request(app.clone(), Method::GET, &worker_uri, token).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let detail: RuntimeHttpWorkerResponse = read_json(response).await;
+        assert_eq!(detail.worker.status, crate::catalog::WorkerStatus::Stopped);
+
+        let response = authed_empty_request(app.clone(), Method::DELETE, &worker_uri, token).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let removed: RuntimeHttpWorkerDeleteResponse = read_json(response).await;
+        assert_eq!(removed.worker.worker_id, created.worker_id);
+        assert!(removed.worker.deleted);
+        // Removal asks the backend to reconfirm shutdown even for a saved
+        // Stopped Worker; it must use the same WorkerRef as the original stop.
+        assert_eq!(
+            *backend.stops.lock().unwrap(),
+            vec![created.worker_ref.clone(), created.worker_ref.clone()]
+        );
+        assert!(
+            !temp
+                .path()
+                .join("runtime/workers")
+                .join(created.worker_id.to_string())
+                .exists()
+        );
+
+        let response = authed_empty_request(app, Method::GET, &worker_uri, token).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn local_token_placeholder_rejects_missing_bearer_token() {
         let app = runtime_http_router(Runtime::new_memory(), "local-token".to_string());
@@ -4040,8 +4228,9 @@ mod ws_tests {
         ConfigBundle, ConfigBundleMetadata, ConfigBundleProvenance, ConfigProfileDescriptor,
     };
     use crate::execution::{
-        WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation,
-        WorkerExecutionResult, WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
+        WorkerExecutionBackend, WorkerExecutionContext, WorkerExecutionOperation,
+        WorkerExecutionRestoreRequest, WorkerExecutionResult, WorkerExecutionSpawnRequest,
+        WorkerExecutionSpawnResult, WorkerProtocolTransport,
     };
     use crate::management::RuntimeOptions;
     use futures::{SinkExt, StreamExt};
@@ -4051,7 +4240,133 @@ mod ws_tests {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http::header as ws_header;
 
-    struct WsBackend;
+    struct WsController {
+        commands: tokio::sync::mpsc::UnboundedReceiver<protocol::Method>,
+        connections: Vec<tokio::sync::mpsc::Sender<protocol::Event>>,
+    }
+
+    struct WsExecution {
+        snapshot: protocol::Event,
+        context: WorkerExecutionContext,
+        methods: tokio::sync::mpsc::UnboundedSender<protocol::Method>,
+        controller: Mutex<WsController>,
+    }
+
+    impl WsExecution {
+        fn validate(&self) -> Result<(), WorkerExecutionResult> {
+            if self.methods.is_closed() {
+                Err(WorkerExecutionResult::rejected(
+                    WorkerExecutionOperation::ProtocolMethod,
+                    "mock Controller method channel is closed",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn dispatch(
+            &self,
+            method: protocol::Method,
+        ) -> Result<Vec<protocol::Event>, WorkerExecutionResult> {
+            let mut controller = self.controller.lock().unwrap();
+            self.validate()?;
+            match method {
+                protocol::Method::ListCompletions {
+                    kind,
+                    prefix,
+                    request_id,
+                    context,
+                } => Ok(vec![protocol::Event::Completions {
+                    kind,
+                    prefix,
+                    request_id,
+                    context,
+                    entries: Vec::new(),
+                }]),
+                protocol::Method::Shutdown { .. } => {
+                    controller.commands.close();
+                    controller.connections.clear();
+                    Ok(Vec::new())
+                }
+                method => {
+                    self.methods.send(method).map_err(|error| {
+                        WorkerExecutionResult::rejected(
+                            WorkerExecutionOperation::ProtocolMethod,
+                            error.to_string(),
+                        )
+                    })?;
+                    Ok(Vec::new())
+                }
+            }
+        }
+
+        fn close(&self) {
+            let mut controller = self.controller.lock().unwrap();
+            controller.commands.close();
+            controller.connections.clear();
+        }
+    }
+
+    #[derive(Default)]
+    struct WsBackend {
+        executions: Mutex<HashMap<WorkerRef, Arc<WsExecution>>>,
+    }
+
+    impl WsBackend {
+        fn insert_execution(&self, worker_ref: WorkerRef, context: WorkerExecutionContext) {
+            let (methods, commands) = tokio::sync::mpsc::unbounded_channel();
+            let execution = Arc::new(WsExecution {
+                snapshot: ws_snapshot(&worker_ref),
+                context,
+                methods,
+                controller: Mutex::new(WsController {
+                    commands,
+                    connections: Vec::new(),
+                }),
+            });
+            if let Some(previous) = self
+                .executions
+                .lock()
+                .unwrap()
+                .insert(worker_ref, execution)
+            {
+                previous.close();
+            }
+        }
+
+        fn publish(
+            &self,
+            worker_ref: &WorkerRef,
+            event: protocol::Event,
+        ) -> crate::observation::WorkerObservationEvent {
+            let execution = self
+                .executions
+                .lock()
+                .unwrap()
+                .get(worker_ref)
+                .unwrap()
+                .clone();
+            let observation = execution
+                .context
+                .publish_protocol_event(event.clone())
+                .unwrap();
+            // The fixture publishes separately to Runtime history and to this
+            // Controller's attached streams, just like the backend event relay.
+            execution
+                .controller
+                .lock()
+                .unwrap()
+                .connections
+                .retain(|sender| match sender.try_send(event.clone()) {
+                    Ok(()) => true,
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        panic!("mock protocol event receiver lagged")
+                    }
+                });
+            observation
+        }
+    }
 
     impl WorkerExecutionBackend for WsBackend {
         fn backend_id(&self) -> &str {
@@ -4059,12 +4374,10 @@ mod ws_tests {
         }
 
         fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
-            WorkerExecutionSpawnResult::Connected {
-                handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
-                worker_state: protocol::WorkerStateSnapshot {
-                    ..protocol::WorkerStatus::Idle.into()
-                },
-                workdir_attachments: request
+            self.insert_execution(request.worker_ref, request.context);
+            WorkerExecutionSpawnResult::connected(
+                protocol::WorkerStatus::Idle.into(),
+                request
                     .workdir_attachments
                     .iter()
                     .map(
@@ -4074,12 +4387,12 @@ mod ws_tests {
                         },
                     )
                     .collect(),
-            }
+            )
         }
 
         fn dispatch_input(
             &self,
-            _handle: &WorkerExecutionHandle,
+            _worker_ref: &WorkerRef,
             input: WorkerInput,
         ) -> WorkerExecutionResult {
             if let Some(submission_id) = input.submission_request_id {
@@ -4094,40 +4407,91 @@ mod ws_tests {
             }
         }
 
-        fn worker_snapshot(&self, handle: &WorkerExecutionHandle) -> Option<protocol::Event> {
-            Some(protocol::Event::Snapshot {
-                session: protocol::SessionSnapshot {
-                    pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
-                    entries: Vec::new(),
-                },
-                greeting: protocol::Greeting {
-                    worker_name: handle.worker_ref().worker_id.to_string(),
-                    cwd: String::new(),
-                    provider: "ws-test".to_string(),
-                    model: "ws-test".to_string(),
-                    scope_summary: "WebSocket test execution snapshot".to_string(),
-                    tools: Vec::new(),
-                    context_window: 0,
-                    context_tokens: 0,
-                    reasoning: None,
-                    context_usage: None,
-                },
-                state: protocol::WorkerStateSnapshot::initial(),
-                in_flight: protocol::InFlightSnapshot {
-                    blocks: Vec::new(),
-                    commands: Vec::new(),
-                    compaction: None,
-                },
-                internal_workers: Vec::new(),
-            })
+        fn worker_snapshot(&self, worker_ref: &WorkerRef) -> Option<protocol::Event> {
+            self.executions
+                .lock()
+                .unwrap()
+                .get(worker_ref)
+                .map(|execution| execution.snapshot.clone())
         }
 
-        fn dispatch_method(
+        fn restore_worker(
             &self,
-            _handle: &WorkerExecutionHandle,
-            _method: protocol::Method,
-        ) -> WorkerExecutionResult {
-            WorkerExecutionResult::accepted(WorkerExecutionOperation::ProtocolMethod)
+            request: WorkerExecutionRestoreRequest,
+        ) -> WorkerExecutionSpawnResult {
+            self.insert_execution(request.worker_ref, request.context);
+            WorkerExecutionSpawnResult::connected(
+                protocol::WorkerStatus::Idle.into(),
+                request.previous_workdir_attachments,
+            )
+        }
+
+        fn stop_worker(&self, worker_ref: &WorkerRef) -> WorkerExecutionResult {
+            if let Some(execution) = self.executions.lock().unwrap().remove(worker_ref) {
+                execution.close();
+            }
+            WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop)
+        }
+
+        fn attach_worker_protocol(
+            self: Arc<Self>,
+            worker_ref: &WorkerRef,
+        ) -> Result<WorkerProtocolTransport, WorkerExecutionResult> {
+            let execution = self
+                .executions
+                .lock()
+                .unwrap()
+                .get(worker_ref)
+                .cloned()
+                .ok_or_else(|| {
+                    WorkerExecutionResult::rejected(
+                        WorkerExecutionOperation::ProtocolMethod,
+                        "mock Controller is unavailable",
+                    )
+                })?;
+            let (sender, events) = tokio::sync::mpsc::channel(32);
+            {
+                let mut controller = execution.controller.lock().unwrap();
+                execution.validate()?;
+                controller.connections.push(sender);
+            }
+            let dispatcher = execution.clone();
+            let validator = execution.clone();
+            Ok(WorkerProtocolTransport::new(
+                worker_ref.clone(),
+                execution.snapshot.clone(),
+                events,
+                Arc::new(move |method| dispatcher.dispatch(method)),
+                Arc::new(move || validator.validate()),
+            ))
+        }
+    }
+
+    fn ws_snapshot(worker_ref: &WorkerRef) -> protocol::Event {
+        protocol::Event::Snapshot {
+            session: protocol::SessionSnapshot {
+                pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                entries: Vec::new(),
+            },
+            greeting: protocol::Greeting {
+                worker_name: worker_ref.worker_id.to_string(),
+                cwd: String::new(),
+                provider: "ws-test".to_string(),
+                model: "ws-test".to_string(),
+                scope_summary: "WebSocket test execution snapshot".to_string(),
+                tools: Vec::new(),
+                context_window: 0,
+                context_tokens: 0,
+                reasoning: None,
+                context_usage: None,
+            },
+            state: protocol::WorkerStateSnapshot::initial(),
+            in_flight: protocol::InFlightSnapshot {
+                blocks: Vec::new(),
+                commands: Vec::new(),
+                compaction: None,
+            },
+            internal_workers: Vec::new(),
         }
     }
 
@@ -4199,10 +4563,10 @@ mod ws_tests {
         }
     }
 
-    async fn spawn_runtime_server() -> (Runtime, WorkerRef, String) {
+    async fn spawn_runtime_server() -> (Runtime, Arc<WsBackend>, WorkerRef, String) {
+        let backend = Arc::new(WsBackend::default());
         let runtime =
-            Runtime::with_execution_backend(RuntimeOptions::default(), Arc::new(WsBackend))
-                .unwrap();
+            Runtime::with_execution_backend(RuntimeOptions::default(), backend.clone()).unwrap();
         runtime
             .store_config_bundle(ws_test_bundle(ProfileSelector::Builtin(
                 "builtin:companion".to_string(),
@@ -4226,6 +4590,7 @@ mod ws_tests {
         });
         (
             runtime,
+            backend,
             worker.worker_ref.clone(),
             format!(
                 "ws://{addr}/v1/workers/{}/protocol/ws",
@@ -4248,7 +4613,11 @@ mod ws_tests {
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
     ) -> protocol::Event {
-        let message = stream.next().await.unwrap().unwrap();
+        let message = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("Worker protocol frame must arrive promptly")
+            .unwrap()
+            .unwrap();
         let Message::Text(text) = message else {
             panic!("expected text frame");
         };
@@ -4260,7 +4629,11 @@ mod ws_tests {
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
     ) -> SubscriptionFrame {
-        let message = stream.next().await.unwrap().unwrap();
+        let message = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("Worker protocol frame must arrive promptly")
+            .unwrap()
+            .unwrap();
         let Message::Text(text) = message else {
             panic!("expected text frame");
         };
@@ -4290,7 +4663,7 @@ mod ws_tests {
 
     #[tokio::test]
     async fn runtime_protocol_ws_subscribes_and_filters_worker_lifecycle() {
-        let (runtime, worker_ref, worker_url) = spawn_runtime_server().await;
+        let (runtime, backend, worker_ref, worker_url) = spawn_runtime_server().await;
         let other = runtime
             .create_worker_scoped(
                 &RuntimeWorkspaceScope::new("local", "local-token"),
@@ -4347,22 +4720,18 @@ mod ws_tests {
             ));
             snapshot
         };
-        runtime
-            .observe_worker_event(
-                &other.worker_ref,
-                protocol::Event::WorkerState {
-                    snapshot: running_snapshot(&other.worker_ref),
-                },
-            )
-            .unwrap();
-        runtime
-            .observe_worker_event(
-                &worker_ref,
-                protocol::Event::WorkerState {
-                    snapshot: running_snapshot(&worker_ref),
-                },
-            )
-            .unwrap();
+        backend.publish(
+            &other.worker_ref,
+            protocol::Event::WorkerState {
+                snapshot: running_snapshot(&other.worker_ref),
+            },
+        );
+        backend.publish(
+            &worker_ref,
+            protocol::Event::WorkerState {
+                snapshot: running_snapshot(&worker_ref),
+            },
+        );
         let event = next_subscription_frame(&mut stream).await;
         assert!(matches!(
             event.payload,
@@ -4409,7 +4778,7 @@ mod ws_tests {
 
     #[tokio::test]
     async fn protocol_ws_connect_sends_snapshot_and_live_worker_events() {
-        let (runtime, worker_ref, url) = spawn_runtime_server().await;
+        let (_runtime, backend, worker_ref, url) = spawn_runtime_server().await;
         let (mut stream, _) = connect_async(authed_ws_request(&url)).await.unwrap();
 
         assert!(matches!(
@@ -4417,14 +4786,12 @@ mod ws_tests {
             protocol::Event::Snapshot { .. }
         ));
 
-        runtime
-            .observe_worker_event(
-                &worker_ref,
-                protocol::Event::TextDelta {
-                    text: "started".into(),
-                },
-            )
-            .unwrap();
+        backend.publish(
+            &worker_ref,
+            protocol::Event::TextDelta {
+                text: "started".into(),
+            },
+        );
         assert!(matches!(
             next_frame(&mut stream).await,
             protocol::Event::TextDelta { .. }
@@ -4432,25 +4799,116 @@ mod ws_tests {
     }
 
     #[tokio::test]
+    async fn protocol_ws_connected_dispatch_preserves_transport_source_and_completion_reply() {
+        let (_runtime, backend, worker_ref, url) = spawn_runtime_server().await;
+        let mut request = authed_ws_request(&url);
+        request.headers_mut().insert(
+            protocol::AUTHENTICATED_ACCOUNT_ID_HEADER,
+            "account-1".parse().unwrap(),
+        );
+        let (mut stream, _) = connect_async(request).await.unwrap();
+        let _ = next_frame(&mut stream).await;
+        let notification = protocol::Method::NotifyTracked {
+            notification_request_id: "notification-1".into(),
+            message: "hello".into(),
+            source: protocol::AuthenticatedInputSource::Account {
+                account_id: "forged".into(),
+            },
+        };
+        let completions = protocol::Method::ListCompletions {
+            kind: protocol::CompletionKind::Feature,
+            prefix: "builtin:".into(),
+            request_id: Some("completion-1".into()),
+            context: None,
+        };
+        for method in [notification, completions] {
+            stream
+                .send(Message::Text(
+                    serde_json::to_string(&method).unwrap().into(),
+                ))
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            next_frame(&mut stream).await,
+            protocol::Event::Completions { request_id: Some(request_id), prefix, .. }
+                if request_id == "completion-1" && prefix == "builtin:"
+        ));
+        // The reply orders this assertion after dispatch of the preceding frame.
+        let execution = backend
+            .executions
+            .lock()
+            .unwrap()
+            .get(&worker_ref)
+            .unwrap()
+            .clone();
+        let method = execution
+            .controller
+            .lock()
+            .unwrap()
+            .commands
+            .try_recv()
+            .unwrap();
+        assert!(matches!(
+            method,
+            protocol::Method::NotifyTracked {
+                source: protocol::AuthenticatedInputSource::Account { account_id },
+                ..
+            } if account_id == "account-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn protocol_ws_stop_closes_old_stream_and_restore_requires_new_connection() {
+        let (runtime, backend, worker_ref, url) = spawn_runtime_server().await;
+        let (mut old_stream, _) = connect_async(authed_ws_request(&url)).await.unwrap();
+        let _ = next_frame(&mut old_stream).await;
+        runtime.stop_worker(&worker_ref, None).unwrap();
+        runtime.restore_worker(&worker_ref).unwrap();
+        backend.publish(
+            &worker_ref,
+            protocol::Event::TextDelta {
+                text: "new execution".into(),
+            },
+        );
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), old_stream.next())
+            .await
+            .expect("the old protocol connection must close on stop");
+        assert!(matches!(closed, Some(Ok(Message::Close(_))) | None));
+
+        let (mut new_stream, _) = connect_async(authed_ws_request(&url)).await.unwrap();
+        assert!(matches!(
+            next_frame(&mut new_stream).await,
+            protocol::Event::Snapshot { .. }
+        ));
+        backend.publish(
+            &worker_ref,
+            protocol::Event::TextDone {
+                text: "restored execution".into(),
+            },
+        );
+        assert!(matches!(
+            next_frame(&mut new_stream).await,
+            protocol::Event::TextDone { text } if text == "restored execution"
+        ));
+    }
+
+    #[tokio::test]
     async fn protocol_ws_cursor_resume_is_duplicate_safe_and_filters_workers() {
-        let (runtime, worker_ref, url) = spawn_runtime_server().await;
+        let (runtime, backend, worker_ref, url) = spawn_runtime_server().await;
         let other = runtime.create_worker(ws_create_request()).unwrap();
-        let first = runtime
-            .observe_worker_event(
-                &worker_ref,
-                protocol::Event::TextDelta {
-                    text: "started".into(),
-                },
-            )
-            .unwrap();
-        runtime
-            .observe_worker_event(
-                &other.worker_ref,
-                protocol::Event::TextDelta {
-                    text: "other".into(),
-                },
-            )
-            .unwrap();
+        let first = backend.publish(
+            &worker_ref,
+            protocol::Event::TextDelta {
+                text: "started".into(),
+            },
+        );
+        backend.publish(
+            &other.worker_ref,
+            protocol::Event::TextDelta {
+                text: "other".into(),
+            },
+        );
 
         let resume_url = format!("{url}?cursor={}", first.cursor);
         let (mut stream, _) = connect_async(authed_ws_request(&resume_url)).await.unwrap();
@@ -4459,14 +4917,12 @@ mod ws_tests {
             protocol::Event::Snapshot { .. }
         ));
 
-        runtime
-            .observe_worker_event(
-                &worker_ref,
-                protocol::Event::TextDone {
-                    text: "done".into(),
-                },
-            )
-            .unwrap();
+        backend.publish(
+            &worker_ref,
+            protocol::Event::TextDone {
+                text: "done".into(),
+            },
+        );
         assert!(matches!(
             next_frame(&mut stream).await,
             protocol::Event::TextDone { .. }
@@ -4474,8 +4930,43 @@ mod ws_tests {
     }
 
     #[tokio::test]
+    async fn protocol_ws_old_cursor_never_replays_stopped_execution_after_new_snapshot() {
+        let (runtime, backend, worker_ref, url) = spawn_runtime_server().await;
+        let old = backend.publish(
+            &worker_ref,
+            protocol::Event::TextDelta {
+                text: "old cursor".into(),
+            },
+        );
+        backend.publish(
+            &worker_ref,
+            protocol::Event::TextDone {
+                text: "old output".into(),
+            },
+        );
+        backend.publish(&worker_ref, protocol::Event::Shutdown);
+        runtime.stop_worker(&worker_ref, None).unwrap();
+        runtime.restore_worker(&worker_ref).unwrap();
+        let resume_url = format!("{url}?cursor={}", old.cursor);
+        let (mut stream, _) = connect_async(authed_ws_request(&resume_url)).await.unwrap();
+        assert!(matches!(
+            next_frame(&mut stream).await,
+            protocol::Event::Snapshot { .. }
+        ));
+        backend.publish(
+            &worker_ref,
+            protocol::Event::TextDone {
+                text: "new output".into(),
+            },
+        );
+        assert!(
+            matches!(next_frame(&mut stream).await, protocol::Event::TextDone { text } if text == "new output")
+        );
+    }
+
+    #[tokio::test]
     async fn protocol_ws_reports_malformed_cursor_and_method_frame() {
-        let (_runtime, _worker_ref, url) = spawn_runtime_server().await;
+        let (_runtime, _backend, _worker_ref, url) = spawn_runtime_server().await;
         let malformed_url = format!("{url}?cursor=bad");
         let (mut malformed, _) = connect_async(authed_ws_request(&malformed_url))
             .await

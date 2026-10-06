@@ -6869,7 +6869,7 @@ mod tests {
 
         fn dispatch_input(
             &self,
-            _handle: &worker_runtime::execution::WorkerExecutionHandle,
+            _worker_ref: &EmbeddedWorkerRef,
             _input: EmbeddedWorkerInput,
         ) -> worker_runtime::execution::WorkerExecutionResult {
             worker_runtime::execution::WorkerExecutionResult::rejected(
@@ -6898,7 +6898,7 @@ mod tests {
 
         fn dispatch_input(
             &self,
-            _handle: &worker_runtime::execution::WorkerExecutionHandle,
+            _worker_ref: &EmbeddedWorkerRef,
             _input: EmbeddedWorkerInput,
         ) -> worker_runtime::execution::WorkerExecutionResult {
             unreachable!("Repository observation test does not dispatch Worker input")
@@ -6978,10 +6978,6 @@ mod tests {
                 .unwrap()
                 .insert(request.worker_ref.clone(), request.context);
             worker_runtime::execution::WorkerExecutionSpawnResult::Connected {
-                handle: worker_runtime::execution::WorkerExecutionHandle::new(
-                    request.worker_ref,
-                    self.backend_id(),
-                ),
                 worker_state: protocol::WorkerStateSnapshot {
                     ..protocol::WorkerStatus::Idle.into()
                 },
@@ -7000,15 +6996,10 @@ mod tests {
 
         fn dispatch_input(
             &self,
-            handle: &worker_runtime::execution::WorkerExecutionHandle,
+            worker_ref: &EmbeddedWorkerRef,
             input: EmbeddedWorkerInput,
         ) -> worker_runtime::execution::WorkerExecutionResult {
-            let context = self
-                .contexts
-                .lock()
-                .unwrap()
-                .get(handle.worker_ref())
-                .cloned();
+            let context = self.contexts.lock().unwrap().get(worker_ref).cloned();
             let Some(context) = context else {
                 return worker_runtime::execution::WorkerExecutionResult::rejected(
                     worker_runtime::execution::WorkerExecutionOperation::Input,

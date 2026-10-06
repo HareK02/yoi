@@ -175,8 +175,8 @@ use crate::memory_staging::{
     list_memory_staging_from_authority, memory_staging_backlog_from_authority,
 };
 use crate::observation::{
-    BackendObservationProxy, ObservationProxyError, RuntimeObservationClient,
-    RuntimeObservationSource, RuntimeObservationSourceConfig,
+    BackendObservationProxy, ObservationProxyError, RuntimeObservationSource,
+    RuntimeObservationSourceConfig,
 };
 use crate::records::{
     MergeRequestListItem, MergeRequestListResponse, MergeRequestRefDiagnostic, ObjectiveDetail,
@@ -29832,8 +29832,9 @@ async fn worker_protocol_ws(
         }
     };
     let input_source = authenticated_browser_input_source(&actor);
+    let scope = worker_runtime::RuntimeWorkspaceScope::new(api.workspace_id(), "embedded-backend");
     ws.on_upgrade(move |socket| {
-        worker_protocol_ws_session(source, socket, input_source, job_read_only)
+        worker_protocol_ws_session(source, socket, input_source, job_read_only, scope)
     })
 }
 
@@ -29866,7 +29867,9 @@ pub(crate) async fn connect_workspace_worker_protocol(
             connect_remote_worker_protocol(config, input_source).await
         }
         RuntimeObservationSource::Embedded(source) => {
-            connect_embedded_worker_protocol(source).await
+            let scope =
+                worker_runtime::RuntimeWorkspaceScope::new(api.workspace_id(), "embedded-backend");
+            connect_embedded_worker_protocol(source, scope).await
         }
     }
 }
@@ -29948,38 +29951,55 @@ async fn connect_remote_worker_protocol(
 
 async fn connect_embedded_worker_protocol(
     source: crate::observation::EmbeddedRuntimeObservationSource,
+    scope: worker_runtime::RuntimeWorkspaceScope,
 ) -> Result<WorkspaceWorkerProtocolConnection> {
-    let mut upstream =
-        RuntimeObservationClient::connect(&RuntimeObservationSource::Embedded(source.clone()))
-            .await
-            .map_err(|error| Error::RuntimeOperationFailed {
-                runtime_id: source.worker.runtime_id.clone(),
-                code: error.code().to_string(),
-                message: error.message().to_string(),
-            })?;
+    // Capture one real execution endpoint, including its greeting/snapshot.
+    // The WorkerRef-wide Workspace observation bus is a separate catalogue
+    // channel and must not reconnect this operational session after Restore.
+    let mut transport = source
+        .runtime
+        .attach_worker_protocol_scoped(&scope, &source.worker_ref)
+        .map_err(|error| Error::RuntimeOperationFailed {
+            runtime_id: source.worker.runtime_id.clone(),
+            code: "embedded_worker_protocol_connect_failed".to_string(),
+            message: error.to_string(),
+        })?;
     let (methods, mut method_receiver) = tokio::sync::mpsc::channel(256);
     let (event_sender, events) = tokio::sync::mpsc::channel(512);
     tokio::spawn(async move {
+        if event_sender.send(transport.snapshot.clone()).await.is_err() {
+            return;
+        }
         loop {
             tokio::select! {
+                _ = event_sender.closed() => break,
                 method = method_receiver.recv() => {
                     let Some(method) = method else { break };
-                    match source.runtime.send_protocol_method(&source.worker_ref, method) {
+                    let shutdown = matches!(&method, protocol::Method::Shutdown { .. });
+                    match source.runtime.send_connected_protocol_method_scoped(
+                        &scope, &source.worker_ref, &transport, method,
+                    ) {
                         Ok(direct_events) => {
                             for event in direct_events {
-                                if event_sender.send(event).await.is_err() { return; }
+                                let terminal = matches!(event, protocol::Event::Shutdown);
+                                if event_sender.send(event).await.is_err() || terminal { return; }
                             }
                         }
                         Err(error) => {
-                            if event_sender.send(protocol_error_event(error.to_string())).await.is_err() { return; }
+                            let terminal = embedded_protocol_dispatch_is_terminal(&error, &transport);
+                            if event_sender.send(protocol_error_event(error.to_string())).await.is_err() || terminal { return; }
                         }
                     }
+                    if shutdown { break; }
                 }
-                event = upstream.next_event() => match event {
-                    Ok(event) => {
-                        if event_sender.send(event.payload).await.is_err() { break; }
+                event = transport.events.recv() => match event {
+                    Some(event) => {
+                        let terminal = matches!(event, protocol::Event::Shutdown);
+                        if event_sender.send(event).await.is_err() || terminal { break; }
                     }
-                    Err(_) => break,
+                    // The execution relay closes on Stop, disconnect or lag.
+                    // Uncertain streams are terminal, never grounds to reattach.
+                    None => break,
                 }
             }
         }
@@ -29987,18 +30007,37 @@ async fn connect_embedded_worker_protocol(
     Ok(WorkspaceWorkerProtocolConnection { methods, events })
 }
 
+fn embedded_protocol_dispatch_is_terminal(
+    error: &worker_runtime::error::RuntimeError,
+    transport: &worker_runtime::execution::WorkerProtocolTransport,
+) -> bool {
+    // A settled, side-effect-free method rejection can leave the connection
+    // usable. Uncertain lifecycle/store/transport errors cannot.
+    !matches!(
+        error,
+        worker_runtime::error::RuntimeError::WorkerExecutionRejected {
+            outcome: worker_runtime::execution::WorkerExecutionOutcome::Busy
+                | worker_runtime::execution::WorkerExecutionOutcome::Rejected
+                | worker_runtime::execution::WorkerExecutionOutcome::Unsupported,
+            ..
+        }
+    ) || transport.validate().is_err()
+}
+
 async fn worker_protocol_ws_session(
     source: RuntimeObservationSource,
     socket: WebSocket,
     input_source: protocol::AuthenticatedInputSource,
     read_only: bool,
+    scope: worker_runtime::RuntimeWorkspaceScope,
 ) {
     match source {
         RuntimeObservationSource::RemoteWs(config) => {
             remote_worker_protocol_ws_session(config, socket, input_source, read_only).await;
         }
         RuntimeObservationSource::Embedded(source) => {
-            embedded_worker_protocol_ws_session(source, socket, input_source, read_only).await;
+            embedded_worker_protocol_ws_session(source, socket, input_source, read_only, scope)
+                .await;
         }
     }
 }
@@ -30158,19 +30197,23 @@ async fn embedded_worker_protocol_ws_session(
     mut socket: WebSocket,
     input_source: protocol::AuthenticatedInputSource,
     read_only: bool,
+    scope: worker_runtime::RuntimeWorkspaceScope,
 ) {
-    let mut upstream = match RuntimeObservationClient::connect(&RuntimeObservationSource::Embedded(
-        source.clone(),
-    ))
-    .await
+    let mut transport = match source
+        .runtime
+        .attach_worker_protocol_scoped(&scope, &source.worker_ref)
     {
-        Ok(client) => client,
+        Ok(transport) => transport,
         Err(error) => {
-            let event = protocol_error_event(error.message());
+            let event = protocol_error_event(error.to_string());
             let _ = send_protocol_event(&mut socket, &event).await;
+            let _ = socket.send(WsMessage::Close(None)).await;
             return;
         }
     };
+    if !send_protocol_event(&mut socket, &transport.snapshot).await {
+        return;
+    }
 
     loop {
         tokio::select! {
@@ -30184,24 +30227,44 @@ async fn embedded_worker_protocol_ws_session(
                     }
                     Some(Ok(WsMessage::Text(text))) => match decode_method(&text) {
                         Ok(method) => match authorize_browser_worker_method(method, &input_source) {
-                            Ok(method) => match source.runtime.send_protocol_method(&source.worker_ref, method) {
-                                Ok(events) => {
-                                    for event in events {
+                            Ok(method) => {
+                                let shutdown = matches!(&method, protocol::Method::Shutdown { .. });
+                                match source.runtime.send_connected_protocol_method_scoped(
+                                    &scope, &source.worker_ref, &transport, method,
+                                ) {
+                                    Ok(events) => {
+                                        for event in events {
+                                            let terminal = matches!(event, protocol::Event::Shutdown);
+                                            if !send_protocol_event(&mut socket, &event).await {
+                                                return;
+                                            }
+                                            if terminal {
+                                                let _ = socket.send(WsMessage::Close(None)).await;
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        let terminal = embedded_protocol_dispatch_is_terminal(&error, &transport);
+                                        let event = protocol_error_event(error.to_string());
                                         if !send_protocol_event(&mut socket, &event).await {
+                                            return;
+                                        }
+                                        if terminal {
+                                            let _ = socket.send(WsMessage::Close(None)).await;
                                             return;
                                         }
                                     }
                                 }
-                                Err(error) => {
-                                    let event = protocol_error_event(error.to_string());
-                                    if !send_protocol_event(&mut socket, &event).await {
-                                        return;
-                                    }
+                                if shutdown {
+                                    let _ = socket.send(WsMessage::Close(None)).await;
+                                    return;
                                 }
                             },
                             Err(message) => {
                                 let event = protocol_error_event(message);
                                 let _ = send_protocol_event(&mut socket, &event).await;
+                                let _ = socket.send(WsMessage::Close(None)).await;
                                 return;
                             }
                         },
@@ -30228,16 +30291,22 @@ async fn embedded_worker_protocol_ws_session(
                     }
                 }
             }
-            upstream_event = upstream.next_event() => {
+            upstream_event = transport.events.recv() => {
                 match upstream_event {
-                    Ok(event) => {
-                        if !send_protocol_event(&mut socket, &event.payload).await {
+                    Some(event) => {
+                        let terminal = matches!(event, protocol::Event::Shutdown);
+                        if !send_protocol_event(&mut socket, &event).await {
+                            return;
+                        }
+                        if terminal {
+                            let _ = socket.send(WsMessage::Close(None)).await;
                             return;
                         }
                     }
-                    Err(error) => {
-                        let event = protocol_error_event(error.message());
-                        let _ = send_protocol_event(&mut socket, &event).await;
+                    // Stop/disconnect/lag closes the execution-owned relay.
+                    // Never follow the WorkerRef to a restored Controller.
+                    None => {
+                        let _ = socket.send(WsMessage::Close(None)).await;
                         return;
                     }
                 }
@@ -42971,11 +43040,125 @@ mod tests {
         assert!(!workdir_runtime_miss_is_not_found(&unrelated));
     }
 
+    // The receiver belongs to one mock execution, not to a Runtime WorkerRecord.
+    // Bound protocol senders become terminal when Stop drops this execution.
+    struct DeterministicWorkerExecution {
+        context: worker_runtime::execution::WorkerExecutionContext,
+        state: std::sync::Mutex<protocol::WorkerStateSnapshot>,
+        method_tx: tokio::sync::mpsc::Sender<protocol::Method>,
+        method_rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<protocol::Method>>>,
+        events: tokio::sync::broadcast::Sender<protocol::Event>,
+        protocol_methods:
+            Arc<std::sync::Mutex<Vec<(worker_runtime::identity::WorkerRef, protocol::Method)>>>,
+    }
+
+    impl DeterministicWorkerExecution {
+        fn new(
+            context: worker_runtime::execution::WorkerExecutionContext,
+            protocol_methods: Arc<
+                std::sync::Mutex<Vec<(worker_runtime::identity::WorkerRef, protocol::Method)>>,
+            >,
+        ) -> Self {
+            let (method_tx, method_rx) = tokio::sync::mpsc::channel(32);
+            let (events, _) = tokio::sync::broadcast::channel(32);
+            Self {
+                context,
+                state: std::sync::Mutex::new(protocol::WorkerStateSnapshot::initial()),
+                method_tx,
+                method_rx: std::sync::Mutex::new(Some(method_rx)),
+                events,
+                protocol_methods,
+            }
+        }
+
+        fn unavailable() -> worker_runtime::execution::WorkerExecutionResult {
+            worker_runtime::execution::WorkerExecutionResult::rejected(
+                worker_runtime::execution::WorkerExecutionOperation::ProtocolMethod,
+                "deterministic test execution protocol is closed",
+            )
+        }
+
+        fn dispatch(
+            &self,
+            method: protocol::Method,
+        ) -> std::result::Result<
+            Vec<protocol::Event>,
+            worker_runtime::execution::WorkerExecutionResult,
+        > {
+            // Drive the actual mock receiver synchronously; no method is routed
+            // through a WorkerRef lookup after a protocol connection is attached.
+            let mut receiver = self.method_rx.lock().unwrap();
+            let receiver = receiver.as_mut().ok_or_else(Self::unavailable)?;
+            self.method_tx
+                .try_send(method)
+                .map_err(|_| Self::unavailable())?;
+            let method = receiver.try_recv().map_err(|_| Self::unavailable())?;
+            self.protocol_methods
+                .lock()
+                .unwrap()
+                .push((self.context.worker_ref().clone(), method.clone()));
+            Ok(match method {
+                protocol::Method::ListCompletions {
+                    kind,
+                    prefix,
+                    request_id,
+                    context,
+                } => vec![protocol::Event::Completions {
+                    kind,
+                    prefix,
+                    request_id,
+                    context,
+                    entries: Vec::new(),
+                }],
+                _ => Vec::new(),
+            })
+        }
+
+        fn publish_event(
+            &self,
+            event: protocol::Event,
+        ) -> std::result::Result<(), worker_runtime::error::RuntimeError> {
+            if let protocol::Event::WorkerState { snapshot } = &event {
+                *self.state.lock().unwrap() = snapshot.clone();
+            }
+            let _ = self.events.send(event.clone());
+            self.context.publish_protocol_event(event).map(|_| ())
+        }
+
+        fn snapshot(&self) -> protocol::Event {
+            protocol::Event::Snapshot {
+                session: protocol::SessionSnapshot {
+                    pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
+                    entries: Vec::new(),
+                },
+                greeting: protocol::Greeting {
+                    worker_name: self.context.worker_ref().worker_id.to_string(),
+                    cwd: String::new(),
+                    provider: "deterministic-workspace-server-test".to_string(),
+                    model: "deterministic-workspace-server-test".to_string(),
+                    reasoning: None,
+                    scope_summary: "test execution snapshot".to_string(),
+                    tools: Vec::new(),
+                    context_window: 0,
+                    context_tokens: 0,
+                    context_usage: None,
+                },
+                state: self.state.lock().unwrap().clone(),
+                in_flight: protocol::InFlightSnapshot {
+                    blocks: Vec::new(),
+                    commands: Vec::new(),
+                    compaction: None,
+                },
+                internal_workers: Vec::new(),
+            }
+        }
+    }
+
     struct DeterministicExecutionBackend {
         contexts: std::sync::Mutex<
             std::collections::HashMap<
                 worker_runtime::identity::WorkerRef,
-                worker_runtime::execution::WorkerExecutionContext,
+                Arc<DeterministicWorkerExecution>,
             >,
         >,
         materializer: worker_runtime::working_directory::RuntimeGitMaterializer,
@@ -42988,7 +43171,8 @@ mod tests {
         accept_restores: std::sync::atomic::AtomicBool,
         inputs: std::sync::Mutex<Vec<(worker_runtime::identity::WorkerRef, String)>>,
         protocol_methods:
-            std::sync::Mutex<Vec<(worker_runtime::identity::WorkerRef, protocol::Method)>>,
+            Arc<std::sync::Mutex<Vec<(worker_runtime::identity::WorkerRef, protocol::Method)>>>,
+        stops: std::sync::Mutex<Vec<worker_runtime::identity::WorkerRef>>,
     }
 
     impl Default for DeterministicExecutionBackend {
@@ -43012,7 +43196,8 @@ mod tests {
                 input_request_ids: std::sync::Mutex::new(Vec::new()),
                 accept_restores: std::sync::atomic::AtomicBool::new(false),
                 inputs: std::sync::Mutex::new(Vec::new()),
-                protocol_methods: std::sync::Mutex::new(Vec::new()),
+                protocol_methods: Arc::new(std::sync::Mutex::new(Vec::new())),
+                stops: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -43039,17 +43224,32 @@ mod tests {
             worker: &RuntimeWorkerRef,
             snapshot: protocol::WorkerStateSnapshot,
         ) {
-            let context = self
+            let execution = self
                 .contexts
                 .lock()
                 .unwrap()
                 .iter()
                 .find(|(worker_ref, _)| worker_ref.worker_id.to_string() == worker.worker_id)
-                .map(|(_, context)| context.clone())
-                .expect("execution context");
-            context
-                .publish_protocol_event(protocol::Event::WorkerState { snapshot })
+                .map(|(_, execution)| execution.clone())
+                .expect("mock execution");
+            execution
+                .publish_event(protocol::Event::WorkerState { snapshot })
                 .unwrap();
+        }
+
+        fn emit_worker_event(
+            &self,
+            worker_ref: &worker_runtime::identity::WorkerRef,
+            event: protocol::Event,
+        ) {
+            let execution = self
+                .contexts
+                .lock()
+                .unwrap()
+                .get(worker_ref)
+                .cloned()
+                .expect("mock execution");
+            execution.publish_event(event).unwrap();
         }
 
         fn take_input_request_ids(&self) -> Vec<Option<String>> {
@@ -43139,20 +43339,33 @@ mod tests {
                     working_directory: binding.status(),
                 })
                 .collect();
-            self.contexts
-                .lock()
-                .unwrap()
-                .insert(request.worker_ref.clone(), request.context);
+            self.contexts.lock().unwrap().insert(
+                request.worker_ref.clone(),
+                Arc::new(DeterministicWorkerExecution::new(
+                    request.context,
+                    self.protocol_methods.clone(),
+                )),
+            );
             worker_runtime::execution::WorkerExecutionSpawnResult::Connected {
-                handle: worker_runtime::execution::WorkerExecutionHandle::new(
-                    request.worker_ref,
-                    self.backend_id(),
-                ),
                 worker_state: protocol::WorkerStateSnapshot {
                     ..protocol::WorkerStatus::Idle.into()
                 },
                 workdir_attachments,
             }
+        }
+
+        fn preflight_restore(
+            &self,
+            request: &worker_runtime::execution::WorkerExecutionRestoreRequest,
+        ) -> std::result::Result<(), worker_runtime::execution::WorkerExecutionResult> {
+            if let Some(execution) = self.contexts.lock().unwrap().get(&request.worker_ref) {
+                return Err(worker_runtime::execution::WorkerExecutionResult::busy(
+                    worker_runtime::execution::WorkerExecutionOperation::Restore,
+                    "deterministic test backend already has a live execution",
+                )
+                .with_worker_state(execution.state.lock().unwrap().clone()));
+            }
+            Ok(())
         }
 
         fn restore_worker(
@@ -43178,15 +43391,14 @@ mod tests {
                     working_directory: binding.status(),
                 })
                 .collect();
-            self.contexts
-                .lock()
-                .unwrap()
-                .insert(request.worker_ref.clone(), request.context);
+            self.contexts.lock().unwrap().insert(
+                request.worker_ref.clone(),
+                Arc::new(DeterministicWorkerExecution::new(
+                    request.context,
+                    self.protocol_methods.clone(),
+                )),
+            );
             worker_runtime::execution::WorkerExecutionSpawnResult::Connected {
-                handle: worker_runtime::execution::WorkerExecutionHandle::new(
-                    request.worker_ref,
-                    self.backend_id(),
-                ),
                 worker_state: protocol::WorkerStateSnapshot::initial(),
                 workdir_attachments,
             }
@@ -43194,53 +43406,88 @@ mod tests {
 
         fn dispatch_method(
             &self,
-            handle: &worker_runtime::execution::WorkerExecutionHandle,
+            worker_ref: &worker_runtime::identity::WorkerRef,
             method: protocol::Method,
         ) -> worker_runtime::execution::WorkerExecutionResult {
-            self.protocol_methods
+            let execution = self.contexts.lock().unwrap().get(worker_ref).cloned();
+            let Some(execution) = execution else {
+                return DeterministicWorkerExecution::unavailable();
+            };
+            match execution.dispatch(method) {
+                Ok(_) => worker_runtime::execution::WorkerExecutionResult::accepted(
+                    worker_runtime::execution::WorkerExecutionOperation::ProtocolMethod,
+                ),
+                Err(result) => result,
+            }
+        }
+
+        fn attach_worker_protocol(
+            self: Arc<Self>,
+            worker_ref: &worker_runtime::identity::WorkerRef,
+        ) -> std::result::Result<
+            worker_runtime::execution::WorkerProtocolTransport,
+            worker_runtime::execution::WorkerExecutionResult,
+        > {
+            let execution = self
+                .contexts
                 .lock()
                 .unwrap()
-                .push((handle.worker_ref().clone(), method));
-            worker_runtime::execution::WorkerExecutionResult::accepted(
-                worker_runtime::execution::WorkerExecutionOperation::ProtocolMethod,
-            )
+                .get(worker_ref)
+                .cloned()
+                .ok_or_else(DeterministicWorkerExecution::unavailable)?;
+            let mut execution_events = execution.events.subscribe();
+            let snapshot = execution.snapshot();
+            let (event_tx, events) = tokio::sync::mpsc::channel(32);
+            tokio::spawn(async move {
+                while let Ok(event) = execution_events.recv().await {
+                    if event_tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let bound_execution = Arc::downgrade(&execution);
+            let method_tx = execution.method_tx.clone();
+            Ok(worker_runtime::execution::WorkerProtocolTransport::new(
+                worker_ref.clone(),
+                snapshot,
+                events,
+                Arc::new(move |method| {
+                    bound_execution
+                        .upgrade()
+                        .ok_or_else(DeterministicWorkerExecution::unavailable)?
+                        .dispatch(method)
+                }),
+                Arc::new(move || {
+                    if method_tx.is_closed() {
+                        Err(DeterministicWorkerExecution::unavailable())
+                    } else {
+                        Ok(())
+                    }
+                }),
+            ))
         }
 
         fn worker_snapshot(
             &self,
-            handle: &worker_runtime::execution::WorkerExecutionHandle,
+            worker_ref: &worker_runtime::identity::WorkerRef,
         ) -> Option<protocol::Event> {
-            Some(protocol::Event::Snapshot {
-                session: protocol::SessionSnapshot {
-                    pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
-                    entries: Vec::new(),
-                },
-                greeting: protocol::Greeting {
-                    worker_name: handle.worker_ref().worker_id.to_string(),
-                    cwd: String::new(),
-                    provider: "deterministic-workspace-server-test".to_string(),
-                    model: "deterministic-workspace-server-test".to_string(),
-                    reasoning: None,
-                    scope_summary: "test execution snapshot".to_string(),
-                    tools: Vec::new(),
-                    context_window: 0,
-                    context_tokens: 0,
-                    context_usage: None,
-                },
-                state: protocol::WorkerStateSnapshot::initial(),
-                in_flight: protocol::InFlightSnapshot {
-                    blocks: Vec::new(),
-                    commands: Vec::new(),
-                    compaction: None,
-                },
-                internal_workers: Vec::new(),
-            })
+            self.contexts
+                .lock()
+                .unwrap()
+                .get(worker_ref)
+                .map(|execution| execution.snapshot())
         }
 
         fn stop_worker(
             &self,
-            _handle: &worker_runtime::execution::WorkerExecutionHandle,
+            worker_ref: &worker_runtime::identity::WorkerRef,
         ) -> worker_runtime::execution::WorkerExecutionResult {
+            self.stops.lock().unwrap().push(worker_ref.clone());
+            if let Some(execution) = self.contexts.lock().unwrap().remove(worker_ref) {
+                // Drop the actual receiver even if an in-flight operation still
+                // briefly owns the execution. Old protocol senders stay closed.
+                execution.method_rx.lock().unwrap().take();
+            }
             worker_runtime::execution::WorkerExecutionResult::accepted(
                 worker_runtime::execution::WorkerExecutionOperation::Stop,
             )
@@ -43248,7 +43495,7 @@ mod tests {
 
         fn cancel_worker(
             &self,
-            _handle: &worker_runtime::execution::WorkerExecutionHandle,
+            _worker_ref: &worker_runtime::identity::WorkerRef,
         ) -> worker_runtime::execution::WorkerExecutionResult {
             worker_runtime::execution::WorkerExecutionResult::accepted(
                 worker_runtime::execution::WorkerExecutionOperation::Cancel,
@@ -43257,7 +43504,7 @@ mod tests {
 
         fn dispatch_input(
             &self,
-            handle: &worker_runtime::execution::WorkerExecutionHandle,
+            worker_ref: &worker_runtime::identity::WorkerRef,
             input: worker_runtime::interaction::WorkerInput,
         ) -> worker_runtime::execution::WorkerExecutionResult {
             self.input_request_ids
@@ -43267,9 +43514,18 @@ mod tests {
             self.inputs
                 .lock()
                 .expect("inputs lock")
-                .push((handle.worker_ref().clone(), input.content.clone()));
+                .push((worker_ref.clone(), input.content.clone()));
+            let execution = self.contexts.lock().unwrap().get(worker_ref).cloned();
+            let Some(execution) = execution else {
+                return worker_runtime::execution::WorkerExecutionResult::rejected(
+                    worker_runtime::execution::WorkerExecutionOperation::Input,
+                    "deterministic test backend has no live Worker",
+                );
+            };
+            let bound_execution = Arc::downgrade(&execution);
+            drop(execution);
             if let Some(hook) = self.input_hook.lock().unwrap().take() {
-                hook(handle.worker_ref());
+                hook(worker_ref);
             }
             if let Some(message) = self.input_failure.lock().unwrap().clone() {
                 return worker_runtime::execution::WorkerExecutionResult::errored(
@@ -43277,21 +43533,16 @@ mod tests {
                     message,
                 );
             }
-            let context = self
-                .contexts
-                .lock()
-                .unwrap()
-                .get(handle.worker_ref())
-                .cloned()
-                .expect("execution context");
             let submission_request_id = input.submission_request_id.clone();
             let input_kind = input.kind.clone();
             let content = input.content.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(25));
-                let _ = context.publish_protocol_event(protocol::Event::TextDone {
-                    text: format!("server companion echoed: {content}"),
-                });
+                if let Some(execution) = bound_execution.upgrade() {
+                    let _ = execution.publish_event(protocol::Event::TextDone {
+                        text: format!("server companion echoed: {content}"),
+                    });
+                }
             });
             if input_kind == worker_runtime::interaction::WorkerInputKind::Notify {
                 worker_runtime::execution::WorkerExecutionResult::accepted_notification(
@@ -49739,20 +49990,20 @@ mod tests {
         fn activate_restored_worker(
             &self,
             id: attention_execution::WorkerLifecycleOperationId,
-            handle: &attention_execution::WorkerExecutionHandle,
+            worker_ref: &worker_runtime::identity::WorkerRef,
         ) -> std::result::Result<(), String> {
-            self.inner.activate_restored_worker(id, handle)
+            self.inner.activate_restored_worker(id, worker_ref)
         }
         fn dispatch_input(
             &self,
-            handle: &attention_execution::WorkerExecutionHandle,
+            worker_ref: &worker_runtime::identity::WorkerRef,
             input: worker_runtime::interaction::WorkerInput,
         ) -> attention_execution::WorkerExecutionResult {
             self.attempts
                 .lock()
                 .unwrap()
                 .push(input.submission_request_id.clone().unwrap());
-            let result = self.inner.dispatch_input(handle, input);
+            let result = self.inner.dispatch_input(worker_ref, input);
             assert_eq!(
                 result.outcome,
                 attention_execution::WorkerExecutionOutcome::Accepted
@@ -49771,10 +50022,10 @@ mod tests {
         }
         fn dispatch_method(
             &self,
-            handle: &attention_execution::WorkerExecutionHandle,
+            worker_ref: &worker_runtime::identity::WorkerRef,
             method: protocol::Method,
         ) -> attention_execution::WorkerExecutionResult {
-            self.inner.dispatch_method(handle, method)
+            self.inner.dispatch_method(worker_ref, method)
         }
         fn stop_worker_operation(
             &self,
@@ -49784,9 +50035,9 @@ mod tests {
         }
         fn worker_snapshot(
             &self,
-            handle: &attention_execution::WorkerExecutionHandle,
+            worker_ref: &worker_runtime::identity::WorkerRef,
         ) -> Option<protocol::Event> {
-            self.inner.worker_snapshot(handle)
+            self.inner.worker_snapshot(worker_ref)
         }
     }
 
@@ -55277,9 +55528,19 @@ mod tests {
     }
 
     fn runtime_with_worker() -> (worker_runtime::Runtime, worker_runtime::identity::WorkerRef) {
+        let (runtime, worker_ref, _) = runtime_with_worker_backend();
+        (runtime, worker_ref)
+    }
+
+    fn runtime_with_worker_backend() -> (
+        worker_runtime::Runtime,
+        worker_runtime::identity::WorkerRef,
+        Arc<DeterministicExecutionBackend>,
+    ) {
+        let execution = Arc::new(DeterministicExecutionBackend::default());
         let runtime = worker_runtime::Runtime::with_execution_backend(
             worker_runtime::RuntimeOptions::default(),
-            Arc::new(DeterministicExecutionBackend::default()),
+            execution.clone(),
         )
         .unwrap();
         runtime.store_config_bundle(runtime_test_bundle()).unwrap();
@@ -55289,7 +55550,7 @@ mod tests {
                 runtime_create_request(),
             )
             .unwrap();
-        (runtime, worker.worker_ref)
+        (runtime, worker.worker_ref, execution)
     }
 
     #[test]
@@ -57289,10 +57550,11 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let restored_store = test_control_store(&config);
+        let restored_execution = Arc::new(DeterministicExecutionBackend::default());
         let restored = WorkspaceApi::new_with_execution_backend(
             config,
             Arc::new(restored_store),
-            Arc::new(DeterministicExecutionBackend::default()),
+            restored_execution.clone(),
         )
         .await
         .expect("restored fs-backed api starts");
@@ -57300,10 +57562,34 @@ mod tests {
             .runtime
             .worker(&worker_ref)
             .expect("restored worker");
-        // The durable projection keeps an observer attached, so the restored Runtime
-        // catalog remains controllable while its failed execution is represented in
-        // `worker_state` rather than by removing the catalog Worker.
+        // A read-only automatic restore rejection retains the active catalog Worker,
+        // but cannot invent a live execution state or protocol snapshot.
         assert_eq!(restored_worker.state, "idle");
+        assert!(restored_worker.worker_state.is_none());
+        let crate::observation::RuntimeObservationSource::Embedded(observation) = restored
+            .runtime
+            .observation_source(&worker_ref)
+            .expect("catalog Worker retains its observation source")
+        else {
+            panic!("expected embedded observation source");
+        };
+        let diagnostics = observation.runtime.diagnostics().unwrap();
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.worker_ref.as_ref() == Some(&observation.worker_ref)
+                    && diagnostic
+                        .message
+                        .contains("deterministic test backend restore disabled")
+            }),
+            "rejected automatic restore must retain its concrete backend diagnostic: {diagnostics:?}"
+        );
+        assert!(matches!(
+            observation
+                .runtime
+                .worker_observation_snapshot(&observation.worker_ref),
+            Err(worker_runtime::error::RuntimeError::WorkerExecutionUnavailable { .. })
+        ));
+        assert!(restored_execution.contexts.lock().unwrap().is_empty());
         assert!(
             serde_json::to_value(&restored_worker)
                 .unwrap()
@@ -57326,13 +57612,108 @@ mod tests {
                 &worker_ref,
                 WorkerInputRequest {
                     kind: WorkerInputKind::User,
-                    content: "should not be routed to corrupted handle".to_string(),
+                    content: "reject input without live Worker".to_string(),
                     submission_request_id: None,
                     segments: None,
                 },
             )
             .expect("stale worker input is projected as an operation result");
         assert_eq!(rejected_input.state, InternalWorkerOperationState::Rejected);
+        assert_eq!(rejected_input.disposition, WorkerInputDisposition::Rejected);
+        assert!(rejected_input.runtime_run_id.is_none());
+        assert!(rejected_input.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "embedded_worker_execution_rejected"
+                && diagnostic
+                    .message
+                    .contains("deterministic test backend has no live Worker")
+        }));
+        assert_eq!(
+            restored_execution.take_inputs(),
+            vec![(
+                observation.worker_ref.clone(),
+                "reject input without live Worker".to_string()
+            )]
+        );
+        assert!(
+            restored
+                .runtime
+                .worker(&worker_ref)
+                .unwrap()
+                .worker_state
+                .is_none()
+        );
+
+        // Exercise the ordinary guarded removal service, not direct catalog deletion.
+        let Json(orchestrator) = scoped_start_workspace_orchestrator(
+            State(restored.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let source = orchestrator.worker.expect("removal controller");
+        let source = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
+        sync_worker_observation(&restored, &restored_worker).unwrap();
+        seed_worker_control_grant(&restored, &source, &worker_ref, "rejected-restore-remove");
+        let verified_source = || crate::worker_source::VerifiedWorkerMutationSource {
+            runtime_id: source.runtime_id.clone(),
+            worker_id: source.worker_id.clone(),
+            actor_kind: worker_runtime::auth::WorkerMutationActorKind::Worker,
+            permission: worker_runtime::auth::WORKER_REMOVE_PERMISSION.to_string(),
+            jti: "rejected-restore-remove".to_string(),
+        };
+        let removal = WorkerRemovalService::new(&restored);
+        let before_stop = removal
+            .execute_async(
+                verified_source(),
+                &worker_ref.runtime_id,
+                &worker_ref.worker_id,
+                "rejected restore is not Stop",
+            )
+            .await
+            .unwrap();
+        assert_eq!(before_stop.status, StatusCode::CONFLICT.as_u16());
+        assert!(before_stop.body.contains("worker_not_stopped"));
+
+        let stopped = restored
+            .runtime
+            .stop_worker(
+                &worker_ref,
+                WorkerLifecycleRequest {
+                    reason: Some("retire Worker after rejected automatic restore".to_string()),
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
+        assert_eq!(
+            restored_execution.stops.lock().unwrap().as_slice(),
+            &[observation.worker_ref.clone()]
+        );
+        let stopped_worker = restored.runtime.worker(&worker_ref).unwrap();
+        assert_eq!(stopped_worker.state, "stopped");
+        sync_worker_observation(&restored, &stopped_worker).unwrap();
+        seed_worker_session_for_cleanup(&dir.path().join("workspace"), &worker_ref);
+        let removed = removal
+            .execute_async(
+                verified_source(),
+                &worker_ref.runtime_id,
+                &worker_ref.worker_id,
+                "remove stopped Worker after rejected automatic restore",
+            )
+            .await
+            .unwrap();
+        assert_eq!(removed.status, StatusCode::OK.as_u16(), "{}", removed.body);
+        assert!(removed.body.contains("\"removed\":true"));
+        assert!(restored.runtime.worker(&worker_ref).is_err());
+        assert!(
+            restored
+                .store
+                .get_worker_registry(TEST_WORKSPACE_ID, &worker_ref)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -57662,7 +58043,7 @@ mod tests {
 
     #[tokio::test]
     async fn proxies_worker_protocol_ws_as_raw_events() {
-        let (runtime, worker_ref, endpoint) = spawn_runtime_worker().await;
+        let (_runtime, worker_ref, endpoint, execution) = spawn_runtime_worker().await;
         let source = RuntimeObservationSourceConfig {
             worker: RuntimeWorkerRef::new("runtime-a", "worker-a"),
             endpoint,
@@ -57693,23 +58074,617 @@ mod tests {
             protocol::Event::Completions { .. }
         ));
 
-        runtime
-            .observe_worker_event(
-                &worker_ref,
-                protocol::Event::TextDelta {
-                    text: "live".into(),
-                },
-            )
-            .unwrap();
+        execution.emit_worker_event(
+            &worker_ref,
+            protocol::Event::TextDelta {
+                text: "live".into(),
+            },
+        );
         assert!(matches!(
             next_client_frame(&mut stream).await,
             protocol::Event::TextDelta { .. }
         ));
     }
 
+    fn embedded_protocol_test_source(
+        runtime: &worker_runtime::Runtime,
+        worker_ref: &worker_runtime::identity::WorkerRef,
+    ) -> crate::observation::EmbeddedRuntimeObservationSource {
+        crate::observation::EmbeddedRuntimeObservationSource {
+            worker: RuntimeWorkerRef::new("runtime-a", worker_ref.worker_id.to_string()),
+            runtime: runtime.clone(),
+            worker_ref: worker_ref.clone(),
+        }
+    }
+
+    fn embedded_protocol_test_scope() -> worker_runtime::RuntimeWorkspaceScope {
+        worker_runtime::RuntimeWorkspaceScope::new("local", "local-token")
+    }
+
+    fn protocol_test_completion(request_id: &str) -> protocol::Method {
+        protocol::Method::ListCompletions {
+            kind: protocol::CompletionKind::File,
+            prefix: String::new(),
+            request_id: Some(request_id.to_string()),
+            context: None,
+        }
+    }
+
+    fn delayed_protocol_test_methods() -> Vec<protocol::Method> {
+        vec![
+            protocol::Method::Submit {
+                submission_request_id: "delayed-submit-a".to_string(),
+                input: vec![protocol::Segment::Text {
+                    content: "must not reach restored B".to_string(),
+                }],
+            },
+            protocol_test_completion("delayed-completion-a"),
+            protocol::Method::Shutdown {
+                command: protocol::WorkerCommandEnvelope::new(700),
+            },
+        ]
+    }
+
+    fn assert_embedded_protocol_snapshot(
+        event: protocol::Event,
+        worker_ref: &worker_runtime::identity::WorkerRef,
+    ) {
+        let protocol::Event::Snapshot {
+            greeting, state, ..
+        } = event
+        else {
+            panic!("protocol connection must start with its attached execution snapshot");
+        };
+        assert_eq!(greeting.worker_name, worker_ref.worker_id.to_string());
+        assert_eq!(greeting.provider, "deterministic-workspace-server-test");
+        assert_eq!(state, protocol::WorkerStateSnapshot::initial());
+    }
+
+    async fn next_embedded_protocol_event(
+        connection: &mut WorkspaceWorkerProtocolConnection,
+    ) -> protocol::Event {
+        tokio::time::timeout(std::time::Duration::from_secs(2), connection.events.recv())
+            .await
+            .expect("embedded protocol event timeout")
+            .expect("embedded protocol unexpectedly closed")
+    }
+
+    async fn assert_embedded_protocol_closed(connection: &mut WorkspaceWorkerProtocolConnection) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(event) = connection.events.recv().await {
+                // A late method may be rejected before the relay closure is
+                // consumed. No completion, snapshot or B event is permitted.
+                assert!(matches!(
+                    event,
+                    protocol::Event::Error { .. } | protocol::Event::Shutdown
+                ));
+            }
+        })
+        .await
+        .expect("old embedded protocol connection did not close");
+        assert!(connection.methods.is_closed());
+    }
+
+    async fn spawn_embedded_protocol_test_ws(
+        source: crate::observation::EmbeddedRuntimeObservationSource,
+        scope: worker_runtime::RuntimeWorkspaceScope,
+        read_only: bool,
+    ) -> (TestWebSocket, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let input_source = authenticated_browser_input_source(&test_browser_request_actor());
+        let app = Router::new().route(
+            "/protocol/ws",
+            get(move |ws: WebSocketUpgrade| {
+                let source = source.clone();
+                let scope = scope.clone();
+                let input_source = input_source.clone();
+                async move {
+                    ws.on_upgrade(move |socket| {
+                        worker_protocol_ws_session(
+                            RuntimeObservationSource::Embedded(source),
+                            socket,
+                            input_source,
+                            read_only,
+                            scope,
+                        )
+                    })
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (socket, _) = connect_async(format!("ws://{address}/protocol/ws"))
+            .await
+            .unwrap();
+        (socket, server)
+    }
+
+    async fn send_protocol_test_ws_method(socket: &mut TestWebSocket, method: &protocol::Method) {
+        socket
+            .send(Message::Text(
+                protocol::stream::encode_method(method).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    async fn next_embedded_protocol_ws_event(socket: &mut TestWebSocket) -> protocol::Event {
+        tokio::time::timeout(std::time::Duration::from_secs(2), next_client_frame(socket))
+            .await
+            .expect("embedded protocol WebSocket event timeout")
+    }
+
+    async fn assert_embedded_protocol_ws_closed(socket: &mut TestWebSocket) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match socket.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let event = protocol::stream::decode_event(text.as_ref()).unwrap();
+                        assert!(matches!(
+                            event,
+                            protocol::Event::Error { .. } | protocol::Event::Shutdown
+                        ));
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    other => panic!("expected terminal WebSocket frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("old embedded protocol WebSocket did not close");
+    }
+
+    #[tokio::test]
+    async fn embedded_internal_protocol_bridge_closes_across_stop_restore_without_retargeting() {
+        // Each delayed method gets its own A connection: a rejected Submit
+        // must not hide whether completion or Shutdown can retarget B.
+        for delayed in delayed_protocol_test_methods() {
+            let (runtime, worker_ref, execution) = runtime_with_worker_backend();
+            let source = embedded_protocol_test_source(&runtime, &worker_ref);
+            let mut old =
+                connect_embedded_worker_protocol(source.clone(), embedded_protocol_test_scope())
+                    .await
+                    .unwrap();
+            assert_embedded_protocol_snapshot(
+                next_embedded_protocol_event(&mut old).await,
+                &worker_ref,
+            );
+            old.methods
+                .send(protocol_test_completion("execution-a"))
+                .await
+                .unwrap();
+            assert!(matches!(
+                next_embedded_protocol_event(&mut old).await,
+                protocol::Event::Completions { request_id: Some(id), .. } if id == "execution-a"
+            ));
+            execution.emit_worker_event(
+                &worker_ref,
+                protocol::Event::TextDelta {
+                    text: "execution-a".into(),
+                },
+            );
+            assert!(matches!(
+                next_embedded_protocol_event(&mut old).await,
+                protocol::Event::TextDelta { text } if text == "execution-a"
+            ));
+
+            // No await here: the old loop has not yet observed A's closure when
+            // B is installed and a delayed method enters its existing queue.
+            runtime.stop_worker(&worker_ref, None).unwrap();
+            execution.accept_restores();
+            runtime.restore_worker(&worker_ref).unwrap();
+            old.methods.try_send(delayed).unwrap();
+            execution.emit_worker_event(
+                &worker_ref,
+                protocol::Event::TextDelta {
+                    text: "execution-b".into(),
+                },
+            );
+            assert_embedded_protocol_closed(&mut old).await;
+            assert_eq!(
+                execution.protocol_methods().len(),
+                1,
+                "delayed A method reached B"
+            );
+            assert_eq!(
+                runtime.worker_detail(&worker_ref).unwrap().status,
+                worker_runtime::catalog::WorkerStatus::Idle
+            );
+            assert_eq!(
+                execution.stops.lock().unwrap().as_slice(),
+                &[worker_ref.clone()]
+            );
+
+            let mut current =
+                connect_embedded_worker_protocol(source, embedded_protocol_test_scope())
+                    .await
+                    .unwrap();
+            assert_embedded_protocol_snapshot(
+                next_embedded_protocol_event(&mut current).await,
+                &worker_ref,
+            );
+            current
+                .methods
+                .send(protocol_test_completion("execution-b"))
+                .await
+                .unwrap();
+            assert!(matches!(
+                next_embedded_protocol_event(&mut current).await,
+                protocol::Event::Completions { request_id: Some(id), .. } if id == "execution-b"
+            ));
+            execution.emit_worker_event(
+                &worker_ref,
+                protocol::Event::TextDelta {
+                    text: "fresh-b".into(),
+                },
+            );
+            assert!(matches!(
+                next_embedded_protocol_event(&mut current).await,
+                protocol::Event::TextDelta { text } if text == "fresh-b"
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_browser_protocol_ws_closes_across_stop_restore_without_retargeting() {
+        for delayed in delayed_protocol_test_methods() {
+            let (runtime, worker_ref, execution) = runtime_with_worker_backend();
+            let source = embedded_protocol_test_source(&runtime, &worker_ref);
+            let (mut old, server) = spawn_embedded_protocol_test_ws(
+                source.clone(),
+                embedded_protocol_test_scope(),
+                false,
+            )
+            .await;
+            assert_embedded_protocol_snapshot(
+                next_embedded_protocol_ws_event(&mut old).await,
+                &worker_ref,
+            );
+            let submit = protocol::Method::Submit {
+                submission_request_id: "authenticated-a".to_string(),
+                input: vec![protocol::Segment::Text {
+                    content: "from browser".into(),
+                }],
+            };
+            send_protocol_test_ws_method(&mut old, &submit).await;
+            send_protocol_test_ws_method(&mut old, &protocol_test_completion("execution-a")).await;
+            assert!(matches!(
+                next_embedded_protocol_ws_event(&mut old).await,
+                protocol::Event::Completions { .. }
+            ));
+            assert!(matches!(
+                &execution.protocol_methods()[0].1,
+                protocol::Method::SubmitTracked { source, .. }
+                    if source == &authenticated_browser_input_source(&test_browser_request_actor())
+            ));
+            execution.emit_worker_event(
+                &worker_ref,
+                protocol::Event::TextDelta {
+                    text: "execution-a".into(),
+                },
+            );
+            assert!(
+                matches!(next_embedded_protocol_ws_event(&mut old).await, protocol::Event::TextDelta { text } if text == "execution-a")
+            );
+
+            // Stop and restore happen before this socket loop processes closure.
+            runtime.stop_worker(&worker_ref, None).unwrap();
+            execution.accept_restores();
+            runtime.restore_worker(&worker_ref).unwrap();
+            // A peer close may win this race; otherwise the old connected
+            // dispatcher must reject the frame without touching B.
+            let _ = old
+                .send(Message::Text(
+                    protocol::stream::encode_method(&delayed).unwrap().into(),
+                ))
+                .await;
+            execution.emit_worker_event(
+                &worker_ref,
+                protocol::Event::TextDelta {
+                    text: "execution-b".into(),
+                },
+            );
+            assert_embedded_protocol_ws_closed(&mut old).await;
+            assert_eq!(
+                execution.protocol_methods().len(),
+                2,
+                "delayed A method reached B"
+            );
+            assert_eq!(
+                runtime.worker_detail(&worker_ref).unwrap().status,
+                worker_runtime::catalog::WorkerStatus::Idle
+            );
+            assert_eq!(
+                execution.stops.lock().unwrap().as_slice(),
+                &[worker_ref.clone()]
+            );
+            server.abort();
+
+            let (mut current, current_server) =
+                spawn_embedded_protocol_test_ws(source, embedded_protocol_test_scope(), false)
+                    .await;
+            assert_embedded_protocol_snapshot(
+                next_embedded_protocol_ws_event(&mut current).await,
+                &worker_ref,
+            );
+            send_protocol_test_ws_method(&mut current, &protocol_test_completion("execution-b"))
+                .await;
+            assert!(matches!(
+                next_embedded_protocol_ws_event(&mut current).await,
+                protocol::Event::Completions { request_id: Some(id), .. } if id == "execution-b"
+            ));
+            execution.emit_worker_event(
+                &worker_ref,
+                protocol::Event::TextDelta {
+                    text: "fresh-b".into(),
+                },
+            );
+            assert!(matches!(
+                next_embedded_protocol_ws_event(&mut current).await,
+                protocol::Event::TextDelta { text } if text == "fresh-b"
+            ));
+            current.close(None).await.unwrap();
+            current_server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_protocol_paths_close_on_shutdown_event_and_lagged_relay() {
+        for lagged in [false, true] {
+            let (runtime, worker_ref, execution) = runtime_with_worker_backend();
+            let source = embedded_protocol_test_source(&runtime, &worker_ref);
+            let mut bridge =
+                connect_embedded_worker_protocol(source.clone(), embedded_protocol_test_scope())
+                    .await
+                    .unwrap();
+            assert_embedded_protocol_snapshot(
+                next_embedded_protocol_event(&mut bridge).await,
+                &worker_ref,
+            );
+            let (mut socket, server) =
+                spawn_embedded_protocol_test_ws(source, embedded_protocol_test_scope(), false)
+                    .await;
+            assert_embedded_protocol_snapshot(
+                next_embedded_protocol_ws_event(&mut socket).await,
+                &worker_ref,
+            );
+            if lagged {
+                // Overflow the execution broadcast before either relay runs.
+                // A lost terminal event is uncertain, never a reason to follow
+                // the Runtime WorkerRef-wide observation bus instead.
+                for _ in 0..40 {
+                    execution.emit_worker_event(
+                        &worker_ref,
+                        protocol::Event::TextDelta {
+                            text: "overflow".into(),
+                        },
+                    );
+                }
+            } else {
+                execution.emit_worker_event(&worker_ref, protocol::Event::Shutdown);
+            }
+            assert_embedded_protocol_closed(&mut bridge).await;
+            assert_embedded_protocol_ws_closed(&mut socket).await;
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_protocol_paths_close_after_connected_shutdown_method() {
+        let shutdown = protocol::Method::Shutdown {
+            command: protocol::WorkerCommandEnvelope::new(701),
+        };
+        let (runtime, worker_ref, execution) = runtime_with_worker_backend();
+        let mut bridge = connect_embedded_worker_protocol(
+            embedded_protocol_test_source(&runtime, &worker_ref),
+            embedded_protocol_test_scope(),
+        )
+        .await
+        .unwrap();
+        assert_embedded_protocol_snapshot(
+            next_embedded_protocol_event(&mut bridge).await,
+            &worker_ref,
+        );
+        bridge.methods.try_send(shutdown.clone()).unwrap();
+        bridge
+            .methods
+            .try_send(protocol_test_completion("after-shutdown"))
+            .unwrap();
+        assert_embedded_protocol_closed(&mut bridge).await;
+        assert!(matches!(
+            execution.protocol_methods().as_slice(),
+            [(_, protocol::Method::Shutdown { .. })]
+        ));
+        assert_eq!(
+            runtime.worker_detail(&worker_ref).unwrap().status,
+            worker_runtime::catalog::WorkerStatus::Stopped
+        );
+
+        let (runtime, worker_ref, execution) = runtime_with_worker_backend();
+        let (mut socket, server) = spawn_embedded_protocol_test_ws(
+            embedded_protocol_test_source(&runtime, &worker_ref),
+            embedded_protocol_test_scope(),
+            false,
+        )
+        .await;
+        assert_embedded_protocol_snapshot(
+            next_embedded_protocol_ws_event(&mut socket).await,
+            &worker_ref,
+        );
+        send_protocol_test_ws_method(&mut socket, &shutdown).await;
+        let _ = socket
+            .send(Message::Text(
+                protocol::stream::encode_method(&protocol_test_completion("after-shutdown"))
+                    .unwrap()
+                    .into(),
+            ))
+            .await;
+        assert_embedded_protocol_ws_closed(&mut socket).await;
+        assert!(matches!(
+            execution.protocol_methods().as_slice(),
+            [(_, protocol::Method::Shutdown { .. })]
+        ));
+        assert_eq!(
+            runtime.worker_detail(&worker_ref).unwrap().status,
+            worker_runtime::catalog::WorkerStatus::Stopped
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn embedded_protocol_paths_enforce_workspace_scope_and_browser_method_authority() {
+        let (runtime, worker_ref, execution) = runtime_with_worker_backend();
+        let source = embedded_protocol_test_source(&runtime, &worker_ref);
+        let wrong_scope =
+            worker_runtime::RuntimeWorkspaceScope::new("other-workspace", "local-token");
+        assert!(
+            connect_embedded_worker_protocol(source.clone(), wrong_scope.clone())
+                .await
+                .is_err()
+        );
+        let (mut socket, server) =
+            spawn_embedded_protocol_test_ws(source.clone(), wrong_scope, false).await;
+        assert!(matches!(
+            next_embedded_protocol_ws_event(&mut socket).await,
+            protocol::Event::Error { .. }
+        ));
+        assert_embedded_protocol_ws_closed(&mut socket).await;
+        server.abort();
+
+        let (mut socket, server) =
+            spawn_embedded_protocol_test_ws(source.clone(), embedded_protocol_test_scope(), true)
+                .await;
+        assert_embedded_protocol_snapshot(
+            next_embedded_protocol_ws_event(&mut socket).await,
+            &worker_ref,
+        );
+        send_protocol_test_ws_method(&mut socket, &protocol_test_completion("read-only")).await;
+        assert!(matches!(
+            next_embedded_protocol_ws_event(&mut socket).await,
+            protocol::Event::Error { .. }
+        ));
+        socket.close(None).await.unwrap();
+        server.abort();
+
+        let (mut socket, server) =
+            spawn_embedded_protocol_test_ws(source, embedded_protocol_test_scope(), false).await;
+        assert_embedded_protocol_snapshot(
+            next_embedded_protocol_ws_event(&mut socket).await,
+            &worker_ref,
+        );
+        let forged = protocol::Method::SubmitTracked {
+            submission_request_id: "forged-source".into(),
+            input: Vec::new(),
+            source: authenticated_browser_input_source(&test_browser_request_actor()),
+        };
+        send_protocol_test_ws_method(&mut socket, &forged).await;
+        assert!(matches!(
+            next_embedded_protocol_ws_event(&mut socket).await,
+            protocol::Event::Error { .. }
+        ));
+        assert_embedded_protocol_ws_closed(&mut socket).await;
+        assert!(execution.protocol_methods().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn deterministic_protocol_transport_remains_bound_across_stop_and_restore() {
+        use worker_runtime::execution::WorkerExecutionBackend;
+
+        let (runtime, worker_ref, execution) = runtime_with_worker_backend();
+        let completion = |request_id: &str| protocol::Method::ListCompletions {
+            kind: protocol::CompletionKind::File,
+            prefix: String::new(),
+            request_id: Some(request_id.to_string()),
+            context: None,
+        };
+        let mut old = execution
+            .clone()
+            .attach_worker_protocol(&worker_ref)
+            .unwrap();
+        assert!(matches!(old.snapshot, protocol::Event::Snapshot { .. }));
+        old.validate().unwrap();
+        assert!(matches!(
+            old.dispatch(completion("execution-a")).unwrap().as_slice(),
+            [protocol::Event::Completions { .. }]
+        ));
+
+        // Runtime observations are not this execution's protocol event stream.
+        runtime
+            .observe_worker_event(
+                &worker_ref,
+                protocol::Event::TextDelta {
+                    text: "runtime-only".to_string(),
+                },
+            )
+            .unwrap();
+        execution.emit_worker_event(
+            &worker_ref,
+            protocol::Event::TextDelta {
+                text: "execution-a".to_string(),
+            },
+        );
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), old.events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, protocol::Event::TextDelta { text } if text == "execution-a"));
+
+        runtime.stop_worker(&worker_ref, None).unwrap();
+        assert!(old.validate().is_err());
+        assert!(old.dispatch(completion("stopped-a")).is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), old.events.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        execution.accept_restores();
+        runtime.restore_worker(&worker_ref).unwrap();
+        let mut current = execution
+            .clone()
+            .attach_worker_protocol(&worker_ref)
+            .unwrap();
+        current.validate().unwrap();
+        current.dispatch(completion("execution-b")).unwrap();
+        assert!(old.validate().is_err());
+        assert!(old.dispatch(completion("must-not-reach-b")).is_err());
+        execution.emit_worker_event(
+            &worker_ref,
+            protocol::Event::TextDelta {
+                text: "execution-b".to_string(),
+            },
+        );
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), current.events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, protocol::Event::TextDelta { text } if text == "execution-b"));
+        let delivered: Vec<_> = execution
+            .protocol_methods()
+            .into_iter()
+            .map(|(worker, method)| {
+                let protocol::Method::ListCompletions { request_id, .. } = method else {
+                    panic!("expected completion method");
+                };
+                (worker, request_id.unwrap())
+            })
+            .collect();
+        assert_eq!(
+            delivered,
+            vec![
+                (worker_ref.clone(), "execution-a".to_string()),
+                (worker_ref, "execution-b".to_string()),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn proxy_maps_runtime_worker_not_found_http_404_to_protocol_error_event() {
-        let (_runtime, _worker_ref, endpoint) = spawn_runtime_worker().await;
+        let (_runtime, _worker_ref, endpoint, _execution) = spawn_runtime_worker().await;
         let endpoint = endpoint.replace("/protocol/ws", "/missing-worker/protocol/ws");
         let source = RuntimeObservationSourceConfig {
             worker: RuntimeWorkerRef::new("runtime-a", "worker-a"),
@@ -57804,8 +58779,9 @@ mod tests {
         worker_runtime::Runtime,
         worker_runtime::identity::WorkerRef,
         String,
+        Arc<DeterministicExecutionBackend>,
     ) {
-        let (runtime, worker_ref) = runtime_with_worker();
+        let (runtime, worker_ref, execution) = runtime_with_worker_backend();
         let runtime_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let runtime_addr = runtime_listener.local_addr().unwrap();
         tokio::spawn({
@@ -57824,7 +58800,7 @@ mod tests {
             "ws://{runtime_addr}/v1/workers/{}/protocol/ws",
             worker_ref.worker_id
         );
-        (runtime, worker_ref, endpoint)
+        (runtime, worker_ref, endpoint, execution)
     }
 
     fn test_browser_request_actor() -> RequestActor {

@@ -493,7 +493,12 @@ pub(crate) struct PersistedWorkerRestoreOperation {
 #[serde(deny_unknown_fields)]
 pub(crate) struct PersistedWorkerStopOperation {
     pub(crate) operation_id: WorkerLifecycleOperationId,
-    pub(crate) request: CreateWorkerRequest,
+    /// Restore resources remain operation-owned until stop confirms cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pending_restore: Option<PersistedWorkerRestoreOperation>,
+    /// Stop can reconcile an identity whose execution metadata is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) request: Option<CreateWorkerRequest>,
     pub(crate) binding: Option<PersistedWorkerExecutionBinding>,
     pub(crate) restore_intent: WorkerRestoreIntent,
     pub(crate) last_settled_status: WorkerStatus,
@@ -1942,7 +1947,7 @@ impl WorkerAggregateRecord {
                             });
                         }
                         (
-                            &restore.request,
+                            Some(&restore.request),
                             &restore.binding,
                             if restore.last_settled_status.is_active() {
                                 WorkerRestoreIntent::Automatic
@@ -1953,7 +1958,7 @@ impl WorkerAggregateRecord {
                         )
                     }
                     PersistedWorkerLifecycleOperation::Stop(stop) => {
-                        if !stop.last_settled_status.is_active() {
+                        if !stop.last_settled_status.is_active() && stop.pending_restore.is_none() {
                             return Err(RuntimeError::StoreCorrupt {
                                 operation: "read Worker stop reconciliation",
                                 path: path.to_path_buf(),
@@ -1961,8 +1966,18 @@ impl WorkerAggregateRecord {
                                     .to_string(),
                             });
                         }
+                        if stop.request.is_none()
+                            && (stop.binding.is_some() || stop.pending_restore.is_some())
+                        {
+                            return Err(RuntimeError::StoreCorrupt {
+                                operation: "read Worker stop reconciliation",
+                                path: path.to_path_buf(),
+                                message: "metadata-free stop cannot carry restore authority"
+                                    .to_string(),
+                            });
+                        }
                         (
-                            &stop.request,
+                            stop.request.as_ref(),
                             &stop.binding,
                             stop.restore_intent,
                             stop.last_settled_status,
@@ -1978,13 +1993,15 @@ impl WorkerAggregateRecord {
                                 .to_string(),
                     });
                 }
-                WorkerExecutionRecord {
-                    schema_version: SCHEMA_VERSION,
-                    request: request.clone(),
-                    binding: binding.clone(),
-                    restore_intent,
+                if let Some(request) = request {
+                    WorkerExecutionRecord {
+                        schema_version: SCHEMA_VERSION,
+                        request: request.clone(),
+                        binding: binding.clone(),
+                        restore_intent,
+                    }
+                    .validate_for_schema(&identity, path, SCHEMA_VERSION)?;
                 }
-                .validate_for_schema(&identity, path, SCHEMA_VERSION)?;
                 PersistedWorkerExecutionState::ReconciliationRequired(operation)
             }
             WorkerExecutionStateRecord::Unavailable => PersistedWorkerExecutionState::Unavailable,
