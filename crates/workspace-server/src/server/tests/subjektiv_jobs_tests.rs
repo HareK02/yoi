@@ -454,7 +454,7 @@ async fn backend_job_project_recipe_is_resolved_and_delivered_without_system_ove
         entrypoints: state.contract.entrypoints.iter().map(|p| p.as_str().into()).collect(),
         changes: vec![server_api::ConfigTreeChange::Update {
             path: entrypoint.as_str().into(), expected_digest: root.content_digest.clone(),
-            content: "{ profile = { entries = [{ selector = \"project:job-recipe\"; source = \"profiles/job-recipe.dcdl\"; }]; }; }".into(),
+            content: "{ profile = { entries = [{ selector = \"project:job-recipe\"; profile = import \"./profiles/job-recipe.dcdl\"; }]; }; }".into(),
         }, server_api::ConfigTreeChange::Create {
             path: "profiles/job-recipe.dcdl".into(), content_type: server_api::ConfigContentType::Decodal,
             content: "{ slug = \"job-recipe\"; scope = \"workspace_read\"; model = { id = \"fixture-model\"; }; engine = { instruction = \"role.default\"; }; feature = { task = { enabled = true; }; }; }".into(),

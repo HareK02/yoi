@@ -381,3 +381,113 @@ Deno.test("generated WASM completes asserted WorkspaceConfigSchema keys", () => 
   assertEquals(result.from, 2);
   assertEquals(result.items.some((item) => item.label === "profile"), true);
 });
+
+Deno.test("generated WASM authors value-based Profiles using the Backend schema without materializing authoring fields", async () => {
+  const source = await Deno.readTextFile(
+    new URL(
+      "../../../../resources/config-schema/profile.dcdl",
+      import.meta.url,
+    ),
+  );
+  const authoring_source = await Deno.readTextFile(
+    new URL(
+      "../../../../resources/config-schema/profile-authoring.dcdl",
+      import.meta.url,
+    ),
+  );
+  const schema = compose_schema_bundle([{
+    provider_id: "builtin:profile",
+    namespace: "profile",
+    version: "2",
+    source,
+    source_digest: await digestText(source),
+    authoring_source,
+  }]) as WorkspaceConfigSchemaBundle;
+  const content =
+    '{ profile = { entries = [{ selector = "project:alpha"; profile = {}; }]; }; } as WorkspaceConfigSchema';
+  const tree: ConfigTreeSnapshot = {
+    revision: 8,
+    digest: "sha256:value-profile-tree",
+    entries: {
+      "main.dcdl": {
+        path: "main.dcdl",
+        content_type: "decodal",
+        content,
+        content_digest: await digestText(content),
+      },
+    },
+  };
+  const valueContract = {
+    ...contract,
+    entrypoints: ["main.dcdl"],
+    schema_bundle: schema,
+    fingerprint: await toolchainFingerprint(["main.dcdl"], schema),
+  };
+  set_snapshot(tree);
+  set_schema_bundle(schema);
+  const evaluated = evaluate_snapshot(tree, valueContract) as {
+    projections: Array<
+      { data_json: { profile: { entries: Array<{ profile: unknown }> } } }
+    >;
+  };
+  assertEquals(
+    evaluated.projections[0].data_json.profile.entries[0].profile,
+    {},
+  );
+  for (
+    const [body, token, label] of [
+      [
+        "{ profile = { entries = [{ sel }] } } as WorkspaceConfigSchema",
+        "sel",
+        "selector",
+      ],
+      [
+        "{ profile = { entries = [{ pro }] } } as WorkspaceConfigSchema",
+        "pro",
+        "profile",
+      ],
+      [
+        "{ profile = { entries = [{ profile = { wor } }] } } as WorkspaceConfigSchema",
+        "wor",
+        "worker",
+      ],
+      [
+        "{ profile = { entries = [{ profile = { worker = { mo } } }] } } as WorkspaceConfigSchema",
+        "mo",
+        "mode",
+      ],
+      [
+        "{ profile = { entries = [{ profile = { feature = { ta } } }] } } as WorkspaceConfigSchema",
+        "ta",
+        "task",
+      ],
+    ]
+  ) {
+    const cursor = body.lastIndexOf(token) + token.length;
+    const result = complete_current("main.dcdl", body, cursor, true) as {
+      from: number;
+      items: Array<{ label: string }>;
+    };
+    assertEquals(
+      result.items.some((item) => item.label === label),
+      true,
+      label,
+    );
+    assertEquals(result.from, cursor - token.length);
+  }
+  const invalidContent = content.replace("profile = {};", "profile = 42;");
+  const invalid = {
+    ...tree,
+    entries: {
+      "main.dcdl": { ...tree.entries["main.dcdl"], content: invalidContent },
+    },
+  };
+  const diagnostics = analyze_snapshot(
+    invalid,
+    "main.dcdl",
+    undefined,
+  ) as Array<
+    unknown
+  >;
+  assertEquals(diagnostics.length > 0, true);
+});

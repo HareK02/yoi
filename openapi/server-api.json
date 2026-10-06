@@ -1235,6 +1235,13 @@
       "ConfigSchemaContribution": {
         "additionalProperties": false,
         "properties": {
+          "authoring_source": {
+            "description": "Completion-only shape for partial values; never materialized as defaults.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "namespace": {
             "type": "string"
           },
@@ -15474,7 +15481,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:fd06f382c6d33a5c3cc98ef9e264545923c53fa95a9be555a85680f98c6065da"
+    "x-yoi-source-digest": "sha256:a6a7147c9a2f465a5da044e9ba21947cb3d86eacbfe3905696483917e794d5cf"
   },
   "openapi": "3.1.0",
   "paths": {

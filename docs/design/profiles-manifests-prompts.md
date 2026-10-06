@@ -17,7 +17,33 @@ A Profile should not contain runtime-bound fields:
 
 Those fields depend on one run, one parent, or one machine. Putting them in a reusable Profile makes reuse unsafe.
 
-Yoi Profiles are data artifacts resolved from builtin profile definitions, `profiles.toml`, Decodal source archives, or explicit JSON/TOML artifacts. Decodal is the authoring syntax used by the Workspace profile editor and Backend Runtime archive path; JSON/TOML artifacts are the low-level resolver interchange format. Runtime launch should not depend on executable profile scripts.
+Yoi Profiles are data artifacts resolved from builtin profile definitions, `profiles.toml`, Workspace Config values, or explicit JSON/TOML artifacts. Decodal is the Workspace authoring syntax; JSON/TOML artifacts are the low-level resolver interchange format. Runtime launch does not depend on executable profile scripts.
+
+### Workspace registration and migration
+
+Register the Profile **value**, not a source pathname:
+
+```dcdl
+{
+    profile = {
+        default_profile = "project:my-companion";
+        entries = [{
+            selector = "project:my-companion";
+            label = "My Companion";
+            description = "My reusable Worker recipe";
+            profile = import "./profiles/my-companion.dcdl";
+        }];
+    };
+} as WorkspaceConfigSchema
+```
+
+The imported file can contain `{ worker = { mode = "wip"; }; model = { ref = "codex-oauth/gpt-5.6-sol"; }; feature = { task = { enabled = true; }; }; }`. That record can also be written directly at `entries[0].profile`. Composition uses ordinary Decodal expressions, for example `(import "./profiles/base.dcdl") // { worker = { mode = "wip"; }; }` for an explicit patch, or `&` for compatible refinement. No dedicated Profile file or `profiles/` directory is required. Imports are relative to the **containing virtual config file**, not a host filesystem path; missing imports and virtual-tree escapes are rejected.
+
+`selector` must be a nonempty `project:*` selector, unique in the Workspace. `label` and `description` are optional display metadata. An omitted `default_profile` selects `builtin:companion`; an explicitly unknown default is an error, not a fallback. A project Profile is a partial recipe resolved against `WorkerManifestConfig::resolution_defaults()`, **not** implicitly inherited from a builtin role. Explicit values remain explicit and omitted Profile fields remain absent in the transported value. Builtin-value import helpers are not part of this registration contract.
+
+The former `entries = [{ selector = "project:name"; source = "profiles/name.dcdl"; }]` registration is no longer accepted. Migrate it explicitly to `profile = import "./profiles/name.dcdl";`, preserving the selector, label, description and default. For registrations in a nested config file, adjust the relative import to the original virtual-tree entry (for example `../profiles/name.dcdl`). Do not rename or recreate the Profile file merely for registration. Previously saved source-based revisions remain readable as config data and are not rewritten, deleted, or silently substituted with a builtin. Their Profile projection/launch reports `profile_source_registration_removed` with the replacement form; saves under the new schema reject the old field. Existing Workers continue using their saved Manifest while the author migrates and saves the config.
+
+The schema contribution separates its materialized registration schema from an optional, fingerprint-bound `authoring_source`. The latter supplies editor field suggestions inside array elements and partial Profile records; it is never evaluated as defaults or substituted for the validation schema. Decodal structural diagnostics cover registration/value shape, and the shared Backend save boundary checks full Profile/Manifest semantics (including mode, forbidden runtime fields, duplicate selectors and default references). UI and WIP saves use that same boundary; invalid candidates leave the active config revision untouched.
 
 ## Manifests
 
@@ -27,7 +53,7 @@ Source/partial layers may omit fields. Resolved manifests should be explicit eno
 
 `--manifest <path>` exists as an explicit low-level escape hatch. Normal fresh startup selects a `builtin:*` or `project:*` Profile from the Backend-managed Workspace Config revision rather than applying an ambient manifest cascade.
 
-Project Profiles are evaluated from the revisioned Virtual Config's Decodal source/import closure. The Backend packages that closure into a digest-bound Profile source archive, delivers it with the resolved launch bundle, and the Worker persists the resulting Manifest for restore. Files below the Workdir are not implicit Profile override layers.
+Project Profiles are evaluated as part of the revisioned Virtual Config, including its imports and value composition. The Backend packages the **evaluated selected value** into a digest-bound JSON entry in the existing Profile archive transport, and binds the launch bundle to the Workspace identity, revision, tree/projection digests and schema/toolchain fingerprints. Runtime verifies the archive and resolves that exact value without re-evaluating Decodal, scanning imports or reading Workspace files. Builtin Profiles retain their embedded Decodal archive path. Saving config changes only future fresh launches; the Worker persists the resulting resolved Manifest and restore uses that saved snapshot rather than selecting the current recipe again. Files below the Workdir are not implicit Profile override layers.
 
 ## Local stdio MCP server declarations
 

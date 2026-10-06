@@ -487,6 +487,9 @@ pub struct ConfigSchemaContribution {
     pub namespace: String,
     pub version: String,
     pub source: String,
+    // Optional editor-only schema; never used to validate or materialize config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authoring_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projection_validator: Option<ConfigProjectionValidator>,
     pub source_digest: String,
@@ -529,8 +532,14 @@ impl ConfigSchemaContribution {
             version,
             source_digest: digest_bytes(source.as_bytes()),
             source,
+            authoring_source: None,
             projection_validator: None,
         })
+    }
+
+    pub fn with_authoring_source(mut self, source: impl Into<String>) -> Self {
+        self.authoring_source = Some(source.into());
+        self
     }
 
     pub fn with_projection_validator(mut self, validator: ConfigProjectionValidator) -> Self {
@@ -539,6 +548,15 @@ impl ConfigSchemaContribution {
     }
 
     fn validate(&self) -> Result<(), ConfigTreeError> {
+        if self
+            .authoring_source
+            .as_ref()
+            .is_some_and(|source| source.trim().is_empty())
+        {
+            return Err(ConfigTreeError::InvalidSchemaContribution(
+                "authoring schema source must not be empty".to_string(),
+            ));
+        }
         let expected = digest_bytes(self.source.as_bytes());
         if self.source_digest != expected {
             return Err(ConfigTreeError::InvalidSchemaContribution(format!(
@@ -591,32 +609,65 @@ impl WorkspaceConfigSchemaBundle {
                 .collect::<Vec<_>>()
                 .join(" & ")
         };
-        let fingerprint = digest_bytes(
-            serde_json::to_vec(&(
-                CONFIG_SOURCE_CONTRACT_VERSION,
-                DECODAL_VERSION,
-                contributions
-                    .iter()
-                    .map(|contribution| {
-                        (
-                            contribution.provider_id.as_str(),
-                            contribution.namespace.as_str(),
-                            contribution.version.as_str(),
-                            contribution.source_digest.as_str(),
-                            contribution.projection_validator.as_ref(),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-                digest_bytes(source.as_bytes()),
-            ))
-            .expect("schema bundle fingerprint input serializes")
-            .as_slice(),
-        );
+        let mut fingerprint_input = serde_json::to_vec(&(
+            CONFIG_SOURCE_CONTRACT_VERSION,
+            DECODAL_VERSION,
+            contributions
+                .iter()
+                .map(|contribution| {
+                    (
+                        contribution.provider_id.as_str(),
+                        contribution.namespace.as_str(),
+                        contribution.version.as_str(),
+                        contribution.source_digest.as_str(),
+                        contribution.projection_validator.as_ref(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            digest_bytes(source.as_bytes()),
+        ))
+        .expect("schema bundle fingerprint input serializes");
+        let authoring_sources = contributions
+            .iter()
+            .filter_map(|contribution| {
+                contribution
+                    .authoring_source
+                    .as_deref()
+                    .map(|source| (contribution.provider_id.as_str(), source))
+            })
+            .collect::<Vec<_>>();
+        // Preserve legacy fingerprints when no editor-only metadata is present.
+        if !authoring_sources.is_empty() {
+            fingerprint_input.extend(
+                serde_json::to_vec(&("authoring_sources", authoring_sources))
+                    .expect("authoring schema fingerprint input serializes"),
+            );
+        }
+        let fingerprint = digest_bytes(&fingerprint_input);
         Ok(Self {
             contributions,
             source,
             fingerprint,
         })
+    }
+
+    fn authoring_source(&self) -> String {
+        if self.contributions.is_empty() {
+            return self.source.clone();
+        }
+        self.contributions
+            .iter()
+            .map(|contribution| {
+                format!(
+                    "({})",
+                    contribution
+                        .authoring_source
+                        .as_deref()
+                        .unwrap_or(&contribution.source)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" & ")
     }
 
     pub fn empty() -> Self {
@@ -752,25 +803,31 @@ pub struct EvaluationResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfigCompletionPathSegment {
+    Field(String),
+    Index(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ConfigFieldCompletionContext {
-    schema_path: Vec<String>,
+    schema_path: Vec<ConfigCompletionPathSegment>,
     from: usize,
 }
 
 #[derive(Debug)]
 enum ConfigCompletionContainer {
     Object {
-        schema_path: Vec<String>,
+        schema_path: Vec<ConfigCompletionPathSegment>,
         pending_path: Vec<String>,
         last_identifier_from: Option<usize>,
         trailing_dot: bool,
         reading_value: bool,
     },
     Array {
-        schema_path: Vec<String>,
+        schema_path: Vec<ConfigCompletionPathSegment>,
     },
     Other {
-        schema_path: Vec<String>,
+        schema_path: Vec<ConfigCompletionPathSegment>,
     },
 }
 
@@ -855,8 +912,17 @@ fn config_field_completion_context(
                 });
             }
             SyntaxTokenKind::LBracket => {
-                let schema_path = pending_container_path(&containers);
+                let mut schema_path = pending_container_path(&containers);
+                schema_path.push(ConfigCompletionPathSegment::Index(0));
                 containers.push(ConfigCompletionContainer::Array { schema_path });
+            }
+            SyntaxTokenKind::Comma => {
+                if let Some(ConfigCompletionContainer::Array { schema_path }) =
+                    containers.last_mut()
+                    && let Some(ConfigCompletionPathSegment::Index(index)) = schema_path.last_mut()
+                {
+                    *index += 1;
+                }
             }
             SyntaxTokenKind::RBracket => {
                 pop_container(&mut containers, |container| {
@@ -943,7 +1009,12 @@ fn config_field_completion_context(
         return None;
     };
     let mut schema_path = schema_path.clone();
-    schema_path.extend(pending_path.iter().cloned());
+    schema_path.extend(
+        pending_path
+            .iter()
+            .cloned()
+            .map(ConfigCompletionPathSegment::Field),
+    );
     Some(ConfigFieldCompletionContext {
         schema_path,
         from: if *trailing_dot {
@@ -954,14 +1025,25 @@ fn config_field_completion_context(
     })
 }
 
-fn pending_container_path(containers: &[ConfigCompletionContainer]) -> Vec<String> {
+fn pending_container_path(
+    containers: &[ConfigCompletionContainer],
+) -> Vec<ConfigCompletionPathSegment> {
     match containers.last() {
         Some(ConfigCompletionContainer::Object {
             schema_path,
             pending_path,
             reading_value: true,
             ..
-        }) => schema_path.iter().chain(pending_path).cloned().collect(),
+        }) => schema_path
+            .iter()
+            .cloned()
+            .chain(
+                pending_path
+                    .iter()
+                    .cloned()
+                    .map(ConfigCompletionPathSegment::Field),
+            )
+            .collect(),
         Some(ConfigCompletionContainer::Array { schema_path })
         | Some(ConfigCompletionContainer::Other { schema_path }) => schema_path.clone(),
         _ => Vec::new(),
@@ -1201,12 +1283,37 @@ impl SnapshotEnvironment {
         if self.schema_bundle.is_some()
             && let Some(context) = config_field_completion_context(source, utf8_byte_offset)
         {
-            let mut member_source = format!("{WORKSPACE_CONFIG_SCHEMA_GLOBAL}.");
-            member_source.push_str(&context.schema_path.join("."));
-            if !context.schema_path.is_empty() && context.from == utf8_byte_offset {
-                member_source.push('.');
+            let (schema_path, prefix) = if context.from == utf8_byte_offset {
+                (context.schema_path.as_slice(), "")
+            } else {
+                let Some((ConfigCompletionPathSegment::Field(prefix), schema_path)) =
+                    context.schema_path.split_last()
+                else {
+                    return self.complete(entrypoint, source, utf8_byte_offset, explicit);
+                };
+                (schema_path, prefix.as_str())
+            };
+            let has_array = schema_path
+                .iter()
+                .any(|segment| matches!(segment, ConfigCompletionPathSegment::Index(_)));
+            let mut member_source = WORKSPACE_CONFIG_SCHEMA_GLOBAL.to_owned();
+            // Ordinary object paths retain the language service's member traversal,
+            // but both branches install the composed authoring schema.
+            if !has_array {
+                for segment in schema_path {
+                    if let ConfigCompletionPathSegment::Field(field) = segment {
+                        member_source.push('.');
+                        member_source.push_str(field);
+                    }
+                }
             }
-            let mut completion = LanguageService::new(self).complete(
+            member_source.push('.');
+            member_source.push_str(prefix);
+            let completion_environment = ConfigFieldCompletionEnvironment {
+                environment: self,
+                schema_path: if has_array { schema_path } else { &[] },
+            };
+            let mut completion = LanguageService::new(completion_environment).complete(
                 entrypoint.as_str(),
                 &member_source,
                 member_source.len(),
@@ -1266,6 +1373,91 @@ impl HostEnvironment for &SnapshotEnvironment {
         )?;
         let schema = engine.eval_module(schema_module)?;
         engine.bind_global_runtime(WORKSPACE_CONFIG_SCHEMA_GLOBAL, schema);
+        Ok(())
+    }
+}
+
+// Decodal has no indexed member syntax. Resolve array ranges only in this
+// completion environment, then reuse the language service's member behavior.
+struct ConfigFieldCompletionEnvironment<'a> {
+    environment: &'a SnapshotEnvironment,
+    schema_path: &'a [ConfigCompletionPathSegment],
+}
+
+impl HostEnvironment for ConfigFieldCompletionEnvironment<'_> {
+    type Loader = SnapshotImportLoader;
+
+    fn create_loader(&self) -> Self::Loader {
+        self.environment.create_loader()
+    }
+
+    fn configure_engine(&self, engine: &mut Engine<Self::Loader>) -> decodal::Result<()> {
+        use decodal::runtime::{ConcreteValue, ObjectField, ObjectValue, RuntimeValue};
+
+        let Some(bundle) = &self.environment.schema_bundle else {
+            return Ok(());
+        };
+        let module = engine.add_root_source(
+            WORKSPACE_CONFIG_SCHEMA_SOURCE,
+            WORKSPACE_CONFIG_SCHEMA_SOURCE,
+            &bundle.authoring_source(),
+        )?;
+        let mut schema = Some(engine.eval_module(module)?);
+        for segment in self.schema_path {
+            let Some(value) = schema else {
+                break;
+            };
+            schema = match segment {
+                ConfigCompletionPathSegment::Field(field) => engine
+                    .value_fields(&value)?
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|(name, _)| name == field)
+                    .map(|(_, value)| value),
+                ConfigCompletionPathSegment::Index(index) => {
+                    let element = match value {
+                        RuntimeValue::Concrete(ConcreteValue::Array(elements)) => {
+                            elements.get(*index).copied()
+                        }
+                        RuntimeValue::Abstract(range) => {
+                            range.constraints.iter().find_map(|entry| {
+                                if let decodal::Constraint::ArrayItems(element) = entry.constraint {
+                                    Some(element)
+                                } else {
+                                    None
+                                }
+                            })
+                        }
+                        _ => None,
+                    };
+                    if let Some(element) = element {
+                        // value_fields is the public API for forcing lazy fields.
+                        // Wrap the element thunk without materializing its schema.
+                        let object = RuntimeValue::Concrete(ConcreteValue::Object(ObjectValue {
+                            fields: vec![ObjectField {
+                                name: "element".into(),
+                                value: element,
+                                span: Span::default(),
+                            }],
+                            rest: None,
+                        }));
+                        engine
+                            .value_fields(&object)?
+                            .and_then(|fields| fields.into_iter().next().map(|(_, value)| value))
+                    } else {
+                        None
+                    }
+                }
+            };
+        }
+        if let Some(schema) = schema {
+            engine.bind_global_runtime(WORKSPACE_CONFIG_SCHEMA_GLOBAL, schema);
+        } else {
+            engine.bind_global(
+                WORKSPACE_CONFIG_SCHEMA_GLOBAL,
+                Value::object([] as [(&str, Value); 0]),
+            )?;
+        }
         Ok(())
     }
 }
@@ -1890,7 +2082,7 @@ mod tests {
         assert_eq!(
             config_field_completion_context(root, root_cursor),
             Some(ConfigFieldCompletionContext {
-                schema_path: vec!["pro".into()],
+                schema_path: vec![ConfigCompletionPathSegment::Field("pro".into())],
                 from: root_cursor - 3,
             })
         );
@@ -1899,7 +2091,10 @@ mod tests {
         assert_eq!(
             config_field_completion_context(nested, nested_cursor),
             Some(ConfigFieldCompletionContext {
-                schema_path: vec!["profile".into(), "def".into()],
+                schema_path: vec![
+                    ConfigCompletionPathSegment::Field("profile".into()),
+                    ConfigCompletionPathSegment::Field("def".into()),
+                ],
                 from: nested_cursor - 3,
             })
         );
@@ -1908,7 +2103,12 @@ mod tests {
         assert_eq!(
             config_field_completion_context(array, array_cursor),
             Some(ConfigFieldCompletionContext {
-                schema_path: vec!["profile".into(), "entries".into(), "sel".into()],
+                schema_path: vec![
+                    ConfigCompletionPathSegment::Field("profile".into()),
+                    ConfigCompletionPathSegment::Field("entries".into()),
+                    ConfigCompletionPathSegment::Index(0),
+                    ConfigCompletionPathSegment::Field("sel".into()),
+                ],
                 from: array_cursor - 3,
             })
         );
@@ -1989,6 +2189,420 @@ mod tests {
                 .iter()
                 .any(|item| item.label == "profile")
         );
+    }
+
+    fn profile_entries_completion_schema() -> WorkspaceConfigSchemaBundle {
+        WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+            "builtin:profile",
+            "profile",
+            "1",
+            "{ profile = { default_profile = String; entries = [...{ selector = String; profile = { slug = String; worker = { mode = String; }; }; }]; }; }",
+        )
+        .unwrap()])
+        .unwrap()
+    }
+
+    #[test]
+    fn completion_projects_array_element_and_nested_profile_fields() {
+        let snapshot = ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", "{}")]).unwrap();
+        let environment = SnapshotEnvironment::new(snapshot)
+            .with_schema_bundle(profile_entries_completion_schema());
+        for (marked_source, expected, prefix_len) in [
+            (
+                "{ profile.entries = [{ sel| }] } as WorkspaceConfigSchema",
+                "selector",
+                3,
+            ),
+            (
+                "{ profile = { entries = [{ pro| }] } } as WorkspaceConfigSchema",
+                "profile",
+                3,
+            ),
+            (
+                "{ profile.entries = [{ | }] } as WorkspaceConfigSchema",
+                "selector",
+                0,
+            ),
+            (
+                "{ profile.entries = [{ | }] } as WorkspaceConfigSchema",
+                "profile",
+                0,
+            ),
+            (
+                "{ profile.entries = [{ profile = { slu| } }] } as WorkspaceConfigSchema",
+                "slug",
+                3,
+            ),
+            (
+                "{ profile.entries = [{ profile = { | } }] } as WorkspaceConfigSchema",
+                "worker",
+                0,
+            ),
+            (
+                "{ profile.entries = [{ profile.worker.mo| }] } as WorkspaceConfigSchema",
+                "mode",
+                2,
+            ),
+            (
+                "{ profile.entries = [{ profile.worker.| }] } as WorkspaceConfigSchema",
+                "mode",
+                0,
+            ),
+            (
+                "{ profile.entries = [{ profile = { worker = { mo| } } }] } as WorkspaceConfigSchema",
+                "mode",
+                2,
+            ),
+            (
+                "{ profile.entries = [{}, { sel| }] } as WorkspaceConfigSchema",
+                "selector",
+                3,
+            ),
+            (
+                "{ profile.entries = [{ selector = \"日本語\"; profile = { slu|g } }] } as WorkspaceConfigSchema",
+                "slug",
+                3,
+            ),
+            (
+                "{ profile.entries = [{ pro|file }] } as WorkspaceConfigSchema",
+                "profile",
+                3,
+            ),
+            (
+                "{ profile.entries = [({ profile = { worker = { mo| } } })] } as WorkspaceConfigSchema",
+                "mode",
+                2,
+            ),
+        ] {
+            let cursor = marked_source.find('|').unwrap();
+            let source = marked_source.replace('|', "");
+            let completion = environment
+                .complete_config(&path("main.dcdl"), &source, cursor, true)
+                .unwrap()
+                .unwrap_or_else(|| panic!("missing completion for {marked_source}"));
+            assert_eq!(completion.from, cursor - prefix_len, "{marked_source}");
+            assert!(
+                completion.items.iter().any(|item| item.label == expected),
+                "{marked_source}: {completion:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_tracks_fixed_array_positions_and_nested_array_ranges() {
+        let snapshot = ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", "{}")]).unwrap();
+        let schema = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+            "builtin:profile",
+            "profile",
+            "1",
+            "{ profile = { entries = [{ selector = String; }, { profile = { slug = String; worker = { mode = String; }; }; }]; matrix = [...[...{ selector = String; }]]; }; }",
+        )
+        .unwrap()])
+        .unwrap();
+        let environment = SnapshotEnvironment::new(snapshot).with_schema_bundle(schema);
+        for (marked_source, expected, unexpected) in [
+            (
+                "{ profile.entries = [{ | }] } as WorkspaceConfigSchema",
+                "selector",
+                "profile",
+            ),
+            (
+                "{ profile.entries = [{}, { | }] } as WorkspaceConfigSchema",
+                "profile",
+                "selector",
+            ),
+            (
+                "{ profile.entries = [{}, { profile.worker.mo| }] } as WorkspaceConfigSchema",
+                "mode",
+                "selector",
+            ),
+            (
+                "{ profile.matrix = [[{}, { sel| }]] } as WorkspaceConfigSchema",
+                "selector",
+                "profile",
+            ),
+            (
+                "{ profile.matrix = [[], [{ sel| }]] } as WorkspaceConfigSchema",
+                "selector",
+                "profile",
+            ),
+        ] {
+            let cursor = marked_source.find('|').unwrap();
+            let source = marked_source.replace('|', "");
+            let completion = environment
+                .complete_config(&path("main.dcdl"), &source, cursor, true)
+                .unwrap()
+                .unwrap_or_else(|| panic!("missing completion for {marked_source}"));
+            assert!(
+                completion.items.iter().any(|item| item.label == expected),
+                "{marked_source}: {completion:?}"
+            );
+            assert!(
+                !completion.items.iter().any(|item| item.label == unexpected),
+                "{marked_source}: {completion:?}"
+            );
+        }
+        for marked_source in [
+            "{ profile.entries = [{}, {}, { | }] } as WorkspaceConfigSchema",
+            "{ profile.entries = [{ missing = { | } }] } as WorkspaceConfigSchema",
+        ] {
+            let cursor = marked_source.find('|').unwrap();
+            let source = marked_source.replace('|', "");
+            let completion = environment
+                .complete_config(&path("main.dcdl"), &source, cursor, true)
+                .unwrap();
+            assert!(
+                completion.is_none_or(|completion| !completion
+                    .items
+                    .iter()
+                    .any(|item| matches!(item.label.as_str(), "selector" | "profile"))),
+                "{marked_source}"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_preserves_general_schema_member_behavior() {
+        let snapshot = ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", "{}")]).unwrap();
+        let environment = SnapshotEnvironment::new(snapshot)
+            .with_schema_bundle(profile_entries_completion_schema());
+        for source in [
+            "WorkspaceConfigSchema.pro",
+            "WorkspaceConfigSchema.profile.",
+            "WorkspaceConfigSchema.profile.entries.",
+            "WorkspaceConfigSchema.profile.default_pro",
+            "let schema = WorkspaceConfigSchema; in schema.profile.def",
+        ] {
+            assert_eq!(
+                environment
+                    .complete_config(&path("main.dcdl"), source, source.len(), true)
+                    .unwrap(),
+                environment
+                    .complete(&path("main.dcdl"), source, source.len(), true)
+                    .unwrap(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_array_schema_retains_nested_profile_diagnostics() {
+        let valid = "{ profile = { default_profile = \"default\"; entries = [{ selector = \"default\"; profile = { slug = \"default\"; worker = { mode = \"interactive\"; }; }; }]; }; } as WorkspaceConfigSchema";
+        let snapshot = ConfigTreeSnapshot::from_entries(7, [entry("main.dcdl", valid)]).unwrap();
+        let environment = SnapshotEnvironment::new(snapshot)
+            .with_schema_bundle(profile_entries_completion_schema());
+        assert!(environment.analyze(&path("main.dcdl"), None).is_empty());
+        for (source, field) in [
+            (
+                valid.replace("selector = \"default\"", "selector = 42"),
+                "selector",
+            ),
+            (valid.replace("slug = \"default\"", "slug = 42"), "slug"),
+            (valid.replace("mode = \"interactive\"", "mode = 42"), "mode"),
+            (
+                valid.replace("mode = \"interactive\"", "typo = \"interactive\""),
+                "typo",
+            ),
+        ] {
+            let diagnostics = environment.analyze(&path("main.dcdl"), Some(&source));
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.kind == "constraint_violation"
+                        && diagnostic.path == path("main.dcdl")
+                        && diagnostic.revision == 7
+                        && diagnostic.span.end_byte > diagnostic.span.start_byte
+                        && (diagnostic.message.contains(field)
+                            || diagnostic
+                                .labels
+                                .iter()
+                                .any(|label| label.message.contains(field)))
+                }),
+                "{field}: {diagnostics:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_authoring_schema_preserves_omitted_profile_fields_in_evaluation() {
+        let schema = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+            "builtin:profile",
+            "profile",
+            "1",
+            "{ profile = { defaults = {...Unknown}; entries = [...{ selector = String; profile = {...Unknown}; }]; }; }",
+        )
+        .unwrap()
+        .with_authoring_source(
+            "{ profile = { defaults = { slug = String; worker = { mode = String; }; }; entries = [...{ selector = String; profile = { slug = String; worker = { mode = String; }; }; }]; }; }",
+        )])
+        .unwrap();
+        let source = "{ profile = { defaults = {}; entries = [{ selector = \"default\"; profile = {}; }]; }; } as WorkspaceConfigSchema";
+        let snapshot = ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", source)]).unwrap();
+        let environment = SnapshotEnvironment::new(snapshot).with_schema_bundle(schema.clone());
+        assert!(environment.analyze(&path("main.dcdl"), None).is_empty());
+        let contract = ToolchainContract::with_schema_bundle(1, vec![path("main.dcdl")], 1, schema);
+        let evaluated = environment.evaluate_contract(&contract).unwrap();
+        assert_eq!(
+            evaluated.projections[0].data_json,
+            serde_json::json!({"profile": {"defaults": {}, "entries": [{"selector": "default", "profile": {}}]}})
+        );
+        // Both ordinary object paths and array-element paths use editor metadata.
+        for (marked_source, expected) in [
+            (
+                "{ profile.defaults = { slu| } } as WorkspaceConfigSchema",
+                "slug",
+            ),
+            (
+                "{ profile.defaults.worker = { mo| } } as WorkspaceConfigSchema",
+                "mode",
+            ),
+            (
+                "{ profile.entries = [{ pro| }] } as WorkspaceConfigSchema",
+                "profile",
+            ),
+            (
+                "{ profile.entries = [{ profile = { slu| } }] } as WorkspaceConfigSchema",
+                "slug",
+            ),
+            (
+                "{ profile.entries = [{ profile.worker = { mo| } }] } as WorkspaceConfigSchema",
+                "mode",
+            ),
+            (
+                "{ profile.entries = [{ profile = { | } }] } as WorkspaceConfigSchema",
+                "worker",
+            ),
+        ] {
+            let cursor = marked_source.find('|').unwrap();
+            let source = marked_source.replace('|', "");
+            let completion = environment
+                .complete_config(&path("main.dcdl"), &source, cursor, true)
+                .unwrap()
+                .unwrap_or_else(|| panic!("missing completion for {marked_source}"));
+            assert!(
+                completion.items.iter().any(|item| item.label == expected),
+                "{marked_source}: {completion:?}"
+            );
+        }
+        // Completion does not install its schema into later analysis/evaluation.
+        assert!(environment.analyze(&path("main.dcdl"), None).is_empty());
+        assert_eq!(environment.evaluate_contract(&contract).unwrap(), evaluated);
+    }
+
+    #[test]
+    fn completion_authoring_sources_compose_with_validation_source_fallbacks() {
+        let schema = WorkspaceConfigSchemaBundle::compose([
+            ConfigSchemaContribution::new(
+                "builtin:editor",
+                "editor",
+                "1",
+                "{ editor = {...Unknown}; }",
+            )
+            .unwrap()
+            .with_authoring_source(
+                "{ editor = { theme = String; settings = { enabled = Bool; }; }; }",
+            ),
+            ConfigSchemaContribution::new(
+                "builtin:web",
+                "web",
+                "1",
+                "{ web = { enabled = Bool; }; }",
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let snapshot = ConfigTreeSnapshot::from_entries(1, [entry("main.dcdl", "{}")]).unwrap();
+        let environment = SnapshotEnvironment::new(snapshot).with_schema_bundle(schema);
+        for (marked_source, expected) in [
+            ("{ ed| } as WorkspaceConfigSchema", "editor"),
+            ("{ editor = { th| } } as WorkspaceConfigSchema", "theme"),
+            (
+                "{ editor.settings = { en| } } as WorkspaceConfigSchema",
+                "enabled",
+            ),
+            ("{ web = { en| } } as WorkspaceConfigSchema", "enabled"),
+        ] {
+            let cursor = marked_source.find('|').unwrap();
+            let source = marked_source.replace('|', "");
+            let completion = environment
+                .complete_config(&path("main.dcdl"), &source, cursor, true)
+                .unwrap()
+                .unwrap();
+            assert!(
+                completion.items.iter().any(|item| item.label == expected),
+                "{marked_source}: {completion:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn authoring_schema_metadata_is_optional_validated_and_fingerprinted() {
+        let contribution = ConfigSchemaContribution::new(
+            "builtin:editor",
+            "editor",
+            "1",
+            "{ editor = {...Unknown}; }",
+        )
+        .unwrap();
+        let serialized = serde_json::to_value(&contribution).unwrap();
+        assert!(serialized.get("authoring_source").is_none());
+        assert_eq!(
+            serde_json::from_value::<ConfigSchemaContribution>(serialized).unwrap(),
+            contribution
+        );
+        let legacy = WorkspaceConfigSchemaBundle::compose([contribution.clone()]).unwrap();
+        let legacy_input = serde_json::to_vec(&(
+            CONFIG_SOURCE_CONTRACT_VERSION,
+            DECODAL_VERSION,
+            vec![(
+                contribution.provider_id.as_str(),
+                contribution.namespace.as_str(),
+                contribution.version.as_str(),
+                contribution.source_digest.as_str(),
+                contribution.projection_validator.as_ref(),
+            )],
+            digest_bytes(legacy.source.as_bytes()),
+        ))
+        .unwrap();
+        assert_eq!(legacy.fingerprint, digest_bytes(&legacy_input));
+        legacy.validate().unwrap();
+
+        let authoring = contribution
+            .clone()
+            .with_authoring_source("{ editor = { theme = String; }; }");
+        assert_eq!(authoring.source_digest, contribution.source_digest);
+        let serialized = serde_json::to_value(&authoring).unwrap();
+        assert_eq!(
+            serialized["authoring_source"],
+            "{ editor = { theme = String; }; }"
+        );
+        assert_eq!(
+            serde_json::from_value::<ConfigSchemaContribution>(serialized).unwrap(),
+            authoring
+        );
+        let authored = WorkspaceConfigSchemaBundle::compose([authoring]).unwrap();
+        authored.validate().unwrap();
+        assert_eq!(authored.source, legacy.source);
+        assert_ne!(authored.fingerprint, legacy.fingerprint);
+        assert_ne!(
+            ToolchainContract::with_schema_bundle(1, vec![path("main.dcdl")], 1, authored.clone())
+                .fingerprint,
+            ToolchainContract::with_schema_bundle(1, vec![path("main.dcdl")], 1, legacy)
+                .fingerprint,
+        );
+        let changed = WorkspaceConfigSchemaBundle::compose([contribution
+            .clone()
+            .with_authoring_source("{ editor = { theme = String; mode = String; }; }")])
+        .unwrap();
+        assert_ne!(changed.fingerprint, authored.fingerprint);
+        let mut tampered = authored;
+        tampered.contributions[0].authoring_source =
+            changed.contributions[0].authoring_source.clone();
+        assert!(tampered.validate().is_err());
+        for source in ["", " \n\t "] {
+            assert!(
+                matches!(WorkspaceConfigSchemaBundle::compose([contribution.clone().with_authoring_source(source)]), Err(ConfigTreeError::InvalidSchemaContribution(message)) if message.contains("authoring"))
+            );
+        }
     }
 
     #[test]
