@@ -475,19 +475,100 @@ Deno.test("generated WASM authors value-based Profiles using the Backend schema 
     );
     assertEquals(result.from, cursor - token.length);
   }
-  const invalidContent = content.replace("profile = {};", "profile = 42;");
-  const invalid = {
+  for (
+    const value of [
+      "{}",
+      "{ worker = {}; }",
+      '{ worker = { mode = "wip"; }; }',
+      "{ feature = { task = {}; }; }",
+    ]
+  ) {
+    const partialContent = content.replace(
+      "profile = {};",
+      `profile = ${value};`,
+    );
+    assertEquals(
+      analyze_snapshot(tree, "main.dcdl", partialContent),
+      [],
+      value,
+    );
+  }
+  const recipe = "{ worker = { mode = 42; }; }";
+  const analysisTree = {
     ...tree,
     entries: {
-      "main.dcdl": { ...tree.entries["main.dcdl"], content: invalidContent },
+      ...tree.entries,
+      "recipe.dcdl": {
+        path: "recipe.dcdl",
+        content_type: "decodal",
+        content: recipe,
+        content_digest: await digestText(recipe),
+      },
     },
   };
-  const diagnostics = analyze_snapshot(
-    invalid,
-    "main.dcdl",
-    undefined,
-  ) as Array<
-    unknown
-  >;
-  assertEquals(diagnostics.length > 0, true);
+  for (
+    const [value, field, expectedPath] of [
+      ["42", "profile", "main.dcdl"],
+      ["{ worker = 42; }", "worker", "main.dcdl"],
+      ["{ worker = { mode = 42; }; }", "mode", "main.dcdl"],
+      ["{ feature = { task = { enabled = 42; }; }; }", "enabled", "main.dcdl"],
+      ['{ worker = { typo = "wip"; }; }', "typo", "main.dcdl"],
+      ['import "./recipe.dcdl"', "mode", "recipe.dcdl"],
+      [
+        '(import "./recipe.dcdl") // { worker = { mode = 42; }; }',
+        "mode",
+        "main.dcdl",
+      ],
+    ]
+  ) {
+    const invalidContent = content.replace(
+      "profile = {};",
+      `profile = ${value};`,
+    );
+    const diagnostics = analyze_snapshot(
+      analysisTree,
+      "main.dcdl",
+      invalidContent,
+    ) as Array<{
+      path: string;
+      revision: number;
+      kind: string;
+      span: { start_byte: number; end_byte: number };
+      message: string;
+      labels: Array<
+        { span: { start_byte: number; end_byte: number }; message: string }
+      >;
+    }>;
+    assertEquals(diagnostics.length > 0, true, value);
+    const diagnostic = diagnostics[0];
+    assertEquals(diagnostic.path, expectedPath);
+    assertEquals(diagnostic.revision, tree.revision);
+    assertEquals(
+      ["constraint_violation", "type_mismatch"].includes(diagnostic.kind),
+      true,
+    );
+    assertEquals(
+      diagnostic.message.includes(field) ||
+        diagnostic.labels.some((label) => label.message.includes(field)),
+      true,
+    );
+    // New authoring failures must be anchored in the supplied value, not the
+    // much longer schema source, including relative imported recipes.
+    if (value !== "42") {
+      const length = new TextEncoder().encode(
+        expectedPath === "main.dcdl" ? invalidContent : recipe,
+      ).length;
+      assertEquals(
+        diagnostic.span.end_byte > diagnostic.span.start_byte &&
+          diagnostic.span.end_byte <= length,
+        true,
+      );
+      assertEquals(
+        diagnostic.labels.every((label) => label.span.end_byte <= length),
+        true,
+      );
+    }
+  }
+  // Neither completion nor diagnostic shape checking changes the saved value.
+  assertEquals(evaluate_snapshot(tree, valueContract), evaluated);
 });

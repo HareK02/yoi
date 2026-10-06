@@ -1,5 +1,6 @@
-# Completion-only shape of partial Profile values. This is never materialized or
-# used as defaults: omitted fields remain omitted until Manifest resolution.
+# Editor-only shape of partial Profile values, used for completion and constraint
+# analysis without materialization. Never used as defaults: omitted fields remain
+# omitted until Manifest resolution.
 let
     Flag = { enabled = Bool; };
     Model = {

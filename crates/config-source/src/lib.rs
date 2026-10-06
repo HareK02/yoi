@@ -487,7 +487,8 @@ pub struct ConfigSchemaContribution {
     pub namespace: String,
     pub version: String,
     pub source: String,
-    // Optional editor-only schema; never used to validate or materialize config.
+    // Optional editor shape for completion and non-materializing constraint analysis;
+    // never used to materialize or validate the persisted config projection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authoring_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1250,17 +1251,83 @@ impl SnapshotEnvironment {
                 "configured entrypoint is missing",
             )];
         };
-        let service = LanguageService::new(self);
-        service
-            .analyze(
-                entrypoint.as_str(),
-                entrypoint.as_str(),
-                source_override.unwrap_or(&entry.content),
-            )
+        let source = source_override.unwrap_or(&entry.content);
+        let diagnostics: Vec<_> = LanguageService::new(self)
+            .analyze(entrypoint.as_str(), entrypoint.as_str(), source)
             .diagnostics
             .iter()
             .map(|diagnostic| project_diagnostic(&self.snapshot, entrypoint.clone(), diagnostic))
-            .collect()
+            .collect();
+        if !diagnostics.is_empty()
+            || !self.schema_bundle.as_ref().is_some_and(|bundle| {
+                bundle
+                    .contributions
+                    .iter()
+                    .any(|entry| entry.authoring_source.is_some())
+            })
+        {
+            return diagnostics;
+        }
+
+        // Check authoring constraints separately, without materializing the shape.
+        // Partial records may omit any recipe field: authoring metadata must neither
+        // make those fields required nor supply defaults to the saved projection.
+        let environment = ConfigAuthoringEnvironment {
+            environment: self,
+            schema_path: &[],
+        };
+        let mut engine = match environment.create_engine() {
+            Ok(engine) => engine,
+            Err(diagnostic) => {
+                return vec![project_diagnostic(
+                    &self.snapshot,
+                    entrypoint.clone(),
+                    &diagnostic,
+                )];
+            }
+        };
+        let result = engine
+            .add_root_source(entrypoint.as_str(), entrypoint.as_str(), source)
+            .and_then(|module| engine.eval_module(module));
+        match result {
+            Ok(_) => Vec::new(),
+            Err(mut diagnostic) => {
+                // Constraint failures often point at the schema declaration. Anchor
+                // the editor diagnostic at the narrowest supplied value instead;
+                // label spans have no file field, so retain only that source's labels.
+                if !engine
+                    .source_name(diagnostic.span.source)
+                    .is_some_and(|name| {
+                        VirtualPath::parse(name)
+                            .is_ok_and(|path| self.snapshot.get(&path).is_some())
+                    })
+                    && let Some(span) = diagnostic
+                        .labels
+                        .iter()
+                        .map(|label| label.span)
+                        .filter(|span| {
+                            engine.source_name(span.source).is_some_and(|name| {
+                                VirtualPath::parse(name)
+                                    .is_ok_and(|path| self.snapshot.get(&path).is_some())
+                            })
+                        })
+                        .min_by_key(|span| span.end.saturating_sub(span.start))
+                {
+                    diagnostic.span = span;
+                }
+                diagnostic
+                    .labels
+                    .retain(|label| label.span.source == diagnostic.span.source);
+                let mut projected = project_engine_diagnostic(
+                    &engine,
+                    &self.snapshot,
+                    entrypoint.clone(),
+                    &diagnostic,
+                );
+                projected.kind = diagnostic_kind(diagnostic.kind).to_string();
+                vec![projected]
+            }
+        }
     }
 
     pub fn complete(
@@ -1309,7 +1376,7 @@ impl SnapshotEnvironment {
             }
             member_source.push('.');
             member_source.push_str(prefix);
-            let completion_environment = ConfigFieldCompletionEnvironment {
+            let completion_environment = ConfigAuthoringEnvironment {
                 environment: self,
                 schema_path: if has_array { schema_path } else { &[] },
             };
@@ -1379,12 +1446,12 @@ impl HostEnvironment for &SnapshotEnvironment {
 
 // Decodal has no indexed member syntax. Resolve array ranges only in this
 // completion environment, then reuse the language service's member behavior.
-struct ConfigFieldCompletionEnvironment<'a> {
+struct ConfigAuthoringEnvironment<'a> {
     environment: &'a SnapshotEnvironment,
     schema_path: &'a [ConfigCompletionPathSegment],
 }
 
-impl HostEnvironment for ConfigFieldCompletionEnvironment<'_> {
+impl HostEnvironment for ConfigAuthoringEnvironment<'_> {
     type Loader = SnapshotImportLoader;
 
     fn create_loader(&self) -> Self::Loader {
@@ -2486,6 +2553,110 @@ mod tests {
         // Completion does not install its schema into later analysis/evaluation.
         assert!(environment.analyze(&path("main.dcdl"), None).is_empty());
         assert_eq!(environment.evaluate_contract(&contract).unwrap(), evaluated);
+    }
+
+    #[test]
+    fn actual_profile_schema_diagnoses_nested_values_without_materializing_omissions() {
+        let schema = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+            "builtin:profile",
+            "profile",
+            "2",
+            include_str!("../../../resources/config-schema/profile.dcdl"),
+        )
+        .unwrap()
+        .with_authoring_source(include_str!(
+            "../../../resources/config-schema/profile-authoring.dcdl"
+        ))])
+        .unwrap();
+        let source = "{ profile = { entries = [{ selector = \"project:alpha\"; profile = {}; }]; }; } as WorkspaceConfigSchema";
+        let snapshot = ConfigTreeSnapshot::from_entries(
+            8,
+            [
+                entry("main.dcdl", source),
+                entry("recipe.dcdl", "{ worker = { mode = 42; }; }"),
+            ],
+        )
+        .unwrap();
+        let environment = SnapshotEnvironment::new(snapshot).with_schema_bundle(schema.clone());
+        let contract = ToolchainContract::with_schema_bundle(1, vec![path("main.dcdl")], 1, schema);
+        let before = environment.evaluate_contract(&contract).unwrap();
+        for value in [
+            "{}",
+            "{ worker = {}; }",
+            "{ worker = { mode = \"wip\"; }; }",
+            "{ feature = { task = {}; }; }",
+        ] {
+            let source = source.replace("profile = {};", &format!("profile = {value};"));
+            assert!(
+                environment
+                    .analyze(&path("main.dcdl"), Some(&source))
+                    .is_empty(),
+                "{source}"
+            );
+        }
+        for (value, field, expected_path) in [
+            ("{ worker = 42; }", "worker", "main.dcdl"),
+            ("{ worker = { mode = 42; }; }", "mode", "main.dcdl"),
+            (
+                "{ feature = { task = { enabled = 42; }; }; }",
+                "enabled",
+                "main.dcdl",
+            ),
+            ("{ worker = { typo = \"wip\"; }; }", "typo", "main.dcdl"),
+            ("import \"./recipe.dcdl\"", "mode", "recipe.dcdl"),
+            (
+                "(import \"./recipe.dcdl\") // { worker = { mode = 42; }; }",
+                "mode",
+                "main.dcdl",
+            ),
+        ] {
+            let source = source.replace("profile = {};", &format!("profile = {value};"));
+            let diagnostics = environment.analyze(&path("main.dcdl"), Some(&source));
+            let diagnostic = diagnostics
+                .first()
+                .unwrap_or_else(|| panic!("missing {field} diagnostic for {source}"));
+            assert!(
+                matches!(
+                    diagnostic.kind.as_str(),
+                    "constraint_violation" | "type_mismatch"
+                ),
+                "{diagnostic:?}"
+            );
+            assert_eq!(diagnostic.path, path(expected_path), "{diagnostic:?}");
+            assert_eq!(diagnostic.revision, 8);
+            let diagnostic_source = if expected_path == "main.dcdl" {
+                &source
+            } else {
+                "{ worker = { mode = 42; }; }"
+            };
+            assert!(
+                diagnostic.span.end_byte > diagnostic.span.start_byte
+                    && diagnostic.span.end_byte <= diagnostic_source.len() as u32,
+                "{diagnostic:?}"
+            );
+            assert!(
+                diagnostic.message.contains(field)
+                    || diagnostic
+                        .labels
+                        .iter()
+                        .any(|label| label.message.contains(field)),
+                "{diagnostic:?}"
+            );
+            assert!(
+                diagnostic
+                    .labels
+                    .iter()
+                    .all(|label| label.span.end_byte <= diagnostic_source.len() as u32)
+            );
+        }
+        // Analysis never changes the evaluation schema or transports authoring fields.
+        assert_eq!(environment.evaluate_contract(&contract).unwrap(), before);
+        assert_eq!(
+            before.projections[0]
+                .data_json
+                .pointer("/profile/entries/0/profile"),
+            Some(&serde_json::json!({}))
+        );
     }
 
     #[test]
