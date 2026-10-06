@@ -18,6 +18,7 @@ futures.workspace = true
 config-source.workspace = true
 flow = { path = "../flow" }
 manifest.workspace = true
+job.workspace = true
 protocol = { workspace = true }
 runtime-api.workspace = true
 server-api.workspace = true

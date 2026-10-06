@@ -5,6 +5,8 @@
 //! Server, HTTP, WebSocket, subprocess Worker, or alternative execution path.
 
 pub mod host;
+mod job_store;
+pub mod jobs;
 pub mod launch;
 pub mod store;
 

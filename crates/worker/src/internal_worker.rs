@@ -205,6 +205,9 @@ where
             .copied()
             .collect::<Vec<_>>()
             .join(", ");
+        worker
+            .stop_feature_runtime("internal Worker feature installation failed")
+            .await;
         return Err(InternalWorkerError {
             source: WorkerError::FeatureInstall(format!(
                 "internal Worker feature installation failed: {diagnostics}; missing tools: {missing}"

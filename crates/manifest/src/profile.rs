@@ -1257,6 +1257,13 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(resolved.manifest.worker.name, "role-worker");
+            if entry.name == "job" {
+                assert!(resolved.manifest.compaction.is_none());
+                assert!(resolved.manifest.scope.allow.is_empty());
+                assert!(resolved.manifest.delegation_scope.allow.is_empty());
+                assert_eq!(resolved.manifest.engine.instruction, "internal.job_system");
+                continue;
+            }
             let compaction = resolved.manifest.compaction.as_ref().unwrap();
             assert_eq!(compaction.worker_max_turns, Some(100), "{}", entry.name);
             assert_eq!(

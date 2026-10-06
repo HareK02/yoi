@@ -97,6 +97,7 @@ pub enum WorkerPrompt {
     SubjektivMemoryConsolidationSystem,
     SubjektivMemorySurfaceSystem,
     FlowVerifierSystem,
+    JobSystem,
     BackendJobSystem,
     NotifyWrapper,
     InterruptToolResultSummary,
@@ -121,6 +122,7 @@ impl WorkerPrompt {
             }
             Self::SubjektivMemorySurfaceSystem => "internal.subjektiv_memory_surface_system",
             Self::FlowVerifierSystem => "internal.flow_verifier_system",
+            Self::JobSystem => "internal.job_system",
             Self::BackendJobSystem => "internal.backend_job_system",
             Self::NotifyWrapper => "internal.notify_wrapper",
             Self::InterruptToolResultSummary => "internal.interrupt_tool_result_summary",
@@ -144,6 +146,7 @@ impl WorkerPrompt {
         WorkerPrompt::SubjektivMemoryConsolidationSystem,
         WorkerPrompt::SubjektivMemorySurfaceSystem,
         WorkerPrompt::FlowVerifierSystem,
+        WorkerPrompt::JobSystem,
         WorkerPrompt::BackendJobSystem,
         WorkerPrompt::NotifyWrapper,
         WorkerPrompt::InterruptToolResultSummary,

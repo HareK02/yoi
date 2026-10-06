@@ -26,7 +26,8 @@ worker
 - Controller transport は `InProcess` に固定する。通常起動で Worker subprocess、HTTP/WS server、Unix socket を作らない。
 - model provider は通常の resolved Manifest から構築する。埋め込み host と deterministic test は `start_with_model_client` で同じ bootstrap に process-owned client を注入できる。
 - feature plan/install は既存 `WorkerController` が行う。Task や optional direct SubWorker を standalone 側で再実装しない。
-- `shutdown()` は既存 `Method::Shutdown` を送り、controller が active run、SubWorker registry、Workdir session、MachineScope allocation を順に片付けた後の confirmation を待つ。
+- `shutdown()` は Host-owned Job service の scheduling を閉じ、Internal Worker の取消・cleanup とローカル SQLite connection の close を確認してから、既存 `Method::Shutdown` を送る。controller が active run、SubWorker registry、Workdir session、MachineScope allocation を順に片付けた後の confirmation を待つ。cleanup を確認できない drop/error では lease を保持する。
+- `jobs()` は Feature へ明示的に渡す汎用 Job 実行 capability。対話 Session・モデル作成 SubWorker とは別で、Profile/result authority と永続化の契約は [Standalone Jobs](standalone-jobs.md) に記録する。
 - startup error は category のみを公開し、credential、prompt 本文、session metadata、内部 path を error text に含めない。
 
 ## CLI / TUI routing

@@ -8,6 +8,7 @@ members = [
     "crates/api-macros-impl",
     "crates/session-store",
     "crates/standalone",
+    "crates/job",
     "crates/secrets",
     "crates/manifest",
     "crates/mcp",
@@ -43,6 +44,7 @@ default-members = [
     "crates/api-macros-impl",
     "crates/session-store",
     "crates/standalone",
+    "crates/job",
     "crates/secrets",
     "crates/manifest",
     "crates/mcp",
@@ -103,6 +105,7 @@ session-metrics = { path = "crates/session-metrics" }
 session-analytics = { path = "crates/session-analytics" }
 session-store = { path = "crates/session-store" }
 standalone = { path = "crates/standalone" }
+job = { path = "crates/job" }
 runtime-api = { path = "crates/runtime-api" }
 server-api = { path = "crates/server-api" }
 secrets = { path = "crates/secrets" }

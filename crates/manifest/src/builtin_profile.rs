@@ -95,6 +95,13 @@ pub const BUILTIN_PROFILE_RESOURCES: &[BuiltinProfileResource] = &[
         imports: BASE_IMPORT,
     },
     BuiltinProfileResource {
+        selector: Some("builtin:job"),
+        path: "profiles/job.dcdl",
+        source: include_str!("../../../resources/profiles/job.dcdl"),
+        description: "Result-only caller-selected Job policy.",
+        imports: NO_IMPORTS,
+    },
+    BuiltinProfileResource {
         selector: Some("builtin:backend-job"),
         path: "profiles/backend-job.dcdl",
         source: include_str!("../../../resources/profiles/backend-job.dcdl"),

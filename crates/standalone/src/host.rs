@@ -43,6 +43,7 @@ pub struct StandaloneHost {
     worker_store: FsWorkerStore,
     record: StandaloneWorkerRecord,
     lease: Option<StandaloneWorkerLease>,
+    jobs: crate::jobs::StandaloneJobs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -77,6 +78,8 @@ pub enum StandaloneStartupError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum StandaloneShutdownError {
+    #[error("standalone Job execution cleanup or terminal persistence could not be confirmed")]
+    JobCleanup,
     #[error("the standalone Worker did not stop before the shutdown deadline")]
     DeadlineExceeded,
     #[error("the standalone Worker shutdown confirmation was lost")]
@@ -110,6 +113,16 @@ impl StandaloneHost {
             .allocate(&launch.cwd, StaleLeasePolicy::Reject)
             .map_err(classify_store_startup_error)?;
         let worker_id = allocation.worker_id();
+        let jobs = match crate::jobs::StandaloneJobs::open(
+            &store.jobs_path(worker_id),
+            launch.cwd.clone(),
+        ) {
+            Ok(jobs) => jobs,
+            Err(_) => {
+                let _ = store.abandon_allocation(allocation);
+                return Err(StandaloneStartupError::StateStore);
+            }
+        };
 
         // WorkerId is the stable identity. The current Worker store remains
         // name-keyed, so keep its derived storage key separate from the
@@ -181,6 +194,7 @@ impl StandaloneHost {
             worker_store,
             record,
             allocation.into_lease(),
+            jobs,
         ))
     }
 
@@ -216,6 +230,11 @@ impl StandaloneHost {
         let lease = store
             .acquire_lease(worker_id, StaleLeasePolicy::Recover)
             .map_err(classify_store_startup_error)?;
+        let jobs = crate::jobs::StandaloneJobs::open(
+            &store.jobs_path(worker_id),
+            record.cwd.canonical_path.clone(),
+        )
+        .map_err(|_| StandaloneStartupError::StateStore)?;
         let (backing_store, worker_store) = backing_store(&store, worker_id)?;
         let storage_key = record.storage_key.clone();
         let mut manifest = record.manifest.clone();
@@ -270,6 +289,7 @@ impl StandaloneHost {
             worker_store,
             record,
             lease,
+            jobs,
         ))
     }
 
@@ -279,6 +299,7 @@ impl StandaloneHost {
         worker_store: FsWorkerStore,
         record: StandaloneWorkerRecord,
         lease: StandaloneWorkerLease,
+        jobs: crate::jobs::StandaloneJobs,
     ) -> Self {
         Self {
             handle: started.handle,
@@ -288,7 +309,14 @@ impl StandaloneHost {
             worker_store,
             record,
             lease: Some(lease),
+            jobs,
         }
+    }
+
+    /// Explicit Host execution capability for local Features, separate from the
+    /// interactive Worker protocol and its model-created SubWorkers.
+    pub fn jobs(&self) -> crate::jobs::StandaloneJobs {
+        self.jobs.clone()
     }
 
     #[must_use]
@@ -318,6 +346,7 @@ impl StandaloneHost {
     }
 
     pub async fn shutdown(mut self) -> Result<(), StandaloneShutdownError> {
+        let jobs_result = self.jobs.shutdown().await;
         let command = protocol::WorkerCommandEnvelope::new(u64::MAX);
         let _ = self.handle.send(Method::Shutdown { command }).await;
         let Some(shutdown) = self.shutdown.take() else {
@@ -334,6 +363,10 @@ impl StandaloneHost {
                 self.retain_lease();
                 return Err(StandaloneShutdownError::DeadlineExceeded);
             }
+        }
+        if jobs_result.is_err() {
+            self.retain_lease();
+            return Err(StandaloneShutdownError::JobCleanup);
         }
         let active = match active_pointer(&self.worker_store, &self.record.storage_key) {
             Ok(active) => active,
@@ -367,6 +400,16 @@ impl StandaloneHost {
         if let Some(lease) = self.lease.take() {
             lease.retain();
         }
+    }
+}
+
+impl Drop for StandaloneHost {
+    fn drop(&mut self) {
+        self.jobs.close();
+        // A dropped Host cannot synchronously confirm either controller or Job
+        // cleanup. Keep its lease until explicit shutdown or process recovery,
+        // preventing another Host from reopening a still-live execution store.
+        self.retain_lease();
     }
 }
 

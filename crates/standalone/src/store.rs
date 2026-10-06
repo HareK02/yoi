@@ -352,6 +352,10 @@ impl StandaloneWorkerStore {
     }
 
     #[must_use]
+    pub(crate) fn jobs_path(&self, id: WorkerId) -> PathBuf {
+        self.worker_dir(id).join("jobs.sqlite3")
+    }
+
     pub(crate) fn runtime_dir(&self, id: WorkerId) -> PathBuf {
         self.worker_dir(id).join("runtime")
     }
