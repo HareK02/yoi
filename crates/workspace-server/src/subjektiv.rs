@@ -1021,6 +1021,11 @@ ALTER TABLE subjects ADD COLUMN behavior_revision INTEGER NOT NULL DEFAULT 0
     Ok(())
 }
 
+fn add_surface_job_provenance(transaction: &Transaction<'_>) -> crate::feature_storage::Result<()> {
+    transaction.execute_batch("ALTER TABLE surface_generation_runs ADD COLUMN job_id TEXT; ALTER TABLE surface_generation_runs ADD COLUMN attempt_id TEXT;")?;
+    Ok(())
+}
+
 static MIGRATIONS: &[FeatureMigration] = &[
     FeatureMigration::new(1, "create subjektiv subject memory store", create_schema),
     FeatureMigration::new(
@@ -1039,6 +1044,11 @@ static MIGRATIONS: &[FeatureMigration] = &[
         add_surface_generation_state,
     ),
     FeatureMigration::new(5, "add user-managed subject behavior", add_subject_behavior),
+    FeatureMigration::new(
+        6,
+        "bind surface generation provenance to Job attempts",
+        add_surface_job_provenance,
+    ),
 ];
 
 pub const REGISTRATION: FeatureRegistration =
@@ -1958,6 +1968,14 @@ impl SubjektivStore {
     /// active Memory revisions. Kind order is fixed and selection is round-robin
     /// across kinds; within each kind, updated_at desc then memory id asc.
     pub fn prepare_surface_generation(&self, subject_id: &str) -> Result<SurfaceGeneration> {
+        self.prepare_job_surface_generation(subject_id, None)
+    }
+
+    pub(crate) fn prepare_job_surface_generation(
+        &self,
+        subject_id: &str,
+        job_attempt: Option<(&str, &str)>,
+    ) -> Result<SurfaceGeneration> {
         self.database.try_transaction(|transaction| {
             let subject = require_active_subject(transaction, subject_id)?;
             let (active_memory_count, materials) =
@@ -1973,18 +1991,68 @@ impl SubjektivStore {
             transaction.execute(
                 "INSERT INTO surface_generation_runs (
                     subject_id, generation_id, store_revision, active_memory_count,
-                    materials_json, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    materials_json, created_at, job_id, attempt_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     subject_id,
                     generation.id,
                     to_i64(generation.store_revision)?,
                     to_i64(generation.active_memory_count as u64)?,
                     serde_json::to_string(&generation.materials)?,
-                    generation.created_at
+                    generation.created_at,
+                    job_attempt.map(|(job_id, _)| job_id),
+                    job_attempt.map(|(_, attempt_id)| attempt_id),
                 ],
             )?;
             Ok(generation)
+        })
+    }
+
+    /// Validate a Job's structured surface claim against the existing generation
+    /// and publication/failure records. This does not create another receipt or
+    /// roll back Memory. The generation must have begun inside this attempt.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn validate_job_surface_outcome(
+        &self,
+        subject_id: &str,
+        generation_id: &str,
+        store_revision: u64,
+        availability: &str,
+        snapshot_id: Option<&str>,
+        reason_code: Option<&str>,
+        job_id: &str,
+        attempt_id: &str,
+    ) -> Result<()> {
+        self.database.try_with_connection(|connection| {
+            let subject = require_subject_in_connection(connection, subject_id)?;
+            let generation_revision = require_job_generation(connection, subject_id, generation_id, job_id, attempt_id)?;
+            if generation_revision != store_revision || subject.store_revision != store_revision {
+                return Err(SubjektivError::InvalidRecord("surface generation is stale".into()));
+            }
+            let state = connection.query_row(
+                "SELECT store_revision, status, snapshot_id, reason_code FROM surface_generation_state WHERE subject_id = ?1",
+                [subject_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?)),
+            ).optional()?.ok_or_else(|| SubjektivError::InvalidRecord("surface generation has no terminal outcome".into()))?;
+            if state.0 != to_i64(store_revision)? || state.1 != availability
+                || !matches!(availability, "ready" | "failed")
+                || state.2.as_deref() != snapshot_id || state.3.as_deref() != reason_code {
+                return Err(SubjektivError::InvalidRecord("surface claim differs from the persisted outcome".into()));
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn require_job_surface_generation(
+        &self,
+        subject_id: &str,
+        generation_id: &str,
+        job_id: &str,
+        attempt_id: &str,
+    ) -> Result<()> {
+        self.database.try_with_connection(|connection| {
+            require_job_generation(connection, subject_id, generation_id, job_id, attempt_id)?;
+            Ok(())
         })
     }
 
@@ -3603,6 +3671,26 @@ fn reject_duplicate_memory_ids(kind: &str, values: &[MemoryRevisionRef]) -> Resu
         )));
     }
     Ok(())
+}
+
+fn require_job_generation(
+    connection: &Connection,
+    subject_id: &str,
+    generation_id: &str,
+    job_id: &str,
+    attempt_id: &str,
+) -> Result<u64> {
+    let revision: Option<i64> = connection.query_row(
+        "SELECT store_revision FROM surface_generation_runs WHERE subject_id = ?1 AND generation_id = ?2 AND job_id = ?3 AND attempt_id = ?4",
+        params![subject_id, generation_id, job_id, attempt_id], |row| row.get(0),
+    ).optional()?;
+    revision
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(|| {
+            SubjektivError::InvalidRecord(
+                "surface generation is not owned by this Job attempt".into(),
+            )
+        })
 }
 
 fn to_i64(value: u64) -> Result<i64> {

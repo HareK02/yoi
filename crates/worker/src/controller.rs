@@ -1376,10 +1376,12 @@ where
         ),
         None => durable_parent_notifications,
     };
-    let backend_job_profile = worker.manifest().engine.instruction == "internal.backend_job_system";
+    let backend_job = worker.backend_job().cloned();
+    // Bounded Jobs complete their lifecycle synchronously, never by post-run background work.
+    let lifecycle_enabled = worker.manifest_lifecycle_features_enabled() && backend_job.is_none();
     let prompts = worker.prompts().clone();
     let tracker = tools::Tracker::new();
-    if !backend_job_profile {
+    {
         let paste_store = worker.store().clone();
         let paste_session_id = worker.session_id();
         worker
@@ -1426,11 +1428,9 @@ where
     let worker_enabled = feature_config.worker.enabled;
     let sub_worker_enabled = feature_config.sub_worker.enabled;
     let mut feature_registry = FeatureRegistryBuilder::new();
-    if !backend_job_profile {
-        feature_registry
-            .add_module(crate::feature::builtin::chat_invocation::AttachmentInvocationFeature);
-    }
-    if backend_job_profile {
+    feature_registry
+        .add_module(crate::feature::builtin::chat_invocation::AttachmentInvocationFeature);
+    if let Some(binding) = backend_job.as_ref() {
         let workspace_client = worker.workspace_client_handle();
         if !workspace_client.is_available() || workspace_client.workspace_id().is_none() {
             return Err(std::io::Error::new(
@@ -1438,11 +1438,18 @@ where
                 "Backend Job result capability requires Backend Workspace API authority",
             ));
         }
-        feature_registry.add_module(
+        let mut result_feature =
             crate::feature::builtin::backend_job_result::BackendJobResultFeature::new(
-                workspace_client,
-            ),
-        );
+                workspace_client.clone(),
+            );
+        if binding.subjektiv_consolidation {
+            let surface = crate::feature::builtin::memory_surface_lifecycle::SubjektivSurfaceLifecycleFeature::for_job(
+                workspace_client, spawner_manifest.clone(), worker.llm_client_handle(),
+                prompts.clone(), spawner_workspace_context.clone(),
+            )?;
+            result_feature = result_feature.with_surface(surface);
+        }
+        feature_registry.add_module(result_feature);
     }
     let memory_profile = &worker.manifest().feature.memory.profile;
     let subjektiv_profile = &worker.manifest().feature.subjektiv.profile;
@@ -1455,7 +1462,11 @@ where
     let mut feature_prompt_contribution = memory_install_plan.as_ref().map(|plan| {
         (
             plan.resident_summary_source.clone(),
-            plan.system_prompt_override.clone(),
+            if backend_job.is_none() {
+                plan.system_prompt_override.clone()
+            } else {
+                None
+            },
         )
     });
     let memory_lifecycle_config = worker.manifest().feature.memory.clone();
@@ -1469,7 +1480,9 @@ where
             worker.prompts().load_full(),
         )?;
     if let Some(plan) = subjektiv_consolidation_plan {
-        feature_prompt_contribution = Some((None, Some(plan.system_prompt_override)));
+        if backend_job.is_none() {
+            feature_prompt_contribution = Some((None, Some(plan.system_prompt_override)));
+        }
         feature_registry.add_module(plan.module);
     }
     let ordinary_subjektiv_features_enabled =
@@ -1488,7 +1501,7 @@ where
             .to_string();
         if let Some(refresh_feature) =
             crate::feature::builtin::memory::SubjektivResidentRestoreRefreshFeature::for_host(
-                worker.manifest_lifecycle_features_enabled(),
+                lifecycle_enabled,
                 Arc::clone(&resident_summary_source),
                 worker.prompts(),
                 workspace_id,
@@ -1519,7 +1532,7 @@ where
     }
     if let Some(memory_lifecycle) =
         crate::feature::builtin::memory_lifecycle::MemoryLifecycleFeature::from_resolved_config(
-            worker.manifest_lifecycle_features_enabled(),
+            lifecycle_enabled,
             memory_lifecycle_config,
             worker.committed_session_capture_handle(),
             worker.session_extension_handle(),
@@ -1533,8 +1546,8 @@ where
     {
         feature_registry.add_module(memory_lifecycle);
     }
-    if let Some(surface_lifecycle) = crate::feature::builtin::memory_surface_lifecycle::SubjektivSurfaceLifecycleFeature::from_manifest(
-        worker.manifest_lifecycle_features_enabled(),
+    if backend_job.is_none() && let Some(surface_lifecycle) = crate::feature::builtin::memory_surface_lifecycle::SubjektivSurfaceLifecycleFeature::from_manifest(
+        lifecycle_enabled,
         worker.workspace_client_handle(),
         spawner_manifest.clone(),
         worker.llm_client_handle(),
@@ -1546,7 +1559,7 @@ where
     if ordinary_subjektiv_features_enabled
         && let Some(subjektiv_lifecycle) =
             crate::feature::builtin::memory_lifecycle::SubjektivLifecycleFeature::from_resolved_config(
-                worker.manifest_lifecycle_features_enabled(),
+                lifecycle_enabled,
                 worker.manifest().feature.subjektiv.clone(),
                 worker.committed_session_capture_handle(),
                 worker.session_extension_handle(),
@@ -1721,7 +1734,7 @@ where
             )
         })?;
     }
-    if wip_mode && !backend_job_profile {
+    if wip_mode {
         crate::checkout::mount_checkouts(
             &mut wip_mount_registry,
             worker.workdir_sessions(),

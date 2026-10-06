@@ -2599,6 +2599,8 @@ struct PendingCompactionCleanup {
 /// `session-store` functions after each turn.
 pub struct Worker<C: LlmClient, St: Store> {
     manifest: WorkerManifest,
+    /// Host-bound once before Feature installation; never inherited by child Workers.
+    backend_job: std::sync::OnceLock<Option<crate::BackendJobExecutionBinding>>,
     /// Always `Some` outside of `run()`/`resume()`.
     engine: Option<Engine<C, Mutable, SessionHistoryMetadata>>,
     /// Sole live authority for committed model-visible history.
@@ -2965,6 +2967,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let scope = SharedScope::new(scope);
         let workdir_sessions = workdir_sessions_from_authority(&filesystem_authority, &scope);
         let mut worker = Self {
+            backend_job: std::sync::OnceLock::new(),
             manifest,
             engine: Some(worker),
             session: WorkerSession::new(session_id, Vec::new()),
@@ -3126,6 +3129,30 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     /// Session.
     pub fn session_id(&self) -> SessionId {
         self.segment_state.session_id()
+    }
+
+    /// Immutable host-owned Job authority, absent for ordinary and child Workers.
+    pub fn backend_job(&self) -> Option<&crate::BackendJobExecutionBinding> {
+        self.backend_job.get().and_then(Option::as_ref)
+    }
+
+    /// Trusted host seam; immutable after binding and unavailable after Feature installation.
+    pub fn bind_backend_job(
+        &mut self,
+        binding: crate::BackendJobExecutionBinding,
+    ) -> Result<(), &'static str> {
+        binding.validate()?;
+        if self.interceptor_installed || self.backend_job.get().is_some() {
+            return Err("Backend Job capability is already sealed");
+        }
+        if !self.workspace_client().is_available()
+            || self.workspace_client().workspace_id().is_none()
+        {
+            return Err("Backend Job capability requires Backend Workspace API authority");
+        }
+        self.backend_job
+            .set(Some(binding))
+            .map_err(|_| "Backend Job capability is already bound")
     }
 
     /// The Worker's manifest.
@@ -3398,6 +3425,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         &mut self,
         registry: FeatureRegistryBuilder,
     ) -> FeatureRegistryInstallReport {
+        self.backend_job.get_or_init(|| None);
         let worker = self.engine.as_mut().expect("worker taken during run");
         let report = registry.install_into_engine(worker, &mut self.hook_builder);
         if report.has_errors() {
@@ -7249,6 +7277,7 @@ where
             workdir_sessions_from_authority(&common.filesystem_authority, &scope);
 
         let mut worker = Self {
+            backend_job: std::sync::OnceLock::new(),
             manifest,
             engine: Some(worker),
             session: WorkerSession::new(session_id, Vec::new()),
@@ -7350,6 +7379,18 @@ where
             });
         }
 
+        if self
+            .backend_job()
+            .is_some_and(|binding| binding.subjektiv_consolidation)
+        {
+            if metadata.subjektiv_session_attribution.is_some() {
+                return Err(WorkerError::SubjektivSessionAttribution {
+                    state: "job_attribution_forbidden",
+                    message: "consolidation Job execution must not carry subject-body Session attribution".into(),
+                });
+            }
+            return Ok(());
+        }
         if !subjektiv_attached {
             if metadata.subjektiv_session_attribution.is_some() {
                 return Err(WorkerError::SubjektivSessionAttribution {
@@ -7528,6 +7569,7 @@ where
         let workdir_sessions =
             workdir_sessions_from_authority(&common.filesystem_authority, &scope);
         let mut worker = Self {
+            backend_job: std::sync::OnceLock::new(),
             manifest,
             engine: Some(engine),
             session: WorkerSession::new(session_id, Vec::new()),
@@ -7655,6 +7697,7 @@ where
             workdir_sessions_from_authority(&common.filesystem_authority, &scope);
 
         let mut worker = Self {
+            backend_job: std::sync::OnceLock::new(),
             manifest,
             engine: Some(worker),
             session: WorkerSession::new(session_id, Vec::new()),
@@ -8036,6 +8079,7 @@ where
             workdir_sessions_from_authority(&common.filesystem_authority, &scope);
 
         let mut worker = Self {
+            backend_job: std::sync::OnceLock::new(),
             manifest,
             engine: Some(worker),
             session: WorkerSession::new(session_id, restored_history_entries),
@@ -10483,6 +10527,56 @@ mod build_summary_prompt_tests {
         .unwrap();
         worker.enable_worker_metadata_write_through().unwrap();
         (worker, store, temp)
+    }
+
+    #[tokio::test]
+    async fn ordinary_worker_cannot_gain_job_authority_after_feature_installation() {
+        let client = Arc::new(AttributionLifecycleClient::new([]));
+        let (mut worker, _store, _temp) = attribution_lifecycle_worker(client).await;
+        worker.install_features(FeatureRegistryBuilder::new());
+        assert!(
+            worker
+                .bind_backend_job(crate::BackendJobExecutionBinding {
+                    job_id: "job-1".into(),
+                    attempt_id: "attempt-1".into(),
+                    input_revision: None,
+                    subjektiv_consolidation: false
+                })
+                .is_err()
+        );
+        assert!(worker.backend_job().is_none());
+    }
+
+    #[tokio::test]
+    async fn consolidation_job_binding_is_immutable_and_has_no_subject_body_attribution() {
+        let client = Arc::new(AttributionLifecycleClient::new([]));
+        let (mut worker, store, _temp) = attribution_lifecycle_worker(client.clone()).await;
+        let binding = crate::BackendJobExecutionBinding {
+            job_id: "job-1".into(),
+            attempt_id: "attempt-1".into(),
+            input_revision: Some("revision-1".into()),
+            subjektiv_consolidation: true,
+        };
+        worker.bind_backend_job(binding.clone()).unwrap();
+        assert_eq!(worker.backend_job(), Some(&binding));
+        assert!(worker.bind_backend_job(binding).is_err());
+        for lifecycle in [
+            SubjektivSessionAttributionLifecycle::NewSession,
+            SubjektivSessionAttributionLifecycle::RestoredSession,
+        ] {
+            worker
+                .finalize_subjektiv_session_attribution(true, lifecycle)
+                .unwrap();
+        }
+        assert!(client.requests.lock().unwrap().is_empty());
+        assert!(
+            store
+                .read_by_name(&worker.manifest().worker.name)
+                .unwrap()
+                .unwrap()
+                .subjektiv_session_attribution
+                .is_none()
+        );
     }
 
     #[tokio::test]

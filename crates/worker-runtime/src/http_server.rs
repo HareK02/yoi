@@ -3129,6 +3129,7 @@ mod tests {
                 language: "English".to_string(),
             }),
             subjektiv_attached: false,
+            backend_job: None,
         }
     }
 
@@ -4685,6 +4686,7 @@ mod ws_tests {
                 language: "English".to_string(),
             }),
             subjektiv_attached: false,
+            backend_job: None,
         }
     }
 

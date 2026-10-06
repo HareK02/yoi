@@ -1115,7 +1115,7 @@ pub(crate) fn is_builtin_subjektiv_consolidation_profile(
 
 pub(crate) fn ordinary_subjektiv_features_enabled(manifest: &manifest::WorkerManifest) -> bool {
     manifest.feature.subjektiv.execution_enabled()
-        && !is_builtin_subjektiv_consolidation_profile(manifest)
+        && !manifest.feature.subjektiv.profile.consolidation_tools
 }
 
 pub(crate) fn ordinary_subjektiv_resident_summary_source(
@@ -1175,7 +1175,7 @@ impl SubjektivConsolidationFeatureInstallPlan {
         client: Arc<dyn WorkspaceClient>,
         prompts: Arc<crate::prompt::catalog::PromptCatalog>,
     ) -> std::io::Result<Option<Self>> {
-        if !is_builtin_subjektiv_consolidation_profile(manifest) {
+        if !manifest.feature.subjektiv.profile.consolidation_tools {
             return Ok(None);
         }
         let config = &manifest.feature.subjektiv;

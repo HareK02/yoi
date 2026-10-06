@@ -258,6 +258,8 @@ impl std::fmt::Debug for WorkspaceApiRef {
     }
 }
 
+pub use worker::BackendJobExecutionBinding;
+
 /// Canonical Runtime Worker creation request.
 ///
 /// Browser/product launch semantics are resolved by a backend before this
@@ -302,6 +304,9 @@ pub struct CreateWorkerRequest {
     /// may enable subjektiv policy, but only this host-owned bit activates it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub subjektiv_attached: bool,
+    /// Backend-only immutable Job/attempt capability. Never inferred from Profile policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_job: Option<BackendJobExecutionBinding>,
 }
 
 /// Last persisted Worker lifecycle status.

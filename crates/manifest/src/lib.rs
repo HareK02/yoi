@@ -402,6 +402,8 @@ impl ResolvedMemoryFeatureConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SubjektivFeatureProfileConfig {
     pub enabled: bool,
+    /// Explicit consolidation tool policy; never grants Job or subject authority.
+    pub consolidation_tools: bool,
     pub extraction: MemoryExtractionProfileConfig,
 }
 
@@ -409,6 +411,7 @@ impl Default for SubjektivFeatureProfileConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            consolidation_tools: false,
             extraction: MemoryExtractionProfileConfig::default(),
         }
     }

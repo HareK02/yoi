@@ -288,6 +288,8 @@ pub struct SubjektivFeatureConfigPartial {
     #[serde(default)]
     pub enabled: Option<bool>,
     #[serde(default)]
+    pub consolidation_tools: Option<bool>,
+    #[serde(default)]
     pub extraction: Option<MemoryExtractionProfileConfigPartial>,
 }
 
@@ -295,6 +297,7 @@ impl SubjektivFeatureConfigPartial {
     fn merge(self, other: Self) -> Self {
         Self {
             enabled: other.enabled.or(self.enabled),
+            consolidation_tools: other.consolidation_tools.or(self.consolidation_tools),
             extraction: merge_option(
                 self.extraction,
                 other.extraction,
@@ -544,6 +547,7 @@ impl From<SubjektivFeatureConfigPartial> for ResolvedSubjektivFeatureConfig {
         Self {
             profile: SubjektivFeatureProfileConfig {
                 enabled: value.enabled.unwrap_or_default(),
+                consolidation_tools: value.consolidation_tools.unwrap_or_default(),
                 extraction: MemoryExtractionProfileConfig {
                     enabled: extraction.enabled.unwrap_or(true),
                     model: extraction.model,
@@ -563,6 +567,7 @@ impl From<ResolvedSubjektivFeatureConfig> for SubjektivFeatureConfigPartial {
     fn from(value: ResolvedSubjektivFeatureConfig) -> Self {
         Self {
             enabled: Some(value.profile.enabled),
+            consolidation_tools: Some(value.profile.consolidation_tools),
             extraction: Some(MemoryExtractionProfileConfigPartial {
                 enabled: Some(value.profile.extraction.enabled),
                 model: value.profile.extraction.model,

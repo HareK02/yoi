@@ -564,6 +564,8 @@ pub enum WorkerSpawnIntent {
         job_id: String,
         attempt_id: String,
         purpose: String,
+        input_revision: String,
+        subjektiv_consolidation: bool,
     },
     TicketRole {
         ticket_id: String,
@@ -5708,6 +5710,21 @@ fn runtime_create_worker_request(
         workspace_api: Some(workspace_api),
         memory_settings: request.resolved_memory_settings.clone(),
         subjektiv_attached: request.resolved_subjektiv_attached,
+        backend_job: match &request.intent {
+            WorkerSpawnIntent::BackendJob {
+                job_id,
+                attempt_id,
+                input_revision,
+                subjektiv_consolidation,
+                ..
+            } => Some(worker_runtime::catalog::BackendJobExecutionBinding {
+                job_id: job_id.clone(),
+                attempt_id: attempt_id.clone(),
+                input_revision: Some(input_revision.clone()),
+                subjektiv_consolidation: *subjektiv_consolidation,
+            }),
+            _ => None,
+        },
     }
 }
 

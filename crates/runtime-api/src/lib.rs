@@ -420,6 +420,18 @@ pub struct WorkerInput {
     pub segments: Option<Vec<Segment>>,
 }
 
+/// Host-authored Job/attempt identity, independent of Profile selection.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendJobExecutionBinding {
+    pub job_id: String,
+    pub attempt_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_revision: Option<String>,
+    #[serde(default)]
+    pub subjektiv_consolidation: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CreateWorkerRequest {
     pub worker_id: WorkerId,
@@ -448,6 +460,8 @@ pub struct CreateWorkerRequest {
     /// never activates subjektiv for an ordinary Workspace Worker.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub subjektiv_attached: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_job: Option<BackendJobExecutionBinding>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

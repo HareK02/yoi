@@ -74,6 +74,7 @@ fn create_request(name: &str) -> CreateWorkerRequest {
             language: "English".to_string(),
         }),
         subjektiv_attached: false,
+        backend_job: None,
     }
 }
 

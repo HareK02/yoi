@@ -28,7 +28,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 80;
+const LATEST_SCHEMA_VERSION: i64 = 81;
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
@@ -277,6 +277,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 80,
         name: WORKER_RESTORE_INTENTS_MIGRATION_NAME,
         apply: migrate_worker_restore_intents_v79_to_v80,
+    },
+    Migration {
+        version: 81,
+        name: "Backend Job immutable resource serialization",
+        apply: migrate_backend_job_resources_v80_to_v81,
     },
 ];
 
@@ -1583,6 +1588,20 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
     ) -> Result<BackendJobReservation>;
     fn get_backend_job(&self, workspace_id: &str, job_id: &str)
     -> Result<Option<BackendJobRecord>>;
+    /// Pending/unknown Jobs and terminal Jobs with unfinished Worker cleanup
+    /// retain their resource. This is a query, not an independent lock ledger.
+    fn find_active_backend_job_for_resource(
+        &self,
+        workspace_id: &str,
+        resource_key: &str,
+    ) -> Result<Option<BackendJobRecord>>;
+    /// Current dispatched Job bound to this Worker and Runtime run. Returns the
+    /// immutable grants for Backend authorization without trusting caller input.
+    fn get_active_backend_job_for_worker(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<BackendJobRecord>>;
     fn get_backend_job_attempt(
         &self,
         workspace_id: &str,
@@ -6472,7 +6491,18 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 let attempt = read_backend_job_attempt(&tx, workspace_id, &request.job_id, &attempt_id)?
                     .ok_or_else(|| Error::Store("Backend Job current attempt is missing".to_string()))?;
                 tx.commit()?;
-                return Ok(BackendJobReservation { job, attempt, replayed: true });
+                return Ok(BackendJobReservation { job, attempt, replayed: true, resource_reused: false });
+            }
+            if let Some(key) = request.resource_key()
+                && let Some(job) = read_active_backend_job_for_resource(&tx, workspace_id, &key)?
+            {
+                let id = attempt_id(&job.request.job_id, job.current_attempt);
+                let attempt = read_backend_job_attempt(&tx, workspace_id, &job.request.job_id, &id)?
+                    .ok_or_else(|| Error::Store("active Backend Job current attempt is missing".into()))?;
+                tx.commit()?;
+                return Ok(BackendJobReservation {
+                    job, attempt, replayed: false, resource_reused: true,
+                });
             }
             for (role, worker) in [
                 ("source", request.source_worker.as_ref()),
@@ -6489,8 +6519,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let current_attempt = 1_u8;
             let attempt_id = attempt_id(&request.job_id, current_attempt);
             tx.execute(
-                "INSERT INTO backend_jobs (workspace_id, job_id, purpose, input_revision, input_ref, request_json, intent_fingerprint, state, current_attempt, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?9)",
-                params![workspace_id, request.job_id, request.purpose, request.input_revision, request.input_ref, request_json, fingerprint, current_attempt as i64, now],
+                "INSERT INTO backend_jobs (workspace_id, job_id, purpose, input_revision, input_ref, request_json, intent_fingerprint, state, current_attempt, created_at, updated_at, resource_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?9, ?10)",
+                params![workspace_id, request.job_id, request.purpose, request.input_revision, request.input_ref, request_json, fingerprint, current_attempt as i64, now, request.resource_key()],
             )?;
             tx.execute(
                 "INSERT INTO backend_job_attempts (workspace_id, job_id, attempt_id, attempt, input_revision, state, deadline_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?7, ?7)",
@@ -6501,7 +6531,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let attempt = read_backend_job_attempt(&tx, workspace_id, &request.job_id, &attempt_id)?
                 .ok_or_else(|| Error::Store("reserved Backend Job attempt is missing".to_string()))?;
             tx.commit()?;
-            Ok(BackendJobReservation { job, attempt, replayed: false })
+            Ok(BackendJobReservation { job, attempt, replayed: false, resource_reused: false })
         })
     }
 
@@ -6518,10 +6548,23 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let previous_id = attempt_id(job_id, job.current_attempt);
             let previous = read_backend_job_attempt(&tx, workspace_id, job_id, &previous_id)?
                 .ok_or_else(|| Error::Store("Backend Job current attempt is missing".to_string()))?;
-            if previous.state != BackendJobAttemptState::Failed {
+            if job.state != BackendJobState::Failed || previous.state != BackendJobAttemptState::Failed {
                 return Err(Error::InvalidInput(
                     "Backend Job re-evaluation requires a definitively failed current attempt; unknown execution outcomes cannot be retried"
                         .to_string(),
+                ));
+            }
+            if backend_job_has_unfinished_cleanup(&tx, workspace_id, job_id)? {
+                return Err(Error::InvalidInput(
+                    "Backend Job retry requires completed Worker cleanup for every prior attempt".into(),
+                ));
+            }
+            if let Some(key) = job.request.resource_key()
+                && let Some(active) = read_active_backend_job_for_resource(&tx, workspace_id, &key)?
+                && active.request.job_id != job_id
+            {
+                return Err(Error::InvalidInput(
+                    "Backend Job retry resource is reserved by another Job".into(),
                 ));
             }
             if job.current_attempt >= job.request.limits.max_attempts {
@@ -6548,7 +6591,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, &next_id)?
                 .ok_or_else(|| Error::Store("retried Backend Job attempt is missing".to_string()))?;
             tx.commit()?;
-            Ok(BackendJobReservation { job, attempt, replayed: false })
+            Ok(BackendJobReservation { job, attempt, replayed: false, resource_reused: false })
         })
     }
 
@@ -6558,6 +6601,36 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         job_id: &str,
     ) -> Result<Option<BackendJobRecord>> {
         self.with_conn(|conn| read_backend_job(conn, workspace_id, job_id))
+    }
+
+    fn find_active_backend_job_for_resource(
+        &self,
+        workspace_id: &str,
+        resource_key: &str,
+    ) -> Result<Option<BackendJobRecord>> {
+        self.with_conn(|conn| {
+            read_active_backend_job_for_resource(conn, workspace_id, resource_key)
+        })
+    }
+
+    fn get_active_backend_job_for_worker(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<BackendJobRecord>> {
+        self.with_conn(|conn| {
+            let id = conn.query_row(
+                "SELECT job.job_id FROM backend_jobs job JOIN backend_job_attempts attempt
+                 ON attempt.workspace_id = job.workspace_id AND attempt.job_id = job.job_id
+                 AND attempt.attempt = job.current_attempt
+                 WHERE job.workspace_id = ?1 AND job.state = 'pending'
+                 AND attempt.state = 'dispatched' AND attempt.runtime_id = ?2 AND attempt.worker_id = ?3
+                 AND attempt.runtime_run_id IS NOT NULL",
+                params![workspace_id, worker.runtime_id.as_str(), worker.worker_id.as_str()],
+                |row| row.get::<_, String>(0),
+            ).optional()?;
+            id.map(|id| read_backend_job(conn, workspace_id, &id)).transpose().map(Option::flatten)
+        })
     }
 
     fn get_backend_job_attempt(
@@ -6614,7 +6687,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job attempt `{attempt_id}`")))?;
             if attempt.state != BackendJobAttemptState::Reserved {
                 tx.commit()?;
-                return Ok((BackendJobReservation { job, attempt, replayed: true }, false));
+                return Ok((BackendJobReservation { job, attempt, replayed: true, resource_reused: false }, false));
             }
             let active: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM backend_job_attempts WHERE workspace_id = ?1 AND state IN ('dispatching', 'dispatched')",
@@ -6623,7 +6696,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )?;
             if active >= i64::from(job.request.limits.max_concurrent_jobs) {
                 tx.commit()?;
-                return Ok((BackendJobReservation { job, attempt, replayed: true }, false));
+                return Ok((BackendJobReservation { job, attempt, replayed: true, resource_reused: false }, false));
             }
             let deadline = backend_job_deadline(now, job.request.limits.timeout_seconds)?;
             let changed = tx.execute(
@@ -6636,7 +6709,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, attempt_id)?
                 .ok_or_else(|| Error::Store("claimed Backend Job attempt disappeared".to_string()))?;
             tx.commit()?;
-            Ok((BackendJobReservation { job, attempt, replayed: false }, true))
+            Ok((BackendJobReservation { job, attempt, replayed: false, resource_reused: false }, true))
         })
     }
 
@@ -11033,6 +11106,41 @@ fn backend_job_deadline(now: &str, timeout_seconds: u32) -> Result<String> {
     Ok((now + chrono::Duration::seconds(i64::from(timeout_seconds))).to_rfc3339())
 }
 
+fn backend_job_has_unfinished_cleanup(
+    conn: &Connection,
+    workspace_id: &str,
+    job_id: &str,
+) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM backend_job_attempts WHERE workspace_id = ?1 AND job_id = ?2
+         AND worker_cleanup_state IS NOT 'completed')",
+        params![workspace_id, job_id],
+        |row| row.get(0),
+    )?)
+}
+
+fn read_active_backend_job_for_resource(
+    conn: &Connection,
+    workspace_id: &str,
+    resource_key: &str,
+) -> Result<Option<BackendJobRecord>> {
+    // Resource ownership is computed from common Job/attempt authority. Unknown
+    // effects block even after Worker removal; cleanup is not outcome resolution.
+    let id = conn.query_row(
+        "SELECT job.job_id FROM backend_jobs job WHERE job.workspace_id = ?1 AND job.resource_key = ?2
+         AND (job.state IN ('pending', 'unknown') OR EXISTS (
+             SELECT 1 FROM backend_job_attempts attempt WHERE attempt.workspace_id = job.workspace_id
+             AND attempt.job_id = job.job_id
+             AND attempt.worker_cleanup_state IS NOT 'completed'))
+         ORDER BY job.created_at, job.job_id LIMIT 1",
+        params![workspace_id, resource_key],
+        |row| row.get::<_, String>(0),
+    ).optional()?;
+    id.map(|id| read_backend_job(conn, workspace_id, &id))
+        .transpose()
+        .map(Option::flatten)
+}
+
 fn read_backend_job(
     conn: &Connection,
     workspace_id: &str,
@@ -15020,6 +15128,27 @@ fn migrate_archive_observe_grants_v75_to_v76(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_backend_job_resources_v80_to_v81(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 80 {
+        return Err(Error::Store(
+            "Backend Job resource migration requires schema 80".into(),
+        ));
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    tx.execute_batch(
+        "ALTER TABLE backend_jobs ADD COLUMN resource_key TEXT;
+         CREATE INDEX backend_jobs_resource ON backend_jobs(workspace_id, resource_key, created_at);",
+    )?;
+    // Pre-grant requests had no resource lock. Preserve their exact stored JSON
+    // and fingerprint; serde defaults read them as empty grants / no key.
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version, name) VALUES (81, 'Backend Job immutable resource serialization')",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn migrate_backend_job_worker_cleanup_v76_to_v77(conn: &Connection) -> Result<()> {
     let current = current_schema_version(conn)?;
     if current != 76 {
@@ -17795,6 +17924,10 @@ mod tests {
                     version: 80,
                     name: WORKER_RESTORE_INTENTS_MIGRATION_NAME.to_string()
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 81,
+                    name: "Backend Job immutable resource serialization".to_string()
+                },
             ]
         );
 
@@ -17885,6 +18018,7 @@ mod tests {
                         (78, WORKDIR_CONNECTION_ID_MIGRATION_NAME.to_string()),
                         (79, WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME.to_string()),
                         (80, WORKER_RESTORE_INTENTS_MIGRATION_NAME.to_string()),
+                        (81, "Backend Job immutable resource serialization".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -18236,7 +18370,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72,
-                73, 74, 75, 76, 77, 78, 79, 80
+                73, 74, 75, 76, 77, 78, 79, 80, 81
             ]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
@@ -18245,7 +18379,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 31);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 32);
         assert!(column_exists(&conn, "worker_workdir_links", "alias").unwrap());
         assert!(column_exists(&conn, "worker_workdir_links", "capabilities").unwrap());
         assert!(!column_exists(&conn, "worker_workdir_links", "role").unwrap());
@@ -22678,6 +22812,816 @@ INSERT INTO worker_registry (
         );
     }
 
+    const RESOURCE_JOB_NOW: &str = "2026-09-01T00:00:00Z";
+
+    async fn seed_resource_job_workspace(store: &SqliteWorkspaceStore) {
+        store
+            .upsert_account(&AccountRecord {
+                account_id: "resource-owner".into(),
+                kind: "user".into(),
+                handle: "resource-owner".into(),
+                display_name: "Resource Owner".into(),
+                created_at: RESOURCE_JOB_NOW.into(),
+                updated_at: RESOURCE_JOB_NOW.into(),
+            })
+            .unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "resource-workspace".into(),
+                owner_account_id: "resource-owner".into(),
+                display_name: "Resource Workspace".into(),
+                state: "active".into(),
+                created_at: RESOURCE_JOB_NOW.into(),
+                updated_at: RESOURCE_JOB_NOW.into(),
+            })
+            .await
+            .unwrap();
+    }
+
+    fn resource_job_request(id: &str, subject: &str, candidate: &str) -> BackendJobRequest {
+        BackendJobRequest {
+            job_id: id.into(),
+            purpose: "subjektiv_consolidation".into(),
+            input_revision: candidate.into(),
+            input_ref: format!("subject://{subject}/{candidate}"),
+            input: serde_json::json!({"candidate": candidate}),
+            instruction: "Consolidate this immutable candidate snapshot.".into(),
+            profile: "project:custom-consolidation".into(),
+            grants: crate::backend_job::BackendJobGrants {
+                subjektiv_consolidation: Some(crate::backend_job::SubjektivConsolidationGrant {
+                    subject_id: subject.into(),
+                    candidate_ids: vec![candidate.into()],
+                }),
+            },
+            serialization_key: None,
+            source_worker: None,
+            notification_target: None,
+            limits: Default::default(),
+        }
+    }
+
+    fn bind_resource_job_worker(
+        store: &SqliteWorkspaceStore,
+        reservation: &BackendJobReservation,
+        id: &str,
+    ) -> RuntimeWorkerRef {
+        let worker = RuntimeWorkerRef::new("embedded-worker-runtime", id);
+        store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: "resource-workspace".into(),
+                worker: worker.clone(),
+                display_name: id.into(),
+                profile: Some(reservation.job.request.profile.clone()),
+                retention_state: "normal".into(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: RESOURCE_JOB_NOW.into(),
+                updated_at: RESOURCE_JOB_NOW.into(),
+            })
+            .unwrap();
+        let (_, claimed) = store
+            .claim_backend_job_attempt_dispatch(
+                "resource-workspace",
+                &reservation.job.request.job_id,
+                &reservation.attempt.attempt_id,
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        assert!(claimed);
+        store
+            .bind_backend_job_attempt_worker(
+                "resource-workspace",
+                &reservation.job.request.job_id,
+                &reservation.attempt.attempt_id,
+                &worker,
+                Some("resource-run"),
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        worker
+    }
+
+    fn finish_resource_job_cleanup(
+        store: &SqliteWorkspaceStore,
+        reservation: &BackendJobReservation,
+    ) {
+        let (_, claimed) = store
+            .claim_backend_job_worker_cleanup(
+                "resource-workspace",
+                &reservation.job.request.job_id,
+                &reservation.attempt.attempt_id,
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        assert!(claimed);
+        store
+            .finish_backend_job_worker_cleanup(
+                "resource-workspace",
+                &reservation.job.request.job_id,
+                &reservation.attempt.attempt_id,
+                BackendJobWorkerCleanupState::Completed,
+                None,
+                None,
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn backend_job_resource_reserve_converges_across_connections_without_changing_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resource-jobs.sqlite");
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        seed_resource_job_workspace(&store).await;
+        let other = SqliteWorkspaceStore::open(&path).unwrap();
+        let requests = [
+            resource_job_request("first", "subject-a", "candidate-1"),
+            resource_job_request("followup", "subject-a", "candidate-2"),
+        ];
+        let barrier = std::sync::Barrier::new(2);
+        let reservations = std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                barrier.wait();
+                store
+                    .reserve_backend_job("resource-workspace", &requests[0], RESOURCE_JOB_NOW)
+                    .unwrap()
+            });
+            let b = scope.spawn(|| {
+                barrier.wait();
+                other
+                    .reserve_backend_job("resource-workspace", &requests[1], RESOURCE_JOB_NOW)
+                    .unwrap()
+            });
+            [a.join().unwrap(), b.join().unwrap()]
+        });
+        assert_eq!(reservations.iter().filter(|r| r.resource_reused).count(), 1);
+        assert!(reservations.iter().all(|r| !r.replayed));
+        assert_eq!(reservations[0].job.request, reservations[1].job.request);
+        let original = &reservations[0];
+        let deferred = requests
+            .iter()
+            .find(|r| r.job_id != original.job.request.job_id)
+            .unwrap();
+        assert!(
+            store
+                .get_backend_job("resource-workspace", &deferred.job_id)
+                .unwrap()
+                .is_none()
+        );
+        let replay = other
+            .reserve_backend_job(
+                "resource-workspace",
+                &original.job.request,
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        assert!(replay.replayed && !replay.resource_reused);
+        let mut changed = original.job.request.clone();
+        changed.input = serde_json::json!({"changed": true});
+        assert!(
+            other
+                .reserve_backend_job("resource-workspace", &changed, RESOURCE_JOB_NOW)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .find_active_backend_job_for_resource(
+                    "resource-workspace",
+                    &original.job.request.resource_key().unwrap()
+                )
+                .unwrap()
+                .unwrap()
+                .request,
+            original.job.request
+        );
+        // A separate subject does not collide.
+        assert!(
+            !store
+                .reserve_backend_job(
+                    "resource-workspace",
+                    &resource_job_request("other", "subject-b", "candidate-3"),
+                    RESOURCE_JOB_NOW
+                )
+                .unwrap()
+                .resource_reused
+        );
+        store
+            .finish_backend_job_attempt(
+                "resource-workspace",
+                &original.job.request.job_id,
+                &original.attempt.attempt_id,
+                BackendJobAttemptState::Failed,
+                "not_started",
+                "no Worker allocated",
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        let followup = other
+            .reserve_backend_job("resource-workspace", deferred, RESOURCE_JOB_NOW)
+            .unwrap();
+        assert!(!followup.replayed && !followup.resource_reused);
+        assert_eq!(&followup.job.request, deferred);
+        assert_ne!(
+            followup.job.intent_fingerprint,
+            original.job.intent_fingerprint
+        );
+        assert_eq!(
+            store
+                .get_backend_job("resource-workspace", &original.job.request.job_id)
+                .unwrap()
+                .unwrap()
+                .request,
+            original.job.request
+        );
+        assert!(
+            store
+                .reserve_backend_job_retry(
+                    "resource-workspace",
+                    &original.job.request.job_id,
+                    RESOURCE_JOB_NOW
+                )
+                .is_err(),
+            "retry cannot displace a followup that reserved the same resource"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_job_resource_retry_and_unknown_are_fenced_by_durable_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cleanup-jobs.sqlite");
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        seed_resource_job_workspace(&store).await;
+        let request = resource_job_request("failed", "subject-a", "candidate-1");
+        let first = store
+            .reserve_backend_job("resource-workspace", &request, RESOURCE_JOB_NOW)
+            .unwrap();
+        let worker = bind_resource_job_worker(&store, &first, "failed-worker");
+        assert_eq!(
+            store
+                .get_active_backend_job_for_worker("resource-workspace", &worker)
+                .unwrap()
+                .unwrap()
+                .request
+                .grants,
+            request.grants
+        );
+        assert!(
+            store
+                .get_active_backend_job_for_worker("other-workspace", &worker)
+                .unwrap()
+                .is_none()
+        );
+        store
+            .finish_backend_job_attempt(
+                "resource-workspace",
+                &request.job_id,
+                &first.attempt.attempt_id,
+                BackendJobAttemptState::Failed,
+                "definite_failure",
+                "known failed",
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        assert!(
+            store
+                .get_active_backend_job_for_worker("resource-workspace", &worker)
+                .unwrap()
+                .is_none()
+        );
+        let deferred = resource_job_request("later", "subject-a", "candidate-2");
+        for cleanup_state in [
+            BackendJobWorkerCleanupState::Pending,
+            BackendJobWorkerCleanupState::Executing,
+            BackendJobWorkerCleanupState::Failed,
+        ] {
+            assert!(
+                store
+                    .reserve_backend_job_retry(
+                        "resource-workspace",
+                        &request.job_id,
+                        RESOURCE_JOB_NOW
+                    )
+                    .is_err()
+            );
+            let reused = store
+                .reserve_backend_job("resource-workspace", &deferred, RESOURCE_JOB_NOW)
+                .unwrap();
+            assert!(reused.resource_reused && !reused.replayed);
+            assert_eq!(reused.job.request, request);
+            match cleanup_state {
+                BackendJobWorkerCleanupState::Pending => {
+                    store
+                        .claim_backend_job_worker_cleanup(
+                            "resource-workspace",
+                            &request.job_id,
+                            &first.attempt.attempt_id,
+                            RESOURCE_JOB_NOW,
+                        )
+                        .unwrap();
+                }
+                BackendJobWorkerCleanupState::Executing => {
+                    store
+                        .finish_backend_job_worker_cleanup(
+                            "resource-workspace",
+                            &request.job_id,
+                            &first.attempt.attempt_id,
+                            BackendJobWorkerCleanupState::Failed,
+                            Some("cleanup_failed"),
+                            Some("Worker still exists"),
+                            RESOURCE_JOB_NOW,
+                        )
+                        .unwrap();
+                }
+                _ => {}
+            }
+        }
+        finish_resource_job_cleanup(&store, &first);
+        let second = store
+            .reserve_backend_job_retry("resource-workspace", &request.job_id, RESOURCE_JOB_NOW)
+            .unwrap();
+        assert_eq!(second.job.request, request);
+        assert_eq!(second.attempt.attempt, 2);
+        bind_resource_job_worker(&store, &second, "unknown-worker");
+        store
+            .finish_backend_job_attempt(
+                "resource-workspace",
+                &request.job_id,
+                &second.attempt.attempt_id,
+                BackendJobAttemptState::Unknown,
+                "unknown_effects",
+                "domain outcome unknown",
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        finish_resource_job_cleanup(&store, &second);
+        drop(store);
+        let restarted = SqliteWorkspaceStore::open(&path).unwrap();
+        let active = restarted
+            .find_active_backend_job_for_resource(
+                "resource-workspace",
+                &request.resource_key().unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.state, BackendJobState::Unknown);
+        assert_eq!(active.request, request);
+        assert!(
+            restarted
+                .reserve_backend_job("resource-workspace", &deferred, RESOURCE_JOB_NOW)
+                .unwrap()
+                .resource_reused,
+            "Worker removal must not resolve unknown domain effects"
+        );
+        assert!(
+            restarted
+                .reserve_backend_job_retry("resource-workspace", &request.job_id, RESOURCE_JOB_NOW)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn backend_job_resource_migration_preserves_legacy_intent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE __yoi_schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             INSERT INTO __yoi_schema_migrations VALUES (80, 'workspace schema baseline');
+             CREATE TABLE backend_jobs(workspace_id TEXT, job_id TEXT, request_json TEXT, intent_fingerprint TEXT, created_at TEXT);
+             INSERT INTO backend_jobs VALUES ('workspace', 'legacy', '{\"profile\":\"builtin:backend-job\"}', 'sha256:original', '1');",
+        ).unwrap();
+        migrate_backend_job_resources_v80_to_v81(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 81);
+        assert_eq!(
+            conn.query_row(
+                "SELECT request_json, intent_fingerprint, resource_key FROM backend_jobs",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                }
+            )
+            .unwrap(),
+            (
+                "{\"profile\":\"builtin:backend-job\"}".into(),
+                "sha256:original".into(),
+                None
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_job_resource_retry_races_new_intent_atomically_and_remains_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retry-race.sqlite");
+        let store = SqliteWorkspaceStore::open(&path).unwrap();
+        seed_resource_job_workspace(&store).await;
+        // Generic resources use the same common reservation API without domain grants.
+        let mut request = resource_job_request("generic", "subject-a", "candidate-1");
+        request.grants = Default::default();
+        request.serialization_key = Some("custom-resource".into());
+        let first = store
+            .reserve_backend_job("resource-workspace", &request, RESOURCE_JOB_NOW)
+            .unwrap();
+        store
+            .finish_backend_job_attempt(
+                "resource-workspace",
+                &request.job_id,
+                &first.attempt.attempt_id,
+                BackendJobAttemptState::Failed,
+                "not_started",
+                "no Worker allocated",
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        let mut followup = request.clone();
+        followup.job_id = "generic-followup".into();
+        followup.input = serde_json::json!({"candidate": "new"});
+        let other = SqliteWorkspaceStore::open(&path).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let (retry, reserve) = std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                barrier.wait();
+                store.reserve_backend_job_retry(
+                    "resource-workspace",
+                    &request.job_id,
+                    RESOURCE_JOB_NOW,
+                )
+            });
+            let b = scope.spawn(|| {
+                barrier.wait();
+                other
+                    .reserve_backend_job("resource-workspace", &followup, RESOURCE_JOB_NOW)
+                    .unwrap()
+            });
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        match retry {
+            Ok(retried) => {
+                assert!(reserve.resource_reused);
+                assert_eq!(reserve.job.request, request);
+                assert_eq!(retried.attempt.attempt, 2);
+                store
+                    .finish_backend_job_attempt(
+                        "resource-workspace",
+                        &request.job_id,
+                        &retried.attempt.attempt_id,
+                        BackendJobAttemptState::Failed,
+                        "not_started",
+                        "no Worker allocated",
+                        RESOURCE_JOB_NOW,
+                    )
+                    .unwrap();
+            }
+            Err(_) => {
+                assert!(!reserve.resource_reused);
+                assert_eq!(reserve.job.request, followup);
+                store
+                    .finish_backend_job_attempt(
+                        "resource-workspace",
+                        &followup.job_id,
+                        &reserve.attempt.attempt_id,
+                        BackendJobAttemptState::Failed,
+                        "not_started",
+                        "no Worker allocated",
+                        RESOURCE_JOB_NOW,
+                    )
+                    .unwrap();
+                let retried = store
+                    .reserve_backend_job_retry(
+                        "resource-workspace",
+                        &request.job_id,
+                        RESOURCE_JOB_NOW,
+                    )
+                    .unwrap();
+                store
+                    .finish_backend_job_attempt(
+                        "resource-workspace",
+                        &request.job_id,
+                        &retried.attempt.attempt_id,
+                        BackendJobAttemptState::Failed,
+                        "not_started",
+                        "no Worker allocated",
+                        RESOURCE_JOB_NOW,
+                    )
+                    .unwrap();
+            }
+        }
+        assert!(
+            store
+                .reserve_backend_job_retry("resource-workspace", &request.job_id, RESOURCE_JOB_NOW)
+                .is_err(),
+            "retry limit cannot be reset by new candidates"
+        );
+        assert!(
+            store
+                .find_active_backend_job_for_resource("resource-workspace", "custom-resource")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_job_all_older_attempt_cleanups_fence_retry_and_resource_release() {
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        seed_resource_job_workspace(&store).await;
+        let mut request = resource_job_request("legacy-overlap", "subject-a", "candidate-1");
+        request.limits.max_attempts = 3;
+        let first = store
+            .reserve_backend_job("resource-workspace", &request, RESOURCE_JOB_NOW)
+            .unwrap();
+        bind_resource_job_worker(&store, &first, "old-worker");
+        store
+            .finish_backend_job_attempt(
+                "resource-workspace",
+                &request.job_id,
+                &first.attempt.attempt_id,
+                BackendJobAttemptState::Failed,
+                "partial_apply",
+                "some candidate effects durably applied",
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        // Model a pre-fence durable journal: the old runner permitted attempt 2
+        // before attempt 1's Worker cleanup. Current reservation must fail closed
+        // on this inherited state, even after the current attempt is cleaned.
+        let second_id = attempt_id(&request.job_id, 2);
+        store.with_conn(|conn| {
+            conn.execute("UPDATE backend_jobs SET state = 'pending', current_attempt = 2, completed_at = NULL WHERE workspace_id = 'resource-workspace' AND job_id = ?1", params![request.job_id])?;
+            conn.execute("INSERT INTO backend_job_attempts (workspace_id, job_id, attempt_id, attempt, input_revision, state, deadline_at, created_at, updated_at) VALUES ('resource-workspace', ?1, ?2, 2, ?3, 'reserved', ?4, ?4, ?4)",
+                params![request.job_id, second_id, request.input_revision, RESOURCE_JOB_NOW])?;
+            Ok(())
+        }).unwrap();
+        let second = store
+            .reserve_backend_job("resource-workspace", &request, RESOURCE_JOB_NOW)
+            .unwrap();
+        assert_eq!(second.attempt.attempt, 2);
+        bind_resource_job_worker(&store, &second, "current-worker");
+        store
+            .finish_backend_job_attempt(
+                "resource-workspace",
+                &request.job_id,
+                &second.attempt.attempt_id,
+                BackendJobAttemptState::Failed,
+                "partial_apply",
+                "remaining candidate effects not yet applied",
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        finish_resource_job_cleanup(&store, &second);
+        let followup = resource_job_request("new-batch", "subject-a", "candidate-2");
+        assert!(
+            store
+                .reserve_backend_job_retry("resource-workspace", &request.job_id, RESOURCE_JOB_NOW)
+                .is_err(),
+            "completed current cleanup must not hide incomplete attempt 1"
+        );
+        assert!(
+            store
+                .reserve_backend_job("resource-workspace", &followup, RESOURCE_JOB_NOW)
+                .unwrap()
+                .resource_reused
+        );
+        assert_eq!(
+            store
+                .find_active_backend_job_for_resource(
+                    "resource-workspace",
+                    &request.resource_key().unwrap()
+                )
+                .unwrap()
+                .unwrap()
+                .current_attempt,
+            2
+        );
+        finish_resource_job_cleanup(&store, &first);
+        let third = store
+            .reserve_backend_job_retry("resource-workspace", &request.job_id, RESOURCE_JOB_NOW)
+            .unwrap();
+        assert_eq!(
+            third.job.request, request,
+            "partial apply retry keeps its original snapshot and grants"
+        );
+        assert_eq!(third.attempt.attempt, 3);
+        let worker = bind_resource_job_worker(&store, &third, "converged-worker");
+        let submission = BackendJobResultSubmission {
+            job_id: request.job_id.clone(),
+            attempt_id: third.attempt.attempt_id.clone(),
+            input_revision: request.input_revision.clone(),
+            result: serde_json::json!({"converged": true}),
+        };
+        store
+            .accept_backend_job_result("resource-workspace", &worker, &submission, RESOURCE_JOB_NOW)
+            .unwrap();
+        finish_resource_job_cleanup(&store, &third);
+        // A legacy incomplete older cleanup also fences a completed current Job.
+        store.with_conn(|conn| {
+            conn.execute("UPDATE backend_job_attempts SET worker_cleanup_state = 'failed', worker_cleanup_completed_at = NULL WHERE workspace_id = 'resource-workspace' AND attempt_id = ?1", params![first.attempt.attempt_id])?;
+            Ok(())
+        }).unwrap();
+        assert!(
+            store
+                .reserve_backend_job("resource-workspace", &followup, RESOURCE_JOB_NOW)
+                .unwrap()
+                .resource_reused,
+            "completed Job and current cleanup must not release an older unremoved Worker"
+        );
+        finish_resource_job_cleanup(&store, &first);
+        assert!(
+            !store
+                .reserve_backend_job("resource-workspace", &followup, RESOURCE_JOB_NOW)
+                .unwrap()
+                .resource_reused
+        );
+        let replay = store
+            .accept_backend_job_result("resource-workspace", &worker, &submission, RESOURCE_JOB_NOW)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.job.result, Some(submission.result));
+        assert!(
+            store
+                .reserve_backend_job_retry("resource-workspace", &request.job_id, RESOURCE_JOB_NOW)
+                .is_err(),
+            "converged intent cannot be reopened or exceed its bounded attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_job_empty_batch_surface_refresh_locks_subject_and_defers_candidates() {
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        seed_resource_job_workspace(&store).await;
+        for surface_state in ["ungenerated", "stale", "failed"] {
+            let subject = format!("subject-{surface_state}");
+            let mut refresh = resource_job_request(
+                &format!("surface-{surface_state}"),
+                &subject,
+                "surface-revision",
+            );
+            refresh
+                .grants
+                .subjektiv_consolidation
+                .as_mut()
+                .unwrap()
+                .candidate_ids
+                .clear();
+            refresh.input = serde_json::json!({"subject_id": subject, "candidate_ids": [], "surface_state": surface_state});
+            refresh.instruction =
+                "Regenerate only the Subject surface; this batch grants no candidate access."
+                    .into();
+            let first = store
+                .reserve_backend_job("resource-workspace", &refresh, RESOURCE_JOB_NOW)
+                .unwrap();
+            assert_eq!(first.job.request, refresh);
+            assert!(
+                store
+                    .reserve_backend_job("resource-workspace", &refresh, RESOURCE_JOB_NOW)
+                    .unwrap()
+                    .replayed
+            );
+            let worker = bind_resource_job_worker(
+                &store,
+                &first,
+                &format!("surface-worker-{surface_state}"),
+            );
+            let active = store
+                .get_active_backend_job_for_worker("resource-workspace", &worker)
+                .unwrap()
+                .unwrap();
+            let grant = active
+                .request
+                .grants
+                .subjektiv_consolidation
+                .as_ref()
+                .unwrap();
+            assert_eq!(grant.subject_id, subject);
+            assert!(
+                grant.candidate_ids.is_empty(),
+                "surface-only Job grants no candidate capability"
+            );
+            assert!(
+                active
+                    .request
+                    .worker_input(&first.attempt.attempt_id)
+                    .unwrap()
+                    .contains("Regenerate only the Subject surface")
+            );
+            assert_eq!(
+                store
+                    .find_active_backend_job_for_resource(
+                        "resource-workspace",
+                        &refresh.resource_key().unwrap()
+                    )
+                    .unwrap()
+                    .unwrap()
+                    .request,
+                refresh
+            );
+            let followup = resource_job_request(
+                &format!("candidates-{surface_state}"),
+                &subject,
+                "new-candidate",
+            );
+            let reused = store
+                .reserve_backend_job("resource-workspace", &followup, RESOURCE_JOB_NOW)
+                .unwrap();
+            assert!(reused.resource_reused && !reused.replayed);
+            assert_eq!(
+                reused.job.request, refresh,
+                "later candidates must not expand surface-only authority"
+            );
+            store
+                .accept_backend_job_result(
+                    "resource-workspace",
+                    &worker,
+                    &BackendJobResultSubmission {
+                        job_id: refresh.job_id.clone(),
+                        attempt_id: first.attempt.attempt_id.clone(),
+                        input_revision: refresh.input_revision.clone(),
+                        result: serde_json::json!({"surface": {"availability": "available"}}),
+                    },
+                    RESOURCE_JOB_NOW,
+                )
+                .unwrap();
+            assert!(
+                store
+                    .reserve_backend_job("resource-workspace", &followup, RESOURCE_JOB_NOW)
+                    .unwrap()
+                    .resource_reused,
+                "completed surface refresh still fences the subject until Worker cleanup"
+            );
+            finish_resource_job_cleanup(&store, &first);
+            let next = store
+                .reserve_backend_job("resource-workspace", &followup, RESOURCE_JOB_NOW)
+                .unwrap();
+            assert!(!next.resource_reused);
+            assert_eq!(next.job.request, followup);
+            assert_eq!(
+                store
+                    .get_backend_job("resource-workspace", &refresh.job_id)
+                    .unwrap()
+                    .unwrap()
+                    .request,
+                refresh
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_job_completed_resource_releases_only_after_worker_cleanup() {
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        seed_resource_job_workspace(&store).await;
+        let request = resource_job_request("completed", "subject-a", "candidate-1");
+        let first = store
+            .reserve_backend_job("resource-workspace", &request, RESOURCE_JOB_NOW)
+            .unwrap();
+        let worker = bind_resource_job_worker(&store, &first, "completed-worker");
+        store
+            .accept_backend_job_result(
+                "resource-workspace",
+                &worker,
+                &BackendJobResultSubmission {
+                    job_id: request.job_id.clone(),
+                    attempt_id: first.attempt.attempt_id.clone(),
+                    input_revision: request.input_revision.clone(),
+                    result: serde_json::json!({"done": true}),
+                },
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        let followup = resource_job_request("new-candidates", "subject-a", "candidate-2");
+        assert!(
+            store
+                .reserve_backend_job("resource-workspace", &followup, RESOURCE_JOB_NOW)
+                .unwrap()
+                .resource_reused
+        );
+        finish_resource_job_cleanup(&store, &first);
+        assert!(
+            store
+                .find_active_backend_job_for_resource(
+                    "resource-workspace",
+                    &request.resource_key().unwrap()
+                )
+                .unwrap()
+                .is_none()
+        );
+        let next = store
+            .reserve_backend_job("resource-workspace", &followup, RESOURCE_JOB_NOW)
+            .unwrap();
+        assert!(!next.resource_reused);
+        assert_eq!(next.job.request, followup);
+        assert_eq!(
+            store
+                .get_backend_job("resource-workspace", &request.job_id)
+                .unwrap()
+                .unwrap()
+                .request,
+            request
+        );
+    }
+
     #[tokio::test]
     async fn backend_jobs_fence_results_project_ownership_and_bound_retries() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
@@ -22765,6 +23709,8 @@ INSERT INTO worker_registry (
             input: serde_json::json!({"title": "check"}),
             instruction: "Check the immutable input.".to_string(),
             profile: "builtin:backend-job".to_string(),
+            grants: Default::default(),
+            serialization_key: None,
             source_worker: Some(source.clone()),
             notification_target: Some(source.clone()),
             limits: crate::backend_job::BackendJobLimits {
@@ -23185,6 +24131,35 @@ INSERT INTO worker_registry (
                 )
                 .is_err()
         );
+        assert!(
+            store
+                .reserve_backend_job_retry(
+                    workspace_id,
+                    &retry_request.job_id,
+                    "2026-09-01T00:01:04Z"
+                )
+                .is_err(),
+            "failed attempt cannot retry before canonical Worker cleanup"
+        );
+        store
+            .claim_backend_job_worker_cleanup(
+                workspace_id,
+                &retry_request.job_id,
+                &failed.attempt.attempt_id,
+                "2026-09-01T00:01:04Z",
+            )
+            .unwrap();
+        store
+            .finish_backend_job_worker_cleanup(
+                workspace_id,
+                &retry_request.job_id,
+                &failed.attempt.attempt_id,
+                BackendJobWorkerCleanupState::Completed,
+                None,
+                None,
+                "2026-09-01T00:01:04Z",
+            )
+            .unwrap();
         let second = store
             .reserve_backend_job_retry(workspace_id, &retry_request.job_id, "2026-09-01T00:01:04Z")
             .unwrap();

@@ -199,6 +199,34 @@ const fn default_max_attempts() -> u8 {
     DEFAULT_MAX_ATTEMPTS
 }
 
+/// Explicit Backend-issued domain capabilities, never inferred from purpose or profile.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BackendJobGrants {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subjektiv_consolidation: Option<SubjektivConsolidationGrant>,
+}
+
+impl BackendJobGrants {
+    pub fn is_empty(&self) -> bool {
+        self.subjektiv_consolidation.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivConsolidationGrant {
+    pub subject_id: String,
+    /// Exact immutable candidate scope. Empty is a surface-only refresh grant:
+    /// the subject is still locked, but no candidate access is authorized.
+    pub candidate_ids: Vec<String>,
+}
+
+/// Common runner lock identity for a subject, independent of the candidate snapshot.
+pub fn subjektiv_serialization_key(subject_id: &str) -> String {
+    format!("subjektiv-consolidation:{subject_id}")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BackendJobRequest {
@@ -216,6 +244,13 @@ pub struct BackendJobRequest {
     pub instruction: String,
     /// Existing configured profile selector. Job dispatch never accepts raw profile source.
     pub profile: String,
+    /// Immutable domain grants; profile resolution alone never grants access.
+    #[serde(default, skip_serializing_if = "BackendJobGrants::is_empty")]
+    pub grants: BackendJobGrants,
+    /// Optional common-runner single-flight resource, not a separate domain state machine.
+    /// Consolidation grants always derive their subject lock; an explicit key must match it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serialization_key: Option<String>,
     /// Writer provenance and optional advisory destination, not parent ownership.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_worker: Option<RuntimeWorkerRef>,
@@ -233,10 +268,34 @@ impl BackendJobRequest {
         validate_bounded_text("input_ref", &self.input_ref, MAX_JOB_REFERENCE_BYTES)?;
         validate_bounded_text("instruction", &self.instruction, MAX_JOB_INSTRUCTION_BYTES)?;
         validate_identifier("profile", &self.profile, 256)?;
-        if self.profile != "builtin:backend-job" {
-            return Err(Error::InvalidInput(
-                "Backend Jobs must use the dedicated builtin:backend-job profile".to_string(),
-            ));
+        self.profile_selector()?;
+        if let Some(key) = &self.serialization_key {
+            validate_identifier("serialization_key", key, MAX_JOB_REFERENCE_BYTES)?;
+        }
+        if let Some(grant) = &self.grants.subjektiv_consolidation {
+            validate_identifier("grant subject_id", &grant.subject_id, 256)?;
+            if grant.candidate_ids.len() > 256 {
+                return Err(Error::InvalidInput(
+                    "Backend Job consolidation grant requires 0..=256 candidate ids".into(),
+                ));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for id in &grant.candidate_ids {
+                validate_identifier("grant candidate_id", id, 256)?;
+                if !seen.insert(id) {
+                    return Err(Error::InvalidInput(
+                        "Backend Job consolidation grant has duplicate candidate ids".into(),
+                    ));
+                }
+            }
+            if let Some(key) = &self.serialization_key
+                && *key != subjektiv_serialization_key(&grant.subject_id)
+            {
+                return Err(Error::InvalidInput(
+                    "Backend Job serialization_key must match the consolidation subject lock"
+                        .into(),
+                ));
+            }
         }
         let input = serde_json::to_vec(&self.input).map_err(|error| {
             Error::InvalidInput(format!("serialize Backend Job input: {error}"))
@@ -247,6 +306,44 @@ impl BackendJobRequest {
             )));
         }
         self.limits.validate()
+    }
+
+    /// Validate selector syntax only. Registry existence and resolution are dispatch authority.
+    pub fn profile_selector(&self) -> Result<manifest::ProfileSelector> {
+        use manifest::ProfileSelector;
+        validate_identifier("profile", &self.profile, 256)?;
+        let selector = ProfileSelector::parse_cli(&self.profile);
+        let valid = match &selector {
+            ProfileSelector::Default => true,
+            ProfileSelector::Path { .. } => false,
+            ProfileSelector::Named { source, name } => {
+                !name.is_empty()
+                    && !name.starts_with('.')
+                    && !name.contains(['/', '\\', ':'])
+                    && name
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+                    && ![".toml", ".json", ".dcdl", ".nix"]
+                        .iter()
+                        .any(|suffix| name.ends_with(suffix))
+                    && (source.is_some() || name != "inherit")
+            }
+        };
+        if !valid {
+            return Err(Error::InvalidInput(
+                "Backend Job profile must be a manifest registry selector, not raw source or a path".into(),
+            ));
+        }
+        Ok(selector)
+    }
+
+    /// Effective single-flight key. Typed grants cannot bypass their subject fence.
+    pub fn resource_key(&self) -> Option<String> {
+        self.grants
+            .subjektiv_consolidation
+            .as_ref()
+            .map(|grant| subjektiv_serialization_key(&grant.subject_id))
+            .or_else(|| self.serialization_key.clone())
     }
 
     pub fn fingerprint(&self) -> Result<String> {
@@ -346,7 +443,12 @@ pub struct BackendJobAttemptRecord {
 pub struct BackendJobReservation {
     pub job: BackendJobRecord,
     pub attempt: BackendJobAttemptRecord,
+    /// Exact replay of the caller-selected immutable intent.
     pub replayed: bool,
+    /// A different intent already fences this resource. The returned request is
+    /// the original snapshot; the caller must defer its new input to a followup.
+    #[serde(default)]
+    pub resource_reused: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -486,6 +588,8 @@ mod tests {
             input: serde_json::json!({"title": "Check me"}),
             instruction: "Check this immutable Ticket snapshot.".to_string(),
             profile: "builtin:backend-job".to_string(),
+            grants: BackendJobGrants::default(),
+            serialization_key: None,
             source_worker: Some(RuntimeWorkerRef::new("runtime-a", "worker-a")),
             notification_target: Some(RuntimeWorkerRef::new("runtime-a", "worker-a")),
             limits: BackendJobLimits::default(),
@@ -507,6 +611,133 @@ mod tests {
             mutate(&mut changed);
             assert_ne!(first, changed.fingerprint().unwrap());
         }
+    }
+
+    #[test]
+    fn registry_profile_syntax_accepts_configured_selectors_without_an_allowlist() {
+        for profile in [
+            "builtin:backend-job",
+            "builtin:subjektiv-memory-consolidation",
+            "project:custom",
+            "user:custom",
+            "custom",
+            "default",
+            "builtin:not-yet-configured",
+        ] {
+            let mut request = request();
+            request.profile = profile.into();
+            request.validate().unwrap();
+        }
+        for profile in [
+            "",
+            " builtin:backend-job",
+            "path:custom",
+            "./custom.toml",
+            "/tmp/custom",
+            "project:../custom",
+            "project:custom.toml",
+            "builtin:",
+            "unknown:custom",
+            "project:a:b",
+            "C:\\custom",
+            "{\"worker\":{}}",
+            "inherit",
+        ] {
+            let mut request = request();
+            request.profile = profile.into();
+            assert!(request.validate().is_err(), "accepted {profile}");
+        }
+    }
+
+    #[test]
+    fn explicit_grants_are_immutable_bounded_and_derive_a_subject_fence() {
+        let mut request = request();
+        let original = request.fingerprint().unwrap();
+        request.grants.subjektiv_consolidation = Some(SubjektivConsolidationGrant {
+            subject_id: "subject-a".into(),
+            candidate_ids: vec!["candidate-1".into()],
+        });
+        assert_ne!(original, request.fingerprint().unwrap());
+        assert_eq!(
+            request.resource_key(),
+            Some(subjektiv_serialization_key("subject-a"))
+        );
+        let granted = request.fingerprint().unwrap();
+        request
+            .grants
+            .subjektiv_consolidation
+            .as_mut()
+            .unwrap()
+            .candidate_ids
+            .push("candidate-2".into());
+        assert_ne!(granted, request.fingerprint().unwrap());
+        request.serialization_key = Some("another-subject".into());
+        assert!(request.validate().is_err());
+        request.serialization_key = None;
+        request
+            .grants
+            .subjektiv_consolidation
+            .as_mut()
+            .unwrap()
+            .candidate_ids
+            .push("candidate-2".into());
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn empty_consolidation_grant_keeps_subject_lock_without_candidate_authority() {
+        let mut request = request();
+        request.grants.subjektiv_consolidation = Some(SubjektivConsolidationGrant {
+            subject_id: "subject-a".into(),
+            candidate_ids: vec![],
+        });
+        request.validate().unwrap();
+        assert!(
+            !request.grants.is_empty(),
+            "empty candidate scope still carries a subject grant"
+        );
+        assert_eq!(
+            request.resource_key(),
+            Some(subjektiv_serialization_key("subject-a"))
+        );
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(encoded.contains("\"candidate_ids\":[]"));
+        let decoded: BackendJobRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, request);
+        let surface_only = request.fingerprint().unwrap();
+        request
+            .grants
+            .subjektiv_consolidation
+            .as_mut()
+            .unwrap()
+            .candidate_ids = (0..256).map(|index| format!("candidate-{index}")).collect();
+        request.validate().unwrap();
+        assert_ne!(surface_only, request.fingerprint().unwrap());
+        request
+            .grants
+            .subjektiv_consolidation
+            .as_mut()
+            .unwrap()
+            .candidate_ids
+            .push("candidate-256".into());
+        assert!(
+            request.validate().is_err(),
+            "candidate batch remains bounded"
+        );
+    }
+
+    #[test]
+    fn legacy_request_replay_keeps_its_exact_serialization() {
+        let request = request();
+        let original_json = serde_json::to_string(&request).unwrap();
+        assert!(!original_json.contains("grants"));
+        assert!(!original_json.contains("serialization_key"));
+        let decoded: BackendJobRequest = serde_json::from_str(&original_json).unwrap();
+        assert_eq!(decoded.grants, BackendJobGrants::default());
+        assert_eq!(
+            request.fingerprint().unwrap(),
+            decoded.fingerprint().unwrap()
+        );
     }
 
     #[test]

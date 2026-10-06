@@ -330,9 +330,30 @@ Exact dispatch retry reuses the deterministic attempt and Worker allocation key.
 Only explicit re-evaluation of a definitively failed attempt increments the
 bounded attempt number; unknown outcomes are not replayable. The runner
 uses the existing embedded Runtime spawn, Worker registry, Session input,
-observation, usage, and lifecycle paths with no Workdir attachment. It uses the
-dedicated `builtin:backend-job` profile, whose tools cannot mutate Workspace
-state, recursively create Workers or Jobs, or inherit caller Workdir authority.
+observation, usage, and lifecycle paths with no Workdir attachment. Each client
+explicitly selects an existing registry Profile. The runner resolves the complete
+Builtin/Workspace project catalog through the normal virtual config bundle and
+prompt projection path; browser launch candidates remain a narrower UI policy.
+Raw Profile source and filesystem/path selectors are not accepted. A selected
+recipe's instruction and features are not replaced with `backend-job` defaults.
+Profiles requiring ungranted Workspace mutation, ordinary Memory, child/peer,
+Flow, Workdir or MCP authority fail explicitly; no caller scope is inherited.
+The Ticket checker continues to select `builtin:backend-job` itself.
+
+Job identity/result capability comes from an immutable Host-authored create and
+restore binding, not the Profile name, tag, instruction, Worker display name or
+Runtime placement. Backend checks the exact live Job/attempt/input revision and
+authenticated Worker before accepting results or domain operations. Profile
+policy alone never confers a subject grant.
+
+A common optional resource key serializes Jobs using their existing durable
+intent/attempt records (schema 81), not a second domain workflow table. Exact
+request replay is distinct from a resource collision: the latter returns the
+original active immutable request with `resource_reused`, and never claims that
+new input was processed. Pending/unknown Jobs and **all** unfinished attempt
+cleanups retain the fence. Retry requires definitive failure, remaining attempt
+budget, completed prior cleanups and no competing resource owner. Unknown intent
+remains attention-required even after its Worker is removed.
 
 Success is accepted only by the structured result boundary. Before Runtime
 input can execute, the attempt is fenced by Workspace, Job ID, attempt ID, input

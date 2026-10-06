@@ -898,7 +898,9 @@ impl Runtime {
                     message: "persisted Worker restore request is unavailable".to_string(),
                 }
             })?;
-            if existing_request.create_fingerprint != request.create_fingerprint {
+            if existing_request.create_fingerprint != request.create_fingerprint
+                || existing_request.backend_job != request.backend_job
+            {
                 return Err(RuntimeError::InvalidRequest(format!(
                     "worker {} was already created with a different fingerprint",
                     request.worker_id
@@ -1068,7 +1070,9 @@ impl Runtime {
                         message: "persisted Worker restore request is unavailable".to_string(),
                     }
                 })?;
-                if existing_request.create_fingerprint != request.create_fingerprint {
+                if existing_request.create_fingerprint != request.create_fingerprint
+                    || existing_request.backend_job != request.backend_job
+                {
                     return Err(RuntimeError::InvalidRequest(format!(
                         "worker {} was already created with a different fingerprint",
                         request.worker_id
@@ -6242,6 +6246,16 @@ fn validate_logical_workdir_attachments(
 }
 
 fn validate_create_worker_request(request: &CreateWorkerRequest) -> Result<(), RuntimeError> {
+    if let Some(binding) = &request.backend_job {
+        binding
+            .validate()
+            .map_err(|message| RuntimeError::InvalidRequest(message.into()))?;
+        if request.workspace_api.is_none()
+            || (binding.subjektiv_consolidation && !request.subjektiv_attached)
+        {
+            return Err(RuntimeError::InvalidRequest("Backend Job capability requires Workspace authority and consolidation requires trusted subject attachment".into()));
+        }
+    }
     if request.create_fingerprint.trim().is_empty() {
         return Err(RuntimeError::InvalidRequest(
             "create_fingerprint must not be empty".to_string(),
@@ -7112,7 +7126,93 @@ mod tests {
                 language: "English".to_string(),
             }),
             subjektiv_attached: false,
+            backend_job: None,
         }
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn backend_job_binding_survives_restart_and_restore_without_profile_inference() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = crate::fs_store::FsRuntimeStoreOptions {
+            root: dir.path().join("runtime"),
+            runtime_id: "job-runtime".into(),
+            display_name: None,
+        };
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime =
+            Runtime::with_fs_store_and_execution_backend(options.clone(), backend.clone()).unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let mut request = task_request("bound Job");
+        request.workspace_api = Some(WorkspaceApiRef {
+            workspace_id: "local".into(),
+            base_url: "https://backend.invalid".into(),
+        });
+        request.backend_job = Some(crate::catalog::BackendJobExecutionBinding {
+            job_id: "job-1".into(),
+            attempt_id: "attempt-1".into(),
+            input_revision: Some("revision-1".into()),
+            subjektiv_consolidation: false,
+        });
+        let owner = scope("local", "server-job-test");
+        let created = runtime
+            .create_worker_scoped(&owner, request.clone())
+            .unwrap();
+        assert_eq!(
+            backend.job_bindings.lock().unwrap().as_slice(),
+            &[request.backend_job.clone()]
+        );
+        let mut changed = request.clone();
+        changed.backend_job.as_mut().unwrap().attempt_id = "attempt-other".into();
+        assert!(runtime.create_worker_scoped(&owner, changed).is_err());
+        drop(runtime);
+        let restored_backend = Arc::new(TestExecutionBackend::default());
+        let restored =
+            Runtime::with_fs_store_and_execution_backend(options, restored_backend.clone())
+                .unwrap();
+        assert_eq!(
+            restored
+                .lock()
+                .unwrap()
+                .worker(&created.worker_ref)
+                .unwrap()
+                .request
+                .as_ref()
+                .unwrap()
+                .backend_job,
+            request.backend_job
+        );
+        restored
+            .restore_worker(
+                &created.worker_ref,
+                restored.test_restore_request(&created.worker_ref),
+            )
+            .unwrap();
+        assert_eq!(
+            restored_backend.job_bindings.lock().unwrap().as_slice(),
+            &[request.backend_job]
+        );
+    }
+
+    #[test]
+    fn backend_job_binding_requires_workspace_and_consolidation_attachment() {
+        let mut request = task_request("Job binding validation");
+        request.backend_job = Some(crate::catalog::BackendJobExecutionBinding {
+            job_id: "job-1".into(),
+            attempt_id: "attempt-1".into(),
+            input_revision: None,
+            subjektiv_consolidation: true,
+        });
+        assert!(validate_create_worker_request(&request).is_err());
+        request.workspace_api = Some(WorkspaceApiRef {
+            workspace_id: "local".into(),
+            base_url: "https://backend.invalid".into(),
+        });
+        assert!(validate_create_worker_request(&request).is_err());
+        request.subjektiv_attached = true;
+        assert!(validate_create_worker_request(&request).is_ok());
+        request.backend_job.as_mut().unwrap().attempt_id.clear();
+        assert!(validate_create_worker_request(&request).is_err());
     }
 
     #[test]
@@ -7537,6 +7637,7 @@ mod tests {
     #[derive(Default)]
     struct TestExecutionBackend {
         spawn_result: Mutex<Option<WorkerExecutionSpawnResult>>,
+        job_bindings: Mutex<Vec<Option<crate::catalog::BackendJobExecutionBinding>>>,
         dispatch_result: Mutex<Option<WorkerExecutionResult>>,
         stop_result: Mutex<Option<WorkerExecutionResult>>,
         stop_gate: Mutex<Option<Arc<RestoreGate>>>,
@@ -7653,6 +7754,10 @@ mod tests {
         }
 
         fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
+            self.job_bindings
+                .lock()
+                .unwrap()
+                .push(request.request.backend_job.clone());
             if let Some(result) = self.spawn_result.lock().unwrap().take() {
                 return result;
             }
@@ -7726,6 +7831,10 @@ mod tests {
             &self,
             request: WorkerExecutionRestoreRequest,
         ) -> WorkerExecutionSpawnResult {
+            self.job_bindings
+                .lock()
+                .unwrap()
+                .push(request.request.backend_job.clone());
             *self.restore_count.lock().unwrap() += 1;
             self.restore_operation_ids
                 .lock()

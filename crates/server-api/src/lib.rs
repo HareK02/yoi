@@ -5530,6 +5530,9 @@ pub struct SubjektivSurfacePrepareRequest {}
 #[serde(deny_unknown_fields)]
 pub struct SubjektivSurfacePrepareResponse {
     pub generation_id: String,
+    /// Existing ready surface at this exact store revision, if no rebuild is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_snapshot_id: Option<String>,
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub store_revision: u64,
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]

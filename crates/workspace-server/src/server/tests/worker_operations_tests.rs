@@ -527,6 +527,8 @@ async fn browser_protocol_sender_rejects_job_input_and_all_live_methods() {
         input: serde_json::json!({"immutable": true}),
         instruction: "Return a structured result.".into(),
         profile: "builtin:backend-job".into(),
+        grants: Default::default(),
+        serialization_key: None,
         source_worker: None,
         notification_target: None,
         limits: crate::backend_job::BackendJobLimits::default(),

@@ -289,11 +289,15 @@ active/resolved→retracted, and resolved→active. Retraction remains terminal.
 
 ## Candidate consolidation and corrections (T-670)
 
-The Backend starts a restricted `builtin:subjektiv-memory-consolidation` Worker
-for exactly one authenticated subject. The Host binds the subject; model-visible
-inputs cannot select a Workspace, subject, Runtime, Worker, or Session. Its tools
-list/read pending immutable candidates, query/read confirmed revisions, and make
-one candidate decision. Candidate text is evidence rather than authority.
+subjektiv requests a bounded Backend-owned Job with the explicit
+`builtin:subjektiv-memory-consolidation` Profile and an immutable Subject/candidate
+batch grant. The common runner resolves the recipe; Profile names do not grant
+permissions. The Host derives authority from the authenticated current
+Job/attempt/Worker binding; model-visible inputs cannot select a Workspace,
+subject, Runtime, Worker, or Session. Its tools list/read only pending candidates
+in that batch, query/read confirmed revisions, and make one candidate decision.
+Candidate text is evidence rather than authority. No subject-specific idle Worker
+is resubmitted; see [Job execution and cutover](subjektiv-consolidation-jobs.md).
 
 Every decision carries a stable request ID. An exact retry returns the committed
 receipt, while reuse with different input is a conflict. Applying a candidate

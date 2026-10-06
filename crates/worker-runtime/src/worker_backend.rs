@@ -1086,10 +1086,26 @@ fn restored_workdir_router(
     Ok(router)
 }
 
+fn validate_backend_job_profile(
+    manifest: &manifest::WorkerManifest,
+    request: &CreateWorkerRequest,
+) -> Result<(), String> {
+    if let Some(binding) = &request.backend_job {
+        let policy = &manifest.feature.subjektiv.profile;
+        if policy.consolidation_tools != binding.subjektiv_consolidation
+            || (binding.subjektiv_consolidation && policy.extraction.enabled)
+        {
+            return Err("Backend Job consolidation_tools must match its trusted consolidation grant and extraction must be disabled".into());
+        }
+    }
+    Ok(())
+}
+
 fn bind_workspace_memory_settings(
     manifest: &mut manifest::WorkerManifest,
     request: &CreateWorkerRequest,
 ) -> Result<(), String> {
+    validate_backend_job_profile(manifest, request)?;
     let Some(snapshot) = request.memory_settings.as_ref() else {
         if request.workspace_api.is_some() || request.subjektiv_attached {
             return Err(
@@ -1143,6 +1159,7 @@ fn validate_worker_memory_settings(
     manifest: &manifest::WorkerManifest,
     request: &CreateWorkerRequest,
 ) -> Result<(), String> {
+    validate_backend_job_profile(manifest, request)?;
     let Some(expected) = request.memory_settings.as_ref() else {
         if request.subjektiv_attached || request.workspace_api.is_some() {
             return Err(
@@ -1419,6 +1436,11 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             }
         })?;
         let worker = prepared.worker_mut();
+        if let Some(binding) = request.request.backend_job.as_ref() {
+            worker
+                .bind_backend_job(binding.clone())
+                .map_err(str::to_string)?;
+        }
         validate_worker_memory_settings(worker.manifest(), &request.request)?;
         worker
             .finalize_subjektiv_session_attribution(
@@ -1684,6 +1706,11 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             }
             Err(err) => return Err(format!("failed to restore Worker from metadata: {err}")),
         };
+        if let Some(binding) = request.request.backend_job.as_ref() {
+            worker
+                .bind_backend_job(binding.clone())
+                .map_err(str::to_string)?;
+        }
         validate_worker_memory_settings(worker.manifest(), &request.request)?;
         worker
             .finalize_subjektiv_session_attribution(
@@ -7221,6 +7248,58 @@ mod tests {
             workspace_api: None,
             memory_settings: None,
             subjektiv_attached: false,
+            backend_job: None,
+        }
+    }
+
+    #[test]
+    fn backend_job_profile_policy_matches_trusted_grant_without_implicit_changes() {
+        let mut manifest = WorkerManifest::from_toml(
+            r#"
+            [worker]
+            name = "job-policy-test"
+            pwd = "./"
+            [model]
+            scheme = "anthropic"
+            model_id = "chosen-model"
+            auth = { kind = "none" }
+            [engine]
+            instruction = "default"
+            [[scope.allow]]
+            target = "./"
+            permission = "read"
+        "#,
+        )
+        .unwrap();
+        let mut request = create_request("policy");
+        for granted in [false, true] {
+            request.backend_job = Some(crate::catalog::BackendJobExecutionBinding {
+                job_id: "job-1".into(),
+                attempt_id: "attempt-1".into(),
+                input_revision: None,
+                subjektiv_consolidation: granted,
+            });
+            for tools in [false, true] {
+                for extraction in [false, true] {
+                    manifest.feature.subjektiv.profile.consolidation_tools = tools;
+                    manifest.feature.subjektiv.profile.extraction.enabled = extraction;
+                    let expected = tools == granted && (!granted || !extraction);
+                    let before = serde_json::to_value(&manifest).unwrap();
+                    assert_eq!(
+                        validate_backend_job_profile(&manifest, &request).is_ok(),
+                        expected
+                    );
+                    assert_eq!(
+                        bind_workspace_memory_settings(&mut manifest, &request).is_ok(),
+                        expected
+                    );
+                    assert_eq!(
+                        validate_worker_memory_settings(&manifest, &request).is_ok(),
+                        expected
+                    );
+                    assert_eq!(serde_json::to_value(&manifest).unwrap(), before);
+                }
+            }
         }
     }
 

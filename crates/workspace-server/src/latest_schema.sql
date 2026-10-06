@@ -845,6 +845,7 @@ CREATE TABLE backend_jobs (
             purpose TEXT NOT NULL,
             input_revision TEXT NOT NULL,
             input_ref TEXT NOT NULL,
+            resource_key TEXT,
             request_json TEXT NOT NULL,
             intent_fingerprint TEXT NOT NULL,
             state TEXT NOT NULL CHECK (state IN ('pending', 'completed', 'failed', 'unknown')),
@@ -863,6 +864,8 @@ CREATE TABLE backend_jobs (
         );
 CREATE INDEX backend_jobs_active
         ON backend_jobs(workspace_id, state, updated_at);
+CREATE INDEX backend_jobs_resource
+        ON backend_jobs(workspace_id, resource_key, created_at);
 CREATE TABLE backend_job_attempts (
             workspace_id TEXT NOT NULL,
             job_id TEXT NOT NULL,

@@ -1,3 +1,5 @@
+mod backend_job_profile;
+mod subjektiv_job;
 mod worker_operations;
 pub(crate) use worker_operations::{
     WorkerOperationContext, WorkspaceWorker, WorkspaceWorkerMethodSender,
@@ -3500,6 +3502,7 @@ impl WorkspaceApi {
         &self,
         request: &BackendJobRequest,
     ) -> Result<BackendJobReservation> {
+        self.resolve_backend_job_profile(request)?;
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
         let reservation =
             self.store
@@ -3548,6 +3551,19 @@ impl WorkspaceApi {
             return Ok(reservation);
         }
         let request = &reservation.job.request;
+        let (profile, config_bundle) = match self.resolve_backend_job_profile(request) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.finish_backend_job_attempt(
+                    &request.job_id,
+                    &reservation.attempt.attempt_id,
+                    BackendJobAttemptState::Failed,
+                    "profile_requirements",
+                    &error.to_string(),
+                )?;
+                return Err(error);
+            }
+        };
         let worker_input = request.worker_input(&reservation.attempt.attempt_id)?;
         let control_operation = WorkerControlOperation {
             operation_id: allocation_key(&reservation.attempt.attempt_id),
@@ -3562,22 +3578,24 @@ impl WorkspaceApi {
                     job_id: request.job_id.clone(),
                     attempt_id: reservation.attempt.attempt_id.clone(),
                     purpose: request.purpose.clone(),
+                    input_revision: request.input_revision.clone(),
+                    subjektiv_consolidation: request.grants.subjektiv_consolidation.is_some(),
                 },
                 acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                     expected_segments: 0,
                 },
-                profile: ProfileSelector::Builtin(request.profile.clone()),
+                profile,
                 ticket_assignment: None,
                 initial_submit: Vec::new(),
                 workdir_attachment_requests: Vec::new(),
                 resolved_workdir_attachment_requests: Vec::new(),
                 resolved_workdir_attachments: Vec::new(),
-                resolved_config_bundle: None,
+                resolved_config_bundle: Some(config_bundle),
                 resolved_worker_observation_enabled: false,
                 resolved_worker_observation_grants: Vec::new(),
                 resolved_workspace_api: None,
                 resolved_memory_settings: None,
-                resolved_subjektiv_attached: false,
+                resolved_subjektiv_attached: request.grants.subjektiv_consolidation.is_some(),
                 resolved_control_operation: Some(control_operation),
             },
         ) {
@@ -3647,6 +3665,7 @@ impl WorkspaceApi {
                 job,
                 attempt,
                 replayed: true,
+                resource_reused: false,
             });
         }
 
@@ -3738,6 +3757,7 @@ impl WorkspaceApi {
             job,
             attempt,
             replayed: reservation.replayed,
+            resource_reused: reservation.resource_reused,
         })
     }
 
@@ -3801,6 +3821,7 @@ impl WorkspaceApi {
                     job,
                     attempt: attempt.clone(),
                     replayed: true,
+                    resource_reused: false,
                 }) {
                     Ok(reservation) => {
                         made_progress |=
@@ -4187,6 +4208,7 @@ impl WorkspaceApi {
                             job,
                             attempt,
                             replayed: true,
+                            resource_reused: false,
                         })
                     {
                         tracing::warn!(%error, "Backend Job reserved-attempt recovery failed");
@@ -4292,6 +4314,7 @@ impl WorkspaceApi {
         submission: &BackendJobResultSubmission,
     ) -> Result<BackendJobResultAcceptance> {
         let accepted_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let mut verified_submission = submission.clone();
         if let Some(job) = self
             .store
             .get_backend_job(&self.config.workspace_id, &submission.job_id)?
@@ -4334,10 +4357,41 @@ impl WorkspaceApi {
                 return Err(error);
             }
         }
+        if let Some(job) = self
+            .store
+            .get_backend_job(&self.config.workspace_id, &submission.job_id)?
+            && job.request.grants.subjektiv_consolidation.is_some()
+        {
+            let attempt = self
+                .store
+                .get_backend_job_attempt(
+                    &self.config.workspace_id,
+                    &submission.job_id,
+                    &submission.attempt_id,
+                )?
+                .ok_or_else(|| Error::InvalidInput("unknown consolidation attempt".into()))?;
+            if attempt.worker.as_ref() != Some(source_worker)
+                || job.current_attempt != attempt.attempt
+                || attempt.input_revision != submission.input_revision
+                || !matches!(
+                    attempt.state,
+                    BackendJobAttemptState::Dispatched | BackendJobAttemptState::Completed
+                )
+            {
+                return Err(Error::WorkspacePermissionDenied(
+                    "consolidation result requires the exact bound attempt".into(),
+                ));
+            }
+            if attempt.state != BackendJobAttemptState::Completed {
+                subjektiv_job::validate_result(self, &job.request, &attempt, &submission.result)?;
+            }
+            verified_submission.result =
+                subjektiv_job::with_dispositions(self, &job.request, &submission.result)?;
+        }
         let acceptance = self.store.accept_backend_job_result(
             &self.config.workspace_id,
             source_worker,
-            submission,
+            &verified_submission,
             &accepted_at,
         )?;
         if let Some(target) = acceptance.job.request.notification_target.as_ref() {
@@ -18175,6 +18229,13 @@ fn subjektiv_subject_scope(
         )
     })?;
     let worker = RuntimeWorkerRef::new(&source.runtime_id, worker_id);
+    if let Some(grant) = subjektiv_job::active_grant(api, workspace_id, &worker)? {
+        return Ok((
+            grant.subject_id,
+            worker,
+            SubjektivWorkerAuthority::Consolidation,
+        ));
+    }
     let lease = api
         .store
         .require_current_worker_singleton_owner(workspace_id, &worker)?
@@ -20006,7 +20067,8 @@ async fn scoped_subjektiv_memory_backend(
     Json(request): Json<server_api::SubjektivMemoryBackendRequest>,
 ) -> ApiResult<Json<server_api::SubjektivMemoryBackendResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let (subject_id, _, authority) = subjektiv_subject_scope(&api, &path.workspace_id, &context)?;
+    let (subject_id, source_worker, authority) =
+        subjektiv_subject_scope(&api, &path.workspace_id, &context)?;
     let store = open_subjektiv_store(&api)?;
     let response = match request.operation {
         server_api::SubjektivMemoryBackendOperation::ResidentSummary(_) => {
@@ -20118,9 +20180,30 @@ async fn scoped_subjektiv_memory_backend(
                 "candidate listing",
             )?;
             let limit = bounded_subjektiv_limit(input.limit, SUBJEKTIV_QUERY_DEFAULT_LIMIT)?;
-            let mut candidates = store
-                .pending_staging_candidates(&subject_id, limit.saturating_add(1))
-                .map_err(subjektiv_store_error)?;
+            let mut candidates = if let Some(grant) =
+                subjektiv_job::active_grant(&api, &path.workspace_id, &source_worker)?
+            {
+                let mut pending = Vec::new();
+                for id in &grant.candidate_ids {
+                    if store
+                        .staging_resolution(&subject_id, id)
+                        .map_err(subjektiv_store_error)?
+                        .is_none()
+                    {
+                        if let Some(candidate) = store
+                            .staging_candidate(&subject_id, id)
+                            .map_err(subjektiv_store_error)?
+                        {
+                            pending.push(candidate);
+                        }
+                    }
+                }
+                pending
+            } else {
+                store
+                    .pending_staging_candidates(&subject_id, limit.saturating_add(1))
+                    .map_err(subjektiv_store_error)?
+            };
             let has_more = candidates.len() > limit;
             candidates.truncate(limit);
             server_api::SubjektivMemoryBackendResponse::Candidates(
@@ -20138,6 +20221,12 @@ async fn scoped_subjektiv_memory_backend(
                 authority,
                 SubjektivWorkerAuthority::Consolidation,
                 "candidate read",
+            )?;
+            subjektiv_job::require_candidate_grant(
+                &api,
+                &path.workspace_id,
+                &source_worker,
+                &input.candidate_id,
             )?;
             let candidate = store
                 .staging_candidate(&subject_id, &input.candidate_id)
@@ -20167,6 +20256,12 @@ async fn scoped_subjektiv_memory_backend(
                 SubjektivWorkerAuthority::Consolidation,
                 "candidate decision",
             )?;
+            subjektiv_job::require_candidate_grant(
+                &api,
+                &path.workspace_id,
+                &source_worker,
+                &input.candidate_id,
+            )?;
             let receipt = store
                 .decide_candidate(&subject_id, subjektiv_candidate_decision(input)?)
                 .map_err(subjektiv_store_error)?;
@@ -20180,12 +20275,42 @@ async fn scoped_subjektiv_memory_backend(
                 SubjektivWorkerAuthority::Consolidation,
                 "surface generation preparation",
             )?;
+            if let Some(grant) =
+                subjektiv_job::active_grant(&api, &path.workspace_id, &source_worker)?
+            {
+                for id in &grant.candidate_ids {
+                    if store
+                        .staging_resolution(&subject_id, id)
+                        .map_err(subjektiv_store_error)?
+                        .is_none()
+                    {
+                        return Err(Error::InvalidInput(format!("surface generation requires a durable disposition for batch candidate `{id}`")).into());
+                    }
+                }
+            }
+            let binding = api
+                .store
+                .worker_registry_projection(&path.workspace_id, &source_worker)?
+                .and_then(|p| p.job);
             let generation = store
-                .prepare_surface_generation(&subject_id)
+                .prepare_job_surface_generation(
+                    &subject_id,
+                    binding
+                        .as_ref()
+                        .map(|b| (b.job_id.as_str(), b.attempt_id.as_str())),
+                )
                 .map_err(subjektiv_store_error)?;
-            server_api::SubjektivMemoryBackendResponse::SurfacePrepared(
-                subjektiv_surface_prepare_response(generation),
-            )
+            let resident = store
+                .resident_surface(&subject_id)
+                .map_err(subjektiv_store_error)?;
+            let mut response = subjektiv_surface_prepare_response(generation);
+            if resident.availability == crate::subjektiv::SurfaceAvailability::Ready {
+                response.current_snapshot_id = resident
+                    .snapshot
+                    .filter(|s| s.built_from_store_revision == response.store_revision)
+                    .map(|s| s.id);
+            }
+            server_api::SubjektivMemoryBackendResponse::SurfacePrepared(response)
         }
         server_api::SubjektivMemoryBackendOperation::PublishSurface(input) => {
             require_subjektiv_worker_authority(
@@ -20193,6 +20318,20 @@ async fn scoped_subjektiv_memory_backend(
                 SubjektivWorkerAuthority::Consolidation,
                 "surface publication",
             )?;
+            if let Some(binding) = api
+                .store
+                .worker_registry_projection(&path.workspace_id, &source_worker)?
+                .and_then(|p| p.job)
+            {
+                store
+                    .require_job_surface_generation(
+                        &subject_id,
+                        &input.generation_id,
+                        &binding.job_id,
+                        &binding.attempt_id,
+                    )
+                    .map_err(subjektiv_store_error)?;
+            }
             let points = input
                 .points
                 .into_iter()
@@ -20225,13 +20364,52 @@ async fn scoped_subjektiv_memory_backend(
                 SubjektivWorkerAuthority::Consolidation,
                 "surface generation failure",
             )?;
+            if let Some(binding) = api
+                .store
+                .worker_registry_projection(&path.workspace_id, &source_worker)?
+                .and_then(|p| p.job)
+            {
+                store
+                    .require_job_surface_generation(
+                        &subject_id,
+                        &input.generation_id,
+                        &binding.job_id,
+                        &binding.attempt_id,
+                    )
+                    .map_err(subjektiv_store_error)?;
+            }
             let revision = store
                 .fail_surface_generation(&subject_id, &input.generation_id, &input.reason_code)
                 .map_err(subjektiv_store_error)?;
+            let status = if let Some(binding) = api
+                .store
+                .worker_registry_projection(&path.workspace_id, &source_worker)?
+                .and_then(|p| p.job)
+            {
+                store
+                    .validate_job_surface_outcome(
+                        &subject_id,
+                        &input.generation_id,
+                        revision,
+                        "failed",
+                        None,
+                        Some(&input.reason_code),
+                        &binding.job_id,
+                        &binding.attempt_id,
+                    )
+                    .map_err(|e| {
+                        Error::RepositoryConflict(format!(
+                            "surface failure was not recorded for this attempt: {e}"
+                        ))
+                    })?;
+                "failed_confirmed"
+            } else {
+                "failed"
+            };
             server_api::SubjektivMemoryBackendResponse::SurfaceFailed(
                 server_api::SubjektivSurfaceFailureResponse {
                     store_revision: revision,
-                    status: "failed".into(),
+                    status: status.into(),
                 },
             )
         }
@@ -20244,6 +20422,7 @@ fn subjektiv_surface_prepare_response(
 ) -> server_api::SubjektivSurfacePrepareResponse {
     server_api::SubjektivSurfacePrepareResponse {
         generation_id: generation.id,
+        current_snapshot_id: None,
         store_revision: generation.store_revision,
         active_memory_count: generation.active_memory_count,
         materials: generation
@@ -21448,11 +21627,9 @@ async fn scoped_subjektiv_memory_consolidation(
         SubjektivWorkerAuthority::Subject,
         "consolidation request",
     )?;
-    Ok(Json(start_subjektiv_staging_consolidation(
-        api,
-        &subject_id,
-        operation,
-    )?))
+    Ok(Json(
+        start_subjektiv_staging_consolidation(api, &subject_id, operation).await?,
+    ))
 }
 
 const SUBJECT_CONSOLIDATION_THRESHOLD_FILES: usize = 5;
@@ -21511,7 +21688,7 @@ mod subject_surface_consolidation_policy_tests {
     }
 }
 
-fn start_subjektiv_staging_consolidation(
+async fn start_subjektiv_staging_consolidation(
     api: WorkspaceApi,
     subject_id: &str,
     operation: MemoryConsolidateStagingOperation,
@@ -21520,6 +21697,13 @@ fn start_subjektiv_staging_consolidation(
     let (candidate_count, total_bytes) = store
         .pending_staging_backlog(subject_id)
         .map_err(subjektiv_store_error)?;
+    if !subjektiv_job::retire_legacy_worker(&api, subject_id).await? {
+        return Ok(MemoryConsolidationOutput {
+            status: "skipped_legacy_inflight".into(),
+            summary: "Legacy owned subject consolidator has not completed foreground work; no Job may run concurrently.".into(),
+            candidate_count, total_bytes,
+        });
+    }
     let surface_availability = store
         .resident_surface(subject_id)
         .map_err(subjektiv_store_error)?
@@ -21550,135 +21734,7 @@ fn start_subjektiv_staging_consolidation(
         });
     }
 
-    let runtime_id = select_memory_consolidation_runtime(&api)?;
-    let singleton_key = format!("{SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX}{subject_id}");
-    let input_content = format!(
-        "Process the delegated subject's {candidate_count} pending Memory candidate(s) ({total_bytes} bytes) with MemoryStagingList, MemoryStagingRead, subject Memory reads, and MemoryApplyCandidate. After this committed consolidation turn, the Host will rebuild the {:?} resident surface from confirmed Memory in a separate clean context.",
-        surface_availability
-    );
-    if let Some(output) = try_reuse_subject_consolidation_worker(
-        &api,
-        &singleton_key,
-        &input_content,
-        candidate_count,
-        total_bytes,
-    )? {
-        return Ok(output);
-    }
-    let result = api.spawn_workspace_worker(
-        &runtime_id,
-        WorkerSpawnRequest {
-            requested_worker_name: Some(SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE.to_string()),
-            singleton_key: Some(singleton_key),
-            intent: WorkerSpawnIntent::WorkspaceOrchestrator,
-            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                expected_segments: 1,
-            },
-            profile: ProfileSelector::Builtin(SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE.to_string()),
-            ticket_assignment: None,
-            initial_submit: vec![Segment::text(input_content)],
-            workdir_attachment_requests: Vec::new(),
-            resolved_workdir_attachment_requests: Vec::new(),
-            resolved_workdir_attachments: Vec::new(),
-            resolved_config_bundle: None,
-            resolved_worker_observation_enabled: false,
-            resolved_worker_observation_grants: Vec::new(),
-            resolved_workspace_api: None,
-            resolved_memory_settings: None,
-            resolved_subjektiv_attached: true,
-            resolved_control_operation: None,
-        },
-    )?;
-    if result.state != InternalWorkerOperationState::Accepted {
-        return Ok(MemoryConsolidationOutput {
-            status: "skipped_spawn_rejected".into(),
-            summary: "Runtime rejected subject Memory consolidater spawn.".into(),
-            candidate_count,
-            total_bytes,
-        });
-    }
-    let Some(worker) = result.worker else {
-        return Ok(MemoryConsolidationOutput {
-            status: "skipped_spawn_missing_worker".into(),
-            summary: "Runtime accepted subject Memory consolidater spawn without returning a Worker summary.".into(),
-            candidate_count,
-            total_bytes,
-        });
-    };
-    Ok(MemoryConsolidationOutput {
-        status: "started".into(),
-        summary: format!(
-            "Started subject Memory consolidater '{}' for {candidate_count} staging candidate(s).",
-            worker.worker.worker_id
-        ),
-        candidate_count,
-        total_bytes,
-    })
-}
-
-fn try_reuse_subject_consolidation_worker(
-    api: &WorkspaceApi,
-    singleton_key: &str,
-    input_content: &str,
-    candidate_count: usize,
-    total_bytes: u64,
-) -> ApiResult<Option<MemoryConsolidationOutput>> {
-    let Some(owner) = api
-        .store
-        .current_worker_singleton_owner(&api.config.workspace_id, singleton_key)?
-    else {
-        return Ok(None);
-    };
-    let mut worker = api
-        .runtime
-        .worker(&owner.worker)
-        .map_err(|error| error.into_error())?;
-    worker.singleton_key = Some(owner.key);
-    require_dedicated_subjektiv_consolidation_worker(
-        &worker,
-        &api.config.workspace_id,
-        singleton_key,
-    )?;
-    if worker.state != "idle" {
-        return Ok(Some(MemoryConsolidationOutput {
-            status: "skipped_existing_not_idle".into(),
-            summary: format!(
-                "Existing subject Memory consolidater '{}' is '{}', not confirmed idle.",
-                worker.worker.worker_id, worker.state
-            ),
-            candidate_count,
-            total_bytes,
-        }));
-    }
-    let input = api
-        .runtime
-        .send_input(
-            &worker.worker,
-            WorkerInputRequest {
-                kind: WorkerInputKind::User,
-                content: input_content.to_string(),
-                submission_request_id: None,
-                segments: None,
-            },
-        )
-        .map_err(|error| error.into_error())?;
-    if input.state != InternalWorkerOperationState::Accepted {
-        return Ok(Some(MemoryConsolidationOutput {
-            status: "skipped_existing_input_rejected".into(),
-            summary: "Existing subject Memory consolidater rejected new input.".into(),
-            candidate_count,
-            total_bytes,
-        }));
-    }
-    Ok(Some(MemoryConsolidationOutput {
-        status: "reused".into(),
-        summary: format!(
-            "Reused subject Memory consolidater '{}' for {candidate_count} staging candidate(s).",
-            worker.worker.worker_id
-        ),
-        candidate_count,
-        total_bytes,
-    }))
+    subjektiv_job::dispatch(&api, subject_id, candidate_count, total_bytes)
 }
 
 async fn scoped_memory_consolidation(
@@ -33409,6 +33465,7 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
+    mod subjektiv_jobs_tests;
     mod worker_operations_tests;
     include!("server_workspace_config_tests.rs");
     use super::*;
@@ -44862,6 +44919,8 @@ mod tests {
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Return a structured check result.".to_string(),
             profile: "builtin:backend-job".to_string(),
+            grants: Default::default(),
+            serialization_key: None,
             source_worker: None,
             notification_target: None,
             limits: crate::backend_job::BackendJobLimits::default(),
@@ -44963,6 +45022,8 @@ mod tests {
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Return a structured check result.".to_string(),
             profile: "builtin:backend-job".to_string(),
+            grants: Default::default(),
+            serialization_key: None,
             source_worker: Some(notification_target.clone()),
             notification_target: Some(notification_target.clone()),
             limits: crate::backend_job::BackendJobLimits::default(),
@@ -45069,6 +45130,8 @@ mod tests {
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Return a structured check result.".to_string(),
             profile: "builtin:backend-job".to_string(),
+            grants: Default::default(),
+            serialization_key: None,
             source_worker: None,
             notification_target: None,
             limits: crate::backend_job::BackendJobLimits::default(),
@@ -45105,10 +45168,10 @@ mod tests {
             Some("backend_job_cleanup_removal_rejected")
         );
 
-        let second = api.retry_backend_job(&request.job_id).unwrap();
-        let second_worker = second.attempt.worker.clone().unwrap();
-        seed_worker_session_for_cleanup(temp.path(), &second_worker);
-        assert_ne!(first_worker, second_worker);
+        assert!(
+            api.retry_backend_job(&request.job_id).is_err(),
+            "retry must not overlap an incompletely cleaned attempt"
+        );
         let _ = set_worker_retention(
             api.clone(),
             first_worker.runtime_id.clone(),
@@ -45125,6 +45188,11 @@ mod tests {
             BackendJobWorkerCleanupState::Completed,
         )
         .await;
+        let second = api.retry_backend_job(&request.job_id).unwrap();
+        let second_worker = second.attempt.worker.clone().unwrap();
+        seed_worker_session_for_cleanup(temp.path(), &second_worker);
+        assert_ne!(first_worker, second_worker);
+        api.recover_backend_jobs().unwrap();
         assert!(api.runtime.worker(&second_worker).is_ok());
 
         api.accept_backend_job_result(
@@ -45171,6 +45239,8 @@ mod tests {
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Return a structured check result.".to_string(),
             profile: "builtin:backend-job".to_string(),
+            grants: Default::default(),
+            serialization_key: None,
             source_worker: None,
             notification_target: None,
             limits: crate::backend_job::BackendJobLimits::default(),
@@ -45212,6 +45282,7 @@ mod tests {
                     workspace_api: Some(test_worker_workspace_api(EMBEDDED_WORKER_RUNTIME_ID)),
                     memory_settings: Some(test_worker_memory_settings()),
                     subjektiv_attached: false,
+                    backend_job: None,
                 },
             )
             .unwrap();
@@ -45348,6 +45419,8 @@ mod tests {
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Return a structured check result.".to_string(),
             profile: "builtin:backend-job".to_string(),
+            grants: Default::default(),
+            serialization_key: None,
             source_worker: None,
             notification_target: None,
             limits: crate::backend_job::BackendJobLimits::default(),
@@ -45410,6 +45483,8 @@ mod tests {
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Return a structured check result.".to_string(),
             profile: "builtin:backend-job".to_string(),
+            grants: Default::default(),
+            serialization_key: None,
             source_worker: None,
             notification_target: None,
             limits: crate::backend_job::BackendJobLimits::default(),
@@ -45543,6 +45618,8 @@ mod tests {
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Return a structured check result.".to_string(),
             profile: "builtin:backend-job".to_string(),
+            grants: Default::default(),
+            serialization_key: None,
             source_worker: None,
             notification_target: Some(target.clone()),
             limits: crate::backend_job::BackendJobLimits {
@@ -45625,6 +45702,8 @@ mod tests {
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Return a structured check result.".to_string(),
             profile: "builtin:backend-job".to_string(),
+            grants: Default::default(),
+            serialization_key: None,
             source_worker: None,
             notification_target: None,
             limits: crate::backend_job::BackendJobLimits::default(),
@@ -45663,6 +45742,8 @@ mod tests {
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Return a structured check result.".to_string(),
             profile: "builtin:backend-job".to_string(),
+            grants: Default::default(),
+            serialization_key: None,
             source_worker: None,
             notification_target: None,
             limits: crate::backend_job::BackendJobLimits::default(),
@@ -45728,6 +45809,8 @@ mod tests {
                 input: serde_json::json!({"index": index}),
                 instruction: "Return a structured fixture result.".to_string(),
                 profile: "builtin:backend-job".to_string(),
+                grants: Default::default(),
+                serialization_key: None,
                 source_worker: None,
                 notification_target: None,
                 limits: crate::backend_job::BackendJobLimits {
@@ -45773,6 +45856,8 @@ mod tests {
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Return a structured check result.".to_string(),
             profile: "builtin:backend-job".to_string(),
+            grants: Default::default(),
+            serialization_key: None,
             source_worker: None,
             notification_target: None,
             limits: crate::backend_job::BackendJobLimits::default(),
@@ -45816,6 +45901,8 @@ mod tests {
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Return a structured check result.".to_string(),
             profile: "builtin:backend-job".to_string(),
+            grants: Default::default(),
+            serialization_key: None,
             source_worker: None,
             notification_target: None,
             limits: crate::backend_job::BackendJobLimits::default(),
@@ -45905,6 +45992,8 @@ mod tests {
             input: serde_json::json!({"value": "immutable"}),
             instruction: "Wait for a structured result.".to_string(),
             profile: "builtin:backend-job".to_string(),
+            grants: Default::default(),
+            serialization_key: None,
             source_worker: None,
             notification_target: None,
             limits: crate::backend_job::BackendJobLimits {
@@ -55932,6 +56021,7 @@ mod tests {
             workspace_api: None,
             memory_settings: Some(memory_settings),
             subjektiv_attached: false,
+            backend_job: None,
         }
     }
 
@@ -60280,14 +60370,9 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
         let error = subjektiv_subject_scope(&api, TEST_WORKSPACE_ID, &forged_context).unwrap_err();
         assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
         assert!(
-            try_reuse_subject_consolidation_worker(
-                &api,
-                forged_key,
-                "process pending subject Memory",
-                1,
-                1,
-            )
-            .is_err()
+            subjektiv_job::retire_legacy_worker(&api, "forged-subject")
+                .await
+                .is_err()
         );
     }
 
