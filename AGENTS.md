@@ -19,6 +19,8 @@ LLM に投げる context はappend-onlyが基本であり、またその永続�
 
 ## 検証
 
+テストを追加・変更する前に、必ず[テスト設計規則](docs/development/rust-testing-strategy.md)を読み、その規則に従うこと。
+
 開発中は、変更した契約を証明する最小の target / filter から実行する。
 
 ```sh
