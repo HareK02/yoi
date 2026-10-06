@@ -229,6 +229,81 @@ async fn value_profiles_save_project_and_runtime_consume_the_same_revision() {
 }
 
 #[tokio::test]
+async fn value_profiles_scalar_and_table_scopes_analyze_save_and_resolve_equally() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = test_api(dir.path()).await;
+    let scalar = format!(
+        r#"{PROFILE} // {{ scope = "workspace_read"; delegation_scope = "workspace_write"; }}"#
+    );
+    let table = format!(
+        r#"{PROFILE} // {{ scope = {{ intent = "workspace_read"; }}; delegation_scope = {{ intent = "workspace_write"; }}; }}"#
+    );
+    let mut scopes = Vec::new();
+    for (index, form) in [scalar.clone(), table, r#"import "./scoped.dcdl""#.into()]
+        .iter()
+        .enumerate()
+    {
+        let extra = if index == 0 {
+            vec![config_source::ConfigTreeChange::Create {
+                path: config_source::VirtualPath::parse("scoped.dcdl").unwrap(),
+                content_type: config_source::ConfigContentType::Decodal,
+                content: scalar.clone(),
+            }]
+        } else {
+            vec![]
+        };
+        let authored = format!("{} as WorkspaceConfigSchema", source(form));
+        let state =
+            commit_workspace_config_tree(&api, TEST_WORKSPACE_ID, &request(&api, &authored, extra))
+                .unwrap();
+        let environment = config_source::SnapshotEnvironment::new(state.snapshot.clone())
+            .with_schema_bundle(state.contract.schema_bundle.clone());
+        assert!(
+            environment
+                .analyze(
+                    &config_source::VirtualPath::parse("main.dcdl").unwrap(),
+                    None
+                )
+                .is_empty(),
+            "{authored}"
+        );
+        let projection = project_profiles_from_workspace_config(TEST_WORKSPACE_ID, &state).unwrap();
+        let bundle = build_virtual_profile_config_bundle(
+            &projection,
+            &state,
+            TEST_WORKSPACE_ID,
+            "created",
+            "project:alpha",
+        )
+        .unwrap()
+        .unwrap();
+        let resolved = bundle
+            .profile_source_archive
+            .as_ref()
+            .unwrap()
+            .verify()
+            .unwrap()
+            .resolve_profile(
+                "project:alpha",
+                Path::new("/runtime-worker"),
+                "scoped-worker",
+            )
+            .unwrap();
+        assert_eq!(resolved.scope.allow.len(), 1);
+        assert_eq!(resolved.delegation_scope.allow.len(), 1);
+        let scope = serde_json::to_value(&resolved.scope).unwrap();
+        let delegation = serde_json::to_value(&resolved.delegation_scope).unwrap();
+        assert_eq!(scope["allow"][0]["target"], "/runtime-worker");
+        assert_eq!(scope["allow"][0]["permission"], "read");
+        assert_eq!(delegation["allow"][0]["target"], "/runtime-worker");
+        assert_eq!(delegation["allow"][0]["permission"], "write");
+        scopes.push((scope, delegation));
+    }
+    assert_eq!(scopes[0], scopes[1]);
+    assert_eq!(scopes[1], scopes[2]);
+}
+
+#[tokio::test]
 async fn value_profiles_invalid_saves_preserve_the_active_config() {
     let dir = tempfile::tempdir().unwrap();
     let api = test_api(dir.path()).await;
@@ -242,6 +317,12 @@ async fn value_profiles_invalid_saves_preserve_the_active_config() {
         (source("42"), ""),
         (source(r#"{ worker = { mode = "not-a-mode"; }; }"#), "profile_value_invalid"),
         (source(r#"{ worker = { name = "runtime-only"; }; }"#), "profile_value_invalid"),
+        (source(r#"{ scope = 42; }"#), "profile_value_invalid"),
+        (source(r#"{ scope = "not-an-intent"; }"#), "profile_value_invalid"),
+        (source(r#"{ delegation_scope = { intent = 42; }; }"#), "profile_value_invalid"),
+        (source(r#"{ scope = { intent = "workspace_read"; unknown = true; }; }"#), "profile_value_invalid"),
+        (source(r#"{ scope = { intent = "workspace_read"; deny_write = 42; }; }"#), "profile_value_invalid"),
+        (source(r#"{ delegation_scope = { intent = "workspace_write"; symlink_policy = 42; }; }"#), "profile_value_invalid"),
         (source(r#"import "./missing.dcdl""#), ""),
         (source(r#"import "../outside.dcdl""#), ""),
         (r#"{ profile = { entries = [{ selector = "project:alpha"; profile = {}; }, { selector = "project:alpha"; profile = {}; }]; }; }"#.into(), "profile_selector_duplicate"),

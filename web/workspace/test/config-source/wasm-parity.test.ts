@@ -569,6 +569,93 @@ Deno.test("generated WASM authors value-based Profiles using the Backend schema 
       );
     }
   }
+  for (const field of ["scope", "delegation_scope"]) {
+    for (
+      const [prefix, label] of [["int", "intent"], ["deny", "deny_write"], [
+        "sym",
+        "symlink_policy",
+      ]]
+    ) {
+      const body =
+        `{ profile.entries = [{ profile.${field} = { ${prefix} } }]; } as WorkspaceConfigSchema`;
+      const cursor = body.lastIndexOf(prefix) + prefix.length;
+      const result = complete_current("main.dcdl", body, cursor, true) as {
+        items: Array<{ label: string }>;
+      };
+      assertEquals(
+        result.items.some((item) => item.label === label),
+        true,
+        `${field}.${label}`,
+      );
+    }
+  }
+  for (
+    const [recipe, expected] of [
+      ['{ scope = "workspace_read"; delegation_scope = "workspace_write"; }', {
+        scope: "workspace_read",
+        delegation_scope: "workspace_write",
+      }],
+      ['{ scope = "workspace_write"; delegation_scope = "workspace_read"; }', {
+        scope: "workspace_write",
+        delegation_scope: "workspace_read",
+      }],
+      [
+        '{ scope = { intent = "workspace_read"; }; delegation_scope = { intent = "workspace_write"; deny_write = ["private"]; symlink_policy = "resolved"; }; }',
+        {
+          scope: { intent: "workspace_read" },
+          delegation_scope: {
+            intent: "workspace_write",
+            deny_write: ["private"],
+            symlink_policy: "resolved",
+          },
+        },
+      ],
+    ] as const
+  ) {
+    for (
+      const form of [
+        recipe,
+        'import "./scoped.dcdl"',
+        '(import "./scoped.dcdl") // { description = "patched"; }',
+      ]
+    ) {
+      const scopedContent = content.replace(
+        "profile = {};",
+        `profile = ${form};`,
+      );
+      const scopedTree = {
+        ...tree,
+        entries: {
+          "main.dcdl": {
+            ...tree.entries["main.dcdl"],
+            content: scopedContent,
+            content_digest: await digestText(scopedContent),
+          },
+          "scoped.dcdl": {
+            path: "scoped.dcdl",
+            content_type: "decodal",
+            content: recipe,
+            content_digest: await digestText(recipe),
+          },
+        },
+      };
+      assertEquals(
+        analyze_snapshot(scopedTree, "main.dcdl", undefined),
+        [],
+        form,
+      );
+      const result = evaluate_snapshot(
+        scopedTree,
+        valueContract,
+      ) as typeof evaluated;
+      assertEquals(
+        result.projections[0].data_json.profile.entries[0].profile,
+        form.includes("patched")
+          ? { ...expected, description: "patched" }
+          : expected,
+      );
+    }
+  }
   // Neither completion nor diagnostic shape checking changes the saved value.
   assertEquals(evaluate_snapshot(tree, valueContract), evaluated);
 });

@@ -12,7 +12,11 @@ let
         enabled = Bool; model = Model; reasoning = String;
         threshold = Int; worker_max_turns = Int;
     };
-    Scope = { intent = String; deny_write = [...String]; symlink_policy = String; };
+    # Profile scope accepts either a string intent or a table. Decodal 0.4 has
+    # no union range; keep this field opaque to constraint analysis and expose
+    # the table only as a completion hint. This shape is never materialized;
+    # actual scope forms, intent values and table fields are checked on save.
+    Scope = Unknown default { intent = String; deny_write = [...String]; symlink_policy = String; };
     Profile = {
         slug = String;
         description = String;

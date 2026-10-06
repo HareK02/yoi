@@ -2555,9 +2555,8 @@ mod tests {
         assert_eq!(environment.evaluate_contract(&contract).unwrap(), evaluated);
     }
 
-    #[test]
-    fn actual_profile_schema_diagnoses_nested_values_without_materializing_omissions() {
-        let schema = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+    fn actual_profile_schema() -> WorkspaceConfigSchemaBundle {
+        WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
             "builtin:profile",
             "profile",
             "2",
@@ -2567,7 +2566,12 @@ mod tests {
         .with_authoring_source(include_str!(
             "../../../resources/config-schema/profile-authoring.dcdl"
         ))])
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn actual_profile_schema_diagnoses_nested_values_without_materializing_omissions() {
+        let schema = actual_profile_schema();
         let source = "{ profile = { entries = [{ selector = \"project:alpha\"; profile = {}; }]; }; } as WorkspaceConfigSchema";
         let snapshot = ConfigTreeSnapshot::from_entries(
             8,
@@ -2657,6 +2661,81 @@ mod tests {
                 .pointer("/profile/entries/0/profile"),
             Some(&serde_json::json!({}))
         );
+    }
+
+    #[test]
+    fn actual_profile_schema_preserves_scalar_and_table_scope_forms_and_completion() {
+        for (recipe, expected) in [
+            (
+                r#"{ scope = "workspace_read"; delegation_scope = "workspace_write"; }"#,
+                serde_json::json!({"scope": "workspace_read", "delegation_scope": "workspace_write"}),
+            ),
+            (
+                r#"{ scope = "workspace_write"; delegation_scope = "workspace_read"; }"#,
+                serde_json::json!({"scope": "workspace_write", "delegation_scope": "workspace_read"}),
+            ),
+            (
+                r#"{ scope = { intent = "workspace_read"; }; delegation_scope = { intent = "workspace_write"; deny_write = ["private"]; symlink_policy = "resolved"; }; }"#,
+                serde_json::json!({"scope": {"intent": "workspace_read"}, "delegation_scope": {"intent": "workspace_write", "deny_write": ["private"], "symlink_policy": "resolved"}}),
+            ),
+        ] {
+            for form in [
+                recipe.to_owned(),
+                r#"import "./scoped.dcdl""#.into(),
+                format!(r#"(import "./scoped.dcdl") // {{ description = "patched"; }}"#),
+            ] {
+                let source = format!(
+                    r#"{{ profile.entries = [{{ selector = "project:scoped"; profile = {form}; }}]; }} as WorkspaceConfigSchema"#
+                );
+                let snapshot = ConfigTreeSnapshot::from_entries(
+                    9,
+                    [entry("main.dcdl", &source), entry("scoped.dcdl", recipe)],
+                )
+                .unwrap();
+                let schema = actual_profile_schema();
+                let environment =
+                    SnapshotEnvironment::new(snapshot).with_schema_bundle(schema.clone());
+                let contract =
+                    ToolchainContract::with_schema_bundle(1, vec![path("main.dcdl")], 1, schema);
+                let before = environment.evaluate_contract(&contract).unwrap();
+                assert!(
+                    environment.analyze(&path("main.dcdl"), None).is_empty(),
+                    "{source}"
+                );
+                let mut expected = expected.clone();
+                if form.contains("patched") {
+                    expected["description"] = serde_json::json!("patched");
+                }
+                assert_eq!(
+                    before.projections[0]
+                        .data_json
+                        .pointer("/profile/entries/0/profile"),
+                    Some(&expected)
+                );
+                for field in ["scope", "delegation_scope"] {
+                    for (prefix, label) in [
+                        ("int", "intent"),
+                        ("deny", "deny_write"),
+                        ("sym", "symlink_policy"),
+                    ] {
+                        let marked = format!(
+                            "{{ profile.entries = [{{ profile.{field} = {{ {prefix}| }}; }}]; }} as WorkspaceConfigSchema"
+                        );
+                        let cursor = marked.find('|').unwrap();
+                        let source = marked.replace('|', "");
+                        let result = environment
+                            .complete_config(&path("main.dcdl"), &source, cursor, true)
+                            .unwrap()
+                            .unwrap();
+                        assert!(
+                            result.items.iter().any(|item| item.label == label),
+                            "{source}: {result:?}"
+                        );
+                    }
+                }
+                assert_eq!(environment.evaluate_contract(&contract).unwrap(), before);
+            }
+        }
     }
 
     #[test]
