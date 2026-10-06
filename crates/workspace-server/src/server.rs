@@ -29112,9 +29112,28 @@ fn restore_internal_observed_worker(
         explicit.then_some(request_id.as_str()),
     )?;
     let request_id = request.request_id.clone();
-    let result =
-        WorkspaceWorker::resolve(api, &observed.worker.runtime_id, &observed.worker.worker_id)?
-            .restore_internal(request)?;
+    let result = match WorkspaceWorker::resolve(
+        api,
+        &observed.worker.runtime_id,
+        &observed.worker.worker_id,
+    )?
+    .restore_internal(request)
+    {
+        Ok(result) => result,
+        Err(error) => {
+            // A definitive non-admission conflict is not unknown delivery. Retire
+            // only this pinned intent, without retrying it or exchanging its
+            // observation. A later deliberate invocation may observe anew.
+            if matches!(error.error, Error::RestoreObservationConflict) {
+                api.config_store.settle_internal_worker_restore_intent(
+                    api.workspace_id(),
+                    &observed.worker,
+                    &request_id,
+                )?;
+            }
+            return Err(error);
+        }
+    };
     if result.state != server_api::WorkerRestoreState::ReconciliationRequired {
         api.config_store.settle_internal_worker_restore_intent(
             api.workspace_id(),

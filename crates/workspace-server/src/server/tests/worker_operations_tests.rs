@@ -1280,6 +1280,181 @@ async fn restore_guard_pending_recovery_ignores_new_eligibility_and_reuses_opera
 }
 
 #[tokio::test]
+async fn restore_guard_internal_stale_conflict_retires_intent_for_later_explicit_restore() {
+    let workspace = tempfile::tempdir().unwrap();
+    let (mut api, execution) = test_api_with_recording_backend(workspace.path()).await;
+    execution.accept_restores();
+    for domain in ["orchestrator-restore", "subject-restore"] {
+        let identity = spawn_ticket_check_source(&api, domain);
+        let handle =
+            WorkspaceWorker::resolve(&api, &identity.runtime_id, &identity.worker_id).unwrap();
+        handle
+            .stop(&WorkerOperationContext::Backend, operation_lifecycle())
+            .await
+            .unwrap();
+        let observed = api.runtime.worker(&identity).unwrap();
+        let pinned = api
+            .config_store
+            .pin_internal_worker_restore_intent(
+                api.workspace_id(),
+                &identity,
+                domain,
+                observed.restore_observation_token.as_deref(),
+                None,
+            )
+            .unwrap();
+        // A distinct operation wins between the internal observation/pin and admission.
+        let competing = restore_request_for(&api, &identity, &format!("{domain}-competing"));
+        assert_eq!(
+            handle
+                .restore(&WorkerOperationContext::Backend, competing)
+                .await
+                .unwrap()
+                .state,
+            server_api::WorkerRestoreState::Accepted
+        );
+        handle
+            .stop(&WorkerOperationContext::Backend, operation_lifecycle())
+            .await
+            .unwrap();
+        let count = execution.restore_operations.lock().unwrap().len();
+        let error = restore_internal_worker_intent(&api, &identity, domain.into()).unwrap_err();
+        assert!(matches!(error.error, Error::RestoreObservationConflict));
+        assert_eq!(
+            execution.restore_operations.lock().unwrap().len(),
+            count,
+            "a conflict must not automatically exchange observation and retry"
+        );
+        assert_eq!(api.runtime.worker(&identity).unwrap().state, "stopped");
+        // Retirement, unlike in-memory refresh, must survive caller journal restart.
+        api.config_store =
+            Arc::new(SqliteWorkspaceStore::open(api.config.database_path.clone()).unwrap());
+        let fresh = api.runtime.worker(&identity).unwrap();
+        let next = api
+            .config_store
+            .pin_internal_worker_restore_intent(
+                api.workspace_id(),
+                &identity,
+                domain,
+                fresh.restore_observation_token.as_deref(),
+                None,
+            )
+            .unwrap();
+        assert_ne!(pinned.request_id, next.request_id);
+        assert_ne!(
+            pinned.expected_observation_token,
+            next.expected_observation_token
+        );
+        assert_eq!(
+            next.expected_observation_token,
+            fresh.restore_observation_token.unwrap()
+        );
+        // Only this separate deliberate invocation dispatches the new intent.
+        assert_eq!(
+            restore_internal_worker_intent(&api, &identity, domain.into())
+                .unwrap()
+                .state,
+            server_api::WorkerRestoreState::Accepted
+        );
+        assert_eq!(
+            execution.restore_operations.lock().unwrap().len(),
+            count + 1
+        );
+        // Explicit historical identity is immutable, never rewritten to the new token.
+        let original = api
+            .config_store
+            .pin_internal_worker_restore_intent(
+                api.workspace_id(),
+                &identity,
+                domain,
+                None,
+                Some(&pinned.request_id),
+            )
+            .unwrap();
+        assert_eq!(original, pinned);
+    }
+}
+
+#[tokio::test]
+async fn restore_guard_internal_conflict_same_generation_has_distinct_fresh_intents() {
+    let workspace = tempfile::tempdir().unwrap();
+    let (api, execution) = test_api_with_recording_backend(workspace.path()).await;
+    execution.accept_restores();
+    let identity = spawn_ticket_check_source(&api, "internal-other-owner-pending");
+    let handle = WorkspaceWorker::resolve(&api, &identity.runtime_id, &identity.worker_id).unwrap();
+    handle
+        .stop(&WorkerOperationContext::Backend, operation_lifecycle())
+        .await
+        .unwrap();
+    let original = restore_request_for(&api, &identity, "original-pending-owner");
+    *execution.restore_failure.lock().unwrap() = Some(
+        worker_runtime::execution::WorkerExecutionSpawnResult::Errored(
+            worker_runtime::execution::WorkerExecutionResult::errored(
+                worker_runtime::execution::WorkerExecutionOperation::Restore,
+                "unknown delivery",
+            ),
+        ),
+    );
+    assert_eq!(
+        handle
+            .restore(&WorkerOperationContext::Backend, original.clone())
+            .await
+            .unwrap()
+            .state,
+        server_api::WorkerRestoreState::ReconciliationRequired
+    );
+    let operation = execution.restore_operations.lock().unwrap()[0];
+    let observed = api.runtime.worker(&identity).unwrap();
+    let count = execution.restore_operations.lock().unwrap().len();
+    for domain in ["orchestrator-restore", "subject-restore"] {
+        let mut prior = None;
+        for _ in 0..2 {
+            let pinned = api
+                .config_store
+                .pin_internal_worker_restore_intent(
+                    api.workspace_id(),
+                    &identity,
+                    domain,
+                    observed.restore_observation_token.as_deref(),
+                    None,
+                )
+                .unwrap();
+            if let Some(prior) = prior.replace(pinned.clone()) {
+                assert_ne!(pinned.request_id, prior.request_id);
+                assert_eq!(
+                    pinned.expected_observation_token,
+                    prior.expected_observation_token
+                );
+            }
+            let error = restore_internal_worker_intent(&api, &identity, domain.into()).unwrap_err();
+            assert!(matches!(error.error, Error::RestoreObservationConflict));
+            assert_eq!(execution.restore_operations.lock().unwrap().len(), count);
+        }
+    }
+    // Retiring competing rejected intents does not retire or replace an admitted owner.
+    assert_eq!(
+        handle
+            .restore(&WorkerOperationContext::Backend, original)
+            .await
+            .unwrap()
+            .state,
+        server_api::WorkerRestoreState::Accepted
+    );
+    assert_eq!(
+        execution.reconcile_operations.lock().unwrap().as_slice(),
+        &[operation]
+    );
+    assert!(
+        execution
+            .restore_operations
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|id| *id == operation)
+    );
+}
+
+#[tokio::test]
 async fn restore_guard_internal_intent_survives_client_store_restart_without_replacing_token() {
     let workspace = tempfile::tempdir().unwrap();
     let (mut api, execution) = test_api_with_recording_backend(workspace.path()).await;

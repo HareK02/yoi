@@ -43,8 +43,8 @@ Preparation completion is attached to that same pending operation, not a replace
 | Workspace alias, scoped and Worker-control HTTP | Mandatory public request; common target/auth reception and the same Runtime admission |
 | Embedded / remote Runtime providers and management HTTP | Typed Runtime request and coordination transport, including original observation and lifecycle operation owner |
 | `WorkerRestore` Tool | Observed token in Tool arguments and durable Tool-call-derived request identity |
-| Existing TUI Restore/resume path | Selected row's observation token and retained request; no new TUI entrance |
-| Internal Coder, Orchestrator, subject reuse and compensation | Domain intent journal pins the request/token before dispatch and retains it through unknown result and restart; it does not own lifecycle status or bypass Runtime validation |
+| Existing TUI Restore/resume path | Selected row's token and exact request retained through the existing flow. Unknown/pending results refresh Session observation and prompt for an explicit same-tuple retry; cancellation does not retry and reports the original tuple. Conflict exits for fresh selection, never exchanges the failed intent. No new TUI Restore entrance |
+| Internal Coder, Orchestrator, subject reuse and compensation | Domain intent journal pins the request/token before dispatch and retains it through unknown result and restart. A definitive observation conflict retires only that rejected intent without automatic retry; a later deliberate invocation may pin fresh observation with a fresh request ID. It does not own lifecycle status or bypass Runtime validation |
 | Runtime startup / pending reconciliation | Private recovery of the existing persisted Restore owner and operation; not an external unguarded new-intent endpoint |
 
 The Workspace internal intent journal stores client retry identity only. Runtime remains the lifecycle authority; it is not a second Restore state machine, Worker ledger or cross-screen lock.

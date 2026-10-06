@@ -2196,7 +2196,11 @@ impl SqliteWorkspaceStore {
                 return Ok(server_api::WorkerRestoreRequest { request_id, expected_observation_token });
             }
             let observed_token = observed_token.ok_or(Error::RestoreObservationConflict)?;
-            let request_id = explicit_request_id.map(str::to_owned).unwrap_or_else(|| format!("{domain_key}:{observed_token}"));
+            // A separate deliberate invocation after a settled conflict may
+            // still observe the same generation (e.g. another owner is pending).
+            // Give it a new identity rather than colliding with a retired row;
+            // retries of unsettled delivery always return the pinned tuple above.
+            let request_id = explicit_request_id.map(str::to_owned).unwrap_or_else(|| format!("{domain_key}:{}", uuid::Uuid::now_v7()));
             tx.execute("INSERT INTO worker_restore_intents(workspace_id,runtime_id,worker_id,domain_key,request_id,expected_token,settled) VALUES(?1,?2,?3,?4,?5,?6,0)",
                 params![workspace_id, worker.runtime_id, worker.worker_id, domain_key, request_id, observed_token])?;
             Ok(server_api::WorkerRestoreRequest { request_id, expected_observation_token: observed_token.to_owned() })
