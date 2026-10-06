@@ -187,7 +187,7 @@ function parseContribution(value: unknown): ConfigSchemaContribution {
   const item = record(
     value,
     ["provider_id", "namespace", "version", "source", "source_digest"],
-    ["projection_validator"],
+    ["projection_validator", "authoring_source"],
   );
   const projection = item.projection_validator === undefined
     ? undefined
@@ -197,6 +197,12 @@ function parseContribution(value: unknown): ConfigSchemaContribution {
     namespace: boundedString(item.namespace),
     version: boundedString(item.version),
     source: boundedString(item.source, MAX_SCHEMA_SOURCE_BYTES),
+    ...(item.authoring_source === undefined ? {} : {
+      authoring_source: boundedString(
+        item.authoring_source,
+        MAX_SCHEMA_SOURCE_BYTES,
+      ),
+    }),
     ...(projection === undefined ? {} : { projection_validator: projection }),
     source_digest: boundedString(item.source_digest, MAX_DIGEST_BYTES),
   };

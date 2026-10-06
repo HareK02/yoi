@@ -244,3 +244,41 @@ Deno.test("config source API surfaces bounded failed evaluation details", async 
   }
   assert(message.includes("structured diagnostics"));
 });
+
+Deno.test("config source API carries bounded optional authoring schemas without changing validation source", () => {
+  const body = withSchema("validation");
+  const authoringSource = "shape\n".repeat(6000);
+  const contribution = {
+    ...body.contract.schema_bundle.contributions[0],
+    authoring_source: authoringSource,
+  };
+  const withAuthoring = {
+    ...body,
+    contract: {
+      ...body.contract,
+      schema_bundle: {
+        ...body.contract.schema_bundle,
+        contributions: [contribution],
+      },
+    },
+  };
+  const parsed = parseWorkspaceConfigTreeResponse(withAuthoring);
+  assertEquals(
+    parsed.contract.schema_bundle.contributions[0].authoring_source,
+    authoringSource,
+  );
+  assertEquals(parsed.contract.schema_bundle.source, "validation");
+  for (const invalid of [null, 42, {}, "é".repeat(4 * 1024 * 1024) + "x"]) {
+    assertThrows(() =>
+      parseWorkspaceConfigTreeResponse({
+        ...withAuthoring,
+        contract: {
+          ...body.contract,
+          schema_bundle: {
+            ...body.contract.schema_bundle,
+            contributions: [{ ...contribution, authoring_source: invalid }],
+          },
+        },
+      }), ConfigSourceApiError);
+  }
+});

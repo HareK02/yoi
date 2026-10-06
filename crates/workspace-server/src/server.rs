@@ -12321,6 +12321,7 @@ fn config_schema_bundle_to_api(
                 namespace: contribution.namespace,
                 version: contribution.version,
                 source: contribution.source,
+                authoring_source: contribution.authoring_source,
                 projection_validator: contribution
                     .projection_validator
                     .map(config_projection_validator_to_api),
@@ -31976,6 +31977,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     mod subjektiv_jobs_tests;
+    mod value_profiles_tests;
     mod worker_operations_tests;
     include!("server_workspace_config_tests.rs");
     use super::*;

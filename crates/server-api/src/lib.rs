@@ -4496,6 +4496,10 @@ pub struct ConfigSchemaContribution {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub projection_validator: Option<ConfigProjectionValidator>,
+    /// Completion-only shape for partial values; never materialized as defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub authoring_source: Option<String>,
     pub source_digest: String,
 }
 
