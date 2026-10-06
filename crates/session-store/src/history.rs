@@ -40,6 +40,8 @@ pub struct LoggedWorkerSubject {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LoggedSessionHistoryOrigin {
+    /// Human input verified by the standalone Host, without a Backend Account.
+    LocalHumanInput,
     HumanInput {
         account_id: String,
     },

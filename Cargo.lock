@@ -1397,6 +1397,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
+name = "feature-storage"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "ff"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4634,15 +4644,20 @@ dependencies = [
  "agen",
  "async-trait",
  "client",
+ "feature-storage",
  "fs4",
  "futures",
  "job",
+ "libc",
  "manifest",
+ "memory",
  "protocol",
  "rusqlite",
  "serde",
  "serde_json",
+ "server-api",
  "session-store",
+ "subjektiv",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -4717,6 +4732,23 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "subjektiv"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "feature-storage",
+ "manifest",
+ "memory",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "server-api",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
 ]
 
 [[package]]
@@ -6583,6 +6615,7 @@ dependencies = [
  "server-api",
  "session-analytics",
  "session-store",
+ "standalone",
  "tempfile",
  "ticket",
  "tokio",
@@ -6627,6 +6660,7 @@ dependencies = [
  "axum",
  "chrono",
  "config-source",
+ "feature-storage",
  "flow",
  "futures",
  "job",
@@ -6646,6 +6680,7 @@ dependencies = [
  "session-store",
  "sha2 0.11.0",
  "ssh-key",
+ "subjektiv",
  "tempfile",
  "thiserror 2.0.18",
  "ticket",

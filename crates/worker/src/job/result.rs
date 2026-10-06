@@ -23,6 +23,29 @@ pub trait JobResultSink: Send + Sync {
     fn submit(&self, submission: ::job::JobResultSubmission) -> Result<(), String>;
 }
 
+/// Consumer-owned asynchronous completion before durable result acceptance.
+/// The generic runner owns no domain algorithms. This runs in the result tool,
+/// never an orphaned background task, with the selected policy/model and a
+/// cancellation token that must propagate into any child resource cleanup.
+#[async_trait]
+pub trait JobResultFinalizer: Send + Sync {
+    fn validate_profile(&self, manifest: &manifest::WorkerManifest) -> Result<(), String>;
+    async fn finalize(
+        &self,
+        result: Value,
+        manifest: manifest::WorkerManifest,
+        client: Box<dyn agen::llm_client::LlmClient>,
+        cancellation: crate::feature::background::BackgroundTaskCancellation,
+    ) -> Result<Value, ToolError>;
+}
+
+#[derive(Clone)]
+struct FinalizerContext {
+    finalizer: Arc<dyn JobResultFinalizer>,
+    manifest: manifest::WorkerManifest,
+    client: Box<dyn agen::llm_client::LlmClient>,
+}
+
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SubmitJobResultInput {
@@ -32,6 +55,7 @@ struct SubmitJobResultInput {
 #[derive(Default)]
 struct SubmissionState {
     sealed: Option<Value>,
+    prepared: Option<Value>,
     unconfirmed: Option<String>,
 }
 
@@ -46,6 +70,9 @@ pub struct JobResultFeature {
     state: Arc<Mutex<SubmissionState>>,
     accepted: Arc<Mutex<Option<::job::JobResultSubmission>>>,
     cancelled: Arc<Mutex<HashSet<String>>>,
+    serial: Arc<tokio::sync::Mutex<()>>,
+    cancellation: crate::feature::background::BackgroundTaskCancellation,
+    finalizer: Option<FinalizerContext>,
 }
 
 impl JobResultFeature {
@@ -65,7 +92,24 @@ impl JobResultFeature {
             state: Arc::default(),
             accepted: Arc::default(),
             cancelled: Arc::default(),
+            serial: Arc::default(),
+            cancellation: Default::default(),
+            finalizer: None,
         })
+    }
+
+    pub fn with_finalizer(
+        mut self,
+        finalizer: Arc<dyn JobResultFinalizer>,
+        manifest: manifest::WorkerManifest,
+        client: Box<dyn agen::llm_client::LlmClient>,
+    ) -> Self {
+        self.finalizer = Some(FinalizerContext {
+            finalizer,
+            manifest,
+            client,
+        });
+        self
     }
 
     pub(super) fn accepted(&self) -> Arc<Mutex<Option<::job::JobResultSubmission>>> {
@@ -107,6 +151,44 @@ impl Tool for JobResultFeature {
             .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
         ::job::result_digest(&input.result, self.max_result_bytes)
             .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
+        let _serial = self.serial.lock().await;
+        if self.cancellation.is_cancelled() {
+            return Err(ToolError::Cancelled(ToolOutput {
+                summary: "Job result submission cancelled".into(),
+                content: None,
+                attachments: vec![],
+            }));
+        }
+        let cached = {
+            let state = self.state.lock().expect("Job submission state poisoned");
+            if state
+                .sealed
+                .as_ref()
+                .is_some_and(|sealed| sealed != &input.result)
+            {
+                return Err(ToolError::InvalidArgument(
+                    "Job result is sealed; retry only the identical result".into(),
+                ));
+            }
+            state.prepared.clone()
+        };
+        let prepared = if let Some(value) = cached {
+            value
+        } else if let Some(finalizer) = &self.finalizer {
+            finalizer
+                .finalizer
+                .finalize(
+                    input.result.clone(),
+                    finalizer.manifest.clone(),
+                    finalizer.client.clone_boxed(),
+                    self.cancellation.clone(),
+                )
+                .await?
+        } else {
+            input.result.clone()
+        };
+        ::job::result_digest(&prepared, self.max_result_bytes)
+            .map_err(|e| ToolError::InvalidArgument(e.to_string()))?;
         let mut state = self.state.lock().expect("Job submission state poisoned");
         if self
             .cancelled
@@ -129,12 +211,13 @@ impl Tool for JobResultFeature {
         } else {
             // Seal before dispatch: a sink error can follow durable Host acceptance.
             state.sealed = Some(input.result.clone());
+            state.prepared = Some(prepared.clone());
         }
         let submission = ::job::JobResultSubmission {
             job_id: self.job_id.clone(),
             attempt_id: self.attempt_id.clone(),
             input_revision: self.input_revision.clone(),
-            result: input.result,
+            result: prepared,
         };
         let mut accepted = self.accepted.lock().expect("Job result state poisoned");
         if accepted.is_none() {
@@ -156,6 +239,7 @@ impl Tool for JobResultFeature {
     }
 
     async fn cancel_execution(&self, context: &ToolExecutionContext) -> Result<(), ToolError> {
+        self.cancellation.cancel();
         self.cancelled
             .lock()
             .expect("Job cancellation state poisoned")

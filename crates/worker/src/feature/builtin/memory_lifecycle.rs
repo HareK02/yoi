@@ -101,6 +101,7 @@ struct MemoryLifecycleTask {
     capture: CommittedSessionCaptureHandle,
     extensions: SessionExtensionHandle,
     workspace_client: Arc<dyn WorkspaceClient>,
+    subjektiv_host: Option<crate::subjektiv::SubjektivHostConnection>,
     manifest: WorkerManifest,
     client: Box<dyn LlmClient>,
     prompts: Arc<ArcSwap<PromptCatalog>>,
@@ -175,6 +176,7 @@ impl MemoryLifecycleFeature {
                 capture,
                 extensions,
                 workspace_client,
+                subjektiv_host: None,
                 manifest,
                 client,
                 prompts,
@@ -192,32 +194,34 @@ impl SubjektivLifecycleFeature {
         config: manifest::ResolvedSubjektivFeatureConfig,
         capture: CommittedSessionCaptureHandle,
         extensions: SessionExtensionHandle,
-        workspace_client: Arc<dyn WorkspaceClient>,
+        host: Option<crate::subjektiv::SubjektivHostConnection>,
         manifest: WorkerManifest,
         client: Box<dyn LlmClient>,
         prompts: Arc<ArcSwap<PromptCatalog>>,
         workspace_context: WorkerWorkspaceContext,
         event_tx: Option<broadcast::Sender<Event>>,
     ) -> std::io::Result<Option<Self>> {
-        if !lifecycle_enabled || !config.execution_enabled() || !config.profile.extraction.enabled {
+        if !lifecycle_enabled
+            || !config.profile.enabled
+            || host.is_none()
+            || !config.profile.extraction.enabled
+        {
             return Ok(None);
         }
         config
             .validate_execution()
             .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
-        if !workspace_client.is_available() || workspace_client.workspace_id().is_none() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "subjektiv extraction requires Backend Workspace API authority",
-            ));
-        }
         Ok(Some(Self {
             task: MemoryLifecycleTask {
                 config: LifecycleConfig::from_subjektiv(config),
                 target: ExtractionTarget::Subjektiv,
                 capture,
                 extensions,
-                workspace_client,
+                workspace_client: crate::unavailable_workspace_client(
+                    None,
+                    "subjektiv Host has no legacy Memory authority",
+                ),
+                subjektiv_host: host,
                 manifest,
                 client,
                 prompts,
@@ -477,10 +481,11 @@ impl MemoryLifecycleTask {
             ),
             ExtractionTarget::Subjektiv => MemoryStagingOutputState::new_subjektiv(
                 view.clone(),
-                Arc::clone(&self.workspace_client),
+                self.subjektiv_host
+                    .clone()
+                    .expect("subjektiv task has Host connection"),
                 source,
                 audit.run_id.to_string(),
-                capture.session_id.clone(),
             ),
         };
         let client = if let Some(model) = self.config.extraction.model.as_ref() {
@@ -499,6 +504,11 @@ impl MemoryLifecycleTask {
             .config
             .workspace_settings()
             .map(|snapshot| snapshot.language)
+            .or_else(|| {
+                self.subjektiv_host
+                    .as_ref()
+                    .map(|host| host.host.settings().language)
+            })
         else {
             self.record_preparation_failure(
                 &audit,
@@ -737,13 +747,24 @@ impl MemoryLifecycleTask {
         .with_workspace_settings(self.config.workspace_settings.as_ref());
         let operation = memory::backend::MemoryConsolidateStagingOperation { force: false };
         let request = if subjektiv {
-            self.workspace_client
-                .request_subjektiv_memory_staging_consolidation(operation)
-                .await
+            let host = self
+                .subjektiv_host
+                .as_ref()
+                .expect("subjektiv task has Host connection");
+            host.host
+                .request_consolidation(&host.context, operation)
+                .map_err(|error| {
+                    super::memory::WorkspaceMemoryBackendError::Backend(error.to_string())
+                })
         } else {
             self.workspace_client
                 .request_memory_staging_consolidation(operation)
                 .await
+        };
+        let audit = if subjektiv {
+            audit.without_legacy_backend()
+        } else {
+            audit
         };
         match request {
             Ok(output) => {
@@ -1319,6 +1340,7 @@ permission = "write"
             capture: capture_handle,
             extensions,
             workspace_client,
+            subjektiv_host: None,
             manifest: test_manifest(),
             client,
             prompts: Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap())),
@@ -1379,7 +1401,7 @@ permission = "write"
             manifest::ResolvedSubjektivFeatureConfig::default(),
             capture,
             extensions,
-            crate::worker::marker_workspace_client(None, "disabled"),
+            None,
             test_manifest(),
             Box::new(ScriptClient::new(Vec::new())),
             Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap())),
@@ -1407,7 +1429,7 @@ permission = "write"
             config,
             capture,
             extensions,
-            crate::worker::marker_workspace_client(None, "extraction-disabled"),
+            None,
             test_manifest(),
             Box::new(ScriptClient::new(Vec::new())),
             Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap())),
@@ -1444,7 +1466,7 @@ permission = "write"
             config,
             capture,
             extensions,
-            crate::worker::marker_workspace_client(None, "child-disabled"),
+            None,
             test_manifest(),
             Box::new(ScriptClient::new(Vec::new())),
             Arc::new(ArcSwap::from(PromptCatalog::builtins_only().unwrap())),
@@ -1593,6 +1615,9 @@ permission = "write"
             workspace_client.clone(),
         );
         task.target = ExtractionTarget::Subjektiv;
+        task.subjektiv_host = Some(crate::subjektiv::test_connection(
+            task.workspace_client.clone(),
+        ));
         task.config.consolidation_request_enabled = false;
         run_background_task(task).await;
 
@@ -1647,6 +1672,9 @@ permission = "write"
             workspace_client.clone(),
         );
         task.target = ExtractionTarget::Subjektiv;
+        task.subjektiv_host = Some(crate::subjektiv::test_connection(
+            task.workspace_client.clone(),
+        ));
         task.config.consolidation_request_enabled = false;
         run_background_task(task).await;
 
@@ -1689,6 +1717,9 @@ permission = "write"
             workspace_client.clone(),
         );
         task.target = ExtractionTarget::Subjektiv;
+        task.subjektiv_host = Some(crate::subjektiv::test_connection(
+            task.workspace_client.clone(),
+        ));
         task.config.consolidation_request_enabled = false;
         run_background_task(task).await;
 
@@ -1806,6 +1837,9 @@ permission = "write"
             workspace_client.clone(),
         );
         task.target = ExtractionTarget::Subjektiv;
+        task.subjektiv_host = Some(crate::subjektiv::test_connection(
+            task.workspace_client.clone(),
+        ));
         task.config.consolidation_request_enabled = false;
         let registry = start_background_task(task);
         tokio::time::timeout(Duration::from_secs(5), async {

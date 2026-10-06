@@ -11,16 +11,20 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use server_api::{
     SUBJEKTIV_SESSION_MAX_TOOL_CONTENT_BYTES, SubjektivSessionBackendOperation,
-    SubjektivSessionBackendRequest, SubjektivSessionBackendResponse, SubjektivSessionBackendResult,
-    SubjektivSessionDiagnosticCode, SubjektivSessionErrorResponse, SubjektivSessionListRequest,
-    SubjektivSessionReadRequest, SubjektivSessionSearchRequest,
+    SubjektivSessionBackendResponse, SubjektivSessionBackendResult, SubjektivSessionDiagnosticCode,
+    SubjektivSessionErrorResponse, SubjektivSessionListRequest, SubjektivSessionReadRequest,
+    SubjektivSessionSearchRequest,
 };
 
 use crate::feature::{
     FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureModule, ToolContribution,
     ToolDeclaration,
 };
-use crate::worker::{WorkspaceClient, WorkspaceServerOperation};
+use crate::subjektiv::SubjektivHostConnection;
+#[cfg(test)]
+use crate::worker::WorkspaceClient;
+#[cfg(test)]
+use server_api::SubjektivSessionBackendRequest;
 
 const LIST_TOOL: &str = "SubjektivSessionList";
 const SEARCH_TOOL: &str = "SubjektivSessionSearch";
@@ -37,28 +41,23 @@ pub(crate) struct SubjektivSessionFeature {
 
 #[derive(Clone)]
 struct SubjektivSessionState {
-    client: Arc<dyn WorkspaceClient>,
+    host: SubjektivHostConnection,
 }
 
 impl SubjektivSessionFeature {
     pub(crate) fn from_resolved_config(
         config: &manifest::ResolvedSubjektivFeatureConfig,
-        client: Arc<dyn WorkspaceClient>,
+        host: Option<SubjektivHostConnection>,
     ) -> std::io::Result<Option<Self>> {
-        if !config.execution_enabled() {
+        if !config.profile.enabled || host.is_none() {
             return Ok(None);
         }
         config
             .validate_execution()
             .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
-        if !client.is_available() || client.workspace_id().is_none() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "subjektiv Session tools require Backend Workspace API authority",
-            ));
-        }
+        let host = host.expect("checked explicit connection");
         Ok(Some(Self {
-            state: SubjektivSessionState { client },
+            state: SubjektivSessionState { host },
         }))
     }
 }
@@ -154,25 +153,7 @@ impl SubjektivSessionState {
         &self,
         operation: SubjektivSessionBackendOperation,
     ) -> Result<SubjektivSessionBackendResponse, ToolError> {
-        let response = self
-            .client
-            .execute_server_operation(WorkspaceServerOperation::SubjektivSession(
-                SubjektivSessionBackendRequest { operation },
-            ))
-            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
-
-        if let Ok(response) =
-            serde_json::from_str::<SubjektivSessionBackendResponse>(&response.body)
-        {
-            return Ok(response);
-        }
-        let detail = serde_json::from_str::<server_api::RepositoryApiError>(&response.body)
-            .map(|error| error.message)
-            .unwrap_or(response.body);
-        Err(ToolError::ExecutionFailed(format!(
-            "subjektiv Session backend returned HTTP {}: {detail}",
-            response.status
-        )))
+        self.host.session(operation).map_err(Into::into)
     }
 }
 
@@ -293,7 +274,9 @@ mod tests {
     }
 
     fn state(client: Arc<dyn WorkspaceClient>) -> SubjektivSessionState {
-        SubjektivSessionState { client }
+        SubjektivSessionState {
+            host: crate::subjektiv::test_connection(client),
+        }
     }
 
     fn feature(client: Arc<dyn WorkspaceClient>) -> SubjektivSessionFeature {
@@ -363,7 +346,9 @@ mod tests {
         let config = manifest::ResolvedSubjektivFeatureConfig::default();
         let result = SubjektivSessionFeature::from_resolved_config(
             &config,
-            Arc::new(SessionToolClient::new(list_response())),
+            Some(crate::subjektiv::test_connection(Arc::new(
+                SessionToolClient::new(list_response()),
+            ))),
         )
         .unwrap();
         assert!(result.is_none());

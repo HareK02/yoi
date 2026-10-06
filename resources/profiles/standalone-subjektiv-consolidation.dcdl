@@ -1,0 +1,8 @@
+import "./job.dcdl" // {
+    slug = "standalone-subjektiv-consolidation";
+    description = "Subject consolidation policy; local Host grants a bounded batch, not body authority.";
+    engine = { instruction = "internal.subjektiv_memory_consolidation_system"; };
+    feature = {
+        subjektiv = { enabled = true; consolidation_tools = true; extraction = { enabled = false; }; };
+    };
+}

@@ -1,14 +1,21 @@
 //! Scripted in-process model executions, not provider/process tests.
 use super::*;
+use crate::feature::background::BackgroundTaskCancellation;
+use crate::feature::{
+    FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureModule, ToolContribution,
+    ToolDeclaration,
+};
 use agen::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use agen::llm_client::{ClientError, Request};
 use agen::tool::{Tool, ToolExecutionContext};
+use agen::tool::{ToolError, ToolOutput};
 use async_trait::async_trait;
 use futures::Stream;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[derive(Clone)]
 struct ScriptedClient {
@@ -590,6 +597,458 @@ fn unknown_prompt_and_model_are_not_substituted_even_with_injected_client() {
             assert!(matches!(error, JobExecutionError::Model(_)), "{error}");
         }
     }
+}
+
+// A domain capability is issued by the Host, never by the selected Profile.
+#[derive(Clone, Default)]
+struct GrantedTool(Arc<AtomicUsize>);
+#[async_trait]
+impl Tool for GrantedTool {
+    async fn execute(&self, _: &str, _: ToolExecutionContext) -> Result<ToolOutput, ToolError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolOutput {
+            summary: "granted".into(),
+            content: None,
+            attachments: vec![],
+        })
+    }
+}
+impl FeatureModule for GrantedTool {
+    fn descriptor(&self) -> FeatureDescriptor {
+        FeatureDescriptor::builtin("test-job-domain", "Test domain").with_tool(
+            ToolDeclaration::new("GrantedDomainTool", "Explicit Host capability"),
+        )
+    }
+    fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
+        let tool = self.clone();
+        context.tools().register(ToolContribution::new(
+            "GrantedDomainTool",
+            Arc::new(move || {
+                (
+                    agen::tool::ToolMeta::new("GrantedDomainTool"),
+                    Arc::new(tool.clone()) as Arc<dyn Tool>,
+                )
+            }),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn domain_grant_is_explicit_not_profile_derived_and_preserves_selected_policy() {
+    let root = tempfile::tempdir().unwrap();
+    let mut profile = artifact("internal.flow_verifier_system", 100000, 1000);
+    profile["feature"] = json!({"task":{"enabled":true}});
+    let registry = registry(root.path(), profile.clone(), profile);
+    let marker = GrantedTool::default();
+    for selector in ["user:a", "user:b", "default"] {
+        assert!(matches!(
+            prepare_job_from_registry(
+                &request(selector),
+                root.path(),
+                Some(Box::new(ScriptedClient::new(vec![]))),
+                &registry,
+            ),
+            Err(JobExecutionError::UnsupportedProfile(_))
+        ));
+        let client = ScriptedClient::new(vec![
+            call("GrantedDomainTool", json!({})),
+            call(SUBMIT_JOB_RESULT_TOOL, json!({"result":true})),
+            prose(),
+        ]);
+        let job = prepare_job_from_registry_with_grant(
+            &request(selector),
+            root.path(),
+            Some(Box::new(client.clone())),
+            &registry,
+            JobFeatureGrant {
+                features: FeatureRegistryBuilder::new().with_module(marker.clone()),
+                satisfied_requirements: vec!["feature.task"],
+                finalizer: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            job.manifest.model.model_id.as_deref(),
+            Some("scripted-model")
+        );
+        assert_eq!(
+            job.manifest.engine.instruction,
+            "internal.flow_verifier_system"
+        );
+        assert_eq!(job.manifest.engine.max_turns.unwrap().get(), MAX_JOB_TURNS);
+        assert_eq!(job.manifest.engine.max_tokens, Some(MAX_JOB_TOKENS));
+        assert!(job.manifest.scope.allow.is_empty());
+        assert!(job.manifest.delegation_scope.allow.is_empty());
+        job.run("attempt".into(), Arc::new(RecordingSink::default()), |_| {})
+            .await
+            .unwrap();
+        for sent in client.requests.lock().unwrap().iter() {
+            let mut names = sent
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>();
+            names.sort();
+            assert_eq!(names, ["GrantedDomainTool", SUBMIT_JOB_RESULT_TOOL]);
+            assert_eq!(sent.config.max_tokens, Some(MAX_JOB_TOKENS));
+        }
+    }
+    assert_eq!(marker.0.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn domain_grant_does_not_satisfy_unrelated_profile_requirements() {
+    let root = tempfile::tempdir().unwrap();
+    for (key, value, needle) in [
+        (
+            "feature",
+            json!({"task":{"enabled":true},"web":{"enabled":true}}),
+            "feature.web",
+        ),
+        ("scope", json!("workspace_read"), "scope"),
+        (
+            "delegation_scope",
+            json!("workspace_write"),
+            "delegation_scope",
+        ),
+    ] {
+        let mut profile = artifact("default", 512, 3);
+        profile[key] = value;
+        let registry = registry(root.path(), profile.clone(), profile);
+        let error = prepare_job_from_registry_with_grant(
+            &request("user:a"),
+            root.path(),
+            Some(Box::new(ScriptedClient::new(vec![]))),
+            &registry,
+            JobFeatureGrant {
+                features: FeatureRegistryBuilder::new().with_module(GrantedTool::default()),
+                satisfied_requirements: vec!["feature.task"],
+                finalizer: None,
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(
+            matches!(error, JobExecutionError::UnsupportedProfile(_)),
+            "{error}"
+        );
+        assert!(error.to_string().contains(needle), "{error}");
+    }
+}
+
+#[derive(Default)]
+struct ControlledFinalizer {
+    calls: AtomicUsize,
+    active: Arc<AtomicUsize>,
+    manifests: Mutex<Vec<manifest::WorkerManifest>>,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    cancellation_seen: tokio::sync::Notify,
+    cleanup: tokio::sync::Notify,
+    cancelled: AtomicBool,
+    gated: bool,
+    // Reusing a captured request with the supplied client proves transport identity.
+    probe: Option<Arc<Mutex<Vec<Request>>>>,
+    reject_profile: bool,
+}
+struct FinalizerResource(Arc<AtomicUsize>);
+impl Drop for FinalizerResource {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+#[async_trait]
+impl JobResultFinalizer for ControlledFinalizer {
+    fn validate_profile(&self, _: &manifest::WorkerManifest) -> Result<(), String> {
+        if self.reject_profile {
+            Err("test finalizer refuses selected policy".into())
+        } else {
+            Ok(())
+        }
+    }
+    async fn finalize(
+        &self,
+        result: Value,
+        manifest: manifest::WorkerManifest,
+        client: Box<dyn LlmClient>,
+        cancellation: BackgroundTaskCancellation,
+    ) -> Result<Value, ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.active.fetch_add(1, Ordering::SeqCst);
+        let _resource = FinalizerResource(self.active.clone());
+        self.manifests.lock().unwrap().push(manifest);
+        if let Some(requests) = &self.probe {
+            let request = requests.lock().unwrap()[0].clone();
+            let events = client
+                .stream(request)
+                .await
+                .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+            let _: Vec<_> = futures::StreamExt::collect(events).await;
+        }
+        self.entered.notify_one();
+        if self.gated {
+            tokio::select! {
+                _ = self.release.notified() => {},
+                _ = cancellation.cancelled() => {
+                    self.cancelled.store(true, Ordering::SeqCst);
+                    self.cancellation_seen.notify_one();
+                    self.cleanup.notified().await;
+                    return Err(ToolError::Cancelled(ToolOutput {
+                        summary: "finalizer cleaned up".into(), content: None, attachments: vec![],
+                    }));
+                }
+            }
+        }
+        Ok(json!({"prepared":result,"completion":self.calls.load(Ordering::SeqCst)}))
+    }
+}
+async fn signalled(notify: &tokio::sync::Notify) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), notify.notified())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn result_finalization_is_awaited_with_selected_model_policy_and_no_orphan_resource() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = registry(
+        root.path(),
+        artifact("default", 777, 4),
+        artifact("default", 512, 3),
+    );
+    let client = ScriptedClient::new(vec![
+        call(SUBMIT_JOB_RESULT_TOOL, json!({"result":{"draft":true}})),
+        prose(),
+        prose(),
+    ]);
+    let finalizer = Arc::new(ControlledFinalizer {
+        gated: true,
+        probe: Some(client.requests.clone()),
+        ..Default::default()
+    });
+    let job = prepare_job_from_registry_with_grant(
+        &request("user:a"),
+        root.path(),
+        Some(Box::new(client.clone())),
+        &registry,
+        JobFeatureGrant {
+            finalizer: Some(finalizer.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let expected = serde_json::to_value(&job.manifest).unwrap();
+    let sink = Arc::new(RecordingSink::default());
+    let recording = sink.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let run = tokio::spawn(async move {
+        job.run("attempt".into(), recording, move |sender| {
+            let _ = tx.send(sender);
+        })
+        .await
+    });
+    let sender = rx.await.unwrap();
+    signalled(&finalizer.entered).await;
+    assert!(!run.is_finished());
+    assert!(
+        sink.0.lock().unwrap().is_empty(),
+        "sink cannot accept an unfinished result"
+    );
+    assert_eq!(finalizer.active.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        serde_json::to_value(&finalizer.manifests.lock().unwrap()[0]).unwrap(),
+        expected
+    );
+    assert_eq!(
+        client.requests.lock().unwrap().len(),
+        2,
+        "finalizer uses the injected selected transport"
+    );
+    finalizer.release.notify_one();
+    let accepted = tokio::time::timeout(std::time::Duration::from_secs(2), run)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        accepted.submission.result,
+        json!({"prepared":{"draft":true},"completion":1})
+    );
+    assert_eq!(sink.0.lock().unwrap().as_slice(), &[accepted.submission]);
+    assert_eq!(finalizer.active.load(Ordering::SeqCst), 0);
+    assert_eq!(finalizer.calls.load(Ordering::SeqCst), 1);
+    assert!(sender.is_closed());
+}
+
+#[tokio::test]
+async fn cancellation_reaches_finalizer_and_runner_waits_for_cleanup_without_acceptance() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = registry(
+        root.path(),
+        artifact("default", 512, 3),
+        artifact("default", 512, 3),
+    );
+    let finalizer = Arc::new(ControlledFinalizer {
+        gated: true,
+        ..Default::default()
+    });
+    let job = prepare_job_from_registry_with_grant(
+        &request("user:a"),
+        root.path(),
+        Some(Box::new(ScriptedClient::new(vec![
+            call(SUBMIT_JOB_RESULT_TOOL, json!({"result":true})),
+            prose(),
+        ]))),
+        &registry,
+        JobFeatureGrant {
+            finalizer: Some(finalizer.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let sink = Arc::new(RecordingSink::default());
+    let recording = sink.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let run = tokio::spawn(async move {
+        job.run("attempt".into(), recording, move |sender| {
+            let _ = tx.send(sender);
+        })
+        .await
+    });
+    let sender = rx.await.unwrap();
+    signalled(&finalizer.entered).await;
+    assert!(sink.0.lock().unwrap().is_empty());
+    sender.send(()).await.unwrap();
+    signalled(&finalizer.cancellation_seen).await;
+    assert!(finalizer.cancelled.load(Ordering::SeqCst));
+    assert!(
+        !run.is_finished(),
+        "cancellation must await consumer resource cleanup"
+    );
+    assert_eq!(finalizer.active.load(Ordering::SeqCst), 1);
+    assert!(sink.0.lock().unwrap().is_empty());
+    finalizer.cleanup.notify_one();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), run)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(outcome, Err(JobExecutionError::Cancelled)),
+        "{outcome:?}"
+    );
+    assert!(sink.0.lock().unwrap().is_empty());
+    assert_eq!(finalizer.active.load(Ordering::SeqCst), 0);
+    assert!(sender.is_closed());
+}
+
+#[test]
+fn finalizer_can_refuse_selected_profile_before_execution() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = registry(
+        root.path(),
+        artifact("default", 512, 3),
+        artifact("default", 512, 3),
+    );
+    let finalizer = Arc::new(ControlledFinalizer {
+        reject_profile: true,
+        ..Default::default()
+    });
+    let client = ScriptedClient::new(vec![]);
+    let error = prepare_job_from_registry_with_grant(
+        &request("user:a"),
+        root.path(),
+        Some(Box::new(client.clone())),
+        &registry,
+        JobFeatureGrant {
+            finalizer: Some(finalizer.clone()),
+            ..Default::default()
+        },
+    )
+    .err()
+    .unwrap();
+    assert!(matches!(error, JobExecutionError::UnsupportedProfile(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("test finalizer refuses selected policy")
+    );
+    assert!(client.requests.lock().unwrap().is_empty());
+    assert_eq!(finalizer.calls.load(Ordering::SeqCst), 0);
+}
+
+#[derive(Default)]
+struct UncertainThenAcceptedSink(Mutex<Vec<::job::JobResultSubmission>>);
+impl JobResultSink for UncertainThenAcceptedSink {
+    fn submit(&self, submission: ::job::JobResultSubmission) -> Result<(), String> {
+        let mut submissions = self.0.lock().unwrap();
+        submissions.push(submission);
+        if submissions.len() == 1 {
+            Err("durable acceptance is uncertain".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[tokio::test]
+async fn exact_uncertain_sink_retry_reuses_prepared_outcome_without_rerunning_finalizer() {
+    let root = tempfile::tempdir().unwrap();
+    let job = prepared(root.path(), &request("user:a"), ScriptedClient::new(vec![]));
+    let finalizer = Arc::new(ControlledFinalizer::default());
+    let sink = Arc::new(UncertainThenAcceptedSink::default());
+    let feature = JobResultFeature::new(&request("user:a"), "attempt".into(), sink.clone())
+        .unwrap()
+        .with_finalizer(finalizer.clone(), job.manifest, job.client);
+    assert!(
+        feature
+            .execute(
+                r#"{"result":{"draft":true}}"#,
+                ToolExecutionContext::direct()
+            )
+            .await
+            .is_err()
+    );
+    assert!(feature.unconfirmed().is_some());
+    assert!(feature.accepted().lock().unwrap().is_none());
+    assert_eq!(finalizer.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        feature
+            .execute(
+                r#"{"result":{"draft":false}}"#,
+                ToolExecutionContext::direct()
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(sink.0.lock().unwrap().len(), 1);
+    feature
+        .execute(
+            r#"{"result":{"draft":true}}"#,
+            ToolExecutionContext::direct(),
+        )
+        .await
+        .unwrap();
+    feature
+        .execute(
+            r#"{"result":{"draft":true}}"#,
+            ToolExecutionContext::direct(),
+        )
+        .await
+        .unwrap();
+    assert!(feature.unconfirmed().is_none());
+    let submissions = sink.0.lock().unwrap();
+    assert_eq!(submissions.len(), 2);
+    assert_eq!(submissions[0], submissions[1]);
+    assert_eq!(
+        submissions[0].result,
+        json!({"prepared":{"draft":true},"completion":1})
+    );
+    assert_eq!(
+        feature.accepted().lock().unwrap().as_ref(),
+        Some(&submissions[1])
+    );
+    assert_eq!(finalizer.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(finalizer.active.load(Ordering::SeqCst), 0);
 }
 
 struct UnknownSink(Mutex<Vec<::job::JobResultSubmission>>);

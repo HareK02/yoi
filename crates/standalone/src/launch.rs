@@ -15,6 +15,7 @@ pub struct StandaloneLaunchConfig {
     pub state_dir: PathBuf,
     pub profile: ProfileSelector,
     pub worker_name: String,
+    pub subject_id: Option<String>,
 }
 
 pub struct ResolvedStandaloneLaunch {
@@ -22,6 +23,7 @@ pub struct ResolvedStandaloneLaunch {
     pub state_dir: PathBuf,
     pub profile: ResolvedProfile,
     pub prompt_catalog: PromptCatalogSource,
+    pub subject_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -32,6 +34,10 @@ pub enum StandaloneLaunchError {
     PathProfileUnsupported,
     #[error("the standalone profile could not be resolved")]
     ProfileResolutionFailed,
+    #[error(
+        "local Subject selection requires an enabled, non-consolidator subjektiv Profile and canonical Subject id"
+    )]
+    InvalidSubjectPolicy,
 }
 
 impl StandaloneLaunchConfig {
@@ -46,7 +52,13 @@ impl StandaloneLaunchConfig {
             state_dir: state_dir.into(),
             profile,
             worker_name: worker_name.into(),
+            subject_id: None,
         }
+    }
+
+    pub fn with_subject(mut self, subject_id: String) -> Self {
+        self.subject_id = Some(subject_id);
+        self
     }
 
     /// Resolve only built-in/XDG profile authority and bind standalone scope
@@ -74,12 +86,32 @@ impl StandaloneLaunchConfig {
             .map_err(|_| StandaloneLaunchError::ProfileResolutionFailed)?;
         validate_profile_execution_target(&profile.manifest, ProfileExecutionTarget::Standalone)
             .map_err(|_| StandaloneLaunchError::ProfileResolutionFailed)?;
+        if let Some(id) = &self.subject_id {
+            if !crate::subjektiv::valid_subject_id(id)
+                || !profile.manifest.feature.subjektiv.profile.enabled
+                || profile
+                    .manifest
+                    .feature
+                    .subjektiv
+                    .profile
+                    .consolidation_tools
+                || profile
+                    .manifest
+                    .feature
+                    .subjektiv
+                    .workspace_settings
+                    .is_some()
+            {
+                return Err(StandaloneLaunchError::InvalidSubjectPolicy);
+            }
+        }
 
         Ok(ResolvedStandaloneLaunch {
             cwd,
             state_dir: self.state_dir,
             profile,
             prompt_catalog: PromptCatalogSource::builtins_only(),
+            subject_id: self.subject_id,
         })
     }
 }

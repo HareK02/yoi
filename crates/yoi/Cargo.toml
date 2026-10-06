@@ -20,6 +20,7 @@ server-api = { workspace = true }
 workdir = { workspace = true }
 tokio-tungstenite = { workspace = true }
 session-store = { workspace = true }
+standalone = { workspace = true }
 session-analytics = { workspace = true }
 ticket = { workspace = true }
 tui = { workspace = true }

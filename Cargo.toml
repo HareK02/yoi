@@ -30,6 +30,8 @@ members = [
     "crates/workdir",
     "crates/tui",
     "crates/memory",
+    "crates/feature-storage",
+    "crates/subjektiv",
     "crates/ticket",
     "crates/merge-request",
     "crates/project-record",
@@ -66,6 +68,8 @@ default-members = [
     "crates/workdir",
     "crates/tui",
     "crates/memory",
+    "crates/feature-storage",
+    "crates/subjektiv",
     "crates/ticket",
     "crates/merge-request",
     "crates/project-record",
@@ -93,6 +97,8 @@ manifest = { path = "crates/manifest" }
 mcp = { path = "crates/mcp" }
 lint-common = { path = "crates/lint-common" }
 memory = { path = "crates/memory" }
+feature-storage = { path = "crates/feature-storage" }
+subjektiv = { path = "crates/subjektiv" }
 merge-request = { path = "crates/merge-request" }
 ticket = { path = "crates/ticket" }
 project-record = { path = "crates/project-record" }

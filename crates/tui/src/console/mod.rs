@@ -457,20 +457,21 @@ pub(crate) async fn run_standalone(
     state_dir: PathBuf,
     worker_name: Option<String>,
     profile: Option<String>,
+    subject_id: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let worker_name = worker_name.unwrap_or_else(|| "local".to_string());
     let profile = profile.map_or(manifest::ProfileSelector::Default, |profile| {
         manifest::ProfileSelector::parse_cli(&profile)
     });
     let history_root = workspace_root.clone();
-    let launch = StandaloneLaunchConfig {
-        state_dir,
-        cwd: workspace_root,
-        profile,
-        worker_name: worker_name.clone(),
-    }
-    .resolve()
-    .map_err(|error| {
+    let launch =
+        StandaloneLaunchConfig::new(workspace_root, state_dir, profile, worker_name.clone());
+    let launch = if let Some(subject_id) = subject_id {
+        launch.with_subject(subject_id)
+    } else {
+        launch
+    };
+    let launch = launch.resolve().map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("Standalone launch configuration failed: {error}"),

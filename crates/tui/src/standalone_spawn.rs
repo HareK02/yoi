@@ -12,13 +12,14 @@ use thiserror::Error;
 
 use crate::inline_terminal::{InlineTerminal, with_inline_terminal};
 
-const VIEWPORT_HEIGHT: u16 = 6;
+const VIEWPORT_HEIGHT: u16 = 7;
 const FALLBACK_WORKER_NAME: &str = "worker";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StandaloneSpawnSelection {
     pub worker_name: String,
     pub profile: String,
+    pub subject_id: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -55,6 +56,9 @@ enum SpawnAction {
 struct SpawnForm {
     worker_name: String,
     cursor: usize,
+    subject_id: String,
+    subject_cursor: usize,
+    editing_subject: bool,
     profile_choices: Vec<ProfileChoice>,
     selected_profile: usize,
     status: Option<(String, StatusKind)>,
@@ -75,10 +79,24 @@ impl SpawnForm {
         Self {
             worker_name,
             cursor,
+            subject_id: String::new(),
+            subject_cursor: 0,
+            editing_subject: false,
             profile_choices,
             selected_profile,
             status: None,
         }
+    }
+
+    fn with_subject(mut self, subject_id: Option<String>) -> Self {
+        self.subject_id = subject_id.unwrap_or_default();
+        self.subject_cursor = self.subject_id.chars().count();
+        self
+    }
+
+    fn subject_selection(&self) -> Option<String> {
+        let id = self.subject_id.trim();
+        (!id.is_empty()).then(|| id.to_owned())
     }
 
     fn selected_profile(&self) -> &ProfileChoice {
@@ -98,6 +116,47 @@ impl SpawnForm {
         }
 
         self.status = None;
+        if key.code == KeyCode::F(2) {
+            self.editing_subject = !self.editing_subject;
+            return SpawnAction::None;
+        }
+        if self.editing_subject {
+            match key.code {
+                KeyCode::Left => self.subject_cursor = self.subject_cursor.saturating_sub(1),
+                KeyCode::Right => {
+                    self.subject_cursor =
+                        (self.subject_cursor + 1).min(self.subject_id.chars().count())
+                }
+                KeyCode::Home => self.subject_cursor = 0,
+                KeyCode::End => self.subject_cursor = self.subject_id.chars().count(),
+                KeyCode::Backspace => {
+                    if self.subject_cursor > 0 {
+                        self.subject_id
+                            .remove(byte_index(&self.subject_id, self.subject_cursor - 1));
+                        self.subject_cursor -= 1;
+                    }
+                }
+                KeyCode::Delete => {
+                    if self.subject_cursor < self.subject_id.chars().count() {
+                        self.subject_id
+                            .remove(byte_index(&self.subject_id, self.subject_cursor));
+                    }
+                }
+                KeyCode::Char(ch) if is_safe_worker_char(ch) => {
+                    self.subject_id
+                        .insert(byte_index(&self.subject_id, self.subject_cursor), ch);
+                    self.subject_cursor += 1;
+                }
+                KeyCode::Char(_) => {}
+                // Submit/cancel and profile cycling remain available while editing the Subject.
+                _ => return self.apply_form_key(key),
+            }
+            return SpawnAction::None;
+        }
+        self.apply_form_key(key)
+    }
+
+    fn apply_form_key(&mut self, key: KeyEvent) -> SpawnAction {
         match key.code {
             KeyCode::Esc => SpawnAction::Cancel,
             KeyCode::Enter => {
@@ -167,12 +226,14 @@ pub(crate) fn select(
     workspace_root: &Path,
     worker_name: Option<String>,
     profile: Option<String>,
+    subject_id: Option<String>,
 ) -> Result<Option<StandaloneSpawnSelection>, StandaloneSpawnError> {
     let default_worker_name = default_worker_name(workspace_root);
     if let Some(profile) = profile {
         return Ok(Some(StandaloneSpawnSelection {
             worker_name: worker_name.unwrap_or(default_worker_name),
             profile,
+            subject_id,
         }));
     }
 
@@ -185,7 +246,7 @@ pub(crate) fn select(
     with_inline_terminal(VIEWPORT_HEIGHT, |terminal| {
         run_picker(
             terminal,
-            SpawnForm::new(worker_name, default_worker_name, choices),
+            SpawnForm::new(worker_name, default_worker_name, choices).with_subject(subject_id),
         )
     })
 }
@@ -214,6 +275,7 @@ fn run_picker(
                 let selection = StandaloneSpawnSelection {
                     worker_name: form.worker_name.trim().to_owned(),
                     profile: form.selected_profile().selector.clone(),
+                    subject_id: form.subject_selection(),
                 };
                 form.status = Some(("starting worker...".to_owned(), StatusKind::Progress));
                 terminal.draw(|frame| draw_form(frame, &form))?;
@@ -256,6 +318,7 @@ fn draw_form(frame: &mut ratatui::Frame<'_>, form: &SpawnForm) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -307,11 +370,31 @@ fn draw_form(frame: &mut ratatui::Frame<'_>, form: &SpawnForm) {
     );
 
     frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("subject: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if form.subject_id.is_empty() {
+                    "(none)"
+                } else {
+                    &form.subject_id
+                },
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(
+                "  (F2 edit name/Subject ID)",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])),
+        chunks[3],
+    );
+
+    frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "  enter spawn · left/right edit · esc cancel",
             Style::default().fg(Color::DarkGray),
         ))),
-        chunks[3],
+        chunks[4],
     );
 
     let (message, color) = form
@@ -331,16 +414,20 @@ fn draw_form(frame: &mut ratatui::Frame<'_>, form: &SpawnForm) {
             Span::raw("  "),
             Span::styled(message, Style::default().fg(color)),
         ])),
-        chunks[4],
+        chunks[5],
     );
 
-    let prefix_width = "  name: ".chars().count() as u16;
-    let x = chunks[1]
+    let (row, prefix, cursor) = if form.editing_subject {
+        (3, "  subject: ", form.subject_cursor)
+    } else {
+        (1, "  name: ", form.cursor)
+    };
+    let x = chunks[row]
         .x
-        .saturating_add(prefix_width)
-        .saturating_add(form.cursor as u16)
-        .min(chunks[1].right().saturating_sub(1));
-    frame.set_cursor_position((x, chunks[1].y));
+        .saturating_add(prefix.chars().count() as u16)
+        .saturating_add(cursor as u16)
+        .min(chunks[row].right().saturating_sub(1));
+    frame.set_cursor_position((x, chunks[row].y));
 }
 
 fn default_worker_name(workspace_root: &Path) -> String {
@@ -394,7 +481,41 @@ mod tests {
     fn default_form_preserves_old_spawn_layout_defaults() {
         let form = SpawnForm::new(None, "yoi".to_owned(), choices());
         assert_eq!(form.worker_name, "yoi");
+        assert_eq!(form.subject_selection(), None);
         assert_eq!(form.selected_profile().selector, "builtin:standalone");
+    }
+
+    #[test]
+    fn optional_subject_field_edits_independently_and_can_be_cleared() {
+        let mut form = SpawnForm::new(None, "worker".to_owned(), choices());
+        form.apply_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        for ch in "subject-1".chars() {
+            form.apply_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(form.subject_selection().as_deref(), Some("subject-1"));
+        assert_eq!(form.worker_name, "worker");
+        form.apply_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(form.selected_profile().selector, "builtin:coder");
+        assert_eq!(
+            form.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            SpawnAction::Submit
+        );
+        for _ in 0..9 {
+            form.apply_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        assert_eq!(form.subject_selection(), None);
+        form.apply_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        form.apply_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(form.worker_name, "worker2");
+        assert_eq!(form.subject_selection(), None);
+    }
+
+    #[test]
+    fn explicit_subject_prefills_the_optional_field() {
+        let form = SpawnForm::new(None, "worker".to_owned(), choices())
+            .with_subject(Some("subject-id".to_owned()));
+        assert_eq!(form.subject_selection().as_deref(), Some("subject-id"));
+        assert_eq!(form.subject_cursor, 10);
     }
 
     #[test]
@@ -453,6 +574,7 @@ mod tests {
 
         assert!(rendered.contains("spawn worker"));
         assert!(rendered.contains("name: yoi"));
+        assert!(rendered.contains("subject: (none)"));
         assert!(rendered.contains("profile: builtin:standalone (default) — Standalone"));
         assert!(rendered.contains("enter spawn · left/right edit · esc cancel"));
     }
@@ -504,10 +626,12 @@ mod tests {
             Path::new("/home/hare/Project/yoi"),
             None,
             Some("builtin:coder".to_owned()),
+            Some("subject-id".to_owned()),
         )
         .unwrap()
         .unwrap();
         assert_eq!(selection.worker_name, "yoi");
         assert_eq!(selection.profile, "builtin:coder");
+        assert_eq!(selection.subject_id.as_deref(), Some("subject-id"));
     }
 }
