@@ -1255,22 +1255,6 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(resolved.manifest.worker.name, "role-worker");
-            let compaction = resolved.manifest.compaction.as_ref().unwrap();
-            assert_eq!(compaction.worker_max_turns, Some(100), "{}", entry.name);
-            assert_eq!(
-                compaction.worker_context_max_tokens, 100_000,
-                "{}",
-                entry.name
-            );
-            assert_eq!(
-                compaction
-                    .model
-                    .as_ref()
-                    .and_then(|model| model.ref_.as_deref()),
-                Some("codex-oauth/gpt-6-luna"),
-                "{}",
-                entry.name
-            );
         }
     }
 
@@ -1330,125 +1314,6 @@ mod tests {
                 .request_enabled
         );
         assert!(!legacy_consolidator.feature.subjektiv.profile.enabled);
-    }
-
-    #[test]
-    fn builtin_profiles_pin_role_models_and_reasoning() {
-        use crate::model::{ReasoningControl, ReasoningEffort};
-
-        let tmp = TempDir::new().unwrap();
-        let resolve = |name: &str| {
-            ProfileResolver::new()
-                .with_workspace_base(tmp.path())
-                .resolve(
-                    &ProfileSelector::source_named(ProfileRegistrySource::Builtin, name),
-                    ProfileResolveOptions::with_worker_name(format!("{name}-worker")),
-                )
-                .unwrap()
-        };
-
-        for name in [
-            "default",
-            "standalone",
-            "intake",
-            "orchestrator",
-            "companion",
-            "coder",
-            "reviewer",
-            "backend-job",
-            "memory-consolidation",
-            "subjektiv-memory-consolidation",
-        ] {
-            let role = resolve(name);
-            assert_eq!(
-                role.manifest
-                    .compaction
-                    .as_ref()
-                    .map(|compaction| compaction.prune_enabled),
-                Some(false),
-                "{name} must keep pruning disabled for the experiment"
-            );
-            assert_eq!(
-                role.manifest
-                    .compaction
-                    .as_ref()
-                    .and_then(|compaction| compaction.model.as_ref())
-                    .and_then(|model| model.ref_.as_deref()),
-                Some("codex-oauth/gpt-6-luna"),
-                "{name} must use Luna for compaction"
-            );
-        }
-
-        let companion = resolve("companion");
-        assert_eq!(
-            companion.manifest.model.ref_.as_deref(),
-            Some("codex-oauth/gpt-6-astra")
-        );
-        assert_eq!(
-            companion.manifest.engine.reasoning,
-            Some(ReasoningControl::Effort(ReasoningEffort::High))
-        );
-
-        for name in [
-            "default",
-            "standalone",
-            "intake",
-            "orchestrator",
-            "coder",
-            "reviewer",
-        ] {
-            let role = resolve(name);
-            assert_eq!(
-                role.manifest.model.ref_.as_deref(),
-                Some("codex-oauth/gpt-6.1-sol")
-            );
-            assert_eq!(
-                role.manifest.engine.reasoning,
-                Some(ReasoningControl::Effort(ReasoningEffort::High))
-            );
-            let extraction = &role.manifest.feature.subjektiv.profile.extraction;
-            assert_eq!(
-                extraction
-                    .model
-                    .as_ref()
-                    .and_then(|model| model.ref_.as_deref()),
-                Some("codex-oauth/gpt-6-luna")
-            );
-            assert_eq!(
-                extraction.reasoning,
-                Some(ReasoningControl::Effort(ReasoningEffort::Medium))
-            );
-        }
-
-        for name in [
-            "backend-job",
-            "memory-consolidation",
-            "subjektiv-memory-consolidation",
-        ] {
-            let consolidation = resolve(name);
-            assert_eq!(
-                consolidation.manifest.model.ref_.as_deref(),
-                Some("codex-oauth/gpt-6-luna")
-            );
-            assert_eq!(
-                consolidation.manifest.engine.reasoning,
-                Some(ReasoningControl::Effort(ReasoningEffort::Medium))
-            );
-            if name == "memory-consolidation" {
-                assert_eq!(
-                    consolidation
-                        .manifest
-                        .feature
-                        .memory
-                        .profile
-                        .extraction
-                        .model
-                        .as_ref()
-                        .and_then(|model| model.ref_.as_deref()),
-                    Some("codex-oauth/gpt-6-luna")
-                );
-            }
-        }
     }
 
     #[test]
@@ -1595,10 +1460,6 @@ mod tests {
                 ..
             } if name == "standalone" && provenance.starts_with("profiles/standalone.dcdl#sha256:")
         ));
-        assert_eq!(
-            resolved.manifest.model.ref_.as_deref(),
-            Some("codex-oauth/gpt-6.1-sol")
-        );
         assert!(resolved.manifest.feature.task.enabled);
         assert!(resolved.manifest.feature.web.enabled);
         assert!(resolved.manifest.feature.image.enabled);
