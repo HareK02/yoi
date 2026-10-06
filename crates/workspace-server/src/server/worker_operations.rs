@@ -99,35 +99,139 @@ impl WorkerOperationContext {
 
 /// A registry identity, not an authorization lease or a snapshot of live execution.
 #[derive(Clone)]
-pub(crate) struct WorkspaceWorker {
-    api: WorkspaceApi,
+pub(crate) struct WorkspaceWorker<Services = WorkspaceApi> {
+    api: Services,
+    removal: WorkerRemovalService,
     identity: RuntimeWorkerRef,
 }
 
-impl WorkspaceWorker {
-    pub(crate) fn resolve(api: &WorkspaceApi, runtime_id: &str, reference: &str) -> Result<Self> {
-        let identity = resolve_workspace_worker_reference(api, runtime_id, reference)
-            .map_err(|error| error.error)?;
+// The removal-only specialization keeps the installed embedded dispatcher from
+// retaining WorkspaceApi -> Runtime -> dispatcher -> WorkspaceApi as a strong cycle.
+// Both specializations resolve the same registry identity and call the same remove method.
+impl<Services> WorkspaceWorker<Services> {
+    fn resolve_with_services(
+        api: Services,
+        removal: WorkerRemovalService,
+        runtime_id: &str,
+        reference: &str,
+    ) -> Result<Self> {
+        let direct = RuntimeWorkerRef::new(runtime_id, reference);
+        let identity = if let Some(record) = removal
+            .store
+            .get_worker_registry(&removal.workspace_id, &direct)?
+        {
+            record.worker
+        } else {
+            let worker = removal
+                .store
+                .resolve_worker_resource_reference(&removal.workspace_id, reference)?
+                .filter(|worker| worker.runtime_id == runtime_id)
+                .ok_or_else(|| Error::UnknownWorker {
+                    worker: direct.clone(),
+                })?;
+            removal
+                .store
+                .get_worker_registry(&removal.workspace_id, &worker)?
+                .ok_or_else(|| Error::UnknownWorker { worker: direct })?
+                .worker
+        };
         Ok(Self {
-            api: api.clone(),
+            api,
+            removal,
             identity,
         })
     }
-
     pub(super) fn identity(&self) -> &RuntimeWorkerRef {
         &self.identity
     }
 
     fn current_record(&self) -> ApiResult<WorkerRegistryRecord> {
-        self.api
+        self.removal
             .store
-            .get_worker_registry(self.api.workspace_id(), &self.identity)?
+            .get_worker_registry(&self.removal.workspace_id, &self.identity)?
             .ok_or_else(|| {
                 Error::UnknownWorker {
                     worker: self.identity.clone(),
                 }
                 .into()
             })
+    }
+
+    pub(super) async fn remove(
+        &self,
+        source: crate::worker_source::VerifiedWorkerMutationSource,
+        reason: &str,
+    ) -> std::result::Result<worker::WorkspaceResponse, String> {
+        self.current_record()
+            .map_err(|error| error.error.to_string())?;
+        self.removal
+            .execute_async(
+                source,
+                &self.identity.runtime_id,
+                &self.identity.worker_id,
+                reason,
+            )
+            .await
+    }
+}
+
+/// Server-owned adapter for Runtime's independent embedded Tool dispatcher.
+/// The proof was target-bound and verified before this synchronous transport seam.
+pub(super) struct EmbeddedWorkspaceWorkerRemoveExecutor {
+    removal: WorkerRemovalService,
+}
+impl EmbeddedWorkspaceWorkerRemoveExecutor {
+    pub(super) fn new(api: &WorkspaceApi) -> Self {
+        Self {
+            removal: WorkerRemovalService::new(api),
+        }
+    }
+}
+impl crate::worker_source::VerifiedWorkerRemoveExecutor for EmbeddedWorkspaceWorkerRemoveExecutor {
+    fn execute(
+        &self,
+        source: crate::worker_source::VerifiedWorkerMutationSource,
+        target_runtime_id: &str,
+        target_worker_id: &str,
+        reason: &str,
+    ) -> std::result::Result<worker::WorkspaceResponse, String> {
+        let worker = match WorkspaceWorker::resolve_with_services(
+            (),
+            self.removal.clone(),
+            target_runtime_id,
+            target_worker_id,
+        ) {
+            Ok(worker) => worker,
+            Err(Error::UnknownWorker { .. }) => {
+                return Ok(worker_remove_error_response(
+                    StatusCode::NOT_FOUND,
+                    "unknown_worker",
+                    "The target Worker is not known in this Workspace",
+                ));
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let reason = reason.to_owned();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?
+                .block_on(worker.remove(source, &reason))
+        })
+        .join()
+        .map_err(|_| "embedded WorkerRemove executor thread panicked".to_owned())?
+    }
+}
+
+impl WorkspaceWorker {
+    pub(crate) fn resolve(api: &WorkspaceApi, runtime_id: &str, reference: &str) -> Result<Self> {
+        Self::resolve_with_services(
+            api.clone(),
+            WorkerRemovalService::new(api),
+            runtime_id,
+            reference,
+        )
     }
 
     pub(super) async fn authorize_operation(
@@ -323,23 +427,6 @@ impl WorkspaceWorker {
         }
         WorkerRemovalService::new(&self.api)
             .execute_cleanup_removal(candidate)
-            .await
-    }
-
-    pub(super) async fn remove(
-        &self,
-        source: crate::worker_source::VerifiedWorkerMutationSource,
-        reason: &str,
-    ) -> std::result::Result<worker::WorkspaceResponse, String> {
-        self.current_record()
-            .map_err(|error| error.error.to_string())?;
-        WorkerRemovalService::new(&self.api)
-            .execute_async(
-                source,
-                &self.identity.runtime_id,
-                &self.identity.worker_id,
-                reason,
-            )
             .await
     }
 

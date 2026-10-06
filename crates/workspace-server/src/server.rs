@@ -2135,35 +2135,6 @@ impl WorkerRemovalService {
     }
 }
 
-impl crate::worker_source::VerifiedWorkerRemoveExecutor for WorkerRemovalService {
-    fn execute(
-        &self,
-        source: crate::worker_source::VerifiedWorkerMutationSource,
-        target_runtime_id: &str,
-        target_worker_id: &str,
-        reason: &str,
-    ) -> std::result::Result<worker::WorkspaceResponse, String> {
-        let executor = self.clone();
-        let target_runtime_id = target_runtime_id.to_string();
-        let target_worker_id = target_worker_id.to_string();
-        let reason = reason.to_string();
-        std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| error.to_string())?
-                .block_on(executor.execute_async(
-                    source,
-                    &target_runtime_id,
-                    &target_worker_id,
-                    &reason,
-                ))
-        })
-        .join()
-        .map_err(|_| "embedded WorkerRemove executor thread panicked".to_string())?
-    }
-}
-
 #[derive(Clone)]
 pub struct WorkspaceServerApi {
     template: Arc<ServerConfig>,
@@ -3458,7 +3429,9 @@ impl WorkspaceApi {
         };
         if let Some(dispatcher) = worker_remove_dispatcher {
             dispatcher
-                .install_executor(Arc::new(WorkerRemovalService::new(&api)))
+                .install_executor(Arc::new(
+                    worker_operations::EmbeddedWorkspaceWorkerRemoveExecutor::new(&api),
+                ))
                 .map_err(|message| Error::Config(message.to_string()))?;
         }
         let expired_external_workdirs = api.store.reconcile_external_workdir_grants_after_restart(
@@ -28915,27 +28888,9 @@ fn resolve_workspace_worker_reference(
     runtime_id: &str,
     reference: &str,
 ) -> ApiResult<RuntimeWorkerRef> {
-    let direct = RuntimeWorkerRef::new(runtime_id, reference);
-    if let Some(record) = api
-        .store
-        .get_worker_registry(&api.config.workspace_id, &direct)?
-    {
-        return Ok(record.worker);
-    }
-    let worker = api
-        .store
-        .resolve_worker_resource_reference(&api.config.workspace_id, reference)?
-        .filter(|worker| worker.runtime_id == runtime_id)
-        .ok_or_else(|| Error::UnknownWorker {
-            worker: RuntimeWorkerRef::new(runtime_id, reference),
-        })?;
-    let record = api
-        .store
-        .get_worker_registry(&api.config.workspace_id, &worker)?
-        .ok_or_else(|| Error::UnknownWorker {
-            worker: RuntimeWorkerRef::new(runtime_id, reference),
-        })?;
-    Ok(record.worker)
+    Ok(WorkspaceWorker::resolve(api, runtime_id, reference)?
+        .identity()
+        .clone())
 }
 
 async fn get_runtime_worker(
@@ -51491,7 +51446,27 @@ mod tests {
     #[tokio::test]
     async fn embedded_worker_remove_executes_retention_and_returns_bounded_result() {
         let temp = tempfile::tempdir().unwrap();
-        let api = test_api(temp.path()).await;
+        let config = test_server_config(temp.path());
+        let store = Arc::new(test_control_store(&config));
+        seed_test_registered_workspace(store.as_ref(), &config)
+            .await
+            .unwrap();
+        let dispatcher = Arc::new(
+            crate::worker_source::EmbeddedServerWorkerMutationDispatcher::new(
+                config.clone(),
+                store.clone(),
+            ),
+        );
+        // Use the same constructor-installed executor as the production embedded factory.
+        let api = WorkspaceApi::new_with_execution_backend_and_broker(
+            config,
+            store,
+            Arc::new(DeterministicExecutionBackend::default()),
+            BackendResourceBroker::default(),
+            Some(dispatcher.clone()),
+        )
+        .await
+        .unwrap();
         let Json(orchestrator) = scoped_start_workspace_orchestrator(
             State(api.clone()),
             AxumPath(ScopedWorkspacePath {
@@ -51532,6 +51507,27 @@ mod tests {
             )
             .unwrap();
         let target = spawned.worker.unwrap().worker;
+        seed_worker_control_grant(&api, &source, &target, "embedded-valid-proof");
+        let target_key = api
+            .store
+            .worker_resource_key(TEST_WORKSPACE_ID, &target)
+            .unwrap()
+            .unwrap();
+        let forwarder = worker_runtime::worker_source::RuntimeWorkerMutationForwarder::embedded(
+            &source.runtime_id,
+            worker_runtime::RuntimeWorkspaceScope::new(TEST_WORKSPACE_ID, "embedded-backend"),
+            &source.worker_id,
+            dispatcher,
+        );
+        let running = forwarder
+            .execute_worker_remove(
+                &target.runtime_id,
+                &target_key,
+                "must retain running Worker",
+            )
+            .unwrap();
+        assert_eq!(running.status, StatusCode::CONFLICT.as_u16());
+        assert!(running.body.contains("worker_not_stopped"));
         let stopped = api
             .runtime
             .stop_worker(
@@ -51564,24 +51560,29 @@ mod tests {
         .unwrap();
         let summary = api.runtime.worker(&target).unwrap();
         sync_worker_observation(&api, &summary).unwrap();
-        seed_worker_control_grant(&api, &source, &target, "embedded-valid-proof");
+
         let mut subscriber = api.worker_projection.subscribe_ordered(10).unwrap();
         let _ = subscriber.take_snapshot();
 
-        let response = WorkerRemovalService::new(&api)
-            .execute_async(
-                crate::worker_source::VerifiedWorkerMutationSource {
-                    runtime_id: source.runtime_id,
-                    worker_id: source.worker_id,
-                    actor_kind: worker_runtime::auth::WorkerMutationActorKind::Worker,
-                    permission: worker_runtime::auth::WORKER_REMOVE_PERMISSION.to_string(),
-                    jti: "embedded-valid-proof".to_string(),
-                },
-                &target.runtime_id,
-                &target.worker_id,
-                "retire completed Worker",
-            )
+        let handle = WorkspaceWorker::resolve(&api, &target.runtime_id, &target_key).unwrap();
+        handle
+            .set_pinned(&WorkerOperationContext::Backend, true)
             .await
+            .unwrap();
+        let pinned = forwarder
+            .execute_worker_remove(&target.runtime_id, &target_key, "must retain pinned Worker")
+            .unwrap();
+        assert_eq!(pinned.status, StatusCode::CONFLICT.as_u16());
+        assert!(pinned.body.contains("worker_removal_blocked"));
+        handle
+            .set_pinned(&WorkerOperationContext::Backend, false)
+            .await
+            .unwrap();
+
+        // A resource key must be normalized by common reception after its exact
+        // target-bound proof is verified; the old raw service executor cannot do this.
+        let response = forwarder
+            .execute_worker_remove(&target.runtime_id, &target_key, "retire completed Worker")
             .unwrap();
         assert_eq!(
             response.status,
