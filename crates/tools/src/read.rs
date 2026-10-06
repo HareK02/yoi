@@ -26,12 +26,8 @@ pub(crate) struct ReadParams {
     pub target_workdir: Option<String>,
     /// Workdir-relative path, or an absolute path covered by readable scope.
     pub file_path: String,
-    /// 0-based line offset from the start. Defaults to 0.
-    #[serde(default)]
-    pub offset: Option<usize>,
-    /// Maximum number of lines to return. Defaults to 2000.
-    #[serde(default)]
-    pub limit: Option<usize>,
+    #[serde(flatten)]
+    pub read: fs_operation::text::LineReadArgs,
 }
 
 pub(crate) struct ReadTool {
@@ -46,8 +42,7 @@ impl Tool for ReadTool {
         input_json: &str,
         _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
-        let params: ReadParams = serde_json::from_str(input_json)
-            .map_err(|e| ToolError::InvalidArgument(format!("invalid Read input: {e}")))?;
+        let params: ReadParams = crate::error::decode_file_input(input_json, "Read")?;
         let selected = crate::routing::resolve_session(
             &self.router,
             params.target_workdir.as_deref(),
@@ -75,15 +70,21 @@ pub(crate) async fn execute_read(
     tracker: Tracker,
     params: ReadParams,
 ) -> Result<crate::checkout::CheckoutToolOutput, ToolError> {
-    let offset = params.offset.unwrap_or(0);
-    let limit = params.limit.unwrap_or(DEFAULT_LIMIT).max(1);
+    let (offset, limit) = params.read.range(DEFAULT_LIMIT);
     let path = &target.path;
     tracing::debug!(path = %path, offset, limit, "Read");
     let (result, validator) = target.read(offset, limit, PROVIDER_BYTE_LIMIT).await?;
     tracker.record_workdir_observation(path, result.content_hash, result.total_lines);
-    let text = String::from_utf8_lossy(&result.bytes).into_owned();
+    // Source/response bounds were enforced by the streaming provider. Lossy
+    // UTF-8 conversion is the existing Tool presentation contract; rendering
+    // below independently bounds its possible byte expansion.
+    let text = fs_operation::text::read(
+        String::from_utf8_lossy(&result.bytes).into_owned(),
+        Default::default(),
+    )
+    .map_err(crate::error::text_error)?;
     let rendered = render_provider_read(
-        &text,
+        &text.content,
         result.start_line,
         result.total_lines,
         result.truncated,
@@ -111,50 +112,19 @@ pub(crate) async fn execute_read(
     })
 }
 
-struct Rendered {
-    body: String,
-    line_count: usize,
-    total_lines: usize,
-    truncated: bool,
-}
-
 fn render_provider_read(
     text: &str,
     start_line: usize,
     total_lines: usize,
     truncated: bool,
-) -> Rendered {
-    const MARKER: &str = "\n[truncated at rendered output byte limit]\n";
-    // The numbered presentation is bounded too, not only provider source bytes.
-    // This fits the native wire limit even with JSON's worst-case escaping.
-    let budget = PROVIDER_BYTE_LIMIT - MARKER.len();
-    let mut body = String::with_capacity(text.len().min(PROVIDER_BYTE_LIMIT));
-    let mut line_count = 0;
-    let mut output_truncated = false;
-    for (index, line) in text.lines().enumerate() {
-        let numbered = format!("{:>6}\t{}\n", start_line + index + 1, line);
-        let remaining = budget.saturating_sub(body.len());
-        if remaining > 0 {
-            line_count += 1;
-        }
-        if numbered.len() > remaining {
-            let mut end = remaining;
-            while !numbered.is_char_boundary(end) {
-                end -= 1;
-            }
-            body.push_str(&numbered[..end]);
-            body.push_str(MARKER);
-            output_truncated = true;
-            break;
-        }
-        body.push_str(&numbered);
-    }
-    Rendered {
-        body,
-        line_count,
+) -> fs_operation::text::Rendered {
+    fs_operation::text::render_numbered(
+        text,
+        start_line,
         total_lines,
-        truncated: start_line > 0 || truncated || output_truncated,
-    }
+        truncated,
+        PROVIDER_BYTE_LIMIT,
+    )
 }
 
 /// Factory for the `Read` tool bound to one compatibility session.

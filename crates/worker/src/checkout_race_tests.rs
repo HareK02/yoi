@@ -193,6 +193,75 @@ fn provider(router: Arc<WorkdirSessionRouter>) -> Arc<Provider> {
     })
 }
 
+#[tokio::test]
+async fn checkout_wip_file_operations_share_core_and_keep_prior_read_boundary() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("text.txt"), "旧 旧\n").unwrap();
+    let router = Arc::new(WorkdirSessionRouter::new());
+    router
+        .attach(
+            WorkdirAttachmentAlias::new("main").unwrap(),
+            HookedSession::new(&dir),
+        )
+        .unwrap();
+    let provider = provider(router);
+    let route = format!("{}/text.txt", checkout_root("main"));
+    let projection = provider.node(&route).await.unwrap().unwrap();
+    let invalid = BTreeMap::from([
+        ("old_string".into(), Value::String("旧".into())),
+        ("new_string".into(), Value::String("旧".into())),
+    ]);
+    assert!(
+        matches!(projection.handler.call("edit", &invalid, context()).await,
+        Err(WipOperationError::Protocol(error)) if error.code == ProtocolErrorCode::InvalidArguments)
+    );
+    let edit = BTreeMap::from([
+        ("old_string".into(), Value::String("旧".into())),
+        ("new_string".into(), Value::String("新".into())),
+        ("replace_all".into(), Value::Boolean(true)),
+    ]);
+    // Valid shared arguments do not bypass the provider's Read requirement.
+    assert!(
+        projection
+            .handler
+            .call("edit", &edit, context())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("text.txt")).unwrap(),
+        "旧 旧\n"
+    );
+    projection
+        .handler
+        .call("read", &BTreeMap::new(), context())
+        .await
+        .unwrap_or_else(|_| panic!("shared read failed"));
+    projection
+        .handler
+        .call("edit", &edit, context())
+        .await
+        .unwrap_or_else(|_| panic!("shared edit failed after read"));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("text.txt")).unwrap(),
+        "新 新\n"
+    );
+    let projection = provider.node(&route).await.unwrap().unwrap();
+    projection
+        .handler
+        .call(
+            "write",
+            &BTreeMap::from([("content".into(), Value::String("written\n".into()))]),
+            context(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("shared write failed after read/edit"));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("text.txt")).unwrap(),
+        "written\n"
+    );
+}
+
 fn deadline_provider(router: Arc<WorkdirSessionRouter>) -> Arc<Provider> {
     let mut p = provider(router);
     let settings = Arc::get_mut(&mut p).unwrap();

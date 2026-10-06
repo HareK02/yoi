@@ -241,28 +241,21 @@ impl Provider {
                 ops.push(operation(
                     "read",
                     "Read text with line offsets and numbered output",
-                    vec![
-                        parameter("offset", false, TypeExpr::Integer),
-                        parameter("limit", false, TypeExpr::Integer),
-                    ],
+                    crate::file_operation::parameters("read", true).unwrap(),
                 ));
             }
             if has(Cap::Edit, "Edit") {
                 ops.push(operation(
                     "edit",
                     "Replace a unique string (requires prior Read)",
-                    vec![
-                        parameter("old_string", true, TypeExpr::String),
-                        parameter("new_string", true, TypeExpr::String),
-                        parameter("replace_all", false, TypeExpr::Boolean),
-                    ],
+                    crate::file_operation::parameters("edit", true).unwrap(),
                 ));
             }
             if has(Cap::Write, "Write") {
                 ops.push(operation(
                     "write",
                     "Overwrite this existing file (requires prior Read)",
-                    vec![parameter("content", true, TypeExpr::String)],
+                    crate::file_operation::parameters("write", true).unwrap(),
                 ));
             }
         } else {

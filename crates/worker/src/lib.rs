@@ -5,6 +5,7 @@ pub mod controller;
 pub mod discovery;
 pub mod entrypoint;
 pub mod feature;
+mod file_operation;
 pub mod fs_view;
 pub mod hook;
 pub(crate) mod in_flight;

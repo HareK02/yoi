@@ -58,10 +58,50 @@ impl From<ToolsError> for ToolError {
     }
 }
 
+/// Pure text failures are pre-dispatch argument failures, never unknown outcomes.
+pub(crate) fn text_error(error: fs_operation::text::TextError) -> ToolError {
+    ToolError::InvalidArgument(error.to_string())
+}
+
+pub(crate) fn decode_file_input<T: serde::de::DeserializeOwned>(
+    input: &str,
+    name: &str,
+) -> Result<T, ToolError> {
+    fs_operation::text::decode_json(input).map_err(|error| decode_error(error, name))
+}
+
+pub(crate) fn decode_file_value<T: serde::de::DeserializeOwned>(
+    value: serde_json::Value,
+    name: &str,
+) -> Result<T, ToolError> {
+    fs_operation::text::decode(value).map_err(|error| decode_error(error, name))
+}
+
+fn decode_error(error: fs_operation::text::TextError, name: &str) -> ToolError {
+    match error {
+        fs_operation::text::TextError::Decode(error) => {
+            ToolError::InvalidArgument(format!("invalid {name} input: {error}"))
+        }
+        error => text_error(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use workdir::http::{WorkdirTransportError, WorkdirTransportErrorCode};
+
+    #[test]
+    fn flattened_file_tool_arguments_keep_raw_json_duplicate_rejection() {
+        let error = decode_file_input::<crate::edit::EditParams>(
+            r#"{"file_path":"a.txt","old_string":"a","old_string":"b","new_string":"c"}"#,
+            "Edit",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, ToolError::InvalidArgument(message) if message.contains("duplicate field `old_string`"))
+        );
+    }
 
     #[test]
     fn checkout_outcome_unknown_remains_execution_failure() {

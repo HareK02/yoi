@@ -332,9 +332,8 @@ fn descriptor(names: &[String]) -> InterfaceDescriptor {
             name: name.clone(), documentation: None,
             parameters: match name.as_str() {
                 "attach" => vec![parameter("access", false, TypeExpr::String)],
-                "read" | "delete" => vec![],
-                "write" => vec![parameter("content", true, TypeExpr::String)],
-                "edit" => vec![parameter("old_string", true, TypeExpr::String), parameter("new_string", true, TypeExpr::String), parameter("replace_all", false, TypeExpr::Boolean)],
+                "read" | "write" | "edit" => crate::file_operation::parameters(name, false).unwrap(),
+                "delete" => vec![],
                 "create" => vec![parameter("path", false, TypeExpr::String), parameter("content", true, TypeExpr::String), parameter("content_type", false, TypeExpr::String)],
                 "apply_changes" => vec![parameter("changes", true, TypeExpr::Json)],
                 _ => vec![],
@@ -388,6 +387,40 @@ fn text(arguments: &BTreeMap<String, Value>, key: &str) -> Result<String, WipOpe
         _ => Err(invalid()),
     }
 }
+fn text_limits() -> fs_operation::text::TextLimits {
+    fs_operation::text::TextLimits {
+        max_input_bytes: Some(MAX_TEXT_BYTES),
+        max_output_bytes: Some(MAX_TEXT_BYTES),
+        max_replacements: None,
+    }
+}
+fn decode_text<T: serde::de::DeserializeOwned>(
+    arguments: &BTreeMap<String, Value>,
+) -> Result<T, WipOperationError> {
+    let value = Value::Record(arguments.clone());
+    fs_operation::text::decode(crate::wip::wip_to_json(&value).map_err(|_| invalid())?)
+        .map_err(text_error)
+}
+fn text_error(error: fs_operation::text::TextError) -> WipOperationError {
+    use fs_operation::text::TextError;
+    match error {
+        TextError::OutputTooLarge { .. }
+        | TextError::Overflow
+        | TextError::ReplacementLimitExceeded { .. } => failure(
+            ProtocolErrorCode::ResourceLimitExceeded,
+            "Workspace config edit exceeds text limit",
+        ),
+        TextError::IdenticalStrings => failure(
+            ProtocolErrorCode::InvalidArguments,
+            "old_string and new_string are identical",
+        ),
+        TextError::Decode(_)
+        | TextError::EmptyOldString
+        | TextError::NotFound
+        | TextError::MultipleMatches { .. }
+        | TextError::InputTooLarge { .. } => invalid(),
+    }
+}
 fn content_type(value: Option<&Value>) -> Result<ConfigContentType, WipOperationError> {
     match value {
         None => Ok(ConfigContentType::Decodal),
@@ -422,6 +455,10 @@ impl ConfigHandler {
                 "Invalid Workspace config read response",
             ));
         }
+        let mut response = response;
+        response.content = fs_operation::text::read(response.content, text_limits())
+            .map_err(text_error)?
+            .content;
         Ok(response)
     }
 
@@ -582,6 +619,7 @@ impl ConfigHandler {
                 .await;
         }
         if operation == "read" {
+            let _: fs_operation::text::ReadArgs = decode_text(arguments)?;
             let result = self.read().await?;
             // Validator goes to Client state, not the model operation result.
             let value = json_to_wip(&json!({
@@ -601,46 +639,26 @@ impl ConfigHandler {
             ));
         }
         let changes = match operation {
-            "write" => vec![Change::Update {
-                path: self.node.path.clone(),
-                content: text(arguments, "content")?,
-            }],
-            "edit" => {
-                let original = self.read().await?.content;
-                let old = text(arguments, "old_string")?;
-                let new = text(arguments, "new_string")?;
-                let all = match arguments.get("replace_all") {
-                    None => false,
-                    Some(Value::Boolean(all)) => *all,
-                    _ => return Err(invalid()),
-                };
-                if old.is_empty() {
-                    return Err(invalid());
-                }
-                let count = original.matches(&old).count();
-                if count == 0 || (!all && count != 1) {
-                    return Err(invalid());
-                }
-                let count = if all { count } else { 1 };
-                let size = original
-                    .len()
-                    .checked_sub(count.saturating_mul(old.len()))
-                    .and_then(|n| n.checked_add(count.checked_mul(new.len())?))
-                    .filter(|n| *n <= MAX_TEXT_BYTES);
-                if size.is_none() {
-                    return Err(failure(
-                        ProtocolErrorCode::ResourceLimitExceeded,
-                        "Workspace config edit exceeds text limit",
-                    ));
-                }
-                let content = if all {
-                    original.replace(&old, &new)
-                } else {
-                    original.replacen(&old, &new, 1)
-                };
+            "write" => {
+                let args: fs_operation::text::WriteArgs = decode_text(arguments)?;
+                let result =
+                    fs_operation::text::write(args.content, text_limits()).map_err(text_error)?;
                 vec![Change::Update {
                     path: self.node.path.clone(),
-                    content,
+                    content: result.content,
+                }]
+            }
+            "edit" => {
+                let args: fs_operation::text::EditArgs = decode_text(arguments)?;
+                // Reject basic invalid input before reading or entering the commit
+                // path. The captured read and whole-tree CAS remain bound here.
+                args.validate(text_limits()).map_err(text_error)?;
+                let original = self.read().await?.content;
+                let result = fs_operation::text::edit(&original, &args, text_limits())
+                    .map_err(text_error)?;
+                vec![Change::Update {
+                    path: self.node.path.clone(),
+                    content: result.content,
                 }]
             }
             "delete" => vec![Change::Delete {

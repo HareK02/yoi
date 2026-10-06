@@ -22,8 +22,8 @@ pub(crate) struct WriteParams {
     pub target_workdir: Option<String>,
     /// Logical path relative to the bound Workdir root.
     pub file_path: String,
-    /// Full content to write. Overwrites any existing content.
-    pub content: String,
+    #[serde(flatten)]
+    pub write: fs_operation::text::WriteArgs,
 }
 
 pub(crate) struct WriteTool {
@@ -38,8 +38,7 @@ impl Tool for WriteTool {
         input_json: &str,
         ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
-        let params: WriteParams = serde_json::from_str(input_json)
-            .map_err(|e| ToolError::InvalidArgument(format!("invalid Write input: {e}")))?;
+        let params: WriteParams = crate::error::decode_file_input(input_json, "Write")?;
 
         let selected = crate::routing::resolve_session(
             &self.router,
@@ -57,7 +56,7 @@ impl Tool for WriteTool {
                 validator: None,
             },
             tracker,
-            params.content,
+            params.write.content,
             None,
             ctx,
         )
@@ -74,6 +73,11 @@ pub(crate) async fn execute_write(
     create_path: Option<WorkdirPath>,
     ctx: agen::tool::ToolExecutionContext,
 ) -> Result<crate::checkout::CheckoutToolOutput, ToolError> {
+    // Provider size/access checks still run inside the checked save. The shared
+    // core owns text semantics, not the provider's bounds or lifecycle.
+    let content = fs_operation::text::write(content, Default::default())
+        .map_err(crate::error::text_error)?
+        .content;
     let path = create_path.as_ref().unwrap_or(&target.path);
     tracing::debug!(path = %path, bytes = content.len(), "Write");
     let mutation_key = PathBuf::from(path.as_str());

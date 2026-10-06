@@ -858,6 +858,51 @@ async fn workspace_config_production_backend_failure_is_not_hidden_as_unauthoriz
 }
 
 #[tokio::test]
+async fn workspace_config_edit_shared_argument_rejection_never_commits() {
+    let client = Router::new();
+    let (feature, runtime) = runtime(client.clone());
+    feature.attach("initial", None).await.unwrap();
+    let path = "/workspace-config/main.dcdl";
+    observe_interface(&runtime, path, true).await;
+    for (args, expected) in [
+        (
+            json!({"old_string":"old","new_string":"old"}),
+            "old_string and new_string are identical",
+        ),
+        (
+            json!({"old_string":"old","new_string":"new","replace_all":"true"}),
+            "expected boolean",
+        ),
+    ] {
+        let error = call(&runtime, path, "edit", args).await.unwrap_err();
+        assert!(error.to_string().contains(expected), "{error:?}");
+        let state = client.state.lock().unwrap();
+        assert!(state.commits.is_empty());
+        assert_eq!(state.revision, 1);
+        assert_eq!(state.entries["main.dcdl"].1, "model = old");
+        // Argument-only rejection must not even fetch a preimage.
+        assert!(
+            state
+                .requests
+                .iter()
+                .all(|request| !request.path.ends_with("/read"))
+        );
+    }
+    // Rejection has not made the observation stale or poisoned the commit path.
+    call(
+        &runtime,
+        path,
+        "edit",
+        json!({"old_string":"old","new_string":"新"}),
+    )
+    .await
+    .unwrap();
+    let state = client.state.lock().unwrap();
+    assert_eq!(state.commits.len(), 1);
+    assert_eq!(state.entries["main.dcdl"].1, "model = 新");
+}
+
+#[tokio::test]
 async fn workspace_config_production_ungranted_root_does_not_poison_worldspace_discovery() {
     let client = Router::new();
     client.state.lock().unwrap().granted = false;

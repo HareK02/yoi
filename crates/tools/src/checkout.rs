@@ -36,13 +36,19 @@ pub async fn execute_checkout_tool(
     arguments: Value,
     ctx: ToolExecutionContext,
 ) -> Result<CheckoutToolOutput, ToolError> {
+    // Native file arguments come from the same definitions used by ordinary
+    // Tools and both WIP projections. Route fields are intentionally not in them.
+    let file_schema = fs_operation::text::TextOperation::from_name(&tool_name.to_lowercase(), true)
+        .map(|operation| operation.argument_schema());
+    let file_fields: Vec<&str> = file_schema
+        .as_ref()
+        .and_then(|schema| schema.as_value()["properties"].as_object())
+        .map(|properties| properties.keys().map(String::as_str).collect())
+        .unwrap_or_default();
     let (capability, allowed): (_, &[&str]) = match tool_name {
-        "Read" => (WorkdirSessionCapability::Read, &["offset", "limit"]),
-        "Edit" => (
-            WorkdirSessionCapability::Edit,
-            &["old_string", "new_string", "replace_all"],
-        ),
-        "Write" => (WorkdirSessionCapability::Write, &["content"]),
+        "Read" => (WorkdirSessionCapability::Read, &file_fields),
+        "Edit" => (WorkdirSessionCapability::Edit, &file_fields),
+        "Write" => (WorkdirSessionCapability::Write, &file_fields),
         "Create" => (WorkdirSessionCapability::Write, &["path", "content"]),
         "Glob" => (WorkdirSessionCapability::Glob, &["pattern", "path"]),
         "Grep" => (
@@ -110,7 +116,8 @@ pub async fn execute_checkout_tool(
                 }
                 _ => {
                     let params: crate::write::WriteParams = decode(arguments, tool_name)?;
-                    crate::write::execute_write(target, tracker, params.content, None, ctx).await
+                    crate::write::execute_write(target, tracker, params.write.content, None, ctx)
+                        .await
                 }
             }
         }
@@ -185,8 +192,7 @@ pub async fn execute_checkout_tool(
 }
 
 fn decode<T: DeserializeOwned>(arguments: Value, name: &str) -> Result<T, ToolError> {
-    serde_json::from_value(arguments)
-        .map_err(|error| ToolError::InvalidArgument(format!("invalid {name} input: {error}")))
+    crate::error::decode_file_value(arguments, name)
 }
 
 fn stale_search() -> ToolError {
