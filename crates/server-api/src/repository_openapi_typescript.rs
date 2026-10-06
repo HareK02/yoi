@@ -872,14 +872,14 @@ fn validate_runtime_operations(
             "/api/runtimes/{runtime_id}/workers/{worker_id}/restore",
             "post",
             "runtime_worker_restore_alias",
-            None,
+            Some("WorkerRestoreRequest"),
             &[("200", "WorkerRestoreResponse")],
         ),
         runtime_operation(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/restore",
             "post",
             "runtime_worker_restore",
-            None,
+            Some("WorkerRestoreRequest"),
             &[("200", "WorkerRestoreResponse")],
         ),
         runtime_operation(

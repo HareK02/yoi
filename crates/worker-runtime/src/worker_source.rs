@@ -555,9 +555,15 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
                         WorkspaceServerOperation::WorkerControlRestore {
                             runtime_id,
                             worker_id,
+                            request,
                         } => generated_workspace_response(
                             client
-                                .worker_control_restore(workspace_id, runtime_id, worker_id)
+                                .worker_control_restore(
+                                    workspace_id,
+                                    runtime_id,
+                                    worker_id,
+                                    request,
+                                )
                                 .await,
                         ),
                         WorkspaceServerOperation::WorkerObservationSessions => {

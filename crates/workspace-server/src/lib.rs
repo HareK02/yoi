@@ -139,6 +139,10 @@ pub enum Error {
     RuntimeBindingFingerprintConflict { fingerprint: String },
     #[error("Runtime binding was not found for {runtime_id}")]
     RuntimeBindingNotFound { runtime_id: String },
+    #[error(
+        "restore_observation_conflict: Restore observation changed; refresh before a new intent"
+    )]
+    RestoreObservationConflict,
     #[error("Repository conflict: {0}")]
     RepositoryConflict(String),
     #[error("Registry inconsistency: {0}")]

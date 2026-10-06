@@ -291,10 +291,20 @@ impl WorkspaceWorker {
     pub(super) async fn restore(
         &self,
         context: &WorkerOperationContext,
+        request: server_api::WorkerRestoreRequest,
     ) -> ApiResult<InternalWorkerRestoreResult> {
         let _guard = self.authorize_operation(context, "restore").await?;
-        // Preserve singleton, Workdir, credentials, bindings and pending operation reconciliation.
-        self.api.restore_workspace_worker(&self.identity)
+        self.restore_internal(request)
+    }
+
+    /// Trusted Backend callers still supply an explicit observed intent. Runtime
+    /// admission is shared with browser/Tool callers; this is not an unguarded launch.
+    pub(super) fn restore_internal(
+        &self,
+        request: server_api::WorkerRestoreRequest,
+    ) -> ApiResult<InternalWorkerRestoreResult> {
+        self.current_record()?;
+        self.api.restore_workspace_worker(&self.identity, request)
     }
 
     pub(super) async fn stop(

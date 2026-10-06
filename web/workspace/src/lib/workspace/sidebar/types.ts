@@ -4,6 +4,8 @@ import type {
   CleanupWorkerCandidate,
   RuntimeCleanupExecutionResponse,
   RuntimeCleanupPlanResponse,
+  WorkerRestoreResult,
+  WorkerRestoreState,
 } from "#lib/generated/runtime-api.ts";
 import type {
   BrowserCreateWorkerResponse as SharedBrowserCreateWorkerResponse,
@@ -13,7 +15,6 @@ import type {
   WorkerLaunchOptionsResponse as SharedWorkerLaunchOptionsResponse,
   WorkerLaunchProfileCandidate as SharedWorkerLaunchProfileCandidate,
   WorkerLaunchRuntimeOption as SharedWorkerLaunchRuntimeOption,
-  WorkerLaunchWorkerSummary,
   WorkerSummary as SharedWorkerSummary,
   WorkerWorkdirAttachmentSummary as SharedWorkerWorkdirAttachmentSummary,
   WorkingDirectoryRepositoryOption as SharedWorkingDirectoryRepositoryOption,
@@ -95,18 +96,7 @@ export type Worker =
 
 export type WorkerOperationState = "accepted" | "unsupported" | "rejected";
 
-/** Typed result of restore across Runtime, Workspace, Web, and TUI clients. */
-export type WorkerRestoreState =
-  | "accepted"
-  | "rejected"
-  | "rolled_back"
-  | "reconciliation_required";
-
-export type WorkerRestoreResult = {
-  state: WorkerRestoreState;
-  worker?: WorkerLaunchWorkerSummary | null;
-  diagnostics: Diagnostic[];
-};
+export type { WorkerRestoreResult, WorkerRestoreState };
 
 export type WorkerLaunchRuntimeOption = SharedWorkerLaunchRuntimeOption;
 export type WorkerLaunchProfileCandidate = SharedWorkerLaunchProfileCandidate;

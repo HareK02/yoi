@@ -520,6 +520,7 @@ pub(crate) enum PersistedWorkerExecutionState {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PersistedWorkerRecord {
+    pub(crate) restore_guard: crate::runtime::RestoreGuard,
     pub(crate) worker_ref: WorkerRef,
     pub(crate) worker_id: WorkerId,
     pub(crate) profile: ProfileSelector,
@@ -1819,6 +1820,8 @@ impl RuntimeSnapshot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkerAggregateRecord {
+    #[serde(default)]
+    restore_guard: crate::runtime::RestoreGuard,
     schema_version: u32,
     worker_ref: WorkerRef,
     worker_id: WorkerId,
@@ -1874,6 +1877,7 @@ impl WorkerAggregateRecord {
         };
         Self {
             schema_version: SCHEMA_VERSION,
+            restore_guard: worker.restore_guard.clone(),
             worker_ref: worker.worker_ref.clone(),
             worker_id: worker.worker_id,
             profile: worker.profile.clone(),
@@ -1902,6 +1906,7 @@ impl WorkerAggregateRecord {
     }
 
     fn validate(self, path: &Path) -> Result<PersistedWorkerRecord, RuntimeError> {
+        let restore_guard = self.restore_guard;
         let last_finished_submission_request_id = self.last_finished_submission_request_id;
         let identity = WorkerIdentityRecord {
             schema_version: self.schema_version,
@@ -2007,6 +2012,7 @@ impl WorkerAggregateRecord {
             WorkerExecutionStateRecord::Unavailable => PersistedWorkerExecutionState::Unavailable,
         };
         let mut persisted = identity.into_persisted(execution_state);
+        persisted.restore_guard = restore_guard;
         persisted.last_finished_submission_request_id = last_finished_submission_request_id;
         Ok(persisted)
     }
@@ -2180,6 +2186,7 @@ impl WorkerIdentityRecord {
             self.workdir_attachments
         };
         PersistedWorkerRecord {
+            restore_guard: crate::runtime::RestoreGuard::default(),
             worker_ref: self.worker_ref,
             worker_id: self.worker_id,
             profile: self.profile,

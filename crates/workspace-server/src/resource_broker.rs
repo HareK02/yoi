@@ -61,6 +61,16 @@ impl Drop for StoredResource {
 }
 
 impl BackendResourceBroker {
+    #[cfg(test)]
+    pub(crate) fn repository_ssh_access_handle_count(&self) -> usize {
+        self.resources
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|resource| resource.handle.kind == BackendResourceKind::RepositorySshAccess)
+            .count()
+    }
+
     pub fn issue_profile_source_archive_handle(
         &self,
         workspace_id: impl Into<String>,

@@ -378,6 +378,7 @@ function validateWorkers(workers: SubscriptionWorker[]): boolean {
 }
 
 function validateWorker(worker: SubscriptionWorker): boolean {
+  if (worker.restore_observation_token != null && !validateIdentifier(worker.restore_observation_token, MAX_RESOURCE_ID_BYTES)) return false;
   if (!validateIdentifier(worker.worker_id, MAX_RESOURCE_ID_BYTES)) return false;
   if (worker.runtime_id != null && !validateIdentifier(worker.runtime_id, MAX_RESOURCE_ID_BYTES)) {
     return false;

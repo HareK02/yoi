@@ -97,7 +97,11 @@ function optional<T>(
   label: string,
   parse: (item: unknown, label: string) => T,
 ): T | null | undefined {
-  return value === undefined ? undefined : value === null ? null : parse(value, label);
+  return value === undefined
+    ? undefined
+    : value === null
+    ? null
+    : parse(value, label);
 }
 
 function diagnostic(value: unknown, label: string): Diagnostic {
@@ -372,6 +376,7 @@ export function parseWorkerSummary(
       "availability",
       "state",
       "worker_state",
+      "restore_observation_token",
       "last_seen_at",
       "pinned",
       "retention_state",
@@ -406,13 +411,28 @@ export function parseWorkerSummary(
       `${label}.singleton_key`,
       string,
     ),
-    tags: item.tags === undefined ? [] : array(item.tags, `${label}.tags`, string),
+    tags: item.tags === undefined
+      ? []
+      : array(item.tags, `${label}.tags`, string),
     workspace: workspaceSummary(item.workspace, `${label}.workspace`),
     availability,
     state: string(item.state, `${label}.state`),
     worker_state: workerState,
+    restore_observation_token: optional(
+      item.restore_observation_token,
+      `${label}.restore_observation_token`,
+      (value, path) => {
+        const token = string(value, path);
+        if (new TextEncoder().encode(token).byteLength > 256) {
+          throw new Error(`${path} exceeds its 256 UTF-8 byte limit`);
+        }
+        return token;
+      },
+    ),
     last_seen_at: optional(item.last_seen_at, `${label}.last_seen_at`, string),
-    pinned: item.pinned === undefined ? false : boolean(item.pinned, `${label}.pinned`),
+    pinned: item.pinned === undefined
+      ? false
+      : boolean(item.pinned, `${label}.pinned`),
     retention_state: item.retention_state === undefined
       ? ""
       : string(item.retention_state, `${label}.retention_state`),
@@ -420,11 +440,13 @@ export function parseWorkerSummary(
       item.implementation,
       `${label}.implementation`,
     ),
-    workdir_attachments: item.workdir_attachments === undefined ? undefined : array(
-      item.workdir_attachments,
-      `${label}.workdir_attachments`,
-      workerWorkdirAttachment,
-    ),
+    workdir_attachments: item.workdir_attachments === undefined
+      ? undefined
+      : array(
+        item.workdir_attachments,
+        `${label}.workdir_attachments`,
+        workerWorkdirAttachment,
+      ),
     diagnostics: item.diagnostics === undefined
       ? []
       : array(item.diagnostics, `${label}.diagnostics`, diagnostic),
@@ -634,11 +656,13 @@ function workerSummary(
       item.implementation,
       `${label}.implementation`,
     ),
-    workdir_attachments: item.workdir_attachments === undefined ? undefined : array(
-      item.workdir_attachments,
-      `${label}.workdir_attachments`,
-      runtimeWorkdirAttachment,
-    ),
+    workdir_attachments: item.workdir_attachments === undefined
+      ? undefined
+      : array(
+        item.workdir_attachments,
+        `${label}.workdir_attachments`,
+        runtimeWorkdirAttachment,
+      ),
     diagnostics: array(item.diagnostics, `${label}.diagnostics`, diagnostic),
   };
 }
@@ -728,11 +752,17 @@ function featureConnectionsRequest(
 ): WorkspaceWorkerFeatureConnectionsRequest {
   const item = record(value, label);
   exact(item, ["subjektiv"], label);
-  const subjektiv = optional(item.subjektiv, `${label}.subjektiv`, (value, itemLabel) => {
-    const connection = record(value, itemLabel);
-    exact(connection, ["subject_id"], itemLabel);
-    return { subject_id: string(connection.subject_id, `${itemLabel}.subject_id`) };
-  });
+  const subjektiv = optional(
+    item.subjektiv,
+    `${label}.subjektiv`,
+    (value, itemLabel) => {
+      const connection = record(value, itemLabel);
+      exact(connection, ["subject_id"], itemLabel);
+      return {
+        subject_id: string(connection.subject_id, `${itemLabel}.subject_id`),
+      };
+    },
+  );
   return subjektiv === undefined ? {} : { subjektiv };
 }
 
@@ -841,18 +871,32 @@ function uploadedFile(
 function invocationValue(
   value: unknown,
   label: string,
-): Extract<Extract<Segment, { kind: "feature_invoke" }>["invocation"]["arguments"][number], { name: string }>["value"] {
+): Extract<
+  Extract<
+    Segment,
+    { kind: "feature_invoke" }
+  >["invocation"]["arguments"][number],
+  { name: string }
+>["value"] {
   const item = record(value, label);
   const kind = string(item.kind, `${label}.kind`);
   exact(item, ["kind", "value"], label);
-  if (kind === "string") return { kind, value: string(item.value, `${label}.value`) };
+  if (kind === "string") {
+    return { kind, value: string(item.value, `${label}.value`) };
+  }
   if (kind === "integer") {
     const parsed = number(item.value, `${label}.value`);
-    if (!Number.isSafeInteger(parsed)) throw new Error(`${label}.value must be a safe integer`);
-    if (parsed < -2147483648 || parsed > 2147483647) throw new Error(`${label}.value must be a signed 32-bit integer`);
+    if (!Number.isSafeInteger(parsed)) {
+      throw new Error(`${label}.value must be a safe integer`);
+    }
+    if (parsed < -2147483648 || parsed > 2147483647) {
+      throw new Error(`${label}.value must be a signed 32-bit integer`);
+    }
     return { kind, value: parsed };
   }
-  if (kind === "boolean") return { kind, value: boolean(item.value, `${label}.value`) };
+  if (kind === "boolean") {
+    return { kind, value: boolean(item.value, `${label}.value`) };
+  }
   throw new Error(`${label}.kind is invalid`);
 }
 
@@ -866,14 +910,18 @@ function featureInvocation(
     invocation_id: string(item.invocation_id, `${label}.invocation_id`),
     identity: string(item.identity, `${label}.identity`),
     name: string(item.name, `${label}.name`),
-    arguments: array(item.arguments, `${label}.arguments`, (argument, argumentLabel) => {
-      const entry = record(argument, argumentLabel);
-      exact(entry, ["name", "value"], argumentLabel);
-      return {
-        name: string(entry.name, `${argumentLabel}.name`),
-        value: invocationValue(entry.value, `${argumentLabel}.value`),
-      };
-    }),
+    arguments: array(
+      item.arguments,
+      `${label}.arguments`,
+      (argument, argumentLabel) => {
+        const entry = record(argument, argumentLabel);
+        exact(entry, ["name", "value"], argumentLabel);
+        return {
+          name: string(entry.name, `${argumentLabel}.name`),
+          value: invocationValue(entry.value, `${argumentLabel}.value`),
+        };
+      },
+    ),
   };
 }
 

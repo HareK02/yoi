@@ -29,6 +29,7 @@ trait BackendWorkerLifecycle {
     async fn restore(
         &self,
         target: &client::BackendRuntimeTarget,
+        request: client::BackendWorkerRestoreRequest,
     ) -> Result<BackendWorkerRestoreResponse, io::Error>;
 
     async fn observe(
@@ -44,13 +45,19 @@ impl BackendWorkerLifecycle for LiveBackendWorkerLifecycle {
     async fn restore(
         &self,
         target: &client::BackendRuntimeTarget,
+        request: client::BackendWorkerRestoreRequest,
     ) -> Result<BackendWorkerRestoreResponse, io::Error> {
-        restore_backend_worker(target).await.map_err(|error| {
-            io::Error::other(format!(
-                "failed to restore Backend Worker {}: {error}",
-                target.display_label()
-            ))
-        })
+        restore_backend_worker(target, request)
+            .await
+            .map_err(|error| {
+                if error.is_restore_observation_conflict() {
+                    return io::Error::other("Restore observation changed; refresh the Worker list and select again. No new Restore was started.");
+                }
+                io::Error::other(format!(
+                    "failed to restore Backend Worker {}: {error}",
+                    target.display_label()
+                ))
+            })
     }
 
     async fn observe(
@@ -133,8 +140,20 @@ pub(crate) async fn run(
         let attach_target = target
             .runtime_target(selected.runtime_id.clone(), selected.worker_id.clone())
             .map_err(|error| io::Error::other(error.to_string()))?;
-        let attach_target =
-            prepare_selected_worker(&LiveBackendWorkerLifecycle, attach_target, intent).await?;
+        let restore_request =
+            selected
+                .restore_observation_token
+                .map(|token| client::BackendWorkerRestoreRequest {
+                    expected_observation_token: token,
+                    request_id: uuid::Uuid::now_v7().to_string(),
+                });
+        let attach_target = prepare_selected_worker(
+            &LiveBackendWorkerLifecycle,
+            attach_target,
+            intent,
+            restore_request,
+        )
+        .await?;
         return console::run_backend_runtime(attach_target).await;
     }
 }
@@ -143,9 +162,13 @@ async fn prepare_selected_worker(
     lifecycle: &impl BackendWorkerLifecycle,
     mut target: client::BackendRuntimeTarget,
     intent: BackendWorkerPickerIntent,
+    restore_request: Option<client::BackendWorkerRestoreRequest>,
 ) -> Result<client::BackendRuntimeTarget, io::Error> {
     if intent == BackendWorkerPickerIntent::Resume {
-        let response = lifecycle.restore(&target).await?;
+        let request = restore_request.ok_or_else(|| {
+            io::Error::other("Worker has no current Restore observation; refresh and select again")
+        })?;
+        let response = lifecycle.restore(&target, request).await?;
         ensure_restore_accepted(&response)?;
         let observation = lifecycle.observe(&target).await?;
         require_live_resume_observation(observation.observation)?;
@@ -158,7 +181,10 @@ async fn prepare_selected_worker(
 }
 
 fn is_resume_candidate(worker: &BackendWorkerSummary) -> bool {
-    worker.worker_state.is_none()
+    worker.availability == protocol::subscription::SubscriptionWorkerAvailability::Observed
+        && worker.state == "stopped"
+        && worker.worker_state.is_none()
+        && worker.restore_observation_token.is_some()
 }
 
 fn ensure_restore_accepted(response: &BackendWorkerRestoreResponse) -> Result<(), io::Error> {
@@ -570,6 +596,7 @@ mod tests {
 
     fn worker(runtime_id: &str, worker_id: &str, profile: Option<&str>) -> BackendWorkerSummary {
         BackendWorkerSummary {
+            restore_observation_token: Some("observed-worker-generation".into()),
             runtime_id: runtime_id.to_string(),
             worker_id: worker_id.to_string(),
             resource_key: "W-1".to_string(),
@@ -642,6 +669,7 @@ mod tests {
         async fn restore(
             &self,
             _target: &client::BackendRuntimeTarget,
+            _request: client::BackendWorkerRestoreRequest,
         ) -> Result<BackendWorkerRestoreResponse, io::Error> {
             self.calls.lock().unwrap().push("restore");
             Ok(self.restore_response.clone())
@@ -689,10 +717,17 @@ mod tests {
             "worker-a",
         );
 
-        let prepared =
-            prepare_selected_worker(&lifecycle, target, BackendWorkerPickerIntent::Resume)
-                .await
-                .unwrap();
+        let prepared = prepare_selected_worker(
+            &lifecycle,
+            target,
+            BackendWorkerPickerIntent::Resume,
+            Some(client::BackendWorkerRestoreRequest {
+                expected_observation_token: "observed-worker-generation".into(),
+                request_id: "resume-operation".into(),
+            }),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(*lifecycle.calls.lock().unwrap(), ["restore", "observe"]);
         assert!(prepared.initial_snapshot.is_none());
@@ -716,10 +751,18 @@ mod tests {
             "worker-a",
         );
 
-        let error = prepare_selected_worker(&lifecycle, target, BackendWorkerPickerIntent::Resume)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = prepare_selected_worker(
+            &lifecycle,
+            target,
+            BackendWorkerPickerIntent::Resume,
+            Some(client::BackendWorkerRestoreRequest {
+                expected_observation_token: "observed-worker-generation".into(),
+                request_id: "resume-operation".into(),
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
 
         assert!(error.contains("Rejected"));
         assert_eq!(*lifecycle.calls.lock().unwrap(), ["restore"]);
@@ -736,7 +779,7 @@ mod tests {
 
         assert!(!is_resume_candidate(&live));
         assert!(is_resume_candidate(&stopped));
-        assert!(is_resume_candidate(&unknown));
+        assert!(!is_resume_candidate(&unknown));
     }
 
     #[test]

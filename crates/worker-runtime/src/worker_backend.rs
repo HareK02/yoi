@@ -7394,7 +7394,14 @@ mod tests {
             .create_worker(create_request("restart cleanup"))
             .unwrap();
         runtime.stop_worker(&worker.worker_ref, None).unwrap();
-        assert!(runtime.restore_worker(&worker.worker_ref).is_err());
+        assert!(
+            runtime
+                .restore_worker(
+                    &worker.worker_ref,
+                    runtime.test_restore_request(&worker.worker_ref)
+                )
+                .is_err()
+        );
         assert!(runtime.stop_worker(&worker.worker_ref, None).is_err());
         let prior_restore_id = restore_id.lock().unwrap().unwrap();
         let aggregate = runtime_store
@@ -8904,7 +8911,12 @@ mod tests {
             .unwrap();
         assert!(detached.workdir_attachments.is_empty());
         runtime.stop_worker(&detail.worker_ref, None).unwrap();
-        let restored_without_workdir = runtime.restore_worker(&detail.worker_ref).unwrap();
+        let restored_without_workdir = runtime
+            .restore_worker(
+                &detail.worker_ref,
+                runtime.test_restore_request(&detail.worker_ref),
+            )
+            .unwrap();
         assert!(restored_without_workdir.workdir_attachments.is_empty());
         assert!(
             !repo.path().join(".yoi").exists(),
@@ -9191,7 +9203,12 @@ mod tests {
                 .contains_key(&detail.worker_ref)
         );
 
-        runtime.restore_worker(&detail.worker_ref).unwrap();
+        runtime
+            .restore_worker(
+                &detail.worker_ref,
+                runtime.test_restore_request(&detail.worker_ref),
+            )
+            .unwrap();
         assert_eq!(
             runtime.worker_detail(&detail.worker_ref).unwrap().status,
             crate::catalog::WorkerStatus::Idle

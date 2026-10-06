@@ -76,6 +76,7 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "worker_registry_projection_diagnostics",
     "worker_registry_projection_removals",
     "worker_removal_operations",
+    "worker_restore_intents",
     "worker_retention_audit_events",
     "worker_session_archive_observe_grants",
     "worker_session_archives",

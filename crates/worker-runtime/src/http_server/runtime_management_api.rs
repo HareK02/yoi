@@ -462,21 +462,74 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         Ok(runtime_api::WorkerLifecycleResponse { ack })
     }
 
+    async fn coordinate_worker_restore(
+        &self,
+        worker_id: String,
+        request: runtime_api::WorkerRestoreCoordinationRequest,
+    ) -> Result<runtime_api::WorkerRestoreCoordinationResponse, runtime_api::RuntimeApiError> {
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        let scope =
+            auth_workspace_scope(&self.state, auth_extension().as_ref()).map_err(api_error)?;
+        let runtime = self.state.runtime.clone();
+        let (result, preparation) = tokio::task::spawn_blocking(move || {
+            runtime.coordinate_worker_restore_operation(&worker_ref, request, scope.as_ref())
+        })
+        .await
+        .map_err(|error| {
+            runtime_api::RuntimeApiError::new(500, "runtime_restore_task_failed", error.to_string())
+        })?
+        .map_err(RuntimeHttpRestError::runtime)
+        .map_err(api_error)?;
+        let result = result
+            .map(|result| -> Result<_, runtime_api::RuntimeApiError> {
+                Ok(runtime_api::WorkerRestoreResponse {
+                    state: match result.state {
+                        server_api::WorkerRestoreState::Accepted => {
+                            runtime_api::WorkerRestoreState::Accepted
+                        }
+                        server_api::WorkerRestoreState::Rejected => {
+                            runtime_api::WorkerRestoreState::Rejected
+                        }
+                        server_api::WorkerRestoreState::RolledBack => {
+                            runtime_api::WorkerRestoreState::RolledBack
+                        }
+                        server_api::WorkerRestoreState::ReconciliationRequired => {
+                            runtime_api::WorkerRestoreState::ReconciliationRequired
+                        }
+                    },
+                    worker: result.worker.map(response).transpose()?,
+                    reason_code: result.reason_code,
+                    message: result.message,
+                })
+            })
+            .transpose()?;
+        Ok(runtime_api::WorkerRestoreCoordinationResponse {
+            result,
+            preparation,
+        })
+    }
+
     async fn restore_worker(
         &self,
         worker_id: String,
-        _request: runtime_api::EmptyObjectRequest,
+        request: runtime_api::WorkerRestoreRequest,
     ) -> Result<runtime_api::WorkerRestoreResponse, runtime_api::RuntimeApiError> {
         let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
-        let result = match auth_workspace_scope(&self.state, auth_extension().as_ref())
-            .map_err(api_error)?
-        {
-            Some(scope) => self
-                .state
-                .runtime
-                .restore_worker_operation_scoped(&scope, &worker_ref),
-            None => self.state.runtime.restore_worker_operation(&worker_ref),
-        }
+        let scope =
+            auth_workspace_scope(&self.state, auth_extension().as_ref()).map_err(api_error)?;
+        let runtime = self.state.runtime.clone();
+        let result = tokio::task::spawn_blocking(move || match scope {
+            Some(scope) => runtime.restore_worker_operation_scoped(&scope, &worker_ref, request),
+            None => runtime.restore_worker_operation(&worker_ref, request),
+        })
+        .await
+        .map_err(|error| {
+            runtime_api::RuntimeApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                "runtime_restore_task_failed",
+                error.to_string(),
+            )
+        })?
         .map_err(RuntimeHttpRestError::runtime)
         .map_err(api_error)?;
         Ok(runtime_api::WorkerRestoreResponse {

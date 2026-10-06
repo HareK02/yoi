@@ -250,7 +250,13 @@ async fn offline_handle_can_pin_but_deleted_handle_cannot_mutate_or_connect() {
     );
     assert!(matches!(
         handle
-            .restore(&WorkerOperationContext::Backend)
+            .restore(
+                &WorkerOperationContext::Backend,
+                server_api::WorkerRestoreRequest {
+                    expected_observation_token: "stale".into(),
+                    request_id: "removed-handle".into(),
+                }
+            )
             .await
             .unwrap_err()
             .error,
@@ -374,7 +380,17 @@ async fn worker_control_handle_rechecks_revoked_grants_for_each_operation() {
         );
     }
     assert!(matches!(
-        handle.restore(&context).await.unwrap_err().error,
+        handle
+            .restore(
+                &context,
+                server_api::WorkerRestoreRequest {
+                    expected_observation_token: "stale".into(),
+                    request_id: "revoked-grant".into(),
+                }
+            )
+            .await
+            .unwrap_err()
+            .error,
         Error::UnknownWorker { .. }
     ));
     assert!(matches!(
@@ -682,7 +698,15 @@ async fn generic_management_aliases_cannot_bypass_worker_grants_or_target_bound_
     );
     assert!(
         service
-            .runtime_worker_restore_alias(context(), "offline-runtime".into(), "subject".into())
+            .runtime_worker_restore_alias(
+                context(),
+                "offline-runtime".into(),
+                "subject".into(),
+                server_api::WorkerRestoreRequest {
+                    expected_observation_token: "old".into(),
+                    request_id: "unauthorized".into(),
+                }
+            )
             .await
             .is_err()
     );
@@ -861,4 +885,697 @@ async fn browser_protocol_connection_and_cleanup_reject_cookie_origin_mismatch()
     .unwrap_err();
     assert!(matches!(result.error, Error::WorkspacePermissionDenied(_)));
     assert!(execution.protocol_methods().is_empty());
+}
+
+fn restore_request_for(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    request_id: &str,
+) -> server_api::WorkerRestoreRequest {
+    server_api::WorkerRestoreRequest {
+        expected_observation_token: api
+            .runtime
+            .worker(worker)
+            .unwrap()
+            .restore_observation_token
+            .unwrap(),
+        request_id: request_id.into(),
+    }
+}
+
+#[tokio::test]
+async fn restore_guard_rejects_stale_list_and_stopped_restored_stopped_aba() {
+    let workspace = tempfile::tempdir().unwrap();
+    let (api, execution) = test_api_with_recording_backend(workspace.path()).await;
+    execution.accept_restores();
+    let identity = spawn_ticket_check_source(&api, "restore-guard-aba");
+    let handle = WorkspaceWorker::resolve(&api, &identity.runtime_id, &identity.worker_id).unwrap();
+    handle
+        .stop(&WorkerOperationContext::Backend, operation_lifecycle())
+        .await
+        .unwrap();
+    let original = restore_request_for(&api, &identity, "restore-original");
+    let stale_list = server_api::WorkerRestoreRequest {
+        request_id: "restore-stale-list".into(),
+        ..original.clone()
+    };
+    assert_eq!(
+        handle
+            .restore(&WorkerOperationContext::Backend, original.clone())
+            .await
+            .unwrap()
+            .state,
+        server_api::WorkerRestoreState::Accepted
+    );
+    let conflict = handle
+        .restore(&WorkerOperationContext::Backend, stale_list.clone())
+        .await
+        .unwrap_err();
+    assert!(matches!(conflict.error, Error::RestoreObservationConflict));
+    let typed = conflict.into_repository_api_error();
+    assert_eq!(
+        api_error_status(&Error::RestoreObservationConflict),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(typed.error, "restore_observation_conflict");
+    handle
+        .stop(&WorkerOperationContext::Backend, operation_lifecycle())
+        .await
+        .unwrap();
+    assert_ne!(
+        original.expected_observation_token,
+        api.runtime
+            .worker(&identity)
+            .unwrap()
+            .restore_observation_token
+            .unwrap()
+    );
+    assert!(matches!(
+        handle
+            .restore(&WorkerOperationContext::Backend, stale_list)
+            .await
+            .unwrap_err()
+            .error,
+        Error::RestoreObservationConflict
+    ));
+    assert_eq!(api.runtime.worker(&identity).unwrap().state, "stopped");
+    assert!(
+        execution.contexts.lock().unwrap().is_empty(),
+        "conflict must not install execution"
+    );
+    // The original request is result replay, not a new intent; it stays accepted
+    // without resurrecting the Worker after a subsequent stop.
+    assert_eq!(
+        handle
+            .restore(&WorkerOperationContext::Backend, original)
+            .await
+            .unwrap()
+            .state,
+        server_api::WorkerRestoreState::Accepted
+    );
+    assert_eq!(api.runtime.worker(&identity).unwrap().state, "stopped");
+    assert!(execution.contexts.lock().unwrap().is_empty());
+}
+
+fn restore_test_workdir(
+    api: &WorkspaceApi,
+    id: &str,
+    source: WorkdirRegistrySource,
+) -> WorkdirRegistryRecord {
+    WorkdirRegistryRecord {
+        workspace_id: api.workspace_id().into(),
+        workdir_id: id.into(),
+        display_name: None,
+        source,
+        creation_selector: None,
+        creation_ref: None,
+        creation_tree: None,
+        current_selector: None,
+        current_ref: None,
+        current_tree: None,
+        observed_at_epoch_seconds: None,
+        materialization_status: "present".into(),
+        cleanliness: "clean".into(),
+        created_at: TEST_CREATED_AT.into(),
+        updated_at: TEST_CREATED_AT.into(),
+    }
+}
+
+fn attach_restore_test_workdir(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    workdir: &WorkdirRegistryRecord,
+) {
+    api.store
+        .attach_worker_workdir(&WorkerWorkdirLinkRecord {
+            connection_id: String::new(),
+            workspace_id: api.workspace_id().into(),
+            worker: worker.clone(),
+            workdir_id: workdir.workdir_id.clone(),
+            alias: workdir.workdir_id.clone(),
+            capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+            linked_at: TEST_CREATED_AT.into(),
+            unlinked_at: None,
+        })
+        .unwrap();
+}
+
+fn displace_restore_singleton(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    replacement: &RuntimeWorkerRef,
+) {
+    api.config_store.with_conn(|conn| {
+        conn.execute("UPDATE worker_create_reservations SET singleton_key='restore-test-singleton', singleton_generation=1 WHERE workspace_id=?1 AND worker_id=?2",
+            rusqlite::params![api.workspace_id(), worker.worker_id])?;
+        conn.execute("INSERT INTO worker_singleton_owners(workspace_id,singleton_key,runtime_id,worker_id,generation,created_at,updated_at) VALUES(?1,'restore-test-singleton',?2,?3,2,?4,?4)",
+            rusqlite::params![api.workspace_id(), replacement.runtime_id, replacement.worker_id, TEST_CREATED_AT])?;
+        Ok(())
+    }).unwrap();
+    assert!(
+        api.store
+            .require_current_worker_singleton_owner(api.workspace_id(), worker)
+            .is_err()
+    );
+}
+
+fn add_offline_restore_workdir(api: &WorkspaceApi, worker: &RuntimeWorkerRef) {
+    let record = restore_test_workdir(
+        api,
+        "restore-offline",
+        WorkdirRegistrySource::ExternalGrant {
+            grant_id: "restore-offline-grant".into(),
+        },
+    );
+    api.store
+        .create_external_workdir_grant(
+            &crate::store::ExternalWorkdirGrantRecord {
+                grant_id: "restore-offline-grant".into(),
+                workspace_id: api.workspace_id().into(),
+                workdir_id: record.workdir_id.clone(),
+                provider_instance_id: "offline-provider".into(),
+                display_name: "Offline grant".into(),
+                permissions: "read_only".into(),
+                created_by: "owner-account".into(),
+                created_at: TEST_CREATED_AT.into(),
+                expires_at: None,
+                generation: 1,
+                status: "offline".into(),
+                updated_at: TEST_CREATED_AT.into(),
+            },
+            &record,
+        )
+        .unwrap();
+    attach_restore_test_workdir(api, worker, &record);
+}
+
+#[tokio::test]
+async fn restore_guard_stale_ssh_intent_does_not_issue_workspace_resource() {
+    let workspace = tempfile::tempdir().unwrap();
+    let api = test_api_with_remote_repository(workspace.path()).await;
+    let identity = spawn_ticket_check_source(&api, "restore-stale-ssh");
+    let handle = WorkspaceWorker::resolve(&api, &identity.runtime_id, &identity.worker_id).unwrap();
+    let stale = restore_request_for(&api, &identity, "stale-ssh-intent");
+    handle
+        .stop(&WorkerOperationContext::Backend, operation_lifecycle())
+        .await
+        .unwrap();
+    api.repository_secrets
+        .generate_credential(
+            api.workspace_id(),
+            GenerateRepositorySshCredentialRequest {
+                operation_id: "restore-default-key".into(),
+                credential_id:
+                    crate::repository_access::WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID.into(),
+                name: "Restore test default".into(),
+            },
+            "owner-account",
+        )
+        .unwrap();
+    let public_key = api
+        .repository_secrets
+        .credential_public_key(
+            api.workspace_id(),
+            crate::repository_access::WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID,
+        )
+        .unwrap()
+        .unwrap()
+        .public_key;
+    api.repository_secrets
+        .put_host_trust(
+            api.workspace_id(),
+            PutRepositorySshHostTrustRequest {
+                operation_id: "restore-ssh-trust".into(),
+                host_trust_id: "restore-ssh-host".into(),
+                hostname: "example.invalid".into(),
+                port: 22,
+                host_key: public_key,
+                expected_revision: None,
+            },
+            "owner-account",
+        )
+        .unwrap();
+    let record = restore_test_workdir(
+        &api,
+        "restore-ssh-workdir",
+        WorkdirRegistrySource::Repository {
+            runtime_id: identity.runtime_id.clone(),
+            repository_id: test_repository_id(&api),
+        },
+    );
+    api.store.upsert_workdir_registry(&record).unwrap();
+    attach_restore_test_workdir(&api, &identity, &record);
+    // Prove this is a fully issuable SSH fixture; the old pre-admission path would mint another handle.
+    assert!(
+        repository_access_request_for_workdir(
+            &api,
+            &identity.runtime_id,
+            &record.workdir_id,
+            "restore-ssh-positive-control"
+        )
+        .unwrap()
+        .is_some()
+    );
+    let before = api.resource_broker.repository_ssh_access_handle_count();
+    assert!(before > 0);
+    let conflict = handle
+        .restore(&WorkerOperationContext::Backend, stale)
+        .await
+        .unwrap_err();
+    assert!(matches!(conflict.error, Error::RestoreObservationConflict));
+    assert_eq!(
+        api.resource_broker.repository_ssh_access_handle_count(),
+        before
+    );
+    assert_eq!(api.runtime.worker(&identity).unwrap().state, "stopped");
+}
+
+#[tokio::test]
+async fn restore_guard_historical_replay_ignores_new_eligibility_but_rechecks_auth() {
+    let workspace = tempfile::tempdir().unwrap();
+    let (api, execution) = test_api_with_recording_backend(workspace.path()).await;
+    execution.accept_restores();
+    let identity = spawn_ticket_check_source(&api, "restore-historical");
+    let replacement = spawn_ticket_check_source(&api, "restore-replacement");
+    let handle = WorkspaceWorker::resolve(&api, &identity.runtime_id, &identity.worker_id).unwrap();
+    handle
+        .stop(&WorkerOperationContext::Backend, operation_lifecycle())
+        .await
+        .unwrap();
+    let request = restore_request_for(&api, &identity, "restore-historical-request");
+    assert_eq!(
+        handle
+            .restore(&WorkerOperationContext::Backend, request.clone())
+            .await
+            .unwrap()
+            .state,
+        server_api::WorkerRestoreState::Accepted
+    );
+    handle
+        .stop(&WorkerOperationContext::Backend, operation_lifecycle())
+        .await
+        .unwrap();
+    displace_restore_singleton(&api, &identity, &replacement);
+    add_offline_restore_workdir(&api, &identity);
+    let before = execution.restore_operations.lock().unwrap().len();
+    let replay = handle
+        .restore(&WorkerOperationContext::Backend, request.clone())
+        .await
+        .unwrap();
+    assert_eq!(replay.state, server_api::WorkerRestoreState::Accepted);
+    assert_eq!(
+        replay.worker.unwrap().state,
+        "stopped",
+        "never return the old idle receipt summary"
+    );
+    assert_eq!(execution.restore_operations.lock().unwrap().len(), before);
+    let projected = restore_runtime_worker_with_context(
+        api.clone(),
+        identity.runtime_id.clone(),
+        identity.worker_id.clone(),
+        WorkerOperationContext::Backend,
+        request.clone(),
+    )
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(
+        projected.result.worker.unwrap().state,
+        "unavailable",
+        "current fenced projection, never old idle receipt"
+    );
+    let (mut browser, _) = browser_operation_context(&api).await;
+    let WorkerOperationContext::Browser { headers, .. } = &mut browser else {
+        unreachable!()
+    };
+    headers.insert(ORIGIN, "https://untrusted.example".parse().unwrap());
+    assert!(matches!(
+        handle.restore(&browser, request).await.unwrap_err().error,
+        Error::WorkspacePermissionDenied(_)
+    ));
+    assert_eq!(execution.restore_operations.lock().unwrap().len(), before);
+    assert!(
+        handle
+            .restore(
+                &WorkerOperationContext::Backend,
+                restore_request_for(&api, &identity, "new-ineligible-intent")
+            )
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn restore_guard_pending_recovery_ignores_new_eligibility_and_reuses_operation() {
+    let workspace = tempfile::tempdir().unwrap();
+    let (api, execution) = test_api_with_recording_backend(workspace.path()).await;
+    execution.accept_restores();
+    let identity = spawn_ticket_check_source(&api, "restore-pending");
+    let replacement = spawn_ticket_check_source(&api, "restore-pending-replacement");
+    let handle = WorkspaceWorker::resolve(&api, &identity.runtime_id, &identity.worker_id).unwrap();
+    handle
+        .stop(&WorkerOperationContext::Backend, operation_lifecycle())
+        .await
+        .unwrap();
+    *execution.restore_failure.lock().unwrap() = Some(
+        worker_runtime::execution::WorkerExecutionSpawnResult::Errored(
+            worker_runtime::execution::WorkerExecutionResult::rejected(
+                worker_runtime::execution::WorkerExecutionOperation::Restore,
+                "uncertain launch",
+            ),
+        ),
+    );
+    let request = restore_request_for(&api, &identity, "restore-pending-request");
+    assert_eq!(
+        handle
+            .restore(&WorkerOperationContext::Backend, request.clone())
+            .await
+            .unwrap()
+            .state,
+        server_api::WorkerRestoreState::ReconciliationRequired
+    );
+    let original = execution.restore_operations.lock().unwrap()[0];
+    displace_restore_singleton(&api, &identity, &replacement);
+    add_offline_restore_workdir(&api, &identity);
+    assert_eq!(
+        handle
+            .restore(&WorkerOperationContext::Backend, request)
+            .await
+            .unwrap()
+            .state,
+        server_api::WorkerRestoreState::Accepted
+    );
+    assert_eq!(
+        execution.reconcile_operations.lock().unwrap().as_slice(),
+        &[original]
+    );
+    assert!(
+        execution
+            .restore_operations
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|id| id == &original)
+    );
+}
+
+#[tokio::test]
+async fn restore_guard_internal_intent_survives_client_store_restart_without_replacing_token() {
+    let workspace = tempfile::tempdir().unwrap();
+    let (mut api, execution) = test_api_with_recording_backend(workspace.path()).await;
+    execution.accept_restores();
+    let identity = spawn_ticket_check_source(&api, "restore-internal-restart");
+    WorkspaceWorker::resolve(&api, &identity.runtime_id, &identity.worker_id)
+        .unwrap()
+        .stop(&WorkerOperationContext::Backend, operation_lifecycle())
+        .await
+        .unwrap();
+    let observed = api.runtime.worker(&identity).unwrap();
+    *execution.restore_failure.lock().unwrap() = Some(
+        worker_runtime::execution::WorkerExecutionSpawnResult::Errored(
+            worker_runtime::execution::WorkerExecutionResult::rejected(
+                worker_runtime::execution::WorkerExecutionOperation::Restore,
+                "uncertain launch",
+            ),
+        ),
+    );
+    assert_eq!(
+        restore_internal_observed_worker(&api, &observed, "subject-restore".into())
+            .unwrap()
+            .state,
+        server_api::WorkerRestoreState::ReconciliationRequired
+    );
+    let original = execution.restore_operations.lock().unwrap()[0];
+    let current = api.runtime.worker(&identity).unwrap();
+    assert_ne!(
+        observed.restore_observation_token,
+        current.restore_observation_token
+    );
+    // Reopen the durable caller journal, discarding all client-side memory of request identity.
+    api.config_store =
+        Arc::new(SqliteWorkspaceStore::open(api.config.database_path.clone()).unwrap());
+    let pinned = api
+        .config_store
+        .pin_internal_worker_restore_intent(
+            api.workspace_id(),
+            &identity,
+            "subject-restore",
+            current.restore_observation_token.as_deref(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        pinned.expected_observation_token,
+        observed.restore_observation_token.unwrap()
+    );
+    assert_eq!(
+        restore_internal_observed_worker(&api, &current, "subject-restore".into())
+            .unwrap()
+            .state,
+        server_api::WorkerRestoreState::Accepted
+    );
+    assert_eq!(
+        execution.reconcile_operations.lock().unwrap().as_slice(),
+        &[original]
+    );
+    assert!(
+        execution
+            .restore_operations
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|id| id == &original)
+    );
+}
+
+#[tokio::test]
+async fn restore_guard_workspace_interrupted_preparation_recovers_admitted_snapshot() {
+    let workspace = tempfile::tempdir().unwrap();
+    let (api, execution) = test_api_with_recording_backend(workspace.path()).await;
+    execution.accept_restores();
+    let identity = spawn_ticket_check_source(&api, "restore-prepare-interrupted");
+    let replacement = spawn_ticket_check_source(&api, "restore-prepare-replacement");
+    let handle = WorkspaceWorker::resolve(&api, &identity.runtime_id, &identity.worker_id).unwrap();
+    handle
+        .stop(&WorkerOperationContext::Backend, operation_lifecycle())
+        .await
+        .unwrap();
+    let request = restore_request_for(&api, &identity, "restore-prepare-interrupted-request");
+    let preparation = runtime_api::WorkerRestorePreparation {
+        workspace_api: Some(
+            runtime_contract_restore(api.workspace_api_ref(&identity.runtime_id)).unwrap(),
+        ),
+        workdir_attachments: Some(Vec::new()),
+        ..Default::default()
+    };
+    let (result, retained) = api
+        .runtime
+        .coordinate_worker_restore(
+            &identity,
+            runtime_api::WorkerRestoreCoordinationRequest {
+                expected_observation_token: request.expected_observation_token.clone(),
+                request_id: request.request_id.clone(),
+                preparation: Some(preparation.clone()),
+            },
+        )
+        .unwrap();
+    assert!(result.is_none());
+    assert_eq!(retained, Some(preparation));
+    assert!(execution.restore_operations.lock().unwrap().is_empty());
+    // Model interruption between admission and completion, then changed current eligibility.
+    displace_restore_singleton(&api, &identity, &replacement);
+    add_offline_restore_workdir(&api, &identity);
+    let restored = handle
+        .restore(&WorkerOperationContext::Backend, request.clone())
+        .await
+        .unwrap();
+    assert_eq!(restored.state, server_api::WorkerRestoreState::Accepted);
+    assert_eq!(execution.restore_operations.lock().unwrap().len(), 1);
+    let original = execution.restore_operations.lock().unwrap()[0];
+    assert!(
+        execution.reconcile_operations.lock().unwrap().is_empty(),
+        "no execution existed to reconcile yet"
+    );
+    assert_eq!(
+        handle
+            .restore(&WorkerOperationContext::Backend, request)
+            .await
+            .unwrap()
+            .state,
+        server_api::WorkerRestoreState::Accepted
+    );
+    assert_eq!(
+        execution.restore_operations.lock().unwrap().as_slice(),
+        &[original]
+    );
+}
+
+#[tokio::test]
+async fn restore_guard_cross_runtime_ssh_completion_retries_pinned_snapshot_at_workdir_owner() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut config = test_server_config(workspace.path());
+    let source = server_api::RepositorySource {
+        kind: server_api::RepositorySourceKind::Ssh,
+        uri: "git@example.invalid:owner/repository.git".into(),
+    };
+    config.repositories[0].source_fingerprint =
+        crate::repository_source::repository_source_fingerprint(&source);
+    config.repositories[0].source = source;
+    config.repositories[0].path = None;
+    let store = SqliteWorkspaceStore::open(config.database_path.clone()).unwrap();
+    let execution = Arc::new(DeterministicExecutionBackend::default());
+    execution.accept_restores();
+    let api = WorkspaceApi::new_with_execution_backend(config, Arc::new(store), execution.clone())
+        .await
+        .unwrap();
+    let peer = WorkdirlessFixtureRuntime::default();
+    *peer.reject_repository_access.lock().unwrap() = true;
+    api.runtime.register_or_replace(peer.clone());
+    let identity = spawn_ticket_check_source(&api, "restore-cross-runtime-ssh");
+    let handle = WorkspaceWorker::resolve(&api, &identity.runtime_id, &identity.worker_id).unwrap();
+    handle
+        .stop(&WorkerOperationContext::Backend, operation_lifecycle())
+        .await
+        .unwrap();
+    let original_key = api
+        .repository_secrets
+        .generate_credential(
+            api.workspace_id(),
+            GenerateRepositorySshCredentialRequest {
+                operation_id: "cross-runtime-default-key".into(),
+                credential_id:
+                    crate::repository_access::WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID.into(),
+                name: "Restore default".into(),
+            },
+            "owner-account",
+        )
+        .unwrap();
+    let public_key = api
+        .repository_secrets
+        .credential_public_key(api.workspace_id(), &original_key.credential_id)
+        .unwrap()
+        .unwrap()
+        .public_key;
+    api.repository_secrets
+        .put_host_trust(
+            api.workspace_id(),
+            PutRepositorySshHostTrustRequest {
+                operation_id: "cross-runtime-trust".into(),
+                host_trust_id: "cross-runtime-host".into(),
+                hostname: "example.invalid".into(),
+                port: 22,
+                host_key: public_key,
+                expected_revision: None,
+            },
+            "owner-account",
+        )
+        .unwrap();
+    let record = restore_test_workdir(
+        &api,
+        "cross-runtime-restore-workdir",
+        WorkdirRegistrySource::Repository {
+            runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.into(),
+            repository_id: test_repository_id(&api),
+        },
+    );
+    peer.set_workdir_repository(&record.workdir_id, &test_repository_id(&api));
+    api.store.upsert_workdir_registry(&record).unwrap();
+    attach_restore_test_workdir(&api, &identity, &record);
+    let request = restore_request_for(&api, &identity, "cross-runtime-restore-request");
+    assert_eq!(
+        handle
+            .restore(&WorkerOperationContext::Backend, request.clone())
+            .await
+            .unwrap()
+            .state,
+        server_api::WorkerRestoreState::ReconciliationRequired
+    );
+    assert!(
+        execution.restore_operations.lock().unwrap().is_empty(),
+        "credential completion must precede execution"
+    );
+    let first = peer.repository_access_requests.lock().unwrap()[0].clone();
+    assert_eq!(
+        first.materialization.runtime_id,
+        WorkdirlessFixtureRuntime::RUNTIME_ID
+    );
+    assert_ne!(first.materialization.runtime_id, identity.runtime_id);
+    // Rotate current host trust while the accepted operation is uncertain. Its
+    // original credential/trust revisions, source and binding must remain pinned.
+    let alternate = api
+        .repository_secrets
+        .generate_credential(
+            api.workspace_id(),
+            GenerateRepositorySshCredentialRequest {
+                operation_id: "cross-runtime-alternate-key".into(),
+                credential_id: "cross-runtime-alternate".into(),
+                name: "Alternate".into(),
+            },
+            "owner-account",
+        )
+        .unwrap();
+    let alternate_public = api
+        .repository_secrets
+        .credential_public_key(api.workspace_id(), &alternate.credential_id)
+        .unwrap()
+        .unwrap()
+        .public_key;
+    let original_trust_revision = first
+        .materialization
+        .ssh
+        .as_ref()
+        .unwrap()
+        .host_trust_revision;
+    api.repository_secrets
+        .put_host_trust(
+            api.workspace_id(),
+            PutRepositorySshHostTrustRequest {
+                operation_id: "cross-runtime-trust-rotate".into(),
+                host_trust_id: "cross-runtime-host".into(),
+                hostname: "example.invalid".into(),
+                port: 22,
+                host_key: alternate_public,
+                expected_revision: Some(original_trust_revision),
+            },
+            "owner-account",
+        )
+        .unwrap();
+    *peer.reject_repository_access.lock().unwrap() = false;
+    assert_eq!(
+        handle
+            .restore(&WorkerOperationContext::Backend, request.clone())
+            .await
+            .unwrap()
+            .state,
+        server_api::WorkerRestoreState::Accepted
+    );
+    let attempts = peer.repository_access_requests.lock().unwrap();
+    assert_eq!(attempts.len(), 2);
+    let second = &attempts[1];
+    assert_eq!(
+        second.materialization.operation_id,
+        first.materialization.operation_id
+    );
+    let mut normalized = second.clone();
+    let old_ssh = first.materialization.ssh.as_ref().unwrap();
+    let new_ssh = normalized.materialization.ssh.as_mut().unwrap();
+    assert_ne!(new_ssh.secret_resource.nonce, old_ssh.secret_resource.nonce);
+    new_ssh.secret_resource = old_ssh.secret_resource.clone();
+    new_ssh.expires_at_epoch_seconds = old_ssh.expires_at_epoch_seconds;
+    assert_eq!(normalized, first, "only opaque handle and expiry may renew");
+    drop(attempts);
+    assert_eq!(execution.restore_operations.lock().unwrap().len(), 1);
+    assert_eq!(
+        handle
+            .restore(&WorkerOperationContext::Backend, request)
+            .await
+            .unwrap()
+            .state,
+        server_api::WorkerRestoreState::Accepted
+    );
+    assert_eq!(
+        peer.repository_access_requests.lock().unwrap().len(),
+        2,
+        "terminal receipt must not renew access"
+    );
 }

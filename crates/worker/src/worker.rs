@@ -728,6 +728,7 @@ pub enum WorkspaceServerOperation {
     WorkerControlRestore {
         runtime_id: String,
         worker_id: String,
+        request: server_api::WorkerRestoreRequest,
     },
     WorkerObservationSessions,
     WorkerObservationCapture(server_api::WorkerObservationSubjectRef),
@@ -802,11 +803,15 @@ fn workspace_server_operation_request(
         WorkspaceServerOperation::WorkerControlRestore {
             runtime_id,
             worker_id,
-        } => Ok(WorkspaceRequest::json(
-            WorkspaceRequestMethod::Post,
-            format!("{base}/worker-control/workers/{runtime_id}/{worker_id}/restore"),
-            "".to_string(),
-        )),
+            request,
+        } => workspace_server_json_request(
+            format!(
+                "{base}/worker-control/workers/{}/{}/restore",
+                encode_workspace_path_segment(&runtime_id),
+                encode_workspace_path_segment(&worker_id)
+            ),
+            &request,
+        ),
         WorkspaceServerOperation::WorkerObservationSessions => Ok(WorkspaceRequest::get(format!(
             "{base}/worker-observation/sessions"
         ))),

@@ -145,7 +145,7 @@ impl From<PersistedWorkerRestoreMode> for WorkerRestoreMode {
 /// Runtime-internal restore result consumed by both embedded and HTTP
 /// providers. Diagnostics are stable and path-free; detailed backend errors
 /// remain in Runtime logs rather than crossing the API boundary.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeWorkerRestoreResult {
     pub state: WorkerRestoreState,
     pub worker: Option<WorkerDetail>,
@@ -378,6 +378,8 @@ impl Runtime {
             state
         };
         state.execution_backend = execution_backend;
+        // Initialize legacy generations durably before exposing an observation.
+        state.persist_workers()?;
         let runtime = Self {
             inner: Arc::new(Mutex::new(state)),
             worker_operations: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1094,6 +1096,7 @@ impl Runtime {
 
             let durable_request = durable_create_worker_request(&request);
             let record = WorkerRecord {
+                restore_guard: RestoreGuard::default(),
                 worker_ref: worker_ref.clone(),
                 worker_id: worker_id.clone(),
                 status: WorkerStatus::Stopped,
@@ -1529,7 +1532,7 @@ impl Runtime {
     fn replace_worker_workdir_attachments_with_scope(
         &self,
         worker_ref: &WorkerRef,
-        mut attachments: Vec<LogicalWorkdirAttachment>,
+        attachments: Vec<LogicalWorkdirAttachment>,
         scope: Option<&RuntimeWorkspaceScope>,
     ) -> Result<WorkerDetail, RuntimeError> {
         let operation_lock = self.worker_operation_lock(worker_ref.worker_id)?;
@@ -1539,6 +1542,14 @@ impl Runtime {
         if let Some(scope) = scope {
             self.ensure_worker_in_workspace(scope, worker_ref)?;
         }
+        self.replace_worker_workdir_attachments_under_lock(worker_ref, attachments)
+    }
+
+    fn replace_worker_workdir_attachments_under_lock(
+        &self,
+        worker_ref: &WorkerRef,
+        mut attachments: Vec<LogicalWorkdirAttachment>,
+    ) -> Result<WorkerDetail, RuntimeError> {
         validate_logical_workdir_attachments(&attachments)?;
         attachments.sort_by(|left, right| left.alias.cmp(&right.alias));
 
@@ -1712,13 +1723,14 @@ impl Runtime {
         })
     }
 
-    /// Attach a live execution through a workspace-scoped Runtime authorization context.
+    /// Restore admission is fenced by the same lock as every lifecycle mutation.
     pub fn restore_worker_scoped(
         &self,
         scope: &RuntimeWorkspaceScope,
         worker_ref: &WorkerRef,
+        request: runtime_api::WorkerRestoreRequest,
     ) -> Result<WorkerDetail, RuntimeError> {
-        self.restore_worker_operation_scoped(scope, worker_ref)?
+        self.restore_worker_operation_scoped(scope, worker_ref, request)?
             .into_legacy_result()
     }
 
@@ -1726,41 +1738,681 @@ impl Runtime {
         &self,
         scope: &RuntimeWorkspaceScope,
         worker_ref: &WorkerRef,
+        request: runtime_api::WorkerRestoreRequest,
     ) -> Result<RuntimeWorkerRestoreResult, RuntimeError> {
-        self.restore_worker_operation_with_scope(worker_ref, Some(scope))
+        self.restore_worker_operation_with_scope(worker_ref, request, Some(scope))
     }
 
-    /// Attach a live execution to a persisted Worker definition.
-    ///
-    /// Every lifecycle mutation for a Worker is serialized by the same operation
-    /// lock. A concurrent exact restore waits for the first caller and then
-    /// converges on its already-installed execution rather than spawning another
-    /// controller.
-    pub fn restore_worker(&self, worker_ref: &WorkerRef) -> Result<WorkerDetail, RuntimeError> {
-        self.restore_worker_operation(worker_ref)?
+    pub fn restore_worker(
+        &self,
+        worker_ref: &WorkerRef,
+        request: runtime_api::WorkerRestoreRequest,
+    ) -> Result<WorkerDetail, RuntimeError> {
+        self.restore_worker_operation(worker_ref, request)?
             .into_legacy_result()
     }
 
     pub fn restore_worker_operation(
         &self,
         worker_ref: &WorkerRef,
+        request: runtime_api::WorkerRestoreRequest,
     ) -> Result<RuntimeWorkerRestoreResult, RuntimeError> {
-        self.restore_worker_operation_with_scope(worker_ref, None)
+        self.restore_worker_operation_with_scope(worker_ref, request, None)
+    }
+
+    pub fn coordinate_worker_restore_operation(
+        &self,
+        worker_ref: &WorkerRef,
+        request: runtime_api::WorkerRestoreCoordinationRequest,
+        scope: Option<&RuntimeWorkspaceScope>,
+    ) -> Result<
+        (
+            Option<RuntimeWorkerRestoreResult>,
+            Option<runtime_api::WorkerRestorePreparation>,
+        ),
+        RuntimeError,
+    > {
+        self.dispatch_restore_worker_with_scope(
+            worker_ref,
+            runtime_api::WorkerRestoreRequest {
+                expected_observation_token: request.expected_observation_token,
+                request_id: request.request_id,
+                preparation: request.preparation,
+            },
+            scope,
+            true,
+        )
     }
 
     fn restore_worker_operation_with_scope(
         &self,
         worker_ref: &WorkerRef,
+        request: runtime_api::WorkerRestoreRequest,
         scope: Option<&RuntimeWorkspaceScope>,
     ) -> Result<RuntimeWorkerRestoreResult, RuntimeError> {
+        self.dispatch_restore_worker_with_scope(worker_ref, request, scope, false)?
+            .0
+            .ok_or_else(|| RuntimeError::InvalidRequest("Restore preparation is required".into()))
+    }
+
+    fn dispatch_restore_worker_with_scope(
+        &self,
+        worker_ref: &WorkerRef,
+        mut request: runtime_api::WorkerRestoreRequest,
+        scope: Option<&RuntimeWorkspaceScope>,
+        coordinate: bool,
+    ) -> Result<
+        (
+            Option<RuntimeWorkerRestoreResult>,
+            Option<runtime_api::WorkerRestorePreparation>,
+        ),
+        RuntimeError,
+    > {
+        let mut preparation_authorized = !coordinate && request.preparation.is_some();
         let operation_lock = self.worker_operation_lock(worker_ref.worker_id)?;
         let _operation_guard = operation_lock
             .lock()
             .map_err(|_| RuntimeError::StatePoisoned)?;
         if let Some(scope) = scope {
-            self.ensure_worker_in_workspace(scope, worker_ref)?;
+            let mut state = self.lock()?;
+            if !state
+                .worker(worker_ref)?
+                .belongs_to_workspace(&scope.workspace_id)
+            {
+                return Err(RuntimeError::WorkerNotFound {
+                    worker_id: worker_ref.worker_id,
+                });
+            }
+            // Authorization is read-only until token admission succeeds.
+            state.ensure_workspace_owner(scope, false)?;
         }
-        self.restore_worker_under_lock(worker_ref, WorkerRestoreMode::Explicit)
+        if request.request_id.trim().is_empty()
+            || request.request_id.len() > 512
+            || request.expected_observation_token.is_empty()
+            || request.expected_observation_token.len() > 256
+        {
+            return Err(RuntimeError::InvalidRequest(
+                "Restore requires a nonempty request_id and expected_observation_token".to_string(),
+            ));
+        }
+        use sha2::Digest;
+        // Preparation contains ephemeral Workspace/resource handles, not public
+        // intent. Retries must use the first admitted owner's durable payload.
+        // The owner map is scoped to this Worker, so bind only the external fence.
+        let bytes = serde_json::to_vec(&(&request.expected_observation_token, &request.request_id))
+            .map_err(|error| RuntimeError::InvalidRequest(error.to_string()))?;
+        let fingerprint = sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        {
+            let mut state = self.lock()?;
+            let mut candidate = state.worker(worker_ref)?.clone();
+            let conflict = || RuntimeError::RestoreObservationConflict {
+                worker_id: worker_ref.worker_id,
+            };
+            if let Some(mut owner) = candidate
+                .restore_guard
+                .owners
+                .get(&request.request_id)
+                .cloned()
+            {
+                if owner.fingerprint != fingerprint {
+                    return Err(conflict());
+                }
+                // Replay is historical: it must not attach a controller after a later stop.
+                if let Some(receipt) = &owner.receipt {
+                    return Ok((Some(receipt.clone()), None));
+                }
+                if candidate.restore_guard.active_request_id.as_deref() != Some(&request.request_id)
+                    || candidate
+                        .pending_restore
+                        .is_none_or(|pending| pending.operation_id != owner.operation_id)
+                {
+                    return Err(conflict());
+                }
+                if coordinate && !owner.preparation_applied {
+                    if let Some(preparation) = owner.request.preparation.as_mut() {
+                        if preparation.repository_access_workdirs.is_empty()
+                            && !preparation.repository_access.is_empty()
+                        {
+                            preparation.repository_access_workdirs = preparation
+                                .repository_access
+                                .iter()
+                                .map(|access| runtime_api::RepositoryAccessWorkdirReference {
+                                    runtime_id: access.materialization.runtime_id.clone(),
+                                    working_directory_id: access.working_directory_id.clone(),
+                                })
+                                .collect();
+                            candidate
+                                .restore_guard
+                                .owners
+                                .insert(request.request_id.clone(), owner.clone());
+                            match state.persist_worker_record(&candidate) {
+                                Ok(()) => {
+                                    state
+                                        .workers
+                                        .insert(worker_ref.worker_id, candidate.clone());
+                                }
+                                Err(error @ RuntimeError::StoreCommitOutcomeUnknown { .. }) => {
+                                    state.workers.insert(worker_ref.worker_id, candidate);
+                                    return Ok((
+                                        Some(RuntimeWorkerRestoreResult::failed(
+                                            WorkerRestoreState::ReconciliationRequired,
+                                            "worker_restore_preparation_commit_unknown",
+                                            sanitize_worker_create_failure_message(
+                                                &error.to_string(),
+                                            ),
+                                        )),
+                                        None,
+                                    ));
+                                }
+                                Err(error) => {
+                                    return Ok((
+                                        Some(RuntimeWorkerRestoreResult::failed(
+                                            WorkerRestoreState::ReconciliationRequired,
+                                            "worker_restore_preparation_commit_failed",
+                                            sanitize_worker_create_failure_message(
+                                                &error.to_string(),
+                                            ),
+                                        )),
+                                        None,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                if !owner.preparation_applied {
+                    if let (Some(original), Some(incoming)) =
+                        (&owner.request.preparation, &request.preparation)
+                    {
+                        // Server-regenerated bindings are not part of the public fingerprint.
+                        // Reuse admitted bindings and accept only resource completion for those references.
+                        let references_match = incoming.repository_access.len()
+                            == original.repository_access_workdirs.len()
+                            && original.repository_access_workdirs.iter().all(|reference| {
+                                incoming
+                                    .repository_access
+                                    .iter()
+                                    .filter(|access| {
+                                        reference.working_directory_id
+                                            == access.working_directory_id
+                                            && reference.runtime_id
+                                                == access.materialization.runtime_id
+                                    })
+                                    .count()
+                                    == 1
+                            });
+                        let snapshot_matches = original.repository_access.is_empty()
+                            || (original.repository_access.len()
+                                == incoming.repository_access.len()
+                                && original
+                                    .repository_access
+                                    .iter()
+                                    .zip(&incoming.repository_access)
+                                    .all(|(original, incoming)| {
+                                        let mut normalized = incoming.clone();
+                                        if let (Some(old), Some(new)) = (
+                                            &original.materialization.ssh,
+                                            &mut normalized.materialization.ssh,
+                                        ) {
+                                            new.secret_resource = old.secret_resource.clone();
+                                            new.expires_at_epoch_seconds =
+                                                old.expires_at_epoch_seconds;
+                                        }
+                                        &normalized == original
+                                    }));
+                        if !original.repository_access_workdirs.is_empty() {
+                            preparation_authorized =
+                                !coordinate && references_match && snapshot_matches;
+                        }
+                        if references_match
+                            && snapshot_matches
+                            && original.repository_access != incoming.repository_access
+                        {
+                            candidate
+                                .restore_guard
+                                .owners
+                                .get_mut(&request.request_id)
+                                .unwrap()
+                                .request
+                                .preparation
+                                .as_mut()
+                                .unwrap()
+                                .repository_access = incoming.repository_access.clone();
+                            match state.persist_worker_record(&candidate) {
+                                Ok(()) => {
+                                    state
+                                        .workers
+                                        .insert(worker_ref.worker_id, candidate.clone());
+                                }
+                                Err(error @ RuntimeError::StoreCommitOutcomeUnknown { .. }) => {
+                                    state.workers.insert(worker_ref.worker_id, candidate);
+                                    return Ok((
+                                        Some(RuntimeWorkerRestoreResult::failed(
+                                            WorkerRestoreState::ReconciliationRequired,
+                                            "worker_restore_preparation_commit_unknown",
+                                            sanitize_worker_create_failure_message(
+                                                &error.to_string(),
+                                            ),
+                                        )),
+                                        None,
+                                    ));
+                                }
+                                Err(error) => {
+                                    return Ok((
+                                        Some(RuntimeWorkerRestoreResult::failed(
+                                            WorkerRestoreState::ReconciliationRequired,
+                                            "worker_restore_preparation_commit_failed",
+                                            sanitize_worker_create_failure_message(
+                                                &error.to_string(),
+                                            ),
+                                        )),
+                                        None,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Startup/older persisted pending operations have a lifecycle
+                // owner but no public request receipt. Bind recovery to that
+                // exact operation; never allocate replacement execution or apply
+                // candidate preparation. The current observation still fences
+                // stale callers, and a second request cannot steal this receipt.
+                let recovering_pending = candidate.pending_restore.is_some()
+                    && candidate.pending_stop.is_none()
+                    && candidate.restore_guard.active_request_id.is_none();
+                if coordinate && request.preparation.is_none() && !recovering_pending {
+                    if candidate.restore_guard.generation != request.expected_observation_token
+                        || candidate.restore_guard.active_request_id.is_some()
+                        || candidate.has_pending_lifecycle_operation()
+                    {
+                        return Err(conflict());
+                    }
+                    return Ok((None, None));
+                }
+                if coordinate
+                    && request
+                        .preparation
+                        .as_ref()
+                        .is_some_and(|prep| !prep.repository_access.is_empty())
+                {
+                    return Err(RuntimeError::InvalidRequest(
+                        "Admission accepts read-only preparation references only".into(),
+                    ));
+                }
+                state.ensure_running()?;
+                if candidate.restore_guard.generation != request.expected_observation_token
+                    || candidate.restore_guard.active_request_id.is_some()
+                    || (candidate.has_pending_lifecycle_operation() && !recovering_pending)
+                {
+                    return Err(conflict());
+                }
+                if (scope.is_some() || candidate.workspace_id.is_some())
+                    && request.preparation.is_none()
+                    && !recovering_pending
+                {
+                    return Err(RuntimeError::InvalidRequest(
+                        "New Workspace Restore requires preparation".into(),
+                    ));
+                }
+                if let Some(scope) = scope {
+                    state.ensure_workspace_owner(scope, true)?;
+                    state.persist_runtime_snapshot()?;
+                }
+                let pending = candidate
+                    .pending_restore
+                    .unwrap_or_else(|| PendingWorkerRestore {
+                        operation_id: WorkerLifecycleOperationId::new(),
+                        mode: WorkerRestoreMode::Explicit,
+                        last_settled_status: candidate.status,
+                    });
+                let operation_id = pending.operation_id;
+                candidate.pending_restore = Some(pending);
+                if recovering_pending {
+                    request.preparation = None;
+                }
+                candidate.restore_guard.rotate();
+                candidate.restore_guard.active_request_id = Some(request.request_id.clone());
+                candidate.restore_guard.owners.insert(
+                    request.request_id.clone(),
+                    RestoreRequestOwner {
+                        fingerprint,
+                        operation_id,
+                        request,
+                        preparation_applied: recovering_pending,
+                        execution_started: recovering_pending,
+                        receipt: None,
+                    },
+                );
+                match state.persist_worker_record(&candidate) {
+                    Ok(()) => {}
+                    Err(error @ RuntimeError::StoreCommitOutcomeUnknown { .. }) => {
+                        state.workers.insert(worker_ref.worker_id, candidate);
+                        return Ok((
+                            Some(RuntimeWorkerRestoreResult::failed(
+                                WorkerRestoreState::ReconciliationRequired,
+                                "worker_restore_admission_commit_unknown",
+                                sanitize_worker_create_failure_message(&error.to_string()),
+                            )),
+                            None,
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
+                state.workers.insert(worker_ref.worker_id, candidate);
+                state.publish_worker_upsert(worker_ref.worker_id)?;
+            }
+        }
+        if coordinate {
+            let state = self.lock()?;
+            let candidate = state.worker(worker_ref)?;
+            let id = candidate
+                .restore_guard
+                .active_request_id
+                .as_ref()
+                .expect("admitted request");
+            let owner = &candidate.restore_guard.owners[id];
+            if !owner.preparation_applied
+                && !owner.execution_started
+                && owner.request.preparation.is_some()
+            {
+                return Ok((None, owner.request.preparation.clone()));
+            }
+        }
+        self.restore_admitted_worker_under_lock_with_preparation(
+            worker_ref,
+            WorkerRestoreMode::Explicit,
+            preparation_authorized,
+        )
+        .map(|result| (Some(result), None))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_restore_request(
+        &self,
+        worker_ref: &WorkerRef,
+    ) -> runtime_api::WorkerRestoreRequest {
+        let state = self.lock().unwrap();
+        let worker = state.worker(worker_ref).unwrap();
+        if let Some(id) = &worker.restore_guard.active_request_id {
+            return worker.restore_guard.owners[id].request.clone();
+        }
+        runtime_api::WorkerRestoreRequest {
+            expected_observation_token: worker.restore_guard.generation.clone(),
+            request_id: uuid::Uuid::now_v7().to_string(),
+            preparation: worker
+                .workspace_id
+                .as_ref()
+                .map(|_| runtime_api::WorkerRestorePreparation::default()),
+        }
+    }
+
+    /// Private startup and exact pending-owner reconciliation use the durable payload.
+    fn restore_admitted_worker_under_lock(
+        &self,
+        worker_ref: &WorkerRef,
+        mode: WorkerRestoreMode,
+    ) -> Result<RuntimeWorkerRestoreResult, RuntimeError> {
+        self.restore_admitted_worker_under_lock_with_preparation(worker_ref, mode, false)
+    }
+
+    fn restore_admitted_worker_under_lock_with_preparation(
+        &self,
+        worker_ref: &WorkerRef,
+        mode: WorkerRestoreMode,
+        preparation_authorized: bool,
+    ) -> Result<RuntimeWorkerRestoreResult, RuntimeError> {
+        let owner = {
+            let state = self.lock()?;
+            let worker = state.worker(worker_ref)?;
+            match worker.restore_guard.active_request_id.as_ref() {
+                Some(id) => {
+                    let owner = worker.restore_guard.owners.get(id).ok_or_else(|| {
+                        RuntimeError::InvalidRequest(
+                            "Active Restore request has no persisted owner".into(),
+                        )
+                    })?;
+                    if worker
+                        .pending_restore
+                        .is_some_and(|pending| pending.operation_id != owner.operation_id)
+                    {
+                        return Err(RuntimeError::RestoreObservationConflict {
+                            worker_id: worker_ref.worker_id,
+                        });
+                    }
+                    Some(owner.clone())
+                }
+                None => None,
+            }
+        };
+        if let Some(owner) = owner {
+            // A settled owner must never turn into a fresh execution, including
+            // when startup encounters an old active-request marker.
+            if let Some(receipt) = owner.receipt {
+                return Ok(receipt);
+            }
+            if owner.execution_started {
+                let committed_detail = {
+                    let state = self.lock()?;
+                    let worker = state.worker(worker_ref)?;
+                    if worker.pending_restore.is_none() && worker.pending_stop.is_none() {
+                        if !worker.execution_bound || !worker.status.is_active() {
+                            return Ok(RuntimeWorkerRestoreResult::failed(
+                                WorkerRestoreState::ReconciliationRequired,
+                                "worker_restore_terminal_receipt_missing",
+                                "Restore execution was started but its terminal receipt is unavailable",
+                            ));
+                        }
+                        Some(worker.detail())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(detail) = committed_detail {
+                    // Recover a receipt gap without launching execution again.
+                    let result = RuntimeWorkerRestoreResult::accepted(detail);
+                    self.finish_restore_receipt(worker_ref, &result)?;
+                    return Ok(result);
+                }
+            }
+            if !owner.preparation_applied {
+                let uncertain = |message: String| {
+                    RuntimeWorkerRestoreResult::failed(
+                        WorkerRestoreState::ReconciliationRequired,
+                        "worker_restore_preparation_reconciliation_required",
+                        message,
+                    )
+                };
+                if owner.request.preparation.as_ref().is_some_and(|prep| {
+                    prep.repository_access.len() < prep.repository_access_workdirs.len()
+                        || (!prep.repository_access_workdirs.is_empty() && !preparation_authorized)
+                }) {
+                    return Ok(uncertain(
+                        "Admitted Restore is awaiting Workspace resource completion".into(),
+                    ));
+                }
+                // Complete idempotent binding/access effects under the original pending_restore ID.
+                let mut effects_started = false;
+                if let Err(error) = self.apply_restore_preparation_under_lock(
+                    worker_ref,
+                    owner.request.preparation,
+                    owner.operation_id,
+                    &mut effects_started,
+                ) {
+                    if effects_started
+                        || matches!(error, RuntimeError::StoreCommitOutcomeUnknown { .. })
+                    {
+                        return Ok(uncertain(sanitize_worker_create_failure_message(
+                            &error.to_string(),
+                        )));
+                    }
+                    let result = RuntimeWorkerRestoreResult::failed(
+                        WorkerRestoreState::Rejected,
+                        "worker_restore_preparation_rejected",
+                        sanitize_worker_create_failure_message(&error.to_string()),
+                    );
+                    self.finish_restore_receipt(worker_ref, &result)?;
+                    return Ok(result);
+                }
+                let mut state = self.lock()?;
+                let mut candidate = state.worker(worker_ref)?.clone();
+                candidate
+                    .restore_guard
+                    .owners
+                    .get_mut(&owner.request.request_id)
+                    .expect("admitted owner")
+                    .preparation_applied = true;
+                if let Err(error) = state.persist_worker_record(&candidate) {
+                    // Keep the started (not applied) record in memory. Even a
+                    // known failed completion write follows possible effects.
+                    return Ok(uncertain(sanitize_worker_create_failure_message(
+                        &error.to_string(),
+                    )));
+                }
+                state.workers.insert(worker_ref.worker_id, candidate);
+            }
+        }
+        let result = self.restore_worker_under_lock(worker_ref, mode)?;
+        self.finish_restore_receipt(worker_ref, &result)?;
+        Ok(result)
+    }
+
+    fn finish_restore_receipt(
+        &self,
+        worker_ref: &WorkerRef,
+        result: &RuntimeWorkerRestoreResult,
+    ) -> Result<(), RuntimeError> {
+        if result.state == WorkerRestoreState::ReconciliationRequired {
+            return Ok(());
+        }
+        let mut state = self.lock()?;
+        let mut candidate = state.worker(worker_ref)?.clone();
+        if candidate.restore_guard.active_request_id.is_some() {
+            candidate.restore_guard.finish(result.clone());
+            candidate.pending_restore = None;
+            state.persist_worker_record(&candidate)?;
+            state.workers.insert(worker_ref.worker_id, candidate);
+        }
+        Ok(())
+    }
+
+    fn apply_restore_preparation_under_lock(
+        &self,
+        worker_ref: &WorkerRef,
+        preparation: Option<runtime_api::WorkerRestorePreparation>,
+        operation_id: WorkerLifecycleOperationId,
+        effects_started: &mut bool,
+    ) -> Result<(), RuntimeError> {
+        let Some(preparation) = preparation else {
+            return Ok(());
+        };
+        // Validate all read-only structure before any binding effect.
+        if let Some(attachments) = &preparation.workdir_attachments {
+            let attachments: Vec<LogicalWorkdirAttachment> = serde_json::from_value(
+                serde_json::to_value(attachments)
+                    .map_err(|error| RuntimeError::InvalidRequest(error.to_string()))?,
+            )
+            .map_err(|error| RuntimeError::InvalidRequest(error.to_string()))?;
+            validate_logical_workdir_attachments(&attachments)?;
+        }
+        // DTO conversion and every Runtime preparation effect occur AFTER admission.
+        if let Some(api) = preparation.workspace_api {
+            let api: WorkspaceApiRef = serde_json::from_value(
+                serde_json::to_value(api)
+                    .map_err(|error| RuntimeError::InvalidRequest(error.to_string()))?,
+            )
+            .map_err(|error| RuntimeError::InvalidRequest(error.to_string()))?;
+            if self.lock()?.worker(worker_ref)?.workspace_id.as_deref()
+                != Some(api.workspace_id.as_str())
+            {
+                return Err(RuntimeError::InvalidRequest(
+                    "Prepared Workspace API does not match Worker Workspace identity".into(),
+                ));
+            }
+            let mut state = self.lock()?;
+            let mut candidate = state.worker(worker_ref)?.clone();
+            if candidate.pending_stop.is_some()
+                || candidate
+                    .pending_restore
+                    .is_none_or(|pending| pending.operation_id != operation_id)
+            {
+                return Err(RuntimeError::RestoreObservationConflict {
+                    worker_id: worker_ref.worker_id,
+                });
+            }
+            let persisted = candidate.request.as_mut().ok_or_else(|| {
+                RuntimeError::InvalidRequest("Restore specification is missing".into())
+            })?;
+            if persisted.workspace_api.as_ref().is_some_and(|existing| {
+                existing.workspace_id != api.workspace_id
+                    || existing.base_url.trim_end_matches('/') != api.base_url.trim_end_matches('/')
+            }) {
+                return Err(RuntimeError::InvalidRequest(
+                    "Workspace API preparation cannot change Worker identity or base URL".into(),
+                ));
+            }
+            persisted.workspace_api = Some(api);
+            *effects_started = true;
+            match state.persist_worker_record(&candidate) {
+                Ok(()) => {
+                    state.workers.insert(worker_ref.worker_id, candidate);
+                }
+                Err(error @ RuntimeError::StoreCommitOutcomeUnknown { .. }) => {
+                    state.workers.insert(worker_ref.worker_id, candidate);
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(attachments) = preparation.workdir_attachments {
+            let attachments: Vec<LogicalWorkdirAttachment> = serde_json::from_value(
+                serde_json::to_value(attachments)
+                    .map_err(|error| RuntimeError::InvalidRequest(error.to_string()))?,
+            )
+            .map_err(|error| RuntimeError::InvalidRequest(error.to_string()))?;
+            validate_logical_workdir_attachments(&attachments)?;
+            *effects_started = true;
+            self.replace_worker_workdir_attachments_under_lock(worker_ref, attachments)?;
+        }
+        for access in preparation.repository_access {
+            if preparation
+                .repository_access_workdirs
+                .iter()
+                .any(|reference| {
+                    reference.working_directory_id == access.working_directory_id
+                        && reference.runtime_id == access.materialization.runtime_id
+                })
+            {
+                // Workspace completed these at the Workdir owner Runtime after snapshot persistence.
+                // Never send cross-Runtime credentials to this Worker's Runtime.
+                continue;
+            }
+            let access: WorkingDirectoryRepositoryAccessRequest = serde_json::from_value(
+                serde_json::to_value(access)
+                    .map_err(|error| RuntimeError::InvalidRequest(error.to_string()))?,
+            )
+            .map_err(|error| RuntimeError::InvalidRequest(error.to_string()))?;
+            *effects_started = true;
+            let runtime = self.clone();
+            // The public embedded interface is synchronous. A separate IO executor
+            // avoids nested Tokio block_on while retaining the lifecycle lock.
+            std::thread::spawn(move || {
+                let executor = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| RuntimeError::InvalidRequest(error.to_string()))?;
+                executor.block_on(
+                    runtime.authorize_working_directory_repository_access_from_resource(access),
+                )
+            })
+            .join()
+            .map_err(|_| RuntimeError::StatePoisoned)??;
+        }
+        Ok(())
     }
 
     fn restore_worker_under_lock(
@@ -1768,7 +2420,17 @@ impl Runtime {
         worker_ref: &WorkerRef,
         mode: WorkerRestoreMode,
     ) -> Result<RuntimeWorkerRestoreResult, RuntimeError> {
-        let fresh_operation_id = WorkerLifecycleOperationId::new();
+        let fresh_operation_id = {
+            let state = self.lock()?;
+            let worker = state.worker(worker_ref)?;
+            worker
+                .restore_guard
+                .active_request_id
+                .as_ref()
+                .and_then(|id| worker.restore_guard.owners.get(id))
+                .map(|owner| owner.operation_id)
+                .unwrap_or_else(WorkerLifecycleOperationId::new)
+        };
         let (backend, request, operation_id, operation_mode, reconcile, candidate_context) = {
             let state = self.lock()?;
             state.ensure_running()?;
@@ -1781,7 +2443,13 @@ impl Runtime {
                 ));
             }
             let pending_restore = worker.pending_restore;
-            let reconcile = pending_restore.is_some();
+            let reconcile = pending_restore.is_some()
+                && worker
+                    .restore_guard
+                    .active_request_id
+                    .as_ref()
+                    .and_then(|id| worker.restore_guard.owners.get(id))
+                    .is_none_or(|owner| owner.execution_started);
             let operation_id = pending_restore
                 .map(|pending| pending.operation_id)
                 .unwrap_or(fresh_operation_id);
@@ -1967,7 +2635,14 @@ impl Runtime {
                                 error = %error,
                                 "Worker restore commit failed and was rolled back"
                             );
-                            if let Err(settle_error) = self.settle_restore_rollback(worker_ref) {
+                            let receipt = RuntimeWorkerRestoreResult::failed(
+                                WorkerRestoreState::RolledBack,
+                                "worker_restore_commit_rolled_back",
+                                "Worker restore commit failed and cleanup completed",
+                            );
+                            if let Err(settle_error) =
+                                self.settle_restore_rollback(worker_ref, &receipt)
+                            {
                                 tracing::error!(
                                     worker_id = %worker_ref.worker_id,
                                     error = %settle_error,
@@ -1979,11 +2654,7 @@ impl Runtime {
                                     "Worker restore cleanup completed but durable reconciliation is still required",
                                 ));
                             }
-                            Ok(RuntimeWorkerRestoreResult::failed(
-                                WorkerRestoreState::RolledBack,
-                                "worker_restore_commit_rolled_back",
-                                "Worker restore commit failed and cleanup completed",
-                            ))
+                            Ok(receipt)
                         }
                         Err(cleanup_error) => {
                             tracing::error!(
@@ -2022,7 +2693,12 @@ impl Runtime {
                     ));
                 }
                 self.discard_restore_candidate_context(worker_ref, &candidate_context)?;
-                if let Err(error) = self.settle_restore_rollback(worker_ref) {
+                let receipt = RuntimeWorkerRestoreResult::failed(
+                    WorkerRestoreState::Rejected,
+                    "worker_restore_rejected",
+                    sanitize_worker_create_failure_message(&result.message_or_default()),
+                );
+                if let Err(error) = self.settle_restore_rollback(worker_ref, &receipt) {
                     tracing::error!(
                         worker_id = %worker_ref.worker_id,
                         error = %error,
@@ -2034,16 +2710,20 @@ impl Runtime {
                         "Worker restore was rejected but durable reconciliation is still required",
                     ));
                 }
-                Ok(RuntimeWorkerRestoreResult::failed(
-                    WorkerRestoreState::Rejected,
-                    "worker_restore_rejected",
-                    sanitize_worker_create_failure_message(&result.message_or_default()),
-                ))
+                Ok(receipt)
             }
             WorkerExecutionSpawnResult::RolledBack(_result) => {
+                let receipt = RuntimeWorkerRestoreResult::failed(
+                    WorkerRestoreState::RolledBack,
+                    "worker_restore_rolled_back",
+                    sanitize_worker_create_failure_message(&_result.message_or_default()),
+                );
                 self.discard_restore_candidate_context(worker_ref, &candidate_context)?;
                 #[cfg(feature = "fs-store")]
-                if let Err(error) = self.lock()?.record_restore_failure(worker_ref, &_result) {
+                if let Err(error) = self
+                    .lock()?
+                    .record_restore_failure(worker_ref, &_result, &receipt)
+                {
                     tracing::error!(
                         worker_id = %worker_ref.worker_id,
                         error = %error,
@@ -2056,12 +2736,8 @@ impl Runtime {
                     ));
                 }
                 #[cfg(not(feature = "fs-store"))]
-                self.settle_restore_rollback(worker_ref)?;
-                Ok(RuntimeWorkerRestoreResult::failed(
-                    WorkerRestoreState::RolledBack,
-                    "worker_restore_rolled_back",
-                    sanitize_worker_create_failure_message(&_result.message_or_default()),
-                ))
+                self.settle_restore_rollback(worker_ref, &receipt)?;
+                Ok(receipt)
             }
             WorkerExecutionSpawnResult::ReconciliationRequired {
                 result: _result,
@@ -2945,13 +3621,25 @@ impl Runtime {
             )
         };
         if status == WorkerStatus::Stopped && pending_stop.is_none() && pending_restore.is_none() {
-            let state = self.lock()?;
-            let worker = state.worker(worker_ref)?;
-            return Ok(WorkerLifecycleAck {
+            let mut state = self.lock()?;
+            let mut worker = state.worker(worker_ref)?.clone();
+            worker.restore_guard.rotate();
+            worker
+                .restore_guard
+                .finish(RuntimeWorkerRestoreResult::failed(
+                    WorkerRestoreState::RolledBack,
+                    "worker_restore_superseded_by_stop",
+                    "Worker Restore was superseded by Stop",
+                ));
+            state.persist_worker_record(&worker)?;
+            let ack = WorkerLifecycleAck {
                 worker_ref: worker_ref.clone(),
                 status: worker.status,
                 worker_state: worker.worker_state.clone(),
-            });
+            };
+            state.workers.insert(worker_ref.worker_id, worker);
+            state.publish_worker_upsert(worker_ref.worker_id)?;
+            return Ok(ack);
         }
         let backend = backend.ok_or_else(|| RuntimeError::WorkerExecutionUnavailable {
             worker_id: worker_ref.worker_id,
@@ -3357,7 +4045,8 @@ impl Runtime {
                 .workers
                 .values()
                 .filter(|worker| {
-                    worker.pending_restore.is_none()
+                    worker.restore_guard.active_request_id.is_none()
+                        && worker.pending_restore.is_none()
                         && worker.pending_stop.is_none()
                         && worker.execution_bound
                         && worker.status.is_active()
@@ -3393,25 +4082,31 @@ impl Runtime {
             }
         }
 
-        let pending_restores = {
-            let state = self.lock()?;
-            state
-                .workers
-                .values()
-                .filter(|worker| worker.pending_stop.is_none())
-                .filter_map(|worker| {
-                    worker
-                        .pending_restore
-                        .map(|pending| (worker.worker_ref.clone(), pending.mode))
-                })
-                .collect::<Vec<_>>()
-        };
+        let pending_restores =
+            {
+                let state = self.lock()?;
+                state
+                    .workers
+                    .values()
+                    .filter(|worker| worker.pending_stop.is_none())
+                    .filter_map(|worker| {
+                        worker
+                            .pending_restore
+                            .map(|pending| (worker.worker_ref.clone(), pending.mode))
+                            .or_else(|| {
+                                worker.restore_guard.active_request_id.as_ref().map(|_| {
+                                    (worker.worker_ref.clone(), WorkerRestoreMode::Explicit)
+                                })
+                            })
+                    })
+                    .collect::<Vec<_>>()
+            };
         for (worker_ref, mode) in pending_restores {
             let operation_lock = self.worker_operation_lock(worker_ref.worker_id)?;
             let _operation_guard = operation_lock
                 .lock()
                 .map_err(|_| RuntimeError::StatePoisoned)?;
-            let result = self.restore_worker_under_lock(&worker_ref, mode)?;
+            let result = self.restore_admitted_worker_under_lock(&worker_ref, mode)?;
             self.record_startup_restore_result(&worker_ref, &result)?;
         }
 
@@ -3421,7 +4116,7 @@ impl Runtime {
                 .lock()
                 .map_err(|_| RuntimeError::StatePoisoned)?;
             let result =
-                self.restore_worker_under_lock(&worker_ref, WorkerRestoreMode::Automatic)?;
+                self.restore_admitted_worker_under_lock(&worker_ref, WorkerRestoreMode::Automatic)?;
             self.record_startup_restore_result(&worker_ref, &result)?;
         }
         Ok(())
@@ -3516,6 +4211,7 @@ impl Runtime {
                 worker_ref.worker_id
             )));
         }
+        candidate.restore_guard.rotate();
         candidate.pending_stop = Some(PendingWorkerStop {
             operation_id,
             last_settled_status: candidate.status,
@@ -3554,10 +4250,18 @@ impl Runtime {
         if let Some(context) = candidate.restore_candidate_context.take() {
             context.discard_candidate();
         }
+        candidate.restore_guard.rotate();
         candidate.status = WorkerStatus::Stopped;
         candidate.worker_state = None;
         candidate.restore_intent = WorkerRestoreIntent::Explicit;
 
+        candidate
+            .restore_guard
+            .finish(RuntimeWorkerRestoreResult::failed(
+                WorkerRestoreState::RolledBack,
+                "worker_restore_superseded_by_stop",
+                "Worker Restore was superseded by Stop",
+            ));
         candidate.internal_workers.clear();
         state.persist_worker_record(&candidate)?;
         let ack = WorkerLifecycleAck {
@@ -3587,7 +4291,11 @@ impl Runtime {
         let mut state = self.lock()?;
         state.ensure_worker_ref(worker_ref)?;
         let mut candidate = state.worker(worker_ref)?.clone();
-        if candidate.has_pending_lifecycle_operation() {
+        if candidate.pending_stop.is_some()
+            || candidate
+                .pending_restore
+                .is_some_and(|pending| pending.operation_id != operation_id)
+        {
             return Err(RuntimeError::InvalidRequest(format!(
                 "worker {} already has pending lifecycle reconciliation",
                 worker_ref.worker_id
@@ -3599,6 +4307,18 @@ impl Runtime {
                 worker_ref.worker_id
             )));
         }
+        if let Some(id) = &candidate.restore_guard.active_request_id {
+            let owner = candidate.restore_guard.owners.get_mut(id).ok_or_else(|| {
+                RuntimeError::InvalidRequest("Active Restore request has no persisted owner".into())
+            })?;
+            if owner.operation_id != operation_id || owner.receipt.is_some() {
+                return Err(RuntimeError::RestoreObservationConflict {
+                    worker_id: worker_ref.worker_id,
+                });
+            }
+            owner.execution_started = true;
+        }
+        candidate.restore_guard.rotate();
         candidate.pending_restore = Some(PendingWorkerRestore {
             operation_id,
             mode,
@@ -3618,9 +4338,15 @@ impl Runtime {
         }
     }
 
-    fn settle_restore_rollback(&self, worker_ref: &WorkerRef) -> Result<(), RuntimeError> {
+    fn settle_restore_rollback(
+        &self,
+        worker_ref: &WorkerRef,
+        receipt: &RuntimeWorkerRestoreResult,
+    ) -> Result<(), RuntimeError> {
         let mut state = self.lock()?;
         let mut candidate = state.worker(worker_ref)?.clone();
+        candidate.restore_guard.rotate();
+        candidate.restore_guard.finish(receipt.clone());
         candidate.pending_restore = None;
         candidate.restore_candidate_context = None;
         state.persist_worker_record(&candidate)?;
@@ -3639,6 +4365,7 @@ impl Runtime {
         let mut state = self.lock()?;
         state.ensure_worker_ref(worker_ref)?;
         let mut candidate = state.worker(worker_ref)?.clone();
+        candidate.restore_guard.rotate();
         candidate.execution_metadata_available = true;
         candidate.execution_bound = true;
         candidate.pending_restore = None;
@@ -3662,6 +4389,9 @@ impl Runtime {
         // Validate the exact subscription projection before persistence. The
         // subsequent publish uses the same pure projection while the Worker
         // operation lock keeps this candidate stable.
+        candidate.restore_guard.rotate();
+        let accepted = RuntimeWorkerRestoreResult::accepted(candidate.detail());
+        candidate.restore_guard.finish(accepted);
         let _subscription_projection = state.subscription_worker(&candidate)?;
 
         // Persist the complete candidate before making it observable. A failed
@@ -3691,6 +4421,7 @@ impl Runtime {
         let mut state = self.lock()?;
         let mut candidate = state.worker(worker_ref)?.clone();
 
+        candidate.restore_guard.rotate();
         candidate.execution_metadata_available = true;
         candidate.execution_bound = true;
         candidate.status = WorkerStatus::Idle;
@@ -3720,6 +4451,7 @@ impl Runtime {
             )));
         }
 
+        candidate.restore_guard.rotate();
         candidate.execution_metadata_available = true;
         candidate.execution_bound = true;
         candidate.restore_candidate_context = Some(candidate_context);
@@ -3737,6 +4469,7 @@ impl Runtime {
         let mut state = self.lock()?;
         let mut candidate = state.worker(worker_ref)?.clone();
 
+        candidate.restore_guard.rotate();
         candidate.execution_metadata_available = false;
         candidate.execution_bound = true;
         candidate.status = WorkerStatus::Idle;
@@ -4266,6 +4999,15 @@ impl RuntimeState {
             workers.insert(
                 worker_id,
                 WorkerRecord {
+                    restore_guard: {
+                        let mut guard = worker.restore_guard;
+                        // A prior active controller is not live in this process.
+                        // Stopped observations remain stable across restart.
+                        if worker.status.is_active() && execution_bound {
+                            guard.rotate();
+                        }
+                        guard
+                    },
                     worker_ref: worker.worker_ref,
                     worker_id: worker.worker_id,
                     status: worker.status,
@@ -4622,6 +5364,7 @@ impl RuntimeState {
             ProfileSelector::Builtin(name) | ProfileSelector::Named(name) => Some(name.clone()),
         };
         Ok(SubscriptionWorker {
+            restore_observation_token: Some(worker.restore_guard.generation.clone()),
             worker_id,
             runtime_id: None,
             resource_key: None,
@@ -4767,6 +5510,7 @@ impl RuntimeState {
         &mut self,
         worker_ref: &WorkerRef,
         result: &WorkerExecutionResult,
+        receipt: &RuntimeWorkerRestoreResult,
     ) -> Result<(), RuntimeError> {
         let message = sanitize_worker_create_failure_message(&result.message_or_default());
         let diagnostic_id = self.next_diagnostic_id;
@@ -4778,9 +5522,11 @@ impl RuntimeState {
         let mut candidate = self.worker(worker_ref)?.clone();
 
         candidate.execution_bound = false;
+        candidate.restore_guard.finish(receipt.clone());
         candidate.pending_restore = None;
         candidate.pending_stop = None;
         candidate.restore_candidate_context = None;
+        candidate.restore_guard.rotate();
         candidate.status = WorkerStatus::Stopped;
         candidate.restore_intent = WorkerRestoreIntent::Explicit;
         candidate.internal_workers.clear();
@@ -5159,8 +5905,52 @@ struct PendingWorkerStop {
     last_settled_status: WorkerStatus,
 }
 
+/// Durable Restore admission/replay metadata. Never discard receipts on stop.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RestoreRequestOwner {
+    fingerprint: String,
+    operation_id: WorkerLifecycleOperationId,
+    request: runtime_api::WorkerRestoreRequest,
+    preparation_applied: bool,
+    #[serde(default)]
+    execution_started: bool,
+    receipt: Option<RuntimeWorkerRestoreResult>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RestoreGuard {
+    generation: String,
+    active_request_id: Option<String>,
+    owners: BTreeMap<String, RestoreRequestOwner>,
+}
+
+impl Default for RestoreGuard {
+    fn default() -> Self {
+        Self {
+            generation: uuid::Uuid::now_v7().to_string(),
+            active_request_id: None,
+            owners: BTreeMap::new(),
+        }
+    }
+}
+
+impl RestoreGuard {
+    fn rotate(&mut self) {
+        self.generation = uuid::Uuid::now_v7().to_string();
+    }
+
+    fn finish(&mut self, result: RuntimeWorkerRestoreResult) {
+        if let Some(id) = self.active_request_id.take()
+            && let Some(owner) = self.owners.get_mut(&id)
+        {
+            owner.receipt = Some(result);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct WorkerRecord {
+    restore_guard: RestoreGuard,
     worker_ref: WorkerRef,
     worker_id: WorkerId,
     status: WorkerStatus,
@@ -5187,6 +5977,9 @@ struct WorkerRecord {
 
 impl WorkerRecord {
     fn apply_worker_state(&mut self, incoming: &protocol::WorkerStateSnapshot) {
+        if self.worker_state.as_ref().map(|state| &state.state) != Some(&incoming.state) {
+            self.restore_guard.rotate();
+        }
         if let Some(request_id) = &incoming.last_finished_submission_request_id {
             self.last_finished_submission_request_id = Some(request_id.clone());
         }
@@ -5213,6 +6006,7 @@ impl WorkerRecord {
 
     fn summary(&self) -> WorkerSummary {
         WorkerSummary {
+            restore_observation_token: Some(self.restore_guard.generation.clone()),
             worker_ref: self.worker_ref.clone(),
             worker_id: self.worker_id,
             status: self.status,
@@ -5230,6 +6024,7 @@ impl WorkerRecord {
 
     fn detail(&self) -> WorkerDetail {
         WorkerDetail {
+            restore_observation_token: Some(self.restore_guard.generation.clone()),
             worker_ref: self.worker_ref.clone(),
             worker_id: self.worker_id,
             status: self.status,
@@ -5301,6 +6096,7 @@ impl WorkerRecord {
             }
         };
         PersistedWorkerRecord {
+            restore_guard: self.restore_guard.clone(),
             worker_ref: self.worker_ref.clone(),
             worker_id: self.worker_id,
             profile: self.profile.clone(),
@@ -5543,6 +6339,9 @@ fn runtime_worker_create_failure_fields(
     error: &RuntimeError,
 ) -> (&'static str, Option<String>, Option<String>) {
     match error {
+        RuntimeError::RestoreObservationConflict { .. } => {
+            ("restore_observation_conflict", None, None)
+        }
         RuntimeError::RuntimeStopped => ("runtime_stopped", None, None),
         RuntimeError::RuntimeStoreAlreadyOpen { .. } => ("runtime_store_already_open", None, None),
         RuntimeError::InvalidInitialInputKind { .. } => ("invalid_initial_input_kind", None, None),
@@ -7682,7 +8481,12 @@ mod tests {
                 vec![attachment.clone()],
             )
             .unwrap();
-        runtime.restore_worker(&worker.worker_ref).unwrap();
+        runtime
+            .restore_worker(
+                &worker.worker_ref,
+                runtime.test_restore_request(&worker.worker_ref),
+            )
+            .unwrap();
         let state = runtime.lock().unwrap();
         assert_eq!(
             state
@@ -7880,7 +8684,12 @@ mod tests {
         );
 
         runtime.stop_worker(&detail.worker_ref, None).unwrap();
-        runtime.restore_worker(&detail.worker_ref).unwrap();
+        runtime
+            .restore_worker(
+                &detail.worker_ref,
+                runtime.test_restore_request(&detail.worker_ref),
+            )
+            .unwrap();
         assert_eq!(
             backend.config_bundles.lock().unwrap().as_slice(),
             &[Some(bundle), None]
@@ -7940,7 +8749,12 @@ mod tests {
             .unwrap();
         runtime.stop_worker(&detail.worker_ref, None).unwrap();
         runtime.lock().unwrap().config_bundles.clear();
-        runtime.restore_worker(&detail.worker_ref).unwrap();
+        runtime
+            .restore_worker(
+                &detail.worker_ref,
+                runtime.test_restore_request(&detail.worker_ref),
+            )
+            .unwrap();
         assert_eq!(
             backend.config_bundles.lock().unwrap().as_slice(),
             &[Some(bundle), None]
@@ -7960,7 +8774,12 @@ mod tests {
             .unwrap()
             .config_bundles
             .insert(replacement.metadata.id.clone(), replacement);
-        runtime.restore_worker(&detail.worker_ref).unwrap();
+        runtime
+            .restore_worker(
+                &detail.worker_ref,
+                runtime.test_restore_request(&detail.worker_ref),
+            )
+            .unwrap();
         assert_eq!(
             backend.config_bundles.lock().unwrap().as_slice(),
             &[Some(bundle), None]
@@ -8077,7 +8896,12 @@ mod tests {
 
         let restore_runtime = runtime.clone();
         let restore_ref = created.worker_ref.clone();
-        let restoring = std::thread::spawn(move || restore_runtime.restore_worker(&restore_ref));
+        let restoring = std::thread::spawn(move || {
+            restore_runtime.restore_worker(
+                &restore_ref,
+                restore_runtime.test_restore_request(&restore_ref),
+            )
+        });
         assert!(gate.wait_for_entered(1, std::time::Duration::from_secs(2)));
         let remove_runtime = runtime.clone();
         let remove_ref = created.worker_ref.clone();
@@ -8355,7 +9179,9 @@ mod tests {
 
         let restore_runtime = runtime.clone();
         let restore_ref = created.worker_ref.clone();
-        let restoring = std::thread::spawn(move || restore_runtime.restore_worker(&restore_ref));
+        let request = runtime.test_restore_request(&restore_ref);
+        let restoring =
+            std::thread::spawn(move || restore_runtime.restore_worker(&restore_ref, request));
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert_eq!(
             *backend.restore_count.lock().unwrap(),
@@ -8365,8 +9191,18 @@ mod tests {
 
         gate.release();
         stopping.join().unwrap().unwrap();
-        let restored = restoring.join().unwrap().unwrap();
+        assert!(matches!(
+            restoring.join().unwrap(),
+            Err(RuntimeError::RestoreObservationConflict { .. })
+        ));
         assert_eq!(*backend.stop_count.lock().unwrap(), 1);
+        assert_eq!(*backend.restore_count.lock().unwrap(), 0);
+        let restored = runtime
+            .restore_worker(
+                &created.worker_ref,
+                runtime.test_restore_request(&created.worker_ref),
+            )
+            .unwrap();
         assert_eq!(*backend.restore_count.lock().unwrap(), 1);
         assert_eq!(restored.status, WorkerStatus::Idle);
         assert_eq!(
@@ -8478,15 +9314,17 @@ mod tests {
 
         let gate = Arc::new(RestoreGate::default());
         *backend.restore_gate.lock().unwrap() = Some(gate.clone());
+        let request = runtime.test_restore_request(&created.worker_ref);
         let start = Arc::new(Barrier::new(3));
         let mut threads = Vec::new();
         for _ in 0..2 {
             let runtime = runtime.clone();
             let worker_ref = created.worker_ref.clone();
             let start = start.clone();
+            let request = request.clone();
             threads.push(std::thread::spawn(move || {
                 start.wait();
-                runtime.restore_worker(&worker_ref)
+                runtime.restore_worker(&worker_ref, request)
             }));
         }
         start.wait();
@@ -8506,6 +9344,1089 @@ mod tests {
         assert_eq!(restored[0].worker_ref, restored[1].worker_ref);
         assert_eq!(restored[0].worker_state, restored[1].worker_state);
         assert!(runtime.worker_operations.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn restore_guard_coordination_is_authorized_and_none_cannot_admit_new_intent() {
+        let (runtime, backend) = runtime_and_backend();
+        let scope = scope("workspace-a", "server-a");
+        let worker = runtime
+            .create_worker_scoped(&scope, scoped_task_request("coordinate", "workspace-a"))
+            .unwrap();
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        let observed = runtime.worker_detail(&worker.worker_ref).unwrap();
+        let mut request = runtime.test_restore_request(&worker.worker_ref);
+        request.preparation = None;
+        let coordination = runtime_api::WorkerRestoreCoordinationRequest {
+            expected_observation_token: request.expected_observation_token.clone(),
+            request_id: request.request_id.clone(),
+            preparation: None,
+        };
+        assert_eq!(
+            runtime
+                .coordinate_worker_restore_operation(
+                    &worker.worker_ref,
+                    coordination.clone(),
+                    Some(&scope)
+                )
+                .unwrap(),
+            (None, None)
+        );
+        assert_eq!(runtime.worker_detail(&worker.worker_ref).unwrap(), observed);
+        assert!(
+            runtime
+                .lock()
+                .unwrap()
+                .worker(&worker.worker_ref)
+                .unwrap()
+                .restore_guard
+                .owners
+                .is_empty()
+        );
+        assert!(matches!(
+            runtime.restore_worker_operation_scoped(&scope, &worker.worker_ref, request.clone()),
+            Err(RuntimeError::InvalidRequest(_))
+        ));
+        let wrong = RuntimeWorkspaceScope::new("workspace-a", "different-server");
+        assert!(
+            runtime
+                .coordinate_worker_restore_operation(
+                    &worker.worker_ref,
+                    coordination.clone(),
+                    Some(&wrong)
+                )
+                .is_err()
+        );
+        let mut admitted = coordination.clone();
+        admitted.preparation = Some(runtime_api::WorkerRestorePreparation::default());
+        assert!(
+            runtime
+                .coordinate_worker_restore_operation(&worker.worker_ref, admitted, Some(&scope))
+                .unwrap()
+                .1
+                .is_some()
+        );
+        let operation_id = runtime
+            .lock()
+            .unwrap()
+            .worker(&worker.worker_ref)
+            .unwrap()
+            .pending_restore
+            .unwrap()
+            .operation_id;
+        assert!(
+            runtime
+                .coordinate_worker_restore_operation(
+                    &worker.worker_ref,
+                    coordination.clone(),
+                    Some(&scope)
+                )
+                .unwrap()
+                .1
+                .is_some()
+        );
+        assert_eq!(*backend.restore_count.lock().unwrap(), 0);
+        request.preparation = Some(runtime_api::WorkerRestorePreparation::default());
+        let receipt = runtime
+            .restore_worker_operation_scoped(&scope, &worker.worker_ref, request)
+            .unwrap();
+        assert_eq!(receipt.state, WorkerRestoreState::Accepted);
+        assert_eq!(
+            backend.restore_operation_ids.lock().unwrap().as_slice(),
+            &[operation_id]
+        );
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        assert!(
+            runtime
+                .coordinate_worker_restore_operation(
+                    &worker.worker_ref,
+                    coordination.clone(),
+                    Some(&wrong)
+                )
+                .is_err()
+        );
+        assert_eq!(
+            runtime
+                .coordinate_worker_restore_operation(&worker.worker_ref, coordination, Some(&scope))
+                .unwrap()
+                .0,
+            Some(receipt)
+        );
+        assert_eq!(*backend.restore_count.lock().unwrap(), 1);
+        assert_eq!(
+            runtime.worker_detail(&worker.worker_ref).unwrap().status,
+            WorkerStatus::Stopped
+        );
+    }
+
+    #[test]
+    fn restore_guard_resource_snapshot_requires_workspace_completion_before_execution() {
+        let (runtime, backend) = runtime_and_backend();
+        let scope = scope("workspace-a", "server-a");
+        let worker = runtime
+            .create_worker_scoped(
+                &scope,
+                scoped_task_request("resource coordination", "workspace-a"),
+            )
+            .unwrap();
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        let mut request = runtime.test_restore_request(&worker.worker_ref);
+        let mut preparation = runtime_api::WorkerRestorePreparation::default();
+        preparation.repository_access_workdirs.push(
+            runtime_api::RepositoryAccessWorkdirReference {
+                runtime_id: "peer-runtime".into(),
+                working_directory_id: "peer-workdir".into(),
+            },
+        );
+        let mut coordination = runtime_api::WorkerRestoreCoordinationRequest {
+            expected_observation_token: request.expected_observation_token.clone(),
+            request_id: request.request_id.clone(),
+            preparation: Some(preparation.clone()),
+        };
+        runtime
+            .coordinate_worker_restore_operation(
+                &worker.worker_ref,
+                coordination.clone(),
+                Some(&scope),
+            )
+            .unwrap();
+        let operation_id = runtime
+            .lock()
+            .unwrap()
+            .worker(&worker.worker_ref)
+            .unwrap()
+            .pending_restore
+            .unwrap()
+            .operation_id;
+        // Model a retained resource snapshot before the peer authorization callback completes.
+        preparation
+            .repository_access
+            .push(runtime_api::WorkingDirectoryRepositoryAccessRequest {
+                working_directory_id: "peer-workdir".into(),
+                materialization: runtime_api::RepositoryMaterializationContext {
+                    workspace_id: "workspace-a".into(),
+                    runtime_id: "peer-runtime".into(),
+                    operation_id: format!("worker-restore:{}", request.request_id),
+                    config_revision: 1,
+                    config_projection_digest: "snapshot".into(),
+                    ssh: None,
+                },
+            });
+        coordination.preparation = Some(preparation.clone());
+        assert!(
+            runtime
+                .coordinate_worker_restore_operation(&worker.worker_ref, coordination, Some(&scope))
+                .unwrap()
+                .1
+                .is_some()
+        );
+        request.preparation = None;
+        assert_eq!(
+            runtime
+                .restore_worker_operation_scoped(&scope, &worker.worker_ref, request.clone())
+                .unwrap()
+                .state,
+            WorkerRestoreState::ReconciliationRequired
+        );
+        assert_eq!(
+            runtime
+                .restore_admitted_worker_under_lock(&worker.worker_ref, WorkerRestoreMode::Explicit)
+                .unwrap()
+                .state,
+            WorkerRestoreState::ReconciliationRequired
+        );
+        assert_eq!(*backend.restore_count.lock().unwrap(), 0);
+        request.preparation = Some(runtime_api::WorkerRestorePreparation::default());
+        assert_eq!(
+            runtime
+                .restore_worker_operation_scoped(&scope, &worker.worker_ref, request.clone())
+                .unwrap()
+                .state,
+            WorkerRestoreState::ReconciliationRequired
+        );
+        assert_eq!(*backend.restore_count.lock().unwrap(), 0);
+        request.preparation = Some(preparation);
+        assert_eq!(
+            runtime
+                .restore_worker_operation_scoped(&scope, &worker.worker_ref, request)
+                .unwrap()
+                .state,
+            WorkerRestoreState::Accepted
+        );
+        assert_eq!(
+            backend.restore_operation_ids.lock().unwrap().as_slice(),
+            &[operation_id]
+        );
+    }
+
+    #[test]
+    fn restore_guard_stale_preparation_has_no_effects() {
+        let (runtime, backend) = runtime_and_backend();
+        let worker = runtime
+            .create_worker(task_request("stale preparation"))
+            .unwrap();
+        let mut stale = runtime.test_restore_request(&worker.worker_ref);
+        stale.preparation = Some(serde_json::from_value(serde_json::json!({
+            "workspace_api": { "workspace_id": "must-not-bind", "base_url": "https://invalid.example" },
+            "workdir_attachments": [],
+            "repository_access": []
+        })).unwrap());
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        let before = runtime.worker_detail(&worker.worker_ref).unwrap();
+        assert!(matches!(
+            runtime.restore_worker_operation(&worker.worker_ref, stale),
+            Err(RuntimeError::RestoreObservationConflict { .. })
+        ));
+        assert_eq!(runtime.worker_detail(&worker.worker_ref).unwrap(), before);
+        let state = runtime.lock().unwrap();
+        let record = state.worker(&worker.worker_ref).unwrap();
+        assert!(record.request.as_ref().unwrap().workspace_api.is_none());
+        assert!(record.restore_guard.owners.is_empty());
+        assert_eq!(*backend.restore_count.lock().unwrap(), 0);
+        assert!(backend.repository_accesses.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn restore_guard_lifecycle_aba_and_historical_replay_after_stop() {
+        let (runtime, backend) = runtime_and_backend();
+        let worker = runtime.create_worker(task_request("restore ABA")).unwrap();
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        let request = runtime.test_restore_request(&worker.worker_ref);
+        let mut other_intent = request.clone();
+        other_intent.request_id = "other-intent".into();
+        let accepted = runtime
+            .restore_worker_operation(&worker.worker_ref, request.clone())
+            .unwrap();
+        assert_eq!(accepted.state, WorkerRestoreState::Accepted);
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        assert!(matches!(
+            runtime.restore_worker_operation(&worker.worker_ref, other_intent),
+            Err(RuntimeError::RestoreObservationConflict { .. })
+        ));
+        let stopped = runtime.worker_detail(&worker.worker_ref).unwrap();
+        assert_ne!(
+            stopped.restore_observation_token.as_deref(),
+            Some(request.expected_observation_token.as_str())
+        );
+        assert_eq!(
+            runtime
+                .restore_worker_operation(&worker.worker_ref, request.clone())
+                .unwrap(),
+            accepted
+        );
+        assert_eq!(runtime.worker_detail(&worker.worker_ref).unwrap(), stopped);
+        assert_eq!(*backend.restore_count.lock().unwrap(), 1);
+        let mut altered = request;
+        altered.expected_observation_token = stopped.restore_observation_token.unwrap();
+        assert!(matches!(
+            runtime.restore_worker_operation(&worker.worker_ref, altered),
+            Err(RuntimeError::RestoreObservationConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn restore_guard_protocol_state_aba_rotates_generation() {
+        let (runtime, backend) = runtime_and_backend();
+        let worker = runtime.create_worker(task_request("state ABA")).unwrap();
+        let request = runtime.test_restore_request(&worker.worker_ref);
+        {
+            let mut state = runtime.lock().unwrap();
+            for status in [
+                protocol::WorkerStatus::Running,
+                protocol::WorkerStatus::Idle,
+            ] {
+                assert!(state.project_protocol_event_to_worker_state(
+                    &worker.worker_ref,
+                    &protocol::Event::WorkerState {
+                        snapshot: status.into()
+                    }
+                ));
+                state.persist_worker(&worker.worker_id).unwrap();
+            }
+        }
+        assert_eq!(
+            runtime
+                .worker_detail(&worker.worker_ref)
+                .unwrap()
+                .worker_state
+                .unwrap()
+                .state,
+            protocol::WorkerState::Idle
+        );
+        assert!(matches!(
+            runtime.restore_worker_operation(&worker.worker_ref, request),
+            Err(RuntimeError::RestoreObservationConflict { .. })
+        ));
+        assert_eq!(*backend.restore_count.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn restore_guard_distinct_contenders_are_fenced_before_preparation() {
+        let (runtime, backend) = runtime_and_backend();
+        let worker = runtime
+            .create_worker(task_request("distinct contenders"))
+            .unwrap();
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        let request = runtime.test_restore_request(&worker.worker_ref);
+        let mut contender = request.clone();
+        contender.request_id = "losing-request".into();
+        contender.preparation = Some(serde_json::from_value(serde_json::json!({
+            "workspace_api": { "workspace_id": "must-not-bind", "base_url": "https://invalid.example" },
+            "repository_access": []
+        })).unwrap());
+        let gate = Arc::new(RestoreGate::default());
+        backend.restore_gate.lock().unwrap().replace(gate.clone());
+        let first_runtime = runtime.clone();
+        let first_ref = worker.worker_ref.clone();
+        let first =
+            std::thread::spawn(move || first_runtime.restore_worker_operation(&first_ref, request));
+        assert!(gate.wait_for_entered(1, std::time::Duration::from_secs(2)));
+        let second_runtime = runtime.clone();
+        let second_ref = worker.worker_ref.clone();
+        let second = std::thread::spawn(move || {
+            second_runtime.restore_worker_operation(&second_ref, contender)
+        });
+        gate.release();
+        assert_eq!(
+            first.join().unwrap().unwrap().state,
+            WorkerRestoreState::Accepted
+        );
+        assert!(matches!(
+            second.join().unwrap(),
+            Err(RuntimeError::RestoreObservationConflict { .. })
+        ));
+        assert_eq!(*backend.restore_count.lock().unwrap(), 1);
+        assert!(
+            runtime
+                .lock()
+                .unwrap()
+                .worker(&worker.worker_ref)
+                .unwrap()
+                .request
+                .as_ref()
+                .unwrap()
+                .workspace_api
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn restore_guard_applies_preparation_once_and_replays_changed_candidate() {
+        let (runtime, backend) = runtime_and_backend();
+        let scope = scope("workspace-a", "server-a");
+        let worker = runtime
+            .create_worker_scoped(
+                &scope,
+                scoped_task_request("prepared restore", "workspace-a"),
+            )
+            .unwrap();
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        let mut request = runtime.test_restore_request(&worker.worker_ref);
+        request.preparation = Some(serde_json::from_value(serde_json::json!({
+            "workspace_api": { "workspace_id": "workspace-a", "base_url": "https://workspace.example/workspace-a" },
+            "workdir_attachments": [],
+            "repository_access": []
+        })).unwrap());
+        let receipt = runtime
+            .restore_worker_operation_scoped(&scope, &worker.worker_ref, request.clone())
+            .unwrap();
+        assert_eq!(receipt.state, WorkerRestoreState::Accepted);
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        let logical = vec![LogicalWorkdirAttachment {
+            alias: workdir::WorkdirAttachmentAlias::new("changed-after-stop").unwrap(),
+            working_directory_id: "workdir-later".into(),
+            capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+        }];
+        runtime
+            .replace_worker_workdir_attachments(&worker.worker_ref, logical.clone())
+            .unwrap();
+        assert_eq!(
+            runtime
+                .restore_worker_operation_scoped(&scope, &worker.worker_ref, request.clone())
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(
+            runtime
+                .lock()
+                .unwrap()
+                .worker(&worker.worker_ref)
+                .unwrap()
+                .logical_workdir_attachments,
+            logical
+        );
+        assert_eq!(*backend.restore_count.lock().unwrap(), 1);
+        request.preparation = Some(serde_json::from_value(serde_json::json!({
+            "workspace_api": { "workspace_id": "must-not-bind", "base_url": "https://fresh.invalid.example" },
+            "workdir_attachments": [],
+            "repository_access": []
+        })).unwrap());
+        assert_eq!(
+            runtime
+                .restore_worker_operation_scoped(&scope, &worker.worker_ref, request.clone())
+                .unwrap(),
+            receipt
+        );
+        let state = runtime.lock().unwrap();
+        let record = state.worker(&worker.worker_ref).unwrap();
+        assert_eq!(record.logical_workdir_attachments, logical);
+        let owner = &record.restore_guard.owners[&request.request_id];
+        assert_eq!(
+            owner
+                .request
+                .preparation
+                .as_ref()
+                .unwrap()
+                .workspace_api
+                .as_ref()
+                .unwrap()
+                .base_url,
+            "https://workspace.example/workspace-a"
+        );
+        assert_eq!(*backend.restore_count.lock().unwrap(), 1);
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn restore_guard_admission_retry_uses_first_persisted_preparation() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = FsRuntimeStoreOptions::new(dir.path().join("runtime"))
+            .with_runtime_id("guard-first-preparation");
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime =
+            Runtime::with_fs_store_and_execution_backend(options.clone(), backend.clone()).unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let scope = scope("workspace-a", "server-a");
+        let mut create = scoped_task_request("first preparation", "workspace-a");
+        create.workspace_api.as_mut().unwrap().base_url = "https://first.example".into();
+        let worker = runtime.create_worker_scoped(&scope, create).unwrap();
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        let mut request = runtime.test_restore_request(&worker.worker_ref);
+        request.preparation = Some(serde_json::from_value(serde_json::json!({
+            "workspace_api": { "workspace_id": "workspace-a", "base_url": "https://first.example" },
+            "repository_access": []
+        })).unwrap());
+        runtime_store(&runtime)
+            .fail_next_worker_write(crate::fs_store::AtomicWriteFault::AfterRename);
+        assert_eq!(
+            runtime
+                .restore_worker_operation(&worker.worker_ref, request.clone())
+                .unwrap()
+                .state,
+            WorkerRestoreState::ReconciliationRequired
+        );
+        assert_eq!(*backend.restore_count.lock().unwrap(), 0);
+        drop(runtime);
+        // No backend on restart: admission survives, preparation has not run.
+        let resumed = Runtime::with_fs_store(options).unwrap();
+        resumed.lock().unwrap().execution_backend =
+            Some(crate::execution::WorkerExecutionBackendRef::new(backend.clone()).unwrap());
+        request.preparation = Some(serde_json::from_value(serde_json::json!({
+            "workspace_api": { "workspace_id": "must-not-bind", "base_url": "https://fresh.invalid.example" },
+            "repository_access": []
+        })).unwrap());
+        assert!(
+            resumed.worker_detail(&worker.worker_ref).is_ok(),
+            "{:?}",
+            resumed.lock().unwrap().diagnostics
+        );
+        let receipt = resumed
+            .restore_worker_operation(&worker.worker_ref, request.clone())
+            .unwrap();
+        assert_eq!(receipt.state, WorkerRestoreState::Accepted);
+        assert_eq!(*backend.restore_count.lock().unwrap(), 1);
+        let state = resumed.lock().unwrap();
+        let record = state.worker(&worker.worker_ref).unwrap();
+        assert_eq!(
+            record
+                .request
+                .as_ref()
+                .unwrap()
+                .workspace_api
+                .as_ref()
+                .unwrap()
+                .base_url,
+            "https://first.example"
+        );
+        let owner = &record.restore_guard.owners[&request.request_id];
+        assert_eq!(
+            owner
+                .request
+                .preparation
+                .as_ref()
+                .unwrap()
+                .workspace_api
+                .as_ref()
+                .unwrap()
+                .base_url,
+            "https://first.example"
+        );
+        assert_eq!(owner.receipt.as_ref(), Some(&receipt));
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn restore_guard_interrupted_preparation_replays_original_pending_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = FsRuntimeStoreOptions::new(dir.path().join("runtime"))
+            .with_runtime_id("guard-partial-preparation");
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime =
+            Runtime::with_fs_store_and_execution_backend(options.clone(), backend.clone()).unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let scope = scope("workspace-a", "server-a");
+        let mut create = scoped_task_request("interrupted preparation", "workspace-a");
+        create.workspace_api = None;
+        let worker = runtime.create_worker_scoped(&scope, create).unwrap();
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        let mut request = runtime.test_restore_request(&worker.worker_ref);
+        request.preparation = Some(serde_json::from_value(serde_json::json!({
+            "workspace_api": { "workspace_id": "workspace-a", "base_url": "https://partially-applied.example" },
+            "workdir_attachments": [], "repository_access": []
+        })).unwrap());
+        let (_, preparation) = runtime
+            .coordinate_worker_restore_operation(
+                &worker.worker_ref,
+                runtime_api::WorkerRestoreCoordinationRequest {
+                    expected_observation_token: request.expected_observation_token.clone(),
+                    request_id: request.request_id.clone(),
+                    preparation: request.preparation.clone(),
+                },
+                Some(&scope),
+            )
+            .unwrap();
+        assert!(preparation.is_some());
+        let operation_id = runtime
+            .lock()
+            .unwrap()
+            .worker(&worker.worker_ref)
+            .unwrap()
+            .pending_restore
+            .unwrap()
+            .operation_id;
+        runtime_store(&runtime)
+            .fail_next_worker_write(crate::fs_store::AtomicWriteFault::AfterRename);
+        request.preparation = None;
+        assert_eq!(
+            runtime
+                .restore_worker_operation(&worker.worker_ref, request.clone())
+                .unwrap()
+                .state,
+            WorkerRestoreState::ReconciliationRequired
+        );
+        assert_eq!(*backend.restore_count.lock().unwrap(), 0);
+        assert_eq!(
+            runtime
+                .lock()
+                .unwrap()
+                .worker(&worker.worker_ref)
+                .unwrap()
+                .pending_restore
+                .unwrap()
+                .operation_id,
+            operation_id
+        );
+        drop(runtime);
+        let resumed = Runtime::with_fs_store(options).unwrap();
+        resumed.lock().unwrap().execution_backend =
+            Some(crate::execution::WorkerExecutionBackendRef::new(backend.clone()).unwrap());
+        let receipt = resumed
+            .restore_worker_operation(&worker.worker_ref, request)
+            .unwrap();
+        assert_eq!(receipt.state, WorkerRestoreState::Accepted);
+        assert_eq!(*backend.restore_count.lock().unwrap(), 1);
+        assert_eq!(
+            backend.restore_operation_ids.lock().unwrap().as_slice(),
+            &[operation_id]
+        );
+        assert!(
+            resumed
+                .lock()
+                .unwrap()
+                .worker(&worker.worker_ref)
+                .unwrap()
+                .pending_restore
+                .is_none()
+        );
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn restore_guard_unowned_pending_operation_recovers_exact_lifecycle_owner_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = FsRuntimeStoreOptions::new(dir.path().join("runtime"))
+            .with_runtime_id("guard-unowned-pending");
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime =
+            Runtime::with_fs_store_and_execution_backend(options.clone(), backend.clone()).unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("recover existing pending operation"))
+            .unwrap();
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        *backend.restore_result.lock().unwrap() =
+            Some(WorkerExecutionSpawnResult::ReconciliationRequired {
+                result: WorkerExecutionResult::errored(
+                    WorkerExecutionOperation::Restore,
+                    "unknown acknowledgement",
+                ),
+                worker_state: None,
+                workdir_attachments: Vec::new(),
+            });
+        // Existing startup/old-contract pending operation: no public receipt owner.
+        assert_eq!(
+            runtime
+                .restore_worker_under_lock(&worker.worker_ref, WorkerRestoreMode::Explicit)
+                .unwrap()
+                .state,
+            WorkerRestoreState::ReconciliationRequired
+        );
+        let operation_id = runtime
+            .lock()
+            .unwrap()
+            .worker(&worker.worker_ref)
+            .unwrap()
+            .pending_restore
+            .unwrap()
+            .operation_id;
+        drop(runtime);
+        let path = dir
+            .path()
+            .join("runtime/workers")
+            .join(worker.worker_id.to_string())
+            .join("worker.json");
+        let mut aggregate: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        aggregate.as_object_mut().unwrap().remove("restore_guard");
+        std::fs::write(&path, serde_json::to_vec_pretty(&aggregate).unwrap()).unwrap();
+        let resumed = Runtime::with_fs_store(options).unwrap();
+        resumed.lock().unwrap().execution_backend =
+            Some(crate::execution::WorkerExecutionBackendRef::new(backend.clone()).unwrap());
+        let request = runtime_api::WorkerRestoreCoordinationRequest {
+            expected_observation_token: resumed
+                .worker_detail(&worker.worker_ref)
+                .unwrap()
+                .restore_observation_token
+                .unwrap(),
+            request_id: "explicit-pending-recovery".into(),
+            preparation: None,
+        };
+        assert_eq!(
+            resumed
+                .coordinate_worker_restore_operation(&worker.worker_ref, request.clone(), None)
+                .unwrap()
+                .0
+                .unwrap()
+                .state,
+            WorkerRestoreState::ReconciliationRequired
+        );
+        let count = *backend.restore_count.lock().unwrap();
+        let mut competitor = request.clone();
+        competitor.request_id = "different-intent".into();
+        assert!(matches!(
+            resumed.coordinate_worker_restore_operation(&worker.worker_ref, competitor, None),
+            Err(RuntimeError::RestoreObservationConflict { .. })
+        ));
+        assert_eq!(*backend.restore_count.lock().unwrap(), count);
+        *backend.restore_result.lock().unwrap() = None;
+        assert_eq!(
+            resumed
+                .coordinate_worker_restore_operation(&worker.worker_ref, request.clone(), None)
+                .unwrap()
+                .0
+                .unwrap()
+                .state,
+            WorkerRestoreState::Accepted
+        );
+        assert!(
+            backend
+                .restore_operation_ids
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|id| *id == operation_id)
+        );
+        assert!(
+            resumed
+                .lock()
+                .unwrap()
+                .worker(&worker.worker_ref)
+                .unwrap()
+                .pending_restore
+                .is_none()
+        );
+        resumed.stop_worker(&worker.worker_ref, None).unwrap();
+        let count = *backend.restore_count.lock().unwrap();
+        assert_eq!(
+            resumed
+                .coordinate_worker_restore_operation(&worker.worker_ref, request, None)
+                .unwrap()
+                .0
+                .unwrap()
+                .state,
+            WorkerRestoreState::Accepted
+        );
+        assert_eq!(*backend.restore_count.lock().unwrap(), count);
+        assert_eq!(
+            resumed.worker_detail(&worker.worker_ref).unwrap().status,
+            WorkerStatus::Stopped
+        );
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn restore_guard_unknown_preparation_write_retries_same_pending_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = FsRuntimeStoreOptions::new(dir.path().join("runtime"))
+            .with_runtime_id("guard-unknown-preparation");
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime =
+            Runtime::with_fs_store_and_execution_backend(options.clone(), backend.clone()).unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("unknown preparation commit"))
+            .unwrap();
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        let mut request = runtime.test_restore_request(&worker.worker_ref);
+        request.preparation = Some(
+            serde_json::from_value(serde_json::json!({
+                "workdir_attachments": [], "repository_access": []
+            }))
+            .unwrap(),
+        );
+        runtime_store(&runtime)
+            .fail_next_worker_write(crate::fs_store::AtomicWriteFault::AfterRename);
+        assert_eq!(
+            runtime
+                .restore_worker_operation(&worker.worker_ref, request.clone())
+                .unwrap()
+                .state,
+            WorkerRestoreState::ReconciliationRequired
+        );
+        // This write interrupts idempotent attachment completion after admission.
+        runtime_store(&runtime)
+            .fail_next_worker_write(crate::fs_store::AtomicWriteFault::AfterRename);
+        assert_eq!(
+            runtime
+                .restore_worker_operation(&worker.worker_ref, request.clone())
+                .unwrap()
+                .state,
+            WorkerRestoreState::ReconciliationRequired
+        );
+        assert_eq!(*backend.restore_count.lock().unwrap(), 0);
+        drop(runtime);
+        let resumed_backend = Arc::new(TestExecutionBackend::default());
+        let resumed =
+            Runtime::with_fs_store_and_execution_backend(options, resumed_backend.clone()).unwrap();
+        request.preparation = None;
+        assert_eq!(
+            resumed
+                .restore_worker_operation(&worker.worker_ref, request)
+                .unwrap()
+                .state,
+            WorkerRestoreState::Accepted
+        );
+        assert_eq!(*resumed_backend.restore_count.lock().unwrap(), 1);
+        assert_eq!(
+            resumed.worker_detail(&worker.worker_ref).unwrap().status,
+            WorkerStatus::Idle
+        );
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn restore_guard_terminal_commit_is_atomic_and_settled_owner_never_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = FsRuntimeStoreOptions::new(dir.path().join("runtime"))
+            .with_runtime_id("guard-terminal-commit");
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime =
+            Runtime::with_fs_store_and_execution_backend(options.clone(), backend).unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("atomic terminal receipt"))
+            .unwrap();
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        let request = runtime.test_restore_request(&worker.worker_ref);
+        let receipt = runtime
+            .restore_worker_operation(&worker.worker_ref, request.clone())
+            .unwrap();
+        let aggregate: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                dir.path()
+                    .join("runtime/workers")
+                    .join(worker.worker_id.to_string())
+                    .join("worker.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(aggregate["status"], "idle");
+        assert!(aggregate["restore_guard"]["active_request_id"].is_null());
+        assert_eq!(
+            aggregate["restore_guard"]["owners"][&request.request_id]["receipt"],
+            serde_json::to_value(&receipt).unwrap()
+        );
+        // Simulate a legacy/inconsistent active marker on an already-settled
+        // owner. Startup must not silently create a new execution for it.
+        {
+            let mut state = runtime.lock().unwrap();
+            let mut candidate = state.worker(&worker.worker_ref).unwrap().clone();
+            candidate.restore_guard.active_request_id = Some(request.request_id.clone());
+            state.persist_worker_record(&candidate).unwrap();
+            state.workers.insert(worker.worker_id, candidate);
+        }
+        drop(runtime);
+        let resumed_backend = Arc::new(TestExecutionBackend::default());
+        let resumed =
+            Runtime::with_fs_store_and_execution_backend(options, resumed_backend.clone()).unwrap();
+        assert_eq!(*resumed_backend.restore_count.lock().unwrap(), 0);
+        assert_eq!(
+            resumed
+                .restore_worker_operation(&worker.worker_ref, request.clone())
+                .unwrap(),
+            receipt
+        );
+        // Also exercise the accepted-aggregate/receipt-pending crash gap.
+        {
+            let mut state = resumed.lock().unwrap();
+            let mut candidate = state.worker(&worker.worker_ref).unwrap().clone();
+            let owner = candidate
+                .restore_guard
+                .owners
+                .get_mut(&request.request_id)
+                .unwrap();
+            assert!(owner.execution_started);
+            owner.receipt = None;
+            candidate.restore_guard.active_request_id = Some(request.request_id.clone());
+            state.persist_worker_record(&candidate).unwrap();
+            state.workers.insert(worker.worker_id, candidate);
+        }
+        drop(resumed);
+        let gap_backend = Arc::new(TestExecutionBackend::default());
+        let gap_resumed = Runtime::with_fs_store_and_execution_backend(
+            FsRuntimeStoreOptions::new(dir.path().join("runtime"))
+                .with_runtime_id("guard-terminal-commit"),
+            gap_backend.clone(),
+        )
+        .unwrap();
+        assert_eq!(*gap_backend.restore_count.lock().unwrap(), 0);
+        assert!(gap_backend.restore_operation_ids.lock().unwrap().is_empty());
+        assert_eq!(
+            gap_resumed
+                .restore_worker_operation(&worker.worker_ref, request)
+                .unwrap()
+                .state,
+            WorkerRestoreState::Accepted
+        );
+    }
+
+    #[test]
+    fn restore_guard_terminal_rejection_replays_without_repreparation() {
+        let (runtime, backend) = runtime_and_backend();
+        let worker = runtime
+            .create_worker(task_request("rejected owner"))
+            .unwrap();
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        let request = runtime.test_restore_request(&worker.worker_ref);
+        backend
+            .restore_result
+            .lock()
+            .unwrap()
+            .replace(WorkerExecutionSpawnResult::Rejected(
+                WorkerExecutionResult::rejected(
+                    WorkerExecutionOperation::Restore,
+                    "injected rejection",
+                ),
+            ));
+        let receipt = runtime
+            .restore_worker_operation(&worker.worker_ref, request.clone())
+            .unwrap();
+        assert_eq!(receipt.state, WorkerRestoreState::Rejected);
+        backend.restore_result.lock().unwrap().take();
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        assert_eq!(
+            runtime
+                .restore_worker_operation(&worker.worker_ref, request)
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(*backend.restore_count.lock().unwrap(), 1);
+        assert_eq!(
+            runtime.worker_detail(&worker.worker_ref).unwrap().status,
+            WorkerStatus::Stopped
+        );
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn restore_guard_pending_owner_survives_restart_and_reuses_operation_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let options =
+            FsRuntimeStoreOptions::new(dir.path().join("runtime")).with_runtime_id("guard-pending");
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime =
+            Runtime::with_fs_store_and_execution_backend(options.clone(), backend.clone()).unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("durable pending owner"))
+            .unwrap();
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        let request = runtime.test_restore_request(&worker.worker_ref);
+        backend
+            .restore_result
+            .lock()
+            .unwrap()
+            .replace(WorkerExecutionSpawnResult::Errored(
+                WorkerExecutionResult::rejected(WorkerExecutionOperation::Restore, "uncertain"),
+            ));
+        assert_eq!(
+            runtime
+                .restore_worker_operation(&worker.worker_ref, request.clone())
+                .unwrap()
+                .state,
+            WorkerRestoreState::ReconciliationRequired
+        );
+        let operation_id = backend.restore_operation_ids.lock().unwrap()[0];
+        drop(runtime);
+        let restarted = Runtime::with_fs_store(options.clone()).unwrap();
+        let mut other = request.clone();
+        other.request_id = "not-persisted-owner".into();
+        other.expected_observation_token = restarted
+            .worker_detail(&worker.worker_ref)
+            .unwrap()
+            .restore_observation_token
+            .unwrap();
+        assert!(matches!(
+            restarted.restore_worker_operation(&worker.worker_ref, other),
+            Err(RuntimeError::RestoreObservationConflict { .. })
+        ));
+        drop(restarted);
+        let resumed_backend = Arc::new(TestExecutionBackend::default());
+        let resumed =
+            Runtime::with_fs_store_and_execution_backend(options, resumed_backend.clone()).unwrap();
+        assert_eq!(
+            resumed_backend
+                .restore_operation_ids
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &[operation_id]
+        );
+        let receipt = resumed
+            .restore_worker_operation(&worker.worker_ref, request)
+            .unwrap();
+        assert_eq!(receipt.state, WorkerRestoreState::Accepted);
+        assert_eq!(*resumed_backend.restore_count.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn restore_guard_pending_owner_is_only_reconciliation_intent() {
+        let (runtime, backend) = runtime_and_backend();
+        let worker = runtime
+            .create_worker(task_request("pending owner"))
+            .unwrap();
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        let mut request = runtime.test_restore_request(&worker.worker_ref);
+        request.preparation = Some(
+            serde_json::from_value(serde_json::json!({
+                "workdir_attachments": [], "repository_access": []
+            }))
+            .unwrap(),
+        );
+        backend
+            .restore_result
+            .lock()
+            .unwrap()
+            .replace(WorkerExecutionSpawnResult::Errored(
+                WorkerExecutionResult::rejected(WorkerExecutionOperation::Restore, "uncertain"),
+            ));
+        assert_eq!(
+            runtime
+                .restore_worker_operation(&worker.worker_ref, request.clone())
+                .unwrap()
+                .state,
+            WorkerRestoreState::ReconciliationRequired
+        );
+        // A retry may carry newly minted preparation. It must reconcile the
+        // first persisted owner, not apply this invalid replacement payload.
+        request.preparation = Some(serde_json::from_value(serde_json::json!({
+            "workspace_api": { "workspace_id": "must-not-bind", "base_url": "https://fresh.invalid.example" },
+            "repository_access": []
+        })).unwrap());
+        let mut fresh = runtime.test_restore_request(&worker.worker_ref);
+        fresh.request_id = "new-owner".into();
+        fresh.expected_observation_token = runtime
+            .worker_detail(&worker.worker_ref)
+            .unwrap()
+            .restore_observation_token
+            .unwrap();
+        assert!(matches!(
+            runtime.restore_worker_operation(&worker.worker_ref, fresh),
+            Err(RuntimeError::RestoreObservationConflict { .. })
+        ));
+        backend.restore_result.lock().unwrap().take();
+        assert_eq!(
+            runtime
+                .restore_worker_operation(&worker.worker_ref, request)
+                .unwrap()
+                .state,
+            WorkerRestoreState::Accepted
+        );
+        let ids = backend.restore_operation_ids.lock().unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], ids[1]);
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn restore_guard_generation_and_terminal_receipt_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let options =
+            FsRuntimeStoreOptions::new(dir.path().join("runtime")).with_runtime_id("guard-test");
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime =
+            Runtime::with_fs_store_and_execution_backend(options.clone(), backend.clone()).unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("durable replay"))
+            .unwrap();
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        let request = runtime.test_restore_request(&worker.worker_ref);
+        let receipt = runtime
+            .restore_worker_operation(&worker.worker_ref, request.clone())
+            .unwrap();
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        let generation = runtime
+            .worker_detail(&worker.worker_ref)
+            .unwrap()
+            .restore_observation_token;
+        drop(runtime);
+        let restarted = Runtime::with_fs_store(options).unwrap();
+        assert_eq!(
+            restarted
+                .worker_detail(&worker.worker_ref)
+                .unwrap()
+                .restore_observation_token,
+            generation
+        );
+        assert_eq!(
+            restarted
+                .restore_worker_operation(&worker.worker_ref, request.clone())
+                .unwrap(),
+            receipt
+        );
+        let mut stale = request;
+        stale.request_id = "stale-after-restart".into();
+        assert!(matches!(
+            restarted.restore_worker_operation(&worker.worker_ref, stale),
+            Err(RuntimeError::RestoreObservationConflict { .. })
+        ));
+        assert_eq!(
+            restarted.worker_detail(&worker.worker_ref).unwrap().status,
+            WorkerStatus::Stopped
+        );
+        assert_eq!(*backend.restore_count.lock().unwrap(), 1);
     }
 
     #[test]
@@ -8660,8 +10581,12 @@ mod tests {
             backend.restore_gate.lock().unwrap().replace(gate.clone());
             let restoring_runtime = runtime.clone();
             let worker_ref = worker.worker_ref.clone();
-            let restoring =
-                std::thread::spawn(move || restoring_runtime.restore_worker_operation(&worker_ref));
+            let restoring = std::thread::spawn(move || {
+                restoring_runtime.restore_worker_operation(
+                    &worker_ref,
+                    restoring_runtime.test_restore_request(&worker_ref),
+                )
+            });
             assert!(gate.wait_for_entered(1, std::time::Duration::from_secs(2)));
             let operation_id = runtime
                 .lock()
@@ -8698,7 +10623,10 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 runtime
-                    .restore_worker_operation(&worker.worker_ref)
+                    .restore_worker_operation(
+                        &worker.worker_ref,
+                        runtime.test_restore_request(&worker.worker_ref)
+                    )
                     .unwrap()
                     .state,
                 WorkerRestoreState::Accepted
@@ -8760,7 +10688,7 @@ mod tests {
                 text: "first".into(),
             });
         let first = runtime
-            .restore_worker_operation(&worker.worker_ref)
+            .restore_admitted_worker_under_lock(&worker.worker_ref, WorkerRestoreMode::Explicit)
             .unwrap();
         assert_eq!(first.state, WorkerRestoreState::ReconciliationRequired);
         assert!(
@@ -8782,7 +10710,10 @@ mod tests {
             .publish_text_delta(&worker.worker_ref, "second")
             .unwrap();
         let retry = runtime
-            .restore_worker_operation(&worker.worker_ref)
+            .restore_worker_operation(
+                &worker.worker_ref,
+                runtime.test_restore_request(&worker.worker_ref),
+            )
             .unwrap();
         assert_eq!(retry.state, WorkerRestoreState::Accepted);
         assert_eq!(
@@ -8841,8 +10772,12 @@ mod tests {
 
         let restoring_runtime = runtime.clone();
         let restoring_ref = worker.worker_ref.clone();
-        let restoring =
-            std::thread::spawn(move || restoring_runtime.restore_worker_operation(&restoring_ref));
+        let restoring = std::thread::spawn(move || {
+            restoring_runtime.restore_worker_operation(
+                &restoring_ref,
+                restoring_runtime.test_restore_request(&restoring_ref),
+            )
+        });
         assert!(gate.wait_for_entered(1, std::time::Duration::from_secs(2)));
 
         let pending = runtime.worker_detail(&worker.worker_ref).unwrap();
@@ -8883,7 +10818,12 @@ mod tests {
             .unwrap();
         runtime.stop_worker(&created.worker_ref, None).unwrap();
 
-        let restored = runtime.restore_worker(&created.worker_ref).unwrap();
+        let restored = runtime
+            .restore_worker(
+                &created.worker_ref,
+                runtime.test_restore_request(&created.worker_ref),
+            )
+            .unwrap();
 
         let worker_state = restored
             .worker_state
@@ -9362,7 +11302,12 @@ mod tests {
             }),
         );
         runtime.stop_worker(&worker.worker_ref, None).unwrap();
-        runtime.restore_worker(&worker.worker_ref).unwrap();
+        runtime
+            .restore_worker(
+                &worker.worker_ref,
+                runtime.test_restore_request(&worker.worker_ref),
+            )
+            .unwrap();
         let stop_count = *backend.stop_count.lock().unwrap();
         let detail = runtime.worker_detail(&worker.worker_ref).unwrap();
         for method in [
@@ -9479,7 +11424,12 @@ mod tests {
         ));
         assert_eq!(*backend.restore_count.lock().unwrap(), 0);
 
-        runtime.restore_worker(&detail.worker_ref).unwrap();
+        runtime
+            .restore_worker(
+                &detail.worker_ref,
+                runtime.test_restore_request(&detail.worker_ref),
+            )
+            .unwrap();
         runtime
             .send_input(&detail.worker_ref, WorkerInput::user("wake up"))
             .unwrap();
@@ -9525,7 +11475,12 @@ mod tests {
         runtime
             .stop_worker(&detail.worker_ref, Some("restore test".to_string()))
             .unwrap();
-        runtime.restore_worker(&detail.worker_ref).unwrap();
+        runtime
+            .restore_worker(
+                &detail.worker_ref,
+                runtime.test_restore_request(&detail.worker_ref),
+            )
+            .unwrap();
 
         assert_eq!(
             backend.dispatched_inputs.lock().unwrap().len(),
@@ -10308,21 +12263,49 @@ mod tests {
         .unwrap();
         assert_eq!(
             runtime
-                .restore_worker_operation(&worker.worker_ref)
+                .restore_worker_operation(
+                    &worker.worker_ref,
+                    runtime.test_restore_request(&worker.worker_ref)
+                )
                 .unwrap()
                 .state,
             WorkerRestoreState::Rejected
         );
-        assert_eq!(
-            std::fs::read(
+        let mut before: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        let mut after: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
                 dir.path()
                     .join("runtime/workers")
                     .join(worker.worker_id.to_string())
-                    .join("worker.json")
+                    .join("worker.json"),
             )
             .unwrap(),
-            before,
-            "explicit preflight rejection is read-only"
+        )
+        .unwrap();
+        let old_guard = before
+            .as_object_mut()
+            .unwrap()
+            .remove("restore_guard")
+            .unwrap();
+        let guard = after
+            .as_object_mut()
+            .unwrap()
+            .remove("restore_guard")
+            .unwrap();
+        assert_ne!(guard["generation"], old_guard["generation"]);
+        assert!(guard["active_request_id"].is_null());
+        assert_eq!(
+            guard["owners"]
+                .as_object()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()["receipt"]["state"],
+            "rejected"
+        );
+        assert_eq!(
+            after, before,
+            "preflight changes only durable intent/receipt metadata, never execution"
         );
         assert!(matches!(
             runtime.send_input(
@@ -10389,7 +12372,10 @@ mod tests {
 
         restoring_backend.restore_result.lock().unwrap().take();
         let retry = restored
-            .restore_worker_operation(&worker.worker_ref)
+            .restore_worker_operation(
+                &worker.worker_ref,
+                restored.test_restore_request(&worker.worker_ref),
+            )
             .unwrap();
 
         assert_eq!(retry.state, WorkerRestoreState::Accepted);
@@ -10424,7 +12410,10 @@ mod tests {
             ));
 
         let result = runtime
-            .restore_worker_operation(&worker.worker_ref)
+            .restore_worker_operation(
+                &worker.worker_ref,
+                runtime.test_restore_request(&worker.worker_ref),
+            )
             .unwrap();
 
         assert_eq!(result.state, WorkerRestoreState::RolledBack);
@@ -10441,7 +12430,10 @@ mod tests {
 
         backend.restore_result.lock().unwrap().take();
         let retry = runtime
-            .restore_worker_operation(&worker.worker_ref)
+            .restore_worker_operation(
+                &worker.worker_ref,
+                runtime.test_restore_request(&worker.worker_ref),
+            )
             .unwrap();
         assert_eq!(retry.state, WorkerRestoreState::Accepted);
         assert_eq!(*backend.restore_count.lock().unwrap(), 2);
@@ -10466,13 +12458,41 @@ mod tests {
             ));
 
         let result = runtime
-            .restore_worker_operation(&created.worker_ref)
+            .restore_worker_operation(
+                &created.worker_ref,
+                runtime.test_restore_request(&created.worker_ref),
+            )
             .unwrap();
 
         assert_eq!(result.state, WorkerRestoreState::Rejected);
         assert!(result.worker.is_none());
         assert_eq!(*backend.restore_count.lock().unwrap(), 0);
-        assert_eq!(runtime.worker_detail(&created.worker_ref).unwrap(), before);
+        let mut after = runtime.worker_detail(&created.worker_ref).unwrap();
+        assert_ne!(
+            after.restore_observation_token,
+            before.restore_observation_token
+        );
+        after.restore_observation_token = before.restore_observation_token.clone();
+        assert_eq!(
+            after, before,
+            "admission may rotate the fence but must not change execution state"
+        );
+        let state = runtime.lock().unwrap();
+        let record = state.worker(&created.worker_ref).unwrap();
+        assert!(record.pending_restore.is_none());
+        assert!(record.restore_guard.active_request_id.is_none());
+        assert_eq!(record.restore_guard.owners.len(), 1);
+        assert_eq!(
+            record
+                .restore_guard
+                .owners
+                .values()
+                .next()
+                .unwrap()
+                .receipt
+                .as_ref(),
+            Some(&result)
+        );
     }
 
     #[test]
@@ -10495,7 +12515,10 @@ mod tests {
         );
 
         let result = runtime
-            .restore_worker_operation(&created.worker_ref)
+            .restore_worker_operation(
+                &created.worker_ref,
+                runtime.test_restore_request(&created.worker_ref),
+            )
             .unwrap();
 
         assert_eq!(result.state, WorkerRestoreState::ReconciliationRequired);
@@ -10525,7 +12548,10 @@ mod tests {
         );
         backend.restore_result.lock().unwrap().take();
         let retry = runtime
-            .restore_worker_operation(&created.worker_ref)
+            .restore_worker_operation(
+                &created.worker_ref,
+                runtime.test_restore_request(&created.worker_ref),
+            )
             .unwrap();
         assert_eq!(retry.state, WorkerRestoreState::Accepted);
         assert_eq!(*backend.restore_count.lock().unwrap(), 2);
@@ -10655,7 +12681,10 @@ mod tests {
         );
 
         let restored_detail = restored
-            .restore_worker(&restorable.worker_ref)
+            .restore_worker(
+                &restorable.worker_ref,
+                restored.test_restore_request(&restorable.worker_ref),
+            )
             .expect("explicit restore reconstructs execution metadata");
         assert!(restored_detail.execution_metadata_available);
         restored
@@ -10764,7 +12793,12 @@ mod tests {
         ));
         assert_eq!(*backend.restore_count.lock().unwrap(), 0);
 
-        restored.restore_worker(&worker.worker_ref).unwrap();
+        restored
+            .restore_worker(
+                &worker.worker_ref,
+                restored.test_restore_request(&worker.worker_ref),
+            )
+            .unwrap();
         assert_eq!(*backend.restore_count.lock().unwrap(), 1);
         assert_eq!(
             restored.worker_detail(&worker.worker_ref).unwrap().status,
@@ -10811,6 +12845,10 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&worker_path).expect("worker aggregate"))
                 .expect("worker aggregate json");
         worker_identity["schema_version"] = serde_json::json!(7);
+        worker_identity
+            .as_object_mut()
+            .unwrap()
+            .remove("restore_guard");
         let mut worker_execution = worker_identity
             .as_object_mut()
             .expect("worker aggregate object")
@@ -10898,11 +12936,17 @@ mod tests {
 
         runtime_store(&runtime)
             .fail_next_worker_write(crate::fs_store::AtomicWriteFault::AfterRename);
-        let result = runtime
-            .restore_worker_operation(&worker.worker_ref)
-            .unwrap();
+        let result = runtime.begin_restore_operation(
+            &worker.worker_ref,
+            WorkerLifecycleOperationId::new(),
+            WorkerRestoreMode::Explicit,
+            runtime.restore_candidate_execution_context(worker.worker_ref.clone()),
+        );
 
-        assert_eq!(result.state, WorkerRestoreState::ReconciliationRequired);
+        assert!(matches!(
+            result,
+            Err(RuntimeError::StoreCommitOutcomeUnknown { .. })
+        ));
         assert_eq!(*backend.restore_count.lock().unwrap(), 0);
         assert_eq!(*backend.stop_count.lock().unwrap(), 1);
         assert_eq!(
@@ -10956,7 +13000,10 @@ mod tests {
         )
         .unwrap();
         let retry = restarted
-            .restore_worker_operation(&worker.worker_ref)
+            .restore_worker_operation(
+                &worker.worker_ref,
+                restarted.test_restore_request(&worker.worker_ref),
+            )
             .unwrap();
         assert_eq!(retry.state, WorkerRestoreState::Accepted);
         assert_eq!(*restarted_backend.restore_count.lock().unwrap(), 1);
@@ -11031,8 +13078,14 @@ mod tests {
             .unwrap()
             .operation_id;
         restoring_backend.restore_result.lock().unwrap().take();
+        // An explicit observed recovery may bind a receipt to an unowned
+        // startup pending operation, but must preserve its lifecycle ID. It
+        // cannot allocate a new execution operation or overwrite preparation.
         let retry = restored
-            .restore_worker_operation(&worker.worker_ref)
+            .restore_worker_operation(
+                &worker.worker_ref,
+                restored.test_restore_request(&worker.worker_ref),
+            )
             .unwrap();
         assert_eq!(retry.state, WorkerRestoreState::Accepted);
         assert_eq!(*restoring_backend.restore_count.lock().unwrap(), 2);

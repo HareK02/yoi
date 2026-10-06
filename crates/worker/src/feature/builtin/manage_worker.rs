@@ -77,8 +77,9 @@ pub trait WorkerControlService: Send + Sync {
         &self,
         runtime_id: String,
         worker_id: String,
+        request: server_api::WorkerRestoreRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
-        let _ = (runtime_id, worker_id);
+        let _ = (runtime_id, worker_id, request);
         Err(WorkspaceClientError::Unavailable(
             "Runtime Worker restore is unavailable".to_string(),
         ))
@@ -347,6 +348,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
         &self,
         runtime_id: String,
         worker_id: String,
+        request: server_api::WorkerRestoreRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         if !self.runtime_worker_control {
             return Err(WorkspaceClientError::Unavailable(
@@ -357,6 +359,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
             crate::worker::WorkspaceServerOperation::WorkerControlRestore {
                 runtime_id,
                 worker_id,
+                request,
             },
         )
     }
@@ -750,8 +753,13 @@ enum WorkerSubjectInput {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct WorkerTargetInput {
+struct WorkerRestoreInput {
     subject: WorkerSubjectInput,
+    expected_observation_token: String,
+    /// Reuse the reported ID for explicit unknown-outcome recovery. A new intent
+    /// defaults to the durable Tool call identity.
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -864,7 +872,7 @@ impl WorkerOperation {
             Self::Cancel => "Cancel the current turn of a known Runtime Worker when allowed.",
             Self::Stop => "Stop a known Runtime Worker when allowed.",
             Self::Restore => {
-                "Restore a stopped Backend/Runtime Worker session in the current Workspace."
+                "Restore a stopped Backend/Runtime Worker session in the current Workspace. Supply expected_observation_token from WorkerList; a conflict requires refreshing and deliberate new intent. New requests default to the durable Tool call ID. For explicit recovery of an unknown/pending outcome, supply the reported request_id and the original token unchanged; never create a new intent or automatically retry."
             }
             Self::Remove => {
                 "Remove an eligible stopped, unassigned, non-internal Worker. Supply a bounded reason; Backend validation and retention are authoritative."
@@ -981,12 +989,41 @@ impl Tool for WorkspaceWorkerTool {
                     .map_err(control_tool_error)?
             }
             WorkerOperation::Restore => {
-                let input = parse::<WorkerTargetInput>(input_json, "WorkerRestore")?;
+                let input = parse::<WorkerRestoreInput>(input_json, "WorkerRestore")?;
                 let (runtime_id, worker_id) = runtime_subject_ids(&input.subject, self.operation)?;
-                self.control
-                    .restore_worker(runtime_id, worker_id)
+                let request_id = match input.request_id {
+                    Some(id) => non_empty(id, "request_id")?,
+                    None => format!(
+                        "worker-restore:{}",
+                        non_empty(ctx.call_id.clone(), "tool call_id")?
+                    ),
+                };
+                if request_id.len() > 512 {
+                    return Err(ToolError::InvalidArgument(
+                        "request_id must contain at most 512 bytes".into(),
+                    ));
+                }
+                let recoverable_error = |error| {
+                    ToolError::ExecutionFailed(format!(
+                        "WorkerRestore request_id={request_id}; reuse this ID with the original observation token only for explicit unknown/pending outcome recovery, not after a stale-intent conflict: {error}"
+                    ))
+                };
+                let response = self
+                    .control
+                    .restore_worker(
+                        runtime_id,
+                        worker_id,
+                        server_api::WorkerRestoreRequest {
+                            expected_observation_token: non_empty(
+                                input.expected_observation_token,
+                                "expected_observation_token",
+                            )?,
+                            request_id: request_id.clone(),
+                        },
+                    )
                     .await
-                    .map_err(control_tool_error)?
+                    .map_err(|error| recoverable_error(control_tool_error(error)))?;
+                return tool_output(self.operation, response).map_err(recoverable_error);
             }
             WorkerOperation::Remove => {
                 let input = parse::<WorkerRemoveInput>(input_json, "WorkerRemove")?;
@@ -1057,6 +1094,18 @@ fn tool_output(
             "Workspace Worker operation returned HTTP {}: {}",
             response.status, response.body
         )));
+    }
+    if operation == WorkerOperation::Restore {
+        let restored: server_api::WorkerRestoreResponse = serde_json::from_str(&response.body)
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!("invalid WorkerRestore response: {error}"))
+            })?;
+        if restored.result.state != server_api::WorkerRestoreState::Accepted {
+            return Err(ToolError::ExecutionFailed(format!(
+                "WorkerRestore returned {:?}: {}",
+                restored.result.state, response.body
+            )));
+        }
     }
     if operation == WorkerOperation::Stop
         && let Ok(summary) = serde_json::from_str::<SubWorkerStopSummary>(&response.body)
@@ -1150,7 +1199,7 @@ fn worker_tool_contribution(
             }
         }
         WorkerOperation::Restore => {
-            definition::<WorkerTargetInput>(operation, control, runtime_worker_control)
+            definition::<WorkerRestoreInput>(operation, control, runtime_worker_control)
         }
         WorkerOperation::Remove => {
             definition::<WorkerRemoveInput>(operation, control, runtime_worker_control)
@@ -1408,6 +1457,95 @@ mod tests {
             registry: None,
             runtime_worker_control: true,
         })
+    }
+
+    #[tokio::test]
+    async fn worker_restore_forwards_exact_observation_and_request_identity() {
+        let client = Arc::new(RecordingWorkspaceClient::default());
+        let control = test_control(client.clone());
+        for _ in 0..2 {
+            control
+                .restore_worker(
+                    "runtime/a".into(),
+                    "worker/b".into(),
+                    server_api::WorkerRestoreRequest {
+                        expected_observation_token: "same-observation".into(),
+                        request_id: "same-request".into(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].path,
+            "/api/w/workspace%2Ftest/worker-control/workers/runtime%2Fa/worker%2Fb/restore"
+        );
+        assert_eq!(requests[0].body, requests[1].body);
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"expected_observation_token":"same-observation","request_id":"same-request"})
+        );
+        assert!(serde_json::from_str::<WorkerRestoreInput>(r#"{"subject":{"kind":"runtime_worker","runtime_id":"runtime-a","worker_id":"worker-a"}}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn worker_restore_reports_retry_identity_and_reuses_it_across_explicit_tool_calls() {
+        let client = Arc::new(RecordingWorkspaceClient::default());
+        let tool = WorkspaceWorkerTool {
+            operation: WorkerOperation::Restore,
+            control: test_control(client.clone()),
+            runtime_worker_control: true,
+        };
+        let mut input = serde_json::json!({
+            "subject": {"kind":"runtime_worker", "runtime_id":"runtime-a", "worker_id":"worker-b"},
+            "expected_observation_token":"original-observation"
+        });
+        // The fixture deliberately returns malformed JSON shape: delivery may
+        // have succeeded, so retain the exact tuple rather than issuing new intent.
+        let first = tool
+            .execute(
+                &input.to_string(),
+                ToolExecutionContext::new("original-call", "batch", 0),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            first
+                .to_string()
+                .contains("request_id=worker-restore:original-call")
+        );
+        input["request_id"] = "worker-restore:original-call".into();
+        let second = tool
+            .execute(
+                &input.to_string(),
+                ToolExecutionContext::new("explicit-recovery-call", "batch", 1),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            second
+                .to_string()
+                .contains("request_id=worker-restore:original-call")
+        );
+        {
+            let requests = client.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].body, requests[1].body);
+        }
+        input["request_id"] = "x".repeat(513).into();
+        assert!(
+            tool.execute(
+                &input.to_string(),
+                ToolExecutionContext::new("invalid", "batch", 2)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(client.requests.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

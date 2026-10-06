@@ -389,6 +389,7 @@ impl_openapi_schema!(
     WorkspaceRuntimeListResponse,
     RuntimeWorkerListResponse,
     WorkerRestoreResponse,
+    WorkerRestoreRequest,
     WorkerControlSubject,
     WorkerControlRecord,
     WorkerControlListResponse,
@@ -1552,6 +1553,7 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] runtime_id: String,
         #[path] worker_id: String,
+        #[body] request: WorkerRestoreRequest,
     ) -> Result<WorkerRestoreResponse, RepositoryApiError>;
     #[get(
         "/api/w/{workspace_id}/worker-observation/sessions",
@@ -2080,6 +2082,7 @@ pub trait ServerApi {
         #[extension] context: ServerRequestContext,
         #[path] runtime_id: String,
         #[path] worker_id: String,
+        #[body] request: WorkerRestoreRequest,
     ) -> Result<WorkerRestoreResponse, RepositoryApiError>;
 
     #[post(
@@ -2097,6 +2100,7 @@ pub trait ServerApi {
         #[path] runtime_id: String,
         #[path] worker_id: String,
         #[query] query: RestoreTicketAssignmentQuery,
+        #[body] request: WorkerRestoreRequest,
     ) -> Result<WorkerRestoreResponse, RepositoryApiError>;
 
     #[put(
@@ -9594,6 +9598,10 @@ pub struct RuntimeWorkerWorkdirAttachmentSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct WorkerSummary {
+    /// Opaque Runtime-owned observation fence used by explicit Restore intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub restore_observation_token: Option<String>,
     pub runtime_id: String,
     pub worker_id: String,
     pub resource_key: String,
@@ -9828,6 +9836,16 @@ pub enum WorkerRestoreState {
     Rejected,
     RolledBack,
     ReconciliationRequired,
+}
+
+/// One explicit Restore intent. Retries retain both fields; conflicts require a
+/// fresh observation and a deliberate new intent, not automatic token replacement.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRestoreRequest {
+    pub expected_observation_token: String,
+    pub request_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -11692,6 +11710,28 @@ mod tests {
         assert!(
             serde_json::from_value::<WorkerRestoreState>(serde_json::json!("unknown")).is_err()
         );
+    }
+
+    #[test]
+    fn worker_restore_request_requires_observation_and_request_identity() {
+        let valid = serde_json::json!({"expected_observation_token":"opaque-generation", "request_id":"restore-request"});
+        let request: WorkerRestoreRequest = serde_json::from_value(valid.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), valid);
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"request_id":"restore-request"}),
+            serde_json::json!({"expected_observation_token":"opaque-generation"}),
+            serde_json::json!({"expected_observation_token":"opaque-generation", "request_id":"restore-request", "command_id":701}),
+        ] {
+            assert!(serde_json::from_value::<WorkerRestoreRequest>(invalid).is_err());
+        }
+        let contract = canonical_openapi_document().unwrap().to_json().unwrap();
+        let contract: serde_json::Value = serde_json::from_str(&contract).unwrap();
+        let restore = &contract["paths"]["/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/restore"]
+            ["post"];
+        assert_eq!(restore["requestBody"]["required"], true);
+        assert!(restore["responses"]["409"].is_object());
+        assert!(contract["components"]["schemas"]["WorkerRestoreRequest"].is_object());
     }
 
     #[test]

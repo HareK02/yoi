@@ -425,6 +425,7 @@ fn project_registry_worker(
         worker
     } else {
         SubscriptionWorker {
+            restore_observation_token: None,
             worker_id: protocol::subscription::SubscriptionWorkerId::new(
                 record.registry.worker.worker_id.clone(),
             )
@@ -600,6 +601,7 @@ mod tests {
     #[test]
     fn external_workdir_attachment_does_not_remove_workspace_worker() {
         let mut worker = SubscriptionWorker {
+            restore_observation_token: None,
             worker_id: worker_id(),
             runtime_id: Some("runtime-1".to_string()),
             resource_key: Some("W-1".to_string()),

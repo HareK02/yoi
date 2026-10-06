@@ -28,7 +28,7 @@ use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 79;
+const LATEST_SCHEMA_VERSION: i64 = 80;
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
 const WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME: &str = "workspace runtime bindings";
@@ -79,6 +79,8 @@ const ARCHIVE_OBSERVE_GRANTS_MIGRATION_NAME: &str =
 const BACKEND_JOB_WORKER_CLEANUP_MIGRATION_NAME: &str =
     "durable terminal Backend Job Worker cleanup";
 const WORKDIR_CONNECTION_ID_MIGRATION_NAME: &str = "durable Workdir attachment connection identity";
+const WORKER_RESTORE_INTENTS_MIGRATION_NAME: &str =
+    "durable internal Worker Restore request identity";
 const TICKET_SCHEMA_VERSION_WITH_TARGETS: i64 = 7;
 const TICKET_SCHEMA_BASELINE_NAME: &str = "ticket schema baseline";
 const WORKER_REGISTRY_PROJECTION_SCHEMA: &str = r#"
@@ -270,6 +272,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 79,
         name: WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME,
         apply: migrate_workspace_config_v78_to_v79,
+    },
+    Migration {
+        version: 80,
+        name: WORKER_RESTORE_INTENTS_MIGRATION_NAME,
+        apply: migrate_worker_restore_intents_v79_to_v80,
     },
 ];
 
@@ -2164,6 +2171,48 @@ impl SqliteWorkspaceStore {
             let value = f(&tx)?;
             tx.commit()?;
             Ok(value)
+        })
+    }
+
+    /// Client intent journal, not a lifecycle state machine: pin the public tuple
+    /// before dispatch and keep it unchanged until a terminal receipt is obtained.
+    pub(crate) fn pin_internal_worker_restore_intent(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        domain_key: &str,
+        observed_token: Option<&str>,
+        explicit_request_id: Option<&str>,
+    ) -> Result<server_api::WorkerRestoreRequest> {
+        self.with_transaction(|tx| {
+            let existing: Option<(String, String)> = if let Some(id) = explicit_request_id {
+                tx.query_row("SELECT request_id, expected_token FROM worker_restore_intents WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND request_id=?4",
+                    params![workspace_id, worker.runtime_id, worker.worker_id, id], |row| Ok((row.get(0)?, row.get(1)?))).optional()?
+            } else {
+                tx.query_row("SELECT request_id, expected_token FROM worker_restore_intents WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND domain_key=?4 AND settled=0",
+                    params![workspace_id, worker.runtime_id, worker.worker_id, domain_key], |row| Ok((row.get(0)?, row.get(1)?))).optional()?
+            };
+            if let Some((request_id, expected_observation_token)) = existing {
+                return Ok(server_api::WorkerRestoreRequest { request_id, expected_observation_token });
+            }
+            let observed_token = observed_token.ok_or(Error::RestoreObservationConflict)?;
+            let request_id = explicit_request_id.map(str::to_owned).unwrap_or_else(|| format!("{domain_key}:{observed_token}"));
+            tx.execute("INSERT INTO worker_restore_intents(workspace_id,runtime_id,worker_id,domain_key,request_id,expected_token,settled) VALUES(?1,?2,?3,?4,?5,?6,0)",
+                params![workspace_id, worker.runtime_id, worker.worker_id, domain_key, request_id, observed_token])?;
+            Ok(server_api::WorkerRestoreRequest { request_id, expected_observation_token: observed_token.to_owned() })
+        })
+    }
+
+    pub(crate) fn settle_internal_worker_restore_intent(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+        request_id: &str,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute("UPDATE worker_restore_intents SET settled=1 WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND request_id=?4",
+                params![workspace_id, worker.runtime_id, worker.worker_id, request_id])?;
+            Ok(())
         })
     }
 
@@ -11248,6 +11297,7 @@ fn read_worker_registry_projection(
                 })?
             } else {
                 SubscriptionWorker {
+                    restore_observation_token: None,
                     worker_id: SubscriptionWorkerId::new(worker.worker_id.to_string())
                         .map_err(|error| Error::InvalidInput(error.to_string()))?,
                     runtime_id: Some(worker.runtime_id.to_string()),
@@ -12011,6 +12061,24 @@ fn read_workdir_registry_record(
         created_at: row.get(16)?,
         updated_at: row.get(17)?,
     })
+}
+
+fn migrate_worker_restore_intents_v79_to_v80(conn: &Connection) -> Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    tx.execute_batch("CREATE TABLE worker_restore_intents (
+        workspace_id TEXT NOT NULL, runtime_id TEXT NOT NULL, worker_id TEXT NOT NULL,
+        domain_key TEXT NOT NULL, request_id TEXT NOT NULL, expected_token TEXT NOT NULL,
+        settled INTEGER NOT NULL CHECK(settled IN (0,1)),
+        PRIMARY KEY(workspace_id,runtime_id,worker_id,request_id),
+        FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+    );
+    CREATE UNIQUE INDEX worker_restore_intent_pending_domain ON worker_restore_intents(workspace_id,runtime_id,worker_id,domain_key) WHERE settled=0;")?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(?1,?2)",
+        params![80_i64, WORKER_RESTORE_INTENTS_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn prepare_connection(conn: &Connection) -> Result<()> {
@@ -15094,6 +15162,15 @@ fn migrate_workdir_connection_id_v77_to_v78(conn: &Connection) -> Result<()> {
 }
 
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch("CREATE TABLE worker_restore_intents (
+        workspace_id TEXT NOT NULL, runtime_id TEXT NOT NULL, worker_id TEXT NOT NULL,
+        domain_key TEXT NOT NULL, request_id TEXT NOT NULL, expected_token TEXT NOT NULL,
+        settled INTEGER NOT NULL CHECK(settled IN (0,1)),
+        PRIMARY KEY(workspace_id,runtime_id,worker_id,request_id),
+        FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+    );
+    CREATE UNIQUE INDEX worker_restore_intent_pending_domain ON worker_restore_intents(workspace_id,runtime_id,worker_id,domain_key) WHERE settled=0;")?;
+
     conn.execute_batch("DROP TABLE IF EXISTS typed_ticket_targets;")?;
     conn.execute_batch(include_str!("latest_schema.sql"))?;
     conn.execute_batch(
@@ -16202,6 +16279,7 @@ mod tests {
     }
 
     fn downgrade_schema_66_ticket_and_workdir_authority(conn: &Connection) -> Result<()> {
+        conn.execute_batch("DROP TABLE IF EXISTS worker_restore_intents;")?;
         conn.execute_batch(
             "DROP TABLE backend_job_deliveries;
              DROP TABLE backend_job_attempts;
@@ -17709,6 +17787,10 @@ mod tests {
                     version: 79,
                     name: WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME.to_string()
                 },
+                WorkspaceSchemaMigrationStep {
+                    version: 80,
+                    name: WORKER_RESTORE_INTENTS_MIGRATION_NAME.to_string()
+                },
             ]
         );
 
@@ -17798,6 +17880,7 @@ mod tests {
                         ),
                         (78, WORKDIR_CONNECTION_ID_MIGRATION_NAME.to_string()),
                         (79, WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME.to_string()),
+                        (80, WORKER_RESTORE_INTENTS_MIGRATION_NAME.to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -18149,7 +18232,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72,
-                73, 74, 75, 76, 77, 78, 79
+                73, 74, 75, 76, 77, 78, 79, 80
             ]
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
@@ -18158,7 +18241,7 @@ mod tests {
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
-        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 30);
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap().len(), 31);
         assert!(column_exists(&conn, "worker_workdir_links", "alias").unwrap());
         assert!(column_exists(&conn, "worker_workdir_links", "capabilities").unwrap());
         assert!(!column_exists(&conn, "worker_workdir_links", "role").unwrap());
@@ -21860,6 +21943,7 @@ INSERT INTO worker_registry (
 
         for record in [&runtime_a, &runtime_b] {
             let observed = SubscriptionWorker {
+                restore_observation_token: None,
                 worker_id: SubscriptionWorkerId::new("shared-local-id").unwrap(),
                 runtime_id: Some(record.worker.runtime_id.clone()),
                 resource_key: None,
@@ -21996,6 +22080,7 @@ INSERT INTO worker_registry (
             Some("W-1")
         );
         let observed = SubscriptionWorker {
+            restore_observation_token: None,
             worker_id: SubscriptionWorkerId::new("known").unwrap(),
             runtime_id: Some("embedded".to_string()),
             resource_key: None,
@@ -22016,6 +22101,7 @@ INSERT INTO worker_registry (
         };
         store.upsert_worker_registry(&other_catalog).unwrap();
         let other_observed = SubscriptionWorker {
+            restore_observation_token: None,
             worker_id: SubscriptionWorkerId::new("other").unwrap(),
             runtime_id: Some("runtime-other".to_string()),
             display_name: Some("Other Runtime Worker".to_string()),
@@ -22025,6 +22111,7 @@ INSERT INTO worker_registry (
             .apply_worker_registry_observation("local-dev", "runtime-other", &other_observed, "2")
             .unwrap();
         let orphan = SubscriptionWorker {
+            restore_observation_token: None,
             worker_id: SubscriptionWorkerId::new("orphan").unwrap(),
             ..observed.clone()
         };
@@ -22190,6 +22277,7 @@ INSERT INTO worker_registry (
                 .is_none()
         );
         let event = SubscriptionWorker {
+            restore_observation_token: None,
             worker_id: SubscriptionWorkerId::new("removed").unwrap(),
             runtime_id: Some("embedded".to_string()),
             resource_key: None,

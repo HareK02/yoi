@@ -246,6 +246,7 @@ fn rust_serialized_subscription_frame_fixtures() -> Vec<SubscriptionFrame> {
     let external_workdir_id = SubscriptionWorkdirId::new("fixture-external-workdir")
         .expect("fixture external Workdir id must be valid");
     let worker = SubscriptionWorker {
+        restore_observation_token: Some("fixture-restore-observation".into()),
         worker_id: worker_id.clone(),
         runtime_id: Some("fixture-runtime".to_string()),
         resource_key: Some("fixture-worker-resource".to_string()),

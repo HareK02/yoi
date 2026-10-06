@@ -2302,6 +2302,7 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     }
     if path.ends_with("/input")
         || path.ends_with("/restore")
+        || path.ends_with("/restore/coordinate")
         || (path.contains("/attachments") && *method != Method::GET)
         || path.contains("/workdir-attachments")
     {
@@ -2514,6 +2515,7 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
             StatusCode::CONFLICT
         }
         RuntimeError::RuntimeStopped
+        | RuntimeError::RestoreObservationConflict { .. }
         | RuntimeError::RuntimeStoreAlreadyOpen { .. }
         | RuntimeError::WorkerExecutionUnavailable { .. }
         | RuntimeError::ExecutionBackendUnavailable { .. }
@@ -2538,6 +2540,9 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
 fn code_for_runtime_error(error: &RuntimeError) -> String {
     match error {
         RuntimeError::RuntimeStopped => "runtime_stopped".to_string(),
+        RuntimeError::RestoreObservationConflict { .. } => {
+            "restore_observation_conflict".to_string()
+        }
         RuntimeError::RuntimeStoreAlreadyOpen { .. } => "runtime_store_already_open".to_string(),
         RuntimeError::WorkerNotFound { .. } => "worker_not_found".to_string(),
         RuntimeError::WorkerExecutionUnavailable { .. } => {
@@ -3642,7 +3647,17 @@ mod tests {
         client
             .restore_worker(
                 generated_worker_id.clone(),
-                runtime_api::EmptyObjectRequest::default(),
+                runtime_api::WorkerRestoreRequest {
+                    expected_observation_token: client
+                        .get_worker(generated_worker_id.clone())
+                        .await
+                        .unwrap()
+                        .worker
+                        .restore_observation_token
+                        .unwrap(),
+                    request_id: "generated-restore".into(),
+                    preparation: Some(runtime_api::WorkerRestorePreparation::default()),
+                },
             )
             .await
             .unwrap();
@@ -3786,18 +3801,86 @@ mod tests {
         let stop: RuntimeHttpWorkerLifecycleResponse = read_json(response).await;
         assert_eq!(stop.ack.worker_ref, created.worker.worker_ref);
 
-        let response = authed_empty_request(
+        let restore_uri = format!("/v1/workers/{}/restore", created.worker.worker_id);
+        let missing = authed_empty_request(app.clone(), Method::POST, &restore_uri, token).await;
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let stale = runtime_api::WorkerRestoreRequest {
+            expected_observation_token: created.worker.restore_observation_token.clone().unwrap(),
+            request_id: "stale-http-restore".into(),
+            preparation: None,
+        };
+        let response =
+            authed_json_request(app.clone(), Method::POST, &restore_uri, token, &stale).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let conflict: RuntimeHttpErrorResponse = read_json(response).await;
+        assert_eq!(conflict.error.code, "restore_observation_conflict");
+
+        let mut restore_request = runtime.test_restore_request(&created.worker.worker_ref);
+        let coordinate_uri = format!("{restore_uri}/coordinate");
+        let mut coordination = runtime_api::WorkerRestoreCoordinationRequest {
+            expected_observation_token: restore_request.expected_observation_token.clone(),
+            request_id: restore_request.request_id.clone(),
+            preparation: None,
+        };
+        let before_lookup = runtime.worker_detail(&created.worker.worker_ref).unwrap();
+        let response = authed_json_request(
             app.clone(),
             Method::POST,
-            &format!("/v1/workers/{}/restore", created.worker.worker_id),
+            &coordinate_uri,
             token,
+            &coordination,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let missing_owner: runtime_api::WorkerRestoreCoordinationResponse =
+            read_json(response).await;
+        assert!(missing_owner.result.is_none() && missing_owner.preparation.is_none());
+        assert_eq!(
+            runtime.worker_detail(&created.worker.worker_ref).unwrap(),
+            before_lookup
+        );
+        let response = authed_json_request(
+            app.clone(),
+            Method::POST,
+            &coordinate_uri,
+            "wrong-token",
+            &coordination,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        coordination.preparation = Some(runtime_api::WorkerRestorePreparation::default());
+        let response = authed_json_request(
+            app.clone(),
+            Method::POST,
+            &coordinate_uri,
+            token,
+            &coordination,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let admitted: runtime_api::WorkerRestoreCoordinationResponse = read_json(response).await;
+        assert!(admitted.result.is_none() && admitted.preparation.is_some());
+        assert_eq!(
+            runtime
+                .worker_detail(&created.worker.worker_ref)
+                .unwrap()
+                .status,
+            crate::catalog::WorkerStatus::Stopped
+        );
+        restore_request.preparation = admitted.preparation;
+        let response = authed_json_request(
+            app.clone(),
+            Method::POST,
+            &restore_uri,
+            token,
+            &restore_request,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let restored: runtime_api::WorkerRestoreResponse = read_json(response).await;
         assert_eq!(restored.state, WorkerRestoreState::Accepted);
         assert_eq!(
-            restored.worker.unwrap().status,
+            restored.worker.as_ref().unwrap().status,
             runtime_api::WorkerStatus::Idle
         );
 
@@ -3809,6 +3892,47 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
+
+        coordination.preparation = None;
+        let response = authed_json_request(
+            app.clone(),
+            Method::POST,
+            &coordinate_uri,
+            token,
+            &coordination,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let recovered: runtime_api::WorkerRestoreCoordinationResponse = read_json(response).await;
+        assert!(recovered.preparation.is_none());
+        assert_eq!(recovered.result, Some(restored.clone()));
+
+        restore_request.preparation = Some(serde_json::from_value(serde_json::json!({
+            "workspace_api": { "workspace_id": "must-not-bind", "base_url": "https://fresh.invalid.example" },
+            "workdir_attachments": [],
+            "repository_access": []
+        })).unwrap());
+        let response = authed_json_request(
+            app.clone(),
+            Method::POST,
+            &restore_uri,
+            token,
+            &restore_request,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let replayed: runtime_api::WorkerRestoreResponse = read_json(response).await;
+        assert_eq!(
+            serde_json::to_value(replayed).unwrap(),
+            serde_json::to_value(restored).unwrap()
+        );
+        assert_eq!(
+            runtime
+                .worker_detail(&created.worker.worker_ref)
+                .unwrap()
+                .status,
+            crate::catalog::WorkerStatus::Stopped
+        );
 
         let response = authed_empty_request(
             app.clone(),
@@ -3892,11 +4016,12 @@ mod tests {
         assert_eq!(listed.workers[0].status, crate::catalog::WorkerStatus::Idle);
         assert!(listed.workers[0].worker_state.is_none());
 
-        let response = authed_empty_request(
+        let response = authed_json_request(
             app.clone(),
             Method::POST,
             &format!("{worker_uri}/restore"),
             token,
+            &runtime.test_restore_request(&created.worker_ref),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -4864,7 +4989,9 @@ mod ws_tests {
         let (mut old_stream, _) = connect_async(authed_ws_request(&url)).await.unwrap();
         let _ = next_frame(&mut old_stream).await;
         runtime.stop_worker(&worker_ref, None).unwrap();
-        runtime.restore_worker(&worker_ref).unwrap();
+        runtime
+            .restore_worker(&worker_ref, runtime.test_restore_request(&worker_ref))
+            .unwrap();
         backend.publish(
             &worker_ref,
             protocol::Event::TextDelta {
@@ -4946,7 +5073,9 @@ mod ws_tests {
         );
         backend.publish(&worker_ref, protocol::Event::Shutdown);
         runtime.stop_worker(&worker_ref, None).unwrap();
-        runtime.restore_worker(&worker_ref).unwrap();
+        runtime
+            .restore_worker(&worker_ref, runtime.test_restore_request(&worker_ref))
+            .unwrap();
         let resume_url = format!("{url}?cursor={}", old.cursor);
         let (mut stream, _) = connect_async(authed_ws_request(&resume_url)).await.unwrap();
         assert!(matches!(

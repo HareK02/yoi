@@ -65,6 +65,9 @@ beforeEach(() => {
       );
       return Response.json({
         workspace_id: workspaceId,
+        ...(String(input).endsWith("/workers")
+          ? { limit: 100, source: "catalog" }
+          : {}),
         items: [],
         diagnostics: [],
       });
@@ -283,7 +286,17 @@ test("terminal subscription rejection is shown only through WorkspaceAlerts", as
 test("Workdir fetch failure preserves Worker updates and uses a separate stable alert", async () => {
   vi.stubGlobal(
     "fetch",
-    vi.fn(async () => new Response("Workdir lookup failed", { status: 503 })),
+    vi.fn(async (input: RequestInfo | URL) =>
+      String(input).endsWith("/workers")
+        ? Response.json({
+          workspace_id: "workspace-a",
+          limit: 100,
+          source: "catalog",
+          items: [],
+          diagnostics: [],
+        })
+        : new Response("Workdir lookup failed", { status: 503 })
+    ),
   );
   mount();
   await waitFor(() => expect(transport.subscribe).toHaveBeenCalledOnce());

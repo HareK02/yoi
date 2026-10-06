@@ -359,7 +359,11 @@ alias: string, repository_key?: string | null, working_directory_id: Subscriptio
 
 export type SubscriptionWorkerJob = { job_id: string, attempt_id: string, purpose: string, };
 
-export type SubscriptionWorker = { worker_id: SubscriptionWorkerId,
+export type SubscriptionWorker = {
+/**
+ * Opaque Runtime-owned Restore observation identity, never a display-state hash.
+ */
+restore_observation_token?: string | null, worker_id: SubscriptionWorkerId,
 /**
  * Set by the Workspace Server when projecting a Runtime-owned Worker to clients.
  * Runtime producers leave this unset because the connection identifies the Runtime.

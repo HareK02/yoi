@@ -334,6 +334,8 @@ pub(crate) enum WorkerRestoreIntent {
 /// Lightweight persisted Worker identity projection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_observation_token: Option<String>,
     pub worker_ref: WorkerRef,
     pub worker_id: WorkerId,
     pub status: WorkerStatus,
@@ -359,6 +361,8 @@ pub struct WorkerSummary {
 /// Full persisted Worker identity and lifecycle detail.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerDetail {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_observation_token: Option<String>,
     pub worker_ref: WorkerRef,
     pub worker_id: WorkerId,
     pub status: WorkerStatus,

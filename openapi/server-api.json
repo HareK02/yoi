@@ -8062,6 +8062,13 @@
           "resource_key": {
             "type": "string"
           },
+          "restore_observation_token": {
+            "description": "Opaque Runtime-owned observation fence used by explicit Restore intent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "retention_state": {
             "default": "",
             "type": "string"
@@ -12953,6 +12960,23 @@
         ],
         "type": "string"
       },
+      "WorkerRestoreRequest": {
+        "additionalProperties": false,
+        "description": "One explicit Restore intent. Retries retain both fields; conflicts require a\nfresh observation and a deliberate new intent, not automatic token replacement.",
+        "properties": {
+          "expected_observation_token": {
+            "type": "string"
+          },
+          "request_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_observation_token",
+          "request_id"
+        ],
+        "type": "object"
+      },
       "WorkerRestoreResponse": {
         "additionalProperties": false,
         "properties": {
@@ -13156,6 +13180,13 @@
           },
           "resource_key": {
             "type": "string"
+          },
+          "restore_observation_token": {
+            "description": "Opaque Runtime-owned observation fence used by explicit Restore intent.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "retention_state": {
             "default": "",
@@ -15443,7 +15474,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:6001e9f7273288195fb5a9859e4a5932a521d2f2e7c3a9ecd8ec660fd6a37779"
+    "x-yoi-source-digest": "sha256:fd06f382c6d33a5c3cc98ef9e264545923c53fa95a9be555a85680f98c6065da"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -18016,6 +18047,16 @@
             "style": "simple"
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkerRestoreRequest"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
@@ -26433,6 +26474,16 @@
             "style": "form"
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkerRestoreRequest"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
